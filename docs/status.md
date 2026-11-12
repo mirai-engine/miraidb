@@ -126,6 +126,9 @@ a table is still a `map[Row_Id]Row` in memory, and that is the next step of D17.
 
 - **Index use.** Only the base table of a query is narrowed by an index; joined
   tables are scanned by the nested loop. No cost-based planner.
+- **Window frames.** `ROWS BETWEEN … AND …` works for aggregates and value
+  functions; `RANGE`/`GROUPS` are refused with a message. A window beside
+  `GROUP BY` is refused.
 - **Ordering.** `ORDER BY` sorts after projection. It does not read an index
   order, and `LIMIT` does not stop a scan early.
 - **Types.** One 64-bit integer width, one float width, no decimal, no

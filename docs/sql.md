@@ -417,8 +417,15 @@ FROM s;
   `group_concat`) also works as a window; the frame is the partition up to the
   last peer of the current row, or the whole partition without `ORDER BY`.
 - `ORDER BY` may name a window projection by its alias.
-- Frames (`ROWS`/`RANGE`/`GROUPS`) and window functions beside `GROUP BY` are
-  refused with `sql_unsupported` rather than approximated.
+- A frame decides which rows the aggregate sees:
+  `OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)`. Bounds are
+  `UNBOUNDED PRECEDING`, `<n> PRECEDING`, `CURRENT ROW`, `<n> FOLLOWING` and
+  `UNBOUNDED FOLLOWING`; `ROWS <bound>` is the shorthand ending at the current
+  row. An explicit frame also moves `first_value`, `last_value` and `nth_value`,
+  and an empty frame is an empty group (`count` 0, `sum` NULL).
+- `RANGE` and `GROUPS` frames (which need value arithmetic between rows) and
+  window functions beside `GROUP BY` are refused with `sql_unsupported` rather
+  than approximated.
 
 ## Triggers
 

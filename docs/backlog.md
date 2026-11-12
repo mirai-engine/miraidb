@@ -29,7 +29,7 @@ Rules for this file:
 | D6 | Query planner | nested loop + index probes | cost model, statistics, reordering | L | P1 |
 | D7 | Scheduler durability | **durable** (due time is a logged column) | recovery test | S | — |
 | D8 | Crash injection | **done**: `Fault_Vfs` fails any operation at any call, and `test_fault_injection` walks the write offsets | same for the snapshot and the mirror writes | S | P1 |
-| D9 | SQL grammar | 32 statements, no window frames | frames, recursive CTE, full `ALTER` | L | P2 |
+| D9 | SQL grammar | 32 statements, **`ROWS` frames done** (`test_window_frames`) | windows beside `GROUP BY`, `RANGE`/`GROUPS`, `BEFORE`/`WHEN`, full `ALTER`, collations, user functions | L | P2 |
 | D10 | Types and precision | `Int128` as two `u64` | decimal arithmetic, time zones | M | P3 |
 | D11 | Virtual-table breadth | **done**: index DDL is staged and applied after the rows (`test_ddl_in_transaction`) | triggers/policies in the same transaction | S | P1 |
 | D12a | Metering granularity | **per row read and written, with a budget that aborts** | — | S | done |
@@ -268,11 +268,20 @@ walk that exists now.
 
 ## D9 — The rest of the grammar
 
-**Now.** 32 statement kinds. Refused with `sql_unsupported`: window frames,
-windows beside `GROUP BY`, `BEFORE` triggers and trigger `WHEN` clauses,
-recursive CTEs (the keyword parses, the recursion does not run), `ALTER TABLE`
-beyond rename/drop/add column, collations beyond `BINARY`/`NOCASE`/`RTRIM`,
-user-defined functions.
+**Now.** 32 statement kinds. Refused with `sql_unsupported`: windows beside
+`GROUP BY`, `BEFORE` triggers and trigger `WHEN` clauses, `RANGE`/`GROUPS`
+frames, `ALTER TABLE` beyond rename/drop/add column, collations beyond
+`BINARY`/`NOCASE`/`RTRIM`, user-defined functions.
+
+**Done: `ROWS` window frames.** `OVER (... ROWS BETWEEN <bound> AND <bound>)`
+with `UNBOUNDED PRECEDING/FOLLOWING`, `<n> PRECEDING/FOLLOWING` and
+`CURRENT ROW`; the shorthand `ROWS <bound>` ends at the current row. An explicit
+frame moves the aggregates and the value functions (`first_value`,
+`last_value`, `nth_value`); an empty frame is an empty group (`count` 0, `sum`
+NULL). A frame on a ranking function is accepted and does not change it. `RANGE`
+and `GROUPS` need value arithmetic between rows, so they are refused with a
+message rather than approximated. `test_window_frames` covers the shapes,
+partitioning, the shorthand, the empty frame and both refusals.
 
 **Done when.** Each refusal becomes a test; the list above is the checklist and
 must not shrink by approximation.

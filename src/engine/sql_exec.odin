@@ -1153,6 +1153,33 @@ window_fill :: proc(
 	}
 	if strings.equal_fold(name, "first_value") || strings.equal_fold(name, "last_value") ||
 	   strings.equal_fold(name, "nth_value") {
+		if window.frame.has {
+			for index, j in indexes {
+				lo, hi, frame_err := window_frame_bounds(window.frame, j, len(indexes), ctx.params)
+				if frame_err.kind != .None do return frame_err
+				target := lo
+				switch {
+				case strings.equal_fold(name, "last_value"):
+					target = hi
+				case strings.equal_fold(name, "nth_value"):
+					wanted := i64(1)
+					if value := arg_of(cells, index, cell_index, 1); value.kind != .Null {
+						if parsed, ok := value_to_i64(value); ok do wanted = parsed
+					}
+					if wanted < 1 || lo > hi || int(wanted) > hi - lo + 1 {
+						assign(rows, index, position, value_null())
+						continue
+					}
+					target = lo + int(wanted) - 1
+				}
+				if lo > hi {
+					assign(rows, index, position, value_null())
+					continue
+				}
+				assign(rows, index, position, arg_of(cells, indexes[target], cell_index, 0))
+			}
+			return ERROR_NONE
+		}
 		for index, j in indexes {
 			target := 0
 			switch {
@@ -1172,6 +1199,16 @@ window_fill :: proc(
 	}
 	// Aggregate windows reuse the group aggregate: the frame is a group.
 	call := Call_Expr{name = window.name, args = window.args, star = window.star}
+	if window.frame.has {
+		for j in 0 ..< len(indexes) {
+			lo, hi, frame_err := window_frame_bounds(window.frame, j, len(indexes), ctx.params)
+			if frame_err.kind != .None do return frame_err
+			value, agg_err := window_aggregate_over(ctx, call, sources, indexes, lo, hi)
+			if agg_err.kind != .None do return agg_err
+			assign(rows, indexes[j], position, value)
+		}
+		return ERROR_NONE
+	}
 	j := 0
 	for j < len(indexes) {
 		end := running ? peer_end(order_keys, j) : len(indexes) - 1
@@ -1188,6 +1225,83 @@ window_fill :: proc(
 		j = end + 1
 	}
 	return ERROR_NONE
+}
+
+// window_frame_bounds turns a ROWS frame into the inclusive range of partition
+// positions it covers for row `j`. An empty frame (lo > hi) is legal: the
+// aggregate over no rows still has a value (count 0, sum NULL).
+@(private)
+window_frame_bounds :: proc(
+	frame: Window_Frame,
+	j: int,
+	count: int,
+	params: []Value,
+) -> (lo: int, hi: int, err: Error) {
+	bound_position :: proc(bound: Frame_Bound, j: int, is_start: bool, count: int, params: []Value) -> (int, Error) {
+		switch bound.kind {
+		case .Unbounded_Preceding:
+			if !is_start do return 0, errf(.Invalid_Argument, "UNBOUNDED PRECEDING cannot end a frame")
+			return 0, ERROR_NONE
+		case .Unbounded_Following:
+			if is_start do return 0, errf(.Invalid_Argument, "UNBOUNDED FOLLOWING cannot start a frame")
+			return count, ERROR_NONE
+		case .Current_Row:
+			return j, ERROR_NONE
+		case .Preceding, .Following:
+			offset := i64(1)
+			if bound.offset != nil {
+				value, constant := eval_constant(bound.offset, params)
+				if !constant {
+					return 0, errf(.Invalid_Argument, "a frame offset must be a constant")
+				}
+				parsed, ok := value_to_i64(value)
+				if !ok || parsed < 0 {
+					return 0, errf(.Invalid_Argument, "a frame offset must be a non-negative integer")
+				}
+				offset = parsed
+			}
+			if bound.kind == .Preceding do return j - int(offset), ERROR_NONE
+			return j + int(offset), ERROR_NONE
+		}
+		return 0, ERROR_NONE
+	}
+	start, lo_err := bound_position(frame.start, j, true, count, params)
+	if lo_err.kind != .None do return 0, 0, lo_err
+	end, hi_err := bound_position(frame.end, j, false, count, params)
+	if hi_err.kind != .None do return 0, 0, hi_err
+	lo = start
+	hi = end
+	if lo < 0 do lo = 0
+	if hi > count - 1 do hi = count - 1
+	return lo, hi, ERROR_NONE
+}
+
+// window_aggregate_over evaluates an aggregate over positions [lo, hi] of the
+// partition. An empty range is an empty group, not an error.
+@(private)
+window_aggregate_over :: proc(
+	ctx: ^Eval_Ctx,
+	call: Call_Expr,
+	sources: [][]Source,
+	indexes: []int,
+	lo: int,
+	hi: int,
+) -> (Value, Error) {
+	if lo > hi {
+		ctx.group = nil
+		ctx.grouped = true
+		defer ctx.grouped = false
+		return eval_aggregate(ctx, call)
+	}
+	frame := make([][]Source, hi - lo + 1)
+	defer delete(frame)
+	for f in lo ..= hi do frame[f - lo] = sources[indexes[f]]
+	ctx.group = frame
+	ctx.grouped = true
+	value, agg_err := eval_aggregate(ctx, call)
+	ctx.group = nil
+	ctx.grouped = false
+	return value, agg_err
 }
 
 // window_sort orders the row indexes of a partition by their ORDER BY keys.

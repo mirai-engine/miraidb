@@ -528,6 +528,31 @@ parse_table_ref :: proc(p: ^Parser) -> Table_Ref {
 	return ref
 }
 
+// parse_frame_bound reads one end of a ROWS frame:
+// UNBOUNDED PRECEDING|FOLLOWING, CURRENT ROW, or <n> PRECEDING|FOLLOWING.
+@(private)
+parse_frame_bound :: proc(p: ^Parser) -> Frame_Bound {
+	if p_match_keyword(p, "unbounded") {
+		if p_match_keyword(p, "preceding") do return Frame_Bound{kind = .Unbounded_Preceding}
+		if p_match_keyword(p, "following") do return Frame_Bound{kind = .Unbounded_Following}
+		p_fail(p, .Sql_Syntax, "a frame bound needs PRECEDING or FOLLOWING after UNBOUNDED")
+		return {}
+	}
+	if p_match_keyword(p, "current") {
+		if !p_expect_keyword(p, "row") do return {}
+		return Frame_Bound{kind = .Current_Row}
+	}
+	offset := parse_expression(p)
+	if p_match_keyword(p, "preceding") {
+		return Frame_Bound{kind = .Preceding, offset = offset}
+	}
+	if p_match_keyword(p, "following") {
+		return Frame_Bound{kind = .Following, offset = offset}
+	}
+	p_fail(p, .Sql_Syntax, "a frame bound needs PRECEDING or FOLLOWING")
+	return {}
+}
+
 @(private)
 parse_insert :: proc(p: ^Parser) -> Statement {
 	insert: Insert_Stmt
@@ -1740,12 +1765,24 @@ parse_primary :: proc(p: ^Parser) -> ^Expr {
 					}
 					window_expr.order_by = items[:]
 				}
-				// Frames are the one part of the OVER clause this engine does
-				// not model; the default (RANGE UNBOUNDED PRECEDING TO CURRENT
-				// ROW) is what it computes, so a frame clause is refused instead
-				// of silently ignored.
-				if p_is_keyword(p, "rows") || p_is_keyword(p, "range") || p_is_keyword(p, "groups") {
-					p_fail(p, .Sql_Unsupported, "window frames are not supported")
+				// An explicit frame over rows, or the default one when it is
+				// absent. RANGE and GROUPS need value arithmetic between rows and
+				// are refused instead of approximated.
+				if p_is_keyword(p, "range") || p_is_keyword(p, "groups") {
+					p_fail(p, .Sql_Unsupported, "RANGE and GROUPS frames are not supported; use ROWS")
+				}
+				if p_match_keyword(p, "rows") {
+					frame: Window_Frame
+					frame.has = true
+					if p_match_keyword(p, "between") {
+						frame.start = parse_frame_bound(p)
+						p_expect_keyword(p, "and")
+						frame.end = parse_frame_bound(p)
+					} else {
+						frame.start = parse_frame_bound(p)
+						frame.end = Frame_Bound{kind = .Current_Row}
+					}
+					window_expr.frame = frame
 				}
 				p_expect_punct(p, ")")
 				window^ = window_expr

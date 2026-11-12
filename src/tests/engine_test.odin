@@ -7580,9 +7580,16 @@ test_window_functions :: proc(t: ^testing.T) {
 	want_bucket := []i64{1, 1, 1, 2, 2}
 	for row, i in buckets do testing.expect_value(t, row[1].i, want_bucket[i])
 
-	// Frames are refused rather than silently ignored.
-	frame_err := run_error(t, store, "SELECT row_number() OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM s")
-	testing.expect_value(t, frame_err.kind, db.Error_Kind.Sql_Unsupported)
+	// A frame on a ranking function is accepted and has no effect on it; the
+	// aggregate case is covered by test_window_frames.
+	framed_rank := run(
+		t,
+		store,
+		"SELECT row_number() OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM s ORDER BY id",
+	)
+	testing.expect_value(t, len(framed_rank.rows), 5)
+	db.sql_result_destroy(&framed_rank)
+	// A window beside GROUP BY is still refused rather than approximated.
 	group_err := run_error(t, store, "SELECT g, count(*), row_number() OVER (ORDER BY g) FROM s GROUP BY g")
 	testing.expect_value(t, group_err.kind, db.Error_Kind.Sql_Unsupported)
 	cleanup_db(store, "windows")
@@ -8545,4 +8552,148 @@ test_as_of :: proc(t: ^testing.T) {
 	run(t, store, "CREATE VIEW v AS SELECT id FROM t")
 	_, view_err := db.sql_execute(store, "SELECT * FROM v AS OF 1")
 	testing.expect_value(t, view_err.kind, db.Error_Kind.Sql_Unsupported)
+}
+
+@(test)
+test_window_frames :: proc(t: ^testing.T) {
+	// A ROWS frame decides which rows the aggregate sees for each row; without
+	// one, the default (partition start to the last peer) stays as it was.
+	store := fresh_db(t, "window_frames")
+	if store == nil do return
+	defer cleanup_db(store, "window_frames")
+	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
+	run(t, store, "INSERT INTO t (id, v) VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)")
+	column :: proc(t: ^testing.T, store: ^db.Store, sql: string) -> [dynamic]i64 {
+		result := run(t, store, sql)
+		out := make([dynamic]i64, 0, len(result.rows))
+		for row in result.rows do append(&out, row[0].i)
+		db.sql_result_destroy(&result)
+		return out
+	}
+
+	moving := column(
+		t,
+		store,
+		"SELECT SUM(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t ORDER BY id",
+	)
+	testing.expect_value(t, len(moving), 5)
+	if len(moving) == 5 {
+		testing.expect_value(t, moving[0], i64(30))
+		testing.expect_value(t, moving[1], i64(60))
+		testing.expect_value(t, moving[2], i64(90))
+		testing.expect_value(t, moving[3], i64(120))
+		testing.expect_value(t, moving[4], i64(90))
+	}
+	delete(moving)
+
+	running := column(
+		t,
+		store,
+		"SELECT COUNT(*) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t ORDER BY id",
+	)
+	testing.expect_value(t, len(running), 5)
+	if len(running) == 5 {
+		for value, i in running do testing.expect_value(t, value, i64(i + 1))
+	}
+	delete(running)
+
+	whole := run(
+		t,
+		store,
+		"SELECT AVG(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t ORDER BY id",
+	)
+	testing.expect_value(t, len(whole.rows), 5)
+	for row in whole.rows {
+		average, _ := db.value_to_f64(row[0])
+		testing.expect_value(t, average, f64(30))
+	}
+	db.sql_result_destroy(&whole)
+
+	// The frame moves the value functions too.
+	lasts := column(
+		t,
+		store,
+		"SELECT LAST_VALUE(v) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM t ORDER BY id",
+	)
+	testing.expect_value(t, len(lasts), 5)
+	if len(lasts) == 5 {
+		for value in lasts do testing.expect_value(t, value, i64(50))
+	}
+	delete(lasts)
+
+	firsts := column(
+		t,
+		store,
+		"SELECT FIRST_VALUE(v) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND 2 PRECEDING) FROM t ORDER BY id",
+	)
+	testing.expect_value(t, len(firsts), 5)
+	if len(firsts) == 5 {
+		// The frame is empty for the first two rows, then two rows back.
+		testing.expect_value(t, firsts[0], i64(0))
+		testing.expect_value(t, firsts[1], i64(0))
+		testing.expect_value(t, firsts[2], i64(10))
+		testing.expect_value(t, firsts[3], i64(20))
+		testing.expect_value(t, firsts[4], i64(30))
+	}
+	delete(firsts)
+
+	// An empty frame is an empty group: count 0, sum NULL.
+	empties := run(
+		t,
+		store,
+		"SELECT COUNT(*) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND 2 PRECEDING), SUM(v) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND 2 PRECEDING) FROM t ORDER BY id",
+	)
+	testing.expect_value(t, len(empties.rows), 5)
+	if len(empties.rows) == 5 {
+		testing.expect_value(t, empties.rows[0][0].i, i64(0))
+		testing.expect_value(t, empties.rows[0][1].kind, db.Value_Kind.Null)
+		testing.expect_value(t, empties.rows[3][0].i, i64(1))
+		testing.expect_value(t, empties.rows[3][1].i, i64(20))
+	}
+	db.sql_result_destroy(&empties)
+
+	// The shorthand form ends at the current row, like the SQL standard.
+	shorthand := column(
+		t,
+		store,
+		"SELECT SUM(v) OVER (ORDER BY id ROWS 1 PRECEDING) FROM t ORDER BY id",
+	)
+	testing.expect_value(t, len(shorthand), 5)
+	if len(shorthand) == 5 {
+		testing.expect_value(t, shorthand[0], i64(10))
+		testing.expect_value(t, shorthand[1], i64(30))
+		testing.expect_value(t, shorthand[4], i64(90))
+	}
+	delete(shorthand)
+
+	// Partitioning still applies before the frame.
+	partitioned := column(
+		t,
+		store,
+		"SELECT SUM(v) OVER (PARTITION BY id % 2 ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY id",
+	)
+	testing.expect_value(t, len(partitioned), 5)
+	if len(partitioned) == 5 {
+		testing.expect_value(t, partitioned[0], i64(10))
+		testing.expect_value(t, partitioned[1], i64(20))
+		testing.expect_value(t, partitioned[2], i64(40))
+		testing.expect_value(t, partitioned[3], i64(60))
+		testing.expect_value(t, partitioned[4], i64(80))
+	}
+	delete(partitioned)
+
+	// RANGE needs value arithmetic between rows and is refused, not approximated.
+	range_err := run_error(
+		t,
+		store,
+		"SELECT SUM(v) OVER (ORDER BY id RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
+	)
+	testing.expect_value(t, range_err.kind, db.Error_Kind.Sql_Unsupported)
+	// A start of UNBOUNDED FOLLOWING is not a frame.
+	bad_start := run_error(
+		t,
+		store,
+		"SELECT SUM(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED FOLLOWING AND CURRENT ROW) FROM t",
+	)
+	testing.expect_value(t, bad_start.kind, db.Error_Kind.Invalid_Argument)
 }

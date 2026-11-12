@@ -50,12 +50,37 @@ Expr :: union {
 // Window_Expr is a function call with an OVER clause. It cannot be evaluated
 // row by row: it reads its whole partition, so the executor computes it after
 // every row exists.
+// Frame_Bound_Kind names one end of a window frame.
+Frame_Bound_Kind :: enum u8 {
+	Unbounded_Preceding,
+	Preceding,
+	Current_Row,
+	Following,
+	Unbounded_Following,
+}
+
+// Frame_Bound is one end of `ROWS BETWEEN ... AND ...`; `offset` is the row
+// count of a PRECEDING/FOLLOWING bound and nil for the others.
+Frame_Bound :: struct {
+	kind:   Frame_Bound_Kind,
+	offset: ^Expr,
+}
+
+// Window_Frame is an explicit frame over rows. Without one the engine keeps the
+// default: from the partition start to the last peer of the row.
+Window_Frame :: struct {
+	has:   bool,
+	start: Frame_Bound,
+	end:   Frame_Bound,
+}
+
 Window_Expr :: struct {
 	name:      string,
 	args:      []^Expr,
 	star:      bool,
 	partition: []^Expr,
 	order_by:  []Order_Item,
+	frame:     Window_Frame,
 }
 
 // Collate_Expr attaches a collation to an operand. It changes how comparisons
