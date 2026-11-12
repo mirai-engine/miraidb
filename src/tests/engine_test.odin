@@ -9027,3 +9027,97 @@ test_paged_table_roundtrip :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, again, "SELECT name FROM item WHERE id = 399").s, "name-399")
 	testing.expect_value(t, scalar(t, again, "SELECT qty FROM item WHERE id = 151").i, i64(151))
 }
+
+@(test)
+test_paged_table_churn :: proc(t: ^testing.T) {
+	// Updating and deleting rows leaves holes in the pages. Compaction reclaims
+	// them, and it must not move the slot a row is indexed by: this walks enough
+	// churn to force compaction many times and then checks every value.
+	path := "_test_paged_churn"
+	os.remove_all(path)
+	defer os.remove_all(path)
+	store, open_err := db.store_open(path, {
+		persistent = true,
+		create = true,
+		durable = false,
+		paged_tables = true,
+		page_frames = 4,
+	})
+	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
+	defer db.store_close(store)
+
+	run(t, store, "CREATE TABLE c (id INTEGER PRIMARY KEY, v TEXT, n INTEGER)")
+	body: strings.Builder
+	strings.builder_init(&body)
+	defer strings.builder_destroy(&body)
+	strings.write_string(&body, "INSERT INTO c (id, v, n) VALUES ")
+	for id in 0 ..< 300 {
+		if id > 0 do strings.write_string(&body, ", ")
+		fmt.sbprintf(&body, "(%d, 'round-0-%d', %d)", id, id, id)
+	}
+	run(t, store, strings.to_string(body))
+
+	for round in 1 ..< 7 {
+		tx := db.tx_begin_write(store)
+		for id in 0 ..< 300 {
+			statement := fmt.tprintf(
+				"UPDATE c SET v = 'round-%d-%d', n = %d WHERE id = %d",
+				round,
+				id,
+				round * 1000 + id,
+				id,
+			)
+			_, update_err := db.sql_execute_in_tx(tx, statement)
+			if !db.error_ok(update_err) {
+				db.tx_rollback(tx)
+				testing.expectf(t, db.error_ok(update_err), "update %d: %s", id, update_err.message)
+				return
+			}
+		}
+		if commit_err := db.tx_commit(tx); !testing.expectf(t, db.error_ok(commit_err), "commit: %s", commit_err.message) {
+			return
+		}
+	}
+
+	tx := db.tx_begin_write(store)
+	for id in 0 ..< 300 {
+		if id % 2 != 0 do continue
+		_, delete_err := db.sql_execute_in_tx(tx, fmt.tprintf("DELETE FROM c WHERE id = %d", id))
+		testing.expect(t, db.error_ok(delete_err))
+	}
+	for id in 1000 ..< 1150 {
+		statement := fmt.tprintf("INSERT INTO c (id, v, n) VALUES (%d, 'new-%d', %d)", id, id, id)
+		_, insert_err := db.sql_execute_in_tx(tx, statement)
+		testing.expect(t, db.error_ok(insert_err))
+	}
+	testing.expect(t, db.error_ok(db.tx_commit(tx)))
+
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM c").i, i64(300))
+	for id in 0 ..< 300 {
+		if id % 2 == 0 {
+			visible := scalar(t, store, fmt.tprintf("SELECT count(*) FROM c WHERE id = %d", id))
+			testing.expect_value(t, visible.i, i64(0))
+			continue
+		}
+		row := run(t, store, fmt.tprintf("SELECT v, n FROM c WHERE id = %d", id))
+		testing.expectf(t, len(row.rows) == 1, "row %d is missing", id)
+		if len(row.rows) == 1 {
+			testing.expect_value(t, row.rows[0][0].s, fmt.tprintf("round-6-%d", id))
+			testing.expect_value(t, row.rows[0][1].i, i64(6000 + id))
+		}
+		db.sql_result_destroy(&row)
+	}
+	for id in 1000 ..< 1150 {
+		row := run(t, store, fmt.tprintf("SELECT v, n FROM c WHERE id = %d", id))
+		testing.expectf(t, len(row.rows) == 1, "new row %d is missing", id)
+		if len(row.rows) == 1 {
+			testing.expect_value(t, row.rows[0][0].s, fmt.tprintf("new-%d", id))
+			testing.expect_value(t, row.rows[0][1].i, i64(id))
+		}
+		db.sql_result_destroy(&row)
+	}
+	table, table_err := db.store_table(store, "c")
+	testing.expect(t, db.error_ok(table_err))
+	testing.expect_value(t, db.page_rows_stats(table.paged).rows, u64(300))
+	testing.expect_value(t, u64(len(table.paged.directory)), u64(300))
+}

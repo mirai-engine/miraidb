@@ -1579,11 +1579,13 @@ Stream_Scan_Ctx :: struct {
 stream_row_visit :: proc(raw: rawptr, row: Row) -> bool {
 	scan := cast(^Stream_Scan_Ctx)raw
 	if scan.err.kind != .None do return false
-	one := make([]Source, 1, scan.tx.alloc)
+	// The slice lives on this frame: one allocation per row in the transaction
+	// arena would make a streamed scan cost the table again in memory.
+	one: [1]Source
 	one[0] = Source{table = scan.base, row = row, alias = scan.alias}
 	ctx := Eval_Ctx {
 		tx      = scan.tx,
-		sources = one,
+		sources = one[:],
 		params  = scan.params,
 		now_us  = scan.now_us,
 	}

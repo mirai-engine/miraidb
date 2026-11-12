@@ -158,8 +158,11 @@ page_file_create :: proc(vfs: ^Vfs, path: string, frames: int) -> (^Page_File, E
 	pf.vfs = system
 	pf.file = file
 	pf.path = strings.clone(path)
-	pf.frames = make([]Page_Frame, count)
-	for i in 0 ..< count {
+	// Frame 0 is reserved for the header page. If it could be evicted, a flush
+	// would later write header bytes over the row page that had taken it, losing
+	// the rows of that page; the pool is data pages plus this one.
+	pf.frames = make([]Page_Frame, count + 1)
+	for i in 0 ..< count + 1 {
 		pf.frames[i].data = make([]u8, PAGE_SIZE)
 		pf.frames[i].id = NO_PAGE_ID
 	}
@@ -182,6 +185,10 @@ page_file_create :: proc(vfs: ^Vfs, path: string, frames: int) -> (^Page_File, E
 		page_file_destroy_unopened(pf)
 		return nil, sync_err
 	}
+	pf.frames[0].id = 0
+	pf.frames[0].valid = true
+	pf.frames[0].dirty = false
+	pf.frame_map[0] = 0
 	return pf, ERROR_NONE
 }
 
@@ -201,8 +208,8 @@ page_file_open :: proc(vfs: ^Vfs, path: string, frames: int) -> (^Page_File, Err
 	pf.vfs = system
 	pf.file = file
 	pf.path = strings.clone(path)
-	pf.frames = make([]Page_Frame, count)
-	for i in 0 ..< count {
+	pf.frames = make([]Page_Frame, count + 1)
+	for i in 0 ..< count + 1 {
 		pf.frames[i].data = make([]u8, PAGE_SIZE)
 		pf.frames[i].id = NO_PAGE_ID
 	}
@@ -223,6 +230,13 @@ page_file_open :: proc(vfs: ^Vfs, path: string, frames: int) -> (^Page_File, Err
 		page_file_destroy_unopened(pf)
 		return nil, errf(.Corrupt_Log, "the page file %s declares no pages", path)
 	}
+	// Keep the header bytes in the reserved frame: the next flush rewrites them
+	// with the new sequence and must not start from a row page.
+	copy(pf.frames[0].data, header)
+	pf.frames[0].id = 0
+	pf.frames[0].valid = true
+	pf.frames[0].dirty = false
+	pf.frame_map[0] = 0
 	return pf, ERROR_NONE
 }
 
@@ -336,6 +350,7 @@ page_load :: proc(pf: ^Page_File, id: Page_Id) -> (^Page_Frame, Error) {
 	}
 	slot := -1
 	for &frame, i in pf.frames {
+		if i == 0 do continue
 		if !frame.valid {
 			slot = i
 			break
@@ -380,6 +395,7 @@ page_evict :: proc(pf: ^Page_File) -> (int, Error) {
 	count := len(pf.frames)
 	for attempt in 0 ..< count * 2 {
 		index := (pf.clock + attempt) % count
+		if index == 0 do continue
 		frame := &pf.frames[index]
 		if !frame.valid || frame.pins > 0 do continue
 		if frame.used {
@@ -439,6 +455,7 @@ page_frame_new :: proc(pf: ^Page_File, id: Page_Id) -> (^Page_Frame, Error) {
 	}
 	slot := -1
 	for &frame, i in pf.frames {
+		if i == 0 do continue
 		if !frame.valid {
 			slot = i
 			break
@@ -479,9 +496,14 @@ page_free :: proc(pf: ^Page_File, id: Page_Id) {
 	pf.free_pages += 1
 }
 
+// page_resident is how many data pages the pool holds. The header frame is
+// bookkeeping, not a data page, so it does not count against the pool.
 page_resident :: proc(pf: ^Page_File) -> int {
 	count := 0
-	for frame in pf.frames do if frame.valid do count += 1
+	for frame, i in pf.frames {
+		if i == 0 do continue
+		if frame.valid do count += 1
+	}
 	return count
 }
 
@@ -505,6 +527,10 @@ page_slot_put :: proc(data: []u8, slot: u16, offset: u16, length: u16) {
 // page_compact rewrites the live cells at the bottom of the page and rebuilds
 // the slot array, dropping the holes left by deleted rows.
 @(private)
+// page_compact rewrites the live cells at the bottom of the page, closing the
+// holes deleted rows left. The slot array keeps its shape: the row directory
+// points at slot numbers, and renumbering them would silently move every row on
+// the page. A dead slot stays in place with zero length, ready to be reused.
 page_compact :: proc(data: []u8) {
 	header := page_header_decode(data)
 	cells: [dynamic]u8
@@ -514,16 +540,16 @@ page_compact :: proc(data: []u8) {
 	write := PAGE_HEADER_LEN
 	for slot in 0 ..< int(header.slots) {
 		offset, length := page_slot_get(data, u16(slot))
-		if length == 0 do continue
+		if length == 0 {
+			append(&slots, [2]u16{0, 0})
+			continue
+		}
 		append(&slots, [2]u16{u16(write), length})
 		append(&cells, ..data[int(offset):int(offset) + int(length)])
 		write += int(length)
 	}
 	for i in PAGE_HEADER_LEN ..< PAGE_SIZE do data[i] = 0
 	copy(data[PAGE_HEADER_LEN:], cells[:])
-	new_slot_start := PAGE_SIZE - len(slots) * PAGE_SLOT_LEN
-	header.slots = u16(len(slots))
-	header.slot_start = u16(new_slot_start)
 	header.free_start = u16(write)
 	header.dead = 0
 	page_header_encode(data, header)
@@ -533,31 +559,53 @@ page_compact :: proc(data: []u8) {
 }
 
 // page_insert_cell places one cell and returns its slot. It compacts first when
-// the holes make the room, and reports false when the page cannot hold it.
+// the holes are what the room needs, reuses a freed slot so the slot array stays
+// bounded by the rows a page ever held at once, and reports false when the page
+// cannot hold the cell.
 @(private)
 page_insert_cell :: proc(data: []u8, cell: []u8) -> (slot: u16, ok: bool) {
 	if len(cell) + PAGE_SLOT_LEN > PAGE_SIZE - PAGE_HEADER_LEN do return 0, false
 	header := page_header_decode(data)
 	room := int(header.slot_start) - int(header.free_start)
+	compacted := false
 	if room < len(cell) + PAGE_SLOT_LEN && header.dead > 0 {
 		page_compact(data)
 		header = page_header_decode(data)
+		compacted = true
 	}
 	if int(header.slot_start) - int(header.free_start) < len(cell) + PAGE_SLOT_LEN do return 0, false
 	if len(cell) > 0xFFFF do return 0, false
+	slot = header.slots
+	reused := false
+	if header.dead > 0 || header.free_start > PAGE_HEADER_LEN {
+		for existing in 0 ..< int(header.slots) {
+			_, length := page_slot_get(data, u16(existing))
+			if length == 0 {
+				slot = u16(existing)
+				reused = true
+				break
+			}
+		}
+	}
 	offset := header.free_start
 	copy(data[int(offset):], cell)
 	free_start := offset + u16(len(cell))
-	slot = header.slots
-	slot_start := header.slot_start - PAGE_SLOT_LEN
+	slot_start := header.slot_start
+	slots := header.slots
+	if !reused {
+		slot_start = header.slot_start - PAGE_SLOT_LEN
+		slots = header.slots + 1
+	}
 	page_header_encode(
 		data,
 		Page_Header {
 			kind = .Rows,
-			slots = header.slots + 1,
+			slots = slots,
 			slot_start = slot_start,
 			free_start = free_start,
-			dead = header.dead,
+			// A compaction reclaimed every hole; without one the dead bytes the
+			// page already accounted for are still there.
+			dead = compacted ? 0 : header.dead,
 			row_count = header.row_count + 1,
 			next_free = header.next_free,
 		},
@@ -686,8 +734,8 @@ page_rows_put :: proc(rows: ^Page_Rows, row_id: Row_Id, values: []Value) -> Erro
 				page_release(rows.file, frame, false)
 				continue
 			}
-			if _, ok := page_insert_cell(frame.data, cell); ok {
-				slot := page_header_decode(frame.data).slots - 1
+			if placed_slot, ok := page_insert_cell(frame.data, cell); ok {
+				slot := placed_slot
 				page_release(rows.file, frame, true)
 				rows.directory[row_id] = Row_Location{page = Page_Id(id), slot = slot}
 				rows.rows += 1
@@ -703,12 +751,13 @@ page_rows_put :: proc(rows: ^Page_Rows, row_id: Row_Id, values: []Value) -> Erro
 			rows.pages += 1
 			frame, load_err := page_load(rows.file, id)
 			if load_err.kind != .None do return load_err
-			if _, ok := page_insert_cell(frame.data, cell); !ok {
+			placed_slot, ok := page_insert_cell(frame.data, cell)
+			if !ok {
 				page_release(rows.file, frame, false)
 				return errf(.Invalid_Argument, "a row of %d bytes does not fit in a page", len(cell))
 			}
 			page_release(rows.file, frame, true)
-			rows.directory[row_id] = Row_Location{page = id, slot = 0}
+			rows.directory[row_id] = Row_Location{page = id, slot = placed_slot}
 			rows.rows += 1
 			return ERROR_NONE
 		}

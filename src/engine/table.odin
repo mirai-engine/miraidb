@@ -81,6 +81,10 @@ Table :: struct {
 	rows:            map[Row_Id]Row,
 	next_row_id:     u64,
 	next_sequence:   i64,
+	// next_int_key is the highest value an INTEGER PRIMARY KEY has held in a
+	// paged table. It is an upper bound that keeps a bulk load linear; a memory
+	// table keeps computing max+1 over its rows, which is what SQLite does.
+	next_int_key:    i64,
 	indexes:         []Index,
 	// apply_seq is the commit sequence of the change being applied, stamped on
 	// the versions it creates.
@@ -667,6 +671,19 @@ table_row_exists :: proc(t: ^Table, id: Row_Id) -> bool {
 	return exists
 }
 
+// table_touch_int_key remembers the largest integer primary key a paged table
+// has seen. It is read by the insert path, so a bulk load does not walk every
+// page to find the maximum.
+@(private)
+table_touch_int_key :: proc(t: ^Table, values: []Value) {
+	if len(t.schema.primary_key) != 1 do return
+	column := t.schema.primary_key[0]
+	if column >= len(values) do return
+	if values[column].kind == .Int && values[column].i > t.next_int_key {
+		t.next_int_key = values[column].i
+	}
+}
+
 @(private)
 table_touch_sequence :: proc(t: ^Table, values: []Value) {
 	if t.schema.auto_increment_column == NO_COLUMN do return
@@ -713,6 +730,7 @@ table_insert :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
 			return put_err
 		}
 		table_touch_sequence(t, values)
+		table_touch_int_key(t, values)
 		return table_index_add_all(t, values, id)
 	}
 	if _, exists := t.rows[id]; exists {
@@ -758,6 +776,7 @@ table_update :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
 			return put_err
 		}
 		table_touch_sequence(t, values)
+		table_touch_int_key(t, values)
 		return table_index_add_all(t, values, id)
 	}
 	row, exists := t.rows[id]
@@ -833,6 +852,7 @@ table_delete :: proc(t: ^Table, id: Row_Id) -> bool {
 table_truncate :: proc(t: ^Table) {
 	if t.paged != nil {
 		_ = page_rows_truncate(t.paged)
+		t.next_int_key = 0
 		for _, i in t.indexes {
 			rbtree.destroy(&t.indexes[i].tree, false)
 			rbtree.init_cmp(&t.indexes[i].tree, index_cmp)

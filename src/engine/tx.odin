@@ -882,7 +882,12 @@ tx_insert :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error) {
 		v := values[i]
 		if i == pk_position && !column.auto_increment && (v.kind == .Default || v.kind == .Null) {
 			// Assign max(pk) + 1 over the stored rows and the staged ones.
-			next := table_max_int(table, i) + 1
+			next: i64
+			if table.paged != nil {
+				next = table.next_int_key + 1
+			} else {
+				next = table_max_int(table, i) + 1
+			}
 			if next < 1 do next = 1
 			for _, row in writes.inserts {
 				if row.values[i].kind == .Int && row.values[i].i >= next do next = row.values[i].i + 1
@@ -969,7 +974,12 @@ tx_update :: proc(tx: ^Tx, name: string, id: Row_Id, values: []Value) -> Error {
 		v := values[i]
 		if i == pk_position && !column.auto_increment && (v.kind == .Default || v.kind == .Null) {
 			// Assign max(pk) + 1 over the stored rows and the staged ones.
-			next := table_max_int(table, i) + 1
+			next: i64
+			if table.paged != nil {
+				next = table.next_int_key + 1
+			} else {
+				next = table_max_int(table, i) + 1
+			}
 			if next < 1 do next = 1
 			for _, row in writes.inserts {
 				if row.values[i].kind == .Int && row.values[i].i >= next do next = row.values[i].i + 1
