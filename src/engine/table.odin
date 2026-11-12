@@ -801,6 +801,35 @@ table_collect :: proc(t: ^Table, out: ^[dynamic]Row, seq: u64 = max(u64)) {
 	})
 }
 
+// alter_row_values lays one stored row out for the schema an ALTER produced.
+// When the column count is unchanged the statement is a rename, and only
+// positions identify the columns: matching by name would find nothing and turn
+// every value into its default. An added or dropped column changes the count, so
+// names decide there, which is what makes the surviving columns keep their data.
+alter_row_values :: proc(
+	old: ^Table_Schema,
+	next: Table_Schema,
+	values: []Value,
+	alloc: mem.Allocator,
+) -> []Value {
+	out := make([]Value, len(next.columns), alloc)
+	same_width := len(old.columns) == len(next.columns)
+	for column, i in next.columns {
+		old_index := -1
+		if same_width {
+			old_index = i
+		} else {
+			if at, found := schema_column_index(old, column.name); found do old_index = at
+		}
+		if old_index >= 0 && old_index < len(values) {
+			out[i] = values[old_index]
+		} else {
+			out[i] = column.has_default ? column.default_value : value_null()
+		}
+	}
+	return out
+}
+
 // --- Index maintenance for DDL ---------------------------------------------
 
 // table_add_index creates a new index over the existing rows.

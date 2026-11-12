@@ -8775,3 +8775,45 @@ test_trigger_when :: proc(t: ^testing.T) {
 		i64(1),
 	)
 }
+
+@(test)
+test_alter_rename_column :: proc(t: ^testing.T) {
+	// A column can be renamed in place; indexes follow because they refer to
+	// columns by position, not by name.
+	store := fresh_db(t, "rename_column")
+	if store == nil do return
+	defer os.remove_all("_test_rename_column")
+	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT NOT NULL, score INTEGER)")
+	run(t, store, "CREATE UNIQUE INDEX t_label ON t (label)")
+	run(t, store, "INSERT INTO t (id, label, score) VALUES (1, 'a', 10), (2, 'b', 20)")
+
+	run(t, store, "ALTER TABLE t RENAME COLUMN label TO name")
+	testing.expect_value(t, scalar(t, store, "SELECT name FROM t WHERE id = 1").s, "a")
+	// The optional COLUMN and the missing COLUMN spelling are the same statement.
+	run(t, store, "ALTER TABLE t RENAME score TO points")
+	testing.expect_value(t, scalar(t, store, "SELECT sum(points) FROM t").i, i64(30))
+	// The unique index still rejects a duplicate through the new name.
+	_, duplicate := db.sql_execute(store, "INSERT INTO t (id, name, points) VALUES (3, 'a', 30)")
+	testing.expect_value(t, duplicate.kind, db.Error_Kind.Duplicate_Unique)
+	// The old name is gone.
+	_, old_name := db.sql_execute(store, "SELECT label FROM t")
+	testing.expect_value(t, old_name.kind, db.Error_Kind.Column_Not_Found)
+
+	// Renaming to an existing column, or renaming a missing one, is refused.
+	_, clash := db.sql_execute(store, "ALTER TABLE t RENAME COLUMN name TO points")
+	testing.expect_value(t, clash.kind, db.Error_Kind.Invalid_Argument)
+	_, missing := db.sql_execute(store, "ALTER TABLE t RENAME COLUMN nope TO other")
+	testing.expect_value(t, missing.kind, db.Error_Kind.Column_Not_Found)
+
+	// A virtual table keeps the column names its index was built with.
+	run(t, store, "CREATE VIRTUAL TABLE docs USING fts5(body)")
+	_, virtual := db.sql_execute(store, "ALTER TABLE docs RENAME COLUMN body TO text")
+	testing.expect_value(t, virtual.kind, db.Error_Kind.Sql_Unsupported)
+
+	// The rename is in the log: a reopen sees the new schema.
+	db.store_close(store)
+	reopened, open_err := db.store_open("_test_rename_column", {persistent = true, create = false, durable = false})
+	if !testing.expectf(t, db.error_ok(open_err), "reopen: %s", open_err.message) do return
+	defer cleanup_db(reopened, "rename_column")
+	testing.expect_value(t, scalar(t, reopened, "SELECT count(name) FROM t").i, i64(2))
+}

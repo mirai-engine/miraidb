@@ -289,6 +289,19 @@ parse_alter_table :: proc(p: ^Parser) -> Statement {
 	stmt: Alter_Table_Stmt
 	stmt.table = p_ident(p)
 	if p_match_keyword(p, "rename") {
+		if p_match_keyword(p, "column") {
+			stmt.rename_column = p_ident(p)
+			p_expect_keyword(p, "to")
+			stmt.rename_to = p_ident(p)
+			return stmt
+		}
+		// `RENAME a TO b` is the same statement without the optional COLUMN.
+		if !p_is_keyword(p, "to") {
+			stmt.rename_column = p_ident(p)
+			p_expect_keyword(p, "to")
+			stmt.rename_to = p_ident(p)
+			return stmt
+		}
 		p_expect_keyword(p, "to")
 		stmt.rename_to = p_ident(p)
 		return stmt

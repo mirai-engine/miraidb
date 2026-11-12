@@ -521,17 +521,8 @@ store_apply :: proc(store: ^Store, op: Store_Op) -> Error {
 		replacement, table_err := table_create(&schema)
 		if table_err.kind != .None do return table_err
 		for id, row in existing.rows {
-			// Match the columns by name: an ALTER may add or drop them, and the
-			// stored values are laid out for the old schema.
-			values := make([]Value, len(op.schema.columns))
-			for column, i in op.schema.columns {
-				old_index, found := schema_column_index(&existing.schema, column.name)
-				if found && old_index < len(row.values) {
-					values[i] = row.values[old_index]
-				} else {
-					values[i] = column.has_default ? column.default_value : value_null()
-				}
-			}
+			values := alter_row_values(&existing.schema, op.schema, row.values, context.allocator)
+			defer delete(values)
 			if insert_err := table_insert(replacement, id, values); insert_err.kind != .None {
 				return insert_err
 			}

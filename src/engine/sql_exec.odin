@@ -4033,6 +4033,12 @@ sql_exec_alter_table :: proc(tx: ^Tx, stmt: Alter_Table_Stmt) -> (Sql_Result, Er
 		}
 		return Sql_Result{kind = .Ack, commit_seq = tx.store.commit_seq}, ERROR_NONE
 	}
+	if len(stmt.rename_to) > 0 && len(stmt.rename_column) > 0 {
+		if rename_err := tx_rename_column(tx, stmt.table, stmt.rename_column, stmt.rename_to); rename_err.kind != .None {
+			return {}, rename_err
+		}
+		return Sql_Result{kind = .Ack, commit_seq = tx.store.commit_seq}, ERROR_NONE
+	}
 	if len(stmt.rename_to) > 0 {
 		if rename_err := tx_rename_table(tx, stmt.table, stmt.rename_to); rename_err.kind != .None {
 			return {}, rename_err

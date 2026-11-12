@@ -315,7 +315,10 @@ Create_Type_Stmt :: struct {
 
 Alter_Table_Stmt :: struct {
 	rename_to: string,
-	drop_column: string,
+	// rename_column is the old name of `rename_to` when the statement renames a
+	// column instead of the table.
+	rename_column: string,
+	drop_column:   string,
 	table:  string,
 	column: Column,
 }

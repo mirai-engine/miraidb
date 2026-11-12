@@ -96,6 +96,25 @@ CREATE UNIQUE INDEX by_code ON t USING DIRECT (code); -- unique, one row per key
 CREATE INDEX by_id ON t (id);                        -- btree, the default
 ```
 
+## Schema changes
+
+```sql
+ALTER TABLE t RENAME TO t2;
+ALTER TABLE t ADD COLUMN note TEXT NOT NULL DEFAULT '';
+ALTER TABLE t DROP COLUMN note;
+ALTER TABLE t RENAME COLUMN label TO name;
+ALTER TABLE t RENAME label TO name;     -- COLUMN is optional
+```
+
+- A rename keeps the rows and the indexes: indexes refer to columns by
+  position, so nothing has to be rebuilt. Adding or dropping a column matches
+  the surviving columns by name; a rename matches by position, which is what
+  keeps the data.
+- Text that names a column — a generated expression, a trigger body, a policy
+  condition, a view — is stored as written and is **not** rewritten by a rename.
+- A virtual table (full-text or spatial) keeps the column names its index was
+  built with, so renaming one is refused.
+
 ## Types
 
 Columns may be `UNIT` (no payload; only `NULL`), `OPTION(T)` (a typed nullable),

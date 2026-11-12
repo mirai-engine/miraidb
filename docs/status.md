@@ -126,6 +126,9 @@ a table is still a `map[Row_Id]Row` in memory, and that is the next step of D17.
 
 - **Index use.** Only the base table of a query is narrowed by an index; joined
   tables are scanned by the nested loop. No cost-based planner.
+- **Schema changes.** `ALTER TABLE` renames the table, adds and drops columns,
+  and renames a column (keeping the rows and the indexes); text that names a
+  column is not rewritten.
 - **Trigger `WHEN`.** A trigger may carry a condition over `NEW` and `OLD`; a
   false or NULL condition skips it for that row. `BEFORE` triggers are still
   refused.

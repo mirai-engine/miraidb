@@ -29,7 +29,7 @@ Rules for this file:
 | D6 | Query planner | nested loop + index probes | cost model, statistics, reordering | L | P1 |
 | D7 | Scheduler durability | **durable** (due time is a logged column) | recovery test | S | — |
 | D8 | Crash injection | **done**: `Fault_Vfs` fails any operation at any call, and `test_fault_injection` walks the write offsets | same for the snapshot and the mirror writes | S | P1 |
-| D9 | SQL grammar | 32 statements, **`ROWS` frames and trigger `WHEN` done** (`test_window_frames`, `test_trigger_when`) | windows beside `GROUP BY`, `RANGE`/`GROUPS`, `BEFORE`, full `ALTER`, collations, user functions | L | P2 |
+| D9 | SQL grammar | 32 statements, **`ROWS` frames, trigger `WHEN` and `RENAME COLUMN` done** (`test_window_frames`, `test_trigger_when`, `test_alter_rename_column`) | windows beside `GROUP BY`, `RANGE`/`GROUPS`, `BEFORE`, `ALTER` type changes, collations, user functions | L | P2 |
 | D10 | Types and precision | `Int128` as two `u64` | decimal arithmetic, time zones | M | P3 |
 | D11 | Virtual-table breadth | **done**: index DDL is staged and applied after the rows (`test_ddl_in_transaction`) | triggers/policies in the same transaction | S | P1 |
 | D12a | Metering granularity | **per row read and written, with a budget that aborts** | — | S | done |
@@ -272,6 +272,15 @@ walk that exists now.
 `GROUP BY`, `BEFORE` triggers and trigger `WHEN` clauses, `RANGE`/`GROUPS`
 frames, `ALTER TABLE` beyond rename/drop/add column, collations beyond
 `BINARY`/`NOCASE`/`RTRIM`, user-defined functions.
+
+**Done: `ALTER TABLE RENAME COLUMN`.** A rename keeps the rows and the indexes:
+indexes refer to columns by position and a rename keeps the count, so the stored
+values are mapped by position instead of by name (matching by name would find
+nothing and turn every value into its default — the bug the test caught). Adding
+or dropping a column still matches by name because the count changes. Text that
+names a column (a generated expression, a trigger body, a policy, a view) is not
+rewritten, and a virtual table is refused. `test_alter_rename_column` covers the
+rename, the unique index still rejecting duplicates, the refusals and a reopen.
 
 **Done: trigger WHEN.** `CREATE TRIGGER ... WHEN <condition>` keeps the
 condition as text and parses it when the trigger fires, with NEW and OLD in

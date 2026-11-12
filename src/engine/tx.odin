@@ -453,16 +453,7 @@ tx_alter_table :: proc(tx: ^Tx, name: string, next_schema: Table_Schema) -> Erro
 	replacement, create_err := table_create(&schema)
 	if create_err.kind != .None do return create_err
 	for id, row in current.rows {
-		values := make([]Value, len(next_schema.columns), tx.alloc)
-		// Columns are matched by name, so a drop and an addition both work.
-		for column, i in next_schema.columns {
-			old_index, found := schema_column_index(&current.schema, column.name)
-			if found && old_index < len(row.values) {
-				values[i] = row.values[old_index]
-			} else {
-				values[i] = column.has_default ? column.default_value : value_null()
-			}
-		}
+		values := alter_row_values(&current.schema, next_schema, row.values, tx.alloc)
 		if insert_err := table_insert(replacement, id, values); insert_err.kind != .None {
 			return insert_err
 		}
@@ -603,6 +594,43 @@ tx_rename_table :: proc(tx: ^Tx, from, to: string) -> Error {
 	}
 	tx.state.altered[strings.clone(from, tx.alloc)] = replacement
 	return ERROR_NONE
+}
+
+// tx_rename_column renames one column. Indexes refer to columns by position, so
+// they keep working; text that names the column (a generated expression, a
+// trigger body, a policy) is not rewritten, which is noted in the docs.
+tx_rename_column :: proc(tx: ^Tx, table_name, from, to: string) -> Error {
+	if tx.read_only do return errf(.Transaction_Read_Only, "cannot alter a table in a read transaction")
+	if _, created := tx.state.created[table_name]; created {
+		return errf(.Sql_Unsupported, "alter a table outside the transaction that created it")
+	}
+	if _, is_virtual := fts_virtual_lookup(tx, table_name); is_virtual {
+		return errf(.Sql_Unsupported, "a virtual table keeps its column names")
+	}
+	current, current_err := tx_table(tx, table_name)
+	if current_err.kind != .None do return current_err
+	if strings.equal_fold(from, to) do return ERROR_NONE
+	for existing in current.schema.columns {
+		if strings.equal_fold(existing.name, to) {
+			return errf(.Invalid_Argument, "column %s already exists in %s", to, table_name)
+		}
+	}
+	found := false
+	columns := make([]Column, len(current.schema.columns), tx.alloc)
+	for column, i in current.schema.columns {
+		columns[i] = column
+		if strings.equal_fold(column.name, from) {
+			columns[i].name = strings.clone(to, tx.alloc)
+			found = true
+		}
+	}
+	if !found do return errf(.Column_Not_Found, "column %s does not exist in %s", from, table_name)
+	next_schema := current.schema
+	next_schema.columns = columns
+	if validate_err := schema_validate(&next_schema); validate_err.kind != .None {
+		return validate_err
+	}
+	return tx_alter_table(tx, table_name, next_schema)
 }
 
 @(private)
