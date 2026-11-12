@@ -856,8 +856,26 @@ parse_create_trigger :: proc(p: ^Parser) -> Statement {
 		p_expect_keyword(p, "row")
 	}
 	if p_match_keyword(p, "when") {
-		p_fail(p, .Sql_Unsupported, "trigger WHEN clauses are not supported")
-		return stmt
+		// The condition is kept as text, like the body, and parsed when it fires:
+		// that is the only place NEW and OLD exist. It is parsed here too, so a
+		// syntax error is reported at CREATE TRIGGER.
+		when_start := p.lexer.pos - len(p.current.text)
+		_ = parse_expression(p)
+		when_end := p.lexer.pos - len(p.current.text)
+		if when_end <= when_start {
+			p_fail(p, .Sql_Syntax, "WHEN needs a condition")
+			return stmt
+		}
+		stmt.when_text = strings.clone(
+			strings.trim_space(p.query.source[when_start:when_end]),
+			p.alloc,
+		)
+		check, _, check_err := sql_parse_expression(stmt.when_text)
+		if !error_ok(check_err) {
+			p_fail(p, check_err.kind, "trigger WHEN: %s", check_err.message)
+			return stmt
+		}
+		query_destroy(&check)
 	}
 	p_expect_keyword(p, "begin")
 	body_start := p.lexer.pos - len(p.current.text)

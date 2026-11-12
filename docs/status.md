@@ -126,6 +126,9 @@ a table is still a `map[Row_Id]Row` in memory, and that is the next step of D17.
 
 - **Index use.** Only the base table of a query is narrowed by an index; joined
   tables are scanned by the nested loop. No cost-based planner.
+- **Trigger `WHEN`.** A trigger may carry a condition over `NEW` and `OLD`; a
+  false or NULL condition skips it for that row. `BEFORE` triggers are still
+  refused.
 - **Window frames.** `ROWS BETWEEN … AND …` works for aggregates and value
   functions; `RANGE`/`GROUPS` are refused with a message. A window beside
   `GROUP BY` is refused.

@@ -29,7 +29,7 @@ Rules for this file:
 | D6 | Query planner | nested loop + index probes | cost model, statistics, reordering | L | P1 |
 | D7 | Scheduler durability | **durable** (due time is a logged column) | recovery test | S | — |
 | D8 | Crash injection | **done**: `Fault_Vfs` fails any operation at any call, and `test_fault_injection` walks the write offsets | same for the snapshot and the mirror writes | S | P1 |
-| D9 | SQL grammar | 32 statements, **`ROWS` frames done** (`test_window_frames`) | windows beside `GROUP BY`, `RANGE`/`GROUPS`, `BEFORE`/`WHEN`, full `ALTER`, collations, user functions | L | P2 |
+| D9 | SQL grammar | 32 statements, **`ROWS` frames and trigger `WHEN` done** (`test_window_frames`, `test_trigger_when`) | windows beside `GROUP BY`, `RANGE`/`GROUPS`, `BEFORE`, full `ALTER`, collations, user functions | L | P2 |
 | D10 | Types and precision | `Int128` as two `u64` | decimal arithmetic, time zones | M | P3 |
 | D11 | Virtual-table breadth | **done**: index DDL is staged and applied after the rows (`test_ddl_in_transaction`) | triggers/policies in the same transaction | S | P1 |
 | D12a | Metering granularity | **per row read and written, with a budget that aborts** | — | S | done |
@@ -272,6 +272,15 @@ walk that exists now.
 `GROUP BY`, `BEFORE` triggers and trigger `WHEN` clauses, `RANGE`/`GROUPS`
 frames, `ALTER TABLE` beyond rename/drop/add column, collations beyond
 `BINARY`/`NOCASE`/`RTRIM`, user-defined functions.
+
+**Done: trigger WHEN.** `CREATE TRIGGER ... WHEN <condition>` keeps the
+condition as text and parses it when the trigger fires, with NEW and OLD in
+scope; a false or NULL condition means the trigger does not fire for that row,
+which is not an error. The condition is parsed at `CREATE TRIGGER` too, so a
+syntax error is reported there. A catalog written before the column existed gets
+it on first use (`ALTER TABLE _triggers ADD COLUMN when_text`), so older
+databases keep their triggers. `test_trigger_when` covers INSERT/UPDATE/DELETE
+conditions, a NULL condition, the creation-time error and the migration.
 
 **Done: `ROWS` window frames.** `OVER (... ROWS BETWEEN <bound> AND <bound>)`
 with `UNBOUNDED PRECEDING/FOLLOWING`, `<n> PRECEDING/FOLLOWING` and

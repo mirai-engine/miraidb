@@ -514,6 +514,9 @@ Create_Trigger_Stmt :: struct {
 	event:         string, // insert | update | delete
 	before:        bool,
 	body:          string,
+	// when_text is the optional WHEN expression, kept as text and parsed when
+	// the trigger fires with NEW and OLD in scope.
+	when_text:     string,
 	if_not_exists: bool,
 }
 

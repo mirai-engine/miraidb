@@ -446,7 +446,11 @@ DROP TRIGGER audit_insert;
 - The definition is a row in the internal `_triggers` table, which means it is
   logged, replayed and dropped like any other data, and needs no new file
   version.
-- `BEFORE`, `WHEN` and column-specific (`OF`) triggers are refused with
+- `WHEN <condition>` decides whether the trigger fires for a row, with `NEW`
+  and `OLD` in scope: a false or NULL condition skips it without failing the
+  write. The condition is checked when `CREATE TRIGGER` parses it, so a typo is
+  reported there rather than on the first write.
+- `BEFORE` and column-specific (`OF`) triggers are refused with
   `sql_unsupported` instead of being approximated. A trigger that fires itself
   stops at a depth of 8 and fails the statement.
 

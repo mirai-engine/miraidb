@@ -19,10 +19,18 @@ Trigger_Fire_Event :: enum {
 
 // trigger_ensure creates the catalog on first use.
 trigger_ensure :: proc(tx: ^Tx) -> Error {
-	if _, table_err := tx_table(tx, TRIGGER_TABLE); table_err.kind == .None do return ERROR_NONE
+	if table, table_err := tx_table(tx, TRIGGER_TABLE); table_err.kind == .None {
+		// A catalog written before WHEN existed gets the column on first use, so
+		// an older database keeps its triggers instead of failing to open them.
+		if _, found := schema_column_index(&table.schema, "when_text"); !found {
+			_, alter_err := sql_execute_in_tx(tx, "ALTER TABLE _triggers ADD COLUMN when_text TEXT DEFAULT ''")
+			return alter_err
+		}
+		return ERROR_NONE
+	}
 	_, create_err := sql_execute_in_tx(
 		tx,
-		"CREATE TABLE _triggers (name TEXT PRIMARY KEY NOT NULL, table_name TEXT NOT NULL, event TEXT NOT NULL, timing TEXT NOT NULL, body TEXT NOT NULL)",
+		"CREATE TABLE _triggers (name TEXT PRIMARY KEY NOT NULL, table_name TEXT NOT NULL, event TEXT NOT NULL, timing TEXT NOT NULL, body TEXT NOT NULL, when_text TEXT DEFAULT '')",
 	)
 	return create_err
 }
@@ -58,9 +66,32 @@ trigger_create :: proc(tx: ^Tx, stmt: Create_Trigger_Stmt) -> Error {
 		value_string(stmt.event),
 		value_string("after"),
 		value_string(stmt.body),
+		value_string(stmt.when_text),
 	}
 	_, insert_err := tx_insert(tx, TRIGGER_TABLE, values)
 	return insert_err
+}
+
+// trigger_restore puts the transaction back the way it was before one trigger
+// ran, whether it fired, was skipped by its WHEN, or failed.
+@(private)
+trigger_restore :: proc(
+	tx: ^Tx,
+	active: bool,
+	schema: Table_Schema,
+	new_row: Row,
+	old_row: Row,
+	new_present: bool,
+	old_present: bool,
+	depth: int,
+) {
+	tx.trigger_active = active
+	tx.trigger_schema = schema
+	tx.trigger_new = new_row
+	tx.trigger_old = old_row
+	tx.trigger_new_present = new_present
+	tx.trigger_old_present = old_present
+	tx.trigger_depth = depth
 }
 
 @(private)
@@ -144,7 +175,7 @@ trigger_fire :: proc(
 	}
 	result, query_err := sql_execute_in_tx_params(
 		tx,
-		"SELECT body FROM _triggers WHERE table_name = ? AND event = ? AND timing = 'after' ORDER BY name",
+		"SELECT body, when_text FROM _triggers WHERE table_name = ? AND event = ? AND timing = 'after' ORDER BY name",
 		[]Value{value_string(table_name), value_string(event_name)},
 	)
 	if query_err.kind != .None do return query_err
@@ -166,6 +197,28 @@ trigger_fire :: proc(
 		tx.trigger_new_present = event != .Delete
 		tx.trigger_old_present = event != .Insert
 		tx.trigger_depth = saved_depth + 1
+		// The WHEN condition runs with NEW and OLD bound; a false condition means
+		// this trigger does not fire for this row, which is not an error.
+		when_text := ""
+		if len(row) > 1 && row[1].kind == .String do when_text = row[1].s
+		if len(when_text) > 0 {
+			condition, condition_expr, condition_err := sql_parse_expression(when_text)
+			if condition_err.kind != .None {
+				trigger_restore(tx, saved_active, saved_schema, saved_new, saved_old, saved_new_present, saved_old_present, saved_depth)
+				return condition_err
+			}
+			eval_ctx := Eval_Ctx{tx = tx}
+			value, value_err := eval_expr(&eval_ctx, condition_expr)
+			query_destroy(&condition)
+			if value_err.kind != .None {
+				trigger_restore(tx, saved_active, saved_schema, saved_new, saved_old, saved_new_present, saved_old_present, saved_depth)
+				return value_err
+			}
+			if !value_is_truthy(value) {
+				trigger_restore(tx, saved_active, saved_schema, saved_new, saved_old, saved_new_present, saved_old_present, saved_depth)
+				continue
+			}
+		}
 		statements := trigger_split(row[0].s, tx.alloc)
 		body_err := ERROR_NONE
 		for statement in statements {

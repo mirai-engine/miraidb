@@ -7626,11 +7626,12 @@ test_triggers :: proc(t: ^testing.T) {
 	testing.expect_value(t, missing.kind, db.Error_Kind.Table_Not_Found)
 	run(t, store, "DROP TRIGGER IF EXISTS t_ins")
 
-	// Only AFTER triggers are modelled, and the rest is refused with a reason.
+	// Only AFTER triggers are modelled, and a BEFORE one is refused with a reason.
 	before := run_error(t, store, "CREATE TRIGGER b BEFORE INSERT ON t BEGIN INSERT INTO audit (note) VALUES ('no'); END")
 	testing.expect_value(t, before.kind, db.Error_Kind.Sql_Unsupported)
-	when_clause := run_error(t, store, "CREATE TRIGGER w AFTER INSERT ON t WHEN NEW.a = 'x' BEGIN INSERT INTO audit (note) VALUES ('no'); END")
-	testing.expect_value(t, when_clause.kind, db.Error_Kind.Sql_Unsupported)
+	// WHEN is accepted (the condition itself is covered by test_trigger_when).
+	run(t, store, "CREATE TRIGGER w AFTER INSERT ON t WHEN NEW.a = 'x' BEGIN INSERT INTO audit (note) VALUES ('when'); END")
+	run(t, store, "DROP TRIGGER w")
 
 	// Triggers live in the log, so a reopen keeps them.
 	db.store_close(store)
@@ -8696,4 +8697,81 @@ test_window_frames :: proc(t: ^testing.T) {
 		"SELECT SUM(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED FOLLOWING AND CURRENT ROW) FROM t",
 	)
 	testing.expect_value(t, bad_start.kind, db.Error_Kind.Invalid_Argument)
+}
+
+@(test)
+test_trigger_when :: proc(t: ^testing.T) {
+	// WHEN decides whether a trigger fires for a row, with NEW and OLD in scope.
+	store := fresh_db(t, "trigger_when")
+	if store == nil do return
+	defer cleanup_db(store, "trigger_when")
+	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
+	run(t, store, "CREATE TABLE audit (id INTEGER PRIMARY KEY AUTOINCREMENT, note TEXT NOT NULL)")
+
+	run(
+		t,
+		store,
+		"CREATE TRIGGER big_insert AFTER INSERT ON t WHEN NEW.v > 10 BEGIN INSERT INTO audit (note) VALUES ('insert') END",
+	)
+	run(t, store, "INSERT INTO t (id, v) VALUES (1, 5)")
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM audit").i, i64(0))
+	run(t, store, "INSERT INTO t (id, v) VALUES (2, 20)")
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM audit").i, i64(1))
+
+	// UPDATE sees both rows: only a real increase is audited.
+	run(
+		t,
+		store,
+		"CREATE TRIGGER rise AFTER UPDATE ON t WHEN OLD.v < NEW.v BEGIN INSERT INTO audit (note) VALUES ('rise') END",
+	)
+	run(t, store, "UPDATE t SET v = 4 WHERE id = 2")
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM audit").i, i64(1))
+	run(t, store, "UPDATE t SET v = 30 WHERE id = 2")
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM audit").i, i64(2))
+
+	// DELETE has OLD only.
+	run(
+		t,
+		store,
+		"CREATE TRIGGER gone AFTER DELETE ON t WHEN OLD.v >= 10 BEGIN INSERT INTO audit (note) VALUES ('gone') END",
+	)
+	run(t, store, "DELETE FROM t WHERE id = 1")
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM audit").i, i64(2))
+	run(t, store, "DELETE FROM t WHERE id = 2")
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM audit").i, i64(3))
+
+	// A condition that is not a boolean still decides: NULL and 0 do not fire.
+	run(t, store, "INSERT INTO t (id, v) VALUES (3, 50)")
+	run(
+		t,
+		store,
+		"CREATE TRIGGER never AFTER INSERT ON t WHEN NULL BEGIN INSERT INTO audit (note) VALUES ('never') END",
+	)
+	run(t, store, "INSERT INTO t (id, v) VALUES (4, 60)")
+	// big_insert fired for both rows; the NULL condition did not.
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM audit WHERE note = 'insert'").i, i64(3))
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM audit WHERE note = 'never'").i, i64(0))
+
+	// A bad condition is refused at CREATE TRIGGER, not discovered later.
+	_, bad := db.sql_execute(
+		store,
+		"CREATE TRIGGER broken AFTER INSERT ON t WHEN NEW.v > BEGIN INSERT INTO audit (note) VALUES ('x') END",
+	)
+	testing.expect(t, !db.error_ok(bad))
+
+	// A catalog written before WHEN existed gets the column on first use.
+	run(t, store, "DROP TRIGGER big_insert")
+	run(t, store, "DROP TABLE _triggers")
+	run(t, store, "CREATE TABLE _triggers (name TEXT PRIMARY KEY NOT NULL, table_name TEXT NOT NULL, event TEXT NOT NULL, timing TEXT NOT NULL, body TEXT NOT NULL)")
+	run(
+		t,
+		store,
+		"CREATE TRIGGER migrated AFTER INSERT ON t WHEN NEW.v > 100 BEGIN INSERT INTO audit (note) VALUES ('migrated') END",
+	)
+	run(t, store, "INSERT INTO t (id, v) VALUES (5, 200)")
+	testing.expect_value(
+		t,
+		scalar(t, store, "SELECT count(*) FROM audit WHERE note = 'migrated'").i,
+		i64(1),
+	)
 }
