@@ -252,23 +252,35 @@ Page 0 adds, from byte 20: `magic` "MRPG", `version` 1, `page_size` 4096,
 
 - A cell is `u64 row_id | u32 value_count | value...` using the same value
   encoding as the wire and the log.
-- A slot whose length is zero is a deleted cell; the page compacts itself once
-  the holes pass half a page.
+- A slot whose length is zero is a deleted cell. Compaction closes the holes and
+  **keeps the slot numbers**, because the row directory addresses rows by slot;
+  an insert reuses a freed slot, so the slot array stays bounded by the rows a
+  page ever held at once.
 - The free list links free pages through their own `next_free`, and the head
   lives in page 0, so it survives a crash.
 - **Flush order**: every dirty page is written and synced first, then page 0
   with the new `applied_seq`. A header that names a sequence is a promise that
   every page of that sequence is on disk; the fault-injection test breaks each
   write of a flush and checks the promise.
-- Rows are read through a buffer pool: a frame per page, a clock hand, pins, and
-  write-back on eviction. `page_rows_each` streams page by page, so a table
-  larger than the pool is read without holding it.
+- Rows are read through a buffer pool: one frame per page, a clock hand, pins,
+  and write-back on eviction. Frame 0 is reserved for the header page and is
+  never used for rows; the pool is `page_frames` data frames plus that one.
+  `page_rows_each` streams page by page, so a table larger than the pool is read
+  without holding it.
 
-What is **not** wired yet: the query pipeline still scans the in-memory row map.
-The page format, the pool, the free list, the flush order and the streaming
-reader exist and are tested (`test_page_store_roundtrip`,
-`test_page_store_streams_within_the_pool`, `test_page_store_header_is_a_promise`),
-but a table's rows do not live there yet. That step is the rest of D17.
+**A table on disk.** A store opened with `paged_tables` creates
+`<db>/tables/<table>` (non-alphanumeric bytes in the name are `%XX`). The commits
+that touch it are applied to the pages, and a commit flushes them after the log
+record is durable; a failed page flush is recorded, not reported as a failed
+commit, because the log already holds it. On open the `tables` directory is
+discarded and rebuilt by the replay, so the log is always the authority. The
+`ALTER` and `AS OF` paths refuse a paged table: the first would need to rewrite
+rows through a map that is not there, the second needs the versions the page
+keeps only one of.
+
+Tests: `test_page_store_roundtrip`, `test_page_store_streams_within_the_pool`,
+`test_page_store_header_is_a_promise`, `test_paged_table_roundtrip` (a reopen
+with a different pool size), `test_paged_table_churn` (compaction under churn).
 
 ## Durability
 

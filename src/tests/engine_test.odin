@@ -9121,3 +9121,89 @@ test_paged_table_churn :: proc(t: ^testing.T) {
 	testing.expect_value(t, db.page_rows_stats(table.paged).rows, u64(300))
 	testing.expect_value(t, u64(len(table.paged.directory)), u64(300))
 }
+
+@(test)
+test_paged_commit_survives_a_failed_write :: proc(t: ^testing.T) {
+	// One transaction commits while a write fails at every possible point: the
+	// log record, a data page, the page header. A commit that reported success
+	// must have every row after a reopen (the log holds them and the pages are
+	// rebuilt from it); a commit that reported failure must have none. The test
+	// requires that some write index actually fired, so it cannot pass by never
+	// taking the failure path.
+	memory := db.vfs_memory_new()
+	defer db.vfs_memory_destroy(memory)
+	fault := db.vfs_fault_new(memory)
+	defer db.vfs_fault_destroy(fault)
+
+	fired_cases := 0
+	for n in 1 ..= 40 {
+		path := fmt.aprintf("_paged_fault_%d", n)
+		defer delete(path)
+		db.vfs_fault_arm(fault, .Write, u64(n))
+		store, open_err := db.store_open(path, {
+			persistent = true,
+			create = true,
+			durable = true,
+			vfs = fault,
+			paged_tables = true,
+			page_frames = 2,
+		})
+		if !db.error_ok(open_err) do continue
+		_, create_err := db.sql_execute(store, "CREATE TABLE p (id INTEGER PRIMARY KEY, v TEXT)")
+		if !db.error_ok(create_err) {
+			db.store_close(store)
+			continue
+		}
+		committed := false
+		armed := true
+		tx := db.tx_begin_write(store)
+		for i in 0 ..< 50 {
+			statement := fmt.aprintf("INSERT INTO p (v) VALUES ('row-%d')", i)
+			defer delete(statement)
+			_, insert_err := db.sql_execute_in_tx(tx, statement)
+			if !db.error_ok(insert_err) {
+				// The fault fired while staging: nothing to commit.
+				db.tx_rollback(tx)
+				armed = false
+				break
+			}
+		}
+		if armed {
+			commit_err := db.tx_commit(tx)
+			committed = db.error_ok(commit_err)
+			if db.vfs_fault_fired(fault) do fired_cases += 1
+		}
+		db.vfs_fault_arm(fault, .Write, 0)
+		db.store_close(store)
+
+		// Reopen without the fault: the log and the page files are whatever the
+		// failed writes left behind.
+		reopened, reopen_err := db.store_open(path, {
+			persistent = true,
+			create = false,
+			durable = false,
+			vfs = memory,
+			paged_tables = true,
+			page_frames = 2,
+		})
+		if !testing.expectf(t, db.error_ok(reopen_err), "n=%d reopen: %s", n, reopen_err.message) do continue
+		result, count_err := db.sql_execute(reopened, "SELECT count(*) FROM p")
+		if !testing.expectf(t, db.error_ok(count_err), "n=%d count: %s", n, count_err.message) {
+			db.store_close(reopened)
+			continue
+		}
+		count := result.rows[0][0].i
+		db.sql_result_destroy(&result)
+		db.store_close(reopened)
+		expected := committed ? i64(50) : i64(0)
+		testing.expectf(
+			t,
+			count == expected,
+			"n=%d: the commit %s but %d rows survived",
+			n,
+			committed ? "reported success" : "reported failure",
+			count,
+		)
+	}
+	testing.expectf(t, fired_cases > 0, "no write index fired during a commit")
+}

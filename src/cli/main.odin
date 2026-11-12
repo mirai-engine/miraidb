@@ -37,6 +37,10 @@ Usage:
 Options:
   --no-sync                                 do not fsync every commit (faster, less safe)
   --memory                                  run against an in-memory database
+  --paged                                   keep new tables in page files, not in RAM
+  --page-frames=N                           pages of each table file kept in the pool
+  --memory-report                           print this process memory when a sql
+                                            statement finishes
 
 The database is a directory holding a commit log. SQL supports CREATE/DROP
 TABLE, INSERT, UPDATE, DELETE and single-table SELECT with WHERE, ORDER BY,
@@ -61,6 +65,9 @@ main :: proc() {
 	durable := true
 	durability := db.Durability.Full
 	persistent := true
+	paged := false
+	page_frames := 0
+	memory_report := false
 	filtered := make([dynamic]string, 0, len(rest))
 	defer delete(filtered)
 	for arg in rest {
@@ -75,7 +82,17 @@ main :: proc() {
 			durable = false
 		case "--memory":
 			persistent = false
+		case "--paged":
+			paged = true
+		case "--memory-report":
+			memory_report = true
 		case:
+			if strings.has_prefix(arg, "--page-frames=") {
+				parsed, ok := strconv.parse_int(arg[len("--page-frames="):])
+				if !ok || parsed <= 0 do usage_error("--page-frames needs a positive integer")
+				page_frames = int(parsed)
+				continue
+			}
 			append(&filtered, arg)
 		}
 	}
@@ -93,14 +110,25 @@ main :: proc() {
 		fmt.printfln("created %s", arguments[0])
 	case "sql":
 		if len(arguments) < 2 do usage_error("sql needs a database path and a statement")
-		store, err := open_database(arguments[0], persistent, durable, durability)
+		store, err := open_database(arguments[0], persistent, durable, durability, paged, page_frames)
 		if !db.error_ok(err) do fail(err)
-		defer db.store_close(store)
+		baseline := memory_report ? cli_current_rss_bytes() : 0
 		statement := strings.join(arguments[1:], " ")
 		result, exec_err := db.sql_execute(store, statement)
 		if !db.error_ok(exec_err) do fail(exec_err)
-		defer db.sql_result_destroy(&result)
 		print_result(result)
+		db.sql_result_destroy(&result)
+		if memory_report {
+			// The peak covers the whole process, and opening a database already
+			// read the log, so the number the gate reads is how much the statement
+			// added over that baseline.
+			peak := cli_peak_rss_bytes()
+			growth := peak > baseline ? peak - baseline : 0
+			fmt.printfln("baseline-rss-bytes: %d", baseline)
+			fmt.printfln("peak-rss-bytes: %d", peak)
+			fmt.printfln("query-growth-bytes: %d", growth)
+		}
+		db.store_close(store)
 	case "sqlite":
 		if len(arguments) < 2 do usage_error("sqlite needs a .sqlite/.db file and a statement")
 		run_sqlite_file(arguments[0], strings.join(arguments[1:], " "))
@@ -249,7 +277,7 @@ main :: proc() {
 		)
 	case "bench":
 		if len(arguments) < 1 do usage_error("bench needs a database path")
-		store, err := open_database(arguments[0], persistent, durable, durability)
+		store, err := open_database(arguments[0], persistent, durable, durability, paged, page_frames)
 		if !db.error_ok(err) do fail(err)
 		defer db.store_close(store)
 		rows := 1000
@@ -327,6 +355,8 @@ open_database :: proc(
 	persistent: bool,
 	durable: bool,
 	durability: db.Durability,
+	paged := false,
+	page_frames := 0,
 ) -> (^db.Store, db.Error) {
 	if db.sqlite_is_file(path) {
 		file, file_err := db.sqlite_file_open(path)
@@ -342,7 +372,14 @@ open_database :: proc(
 	}
 	return db.store_open(
 		path,
-		{persistent = persistent, create = true, durable = durable, durability = durability},
+		{
+			persistent = persistent,
+			create = true,
+			durable = durable,
+			durability = durability,
+			paged_tables = paged,
+			page_frames = page_frames,
+		},
 	)
 }
 

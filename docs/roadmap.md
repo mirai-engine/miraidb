@@ -25,8 +25,8 @@ outranks the dependent.
 | 5 | **D11 — DDL inside a transaction** — *done* | Index DDL is staged like row changes and applied after them, so a table, its rows and its index commit together and roll back together. Unblocks the FTS index. | S | — |
 | 6 | **D1 — FTS term index + BM25** — *done* | The term index is created with the table, `rank` is BM25 over the postings, `snippet`/`highlight` mark the match, and the scan visits only the matching documents (5000 documents: at most 8 rows visited for a rare term). | M | D11 |
 | 7 | **D13 — return the stored result on a retry** — *done* | The result commits with the request id, and `host_call_once_result` answers a retry with it instead of "already ran". | S | — |
-| 8 | **D17 — rows on disk (page store)** — *in progress* | The page file exists: 4 KiB slotted pages with a checksum, a free list that survives a crash, a buffer pool with a clock hand and pins, flush order proved by breaking every write of a flush, and a streaming reader (`page_rows_each`) that never holds more than the pool. What is left is wiring the query pipeline to read through it; today it still scans the in-memory map. | XL | D8, bench |
-| 9 | **D5 — persistent index pages** | Indexes are rebuilt on open; they become pages once tables are pages. | L | D17 |
+| 8 | **D17 — rows on disk (page store)** — *done* | A store opened with `paged_tables` keeps each user table in a 4 KiB-page file under `<db>/tables`. The page file is a cache over the log: opening discards it and the replay rebuilds it, a commit flushes it after the log record is durable, and frame 0 is reserved for the header. A single-table query streams the pages (`ORDER BY`/`GROUP BY`/`DISTINCT`/windows/`AS OF`/joins/staged writes fall back to collecting), aggregates accumulate as rows pass, and `LIMIT` stops the scan. `scripts/page_rss.py` is a CI gate: a table 63 times the pool adds 316 KiB to the statement, and four times the rows adds the same. `AS OF` and `ALTER` refuse a paged table, and a read transaction holds the shared lock, because one version lives in the pages. | XL | D8, bench |
+| 9 | **D5 — persistent index pages** | Indexes are rebuilt on open and their keys still live in the table arena; they become pages now that tables are pages. | L | D17 |
 | 10 | **D18b — a reader in another process** | With pages and a lock, a read-only open can coexist with a writer: "varios procesos" becomes true, not just safe. | L | D17, D18a |
 | 11 | **D6 — planner with statistics** | `ANALYZE`, a cost model, join reordering; the largest query-level win and a prerequisite for calling the engine fast on real schemas. | L | D5 (statistics live in pages) |
 | 12 | **D4 — `.sqlite` pages in place** | The mirror re-encodes the whole state per commit; with pages it writes only what changed. Until then it stays a documented O(state) export. | XL | D17 |
@@ -108,9 +108,13 @@ Today: every table is a `map[Row_Id]Row` in memory.
 - **D18b** (10): the reader-in-another-process case that pages make possible.
 
 **Acceptance.** A table ten times the buffer pool reads correctly with RSS under
-the configured cap; a kill during a dirty flush reopens to the last committed
-state; `bench` and `bench-read` stay within 10% for data that fits in memory;
-`EXPLAIN` shows index pages being probed rather than a scan.
+the configured cap — `scripts/page_rss.py --check` reads 15k and 60k rows through
+an 8-frame pool and measures what the statement added over the open (316 KiB for
+both; the file is 63 times the pool). A kill during a dirty flush reopens to the
+last committed state (the page file is rebuilt from the log, and the flush writes
+pages before the header). `bench` and `bench-read` stay within 10% for data that
+fits in memory; `EXPLAIN` shows index pages being probed rather than a scan is
+still D5.
 
 ## Reusing the engine's networking for D14
 
@@ -143,6 +147,7 @@ after it, apply through `commitlog`, expose the last applied sequence.
 | **Address sanitizer** over CLI, soak and conformance — *partly done* | Memory bugs have been the real risk; bounds and stack are covered here, the heap needs the Linux toolchain | 1 round per phase | #2 |
 | **Fault injection** (D8) | Proves no third state after a failed write | S, then extended | #3 |
 | **Benchmark with thresholds** — *done* | Bytes per row within 10%; timings under a 3x catastrophe guard, because a shared machine cannot promise 10% (the 10% time rule is measured by hand with `--record`) | 1 day | #4 |
+| **Page memory** — *done* | `scripts/page_rss.py --check` reads a table far larger than the pool and bounds what the statement adds; 19 gates in total | 1 day | #8 |
 | **CI on Linux and macOS** | Locking and the VFS are per-OS | 2–3 days | #13 |
 | **Release packaging** — *done* | `scripts/package.py --check`, one archive per target with the version the library reports | 2–3 days | #23 |
 | **Auth review** | Tokens, subscriptions, byte and work budgets under attack | 1 day | #24 |

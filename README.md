@@ -258,7 +258,10 @@ A second process can still **use** the database through the owner:
 `miraidb-server` serves the wire protocol over HTTP, WebSocket frames and
 Postgres, with per-connection subscriptions and byte budgets
 (`scripts/broker_smoke.py` proves it with two processes). What is missing is
-opening the directory *directly* beside a writer, which needs pages (D17).
+opening the directory *directly* beside a writer, which needs the page files to be
+trusted without a replay (D18b). Tables can already live in page files: open a
+store with `--paged` (or `Store_Options.paged_tables`) and a scan streams them
+through a bounded buffer pool.
 
 There is no follower, no log shipping and no failover;
 a second process can read the same database only after the first one closes. The

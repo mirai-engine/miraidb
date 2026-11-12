@@ -39,7 +39,7 @@ Rules for this file:
 | D14 | Replication | one process, one log | log shipping, follower reads, failover | XL | P3 |
 | D15 | Network hardening | HTTP/WS subset with caps | TLS, HTTP/2, backpressure, per-route timeouts | M | P3 |
 | D16 | Clients | **Python binding over the C ABI, with a smoke gate** | generation per catalog | M | P3 |
-| D17 | Rows on disk | **in progress**: page format, free list, buffer pool, flush order and streaming reader are tested (`page.odin`); queries still scan the in-memory map | wire the pipeline to the pages | XL | P0 |
+| D17 | Rows on disk | **done**: paged tables, pool, free list, flush order, streaming scan with aggregates, memory gate | index pages (D5), a trusted open without replay (D18b) | XL | P0 |
 | D18a | Second writer | **done**: `lock` file, OS lock, refusal naming the owner (`test_writer_lock`, `scripts/lock_smoke.py`) | — | S | P0 |
 | D18b | Reader beside writer | one process owns the directory | pages + lock, read-only open | L | P1 |
 | D18c | Broker mode | **done**: `miraidb-server` owns the directory, clients speak the wire over HTTP, TCP frames or Postgres; two processes proven by `scripts/broker_smoke.py` | — | M | P1 |
@@ -126,25 +126,34 @@ past read narrow as a live one does.
 
 ## D17 — Rows on disk
 
-**Done so far.** `src/engine/page.odin` holds the storage layer: 4 KiB slotted
-pages with a checksum per page, cells encoded with the same value format as the
-log, a free list linked through free pages and headed in page 0, a buffer pool
-with a clock hand, pins and write-back on eviction, and a streaming reader that
-walks pages one at a time. Flush order is data pages first, then page 0 with
-`applied_seq`; `test_page_store_header_is_a_promise` breaks every write of a
-flush and checks that a header never names a sequence with missing rows. A pool
-of four frames reads a file of more than forty and evicts
-(`test_page_store_streams_within_the_pool`). The format is in
-`docs/file-format.md`.
+**Done.** `src/engine/page.odin` holds the storage: 4 KiB slotted pages with a
+checksum per page, cells encoded like the log, a free list linked through free
+pages and headed in page 0, a buffer pool with a clock hand, pins and write-back,
+and a streaming reader. Flush order is data pages first, then page 0 with
+`applied_seq`, proved by breaking each write of a flush. `page_frames` data
+frames plus a reserved header frame; `test_page_store_streams_within_the_pool`
+reads a file of more than forty pages with four.
 
-**Left.** The query pipeline scans `map[Row_Id]Row` in `sql_exec.odin`; it has to
-read through the page store instead, which means the scan stops materialising
-`partials` and streams (an iterator, not a slice). Indexes, versions and
-snapshots follow the same move. Until that lands, a table is still bounded by
-memory even though the format to hold it on disk exists.
+`store_open(..., paged_tables = true, page_frames = N)` gives each user table a
+file under `<db>/tables`, applied to by the commit path and flushed after the log
+record is durable. The file is a cache: open discards it and replays. The
+executor streams a paged table for a single-table query (`WHERE`, projections,
+aggregates, `LIMIT`), and falls back to collecting for `ORDER BY`, `GROUP BY`,
+`DISTINCT`, windows, `AS OF`, joins, staged writes and index-answered filters.
+`test_paged_table_roundtrip` and `test_paged_table_churn` cover it;
+`scripts/page_rss.py --check` bounds the statement's memory (316 KiB for 15k and
+60k rows through an 8-frame pool).
 
-**Not claimed today.** "Pages on disk" for queries; the storage layer is real,
-the pipeline is not wired.
+**Bugs this stage found.** The header frame could be handed to a row page, and
+the next flush wrote the header over it, so those rows never reached the disk
+(119 of 100000 after a reopen). Compaction renumbered slots while the row
+directory addresses rows by slot, so a churned page lost rows. The streaming
+visitor allocated one `Source` slice per row in the transaction arena, making
+the scan's memory grow with the table.
+
+**Left.** Index keys in pages (D5), trusting the page files on open instead of
+replaying the log (D18b), a paged table with versions so `AS OF` and `ALTER` can
+work on it, and a read that does not take the shared lock.
 
 ## D18 — Access from another process
 

@@ -11,5 +11,7 @@
   reads.
 - One owner per database directory (OS lock), and a broker that serves other
   processes over HTTP, WebSocket frames and Postgres.
-- A page file with a buffer pool, a free list and a fault-tested flush order;
-  the query pipeline still reads the in-memory row map.
+- Tables on disk: a page file per table with a buffer pool, a free list, a
+  fault-tested flush order, and a query pipeline that streams a single-table
+  scan without holding the table in memory. Off by default; `--paged` turns it
+  on.

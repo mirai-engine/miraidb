@@ -114,14 +114,30 @@ honest measurement.
   `scripts/soak.py` keeps writing, reading, compacting and reopening for a
   while.
 
-## Partial
+### Rows on disk (opt-in)
 
-### Rows on disk
+- `Store_Options.paged_tables` (CLI `--paged`, `--page-frames=N`) puts each table
+  created from then on in a page file under `<db>/tables`; a table that already
+  exists stays in memory. Internal tables (the catalogs, the full-text shadow
+  tables) stay in memory because the engine reads them whole.
+- Pages are 4 KiB, slotted, checksummed per page, with a free list that survives
+  a crash and a buffer pool with a clock hand, pins and write-back. Frame 0 is
+  reserved for the header: a flush writes the dirty data pages, then page 0 with
+  `applied_seq`, then syncs. The fault test breaks each write of a flush.
+- The page file is a **cache over the log**: opening discards it and replays the
+  log, so a crash never leaves the pages as the only copy.
+- A single-table `SELECT` streams: rows are filtered and projected as they leave
+  the pages, aggregates accumulate (`count`, `sum`, `total`, `avg`, `min`, `max`,
+  `group_concat`) and `LIMIT` stops the scan. `ORDER BY`, `GROUP BY`, `DISTINCT`,
+  a window, `AS OF`, a join, staged writes or an index that answers the filter
+  fall back to collecting the table.
+- `scripts/page_rss.py --check` is a CI gate: 15k and 60k rows over an 8-frame
+  pool both add 316 KiB to the statement, and the file is 63 times the pool.
 
-`src/engine/page.odin` implements the page file: 4 KiB slotted pages with a
-checksum, a free list, a buffer pool with eviction and a streaming reader, with
-the flush order tested under injected faults. Queries do not read through it yet:
-a table is still a `map[Row_Id]Row` in memory, and that is the next step of D17.
+**Not claimed.** Index keys still live in the table arena (D5); a paged table
+keeps one version, so `AS OF` and `ALTER` refuse it; a read transaction of a store
+with pages holds the shared lock (writers wait); opening reads the whole log into
+memory, so a very large log still costs its size at startup.
 
 
 - **Index use.** Only the base table of a query is narrowed by an index; joined
@@ -136,7 +152,7 @@ a table is still a `map[Row_Id]Row` in memory, and that is the next step of D17.
   functions; `RANGE`/`GROUPS` are refused with a message. A window beside
   `GROUP BY` is refused.
 - **Ordering.** `ORDER BY` sorts after projection. It does not read an index
-  order, and `LIMIT` does not stop a scan early.
+  order; `LIMIT` stops a paged scan early but not a memory one.
 - **Types.** One 64-bit integer width, one float width, no decimal, no
   interval, no nested row types in columns.
 - **Memory.** Deleted rows are freed, but index key bytes stay in the table
@@ -157,7 +173,8 @@ a table is still a `map[Row_Id]Row` in memory, and that is the next step of D17.
   connection authenticated as is kept **per connection** (`test_connection_identity`):
   two clients never share the identity policies see, and `SET identity` inside a
   request persists for that client only. What is still missing is opening the
-  directory *directly* beside a writer, which needs pages (D17).
+  directory *directly* beside a writer, which needs the page files to be trusted
+  without a replay (D18b).
 
 This is the one capability the engine does **not** have at all, as opposed to
 having a shallow version of it. There is no code for it in the tree.

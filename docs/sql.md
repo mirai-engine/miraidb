@@ -322,6 +322,20 @@ the cost of an unbounded query is a scan rather than a tree descent. A bounded
 query — a point or a small window — stays cheap because the predicate is
 selective. The tree layout is deliberately not claimed until it is measured.
 
+## Tables on disk (opt-in)
+
+A store opened with `paged_tables` (CLI `--paged`, `--page-frames=N`) keeps new
+tables in a page file instead of memory. SQL does not change; the differences are
+cost and two refusals:
+
+- a single-table query streams the pages, so `WHERE`, projections, aggregates and
+  `LIMIT` do not need the table in memory; `ORDER BY`, `GROUP BY`, `DISTINCT`,
+  windows and joins collect it first;
+- `AS OF` on a paged table is refused (`Sql_Unsupported`): a page keeps one
+  version of a row;
+- `ALTER TABLE` on a paged table is refused: the rewrite walks the row map that a
+  paged table does not have.
+
 ## Reading the past
 
 `FROM t AS OF <seq>` reads the rows as they were when commit `<seq>` landed:

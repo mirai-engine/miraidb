@@ -667,6 +667,14 @@ vfs_fault_arm :: proc(vfs: ^Vfs, kind: Fault_Kind, nth: u64) {
 	wrapper.short = 0
 }
 
+// vfs_fault_calls is how many operations of the armed kind reached the wrapper
+// since it was armed. A test uses it to know whether a fault was in range.
+vfs_fault_calls :: proc(vfs: ^Vfs) -> u64 {
+	if vfs == nil || vfs.data == nil do return 0
+	wrapper := cast(^Fault_Vfs)vfs.data
+	return wrapper.calls
+}
+
 // vfs_fault_short makes the armed write return `bytes` with no error instead of
 // failing outright.
 vfs_fault_short :: proc(vfs: ^Vfs, bytes: int) {
