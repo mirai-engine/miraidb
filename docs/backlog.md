@@ -42,7 +42,7 @@ Rules for this file:
 | D17 | Rows on disk | **in progress**: page format, free list, buffer pool, flush order and streaming reader are tested (`page.odin`); queries still scan the in-memory map | wire the pipeline to the pages | XL | P0 |
 | D18a | Second writer | **done**: `lock` file, OS lock, refusal naming the owner (`test_writer_lock`, `scripts/lock_smoke.py`) | — | S | P0 |
 | D18b | Reader beside writer | one process owns the directory | pages + lock, read-only open | L | P1 |
-| D18c | Broker mode | clients must be in-process | one owner, others over the wire | M | P1 |
+| D18c | Broker mode | **done**: `miraidb-server` owns the directory, clients speak the wire over HTTP, TCP frames or Postgres; two processes proven by `scripts/broker_smoke.py` | — | M | P1 |
 
 ---
 
@@ -155,10 +155,31 @@ silently corrupted. The lock is an OS lock on `<directory>/lock` (Windows
 `LockFileEx`, POSIX `fcntl`) and it disappears with the process, including a
 killed one.
 
-**Gap.** In order: (a) *done*: the exclusive lock on open; (b) with D17, a
-read-only open beside a writer; (c) a broker mode where one process owns the
-database and the others speak the wire protocol to it — the cheap answer, and the
-one that reuses everything already tested.
+**Broker mode (done).** `miraidb-server <db>` owns the directory and serves
+clients: one HTTP request per wire message (`POST /query`, `/call`, `/subscribe`,
+`/wire`), WebSocket frames carrying one message each with a per-connection owner,
+and the Postgres startup plus simple queries. Subscriptions belong to the
+connection that made them (`host_subscribe_many_owned`, `host_drop_owned`), so two
+clients have independent views of the same database, and the outbox budget closes
+a connection that falls behind instead of letting it grow.
+
+`scripts/broker_smoke.py` proves it with real processes: it starts the server on a
+directory, creates and writes through it, reads the write from a different client,
+checks that the read carries the commit sequence, that **a second server on the
+same directory is refused with `locked`**, that six concurrent readers agree, that
+a later write is visible to the next read, and that a client that closes without
+telling the server does not disturb the owner.
+
+That test found a real bug: the server read the request once and parsed it, so a
+request whose body arrived in a second segment was answered `bad request`. The
+loop now keeps reading while the parser reports an incomplete message (the new
+`Error_Kind.Incomplete`), which is what makes an HTTP body over a Nagle boundary
+work.
+
+**What remains.** (b) with D17: a read-only open beside a writer, without going
+through the owner. And the broker's own load limit: one thread accepts and serves
+connections, so a slow client is bounded by the outbox budget rather than by
+concurrency.
 
 **Done when.** A second opener gets a refusal naming the owner — proven twice:
 `test_writer_lock` in-process and `scripts/lock_smoke.py` with two real processes;

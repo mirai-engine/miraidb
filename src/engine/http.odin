@@ -37,7 +37,7 @@ http_parse_request_within :: proc(
 ) -> (request: Http_Request, consumed: int, err: Error) {
 	header_end := strings.index(string(data), "\r\n\r\n")
 	if header_end < 0 {
-		return {}, 0, errf(.Invalid_Argument, "incomplete HTTP request")
+		return {}, 0, errf(.Incomplete, "incomplete HTTP request")
 	}
 	if max_header > 0 && header_end + 4 > max_header {
 		return {}, 0, errf(
@@ -94,7 +94,7 @@ http_parse_request_within :: proc(
 	body_start := header_end + 4
 	consumed = body_start + content_length
 	if consumed > len(data) {
-		return request, 0, errf(.Invalid_Argument, "incomplete HTTP body")
+		return request, 0, errf(.Incomplete, "incomplete HTTP body")
 	}
 	request.body = data[body_start:consumed]
 	return request, consumed, ERROR_NONE

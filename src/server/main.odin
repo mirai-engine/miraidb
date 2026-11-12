@@ -108,21 +108,35 @@ serve :: proc(host: ^db.Host, client: net.TCP_Socket, owner: u64) {
 			return
 		}
 	}
-	request, _, parse_err := db.http_parse_request_within(
-		buffer[:n],
-		host.max_header_bytes,
-		host.max_request_bytes,
-	)
-	if !db.error_ok(parse_err) {
-		status := 400
-		if parse_err.kind == .Quota_Exceeded do status = 413
-		body := text_bytes("bad request")
-		response := db.http_response(status, "text/plain", body)
-		delete(body)
-		_, _ = net.send(client, response)
-		delete(response)
-		return
+	// A request may arrive in more than one segment. Reading once and parsing
+	// would reject a body that has not landed yet, so the loop keeps reading
+	// while the parser says the message is incomplete.
+	request: db.Http_Request
+	parse_err: db.Error
+	used := 0
+	for {
+		request, used, parse_err = db.http_parse_request_within(
+			buffer[:n],
+			host.max_header_bytes,
+			host.max_request_bytes,
+		)
+		if db.error_ok(parse_err) do break
+		if parse_err.kind != .Incomplete {
+			status := 400
+			if parse_err.kind == .Quota_Exceeded do status = 413
+			body := text_bytes("bad request")
+			response := db.http_response(status, "text/plain", body)
+			delete(body)
+			_, _ = net.send(client, response)
+			delete(response)
+			return
+		}
+		if n >= len(buffer) do return
+		read, more_err := net.recv(client, buffer[n:])
+		if more_err != nil || read <= 0 do return
+		n += read
 	}
+	_ = used
 	response := db.http_handle(host, request)
 	_, _ = net.send(client, response)
 	delete(response)

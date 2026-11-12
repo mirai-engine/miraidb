@@ -88,6 +88,9 @@ def main() -> int:
             gates.append(
                 Gate("writer lock (two processes)", [args.windows_python, "scripts/lock_smoke.py"])
             )
+            gates.append(
+                Gate("broker (two processes)", [args.windows_python, "scripts/broker_smoke.py"])
+            )
         else:
             print(f"ci: no Windows Python at {args.windows_python}; skipping the DLL smokes")
     for package in PACKAGES:

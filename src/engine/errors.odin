@@ -32,6 +32,9 @@ Error_Kind :: enum u8 {
 	Quota_Exceeded,
 	// Locked means another process owns the database directory.
 	Locked,
+	// Incomplete means a framed message stopped before its end: a socket loop
+	// must read more bytes rather than treat it as a malformed request.
+	Incomplete,
 	Internal,
 }
 
@@ -111,6 +114,8 @@ error_kind_name :: proc(kind: Error_Kind) -> string {
 		return "quota_exceeded"
 	case .Locked:
 		return "locked"
+	case .Incomplete:
+		return "incomplete"
 	case .Internal:
 		return "internal"
 	}

@@ -251,11 +251,13 @@ them, recovery time grows with the log and range queries scan the table.
 
 One process owns one log. A second process on the same directory is refused with
 `locked` and the owner's pid: an OS lock on `<directory>/lock` is taken on open and
-released on close or death, so nothing is silently corrupted. Several
-*connections* to one host work (each client has its own subscriptions and byte
-budget); several *processes* still do not *share* one database. The order to fix
-that is in `docs/roadmap.md`: pages, then a reader beside a writer, then a
-broker.
+released on close or death, so nothing is silently corrupted.
+
+A second process can still **use** the database through the owner:
+`miraidb-server` serves the wire protocol over HTTP, WebSocket frames and
+Postgres, with per-connection subscriptions and byte budgets
+(`scripts/broker_smoke.py` proves it with two processes). What is missing is
+opening the directory *directly* beside a writer, which needs pages (D17).
 
 There is no follower, no log shipping and no failover;
 a second process can read the same database only after the first one closes. The

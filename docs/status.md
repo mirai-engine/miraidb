@@ -141,10 +141,11 @@ a table is still a `map[Row_Id]Row` in memory, and that is the next step of D17.
 - **One process owns one log.** A second process that opens the same directory is
   refused with `locked` and the owner's pid: an OS lock on `<directory>/lock`
   (Windows `LockFileEx`, POSIX `fcntl`) is taken on open and released on close or
-  death. Connections (not processes) share one host: each client has its own
-  subscriptions and its own byte budget. What is still missing is *sharing*, in
-  `docs/backlog.md` (D18): a read-only open beside a writer once pages exist
-  (D17), and a broker mode that serves other processes over the wire.
+  death. A second process can still **use** the database through the owner:
+  `miraidb-server` serves HTTP wire messages, WebSocket frames and Postgres, and
+  each connection has its own subscriptions and byte budget
+  (`scripts/broker_smoke.py` proves it with two processes). What is still missing
+  is opening the directory *directly* beside a writer, which needs pages (D17).
 
 This is the one capability the engine does **not** have at all, as opposed to
 having a shallow version of it. There is no code for it in the tree.

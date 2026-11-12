@@ -35,7 +35,7 @@ outranks the dependent.
 | 15 | **D9 — the rest of the grammar** | Window frames, windows beside `GROUP BY`, real `WITH RECURSIVE`, full `ALTER`, `BEFORE` triggers and `WHEN`, more collations. Each current refusal becomes a test. | L | — |
 | 16 | **D2 — spatial tree** | Boxes as columns today; node pages and a descent replace the scan. | M | D17, D5 |
 | 17 | **D10 — precision and time** | Decimal arithmetic with scale, `TIMESTAMPTZ`, streaming blobs. | M | — |
-| 18 | **D18c — broker mode** | One process owns the database, the others speak the wire protocol to it; the cheap answer for multi-process and the one to prefer until #10 lands. | M | D18a |
+| 18 | **D18c — broker mode** — *done* | `miraidb-server` owns the directory and serves HTTP wire messages, TCP frames with a per-connection owner, and Postgres; `scripts/broker_smoke.py` runs two real processes, reads a write from a second client, and checks a second server is refused with `locked`. It found and fixed a server that parsed a request from one `recv`. | M | D18a |
 | 19 | **D14 — replication** | `GET /log?since=<seq>`, a follower applying through the replay path, tested against a lagging follower and a dead leader; reuses the engine's `net` package. Failover stays unclaimed. | XL | D18c |
 | 20 | **D12c — module VM** | Deterministic execution with enforced memory and time; today modules are processes with a work budget and the caller's clock. | L | — |
 | 21 | **D15 — network hardening** | TLS, HTTP/2, backpressure, per-route timeouts, a load test. | M | — |
@@ -183,6 +183,9 @@ reason written down instead.
 - **Benchmark gate** — `benchmarks/baseline.json` plus `scripts/bench.py --check`
   as a CI gate: bytes per row within 10%, insert rate, read cost and compaction
   under a 3x guard, with the machine recorded beside the numbers.
+- **D18c broker mode** — one owner process, clients over HTTP wire messages,
+  TCP frames and Postgres, with per-connection subscriptions; two-process proof in
+  `scripts/broker_smoke.py`, including the refusal of a second owner.
 - **D3 `AS OF`** — historical reads over the versions the table keeps, with
   pruning as the bound (`test_as_of`); the snapshot cost was already solved.
 - **Sanitizer pass** — 190 tests run under `-sanitize:address` on Windows with no
