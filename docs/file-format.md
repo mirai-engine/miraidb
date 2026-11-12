@@ -228,6 +228,48 @@ renames it over `log`, and reopens it.
   same operations as any other commit.
 - If writing the snapshot fails, the old log is reopened untouched.
 
+## Page file
+
+The page file is the on-disk materialisation the page store uses: fixed 4 KiB
+pages, a slotted layout for variable-length rows, a free list and a checksum per
+page. It is a **cache over the log**, not a second source of truth: a page file
+that does not match the log is discarded and rebuilt by replay.
+
+```
+page 0   header page (same slot layout, plus the file-wide fields)
+page n   rows page: 32-byte header, cells from byte 32 upward,
+         slots of {u16 offset, u16 length} from the end downward
+```
+
+Header fields (little-endian): `kind u8` (0 free, 1 rows), `slots u16`,
+`slot_start u16`, `free_start u16`, `dead u16`, `row_count u16`,
+`next_free u32`, `crc u32` at byte 16, reserved to byte 32. The checksum covers
+the whole page with the checksum field zeroed, so a reader verifies a page
+without trusting its header.
+
+Page 0 adds, from byte 20: `magic` "MRPG", `version` 1, `page_size` 4096,
+`page_count`, `free_head`, `free_pages` and `applied_seq`.
+
+- A cell is `u64 row_id | u32 value_count | value...` using the same value
+  encoding as the wire and the log.
+- A slot whose length is zero is a deleted cell; the page compacts itself once
+  the holes pass half a page.
+- The free list links free pages through their own `next_free`, and the head
+  lives in page 0, so it survives a crash.
+- **Flush order**: every dirty page is written and synced first, then page 0
+  with the new `applied_seq`. A header that names a sequence is a promise that
+  every page of that sequence is on disk; the fault-injection test breaks each
+  write of a flush and checks the promise.
+- Rows are read through a buffer pool: a frame per page, a clock hand, pins, and
+  write-back on eviction. `page_rows_each` streams page by page, so a table
+  larger than the pool is read without holding it.
+
+What is **not** wired yet: the query pipeline still scans the in-memory row map.
+The page format, the pool, the free list, the flush order and the streaming
+reader exist and are tested (`test_page_store_roundtrip`,
+`test_page_store_streams_within_the_pool`, `test_page_store_header_is_a_promise`),
+but a table's rows do not live there yet. That step is the rest of D17.
+
 ## Durability
 
 `store_open(..., durable = true)` opens the log and calls `fsync` after writing

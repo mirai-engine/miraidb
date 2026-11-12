@@ -8346,3 +8346,143 @@ test_idempotent_result :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(empty), 0)
 	db.values_destroy(empty)
 }
+
+@(test)
+test_page_store_roundtrip :: proc(t: ^testing.T) {
+	// Pages keep rows, not the other way around: put, get, delete, flush and
+	// reopen rebuilds the directory from the page bytes.
+	vfs := db.vfs_memory_new()
+	defer db.vfs_memory_destroy(vfs)
+	rows, open_err := db.page_rows_create(vfs, "pages", 8)
+	if !testing.expectf(t, db.error_ok(open_err), "create: %s", open_err.message) do return
+
+	for i in 0 ..< 500 {
+		values := []db.Value{db.value_int(i64(i)), db.value_string(fmt.tprintf("row-%d", i))}
+		put_err := db.page_rows_put(rows, db.Row_Id(i), values)
+		if !testing.expectf(t, db.error_ok(put_err), "put %d: %s", i, put_err.message) do return
+	}
+	testing.expect_value(t, rows.rows, u64(500))
+
+	row, found := db.page_rows_get(rows, db.Row_Id(42), context.temp_allocator)
+	testing.expect(t, found)
+	if found {
+		testing.expect_value(t, row.values[0].i, i64(42))
+		testing.expect_value(t, row.values[1].s, "row-42")
+	}
+	testing.expect(t, db.page_rows_delete(rows, db.Row_Id(7)))
+	testing.expect_value(t, rows.rows, u64(499))
+	_, deleted := db.page_rows_get(rows, db.Row_Id(7), context.temp_allocator)
+	testing.expect(t, !deleted)
+
+	testing.expect(t, db.error_ok(db.page_rows_flush(rows, 5)))
+	testing.expect_value(t, rows.file.applied_seq, u64(5))
+	db.page_rows_close(rows)
+
+	reopened, reopen_err := db.page_rows_open(vfs, "pages", 4)
+	if !testing.expectf(t, db.error_ok(reopen_err), "reopen: %s", reopen_err.message) do return
+	defer db.page_rows_close(reopened)
+	testing.expect_value(t, reopened.file.applied_seq, u64(5))
+	testing.expect_value(t, reopened.rows, u64(499))
+	again, exists := db.page_rows_get(reopened, db.Row_Id(42), context.temp_allocator)
+	testing.expect(t, exists)
+	if exists {
+		testing.expect_value(t, again.values[1].s, "row-42")
+	}
+}
+
+@(private)
+count_visitor :: proc(ctx: rawptr, row: db.Row) -> bool {
+	counters := cast(^[2]i64)ctx
+	counters[0] += 1
+	counters[1] += row.values[0].i
+	return true
+}
+
+@(test)
+test_page_store_streams_within_the_pool :: proc(t: ^testing.T) {
+	// A table far larger than the buffer pool is read page by page: the pool holds
+	// four pages, the file holds more than forty, and every row decodes.
+	vfs := db.vfs_memory_new()
+	defer db.vfs_memory_destroy(vfs)
+	rows, open_err := db.page_rows_create(vfs, "big", 4)
+	if !testing.expectf(t, db.error_ok(open_err), "create: %s", open_err.message) do return
+	defer db.page_rows_close(rows)
+
+	total: i64 = 0
+	for i in 0 ..< 5000 {
+		values := []db.Value{db.value_int(i64(i)), db.value_string("payload that makes the row big enough to fill pages")}
+		put_err := db.page_rows_put(rows, db.Row_Id(i), values)
+		if !testing.expectf(t, db.error_ok(put_err), "put %d: %s", i, put_err.message) do return
+		total += i64(i)
+	}
+	file_pages := rows.file.page_count
+	testing.expectf(t, file_pages > 4, "the file should outgrow the pool, has %d pages", file_pages)
+	testing.expect_value(t, db.page_resident(rows.file), 4)
+
+	counters := [2]i64{0, 0}
+	testing.expect(t, db.error_ok(db.page_rows_each(rows, &counters, count_visitor)))
+	testing.expect_value(t, counters[0], i64(5000))
+	testing.expect_value(t, counters[1], total)
+	testing.expectf(t, rows.file.evictions > 0, "the pool must have evicted, evicted %d", rows.file.evictions)
+	testing.expect_value(t, db.page_resident(rows.file), 4)
+}
+
+@(test)
+test_page_store_header_is_a_promise :: proc(t: ^testing.T) {
+	// The header names the sequence the pages are complete up to. Break the write
+	// of a flush anywhere and the reopen either keeps the old sequence or, when it
+	// already says the new one, has every row: never a sequence with missing rows.
+	memory := db.vfs_memory_new()
+	defer db.vfs_memory_destroy(memory)
+	fault := db.vfs_fault_new(memory)
+	defer db.vfs_fault_destroy(fault)
+
+	succeeding := 0
+	for n in 1 ..= 40 {
+		path := fmt.aprintf("faulty_%d", n)
+		defer delete(path)
+		base, base_err := db.page_rows_create(memory, path, 8)
+		if !testing.expectf(t, db.error_ok(base_err), "n=%d create: %s", n, base_err.message) do return
+		for i in 0 ..< 500 {
+			put_err := db.page_rows_put(base, db.Row_Id(i), []db.Value{db.value_int(i64(i))})
+			testing.expectf(t, db.error_ok(put_err), "n=%d seed %d: %s", n, i, put_err.message)
+		}
+		if flush_err := db.page_rows_flush(base, 1); !testing.expectf(t, db.error_ok(flush_err), "n=%d seed flush: %s", n, flush_err.message) do return
+		db.page_rows_close(base)
+
+		rows, open_err := db.page_rows_open(memory, path, 8)
+		if !testing.expectf(t, db.error_ok(open_err), "n=%d open: %s", n, open_err.message) do return
+		for i in 500 ..< 700 {
+			db.page_rows_put(rows, db.Row_Id(i), []db.Value{db.value_int(i64(i))})
+		}
+		db.vfs_fault_arm(fault, .Write, u64(n))
+		flush_err := db.page_rows_flush(rows, 2)
+		db.vfs_fault_arm(fault, .Write, 0)
+		db.page_rows_close(rows)
+
+		reopened, reopen_err := db.page_rows_open(memory, path, 8)
+		if !db.error_ok(reopen_err) {
+			// A page that landed halfway cannot be trusted; a corrupt page file is
+			// the honest answer, and the caller rebuilds from the log.
+			testing.expectf(t, reopen_err.kind == db.Error_Kind.Corrupt_Log, "n=%d: %s", n, reopen_err.message)
+			continue
+		}
+		succeeding += 1
+		seq := reopened.file.applied_seq
+		testing.expectf(t, seq == 1 || seq == 2, "n=%d: header claims sequence %d", n, seq)
+		if seq == 2 {
+			for i in 0 ..< 700 {
+				_, exists := db.page_rows_get(reopened, db.Row_Id(i), context.temp_allocator)
+				testing.expectf(t, exists, "n=%d: header says 2 but row %d is missing", n, i)
+			}
+		} else {
+			for i in 0 ..< 500 {
+				_, exists := db.page_rows_get(reopened, db.Row_Id(i), context.temp_allocator)
+				testing.expectf(t, exists, "n=%d: header says 1 but row %d is missing", n, i)
+			}
+		}
+		_ = flush_err
+		db.page_rows_close(reopened)
+	}
+	testing.expectf(t, succeeding > 0, "no reopen succeeded")
+}

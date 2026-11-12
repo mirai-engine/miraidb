@@ -109,6 +109,14 @@ honest measurement.
 
 ## Partial
 
+### Rows on disk
+
+`src/engine/page.odin` implements the page file: 4 KiB slotted pages with a
+checksum, a free list, a buffer pool with eviction and a streaming reader, with
+the flush order tested under injected faults. Queries do not read through it yet:
+a table is still a `map[Row_Id]Row` in memory, and that is the next step of D17.
+
+
 - **Index use.** Only the base table of a query is narrowed by an index; joined
   tables are scanned by the nested loop. No cost-based planner.
 - **Ordering.** `ORDER BY` sorts after projection. It does not read an index

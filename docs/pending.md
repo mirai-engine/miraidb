@@ -569,6 +569,10 @@ acceptance criteria, current cost and effort; this list is the short version.
 - Indexes are rebuilt in memory when a database opens; the log has no index
   pages. Joins are nested loops in the order written; there is no cost model or
   `ANALYZE` statistics. (backlog D5, D6)
+- A page file format exists (`src/engine/page.odin`): 4 KiB slotted pages with a
+  checksum, a free list, a buffer pool and a streaming reader, with the flush
+  order tested under injected faults. Queries do not read through it yet; every
+  table is still a `map[Row_Id]Row` in memory. (backlog D17)
 - Read transactions freeze the tables they touch by borrowing their values
   through a shared store, so a freeze costs a map and its index entries rather
   than a deep copy: 50k rows in ~1 ms, steady state 11.6 µs per read. There is

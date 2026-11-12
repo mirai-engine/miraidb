@@ -39,7 +39,7 @@ Rules for this file:
 | D14 | Replication | one process, one log | log shipping, follower reads, failover | XL | P3 |
 | D15 | Network hardening | HTTP/WS subset with caps | TLS, HTTP/2, backpressure, per-route timeouts | M | P3 |
 | D16 | Clients | **Python binding over the C ABI, with a smoke gate** | generation per catalog | M | P3 |
-| D17 | Rows on disk | every table is a `map[Row_Id]Row` in RAM | page store, buffer pool, free list, eviction | XL | P0 |
+| D17 | Rows on disk | **in progress**: page format, free list, buffer pool, flush order and streaming reader are tested (`page.odin`); queries still scan the in-memory map | wire the pipeline to the pages | XL | P0 |
 | D18a | Second writer | **done**: `lock` file, OS lock, refusal naming the owner (`test_writer_lock`, `scripts/lock_smoke.py`) | — | S | P0 |
 | D18b | Reader beside writer | one process owns the directory | pages + lock, read-only open | L | P1 |
 | D18c | Broker mode | clients must be in-process | one owner, others over the wire | M | P1 |
@@ -129,6 +129,28 @@ during a flush still opens to a consistent state (D8 proves it); `bench` and
 `bench-read` stay within 10% for data that fits in memory.
 
 **Not claimed today.** "Pages on disk" — nothing is paged today.
+
+## D17 — Rows on disk
+
+**Done so far.** `src/engine/page.odin` holds the storage layer: 4 KiB slotted
+pages with a checksum per page, cells encoded with the same value format as the
+log, a free list linked through free pages and headed in page 0, a buffer pool
+with a clock hand, pins and write-back on eviction, and a streaming reader that
+walks pages one at a time. Flush order is data pages first, then page 0 with
+`applied_seq`; `test_page_store_header_is_a_promise` breaks every write of a
+flush and checks that a header never names a sequence with missing rows. A pool
+of four frames reads a file of more than forty and evicts
+(`test_page_store_streams_within_the_pool`). The format is in
+`docs/file-format.md`.
+
+**Left.** The query pipeline scans `map[Row_Id]Row` in `sql_exec.odin`; it has to
+read through the page store instead, which means the scan stops materialising
+`partials` and streams (an iterator, not a slice). Indexes, versions and
+snapshots follow the same move. Until that lands, a table is still bounded by
+memory even though the format to hold it on disk exists.
+
+**Not claimed today.** "Pages on disk" for queries; the storage layer is real,
+the pipeline is not wired.
 
 ## D18 — Access from another process
 
