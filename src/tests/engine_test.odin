@@ -8077,3 +8077,68 @@ run_err :: proc(t: ^testing.T, store: ^db.Store, sql: string) -> db.Error {
 	_, err := db.sql_execute(store, sql)
 	return err
 }
+
+@(test)
+test_ddl_in_transaction :: proc(t: ^testing.T) {
+	// A transaction is the unit of atomicity for schema as well as rows: a table,
+	// the rows in it and an index over them commit together, and a rollback takes
+	// the index with it.
+	store := fresh_db(t, "ddl_in_tx")
+	if store == nil do return
+	defer cleanup_db(store, "ddl_in_tx")
+	run(t, store, "CREATE TABLE t (a INTEGER NOT NULL, b TEXT)")
+	run(t, store, "INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y')")
+
+	// Rows changed and an index created in the same transaction.
+	tx := db.tx_begin_write(store)
+	_, insert_err := db.sql_execute_in_tx(tx, "INSERT INTO t (a, b) VALUES (3, 'z')")
+	testing.expect(t, db.error_ok(insert_err))
+	_, index_err := db.sql_execute_in_tx(tx, "CREATE INDEX t_a ON t (a)")
+	testing.expectf(t, db.error_ok(index_err), "create index with rows: %s", index_err.message)
+	_, update_err := db.sql_execute_in_tx(tx, "UPDATE t SET b = 'q' WHERE a = 1")
+	testing.expect(t, db.error_ok(update_err))
+	testing.expect(t, db.error_ok(db.tx_commit(tx)))
+
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t").i, i64(3))
+	plan, plan_err := db.sql_execute(store, "EXPLAIN SELECT b FROM t WHERE a = 2")
+	testing.expect(t, db.error_ok(plan_err))
+	uses_index := false
+	for row in plan.rows {
+		if len(row) > 0 && strings.contains(row[0].s, "using index t_a") do uses_index = true
+	}
+	db.sql_result_destroy(&plan)
+	testing.expectf(t, uses_index, "the index is usable after the commit")
+
+	// Table, rows and a unique index created together.
+	tx = db.tx_begin_write(store)
+	_, create_err := db.sql_execute_in_tx(tx, "CREATE TABLE u (id INTEGER, label TEXT)")
+	testing.expect(t, db.error_ok(create_err))
+	_, rows_err := db.sql_execute_in_tx(tx, "INSERT INTO u (id, label) VALUES (7, 'seven'), (8, 'eight')")
+	testing.expect(t, db.error_ok(rows_err))
+	_, unique_err := db.sql_execute_in_tx(tx, "CREATE UNIQUE INDEX u_id ON u (id)")
+	testing.expectf(t, db.error_ok(unique_err), "unique index on a new table: %s", unique_err.message)
+	testing.expect(t, db.error_ok(db.tx_commit(tx)))
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM u WHERE id = 8").i, i64(1))
+	_, duplicate_err := db.sql_execute(store, "INSERT INTO u (id, label) VALUES (8, 'again')")
+	testing.expect_value(t, duplicate_err.kind, db.Error_Kind.Duplicate_Unique)
+
+	// A rollback takes the index with it and leaves nothing behind.
+	tx = db.tx_begin_write(store)
+	_, staged_err := db.sql_execute_in_tx(tx, "CREATE INDEX t_b ON t (b)")
+	testing.expect(t, db.error_ok(staged_err))
+	db.tx_rollback(tx)
+	_, missing_err := db.sql_execute(store, "DROP INDEX t_b")
+	testing.expect_value(t, missing_err.kind, db.Error_Kind.Index_Not_Found)
+
+	// Two indexes in one transaction, one of them created and dropped again.
+	tx = db.tx_begin_write(store)
+	_, first_err := db.sql_execute_in_tx(tx, "CREATE INDEX t_b ON t (b)")
+	testing.expect(t, db.error_ok(first_err))
+	_, second_err := db.sql_execute_in_tx(tx, "CREATE INDEX t_ab ON t (a, b)")
+	testing.expect(t, db.error_ok(second_err))
+	_, drop_err := db.sql_execute_in_tx(tx, "DROP INDEX t_ab")
+	testing.expectf(t, db.error_ok(drop_err), "drop inside the creating transaction: %s", drop_err.message)
+	testing.expect(t, db.error_ok(db.tx_commit(tx)))
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t WHERE b = 'q'").i, i64(1))
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM _indexes").i, i64(3))
+}

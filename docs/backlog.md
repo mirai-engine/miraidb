@@ -31,7 +31,7 @@ Rules for this file:
 | D8 | Crash injection | **done**: `Fault_Vfs` fails any operation at any call, and `test_fault_injection` walks the write offsets | same for the snapshot and the mirror writes | S | P1 |
 | D9 | SQL grammar | 32 statements, no window frames | frames, recursive CTE, full `ALTER` | L | P2 |
 | D10 | Types and precision | `Int128` as two `u64` | decimal arithmetic, time zones | M | P3 |
-| D11 | Virtual-table breadth | no index inside a `CREATE` | index in the same transaction, triggers/policies | S | P1 |
+| D11 | Virtual-table breadth | **done**: index DDL is staged and applied after the rows (`test_ddl_in_transaction`) | triggers/policies in the same transaction | S | P1 |
 | D12a | Metering granularity | **per row read and written, with a budget that aborts** | — | S | done |
 | D12b | Module call latency | **one pooled socket per module** | — | S | done |
 | D12c | Module determinism | **caller's clock travels in the call**; no VM | deterministic VM, enforced quotas | L | P2 |
@@ -250,15 +250,19 @@ normalising to UTC, streaming blob reads, and conformance cases for rounding.
 
 ## D11 — Virtual tables inside a transaction
 
-**Now.** `CREATE INDEX` refuses to run in a transaction that also created tables
-(`tx_create_index`), so a virtual table cannot index its own shadow tables (this
-is why D1 exists) and a user cannot create a table and its index in one `BEGIN`.
+**Now.** `CREATE INDEX` and `DROP INDEX` behave like any other change: they are
+staged in the transaction, applied after the rows of the same commit (so the index
+is built once, from the final rows), and rolled back with it. `DROP INDEX`
+without `ON` also resolves an index created earlier in the same transaction, and a
+duplicate name is refused before apply. `test_ddl_in_transaction` covers a table
+created with its rows and index, an index over rows written in the same commit,
+and a rollback that leaves no index behind.
 
-**Done when.** Index creation during a transaction is supported, ordered, and
-rolled back with it — the restriction is removed rather than special-cased, and
-the FTS shadow index lands as its first user.
+**Left.** Triggers and policies created in the same transaction as the rows they
+affect are not ordered against those rows yet.
 
-**Not claimed today.** "Atomic DDL".
+**Not claimed today.** "Atomic DDL" for triggers and policies; index DDL is
+atomic and tested.
 
 ## D12 — Modules: metering and latency are done, the sandbox is not
 

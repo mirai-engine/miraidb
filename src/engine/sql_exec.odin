@@ -4105,6 +4105,13 @@ sql_exec_create_index :: proc(tx: ^Tx, stmt: Create_Index_Stmt) -> (Sql_Result, 
 		if stmt.if_not_exists do return Sql_Result{kind = .Ack}, ERROR_NONE
 		return {}, errf(.Index_Exists, "index %s already exists", stmt.name)
 	}
+	// The schema does not carry an index staged earlier in this transaction.
+	for op in tx.state.index_ops {
+		if op.drop || !strings.equal_fold(op.table, stmt.table) do continue
+		if !strings.equal_fold(op.index.name, stmt.name) do continue
+		if stmt.if_not_exists do return Sql_Result{kind = .Ack}, ERROR_NONE
+		return {}, errf(.Index_Exists, "index %s already exists", stmt.name)
+	}
 	if stmt.algorithm == .Direct && (!stmt.unique || len(columns) != 1) {
 		return {}, errf(.Invalid_Argument, "a DIRECT index must be unique on one column")
 	}
@@ -4132,6 +4139,17 @@ sql_exec_drop_index :: proc(tx: ^Tx, stmt: Drop_Index_Stmt) -> (Sql_Result, Erro
 				}
 			}
 			if len(table_name) > 0 do break
+		}
+	}
+	// An index created earlier in this transaction is not in the schema yet, so
+	// DROP INDEX without ON has to look at the staged operations too.
+	if len(table_name) == 0 {
+		for op in tx.state.index_ops {
+			if op.drop do continue
+			if strings.equal_fold(op.index.name, stmt.name) {
+				table_name = op.table
+				break
+			}
 		}
 	}
 	if len(table_name) == 0 {

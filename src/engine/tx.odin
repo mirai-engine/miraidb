@@ -71,9 +71,9 @@ Table_Writes :: struct {
 	next_sequence: i64,
 }
 
-// Tx_Index_Op is index DDL staged by a transaction. Index changes must run
-// alone: mixing them with row writes would make the pre-log uniqueness check
-// disagree with what is applied.
+// Tx_Index_Op is index DDL staged by a transaction. It is applied after the rows
+// of the same commit, so an index over rows inserted in the transaction is built
+// once, from the final rows, before any reader sees the commit.
 Tx_Index_Op :: struct {
 	drop:  bool,
 	table: string,
@@ -927,19 +927,14 @@ tx_truncate :: proc(tx: ^Tx, name: string) -> Error {
 
 // --- Index DDL -------------------------------------------------------------
 
+// tx_create_index stages an index alongside the rows of the same transaction.
+// The index is built when the transaction is applied, after the rows it covers:
+// a table created here, rows inserted here and an index on them still land in one
+// atomic commit.
 tx_create_index :: proc(tx: ^Tx, table_name: string, index: Index_Schema) -> Error {
 	if tx.read_only do return errf(.Transaction_Read_Only, "cannot create an index in a read transaction")
-	if len(tx.state.index_ops) > 0 || len(tx.state.writes) > 0 {
-		return errf(
-			.Sql_Unsupported,
-			"CREATE INDEX must run in its own transaction; separate it from the data changes",
-		)
-	}
 	table, table_err := tx_table(tx, table_name)
 	if table_err.kind != .None do return table_err
-	if _, created := tx.state.created[table_name]; created {
-		return errf(.Sql_Unsupported, "CREATE INDEX and CREATE TABLE must be separate statements")
-	}
 	stored := Index_Schema {
 		name      = strings.clone(index.name, tx.alloc),
 		unique    = index.unique,
@@ -949,6 +944,13 @@ tx_create_index :: proc(tx: ^Tx, table_name: string, index: Index_Schema) -> Err
 	}
 	for existing in table.schema.indexes {
 		if strings.equal_fold(existing.name, stored.name) {
+			return errf(.Index_Exists, "index %s already exists", stored.name)
+		}
+	}
+	// An index created earlier in this same transaction is not in the schema yet.
+	for op in tx.state.index_ops {
+		if op.drop || !strings.equal_fold(op.table, table_name) do continue
+		if strings.equal_fold(op.index.name, stored.name) {
 			return errf(.Index_Exists, "index %s already exists", stored.name)
 		}
 	}
@@ -966,19 +968,38 @@ tx_create_index :: proc(tx: ^Tx, table_name: string, index: Index_Schema) -> Err
 
 tx_drop_index :: proc(tx: ^Tx, table_name: string, name: string) -> Error {
 	if tx.read_only do return errf(.Transaction_Read_Only, "cannot drop an index in a read transaction")
-	if len(tx.state.index_ops) > 0 || len(tx.state.writes) > 0 {
-		return errf(
-			.Sql_Unsupported,
-			"DROP INDEX must run in its own transaction; separate it from the data changes",
-		)
-	}
 	table, table_err := tx_table(tx, table_name)
 	if table_err.kind != .None do return table_err
+	// The index may already be gone because this transaction created it: the
+	// drop is then a no-op in the same atomic commit, not an error.
+	dropped_already := false
+	for op in tx.state.index_ops {
+		if !op.drop || !strings.equal_fold(op.table, table_name) do continue
+		if strings.equal_fold(op.index.name, name) {
+			dropped_already = true
+		}
+	}
+	if dropped_already {
+		return errf(.Index_Not_Found, "index %s does not exist in %s", name, table_name)
+	}
 	for existing in table.schema.indexes {
 		if !strings.equal_fold(existing.name, name) do continue
 		if existing.implicit {
 			return errf(.Invalid_Argument, "index %s comes from a constraint and cannot be dropped", name)
 		}
+		append(
+			&tx.state.index_ops,
+			Tx_Index_Op {
+				drop = true,
+				table = strings.clone(table_name, tx.alloc),
+				index = Index_Schema{name = strings.clone(name, tx.alloc)},
+			},
+		)
+		return ERROR_NONE
+	}
+	for op in tx.state.index_ops {
+		if op.drop || !strings.equal_fold(op.table, table_name) do continue
+		if !strings.equal_fold(op.index.name, name) do continue
 		append(
 			&tx.state.index_ops,
 			Tx_Index_Op {

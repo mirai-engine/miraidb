@@ -22,7 +22,7 @@ outranks the dependent.
 | 2 | **ASAN pass** over CLI, soak and conformance | The two real bugs in this project were memory bugs; the pass protects every later phase, and is cheapest before the page store exists. | 1 round | — |
 | 3 | **D8 — fault injection** — *done* | `Fault_Vfs` fails any operation at any call; `test_fault_injection` walks every write of a workload and proves the reopened state is exactly the commits that reported success. The page store will reuse the harness. | S | — |
 | 4 | **Benchmark gate** — *done* | `scripts/bench.py` records bytes per row, insert rate, read cost and compaction in `benchmarks/baseline.json` and fails the build beyond the recorded limits; the efficiency contract is now enforced, not remembered. | S | — |
-| 5 | **D11 — DDL inside a transaction** | `CREATE INDEX` cannot share a transaction with `CREATE TABLE`; that single restriction is why full-text needs a scan. Unblocks #6. | S | — |
+| 5 | **D11 — DDL inside a transaction** — *done* | Index DDL is staged like row changes and applied after them, so a table, its rows and its index commit together and roll back together. Unblocks the FTS index. | S | — |
 | 6 | **D1 — FTS term index + BM25** | A per-term index and real ranking: the first of the three asks, and the visible one. | M | D11 |
 | 7 | **D13 — return the stored result on a retry** | Exactly-once currently skips a repeat call; a caller retrying after a lost response should get the same answer. | S | — |
 | 8 | **D17 — rows on disk (page store)** | All tables are in RAM today. Buffer pool, page size, free list, eviction under a cap, flushes ordered after their commit record. The third ask, and the biggest piece. | XL | D8, bench |
@@ -183,6 +183,10 @@ reason written down instead.
 - **Benchmark gate** — `benchmarks/baseline.json` plus `scripts/bench.py --check`
   as a CI gate: bytes per row within 10%, insert rate, read cost and compaction
   under a 3x guard, with the machine recorded beside the numbers.
+- **D11 DDL inside a transaction** — index operations are part of the
+  transaction: `DROP INDEX` without `ON` also finds an index created earlier in
+  the same transaction, and two creates of one name are refused before apply
+  (`test_ddl_in_transaction`).
 - **D8 fault injection** — `Fault_Vfs` (open/read/write/seek/truncate/sync/remove,
   or a short write) and `test_fault_injection`, which arms the fault at every write
   of a workload and checks that the reopen sees only successful commits. A short

@@ -190,8 +190,10 @@ Scalar: `lower`, `upper`, `length`, `abs`, `coalesce`/`ifnull`, `now()`.
 - `LEFT JOIN` extends a partial row with NULLs when no right row matches.
 - Unqualified column names must be unique across the joined tables; qualify
   with the table name or its alias otherwise.
-- `CREATE INDEX` and `DROP INDEX` run in their own transaction: combining them
-  with row changes in one transaction returns `unsupported`.
+- `CREATE INDEX` and `DROP INDEX` are staged like any other change: a table, the
+  rows in it and an index over them commit together, a rollback takes the index
+  with it, and `DROP INDEX` on an index this transaction created is a no-op. The
+  index is built when the transaction is applied, after the rows it covers.
 - An equality or range predicate on a single indexed column narrows the scan
   through the index; the full `WHERE` is still re-checked, so the result is
   always exact.
