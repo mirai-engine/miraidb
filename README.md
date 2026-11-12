@@ -247,7 +247,7 @@ host.on_update = proc(ctx: rawptr, update: ^db.Subscription_Update) {
 Snapshots and compaction came before the network layer on purpose: without
 them, recovery time grows with the log and range queries scan the table.
 
-## Not implemented: a second process, and replication
+## Not implemented: a second opener, and replication
 
 One process owns one log. A second process on the same directory is refused with
 `locked` and the owner's pid: an OS lock on `<directory>/lock` is taken on open and

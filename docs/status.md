@@ -136,7 +136,7 @@ a table is still a `map[Row_Id]Row` in memory, and that is the next step of D17.
 - **Cancellation.** A long query holds the read lock until it finishes. There
   is no statement timeout or cancel handle.
 
-## Not implemented: a second process, and replication
+## Not implemented: a second opener, and replication
 
 - **One process owns one log.** A second process that opens the same directory is
   refused with `locked` and the owner's pid: an OS lock on `<directory>/lock`
