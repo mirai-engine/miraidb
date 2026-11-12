@@ -734,6 +734,12 @@ page_rows_delete :: proc(rows: ^Page_Rows, row_id: Row_Id) -> bool {
 	return true
 }
 
+// page_rows_contains reports whether a row is live. It reads the directory and
+// does not touch the pages, which is what a uniqueness or existence check needs.
+page_rows_contains :: proc(rows: ^Page_Rows, row_id: Row_Id) -> bool {
+	return row_id in rows.directory
+}
+
 // page_rows_get decodes one row into the caller's allocator.
 page_rows_get :: proc(rows: ^Page_Rows, row_id: Row_Id, alloc: mem.Allocator) -> (Row, bool) {
 	location, exists := rows.directory[row_id]
@@ -785,6 +791,81 @@ page_rows_each :: proc(rows: ^Page_Rows, ctx: rawptr, visit: Page_Row_Visitor) -
 		page_release(rows.file, frame, false)
 	}
 	return ERROR_NONE
+}
+
+// page_rows_scan is page_rows_each for a caller that wants the decoded values to
+// outlive the visit: they are allocated in `alloc` and belong to it. It is what
+// lets a table collect its rows from pages without decoding twice.
+page_rows_scan :: proc(
+	rows: ^Page_Rows,
+	alloc: mem.Allocator,
+	ctx: rawptr,
+	visit: Page_Row_Visitor,
+) -> Error {
+	for id in 1 ..< rows.file.page_count {
+		frame, load_err := page_load(rows.file, id)
+		if load_err.kind != .None do return load_err
+		header := page_header_decode(frame.data)
+		if header.kind != .Rows {
+			page_release(rows.file, frame, false)
+			continue
+		}
+		for slot in 0 ..< int(header.slots) {
+			offset, length := page_slot_get(frame.data, u16(slot))
+			if length == 0 do continue
+			row, ok := row_cell_decode(frame.data[offset:offset + length], alloc)
+			if !ok {
+				page_release(rows.file, frame, false)
+				return errf(.Corrupt_Log, "page %d holds a row that cannot be decoded", id)
+			}
+			keep := visit(ctx, row)
+			if !keep {
+				page_release(rows.file, frame, false)
+				return ERROR_NONE
+			}
+		}
+		page_release(rows.file, frame, false)
+	}
+	return ERROR_NONE
+}
+
+// page_rows_truncate empties the table. Every page but the header goes back to
+// the free list, so the file keeps its size and the next insert reuses them.
+// The directory is the only index of what is live, so clearing it is enough for
+// a scan to see nothing; the free list keeps the space accounted for.
+page_rows_truncate :: proc(rows: ^Page_Rows) -> Error {
+	for id in Page_Id(1) ..< rows.file.page_count {
+		page_free(rows.file, id)
+	}
+	clear(&rows.directory)
+	rows.rows = 0
+	return ERROR_NONE
+}
+
+// page_rows_stats reports what one table occupies, for tests and for PRAGMA
+// page_store: pages is the allocated page count, resident how many are in the
+// pool, and disk bytes the file size.
+Page_Rows_Stats :: struct {
+	pages:    u32,
+	resident: int,
+	rows:     u64,
+	disk:     i64,
+	reads:    u64,
+	writes:   u64,
+	evicted:  u64,
+}
+
+page_rows_stats :: proc(rows: ^Page_Rows) -> Page_Rows_Stats {
+	if rows == nil do return {}
+	return Page_Rows_Stats {
+		pages = rows.file.page_count,
+		resident = page_resident(rows.file),
+		rows = rows.rows,
+		disk = rows.file.vfs.ops.size(rows.file.file),
+		reads = rows.file.reads,
+		writes = rows.file.writes,
+		evicted = rows.file.evictions,
+	}
 }
 
 page_rows_flush :: proc(rows: ^Page_Rows, applied_seq: u64) -> Error {

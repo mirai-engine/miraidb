@@ -268,6 +268,15 @@ tx_begin_read :: proc(store: ^Store) -> ^Tx {
 	// statement then runs without it, so a long read never blocks a commit.
 	sync.shared_lock(&store.mutex)
 	tx.read_seq = store.commit_seq
+	// A store with page-backed tables cannot take a snapshot without decoding
+	// every row, which is exactly what pages exist to avoid. Such a read holds
+	// the shared lock for its whole life and reads the live tables: writers wait,
+	// and no commit can land between its statements, so it still sees one state.
+	if store.has_paged {
+		tx.use_frozen = false
+		tx.locked = true
+		return tx
+	}
 	// Reuse the snapshot published for this exact commit sequence: when nothing
 	// committed in between, opening a read is O(1) and copies nothing.
 	if store.read_cache != nil && store.read_cache.seq == store.commit_seq {
@@ -439,11 +448,23 @@ tx_read_tables :: proc(tx: ^Tx, alloc: mem.Allocator) -> []string {
 	return names[:]
 }
 
+// tx_paged_alter_guard refuses a schema change on a paged table. The change
+// rewrites every row through the in-memory map, which a paged table does not
+// have; until the rewrite can stream over pages, refusing is the honest answer.
+@(private)
+tx_paged_alter_guard :: proc(tx: ^Tx, name: string) -> Error {
+	if table, exists := tx.store.tables[name]; exists && table.paged != nil {
+		return errf(.Sql_Unsupported, "alter a table that uses the page store")
+	}
+	return ERROR_NONE
+}
+
 // tx_alter_table stages a schema change. The replacement table already carries
 // the extra columns for every existing row, so the commit only records the
 // schema and the store rebuilds the same way on replay.
 tx_alter_table :: proc(tx: ^Tx, name: string, next_schema: Table_Schema) -> Error {
 	if tx.read_only do return errf(.Transaction_Read_Only, "cannot alter a table in a read transaction")
+	if guard_err := tx_paged_alter_guard(tx, name); guard_err.kind != .None do return guard_err
 	if _, created := tx.state.created[name]; created {
 		return errf(.Sql_Unsupported, "alter a table outside the transaction that created it")
 	}
@@ -469,6 +490,7 @@ tx_alter_table :: proc(tx: ^Tx, name: string, next_schema: Table_Schema) -> Erro
 // their identity is part of how the table is written.
 tx_drop_column :: proc(tx: ^Tx, name, column_name: string) -> Error {
 	if tx.read_only do return errf(.Transaction_Read_Only, "cannot alter a table in a read transaction")
+	if guard_err := tx_paged_alter_guard(tx, name); guard_err.kind != .None do return guard_err
 	if _, created := tx.state.created[name]; created {
 		return errf(.Sql_Unsupported, "alter a table outside the transaction that created it")
 	}
@@ -568,6 +590,7 @@ tx_drop_column :: proc(tx: ^Tx, name, column_name: string) -> Error {
 // staged writes follow the table, so a commit applies the rename before them.
 tx_rename_table :: proc(tx: ^Tx, from, to: string) -> Error {
 	if tx.read_only do return errf(.Transaction_Read_Only, "cannot alter a table in a read transaction")
+	if guard_err := tx_paged_alter_guard(tx, from); guard_err.kind != .None do return guard_err
 	if _, created := tx.state.created[from]; created {
 		return errf(.Sql_Unsupported, "alter a table outside the transaction that created it")
 	}
@@ -601,6 +624,7 @@ tx_rename_table :: proc(tx: ^Tx, from, to: string) -> Error {
 // trigger body, a policy) is not rewritten, which is noted in the docs.
 tx_rename_column :: proc(tx: ^Tx, table_name, from, to: string) -> Error {
 	if tx.read_only do return errf(.Transaction_Read_Only, "cannot alter a table in a read transaction")
+	if guard_err := tx_paged_alter_guard(tx, table_name); guard_err.kind != .None do return guard_err
 	if _, created := tx.state.created[table_name]; created {
 		return errf(.Sql_Unsupported, "alter a table outside the transaction that created it")
 	}
@@ -660,10 +684,7 @@ tx_get :: proc(tx: ^Tx, name: string, id: Row_Id) -> (Row, bool) {
 	}
 	table, table_err := tx_table(tx, name)
 	if table_err.kind != .None do return {}, false
-	if row, exists := table.rows[id]; exists {
-		return row, true
-	}
-	return {}, false
+	return table_get_row(table, id, tx.alloc)
 }
 
 // tx_collect fills `out` with the visible rows of one table, ordered by row id.
@@ -672,7 +693,9 @@ tx_collect :: proc(tx: ^Tx, name: string, out: ^[dynamic]Row) -> Error {
 	if table_err.kind != .None do return table_err
 	writes := tx.state.writes[name]
 	if !tx.state.dropped[name] && (writes == nil || !writes.truncated) {
-		table_collect(table, out, tx.read_seq)
+		// A paged table decodes its rows into the transaction arena: they stay
+		// valid until the statement (and the transaction) ends.
+		table_collect(table, out, tx.read_seq, tx.alloc)
 	}
 	if writes == nil do return ERROR_NONE
 	seen := make(map[Row_Id]bool, len(writes.inserts) + len(out))
@@ -713,6 +736,9 @@ tx_collect :: proc(tx: ^Tx, name: string, out: ^[dynamic]Row) -> Error {
 // transaction holds keeps the table stable for the statement.
 tx_collect_at :: proc(tx: ^Tx, name: string, out: ^[dynamic]Row, seq: u64) -> Error {
 	if table, exists := tx.store.tables[name]; exists {
+		if table.paged != nil {
+			return errf(.Sql_Unsupported, "AS OF is not available on a table that uses the page store")
+		}
 		table_collect(table, out, seq)
 		return ERROR_NONE
 	}
@@ -808,10 +834,8 @@ tx_insert :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error) {
 		v := values[i]
 		if i == pk_position && !column.auto_increment && (v.kind == .Default || v.kind == .Null) {
 			// Assign max(pk) + 1 over the stored rows and the staged ones.
-			next := i64(1)
-			for _, row in table.rows {
-				if row.values[i].kind == .Int && row.values[i].i >= next do next = row.values[i].i + 1
-			}
+			next := table_max_int(table, i) + 1
+			if next < 1 do next = 1
 			for _, row in writes.inserts {
 				if row.values[i].kind == .Int && row.values[i].i >= next do next = row.values[i].i + 1
 			}
@@ -897,10 +921,8 @@ tx_update :: proc(tx: ^Tx, name: string, id: Row_Id, values: []Value) -> Error {
 		v := values[i]
 		if i == pk_position && !column.auto_increment && (v.kind == .Default || v.kind == .Null) {
 			// Assign max(pk) + 1 over the stored rows and the staged ones.
-			next := i64(1)
-			for _, row in table.rows {
-				if row.values[i].kind == .Int && row.values[i].i >= next do next = row.values[i].i + 1
-			}
+			next := table_max_int(table, i) + 1
+			if next < 1 do next = 1
 			for _, row in writes.inserts {
 				if row.values[i].kind == .Int && row.values[i].i >= next do next = row.values[i].i + 1
 			}

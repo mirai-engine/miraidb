@@ -8889,3 +8889,97 @@ test_connection_identity :: proc(t: ^testing.T) {
 	testing.expect_value(t, count_for(t, host, 3, "SELECT count(*) FROM note"), i64(2))
 	testing.expect_value(t, count_for(t, host, 2, "SELECT count(*) FROM note"), i64(1))
 }
+
+@(test)
+test_paged_table_roundtrip :: proc(t: ^testing.T) {
+	// A table whose rows live in a page file behaves like any other: inserts,
+	// lookups by key, updates, deletes, constraints and a reopen. The row map
+	// stays empty and the pool stays small, which is the point of the exercise.
+	path := "_test_paged_roundtrip"
+	os.remove_all(path)
+	defer os.remove_all(path)
+	store, open_err := db.store_open(path, {
+		persistent = true,
+		create = true,
+		durable = false,
+		paged_tables = true,
+		page_frames = 4,
+	})
+	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
+	closed := false
+	defer if !closed do db.store_close(store)
+
+	run(t, store, "CREATE TABLE item (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)")
+	body: strings.Builder
+	strings.builder_init(&body)
+	defer strings.builder_destroy(&body)
+	strings.write_string(&body, "INSERT INTO item (id, name, qty) VALUES ")
+	for i in 0 ..< 400 {
+		if i > 0 do strings.write_string(&body, ", ")
+		fmt.sbprintf(&body, "(%d, 'name-%d', %d)", i, i, i)
+	}
+	run(t, store, strings.to_string(body))
+
+	table, table_err := db.store_table(store, "item")
+	testing.expect(t, db.error_ok(table_err))
+	testing.expect(t, table.paged != nil)
+	testing.expect_value(t, len(table.rows), 0)
+	stats := db.page_rows_stats(table.paged)
+	testing.expectf(t, stats.pages > 4, "the file holds %d pages", stats.pages)
+	testing.expectf(t, stats.resident <= 4, "the pool holds %d pages", stats.resident)
+	testing.expect_value(t, stats.rows, u64(400))
+
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM item").i, i64(400))
+	testing.expect_value(t, scalar(t, store, "SELECT name FROM item WHERE id = 150").s, "name-150")
+	testing.expect_value(t, scalar(t, store, "SELECT max(qty) FROM item").i, i64(399))
+
+	run(t, store, "UPDATE item SET qty = 999 WHERE id = 150")
+	testing.expect_value(t, scalar(t, store, "SELECT qty FROM item WHERE id = 150").i, i64(999))
+	testing.expect_value(t, scalar(t, store, "SELECT qty FROM item WHERE id = 151").i, i64(151))
+
+	run(t, store, "DELETE FROM item WHERE id = 150")
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM item").i, i64(399))
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM item WHERE id = 150").i, i64(0))
+
+	duplicate := run_error(t, store, "INSERT INTO item (id, name, qty) VALUES (200, 'dup', 1)")
+	testing.expect_value(t, duplicate.kind, db.Error_Kind.Duplicate_Primary_Key)
+
+	// An in-place schema change cannot stream over pages yet, so it is refused
+	// instead of silently dropping the rows.
+	alter := run_error(t, store, "ALTER TABLE item ADD COLUMN extra TEXT")
+	testing.expect_value(t, alter.kind, db.Error_Kind.Sql_Unsupported)
+	as_of := run_error(t, store, "SELECT * FROM item AS OF 1")
+	testing.expect_value(t, as_of.kind, db.Error_Kind.Sql_Unsupported)
+
+	// A transaction that writes and rolls back leaves the pages untouched.
+	tx := db.tx_begin_write(store)
+	_, delete_err := db.sql_execute_in_tx(tx, "DELETE FROM item")
+	testing.expect(t, db.error_ok(delete_err))
+	inside, inside_err := db.sql_execute_in_tx(tx, "SELECT count(*) FROM item")
+	testing.expect(t, db.error_ok(inside_err))
+	testing.expect_value(t, inside.rows[0][0].i, i64(0))
+	db.sql_result_destroy(&inside)
+	db.tx_rollback(tx)
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM item").i, i64(399))
+
+	db.store_close(store)
+	closed = true
+
+	// The page files are a cache: reopening discards them and replays the log,
+	// with a different pool size.
+	again, again_err := db.store_open(path, {
+		persistent = true,
+		paged_tables = true,
+		page_frames = 2,
+	})
+	if !testing.expectf(t, db.error_ok(again_err), "reopen: %s", again_err.message) do return
+	defer db.store_close(again)
+	rebuilt, rebuilt_err := db.store_table(again, "item")
+	testing.expect(t, db.error_ok(rebuilt_err))
+	testing.expect(t, rebuilt.paged != nil)
+	testing.expect_value(t, len(rebuilt.rows), 0)
+	testing.expect_value(t, db.page_rows_stats(rebuilt.paged).resident <= 2, true)
+	testing.expect_value(t, scalar(t, again, "SELECT count(*) FROM item").i, i64(399))
+	testing.expect_value(t, scalar(t, again, "SELECT name FROM item WHERE id = 399").s, "name-399")
+	testing.expect_value(t, scalar(t, again, "SELECT qty FROM item WHERE id = 151").i, i64(151))
+}

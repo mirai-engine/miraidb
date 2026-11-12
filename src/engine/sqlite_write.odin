@@ -660,7 +660,12 @@ sqlite_file_write :: proc(store: ^Store, path: string, alloc := context.allocato
 	defer delete(master_rows)
 	for name in names {
 		table := store.tables[name]
-		exported := make([dynamic]Sqlite_Export_Row, 0, len(table.rows))
+		// Reading through the collect makes a paged table export the same as a
+		// memory one; the decoded values are released after the records encode.
+		collected := make([dynamic]Row)
+		table_collect(table, &collected, max(u64))
+		defer table_collect_release(table, &collected)
+		exported := make([dynamic]Sqlite_Export_Row, 0, len(collected))
 		defer delete(exported)
 		rowid_column := -1
 		if len(table.schema.primary_key) == 1 {
@@ -670,7 +675,7 @@ sqlite_file_write :: proc(store: ^Store, path: string, alloc := context.allocato
 			}
 		}
 		next_rowid := i64(1)
-		for _, row in table.rows {
+		for row in collected {
 			if len(row.values) == 0 do continue
 			rowid := next_rowid
 			if rowid_column >= 0 && rowid_column < len(row.values) {

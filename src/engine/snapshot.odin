@@ -58,7 +58,8 @@ store_state_payload :: proc(store: ^Store) -> []u8 {
 		for row in rows {
 			append(&ops, Store_Op{kind = .Insert, name = name, row_id = row.id, values = row.values})
 		}
-		delete(rows)
+		// A paged table decoded its rows for this encoding only.
+		table_collect_release(table, &rows)
 	}
 	delete(names)
 	return tx_encode_ops(ops[:])

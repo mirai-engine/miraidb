@@ -74,7 +74,7 @@ store_attach_restore :: proc(store: ^Store) -> Error {
 	if !found do return ERROR_NONE
 	rows := make([dynamic]Row)
 	table_collect(table, &rows, max(u64))
-	defer delete(rows)
+	defer table_collect_release(table, &rows)
 	if len(rows) == 0 do return ERROR_NONE
 	names := make([]string, len(rows))
 	paths := make([]string, len(rows))
@@ -117,6 +117,7 @@ tx_materialize_attached :: proc(tx: ^Tx, schema, name: string) -> (^Table, Error
 	}
 	rows := make([dynamic]Row)
 	table_collect(source, &rows, max(u64))
+	defer table_collect_release(source, &rows)
 	// Copy the schema: the attached store may disappear while the statement
 	// runs, so nothing here may point into its arena.
 	columns := make([]Column, len(source.schema.columns), tx.alloc)
@@ -132,18 +133,15 @@ tx_materialize_attached :: proc(tx: ^Tx, schema, name: string) -> (^Table, Error
 	copied, table_err := table_create(&copied_schema)
 	if table_err.kind != .None {
 		sync.shared_unlock(&attached.mutex)
-		delete(rows)
 		return nil, table_err
 	}
 	for row in rows {
 		if insert_err := table_insert(copied, row.id, row.values); insert_err.kind != .None {
 			sync.shared_unlock(&attached.mutex)
 			table_destroy(copied)
-			delete(rows)
 			return nil, insert_err
 		}
 	}
-	delete(rows)
 	sync.shared_unlock(&attached.mutex)
 	append(&tx.temp_tables, copied)
 	return copied, ERROR_NONE

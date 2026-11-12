@@ -91,6 +91,13 @@ Table :: struct {
 	// borrowed is true for a snapshot: it reads another table's values and must
 	// not free them.
 	borrowed:        bool,
+	// paged holds the rows in a page file. When it is set the map above stays
+	// empty: the page file is the storage, not a copy of a map, which is what
+	// keeps a table larger than the pool out of RAM. A paged table keeps one
+	// version of each row and no tombstones, so it cannot answer an older
+	// sequence; the executor refuses AS OF on it and its read transactions hold
+	// the store lock.
+	paged: ^Page_Rows,
 }
 
 @(private)
@@ -152,6 +159,10 @@ table_destroy :: proc(t: ^Table) {
 		table_index_map_free(t, i)
 	}
 	delete(t.indexes)
+	// A paged table is closed, not deleted: the caller removes the file when the
+	// table is dropped. Dirty frames are dropped with it, which is safe because
+	// the log holds every committed change.
+	page_rows_close(t.paged)
 	virtual.arena_destroy(&t.arena)
 	if t.store != nil do row_store_release(t.store)
 	free(t)
@@ -455,6 +466,15 @@ index_key_len :: proc(t: ^Table, index: int, values: []Value, id: Row_Id) -> int
 // the hot path.
 table_memory :: proc(t: ^Table) -> Table_Memory {
 	memory: Table_Memory
+	if t.paged != nil {
+		// The values live in the page file and the index keys still live here.
+		memory.rows = int(t.paged.rows)
+		for _ in t.indexes {
+			memory.index_entries += memory.rows
+			memory.index_bytes += 40 * memory.rows
+		}
+		return memory
+	}
 	for _, row in t.rows {
 		memory.rows += 1
 		memory.row_bytes += 48 // map entry, slice header and row header
@@ -632,7 +652,69 @@ index_is_primary :: proc(t: ^Table, index: int) -> bool {
 
 // --- Maintenance -----------------------------------------------------------
 
+// table_get_row returns one row. A memory table lends its values; a paged table
+// decodes them into `alloc`, and the caller owns them.
+table_get_row :: proc(t: ^Table, id: Row_Id, alloc: mem.Allocator) -> (Row, bool) {
+	if t.paged != nil do return page_rows_get(t.paged, id, alloc)
+	row, exists := t.rows[id]
+	return row, exists
+}
+
+// table_row_exists answers without decoding the values.
+table_row_exists :: proc(t: ^Table, id: Row_Id) -> bool {
+	if t.paged != nil do return page_rows_contains(t.paged, id)
+	_, exists := t.rows[id]
+	return exists
+}
+
+@(private)
+table_touch_sequence :: proc(t: ^Table, values: []Value) {
+	if t.schema.auto_increment_column == NO_COLUMN do return
+	column := t.schema.auto_increment_column
+	if number, ok := value_to_i64(values[column]); ok {
+		next := number + t.schema.columns[column].sequence.increment
+		if next > t.next_sequence do t.next_sequence = next
+	}
+}
+
+@(private)
+table_index_add_all :: proc(t: ^Table, values: []Value, id: Row_Id) -> Error {
+	for _, i in t.indexes {
+		key := index_entry_key(t, i, values, id)
+		_, _, insert_err := rbtree.upsert(&t.indexes[i].tree, key, id)
+		if insert_err != nil {
+			return errf(.Out_Of_Memory, "cannot grow index %s", t.indexes[i].schema.name)
+		}
+		if map_err := table_index_map_add(t, i, values, id); map_err.kind != .None {
+			return map_err
+		}
+	}
+	return ERROR_NONE
+}
+
+@(private)
+table_index_remove_all :: proc(t: ^Table, values: []Value, id: Row_Id) {
+	for _, i in t.indexes {
+		key := index_entry_key(t, i, values, id)
+		rbtree.remove_key(&t.indexes[i].tree, key)
+		table_index_map_remove(t, i, values, id)
+	}
+}
+
 table_insert :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
+	if t.paged != nil {
+		if page_rows_contains(t.paged, id) {
+			return errf(.Internal, "row id %d already exists in table %s", u64(id), t.schema.name)
+		}
+		if err := table_check_unique(t, values); err.kind != .None {
+			return err
+		}
+		if put_err := page_rows_put(t.paged, id, values); put_err.kind != .None {
+			return put_err
+		}
+		table_touch_sequence(t, values)
+		return table_index_add_all(t, values, id)
+	}
 	if _, exists := t.rows[id]; exists {
 		return errf(.Internal, "row id %d already exists in table %s", u64(id), t.schema.name)
 	}
@@ -662,6 +744,22 @@ table_insert :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
 }
 
 table_update :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
+	if t.paged != nil {
+		old, exists := page_rows_get(t.paged, id, context.allocator)
+		if !exists {
+			return errf(.Internal, "row id %d is missing from table %s", u64(id), t.schema.name)
+		}
+		defer free_values(old.values)
+		if err := table_check_unique(t, values, id); err.kind != .None {
+			return err
+		}
+		table_index_remove_all(t, old.values, id)
+		if put_err := page_rows_put(t.paged, id, values); put_err.kind != .None {
+			return put_err
+		}
+		table_touch_sequence(t, values)
+		return table_index_add_all(t, values, id)
+	}
 	row, exists := t.rows[id]
 	if !exists {
 		return errf(.Internal, "row id %d is missing from table %s", u64(id), t.schema.name)
@@ -709,6 +807,14 @@ table_update :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
 }
 
 table_delete :: proc(t: ^Table, id: Row_Id) -> bool {
+	if t.paged != nil {
+		if !page_rows_contains(t.paged, id) do return false
+		old, decoded := page_rows_get(t.paged, id, context.allocator)
+		if !decoded do return false
+		defer free_values(old.values)
+		table_index_remove_all(t, old.values, id)
+		return page_rows_delete(t.paged, id)
+	}
 	row, exists := t.rows[id]
 	if !exists do return false
 	for _, i in t.indexes {
@@ -725,6 +831,16 @@ table_delete :: proc(t: ^Table, id: Row_Id) -> bool {
 }
 
 table_truncate :: proc(t: ^Table) {
+	if t.paged != nil {
+		_ = page_rows_truncate(t.paged)
+		for _, i in t.indexes {
+			rbtree.destroy(&t.indexes[i].tree, false)
+			rbtree.init_cmp(&t.indexes[i].tree, index_cmp)
+			table_index_map_free(t, i)
+			t.indexes[i].lookup = make(map[string]^Index_Bucket)
+		}
+		return
+	}
 	for _, row in t.rows {
 		// Truncating while a snapshot reads the same values cannot free them: they
 		// are handed to the shared store, which frees them when the last reader is
@@ -764,6 +880,26 @@ table_insert_borrowed :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
 // deep copy of every value, which is what made the first read of a large database
 // slow. The source defers freeing values while a snapshot that shares them lives.
 table_snapshot :: proc(source: ^Table) -> ^Table {
+	// A paged table can be copied, but the copy has to hold the values: it has no
+	// page file to read them from. Reads of a store with pages take the lock for
+	// the whole transaction instead, so this path is only a safety net.
+	if source.paged != nil {
+		schema := source.schema
+		clone, create_err := table_create(&schema)
+		if create_err.kind != .None do return nil
+		rows := make([dynamic]Row)
+		table_collect(source, &rows, max(u64))
+		defer table_collect_release(source, &rows)
+		for row in rows {
+			if insert_err := table_insert(clone, row.id, row.values); insert_err.kind != .None {
+				table_destroy(clone)
+				return nil
+			}
+		}
+		clone.next_row_id = source.next_row_id
+		clone.next_sequence = source.next_sequence
+		return clone
+	}
 	schema := source.schema
 	clone, create_err := table_create(&schema)
 	if create_err.kind != .None do return nil
@@ -782,6 +918,7 @@ table_snapshot :: proc(source: ^Table) -> ^Table {
 }
 
 table_row_count :: proc(t: ^Table) -> int {
+	if t.paged != nil do return int(t.paged.rows)
 	live := 0
 	for _, row in t.rows {
 		if row.deleted_seq == 0 do live += 1
@@ -789,7 +926,37 @@ table_row_count :: proc(t: ^Table) -> int {
 	return live
 }
 
-table_collect :: proc(t: ^Table, out: ^[dynamic]Row, seq: u64 = max(u64)) {
+// paged_row_put appends one decoded row for table_collect. The values are the
+// ones page_rows_scan decoded into the collect context's allocator.
+@(private)
+paged_collect_visit :: proc(ctx: rawptr, row: Row) -> bool {
+	collect := cast(^Paged_Collect_Ctx)ctx
+	append(collect.out, Row{id = row.id, values = row.values})
+	return true
+}
+
+@(private)
+Paged_Collect_Ctx :: struct {
+	out: ^[dynamic]Row,
+}
+
+// table_collect fills `out` with the visible rows, ordered by row id. A memory
+// table hands out its own values; a paged table decodes them into `alloc`, so the
+// caller owns them (table_collect_release frees a paged collect).
+table_collect :: proc(
+	t: ^Table,
+	out: ^[dynamic]Row,
+	seq: u64 = max(u64),
+	alloc: mem.Allocator = context.allocator,
+) {
+	if t.paged != nil {
+		ctx := Paged_Collect_Ctx{out = out}
+		_ = page_rows_scan(t.paged, alloc, &ctx, paged_collect_visit)
+		slice.sort_by(out[:], proc(a, b: Row) -> bool {
+			return u64(a.id) < u64(b.id)
+		})
+		return
+	}
 	reserve(out, len(out) + len(t.rows))
 	for _, row in t.rows {
 		values, visible := row_values_at(row, seq)
@@ -799,6 +966,50 @@ table_collect :: proc(t: ^Table, out: ^[dynamic]Row, seq: u64 = max(u64)) {
 	slice.sort_by(out[:], proc(a, b: Row) -> bool {
 		return u64(a.id) < u64(b.id)
 	})
+}
+
+// table_max_int returns the largest Int value in one column, or 0 when the
+// column holds none. It answers the INTEGER PRIMARY KEY assignment for both
+// backends: a paged table has no map to walk, so the pages are streamed and no
+// value is copied.
+table_max_int :: proc(t: ^Table, column: int) -> i64 {
+	best := i64(0)
+	if t.paged != nil {
+		ctx := Max_Column_Ctx{column = column}
+		_ = page_rows_each(t.paged, &ctx, max_column_visit)
+		return ctx.best
+	}
+	for _, row in t.rows {
+		if column >= len(row.values) do continue
+		if row.values[column].kind == .Int && row.values[column].i > best {
+			best = row.values[column].i
+		}
+	}
+	return best
+}
+
+@(private)
+Max_Column_Ctx :: struct {
+	column: int,
+	best:   i64,
+}
+
+@(private)
+max_column_visit :: proc(ctx: rawptr, row: Row) -> bool {
+	state := cast(^Max_Column_Ctx)ctx
+	if state.column < len(row.values) && row.values[state.column].kind == .Int {
+		if row.values[state.column].i > state.best do state.best = row.values[state.column].i
+	}
+	return true
+}
+
+// table_collect_release frees a collect from a paged table. A memory table's
+// values belong to the table, so only the list goes.
+table_collect_release :: proc(t: ^Table, rows: ^[dynamic]Row) {
+	if t.paged != nil {
+		for row in rows^ do free_values(row.values)
+	}
+	delete(rows^)
 }
 
 // alter_row_values lays one stored row out for the schema an ALTER produced.
@@ -866,6 +1077,13 @@ table_add_index :: proc(t: ^Table, index: Index_Schema) -> Error {
 		lookup = make(map[string]^Index_Bucket),
 	}
 	rbtree.init_cmp(&t.indexes[position].tree, index_cmp)
+	if t.paged != nil {
+		ctx := Add_Index_Ctx{position = position}
+		if scan_err := page_rows_each(t.paged, &ctx, add_index_visit); scan_err.kind != .None {
+			return scan_err
+		}
+		return ERROR_NONE
+	}
 	for _, row in t.rows {
 		key := index_entry_key(t, position, row.values, row.id)
 		if _, _, insert_err := rbtree.upsert(&t.indexes[position].tree, key, row.id); insert_err != nil {
@@ -876,6 +1094,28 @@ table_add_index :: proc(t: ^Table, index: Index_Schema) -> Error {
 		}
 	}
 	return ERROR_NONE
+}
+
+@(private)
+Add_Index_Ctx :: struct {
+	table:    ^Table,
+	position: int,
+	err:      Error,
+}
+
+@(private)
+add_index_visit :: proc(ctx: rawptr, row: Row) -> bool {
+	add := cast(^Add_Index_Ctx)ctx
+	key := index_entry_key(add.table, add.position, row.values, row.id)
+	if _, _, insert_err := rbtree.upsert(&add.table.indexes[add.position].tree, key, row.id); insert_err != nil {
+		add.err = errf(.Out_Of_Memory, "cannot grow index")
+		return false
+	}
+	if map_err := table_index_map_add(add.table, add.position, row.values, row.id); map_err.kind != .None {
+		add.err = map_err
+		return false
+	}
+	return true
 }
 
 // table_drop_index removes an index. Implicit indexes (the primary key and

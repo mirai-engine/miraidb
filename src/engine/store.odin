@@ -1,6 +1,7 @@
 package engine
 
 import "core:os"
+import "core:fmt"
 import "core:sync"
 import "core:mem"
 import "core:strings"
@@ -34,7 +35,18 @@ Store_Options :: struct {
 	// past this many bytes a worker rewrites it as one snapshot. Zero leaves it
 	// off. It only applies to a persistent database on the OS file system.
 	compact_after_bytes: u64,
+	// paged_tables puts the rows of tables created from now on in page files
+	// under <path>/tables instead of the in-memory row map. The page file is a
+	// cache of the log: it is rebuilt from the log when it is opened, so a
+	// crash never leaves it as the only copy. Existing tables stay in memory.
+	paged_tables: bool,
+	// page_frames is how many 4 KiB pages of each table file stay in the buffer
+	// pool. Zero means the default.
+	page_frames: int,
 }
+
+// STORE_DEFAULT_PAGE_FRAMES is the pool size when the caller does not set one.
+STORE_DEFAULT_PAGE_FRAMES :: 256
 
 // BACKGROUND_COMPACT_INTERVAL is how often the worker looks at the log size.
 BACKGROUND_COMPACT_INTERVAL_MS :: 100
@@ -129,6 +141,12 @@ Store :: struct {
 	// references are borrowed). Subscriptions use it to publish deltas.
 	on_commit:     proc(ctx: rawptr, store: ^Store, ops: []Store_Op),
 	on_commit_ctx: rawptr,
+	// paged_tables and page_frames are the options new tables inherit, and
+	// has_paged says whether any table of this store is paged: a read then keeps
+	// the store lock for the whole transaction instead of taking a snapshot.
+	paged_tables: bool,
+	page_frames:  int,
+	has_paged:    bool,
 }
 
 // Store_Op is one atomic change inside a transaction. The same representation
@@ -163,6 +181,9 @@ store_open :: proc(path: string, options: Store_Options) -> (^Store, Error) {
 	store.persistent = options.persistent
 	store.vfs = options.vfs
 	store.path = path
+	store.paged_tables = options.paged_tables
+	store.page_frames = options.page_frames
+	if store.page_frames <= 0 do store.page_frames = STORE_DEFAULT_PAGE_FRAMES
 	if options.in_memory_log {
 		store.log = log_open_memory()
 		return store, ERROR_NONE
@@ -183,6 +204,23 @@ store_open :: proc(path: string, options: Store_Options) -> (^Store, Error) {
 		if mkdir_err := os.make_directory_all(path); mkdir_err != nil {
 			free(store)
 			return nil, errf(.Io, "cannot create %s: %v", path, mkdir_err)
+		}
+	}
+	if store.paged_tables {
+		if store.vfs == nil {
+			// The page files are a cache of the log, so the directory is discarded
+			// and rebuilt by the replay below. A page file that survived a crash
+			// is never trusted over the log.
+			page_dir := strings.concatenate({path, "/tables"})
+			defer delete(page_dir)
+			if remove_err := os.remove_all(page_dir); remove_err != nil && os.exists(page_dir) {
+				free(store)
+				return nil, errf(.Io, "cannot clear %s: %v", page_dir, remove_err)
+			}
+			if mkdir_err := os.make_directory_all(page_dir); mkdir_err != nil {
+				free(store)
+				return nil, errf(.Io, "cannot create %s: %v", page_dir, mkdir_err)
+			}
 		}
 	}
 	// The directory is owned from here on. A second process that finds it held is
@@ -241,6 +279,11 @@ store_log_path :: proc(directory: string) -> string {
 store_close :: proc(store: ^Store) {
 	if store == nil do return
 	store_stop_background_compaction(store)
+	// A paged table is flushed before it is closed so a clean shutdown leaves the
+	// page files current; a crash leaves them stale, which the next open rebuilds.
+	if flush_err := store_flush_pages(store, store.commit_seq); flush_err.kind != .None {
+		store.last_error = flush_err
+	}
 	// Cached read snapshots own their cloned tables; release them before the
 	// live tables so nothing is destroyed twice.
 	frozen_cache_destroy(store.read_cache)
@@ -474,6 +517,85 @@ store_replay :: proc(store: ^Store) -> Error {
 			}
 		}
 	}
+	// The pages were rebuilt from the log, so they may now claim the sequence the
+	// replay reached. Until this flush the header names a sequence no page
+	// supports, which a later open would notice and rebuild.
+	if flush_err := store_flush_pages(store, store.commit_seq); flush_err.kind != .None {
+		return flush_err
+	}
+	return ERROR_NONE
+}
+
+// --- Paged tables ----------------------------------------------------------
+
+// store_paged_file_name turns a table name into a file name. Letters, digits and
+// .-_ survive; every other byte becomes %XX, so a quoted identifier cannot name a
+// path outside the directory.
+store_paged_file_name :: proc(name: string, alloc: mem.Allocator = context.allocator) -> string {
+	builder: strings.Builder
+	strings.builder_init(&builder, alloc)
+	for i in 0 ..< len(name) {
+		c := name[i]
+		switch c {
+		case 'a' ..= 'z', 'A' ..= 'Z', '0' ..= '9', '.', '-', '_':
+			strings.write_byte(&builder, c)
+		case:
+			fmt.sbprintf(&builder, "%%%02x", c)
+		}
+	}
+	return strings.to_string(builder)
+}
+
+store_table_page_path :: proc(store: ^Store, name: string) -> string {
+	file := store_paged_file_name(name)
+	defer delete(file)
+	return fmt.aprintf("%s/tables/%s", store.path, file)
+}
+
+store_remove_page_file :: proc(store: ^Store, name: string) {
+	path := store_table_page_path(store, name)
+	defer delete(path)
+	system := log_vfs_or_os(store.vfs)
+	_ = system.ops.remove(system, path)
+}
+
+// store_table_new creates the table object for a .Create_Table op. With paging
+// on, a user table gets a page file; internal tables stay in memory because the
+// engine scans them whole (the full-text shadow tables, the catalogs) and paging
+// them would add I/O without removing a scan.
+store_table_new :: proc(store: ^Store, schema_in: Table_Schema) -> (^Table, Error) {
+	schema := schema_in
+	table, table_err := table_create(&schema)
+	if table_err.kind != .None do return nil, table_err
+	if !store.paged_tables do return table, ERROR_NONE
+	if !store.persistent {
+		table_destroy(table)
+		return nil, errf(.Invalid_Argument, "paged tables need a persistent store")
+	}
+	if strings.has_prefix(table.schema.name, "_") do return table, ERROR_NONE
+	path := store_table_page_path(store, table.schema.name)
+	defer delete(path)
+	rows, rows_err := page_rows_create(store.vfs, path, store.page_frames)
+	if rows_err.kind != .None {
+		table_destroy(table)
+		return nil, rows_err
+	}
+	table.paged = rows
+	store.has_paged = true
+	return table, ERROR_NONE
+}
+
+// store_flush_pages writes every dirty page and its header at `seq`. The log is
+// already durable when the commit path calls it, so a header that names a
+// sequence never promises a change the log does not have.
+store_flush_pages :: proc(store: ^Store, seq: u64) -> Error {
+	if !store.has_paged do return ERROR_NONE
+	for _, table in store.tables {
+		if table.paged == nil do continue
+		if flush_err := page_rows_flush(table.paged, seq); flush_err.kind != .None {
+			return flush_err
+		}
+	}
 	return ERROR_NONE
 }
 
@@ -507,7 +629,7 @@ store_apply :: proc(store: ^Store, op: Store_Op) -> Error {
 			return errf(.Table_Exists, "table %s already exists", op.name)
 		}
 		schema := op.schema
-		table, table_err := table_create(&schema)
+		table, table_err := store_table_new(store, schema)
 		if table_err.kind != .None do return table_err
 		// The table arena owns its schema name; keying by it keeps the map entry
 		// valid as long as the table exists.
@@ -517,6 +639,9 @@ store_apply :: proc(store: ^Store, op: Store_Op) -> Error {
 	case .Alter_Table:
 		existing, exists := store.tables[op.name]
 		if !exists do return errf(.Table_Not_Found, "table %s does not exist", op.name)
+		if existing.paged != nil {
+			return errf(.Sql_Unsupported, "alter a table that uses the page store")
+		}
 		schema := op.schema
 		replacement, table_err := table_create(&schema)
 		if table_err.kind != .None do return table_err
@@ -538,7 +663,9 @@ store_apply :: proc(store: ^Store, op: Store_Op) -> Error {
 			// Remove the map entry before destroying the table: the stored key
 			// lives in the table's arena.
 			map_erase(&store.tables, op.name)
+			paged := table.paged != nil
 			table_destroy(table)
+			if paged do store_remove_page_file(store, op.name)
 		}
 		return ERROR_NONE
 	case .Insert:
@@ -943,6 +1070,13 @@ store_commit_prepared :: proc(store: ^Store, prepared: []^Prepared_Tx) -> (int, 
 	store.commit_seq = seq
 	store.last_commit_us = now_microseconds()
 	flush_err := log_flush(&store.log)
+	if flush_err.kind == .None {
+		// A page-flush failure is not a commit failure: the log holds the change
+		// and the pages are a cache, so it is recorded and the commit stands.
+		if page_err := store_flush_pages(store, seq); page_err.kind != .None {
+			store.last_error = page_err
+		}
+	}
 	notify := store.on_commit
 	notify_ctx := store.on_commit_ctx
 	sync.unlock(&store.mutex)

@@ -3494,7 +3494,12 @@ like_match :: proc(text, pattern: string, case_insensitive: bool, escape: u8 = 0
 @(private)
 find_conflict_row :: proc(tx: ^Tx, table: ^Table, values: []Value) -> (Row, bool) {
 	if len(table.schema.primary_key) == 0 do return {}, false
-	for _, row in table.rows {
+	// A paged table has no row map, so both backends answer through a collect.
+	// The values live in the transaction arena and stay valid for the statement.
+	rows := make([dynamic]Row)
+	defer delete(rows)
+	table_collect(table, &rows, max(u64), tx.alloc)
+	for row in rows {
 		matches := true
 		for position in table.schema.primary_key {
 			if position >= len(row.values) || position >= len(values) {
