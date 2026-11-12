@@ -31,6 +31,13 @@ Bug reports, fixes and tests are welcome.
   code registered with the host.
 - Tests live in `src/tests` and run without network access.
 
+## Commits
+
+One change per commit, in the imperative: what it does, then why it had to be
+done that way. Tests and the doc that states the new behaviour travel with the
+code. Small follow-ups get their own commit; the history is published as it is,
+so no squashing is needed and none is expected.
+
 ## Repository hygiene
 
 `bin/`, `_test_*` and any local `*.db` directory are ignored by git. Do not
