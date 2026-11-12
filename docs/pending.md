@@ -42,9 +42,11 @@ Every change must leave this green:
 python3 scripts/ci.py
 
 python3 scripts/build.py                                   # builds and tests
-odin test src/tests                                        # 184 tests
+odin test src/tests                                        # 186 tests
 python3 scripts/conformance.py --bin ./bin/miraidb.exe     # 20/20
 python3 scripts/shell_smoke.py                             # 11/11
+python3 scripts/lock_smoke.py                              # two processes, one owner
+python3 scripts/bench.py --check                           # against benchmarks/baseline.json
 python3 scripts/roadmap.py --check                         # 100/100
 
 # The DLL smokes need an interpreter that can load the DLL; when it is not on

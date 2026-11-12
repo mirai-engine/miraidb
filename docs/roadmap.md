@@ -20,8 +20,8 @@ outranks the dependent.
 |---|---|---|---|---|
 | 1 | **D18a — writer lock** — *done* | Two processes on one directory corrupted each other silently; now the second open is refused with `locked` and the owner's pid, proven in-process and with two real processes. | S | — |
 | 2 | **ASAN pass** over CLI, soak and conformance | The two real bugs in this project were memory bugs; the pass protects every later phase, and is cheapest before the page store exists. | 1 round | — |
-| 3 | **D8 — fault injection** | A VFS wrapper that fails the Nth write proves the log never leaves a third state; the page store will need exactly this harness. | S | — |
-| 4 | **Benchmark gate** (`scripts/bench.py`, 10% threshold) | Turns the efficiency contract below into a build failure instead of a good intention; must exist before performance work starts. | S | — |
+| 3 | **D8 — fault injection** — *done* | `Fault_Vfs` fails any operation at any call; `test_fault_injection` walks every write of a workload and proves the reopened state is exactly the commits that reported success. The page store will reuse the harness. | S | — |
+| 4 | **Benchmark gate** — *done* | `scripts/bench.py` records bytes per row, insert rate, read cost and compaction in `benchmarks/baseline.json` and fails the build beyond the recorded limits; the efficiency contract is now enforced, not remembered. | S | — |
 | 5 | **D11 — DDL inside a transaction** | `CREATE INDEX` cannot share a transaction with `CREATE TABLE`; that single restriction is why full-text needs a scan. Unblocks #6. | S | — |
 | 6 | **D1 — FTS term index + BM25** | A per-term index and real ranking: the first of the three asks, and the visible one. | M | D11 |
 | 7 | **D13 — return the stored result on a retry** | Exactly-once currently skips a repeat call; a caller retrying after a lost response should get the same answer. | S | — |
@@ -142,7 +142,7 @@ after it, apply through `commitlog`, expose the last applied sequence.
 |---|---|---|---|
 | **Address sanitizer** over CLI, soak and conformance | Memory bugs have been the real risk | 1 round per phase | #2 |
 | **Fault injection** (D8) | Proves no third state after a failed write | S, then extended | #3 |
-| **Benchmark with thresholds** | A 10% regression fails the build | 1 day | #4 |
+| **Benchmark with thresholds** — *done* | Bytes per row within 10%; timings under a 3x catastrophe guard, because a shared machine cannot promise 10% (the 10% time rule is measured by hand with `--record`) | 1 day | #4 |
 | **CI on Linux and macOS** | Locking and the VFS are per-OS | 2–3 days | #13 |
 | **Release packaging** | Versioned library, header, `pkg-config`, binaries, changelog | 2–3 days | #23 |
 | **Auth review** | Tokens, subscriptions, byte and work budgets under attack | 1 day | #24 |
@@ -180,6 +180,13 @@ reason written down instead.
 
 ## Closed already (for the record)
 
+- **Benchmark gate** — `benchmarks/baseline.json` plus `scripts/bench.py --check`
+  as a CI gate: bytes per row within 10%, insert rate, read cost and compaction
+  under a 3x guard, with the machine recorded beside the numbers.
+- **D8 fault injection** — `Fault_Vfs` (open/read/write/seek/truncate/sync/remove,
+  or a short write) and `test_fault_injection`, which arms the fault at every write
+  of a workload and checks that the reopen sees only successful commits. A short
+  write is now an error in the log, not a silent success.
 - **D18a writer lock** — `<directory>/lock` held with an OS lock (Windows
   `LockFileEx`, POSIX `fcntl`), released on close and on death; the refusal names
   the owner (`test_writer_lock`, and `scripts/lock_smoke.py`, which opens the

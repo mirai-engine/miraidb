@@ -468,3 +468,222 @@ vfs_read_all :: proc(file: ^Vfs_File, size: int, alloc := context.allocator) -> 
 }
 
 _ :: mem
+
+// --- Fault wrapper ---------------------------------------------------------
+
+// Fault_Kind names the operation a Fault_Vfs can break.
+Fault_Kind :: enum u8 {
+	None,
+	Open,
+	Read,
+	Write,
+	Seek,
+	Truncate,
+	Sync,
+	Remove,
+}
+
+// Fault_Vfs wraps another file system and fails the nth call of one operation.
+// It is the tool the durability story is tested with: a write path must either
+// commit or report failure, never leave a third state, and this is what makes
+// that claim repeatable instead of hopeful.
+//
+// `short` makes the failing write return that many bytes with no error, which is
+// how a partial physical write looks to the caller; the log must treat it as a
+// failure rather than assume the whole record landed.
+Fault_Vfs :: struct {
+	inner:    ^Vfs,
+	kind:     Fault_Kind,
+	fail_at:  u64, // 1-based call number; zero disables the fault
+	calls:    u64,
+	fired:    bool,
+	short:    int,
+	failures: u64,
+}
+
+@(private)
+Vfs_Fault_File :: struct {
+	vfs:  ^Fault_Vfs,
+	file: ^Vfs_File,
+}
+
+@(private)
+vfs_fault_maybe_fail :: proc(vfs: ^Fault_Vfs, kind: Fault_Kind) -> (bool, Error) {
+	if vfs.kind != kind do return false, ERROR_NONE
+	vfs.calls += 1
+	if vfs.fail_at == 0 || vfs.calls != vfs.fail_at do return false, ERROR_NONE
+	vfs.fired = true
+	vfs.failures += 1
+	name := "operation"
+	switch kind {
+	case .Open:
+		name = "open"
+	case .Read:
+		name = "read"
+	case .Write:
+		name = "write"
+	case .Seek:
+		name = "seek"
+	case .Truncate:
+		name = "truncate"
+	case .Sync:
+		name = "sync"
+	case .Remove:
+		name = "remove"
+	case .None:
+	}
+	if kind == .Write && vfs.short > 0 {
+		return true, ERROR_NONE
+	}
+	return true, errf(.Io, "injected fault: %s %d", name, vfs.calls)
+}
+
+@(private)
+vfs_fault_open :: proc(vfs: ^Vfs, path: string, mode: Vfs_Mode) -> (^Vfs_File, Error) {
+	wrapper := cast(^Fault_Vfs)vfs.data
+	if fired, fault := vfs_fault_maybe_fail(wrapper, .Open); fired {
+		if fault.kind != .None do return nil, fault
+	}
+	file, open_err := wrapper.inner.ops.open(wrapper.inner, path, mode)
+	if open_err.kind != .None do return nil, open_err
+	entry := new(Vfs_Fault_File)
+	entry.vfs = wrapper
+	entry.file = file
+	wrapped := new(Vfs_File)
+	wrapped.ops = vfs.ops
+	wrapped.vfs = vfs
+	wrapped.data = entry
+	return wrapped, ERROR_NONE
+}
+
+@(private)
+vfs_fault_close :: proc(file: ^Vfs_File) {
+	entry := cast(^Vfs_Fault_File)file.data
+	if entry != nil && entry.file != nil do entry.file.ops.close(entry.file)
+	free(entry)
+	free(file)
+}
+
+@(private)
+vfs_fault_read :: proc(file: ^Vfs_File, buffer: []u8) -> (int, Error) {
+	entry := cast(^Vfs_Fault_File)file.data
+	if fired, fault := vfs_fault_maybe_fail(entry.vfs, .Read); fired {
+		if fault.kind != .None do return 0, fault
+	}
+	return entry.file.ops.read(entry.file, buffer)
+}
+
+@(private)
+vfs_fault_write :: proc(file: ^Vfs_File, data: []u8) -> (int, Error) {
+	entry := cast(^Vfs_Fault_File)file.data
+	wrapper := entry.vfs
+	if fired, fault := vfs_fault_maybe_fail(wrapper, .Write); fired {
+		if fault.kind != .None do return 0, fault
+		// A short write: the first bytes land and the call reports success, which
+		// is what a losing physical write looks like above the driver.
+		short := wrapper.short
+		if short > len(data) do short = len(data)
+		written, write_err := entry.file.ops.write(entry.file, data[:short])
+		if write_err.kind != .None do return written, write_err
+		return short, ERROR_NONE
+	}
+	return entry.file.ops.write(entry.file, data)
+}
+
+@(private)
+vfs_fault_seek :: proc(file: ^Vfs_File, offset: i64) -> (i64, Error) {
+	entry := cast(^Vfs_Fault_File)file.data
+	if fired, fault := vfs_fault_maybe_fail(entry.vfs, .Seek); fired {
+		if fault.kind != .None do return 0, fault
+	}
+	return entry.file.ops.seek(entry.file, offset)
+}
+
+@(private)
+vfs_fault_truncate :: proc(file: ^Vfs_File, size: i64) -> Error {
+	entry := cast(^Vfs_Fault_File)file.data
+	if fired, fault := vfs_fault_maybe_fail(entry.vfs, .Truncate); fired {
+		if fault.kind != .None do return fault
+	}
+	return entry.file.ops.truncate(entry.file, size)
+}
+
+@(private)
+vfs_fault_sync :: proc(file: ^Vfs_File) -> Error {
+	entry := cast(^Vfs_Fault_File)file.data
+	if fired, fault := vfs_fault_maybe_fail(entry.vfs, .Sync); fired {
+		if fault.kind != .None do return fault
+	}
+	return entry.file.ops.sync(entry.file)
+}
+
+@(private)
+vfs_fault_size :: proc(file: ^Vfs_File) -> i64 {
+	entry := cast(^Vfs_Fault_File)file.data
+	return entry.file.ops.size(entry.file)
+}
+
+@(private)
+vfs_fault_remove :: proc(vfs: ^Vfs, path: string) -> Error {
+	wrapper := cast(^Fault_Vfs)vfs.data
+	if fired, fault := vfs_fault_maybe_fail(wrapper, .Remove); fired {
+		if fault.kind != .None do return fault
+	}
+	return wrapper.inner.ops.remove(wrapper.inner, path)
+}
+
+@(private)
+vfs_fault_ops := Vfs_Ops {
+	open     = vfs_fault_open,
+	close    = vfs_fault_close,
+	read     = vfs_fault_read,
+	write    = vfs_fault_write,
+	seek     = vfs_fault_seek,
+	truncate = vfs_fault_truncate,
+	sync     = vfs_fault_sync,
+	size     = vfs_fault_size,
+	remove   = vfs_fault_remove,
+}
+
+// vfs_fault_new wraps another file system. No fault is armed until
+// vfs_fault_arm is called, so the same wrapper can run a clean warm-up.
+vfs_fault_new :: proc(inner: ^Vfs) -> ^Vfs {
+	wrapper := new(Fault_Vfs)
+	wrapper.inner = inner
+	vfs := new(Vfs)
+	vfs.ops = &vfs_fault_ops
+	vfs.data = wrapper
+	return vfs
+}
+
+// vfs_fault_arm makes the `nth` call of `kind` fail; zero disarms.
+vfs_fault_arm :: proc(vfs: ^Vfs, kind: Fault_Kind, nth: u64) {
+	if vfs == nil || vfs.data == nil do return
+	wrapper := cast(^Fault_Vfs)vfs.data
+	wrapper.kind = kind
+	wrapper.fail_at = nth
+	wrapper.calls = 0
+	wrapper.fired = false
+	wrapper.short = 0
+}
+
+// vfs_fault_short makes the armed write return `bytes` with no error instead of
+// failing outright.
+vfs_fault_short :: proc(vfs: ^Vfs, bytes: int) {
+	if vfs == nil || vfs.data == nil do return
+	wrapper := cast(^Fault_Vfs)vfs.data
+	wrapper.short = bytes
+}
+
+// vfs_fault_fired reports whether the armed fault was reached.
+vfs_fault_fired :: proc(vfs: ^Vfs) -> bool {
+	if vfs == nil || vfs.data == nil do return false
+	wrapper := cast(^Fault_Vfs)vfs.data
+	return wrapper.fired
+}
+
+vfs_fault_destroy :: proc(vfs: ^Vfs) {
+	if vfs == nil || vfs.data == nil do return
+	free(vfs.data)
+	free(vfs)
+}

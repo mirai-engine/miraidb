@@ -1,0 +1,18 @@
+{
+  "machine": {
+    "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-musl1",
+    "machine": "x86_64",
+    "processor": "",
+    "python": "3.14.5"
+  },
+  "metrics": {
+    "rows": 20000,
+    "iterations": 2000,
+    "insert_per_s": 42219.0,
+    "insert_seconds": 0.56,
+    "read_us_per_tx": 50.9,
+    "compact_seconds": 0.374,
+    "database_bytes": 1600296,
+    "bytes_per_row": 80.015
+  }
+}

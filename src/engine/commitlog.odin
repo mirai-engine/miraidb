@@ -96,8 +96,16 @@ log_file_close :: proc(handle: ^Log_File) {
 	free(handle)
 }
 
+// log_file_write appends the whole payload or reports a failure. A write that
+// lands only part of the bytes is a failure, not a success: the caller must not
+// record a commit whose record is incomplete.
 log_file_write :: proc(handle: ^Log_File, data: []u8) -> (int, Error) {
-	return handle.vfs.ops.write(handle.file, data)
+	written, write_err := handle.vfs.ops.write(handle.file, data)
+	if write_err.kind != .None do return written, write_err
+	if written != len(data) {
+		return written, errf(.Io, "short write: %d of %d bytes", written, len(data))
+	}
+	return written, ERROR_NONE
 }
 
 log_file_read :: proc(handle: ^Log_File, buffer: []u8) -> (int, Error) {

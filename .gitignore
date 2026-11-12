@@ -21,3 +21,6 @@ server.log
 /_soak_db/
 /_buzz_db/
 __pycache__/
+
+# bench.py workspace
+/_bench_tmp/

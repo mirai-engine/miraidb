@@ -28,7 +28,7 @@ Rules for this file:
 | D5 | Persistent indexes | rebuilt in memory when a database opens | index pages on disk | L | P2 |
 | D6 | Query planner | nested loop + index probes | cost model, statistics, reordering | L | P1 |
 | D7 | Scheduler durability | **durable** (due time is a logged column) | recovery test | S | — |
-| D8 | Crash injection | fuzzer and soak only | fault injection at every write offset | S | P1 |
+| D8 | Crash injection | **done**: `Fault_Vfs` fails any operation at any call, and `test_fault_injection` walks the write offsets | same for the snapshot and the mirror writes | S | P1 |
 | D9 | SQL grammar | 32 statements, no window frames | frames, recursive CTE, full `ALTER` | L | P2 |
 | D10 | Types and precision | `Int128` as two `u64` | decimal arithmetic, time zones | M | P3 |
 | D11 | Virtual-table breadth | no index inside a `CREATE` | index in the same transaction, triggers/policies | S | P1 |
@@ -204,17 +204,26 @@ tested: there is no fault injection (D8) to prove it.
 
 ## D8 — Fault injection
 
-**Now.** `scripts/fuzz.py` generates statements, `scripts/soak.py` runs long
-sessions, and recovery is tested with a torn tail and a flipped bit.
+**Now.** `Fault_Vfs` wraps any file system and fails the nth call of one
+operation (open, read, write, seek, truncate, sync, remove), or makes a write land
+only part of its bytes. `test_fault_injection` arms the fault at every write of a
+short workload — the log header, the record of `CREATE TABLE`, the record of each
+commit — reopens without the fault, and asserts that the rows that landed are
+exactly the commits that reported success: never a third state. Short writes are
+failures now: `log_file_write` refuses a write that lands fewer bytes than the
+record needs, so a half-written record is never recorded as a commit. A read
+fault during replay is reported as an error and the database opens once reads
+work again.
 
-**Cost.** No test exercises a write failing at an arbitrary offset.
+**Cost.** The same walk over the snapshot file and the `.sqlite` mirror is not
+written yet; `scripts/fuzz.py` and `scripts/soak.py` still cover the statement
+side.
 
-**Done when.** A VFS wrapper fails the Nth write for every N in a range, and the
-suite asserts that opening the database afterwards yields either the previous
-state or the new one — never a third one. Same for the snapshot file and the
-mirror.
+**Done when.** The same N-by-N walk covers snapshot writes, rotation and the
+mirror, and a kill during a dirty flush is tested once pages exist.
 
-**Not claimed today.** "Crash-safe" beyond the torn-tail cases that are tested.
+**Not claimed today.** "Crash-safe" beyond the torn-tail cases and the write
+walk that exists now.
 
 ## D9 — The rest of the grammar
 

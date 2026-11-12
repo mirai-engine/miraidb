@@ -7960,3 +7960,120 @@ test_writer_lock :: proc(t: ^testing.T) {
 	_, missing_err := db.store_open(missing, {persistent = true, create = false, durable = false})
 	testing.expect_value(t, missing_err.kind, db.Error_Kind.Io)
 }
+
+@(test)
+test_fault_injection :: proc(t: ^testing.T) {
+	// Every write of a short workload is broken in turn: the append of the log
+	// header, the record of CREATE TABLE, the record of each commit. A run may
+	// commit or report failure; what it may never do is report failure and leave
+	// the row behind, or report success and lose it. The database is reopened
+	// without the fault to see what really landed.
+	memory := db.vfs_memory_new()
+	defer db.vfs_memory_destroy(memory)
+	fault := db.vfs_fault_new(memory)
+	defer db.vfs_fault_destroy(fault)
+
+	fired := 0
+	for n in 1 ..= 24 {
+		path := fmt.aprintf("_fault_%d", n)
+		db.vfs_fault_arm(fault, .Write, u64(n))
+		store, open_err := db.store_open(path, {persistent = true, create = true, durable = true, vfs = fault})
+		if !db.error_ok(open_err) {
+			// A fault during the initial header leaves no usable database; opening
+			// again must report the same thing instead of inventing state.
+			_, retry_err := db.store_open(path, {persistent = true, create = false, durable = false, vfs = memory})
+			testing.expectf(t, retry_err.kind != .None, "n=%d: a failed header opened clean", n)
+			delete(path)
+			continue
+		}
+		created := db.error_ok(run_err(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"))
+		inserted := 0
+		for i in 0 ..< 6 {
+			statement := fmt.aprintf("INSERT INTO t (v) VALUES (%d)", i)
+			_, insert_err := db.sql_execute(store, statement)
+			delete(statement)
+			if db.error_ok(insert_err) do inserted += 1
+		}
+		if db.vfs_fault_fired(fault) do fired += 1
+		db.store_close(store)
+
+		clean, clean_err := db.store_open(path, {persistent = true, create = false, durable = false, vfs = memory})
+		if !testing.expectf(t, db.error_ok(clean_err), "n=%d: reopen failed: %s", n, clean_err.message) {
+			delete(path)
+			continue
+		}
+		result, count_err := db.sql_execute(clean, "SELECT count(*) FROM t")
+		count := i64(0)
+		if db.error_ok(count_err) {
+			count = result.rows[0][0].i
+		}
+		testing.expectf(t, db.error_ok(count_err) == created, "n=%d: table exists=%v created=%v", n, db.error_ok(count_err), created)
+		testing.expectf(t, count == i64(inserted), "n=%d: %d rows landed, %d commits reported success", n, count, inserted)
+		db.store_close(clean)
+		delete(path)
+	}
+
+	// A short write is a failed write: the record is incomplete, so the commit
+	// must not be reported as applied, and the reopen must not see the row.
+	short_fired := 0
+	for n in 1 ..= 8 {
+		path := fmt.aprintf("_fault_short_%d", n)
+		store, open_err := db.store_open(path, {persistent = true, create = true, durable = true, vfs = fault})
+		if !db.error_ok(open_err) {
+			delete(path)
+			continue
+		}
+		// Arm after the open: every one of these faults lands on a record.
+		db.vfs_fault_arm(fault, .Write, u64(n))
+		db.vfs_fault_short(fault, 3)
+		created := db.error_ok(run_err(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"))
+		inserted := 0
+		_, insert_err := db.sql_execute(store, "INSERT INTO t (v) VALUES (1)")
+		if db.error_ok(insert_err) do inserted += 1
+		if db.vfs_fault_fired(fault) do short_fired += 1
+		db.store_close(store)
+		clean, clean_err := db.store_open(path, {persistent = true, create = false, durable = false, vfs = memory})
+		testing.expectf(t, db.error_ok(clean_err), "short n=%d: reopen: %s", n, clean_err.message)
+		if db.error_ok(clean_err) {
+			result, count_err := db.sql_execute(clean, "SELECT count(*) FROM t")
+			count := i64(0)
+			if db.error_ok(count_err) do count = result.rows[0][0].i
+			testing.expectf(t, db.error_ok(count_err) == created, "short n=%d: table exists=%v created=%v", n, db.error_ok(count_err), created)
+			testing.expectf(t, count == i64(inserted), "short n=%d: %d rows, %d reported", n, count, inserted)
+			db.store_close(clean)
+		}
+		delete(path)
+	}
+
+	testing.expectf(t, fired > 0, "no write fault was ever reached")
+	testing.expectf(t, short_fired > 0, "no short write was ever reached")
+
+	// A read failure during recovery is reported, never a crash, and the database
+	// still opens once reads work again.
+	{
+		path := fmt.aprintf("_fault_read")
+		defer delete(path)
+		store, open_err := db.store_open(path, {persistent = true, create = true, durable = false, vfs = memory})
+		if !testing.expectf(t, db.error_ok(open_err), "seed open: %s", open_err.message) do return
+		run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+		run(t, store, "INSERT INTO t (id) VALUES (1)")
+		db.store_close(store)
+
+		db.vfs_fault_arm(fault, .Read, 1)
+		_, replay_err := db.store_open(path, {persistent = true, create = false, durable = false, vfs = fault})
+		testing.expectf(t, replay_err.kind != .None, "a failing read during replay must be reported")
+		db.vfs_fault_arm(fault, .Read, 0)
+		clean, clean_err := db.store_open(path, {persistent = true, create = false, durable = false, vfs = memory})
+		testing.expectf(t, db.error_ok(clean_err), "reopen after a read fault: %s", clean_err.message)
+		if db.error_ok(clean_err) {
+			testing.expect_value(t, scalar(t, clean, "SELECT count(*) FROM t").i, i64(1))
+			db.store_close(clean)
+		}
+	}
+}
+
+@(private)
+run_err :: proc(t: ^testing.T, store: ^db.Store, sql: string) -> db.Error {
+	_, err := db.sql_execute(store, sql)
+	return err
+}

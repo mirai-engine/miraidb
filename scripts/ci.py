@@ -75,6 +75,7 @@ def main() -> int:
         Gate("conformance (20 cases)", [sys.executable, "scripts/conformance.py", "--bin", "./bin/miraidb.exe"])
     )
     gates.append(Gate("shell smoke", [sys.executable, "scripts/shell_smoke.py"]))
+    gates.append(Gate("performance baseline", [sys.executable, "scripts/bench.py", "--check"]))
     if not args.skip_dll:
         if os.path.exists(args.windows_python):
             gates.append(Gate("C ABI smoke", [args.windows_python, "scripts/capi_smoke.py"]))

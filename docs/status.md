@@ -22,6 +22,13 @@ honest measurement.
   at the snapshot boundary; validated lookups and rebuild on demand.
 - Recovery coverage: a torn tail and a flipped payload bit both stop the replay
   at the previous record and repair the file.
+- Fault injection: `Fault_Vfs` fails the nth call of open/read/write/seek/
+  truncate/sync/remove, or makes a write land part of its bytes. The test arms the
+  fault at every write of a workload — log header, `CREATE TABLE` record, each
+  commit — reopens without it, and finds exactly the commits that reported
+  success. A short write is an error, never a silent success.
+- A benchmark baseline (`benchmarks/baseline.json`) records bytes per row, insert
+  rate, read cost and compaction; `scripts/bench.py --check` runs as a CI gate.
 - Durability modes: `Full` (fsync per commit), `Batched` (every 64 commits and
   on close) and `None`; the CLI exposes `--durability=full|batched|none`.
 - Replay on open, torn-tail detection and truncation.

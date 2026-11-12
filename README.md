@@ -242,7 +242,7 @@ host.on_update = proc(ctx: rawptr, update: ^db.Subscription_Update) {
 | M5 | Hosted mode: `miraidbd`, authentication, connection-scoped authorization |
 | M6 | Retries with backoff, request timeouts, connection limits |
 | M7 | Module ABI: trusted native Odin extensions, then sandboxed WASM modules |
-| M8 | Hardening: statement fuzzing and a soak harness (`scripts/fuzz.py`, `scripts/soak.py`), latency histograms, `PRAGMA integrity_check` and `foreign_key_check`, transport caps and opt-in background compaction; crash injection and process-level load tests remain |
+| M8 | Hardening: statement fuzzing and a soak harness (`scripts/fuzz.py`, `scripts/soak.py`), fault injection at every write of a workload (`Fault_Vfs`), latency histograms, `PRAGMA integrity_check` and `foreign_key_check`, transport caps, opt-in background compaction, a benchmark gate against a recorded baseline; process-level load tests remain |
 
 Snapshots and compaction came before the network layer on purpose: without
 them, recovery time grows with the log and range queries scan the table.
