@@ -110,6 +110,9 @@ Store :: struct {
 	// rows_scanned is how many rows every scan visited since the last reset. It is
 	// what proves a predicate narrows a scan instead of being checked per row.
 	rows_scanned: u64,
+	// stream_scans counts the queries answered by the page-streaming path: they
+	// never collected the table, which is the claim the memory test rests on.
+	stream_scans: u64,
 	// apply_seq is the commit being applied; table versions are stamped with it.
 	apply_seq:           u64,
 	// attached holds the databases ATTACH opened, by name. They are read-only

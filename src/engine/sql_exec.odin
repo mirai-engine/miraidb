@@ -718,6 +718,10 @@ Eval_Ctx :: struct {
 	grouped: bool,
 	params:  []Value,
 	now_us:  i64,
+	// stream is set only while a streaming scan evaluates its final projection:
+	// an aggregate then answers from its running accumulator instead of walking
+	// a materialized group.
+	stream: ^Agg_Stream,
 }
 
 @(private)
@@ -1401,6 +1405,399 @@ window_cell_for :: proc(positions: []int, index: int) -> int {
 	return -1
 }
 
+// --- Streaming scan ---------------------------------------------------------
+
+// Agg_Acc is one aggregate accumulated as rows stream past. It mirrors what
+// eval_aggregate does over a materialized group, with the group replaced by a
+// running value: count, sum, total, avg, min, max and group_concat.
+Agg_Acc :: struct {
+	call:       Call_Expr,
+	name:       string,
+	seen:       int,
+	best:       Value,
+	sum_int:    i64,
+	sum_float:  f64,
+	sum_128:    i128,
+	uses_float: bool,
+	uses_128:   bool,
+	builder:    strings.Builder,
+	has_text:   bool,
+	separator:  string,
+	sep_owned:  bool,
+}
+
+// Agg_Stream is the set of aggregates a streaming scan is accumulating, plus the
+// first row that passed the filter: a projection that mixes an aggregate with a
+// plain column reads that row, the way a group aggregate reads the group.
+Agg_Stream :: struct {
+	accs:         [dynamic]Agg_Acc,
+	first_values: []Value,
+	first_id:     Row_Id,
+	have_first:   bool,
+}
+
+@(private)
+agg_stream_destroy :: proc(stream: ^Agg_Stream) {
+	for &acc in stream.accs {
+		value_deep_free(acc.best, context.allocator)
+		if acc.builder.buf != nil do strings.builder_destroy(&acc.builder)
+		if acc.sep_owned do delete(acc.separator)
+	}
+	delete(stream.accs)
+	free_values(stream.first_values)
+}
+
+@(private)
+agg_stream_lookup :: proc(stream: ^Agg_Stream, call: Call_Expr) -> ^Agg_Acc {
+	for &acc in stream.accs {
+		if !strings.equal_fold(acc.name, call.name) do continue
+		if acc.call.star != call.star do continue
+		if len(acc.call.args) != len(call.args) do continue
+		if len(call.args) == 0 do return &acc
+		if acc.call.args[0] == call.args[0] do return &acc
+	}
+	return nil
+}
+
+// agg_stream_add folds one row into every accumulator. The row context is the
+// one the WHERE clause just used, so the aggregate argument sees the same values.
+@(private)
+agg_stream_add :: proc(row_ctx: ^Eval_Ctx, stream: ^Agg_Stream) -> Error {
+	for &acc in stream.accs {
+		if acc.call.star || len(acc.call.args) == 0 {
+			acc.seen += 1
+			continue
+		}
+		value, value_err := eval_expr(row_ctx, acc.call.args[0])
+		if value_err.kind != .None do return value_err
+		if value.kind == .Null do continue
+		acc.seen += 1
+		switch acc.name {
+		case "count":
+		// counted above
+		case "min", "max":
+			if acc.best.kind == .Null {
+				acc.best = value_clone(value, context.allocator)
+			} else {
+				order, comparable := value_compare(value, acc.best)
+				if !comparable do return errf(.Invalid_Type, "%s() mixes incompatible types", acc.name)
+				if (acc.name == "min" && order == .Less) || (acc.name == "max" && order == .Greater) {
+					value_deep_free(acc.best, context.allocator)
+					acc.best = value_clone(value, context.allocator)
+				}
+			}
+		case "sum", "total", "avg":
+			if !value_is_numeric(value) {
+				return errf(.Invalid_Type, "%s() expects numbers", acc.name)
+			}
+			if value.kind == .Float {
+				acc.uses_float = true
+				number, _ := value_to_f64(value)
+				acc.sum_float += number
+			} else if value.kind == .Int128 || value.kind == .Uint128 {
+				if !acc.uses_128 {
+					acc.uses_128 = true
+					acc.sum_128 = i128(acc.sum_int)
+				}
+				acc.sum_128 += value_as_i128(value)
+			} else if acc.uses_float {
+				number, _ := value_to_f64(value)
+				acc.sum_float += number
+			} else if acc.uses_128 {
+				number, _ := value_to_i64(value)
+				acc.sum_128 += i128(number)
+			} else {
+				number, _ := value_to_i64(value)
+				acc.sum_int += number
+			}
+		case "group_concat", "string_agg":
+			if !acc.has_text {
+				if acc.builder.buf == nil do strings.builder_init(&acc.builder, context.allocator)
+				acc.separator = ","
+				if len(acc.call.args) == 2 {
+					separator_value, sep_err := eval_expr(row_ctx, acc.call.args[1])
+					if sep_err.kind != .None do return sep_err
+					if separator_value.kind != .Null {
+						acc.separator = value_format(separator_value, context.allocator)
+						acc.sep_owned = true
+					}
+				}
+				acc.has_text = true
+			} else if len(acc.separator) > 0 {
+				strings.write_string(&acc.builder, acc.separator)
+			}
+			piece := value_format(value, context.allocator)
+			strings.write_string(&acc.builder, piece)
+			delete(piece)
+		}
+	}
+	return ERROR_NONE
+}
+
+@(private)
+agg_stream_value :: proc(acc: ^Agg_Acc) -> (Value, Error) {
+	switch acc.name {
+	case "count":
+		return value_int(i64(acc.seen)), ERROR_NONE
+	case "min", "max":
+		return value_clone(acc.best, context.allocator), ERROR_NONE
+	case "sum", "total":
+		if acc.seen == 0 do return value_null(), ERROR_NONE
+		if acc.uses_float do return value_float(acc.sum_float), ERROR_NONE
+		if acc.uses_128 do return value_int128(acc.sum_128), ERROR_NONE
+		return value_int(acc.sum_int), ERROR_NONE
+	case "avg":
+		if acc.seen == 0 do return value_null(), ERROR_NONE
+		total := acc.uses_float ? acc.sum_float : (acc.uses_128 ? f64(acc.sum_128) : f64(acc.sum_int))
+		return value_float(total / f64(acc.seen)), ERROR_NONE
+	case "group_concat", "string_agg":
+		if !acc.has_text do return value_null(), ERROR_NONE
+		return value_string(strings.clone(strings.to_string(acc.builder))), ERROR_NONE
+	}
+	return {}, errf(.Internal, "unknown aggregate %s", acc.name)
+}
+
+Stream_Scan_Ctx :: struct {
+	tx:       ^Tx,
+	stmt:     ^Select_Stmt,
+	params:   []Value,
+	expanded: []^Expr,
+	policies: ^[dynamic]Policy_Set,
+	stream:   ^Agg_Stream,
+	aggregate: bool,
+	limit:    int,
+	offset:   int,
+	skipped:  int,
+	rows:     ^[dynamic][]Value,
+	base:     ^Table,
+	alias:    string,
+	err:      Error,
+	now_us:   i64,
+}
+
+@(private)
+stream_row_visit :: proc(raw: rawptr, row: Row) -> bool {
+	scan := cast(^Stream_Scan_Ctx)raw
+	if scan.err.kind != .None do return false
+	one := make([]Source, 1, scan.tx.alloc)
+	one[0] = Source{table = scan.base, row = row, alias = scan.alias}
+	ctx := Eval_Ctx {
+		tx      = scan.tx,
+		sources = one,
+		params  = scan.params,
+		now_us  = scan.now_us,
+	}
+	for &set in scan.policies^ {
+		allowed, policy_err := policy_allows(&set, &ctx, false)
+		if policy_err.kind != .None {
+			scan.err = policy_err
+			return false
+		}
+		if !allowed do return true
+	}
+	if scan.stmt.where_clause != nil {
+		value, where_err := eval_expr(&ctx, scan.stmt.where_clause)
+		if where_err.kind != .None {
+			scan.err = where_err
+			return false
+		}
+		if !value_is_truthy(value) do return true
+	}
+	scan.tx.rows_scanned += 1
+	if scan.aggregate {
+		if !scan.stream.have_first {
+			// The accumulator outlives the row arena, so the row is cloned with
+			// the same allocator the stream is destroyed with.
+			clones := make([]Value, len(row.values))
+			for value, i in row.values do clones[i] = value_clone(value, context.allocator)
+			scan.stream.first_values = clones
+			scan.stream.first_id = row.id
+			scan.stream.have_first = true
+		}
+		if add_err := agg_stream_add(&ctx, scan.stream); add_err.kind != .None {
+			scan.err = add_err
+			return false
+		}
+		return true
+	}
+	values := make([]Value, len(scan.expanded))
+	for expr, i in scan.expanded {
+		value, eval_err := eval_expr(&ctx, expr)
+		if eval_err.kind != .None {
+			free_values(values[:i])
+			scan.err = eval_err
+			return false
+		}
+		values[i] = value_clone(value, context.allocator)
+	}
+	if scan.skipped < scan.offset {
+		scan.skipped += 1
+		free_values(values)
+		return true
+	}
+	append(scan.rows, values)
+	return !(scan.limit >= 0 && len(scan.rows^) >= scan.limit)
+}
+
+// sql_exec_stream_select answers the shapes a page scan can stream: one paged
+// table, no join, no ORDER BY, no GROUP BY, no DISTINCT, no window and nothing
+// staged in the transaction. Rows are filtered and projected as they leave the
+// pages, so the table never sits in memory; LIMIT stops the scan early. When the
+// first aggregate is not a plain projection call the query falls back to the
+// materializing path (handled is false).
+@(private)
+sql_exec_stream_select :: proc(
+	tx: ^Tx,
+	stmt: Select_Stmt,
+	params: []Value,
+	base: ^Table,
+	base_is_view: bool,
+	system_name: bool,
+) -> (result: Sql_Result, handled: bool, err: Error) {
+	if base == nil || base.paged == nil || base_is_view || system_name do return {}, false, ERROR_NONE
+	if len(stmt.joins) != 0 || len(stmt.group_by) != 0 || len(stmt.order_by) != 0 do return {}, false, ERROR_NONE
+	if stmt.is_distinct || stmt.having != nil || stmt.from.as_of != nil do return {}, false, ERROR_NONE
+	if tx.state.dropped[stmt.from.name] do return {}, false, ERROR_NONE
+	if writes, has := tx.state.writes[stmt.from.name]; has {
+		if writes.truncated ||
+		   len(writes.inserts) > 0 ||
+		   len(writes.updates) > 0 ||
+		   len(writes.deletes) > 0 {
+			return {}, false, ERROR_NONE
+		}
+	}
+	// An index answers a point or range query with a handful of rows, which is
+	// cheaper than walking every page. The probe is the same one the main path
+	// runs; only the answer is used here.
+	if _, indexed := index_candidates(tx, base, stmt.from.name, stmt.from.alias, stmt.where_clause, params); indexed {
+		return {}, false, ERROR_NONE
+	}
+
+	now_us := now_microseconds()
+	statement := stmt
+	stream := Agg_Stream{}
+	defer agg_stream_destroy(&stream)
+	probe := make([]Source, 1, tx.alloc)
+	probe[0] = Source{table = base, alias = stmt.from.alias}
+	columns := make([dynamic]string, 0, len(stmt.projections), tx.alloc)
+	expanded := expand_projections(probe, stmt.projections, &columns, tx.alloc)
+	if len(expanded) == 0 do return {}, false, ERROR_NONE
+	aggregate := false
+	for expr in expanded {
+		if _, is_window := expr^.(Window_Expr); is_window do return {}, false, ERROR_NONE
+		if !expr_is_aggregate(expr) do continue
+		call, direct := expr^.(Call_Expr)
+		if !direct || !is_aggregate_name(call.name) || call.is_distinct {
+			return {}, false, ERROR_NONE
+		}
+		if len(call.args) > 2 {
+			return {}, false, ERROR_NONE
+		}
+		if len(call.args) == 2 {
+			// Only group_concat/string_agg take a second argument.
+			if !strings.equal_fold(call.name, "group_concat") &&
+			   !strings.equal_fold(call.name, "string_agg") {
+				return {}, false, ERROR_NONE
+			}
+		}
+		aggregate = true
+		append(&stream.accs, Agg_Acc{call = call, name = strings.to_lower(call.name)})
+	}
+
+	limit := -1
+	offset := 0
+	if stmt.offset != nil {
+		value, value_err := eval_expr(&Eval_Ctx{tx = tx, params = params, now_us = now_us}, stmt.offset)
+		if value_err.kind != .None do return {}, false, value_err
+		parsed, ok := value_to_i64(value)
+		if !ok || parsed < 0 do return {}, false, errf(.Invalid_Argument, "OFFSET must be a non-negative integer")
+		offset = int(parsed)
+	}
+	if stmt.limit != nil {
+		value, value_err := eval_expr(&Eval_Ctx{tx = tx, params = params, now_us = now_us}, stmt.limit)
+		if value_err.kind != .None do return {}, false, value_err
+		parsed, ok := value_to_i64(value)
+		if !ok || parsed < 0 do return {}, false, errf(.Invalid_Argument, "LIMIT must be a non-negative integer")
+		limit = int(parsed)
+	}
+
+	policies := make([dynamic]Policy_Set)
+	defer policy_sets_destroy(&policies)
+	if !is_system_table(stmt.from.name) {
+		set, policy_err := policy_load(tx, stmt.from.name)
+		if policy_err.kind != .None do return {}, false, policy_err
+		append(&policies, set)
+	}
+
+	rows := make([dynamic][]Value)
+	defer {
+		if err.kind != .None {
+			for row in rows do free_values(row)
+		}
+		delete(rows)
+	}
+	scan_ctx := Stream_Scan_Ctx {
+		tx        = tx,
+		stmt      = &statement,
+		params    = params,
+		expanded  = expanded,
+		policies  = &policies,
+		stream    = &stream,
+		aggregate = aggregate,
+		limit     = limit,
+		offset    = offset,
+		rows      = &rows,
+		base      = base,
+		alias     = stmt.from.alias,
+		now_us    = now_us,
+	}
+	if scan_err := tx_scan_visit(tx, stmt.from.name, &scan_ctx, stream_row_visit); scan_err.kind != .None {
+		return {}, false, scan_err
+	}
+	if scan_ctx.err.kind != .None do return {}, false, scan_ctx.err
+
+	if aggregate {
+		final := Eval_Ctx{tx = tx, params = params, now_us = now_us, stream = &stream}
+		if stream.have_first {
+			final.sources = make([]Source, 1, tx.alloc)
+			final.sources[0] = Source {
+				table = base,
+				row   = Row{id = stream.first_id, values = stream.first_values},
+				alias = stmt.from.alias,
+			}
+		}
+		values := make([]Value, len(expanded))
+		for expr, i in expanded {
+			value, eval_err := eval_expr(&final, expr)
+			if eval_err.kind != .None {
+				free_values(values[:i])
+				return {}, false, eval_err
+			}
+			values[i] = value_clone(value, context.allocator)
+		}
+		append(&rows, values)
+	}
+
+	out := Sql_Result{kind = .Rows}
+	out.columns = make([]string, len(columns))
+	for column, i in columns do out.columns[i] = strings.clone(column)
+	out.rows = make([][]Value, len(rows))
+	copy(out.rows, rows[:])
+	resize(&rows, 0)
+	out.row_ids = make([]Row_Id, len(out.rows))
+	for row in out.rows {
+		for value in row do out.row_bytes += value_wire_size(value)
+	}
+	if quota := tx.store.max_rows_per_query; quota > 0 && u64(len(out.rows)) > quota {
+		sql_result_destroy(&out)
+		return {}, false, errf(.Quota_Exceeded, "query returns more than %d rows", quota)
+	}
+	// A statement is a unit of work: the host budget and the statement counter
+	// see the same row count the materializing path reports.
+	tx.store.stream_scans += 1
+	return out, true, ERROR_NONE
+}
+
 sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Result, Error) {
 	if len(stmt.compound) > 0 do return sql_exec_compound(tx, stmt, params)
 	// A SELECT without FROM evaluates its projections once against an empty row.
@@ -1428,6 +1825,21 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		tx     = tx,
 		params = params,
 		now_us = now_microseconds(),
+	}
+
+	// A page-backed table can answer a simple single-table query without ever
+	// holding it in memory: the scan streams, the projection runs per row and
+	// LIMIT stops the scan. Anything the stream cannot answer exactly falls
+	// through to the materializing path below.
+	if stream_result, streamed, stream_err := sql_exec_stream_select(
+		tx,
+		stmt,
+		params,
+		base,
+		base_is_view,
+		system_name,
+	); streamed {
+		return stream_result, stream_err
 	}
 
 	// Base rows. A usable index narrows the scan; the WHERE clause is still
@@ -3226,6 +3638,13 @@ abs_f64 :: proc(f: f64) -> f64 {
 
 @(private)
 eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
+	if ctx.stream != nil {
+		acc := agg_stream_lookup(ctx.stream, call)
+		if acc == nil {
+			return {}, errf(.Internal, "aggregate %s was not accumulated by the scan", call.name)
+		}
+		return agg_stream_value(acc)
+	}
 	name := strings.to_lower(call.name)
 	rows := ctx.group
 	single_rows: [1][]Source

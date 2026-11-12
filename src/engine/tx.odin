@@ -748,6 +748,54 @@ tx_collect_at :: proc(tx: ^Tx, name: string, out: ^[dynamic]Row, seq: u64) -> Er
 	return errf(.Table_Not_Found, "table %s does not exist", name)
 }
 
+// Tx_Scan_Visitor sees one row at a time. The values are only valid during the
+// call: a paged table decodes into an arena that is reset after each row.
+Tx_Scan_Visitor :: proc(ctx: rawptr, row: Row) -> bool
+
+@(private)
+Tx_Scan_Ctx :: struct {
+	ctx:   rawptr,
+	visit: Tx_Scan_Visitor,
+}
+
+@(private)
+tx_scan_trampoline :: proc(ctx: rawptr, row: Row) -> bool {
+	scan := cast(^Tx_Scan_Ctx)ctx
+	return scan.visit(scan.ctx, row)
+}
+
+// tx_scan_visit walks the visible rows of one table without collecting them.
+// A paged table streams page by page (the pool bounds the memory); a memory
+// table walks its map. When the transaction staged changes for the table the
+// collect path runs instead, because the overlay has to be merged and that
+// materializes.
+tx_scan_visit :: proc(tx: ^Tx, name: string, ctx: rawptr, visit: Tx_Scan_Visitor) -> Error {
+	if tx.state.dropped[name] do return ERROR_NONE
+	table, table_err := tx_table(tx, name)
+	if table_err.kind != .None do return table_err
+	overlay := false
+	if writes, has := tx.state.writes[name]; has {
+		overlay = writes.truncated ||
+			len(writes.inserts) > 0 ||
+			len(writes.updates) > 0 ||
+			len(writes.deletes) > 0
+	}
+	if overlay || table.paged == nil {
+		rows := make([dynamic]Row)
+		if collect_err := tx_collect(tx, name, &rows); collect_err.kind != .None {
+			delete(rows)
+			return collect_err
+		}
+		for row in rows {
+			if !visit(ctx, row) do break
+		}
+		delete(rows)
+		return ERROR_NONE
+	}
+	scan := Tx_Scan_Ctx{ctx = ctx, visit = visit}
+	return page_rows_each(table.paged, &scan, tx_scan_trampoline)
+}
+
 tx_row_count :: proc(tx: ^Tx, name: string) -> (int, Error) {
 	rows := make([dynamic]Row)
 	defer delete(rows)

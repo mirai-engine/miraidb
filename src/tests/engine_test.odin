@@ -8962,6 +8962,50 @@ test_paged_table_roundtrip :: proc(t: ^testing.T) {
 	db.tx_rollback(tx)
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM item").i, i64(399))
 
+	// A simple query streams over the pages: it never collects the table, which
+	// is what keeps the memory bounded. The counter records the path taken.
+	streams_before := store.stream_scans
+	aggregated := run(t, store, "SELECT count(*), sum(qty), min(qty), max(qty), avg(qty) FROM item")
+	testing.expect_value(t, len(aggregated.rows), 1)
+	testing.expect_value(t, aggregated.rows[0][0].i, i64(399))
+	testing.expect_value(t, aggregated.rows[0][1].i, i64(79650))
+	testing.expect_value(t, aggregated.rows[0][2].i, i64(0))
+	testing.expect_value(t, aggregated.rows[0][3].i, i64(399))
+	testing.expect_value(t, aggregated.rows[0][4].kind, db.Value_Kind.Float)
+	testing.expectf(
+		t,
+		abs(aggregated.rows[0][4].f - 79650.0 / 399.0) < 0.0001,
+		"avg is %v",
+		aggregated.rows[0][4].f,
+	)
+	db.sql_result_destroy(&aggregated)
+	testing.expect_value(t, store.stream_scans, streams_before + 1)
+
+	// LIMIT stops the scan and the projection runs per row.
+	limited := run(t, store, "SELECT id FROM item LIMIT 5")
+	testing.expect_value(t, len(limited.rows), 5)
+	db.sql_result_destroy(&limited)
+	testing.expect_value(t, store.stream_scans, streams_before + 2)
+
+	// ORDER BY needs every row, so it takes the materializing path.
+	ordered := run(t, store, "SELECT id FROM item ORDER BY id DESC LIMIT 3")
+	testing.expect_value(t, len(ordered.rows), 3)
+	testing.expect_value(t, ordered.rows[0][0].i, i64(399))
+	db.sql_result_destroy(&ordered)
+	testing.expect_value(t, store.stream_scans, streams_before + 2)
+
+	// An aggregate over no rows is still one row, with the neutral values.
+	empty := run(t, store, "SELECT count(*), sum(qty) FROM item WHERE id = 9999")
+	testing.expect_value(t, len(empty.rows), 1)
+	testing.expect_value(t, empty.rows[0][0].i, i64(0))
+	testing.expect_value(t, empty.rows[0][1].kind, db.Value_Kind.Null)
+	db.sql_result_destroy(&empty)
+
+	// group_concat accumulates while streaming when no index answers the filter.
+	concat := run(t, store, "SELECT group_concat(name) FROM item WHERE qty IN (0, 1, 2)")
+	testing.expect_value(t, concat.rows[0][0].s, "name-0,name-1,name-2")
+	db.sql_result_destroy(&concat)
+
 	db.store_close(store)
 	closed = true
 
