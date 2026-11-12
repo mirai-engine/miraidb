@@ -1,0 +1,23 @@
+# build output
+/bin/
+*.exe
+*.pdb
+
+# local databases produced by the CLI, examples and tests
+/*.db/
+/*.miraidb/
+/_test_*/
+/tmpdb/
+/todo.db/
+*.srctrldb
+*.srctrldb-shm
+*.srctrldb-wal
+
+_srvdb/
+server.log
+
+# fuzz and soak scratch databases
+/_fuzz_db/
+/_soak_db/
+/_buzz_db/
+__pycache__/
