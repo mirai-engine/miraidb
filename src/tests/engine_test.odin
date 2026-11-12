@@ -8817,3 +8817,75 @@ test_alter_rename_column :: proc(t: ^testing.T) {
 	defer cleanup_db(reopened, "rename_column")
 	testing.expect_value(t, scalar(t, reopened, "SELECT count(name) FROM t").i, i64(2))
 }
+
+@(test)
+test_connection_identity :: proc(t: ^testing.T) {
+	// The identity belongs to the connection: authenticating on one client must
+	// not lend its rows to another, and two clients keep their own view.
+	store, host := fresh_host(t, "conn_identity")
+	if store == nil do return
+	defer destroy_host(store, host, "conn_identity")
+	ana := "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+	luis := "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+	run(t, store, "CREATE TABLE note (id INTEGER PRIMARY KEY AUTOINCREMENT, owner IDENTITY NOT NULL, body TEXT NOT NULL)")
+	insert := fmt.tprintf(
+		"INSERT INTO note (owner, body) VALUES ('%s', 'a1'), ('%s', 'a2'), ('%s', 'l1')",
+		ana, ana, luis,
+	)
+	run(t, store, insert)
+	run(t, store, "CREATE POLICY note_owner ON note USING (owner = current_identity())")
+
+	ana_identity, _ := db.identity_parse(ana)
+	luis_identity, _ := db.identity_parse(luis)
+	host.now_us = i64(1_000_000)
+	ana_token, ana_err := db.host_issue_token(host, ana_identity, 0)
+	luis_token, luis_err := db.host_issue_token(host, luis_identity, 0)
+	testing.expect(t, db.error_ok(ana_err) && db.error_ok(luis_err))
+
+	count_for :: proc(t: ^testing.T, host: ^db.Host, owner: u64, sql: string) -> i64 {
+		response := db.wire_request_owned(host, db.wire_encode_query(sql, nil), owner)
+		result, err := db.wire_decode_result(response, context.allocator)
+		if !testing.expectf(t, db.error_ok(err), "owner %d: %s", owner, err.message) do return -1
+		defer db.sql_result_destroy(&result)
+		if len(result.rows) == 0 || len(result.rows[0]) == 0 do return -1
+		return result.rows[0][0].i
+	}
+
+	testing.expect(t, db.host_client_connect(host, 1))
+	testing.expect(t, db.host_client_connect(host, 2))
+	// Before authenticating, a client sees what the default identity sees: none
+	// of the rows. The store starts with no identity, so this is the baseline.
+	testing.expect_value(t, count_for(t, host, 1, "SELECT count(*) FROM note"), i64(0))
+
+	// Client 1 authenticates as Ana.
+	auth := db.wire_encode_auth(ana_token)
+	testing.expect_value(t, wire_kind(db.wire_request_owned(host, auth, 1)), db.WIRE_RESULT)
+	testing.expect_value(t, count_for(t, host, 1, "SELECT count(*) FROM note"), i64(2))
+
+	// Client 2 is still unauthenticated: it must not inherit Ana.
+	testing.expect_value(t, count_for(t, host, 2, "SELECT count(*) FROM note"), i64(0))
+	// Authenticating client 2 as Luis gives it his two rows and leaves client 1
+	// with Ana's.
+	testing.expect_value(t, wire_kind(db.wire_request_owned(host, db.wire_encode_auth(luis_token), 2)), db.WIRE_RESULT)
+	testing.expect_value(t, count_for(t, host, 2, "SELECT count(*) FROM note"), i64(1))
+	testing.expect_value(t, count_for(t, host, 1, "SELECT count(*) FROM note"), i64(2))
+	testing.expect_value(
+		t,
+		count_for(t, host, 1, "SELECT count(*) FROM note WHERE owner = current_identity()"),
+		i64(2),
+	)
+
+	// A bad token leaves the caller as it was.
+	testing.expect_value(t, wire_kind(db.wire_request_owned(host, db.wire_encode_auth("nope"), 2)), db.WIRE_ERROR)
+	testing.expect_value(t, count_for(t, host, 2, "SELECT count(*) FROM note"), i64(1))
+
+	// A new, unauthenticated connection starts from the default again.
+	testing.expect(t, db.host_client_connect(host, 3))
+	testing.expect_value(t, count_for(t, host, 3, "SELECT count(*) FROM note"), i64(0))
+
+	// SET identity inside a request persists for that client only.
+	set := db.wire_encode_query(fmt.tprintf("SET identity = '%s'", ana), nil)
+	testing.expect_value(t, wire_kind(db.wire_request_owned(host, set, 3)), db.WIRE_RESULT)
+	testing.expect_value(t, count_for(t, host, 3, "SELECT count(*) FROM note"), i64(2))
+	testing.expect_value(t, count_for(t, host, 2, "SELECT count(*) FROM note"), i64(1))
+}

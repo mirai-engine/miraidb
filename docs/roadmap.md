@@ -41,7 +41,7 @@ outranks the dependent.
 | 21 | **D15 — network hardening** | TLS, HTTP/2, backpressure, per-route timeouts, a load test. | M | — |
 | 22 | **D16 — client generation from the catalog** | Emit the Python binding from the schema; the hand-written one is the contract it has to meet. | M | — |
 | 23 | **Release packaging** | Versioned `libmiraidb` + header + `pkg-config`, binaries per platform, changelog. | M | #13 |
-| 24 | **Auth review** | Tokens, connection-scoped subscriptions and the byte and work budgets, attacked deliberately. | S | — |
+| 24 | **Auth review** — *started* | It found that one client's identity was left on the store and inherited by the next; the wire now runs each request with its caller's identity (`test_connection_identity`). Left: rate limits, token lifetime policy, and the fact that without TLS (D15) a token travels in clear. | S | — |
 | 25 | **Licence and notice review** | MIT/Apache-2.0 with no vendored third-party source; confirm before each public release. | external | #23 |
 
 Priority 1 landed first; the numbers are position, not rank, so the work

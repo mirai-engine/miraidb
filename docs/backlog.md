@@ -170,8 +170,17 @@ same directory is refused with `locked`**, that six concurrent readers agree, th
 a later write is visible to the next read, and that a client that closes without
 telling the server does not disturb the owner.
 
+The auth review found a second, worse bug: the identity was stored on the store,
+so a client that authenticated lent its rows to every later client. Each client
+now carries its own identity (`Client.identity`): a request runs with its
+caller's identity, a token or `SET identity` inside a request is kept for that
+connection, and a new connection starts from the default.
+`test_connection_identity` covers two authenticated clients, an unauthenticated
+one, a bad token and `SET identity`.
+
 That test found a real bug: the server read the request once and parsed it, so a
-request whose body arrived in a second segment was answered `bad request`. The
+request whose body arrived in a second segment was answered
+`bad request`. The
 loop now keeps reading while the parser reports an incomplete message (the new
 `Error_Kind.Incomplete`), which is what makes an HTTP body over a Nagle boundary
 work.

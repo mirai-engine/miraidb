@@ -153,8 +153,11 @@ a table is still a `map[Row_Id]Row` in memory, and that is the next step of D17.
   death. A second process can still **use** the database through the owner:
   `miraidb-server` serves HTTP wire messages, WebSocket frames and Postgres, and
   each connection has its own subscriptions and byte budget
-  (`scripts/broker_smoke.py` proves it with two processes). What is still missing
-  is opening the directory *directly* beside a writer, which needs pages (D17).
+  (`scripts/broker_smoke.py` proves it with two processes). The identity a
+  connection authenticated as is kept **per connection** (`test_connection_identity`):
+  two clients never share the identity policies see, and `SET identity` inside a
+  request persists for that client only. What is still missing is opening the
+  directory *directly* beside a writer, which needs pages (D17).
 
 This is the one capability the engine does **not** have at all, as opposed to
 having a shallow version of it. There is no code for it in the tree.

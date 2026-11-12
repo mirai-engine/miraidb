@@ -116,6 +116,9 @@ Client :: struct {
 	queue:   u64,
 	dropped: u64,
 	drop:    bool,
+	// identity is the caller this connection authenticated as. Each request runs
+	// with it, so two clients never share the identity the policies see.
+	identity: Identity,
 }
 
 Subscription :: struct {

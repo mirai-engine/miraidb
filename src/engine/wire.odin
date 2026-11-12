@@ -237,7 +237,22 @@ wire_request :: proc(host: ^Host, data: []u8) -> []u8 {
 // created by this message belong to `owner` and host_drop_owned removes them.
 wire_request_owned :: proc(host: ^Host, data: []u8, owner: u64) -> []u8 {
 	host.metric_requests += 1
+	// The identity belongs to the connection, not to the store: before the
+	// request the store carries the caller's identity, and a token or SET
+	// identity inside the request is kept for the next one. An embedded caller
+	// (owner 0) keeps using the store identity directly.
+	if owner != 0 {
+		if client, exists := host.clients[owner]; exists {
+			store_set_identity(host.store, client.identity)
+		}
+	}
 	response := wire_dispatch_owned(host, data, owner)
+	if owner != 0 {
+		if client, exists := host.clients[owner]; exists {
+			client.identity = store_identity(host.store)
+			host.clients[owner] = client
+		}
+	}
 	if client, exists := host.clients[owner]; exists {
 		client.bytes_out += u64(len(response))
 		host.clients[owner] = client
