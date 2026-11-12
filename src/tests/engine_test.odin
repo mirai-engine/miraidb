@@ -8486,3 +8486,63 @@ test_page_store_header_is_a_promise :: proc(t: ^testing.T) {
 	}
 	testing.expectf(t, succeeding > 0, "no reopen succeeded")
 }
+
+@(test)
+test_as_of :: proc(t: ^testing.T) {
+	// A table keeps its versions until they are pruned, so a query can read the
+	// rows as they were at any commit sequence it still has.
+	store := fresh_db(t, "as_of")
+	if store == nil do return
+	defer cleanup_db(store, "as_of")
+	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+	run(t, store, "INSERT INTO t (id, v) VALUES (1, 'one'), (2, 'two')")
+	first := store.commit_seq
+	run(t, store, "UPDATE t SET v = 'ONE' WHERE id = 1")
+	second := store.commit_seq
+	run(t, store, "DELETE FROM t WHERE id = 2")
+	third := store.commit_seq
+	run(t, store, "INSERT INTO t (id, v) VALUES (3, 'three')")
+	testing.expect(t, first < second && second < third)
+
+	// Now: one updated, one deleted, one added.
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t").i, i64(2))
+	testing.expect_value(t, scalar(t, store, "SELECT v FROM t WHERE id = 1").s, "ONE")
+
+	// At `first` the original two rows are there and nothing else.
+	statement := fmt.tprintf("SELECT count(*) FROM t AS OF %d", first)
+	testing.expect_value(t, scalar(t, store, statement).i, i64(2))
+	statement = fmt.tprintf("SELECT v FROM t AS OF %d WHERE id = 1", first)
+	testing.expect_value(t, scalar(t, store, statement).s, "one")
+	statement = fmt.tprintf("SELECT count(*) FROM t AS OF %d WHERE id = 3", first)
+	testing.expect_value(t, scalar(t, store, statement).i, i64(0))
+
+	// At `second` the update is visible and the delete is not yet.
+	statement = fmt.tprintf("SELECT v FROM t AS OF %d WHERE id = 1", second)
+	testing.expect_value(t, scalar(t, store, statement).s, "ONE")
+	statement = fmt.tprintf("SELECT count(*) FROM t AS OF %d WHERE id = 2", second)
+	testing.expect_value(t, scalar(t, store, statement).i, i64(1))
+
+	// At `third` the delete has happened and the insert has not.
+	statement = fmt.tprintf("SELECT count(*) FROM t AS OF %d", third)
+	testing.expect_value(t, scalar(t, store, statement).i, i64(1))
+	statement = fmt.tprintf("SELECT count(*) FROM t AS OF %d WHERE id = 3", third)
+	testing.expect_value(t, scalar(t, store, statement).i, i64(0))
+
+	// Updates and deletes in the same statement see the historical rows.
+	statement = fmt.tprintf("SELECT max(v) FROM t AS OF %d", first)
+	testing.expect_value(t, scalar(t, store, statement).s, "two")
+
+	// Pruning what no reader needs discards that history: a read before it finds
+	// only the rows whose versions are still there, never inventing the others.
+	db.store_prune_versions(store, second)
+	statement = fmt.tprintf("SELECT count(*) FROM t AS OF %d", first)
+	testing.expect_value(t, scalar(t, store, statement).i, i64(1))
+	statement = fmt.tprintf("SELECT count(*) FROM t AS OF %d WHERE id = 2", first)
+	testing.expect_value(t, scalar(t, store, statement).i, i64(1))
+
+	// A sequence beyond the log is clamped to the latest commit, and a view is
+	// refused rather than half read.
+	run(t, store, "CREATE VIEW v AS SELECT id FROM t")
+	_, view_err := db.sql_execute(store, "SELECT * FROM v AS OF 1")
+	testing.expect_value(t, view_err.kind, db.Error_Kind.Sql_Unsupported)
+}

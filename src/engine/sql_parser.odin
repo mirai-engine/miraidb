@@ -516,6 +516,11 @@ parse_table_ref :: proc(p: ^Parser) -> Table_Ref {
 		ref.args = args[:]
 	}
 	if p_match_keyword(p, "as") {
+		// `AS OF <seq>` is the historical read; `AS <alias>` is a name.
+		if p_match_keyword(p, "of") {
+			ref.as_of = parse_expression(p)
+			return ref
+		}
 		ref.alias = p_ident(p)
 	} else if (p.current.kind == .Ident || p.current.kind == .Quoted_Ident) && !p_is_table_clause_keyword(p) {
 		ref.alias = p_ident(p)

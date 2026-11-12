@@ -93,42 +93,36 @@ as the fallback for `WITHOUT ROWID`-style tables if the tree cannot be built.
 
 **Not claimed today.** "Spatial index" — today it is a spatial *table*.
 
-## D3 — Snapshot cost: **done**, history still open
+## D3 — Snapshot cost and history
 
-**Now.** A read snapshot borrows the table's values instead of copying them: the
-freeze builds the row map and the index entries and hands both tables a
-reference-counted `Row_Store`. The source defers freeing values while a snapshot
-that shares them is alive (an update keeps the old values as a version, a delete
-tombstones the row, a truncate hands the rows to the store), and the last owner
-out frees them. Adopting a foreign row store per table cost 23 lines of plumbing.
+**Snapshot cost (done).** A read snapshot borrows the table's values instead of
+copying them: the freeze builds the row map and the index entries and hands both
+tables a reference-counted `Row_Store`. The source defers freeing values while a
+snapshot that shares them is alive (an update keeps the old values as a version, a
+delete tombstones the row, a truncate hands the rows to the store), and the last
+owner out frees them. Four hundred fifty thousand rows freeze in the noise of one
+statement: `bench-read <db> 50000 100` reports ~11 µs per transaction including
+the first (before, the first read alone cost ~190 ms).
+`test_snapshot_shares_values_safely` proves isolation across an update and a
+truncate while the reader holds its view.
 
-**Effect.** Four hundred fifty thousand rows freeze in the noise of one
-statement: `bench-read <db> 50000 100` reports 11.2 µs per transaction including
-the first one (before, the first read alone cost ~190 ms). Steady state is
-unchanged at 11.6 µs. `test_snapshot_shares_values_safely` proves isolation across
-an update and a truncate while the reader holds its view.
+**History (done).** `SELECT ... FROM t AS OF <seq>` reads the rows as they were at
+that commit: the scan walks the versions `row_values_at` keeps instead of the live
+values, and it does not use an index, because the keys of that commit are not the
+live ones. A sequence beyond the log is clamped to the last commit. The live table
+is read, not the frozen snapshot, because the snapshot is built for the present
+and drops the versions a past read needs. `test_as_of` covers an update, a delete,
+an insert, a read before all three and the prune.
 
-**What remains.** There is still no `AS OF`: reading an arbitrary past sequence
-needs versions indexed by sequence and garbage collection for them, which is a
-separate piece of work.
+**Retention.** Versions stay until `store_prune_versions(store, before_seq)` is
+called with the oldest sequence still in use; the server calls it when a
+subscription or reader falls behind. There is no automatic policy yet, and the
+history is not counted against a memory budget: a long-lived database that never
+prunes grows with every update.
 
-## D17 — Rows on disk (the page store)
-
-**Now.** Every table is a `map[Row_Id]Row` in memory. That is why reads are
-10.7 µs and why opening a large database rebuilds its indexes: the whole
-database is the working set.
-
-**Gap.** Fixed-size pages, a page file (or one file with an allocation map), a
-buffer pool with a clock hand and a memory cap, dirty-page flushing ordered
-after the commit record that describes it, a free list that survives a crash, and
-rows read and written through pages instead of a Go-style map.
-
-**Done when.** A table larger than the buffer pool reads correctly; RSS stays
-under the configured cap while scanning a database ten times larger; a kill
-during a flush still opens to a consistent state (D8 proves it); `bench` and
-`bench-read` stay within 10% for data that fits in memory.
-
-**Not claimed today.** "Pages on disk" — nothing is paged today.
+**Left.** `AS OF` on a join (refused with a clear error), an automatic retention
+policy tied to the oldest open reader, and an index over the versions to make a
+past read narrow as a live one does.
 
 ## D17 — Rows on disk
 

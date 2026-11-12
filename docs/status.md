@@ -44,6 +44,13 @@ honest measurement.
 - Per-table and per-database memory accounting (`store_table_memory`,
   `store_memory`, and the totals `miraidb inspect` prints).
 
+### History
+
+- `SELECT ... FROM t AS OF <seq>` reads the rows as they were at that commit,
+  using the versions the table keeps; an index is not used for a past read.
+- `store_prune_versions(store, before_seq)` drops versions and tombstones no
+  reader can ask for; nothing prunes automatically yet.
+
 ### Transactions
 
 - One writer, many readers, staged writes, read-your-writes.

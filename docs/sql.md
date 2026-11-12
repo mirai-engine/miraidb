@@ -303,6 +303,24 @@ the cost of an unbounded query is a scan rather than a tree descent. A bounded
 query — a point or a small window — stays cheap because the predicate is
 selective. The tree layout is deliberately not claimed until it is measured.
 
+## Reading the past
+
+`FROM t AS OF <seq>` reads the rows as they were when commit `<seq>` landed:
+
+```sql
+SELECT * FROM t AS OF 4;                 -- the table at commit 4
+SELECT v FROM t AS OF 4 WHERE id = 1;    -- the value it had then
+```
+
+The engine keeps the previous values of a row when it is updated, and keeps a
+deleted row as a tombstone, so the past is available without a second copy. A
+historical scan does not use an index: the keys of that commit are not the live
+ones. `AS OF` reads only the first table of a query (a join answer is refused),
+a sequence past the last commit is clamped to it, and `store_prune_versions` (the
+server calls it when readers fall behind) discards history that no one can ask
+for: after pruning, a read before that point sees only the rows whose versions
+survived.
+
 ## Full-text search
 
 `CREATE VIRTUAL TABLE docs USING fts5(body, title)` makes a table of documents

@@ -1337,8 +1337,27 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		append(&partials, make([]Source, 0))
 		used_index = true
 	}
+	// A historical read asks for the rows as they were at one commit. It cannot
+	// use an index (the keys of that commit are not the live ones) and it ignores
+	// the staged writes: it reads what committed.
+	as_of_seq: u64 = 0
+	if stmt.from.as_of != nil {
+		if base_is_view {
+			return {}, errf(.Sql_Unsupported, "AS OF reads a table, not a view")
+		}
+		moment, constant := eval_constant(stmt.from.as_of, params)
+		if !constant {
+			return {}, errf(.Invalid_Argument, "AS OF needs a constant commit sequence")
+		}
+		sequence, ok := value_to_i64(moment)
+		if !ok || sequence < 0 {
+			return {}, errf(.Invalid_Argument, "AS OF needs a non-negative commit sequence")
+		}
+		as_of_seq = u64(sequence)
+		if as_of_seq > tx.store.commit_seq do as_of_seq = tx.store.commit_seq
+	}
 	// A view already holds a materialized table: scan it directly.
-	if !base_is_view && !empty_row {
+	if !base_is_view && !empty_row && as_of_seq == 0 {
 		if candidate_ids, used, fts_err := fts_scan_candidates(
 			tx,
 			stmt.from.name,
@@ -1377,6 +1396,10 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		rows := make([dynamic]Row)
 		if base_is_view {
 			table_collect(base, &rows, tx.read_seq)
+		} else if as_of_seq > 0 {
+			if collect_err := tx_collect_at(tx, stmt.from.name, &rows, as_of_seq); collect_err.kind != .None {
+				return {}, collect_err
+			}
 		} else if collect_err := tx_collect(tx, stmt.from.name, &rows); collect_err.kind != .None {
 			return {}, collect_err
 		}
@@ -1396,6 +1419,10 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 
 	// Nested-loop joins. Each partial is one bound combination of rows.
 	for join in stmt.joins {
+		if join.table.as_of != nil {
+			free_partials(&partials)
+			return {}, errf(.Sql_Unsupported, "AS OF is only supported on the first table of a join")
+		}
 		// A JSON table function may take a column of the table before it, so it
 		// is materialized once per outer row (a lateral join). Everything else is
 		// collected once. The materialized tables stay in tx.temp_tables until the

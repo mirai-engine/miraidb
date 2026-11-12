@@ -679,6 +679,21 @@ tx_collect :: proc(tx: ^Tx, name: string, out: ^[dynamic]Row) -> Error {
 	return ERROR_NONE
 }
 
+// tx_collect_at reads the rows as they were at one commit sequence. It reads the
+// live table, not the transaction's frozen snapshot: the snapshot is built for
+// the present and drops the versions a past read needs. The read lock the
+// transaction holds keeps the table stable for the statement.
+tx_collect_at :: proc(tx: ^Tx, name: string, out: ^[dynamic]Row, seq: u64) -> Error {
+	if table, exists := tx.store.tables[name]; exists {
+		table_collect(table, out, seq)
+		return ERROR_NONE
+	}
+	if _, dropped := tx.state.dropped[name]; dropped {
+		return errf(.Table_Not_Found, "table %s was dropped in this transaction", name)
+	}
+	return errf(.Table_Not_Found, "table %s does not exist", name)
+}
+
 tx_row_count :: proc(tx: ^Tx, name: string) -> (int, Error) {
 	rows := make([dynamic]Row)
 	defer delete(rows)

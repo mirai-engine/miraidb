@@ -569,6 +569,10 @@ acceptance criteria, current cost and effort; this list is the short version.
 - Indexes are rebuilt in memory when a database opens; the log has no index
   pages. Joins are nested loops in the order written; there is no cost model or
   `ANALYZE` statistics. (backlog D5, D6)
+- `FROM t AS OF <seq>` reads the versions a table keeps; versions stay until
+  `store_prune_versions` is called with the oldest sequence in use, and there is
+  no automatic retention policy or memory budget for history yet. `AS OF` on a
+  join is refused.
 - A page file format exists (`src/engine/page.odin`): 4 KiB slotted pages with a
   checksum, a free list, a buffer pool and a streaming reader, with the flush
   order tested under injected faults. Queries do not read through it yet; every

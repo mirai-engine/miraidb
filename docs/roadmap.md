@@ -31,7 +31,7 @@ outranks the dependent.
 | 11 | **D6 — planner with statistics** | `ANALYZE`, a cost model, join reordering; the largest query-level win and a prerequisite for calling the engine fast on real schemas. | L | D5 (statistics live in pages) |
 | 12 | **D4 — `.sqlite` pages in place** | The mirror re-encodes the whole state per commit; with pages it writes only what changed. Until then it stays a documented O(state) export. | XL | D17 |
 | 13 | **CI on Linux and macOS** | The suite runs on Windows only; file locking (D18a) and the VFS are per-OS, so the lock must be proven on all three. | M | D18a |
-| 14 | **D3 — `AS OF` and version GC** | Reading a past sequence and collecting versions no open reader can see; the snapshot cost is already solved. | M | — |
+| 14 | **D3 — `AS OF` and version GC** — *done* | `FROM t AS OF <seq>` reads the versions the table keeps, and `store_prune_versions` discards what no reader can ask for (`test_as_of`). What is left is an automatic retention policy and `AS OF` on a join. | M | — |
 | 15 | **D9 — the rest of the grammar** | Window frames, windows beside `GROUP BY`, real `WITH RECURSIVE`, full `ALTER`, `BEFORE` triggers and `WHEN`, more collations. Each current refusal becomes a test. | L | — |
 | 16 | **D2 — spatial tree** | Boxes as columns today; node pages and a descent replace the scan. | M | D17, D5 |
 | 17 | **D10 — precision and time** | Decimal arithmetic with scale, `TIMESTAMPTZ`, streaming blobs. | M | — |
@@ -183,6 +183,8 @@ reason written down instead.
 - **Benchmark gate** — `benchmarks/baseline.json` plus `scripts/bench.py --check`
   as a CI gate: bytes per row within 10%, insert rate, read cost and compaction
   under a 3x guard, with the machine recorded beside the numbers.
+- **D3 `AS OF`** — historical reads over the versions the table keeps, with
+  pruning as the bound (`test_as_of`); the snapshot cost was already solved.
 - **Sanitizer pass** — 190 tests run under `-sanitize:address` on Windows with no
   bounds or stack report; the heap half waits for the Linux CI, because Odin's
   allocator on Windows bypasses the sanitizer's interception (verified with a

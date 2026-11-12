@@ -171,6 +171,9 @@ Table_Ref :: struct {
 	alias: string,
 	// args are the view parameters: `FROM v(1, 2)` binds them to the view's `?`.
 	args:  []^Expr,
+	// as_of is `FROM t AS OF <seq>`: read the rows as they were at that commit.
+	// The scan then uses the versions the table keeps instead of the live rows.
+	as_of: ^Expr,
 }
 
 // Join_Clause chains one table onto the query. `left` turns the inner join into
