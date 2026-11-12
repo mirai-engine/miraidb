@@ -35,7 +35,7 @@ Rules for this file:
 | D12a | Metering granularity | **per row read and written, with a budget that aborts** | — | S | done |
 | D12b | Module call latency | **one pooled socket per module** | — | S | done |
 | D12c | Module determinism | **caller's clock travels in the call**; no VM | deterministic VM, enforced quotas | L | P2 |
-| D13 | Exactly-once across restarts | **durable** (request id commits with the effects) | result replay, not only skip | S | P2 |
+| D13 | Exactly-once across restarts | **done**: request id and result commit with the effects; a retry returns the stored result (`test_idempotent_result`) | — | S | P2 |
 | D14 | Replication | one process, one log | log shipping, follower reads, failover | XL | P3 |
 | D15 | Network hardening | HTTP/WS subset with caps | TLS, HTTP/2, backpressure, per-route timeouts | M | P3 |
 | D16 | Clients | **Python binding over the C ABI, with a smoke gate** | generation per catalog | M | P3 |
@@ -288,15 +288,17 @@ and asserts the listener accepted exactly one connection.
 What is still unclaimed is a VM that also controls randomness, memory and time
 limits; the host can bound the work per call (D12a) but not the module's internals.
 
-## D13 — Exactly-once: **durable**, with one gap
+## D13 — Exactly-once across restarts
 
-**Now.** `host_call_once` inserts the request id into `_request` **inside the
-reducer's transaction**, so the id and the effects commit together; a restart
-replays it and a retry is a no-op. `test_durability_after_restart` proves it.
-
-**What remains.** The stored response is an empty product, so a retry returns
-"already ran" rather than the original result. Storing and returning it is a
-small change; a caller that needs the value has to read the state instead.
+**Done.** `host_call_once` inserts the request id and the reducer's result into
+`_request` **inside the reducer's transaction**, so the id, the response and the
+effects commit together; a restart replays it and a retry is a no-op.
+`host_call_once_result` (and its `_at` form with the caller's clock) returns the
+stored response on a retry and the fresh one on the first run, so a caller that
+lost the reply gets the same answer instead of reading the state again.
+`test_idempotent_result` covers the first call, the retry (counter unchanged), a
+different id, and a reducer that names no result. `test_durability_after_restart`
+covers the restart.
 
 ## D14 — Replication
 

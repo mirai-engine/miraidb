@@ -24,7 +24,7 @@ outranks the dependent.
 | 4 | **Benchmark gate** — *done* | `scripts/bench.py` records bytes per row, insert rate, read cost and compaction in `benchmarks/baseline.json` and fails the build beyond the recorded limits; the efficiency contract is now enforced, not remembered. | S | — |
 | 5 | **D11 — DDL inside a transaction** — *done* | Index DDL is staged like row changes and applied after them, so a table, its rows and its index commit together and roll back together. Unblocks the FTS index. | S | — |
 | 6 | **D1 — FTS term index + BM25** — *done* | The term index is created with the table, `rank` is BM25 over the postings, `snippet`/`highlight` mark the match, and the scan visits only the matching documents (5000 documents: at most 8 rows visited for a rare term). | M | D11 |
-| 7 | **D13 — return the stored result on a retry** | Exactly-once currently skips a repeat call; a caller retrying after a lost response should get the same answer. | S | — |
+| 7 | **D13 — return the stored result on a retry** — *done* | The result commits with the request id, and `host_call_once_result` answers a retry with it instead of "already ran". | S | — |
 | 8 | **D17 — rows on disk (page store)** | All tables are in RAM today. Buffer pool, page size, free list, eviction under a cap, flushes ordered after their commit record. The third ask, and the biggest piece. | XL | D8, bench |
 | 9 | **D5 — persistent index pages** | Indexes are rebuilt on open; they become pages once tables are pages. | L | D17 |
 | 10 | **D18b — a reader in another process** | With pages and a lock, a read-only open can coexist with a writer: "varios procesos" becomes true, not just safe. | L | D17, D18a |
@@ -183,6 +183,8 @@ reason written down instead.
 - **Benchmark gate** — `benchmarks/baseline.json` plus `scripts/bench.py --check`
   as a CI gate: bytes per row within 10%, insert rate, read cost and compaction
   under a 3x guard, with the machine recorded beside the numbers.
+- **D13 stored result** — the response is recorded with the request id and
+  returned on a retry (`host_call_once_result`, `test_idempotent_result`).
 - **D1 full-text ranking** — index on `term` created with the table, BM25
   `rank` (negated, best first), `snippet()`/`highlight()`, `AND`, and a scan
   narrowed to the matches measured by `rows_scanned`

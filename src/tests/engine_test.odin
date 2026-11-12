@@ -8283,3 +8283,66 @@ test_full_text_cost :: proc(t: ^testing.T) {
 	testing.expectf(t, common_scanned >= 5000, "a common term must read its postings, visited %d", common_scanned)
 	testing.expectf(t, common_scanned < 30000, "a common term must not scan the vocabulary: %d", common_scanned)
 }
+
+@(test)
+test_idempotent_result :: proc(t: ^testing.T) {
+	// A retry after a lost reply gets the answer the first call produced, and the
+	// reducer does not run again.
+	store := fresh_db(t, "idem_result")
+	if store == nil do return
+	host := db.host_init(store)
+	defer db.host_destroy(host)
+	defer cleanup_db(store, "idem_result")
+	run(t, store, "CREATE TABLE counter (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)")
+	run(t, store, "INSERT INTO counter (id, value) VALUES (0, 0)")
+
+	runs := 0
+	tally :: proc(ctx: ^db.Reducer_Ctx, args: []db.Value) -> db.Error {
+		amount := args[0].i
+		statement := fmt.tprintf("UPDATE counter SET value = value + %d WHERE id = 0", amount)
+		if _, err := db.sql_execute_in_tx(ctx.tx, statement); !db.error_ok(err) do return err
+		_, read_err := db.sql_execute_in_tx(ctx.tx, "SELECT value FROM counter WHERE id = 0")
+		if !db.error_ok(read_err) do return read_err
+		// The reducer names its result; it is recorded with the request.
+		ctx.result = []db.Value{db.value_int(amount * 10)}
+		return db.Error{}
+	}
+	testing.expect(t, db.error_ok(db.host_register(host, "tally", []db.Column_Type{db.type_int}, tally)))
+	_ = runs
+
+	request := []u8{7, 7}
+	first, first_err := db.host_call_once_result(host, request, "tally", []db.Value{db.value_int(4)})
+	testing.expect(t, db.error_ok(first_err))
+	if testing.expectf(t, len(first) == 1, "first call returned %d values", len(first)) {
+		testing.expect_value(t, first[0].i, i64(40))
+	}
+	db.values_destroy(first)
+
+	// The retry returns the stored result and leaves the counter alone.
+	second, second_err := db.host_call_once_result(host, request, "tally", []db.Value{db.value_int(4)})
+	testing.expect(t, db.error_ok(second_err))
+	if testing.expectf(t, len(second) == 1, "retry returned %d values", len(second)) {
+		testing.expect_value(t, second[0].i, i64(40))
+	}
+	db.values_destroy(second)
+	testing.expect_value(t, scalar(t, store, "SELECT value FROM counter WHERE id = 0").i, i64(4))
+
+	// A different request runs and answers with its own result.
+	third, third_err := db.host_call_once_result(host, []u8{8}, "tally", []db.Value{db.value_int(3)})
+	testing.expect(t, db.error_ok(third_err))
+	if testing.expectf(t, len(third) == 1, "third call returned %d values", len(third)) {
+		testing.expect_value(t, third[0].i, i64(30))
+	}
+	db.values_destroy(third)
+	testing.expect_value(t, scalar(t, store, "SELECT value FROM counter WHERE id = 0").i, i64(7))
+
+	// A reducer that names no result still replays as an empty answer, not an error.
+	quiet :: proc(ctx: ^db.Reducer_Ctx, args: []db.Value) -> db.Error {
+		return db.Error{}
+	}
+	testing.expect(t, db.error_ok(db.host_register(host, "quiet", nil, quiet)))
+	empty, empty_err := db.host_call_once_result(host, []u8{9}, "quiet", nil)
+	testing.expect(t, db.error_ok(empty_err))
+	testing.expect_value(t, len(empty), 0)
+	db.values_destroy(empty)
+}

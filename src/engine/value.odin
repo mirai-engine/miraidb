@@ -319,6 +319,12 @@ value_deep_free :: proc(v: Value, alloc: mem.Allocator) {
 	}
 }
 
+// values_destroy frees a list of values and the list itself; it is the way to
+// release what a call returned.
+values_destroy :: proc(values: []Value) {
+	value_deep_free(value_product(values), context.allocator)
+}
+
 // value_wire_size estimates the bytes a value contributes on the wire. It is a
 // hint for sizing buffers and quotas, not an exact encoding length.
 value_wire_size :: proc(v: Value) -> u64 {

@@ -574,8 +574,9 @@ acceptance criteria, current cost and effort; this list is the short version.
   than a deep copy: 50k rows in ~1 ms, steady state 11.6 µs per read. There is
   still no `AS OF` history. (backlog D3)
 - A scheduled reducer keeps its due time as a column of `_schedule`, and an
-  idempotent call commits its request id in the same transaction as its effects,
-  so both survive a restart (`test_durability_after_restart`). What is still not
+  idempotent call commits its request id and its result in the same transaction
+  as its effects, so a retry after a restart answers with the stored result
+  (`test_idempotent_result`, `test_durability_after_restart`). What is still not
   offered is `AS OF` history and a sandbox that makes a module deterministic.
 - Modules are processes, not a deterministic sandbox: the byte cap, socket
   timeouts, the reducer allow-list and a per-call **work budget** (rows read and

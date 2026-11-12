@@ -17,6 +17,10 @@ Reducer_Ctx :: struct {
 	tx:     ^Tx,
 	host:   ^Host,
 	now_us: i64,
+	// result is what the reducer returns to its caller. It is recorded with the
+	// request, so a retry answers with the same value instead of running again.
+	// The handler sets it; the slice lives as long as the transaction does.
+	result: []Value,
 }
 
 // Reducer_Def is a registered reducer: what it is called, the parameter types a
@@ -1993,7 +1997,8 @@ host_ensure_request_table :: proc(host: ^Host) -> Error {
 // in the same transaction as the reducer's changes, so either both commit or
 // neither does.
 host_call_once :: proc(host: ^Host, request_id: []u8, name: string, args: []Value) -> Error {
-	return host_call_once_at(host, request_id, name, args, host_now(host))
+	_, err := host_call_at(host, request_id, name, args, host_now(host), false)
+	return err
 }
 
 // host_call_once_at runs an idempotent call at a given time. A remote caller
@@ -2005,15 +2010,53 @@ host_call_once_at :: proc(
 	args: []Value,
 	now_us: i64,
 ) -> Error {
+	_, err := host_call_at(host, request_id, name, args, now_us, false)
+	return err
+}
+
+// host_call_once_result is the idempotent call that also returns the reducer's
+// result: the stored one when the request already ran, the fresh one otherwise.
+// The caller owns the values and frees them with values_destroy.
+host_call_once_result :: proc(
+	host: ^Host,
+	request_id: []u8,
+	name: string,
+	args: []Value,
+) -> ([]Value, Error) {
+	return host_call_at(host, request_id, name, args, host_now(host), true)
+}
+
+// host_call_once_result_at is the same call with the caller's clock.
+host_call_once_result_at :: proc(
+	host: ^Host,
+	request_id: []u8,
+	name: string,
+	args: []Value,
+	now_us: i64,
+) -> ([]Value, Error) {
+	return host_call_at(host, request_id, name, args, now_us, true)
+}
+
+// host_call_at is the one implementation behind the four names above. The
+// request and the response are written in the reducer's transaction, so a lost
+// reply is answered from the log rather than by running the call again.
+host_call_at :: proc(
+	host: ^Host,
+	request_id: []u8,
+	name: string,
+	args: []Value,
+	now_us: i64,
+	want_result: bool,
+) -> ([]Value, Error) {
 	if len(request_id) == 0 {
-		return errf(.Invalid_Argument, "an idempotent call needs a request id")
+		return nil, errf(.Invalid_Argument, "an idempotent call needs a request id")
 	}
 	reducer, registered := host.reducers[name]
 	if !registered {
-		return errf(.Invalid_Argument, "no reducer named %s", name)
+		return nil, errf(.Invalid_Argument, "no reducer named %s", name)
 	}
 	if len(args) != len(reducer.params) {
-		return errf(
+		return nil, errf(
 			.Invalid_Argument,
 			"reducer %s takes %d arguments but %d were given",
 			name,
@@ -2022,39 +2065,48 @@ host_call_once_at :: proc(
 		)
 	}
 	if ensure_err := host_ensure_request_table(host); ensure_err.kind != .None {
-		return ensure_err
+		return nil, ensure_err
 	}
 	coerced := make([]Value, len(args))
 	defer delete(coerced)
 	for param, i in reducer.params {
 		value, coerce_err := value_coerce(args[i], param)
-		if coerce_err.kind != .None do return coerce_err
+		if coerce_err.kind != .None do return nil, coerce_err
 		coerced[i] = value
 	}
 
 	tx := tx_begin_write(host.store)
 	seen, seen_err := sql_execute_in_tx_params(
 		tx,
-		"SELECT count(*) FROM _request WHERE id = ?",
+		"SELECT response FROM _request WHERE id = ?",
 		[]Value{value_bytes(request_id)},
 	)
 	if seen_err.kind != .None {
 		tx_rollback(tx)
-		return seen_err
+		return nil, seen_err
 	}
-	already_ran := len(seen.rows) > 0 && seen.rows[0][0].i > 0
-	sql_result_destroy(&seen)
-	if already_ran {
+	if len(seen.rows) > 0 {
+		stored := seen.rows[0][0]
+		decoded: []Value
+		if stored.kind == .Bytes && len(stored.bytes) > 0 {
+			decoded = decode_values(stored.bytes, context.allocator)
+		}
+		sql_result_destroy(&seen)
 		tx_rollback(tx)
-		return ERROR_NONE
+		if !want_result {
+			values_destroy(decoded)
+			return nil, ERROR_NONE
+		}
+		return decoded, ERROR_NONE
 	}
+	sql_result_destroy(&seen)
 
 	call_now := now_us
 	if call_now == 0 do call_now = host_now(host)
 	ctx := Reducer_Ctx{tx = tx, host = host, now_us = call_now}
 	if call_err := reducer.handler(&ctx, coerced); call_err.kind != .None {
 		tx_rollback(tx)
-		return call_err
+		return nil, call_err
 	}
 	// The transaction priced every statement it ran: one unit of work per row
 	// touched, which is what a runaway reducer is measured in.
@@ -2062,7 +2114,7 @@ host_call_once_at :: proc(
 	host.work_units_last = spent
 	if host.max_work_units > 0 && spent > host.max_work_units {
 		tx_rollback(tx)
-		return errf(
+		return nil, errf(
 			.Quota_Exceeded,
 			"reducer %s spent %d work units, over the %d budget",
 			name,
@@ -2071,7 +2123,12 @@ host_call_once_at :: proc(
 		)
 	}
 
-	response: Value = value_product(nil)
+	// The handler may hand back a slice that lived only in its own frame, so the
+	// values are copied before the response is encoded.
+	result_values := make([]Value, len(ctx.result))
+	defer delete(result_values)
+	copy(result_values, ctx.result)
+	response := value_product(result_values)
 	w: Byte_Writer
 	bw_init(&w)
 	defer bw_destroy(&w)
@@ -2086,9 +2143,21 @@ host_call_once_at :: proc(
 		insert,
 	); insert_err.kind != .None {
 		tx_rollback(tx)
-		return insert_err
+		return nil, insert_err
 	}
-	return tx_commit(tx)
+	if commit_err := tx_commit(tx); commit_err.kind != .None do return nil, commit_err
+	if !want_result do return nil, ERROR_NONE
+	return decode_values(payload, context.allocator), ERROR_NONE
+}
+
+// decode_values reads a response payload the way the wire reads values.
+@(private)
+decode_values :: proc(payload: []u8, alloc: mem.Allocator) -> []Value {
+	r: Byte_Reader
+	br_init(&r, payload)
+	value := value_decode(&r, alloc)
+	if r.bad || value.kind != .Product do return nil
+	return value.list
 }
 
 // host_client_connect registers a connection. It returns false when the
