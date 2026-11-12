@@ -19,7 +19,7 @@ outranks the dependent.
 | # | Item | Why at this position | Effort | Depends on |
 |---|---|---|---|---|
 | 1 | **D18a — writer lock** — *done* | Two processes on one directory corrupted each other silently; now the second open is refused with `locked` and the owner's pid, proven in-process and with two real processes. | S | — |
-| 2 | **ASAN pass** over CLI, soak and conformance | The two real bugs in this project were memory bugs; the pass protects every later phase, and is cheapest before the page store exists. | 1 round | — |
+| 2 | **ASAN pass** over CLI, soak and conformance — *partly done* | The whole suite ran under `-sanitize:address` and found no bounds or stack errors. Odin's heap allocator is not intercepted on this toolchain (a deliberate use-after-free is not reported), so heap safety rests on the fault walk, the leak tracker and the tests until the Linux CI (#13) runs the same pass with a working heap sanitizer. | 1 round | — |
 | 3 | **D8 — fault injection** — *done* | `Fault_Vfs` fails any operation at any call; `test_fault_injection` walks every write of a workload and proves the reopened state is exactly the commits that reported success. The page store will reuse the harness. | S | — |
 | 4 | **Benchmark gate** — *done* | `scripts/bench.py` records bytes per row, insert rate, read cost and compaction in `benchmarks/baseline.json` and fails the build beyond the recorded limits; the efficiency contract is now enforced, not remembered. | S | — |
 | 5 | **D11 — DDL inside a transaction** — *done* | Index DDL is staged like row changes and applied after them, so a table, its rows and its index commit together and roll back together. Unblocks the FTS index. | S | — |
@@ -140,7 +140,7 @@ after it, apply through `commitlog`, expose the last applied sequence.
 
 | Gate | Why | Effort | Priority |
 |---|---|---|---|
-| **Address sanitizer** over CLI, soak and conformance | Memory bugs have been the real risk | 1 round per phase | #2 |
+| **Address sanitizer** over CLI, soak and conformance — *partly done* | Memory bugs have been the real risk; bounds and stack are covered here, the heap needs the Linux toolchain | 1 round per phase | #2 |
 | **Fault injection** (D8) | Proves no third state after a failed write | S, then extended | #3 |
 | **Benchmark with thresholds** — *done* | Bytes per row within 10%; timings under a 3x catastrophe guard, because a shared machine cannot promise 10% (the 10% time rule is measured by hand with `--record`) | 1 day | #4 |
 | **CI on Linux and macOS** | Locking and the VFS are per-OS | 2–3 days | #13 |
@@ -183,6 +183,10 @@ reason written down instead.
 - **Benchmark gate** — `benchmarks/baseline.json` plus `scripts/bench.py --check`
   as a CI gate: bytes per row within 10%, insert rate, read cost and compaction
   under a 3x guard, with the machine recorded beside the numbers.
+- **Sanitizer pass** — 190 tests run under `-sanitize:address` on Windows with no
+  bounds or stack report; the heap half waits for the Linux CI, because Odin's
+  allocator on Windows bypasses the sanitizer's interception (verified with a
+  deliberate use-after-free).
 - **D13 stored result** — the response is recorded with the request id and
   returned on a retry (`host_call_once_result`, `test_idempotent_result`).
 - **D1 full-text ranking** — index on `term` created with the table, BM25
