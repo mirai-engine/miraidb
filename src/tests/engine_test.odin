@@ -8994,6 +8994,17 @@ test_paged_table_roundtrip :: proc(t: ^testing.T) {
 	db.sql_result_destroy(&ordered)
 	testing.expect_value(t, store.stream_scans, streams_before + 2)
 
+	// LIMIT 0 returns nothing, for a projection and for the single aggregate row.
+	empty_limit := run(t, store, "SELECT id FROM item LIMIT 0")
+	testing.expect_value(t, len(empty_limit.rows), 0)
+	db.sql_result_destroy(&empty_limit)
+	empty_aggregate := run(t, store, "SELECT count(*) FROM item LIMIT 0")
+	testing.expect_value(t, len(empty_aggregate.rows), 0)
+	db.sql_result_destroy(&empty_aggregate)
+	skipped_aggregate := run(t, store, "SELECT count(*) FROM item OFFSET 1")
+	testing.expect_value(t, len(skipped_aggregate.rows), 0)
+	db.sql_result_destroy(&skipped_aggregate)
+
 	// An aggregate over no rows is still one row, with the neutral values.
 	empty := run(t, store, "SELECT count(*), sum(qty) FROM item WHERE id = 9999")
 	testing.expect_value(t, len(empty.rows), 1)

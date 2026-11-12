@@ -1622,6 +1622,7 @@ stream_row_visit :: proc(raw: rawptr, row: Row) -> bool {
 		}
 		return true
 	}
+	if scan.limit == 0 do return false
 	values := make([]Value, len(scan.expanded))
 	for expr, i in scan.expanded {
 		value, eval_err := eval_expr(&ctx, expr)
@@ -1671,7 +1672,8 @@ sql_exec_stream_select :: proc(
 	// An index answers a point or range query with a handful of rows, which is
 	// cheaper than walking every page. The probe is the same one the main path
 	// runs; only the answer is used here.
-	if _, indexed := index_candidates(tx, base, stmt.from.name, stmt.from.alias, stmt.where_clause, params); indexed {
+	if ids, indexed := index_candidates(tx, base, stmt.from.name, stmt.from.alias, stmt.where_clause, params); indexed {
+		delete(ids)
 		return {}, false, ERROR_NONE
 	}
 
@@ -1758,7 +1760,9 @@ sql_exec_stream_select :: proc(
 	}
 	if scan_ctx.err.kind != .None do return {}, false, scan_ctx.err
 
-	if aggregate {
+	// One aggregate row is still subject to OFFSET and LIMIT, the same way the
+	// materializing path cuts the single row it built.
+	if aggregate && offset == 0 && limit != 0 {
 		final := Eval_Ctx{tx = tx, params = params, now_us = now_us, stream = &stream}
 		if stream.have_first {
 			final.sources = make([]Source, 1, tx.alloc)
