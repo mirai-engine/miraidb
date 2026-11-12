@@ -30,6 +30,8 @@ Error_Kind :: enum u8 {
 	Permission_Denied,
 	Cancelled,
 	Quota_Exceeded,
+	// Locked means another process owns the database directory.
+	Locked,
 	Internal,
 }
 
@@ -107,6 +109,8 @@ error_kind_name :: proc(kind: Error_Kind) -> string {
 		return "cancelled"
 	case .Quota_Exceeded:
 		return "quota_exceeded"
+	case .Locked:
+		return "locked"
 	case .Internal:
 		return "internal"
 	}

@@ -42,6 +42,12 @@ Capi_Statement :: struct {
 	embed: ^engine.Embed_Statement,
 }
 
+// last_open_error is the reason the last miraidb_open failed. The connection
+// does not exist when an open fails, so miraidb_errmsg(NULL) reports it; that is
+// the only place in the API where a failed call has no handle to explain itself.
+@(private)
+last_open_error: string
+
 @(export)
 miraidb_open :: proc "c" (path: cstring) -> rawptr {
 	context = runtime.default_context()
@@ -49,8 +55,12 @@ miraidb_open :: proc "c" (path: cstring) -> rawptr {
 	conn, err := engine.embed_open(string(path))
 	if err.kind != .None {
 		if conn != nil do engine.embed_close(conn)
+		delete(last_open_error)
+		last_open_error = strings.clone(err.message)
 		return nil
 	}
+	delete(last_open_error)
+	last_open_error = ""
 	handle := new(Capi_Connection)
 	handle.embed = conn
 	return rawptr(handle)
@@ -75,7 +85,10 @@ miraidb_close :: proc "c" (handle: rawptr) {
 miraidb_errmsg :: proc "c" (handle: rawptr) -> cstring {
 	context = runtime.default_context()
 	conn := capi_conn(handle)
-	if conn == nil do return "no connection"
+	if conn == nil {
+		if len(last_open_error) == 0 do return ""
+		return cstring(raw_data(last_open_error))
+	}
 	delete(conn.last)
 	conn.last = strings.clone(engine.embed_error(conn.embed))
 	if len(conn.last) == 0 do return ""

@@ -183,7 +183,8 @@ class Connection:
             raise Error(f"{path} does not exist")
         self._handle = _lib.miraidb_open(path.encode())
         if not self._handle:
-            raise Error("cannot open the database")
+            raw = _lib.miraidb_errmsg(None)
+            raise Error(raw.decode() if raw else "cannot open the database")
 
     def _error(self) -> Error:
         message = _lib.miraidb_errmsg(self._handle) if self._handle else None

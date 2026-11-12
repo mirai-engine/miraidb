@@ -18,7 +18,7 @@ outranks the dependent.
 
 | # | Item | Why at this position | Effort | Depends on |
 |---|---|---|---|---|
-| 1 | **D18a — writer lock** | Today two processes on one directory corrupt each other silently. Nothing else matters until that is refused with a clear error. | S | — |
+| 1 | **D18a — writer lock** — *done* | Two processes on one directory corrupted each other silently; now the second open is refused with `locked` and the owner's pid, proven in-process and with two real processes. | S | — |
 | 2 | **ASAN pass** over CLI, soak and conformance | The two real bugs in this project were memory bugs; the pass protects every later phase, and is cheapest before the page store exists. | 1 round | — |
 | 3 | **D8 — fault injection** | A VFS wrapper that fails the Nth write proves the log never leaves a third state; the page store will need exactly this harness. | S | — |
 | 4 | **Benchmark gate** (`scripts/bench.py`, 10% threshold) | Turns the efficiency contract below into a build failure instead of a good intention; must exist before performance work starts. | S | — |
@@ -44,8 +44,9 @@ outranks the dependent.
 | 24 | **Auth review** | Tokens, connection-scoped subscriptions and the byte and work budgets, attacked deliberately. | S | — |
 | 25 | **Licence and notice review** | MIT/Apache-2.0 with no vendored third-party source; confirm before each public release. | external | #23 |
 
-Rounds map onto the list: **1–7** are one round of small, mutually unblocking
-work; **8–12** are the storage round; **13–17** the surface round; **18–22** the
+Priority 1 landed first; the numbers are position, not rank, so the work
+continues at 2. Rounds map onto the list: **1–7** are one round of small,
+mutually unblocking work; **8–12** are the storage round; **13–17** the surface round; **18–22** the
 sharing round; **23–25** are release gates that can run in parallel from #13.
 
 ## The three asks, in detail
@@ -178,6 +179,12 @@ reason written down instead.
 | **Total** | **~33.000**, roughly doubling the tree |
 
 ## Closed already (for the record)
+
+- **D18a writer lock** — `<directory>/lock` held with an OS lock (Windows
+  `LockFileEx`, POSIX `fcntl`), released on close and on death; the refusal names
+  the owner (`test_writer_lock`, and `scripts/lock_smoke.py`, which opens the
+  database from one process, is refused in another, and reopens after the owner is
+  killed). `miraidb_errmsg(NULL)` reports the reason a failed open failed.
 
 - **D7 scheduler durability** — `_schedule.at_us` is a column and commits; a
   restart resumes pending work (`test_durability_after_restart`).

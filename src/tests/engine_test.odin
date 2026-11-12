@@ -7922,3 +7922,41 @@ test_commit_queue :: proc(t: ^testing.T) {
 	db.commit_queue_destroy(&real)
 	cleanup_db(store, "commit_queue")
 }
+
+@(test)
+test_writer_lock :: proc(t: ^testing.T) {
+	// One database directory has one owner. A second open from this process is
+	// refused by the engine's registry before the operating system is asked, and
+	// the refusal names the pid that holds it; closing the owner releases both.
+	path := fmt.aprintf("_test_%s", "writer_lock")
+	defer delete(path)
+	os.remove_all(path)
+	defer os.remove_all(path)
+
+	first, first_err := db.store_open(path, {persistent = true, create = true, durable = false})
+	if !testing.expectf(t, db.error_ok(first_err), "first open: %s", first_err.message) do return
+
+	second, second_err := db.store_open(path, {persistent = true, create = true, durable = false})
+	testing.expect(t, second == nil)
+	testing.expect_value(t, second_err.kind, db.Error_Kind.Locked)
+	testing.expectf(t, strings.contains(second_err.message, path), "refusal names the database: %s", second_err.message)
+	testing.expectf(t, strings.contains(second_err.message, "pid"), "refusal names the owner: %s", second_err.message)
+
+	// The lock file carries the owner, and it is inside the directory.
+	lock_file := fmt.aprintf("%s/lock", path)
+	defer delete(lock_file)
+	testing.expect(t, os.exists(lock_file))
+
+	db.store_close(first)
+	third, third_err := db.store_open(path, {persistent = true, create = true, durable = false})
+	if !testing.expectf(t, db.error_ok(third_err), "reopen after close: %s", third_err.message) do return
+	db.store_close(third)
+
+	// A database that does not exist is still reported as missing, never as
+	// locked: the lock is taken after the directory exists.
+	missing := fmt.aprintf("_test_%s_missing", "writer_lock")
+	defer delete(missing)
+	os.remove_all(missing)
+	_, missing_err := db.store_open(missing, {persistent = true, create = false, durable = false})
+	testing.expect_value(t, missing_err.kind, db.Error_Kind.Io)
+}

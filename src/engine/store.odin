@@ -47,6 +47,9 @@ Store :: struct {
 	// statement reach the module registry (LOAD EXTENSION); a store used without a
 	// host simply records the catalog row.
 	host: ^Host,
+	// lock is the ownership of the database directory, when it is on the OS file
+	// system. A virtual file system and an in-memory log have no second process.
+	lock: Db_Lock,
 	mutex:         sync.RW_Mutex,
 	tables:        map[string]^Table,
 	commit_seq:    u64,
@@ -179,23 +182,36 @@ store_open :: proc(path: string, options: Store_Options) -> (^Store, Error) {
 			return nil, errf(.Io, "cannot create %s: %v", path, mkdir_err)
 		}
 	}
+	// The directory is owned from here on. A second process that finds it held is
+	// refused with the owner's pid instead of appending to a log it does not own.
+	if options.vfs == nil {
+		lock, lock_err := db_lock_acquire(path)
+		if lock_err.kind != .None {
+			free(store)
+			return nil, lock_err
+		}
+		store.lock = lock
+	}
 	durability := options.durability
 	if !options.durable do durability = .None
 	checksum := options.checksum
 	if checksum == .Default do checksum = .CRC32C
 	log, log_err := log_open(path, options.create, durability, checksum, options.vfs)
 	if log_err.kind != .None {
+		db_lock_release(&store.lock)
 		free(store)
 		return nil, log_err
 	}
 	store.log = log
 	if snapshot_err := store_load_snapshot(store); snapshot_err.kind != .None {
 		log_close(&store.log)
+		db_lock_release(&store.lock)
 		free(store)
 		return nil, snapshot_err
 	}
 	if replay_err := store_replay(store); replay_err.kind != .None {
 		log_close(&store.log)
+		db_lock_release(&store.lock)
 		free(store)
 		return nil, replay_err
 	}
@@ -240,6 +256,7 @@ store_close :: proc(store: ^Store) {
 	}
 	delete(store.variables)
 	log_close(&store.log)
+	db_lock_release(&store.lock)
 	free(store)
 }
 

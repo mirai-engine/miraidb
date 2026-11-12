@@ -111,18 +111,20 @@ honest measurement.
 
 ## Not implemented: a second process, and replication
 
-- **One process owns one log, and there is no lock.** A second process that opens
-  the same directory is not refused; two writers would corrupt each other.
-  Connections (not processes) are supported through the host: each client has its
-  own subscriptions and its own byte budget. The fix has three steps, in
-  `docs/backlog.md` (D18): a writer lock, a read-only open beside a writer once
-  pages exist (D17), and a broker mode that serves other processes over the wire.
+- **One process owns one log.** A second process that opens the same directory is
+  refused with `locked` and the owner's pid: an OS lock on `<directory>/lock`
+  (Windows `LockFileEx`, POSIX `fcntl`) is taken on open and released on close or
+  death. Connections (not processes) share one host: each client has its own
+  subscriptions and its own byte budget. What is still missing is *sharing*, in
+  `docs/backlog.md` (D18): a read-only open beside a writer once pages exist
+  (D17), and a broker mode that serves other processes over the wire.
 
 This is the one capability the engine does **not** have at all, as opposed to
 having a shallow version of it. There is no code for it in the tree.
 
 - **Nothing streams commits between processes**; a second process can read the
-  same database only after the first one closes.
+  same database only after the first one closes (the second opener is refused, it
+  does not wait).
 - **No follower.** There is no way to run a read-only copy that catches up, and
   no way to promote one.
 - **No failover, no leader election, no consistency story for a partition.**

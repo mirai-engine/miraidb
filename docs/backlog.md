@@ -40,7 +40,7 @@ Rules for this file:
 | D15 | Network hardening | HTTP/WS subset with caps | TLS, HTTP/2, backpressure, per-route timeouts | M | P3 |
 | D16 | Clients | **Python binding over the C ABI, with a smoke gate** | generation per catalog | M | P3 |
 | D17 | Rows on disk | every table is a `map[Row_Id]Row` in RAM | page store, buffer pool, free list, eviction | XL | P0 |
-| D18a | Second writer | no lock at all | lock file, clear error | S | P0 |
+| D18a | Second writer | **done**: `lock` file, OS lock, refusal naming the owner (`test_writer_lock`, `scripts/lock_smoke.py`) | — | S | P0 |
 | D18b | Reader beside writer | one process owns the directory | pages + lock, read-only open | L | P1 |
 | D18c | Broker mode | clients must be in-process | one owner, others over the wire | M | P1 |
 
@@ -129,17 +129,21 @@ during a flush still opens to a consistent state (D8 proves it); `bench` and
 ## D18 — Access from another process
 
 **Now.** Several *connections* to one host work. Several *processes* on one
-database directory do not: there is no lock file, so two writers would corrupt
-each other silently.
+database directory do not share it: the first one owns it, and the others are
+refused with `locked` naming the owner (`pid` and start time), so nothing is
+silently corrupted. The lock is an OS lock on `<directory>/lock` (Windows
+`LockFileEx`, POSIX `fcntl`) and it disappears with the process, including a
+killed one.
 
-**Gap.** In order: (a) an exclusive lock on open, so a second writer is refused
-with a clear error; (b) with D17, a read-only open beside a writer; (c) a broker
-mode where one process owns the database and the others speak the wire protocol
-to it — the cheap answer, and the one that reuses everything already tested.
+**Gap.** In order: (a) *done*: the exclusive lock on open; (b) with D17, a
+read-only open beside a writer; (c) a broker mode where one process owns the
+database and the others speak the wire protocol to it — the cheap answer, and the
+one that reuses everything already tested.
 
-**Done when.** A test opens the same directory twice and gets a refusal naming the
-owner; with pages, a reader sees a committed row written by another process;
-broker mode serves two clients with independent subscriptions from one owner.
+**Done when.** A second opener gets a refusal naming the owner — proven twice:
+`test_writer_lock` in-process and `scripts/lock_smoke.py` with two real processes;
+with pages, a reader sees a committed row written by another process; broker mode
+serves two clients with independent subscriptions from one owner.
 
 **Not claimed today.** "Multi-process access" beyond refusing a second writer.
 

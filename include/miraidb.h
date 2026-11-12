@@ -50,7 +50,8 @@ typedef void *miraidb_stmt;
 miraidb_conn miraidb_open(const char *path);
 void         miraidb_close(miraidb_conn db);
 
-/* Last error for the connection, or an empty string. */
+/* Last error for the connection, or an empty string. When db is NULL, the
+   reason the last miraidb_open failed. */
 const char  *miraidb_errmsg(miraidb_conn db);
 
 /* Runs one statement without parameters. */

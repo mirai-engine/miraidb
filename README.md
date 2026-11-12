@@ -249,10 +249,13 @@ them, recovery time grows with the log and range queries scan the table.
 
 ## Not implemented: a second process, and replication
 
-One process owns one log, and there is no lock: a second process on the same
-directory is not refused. Several *connections* to one host work (each client has
-its own subscriptions and byte budget); several *processes* do not. The order to
-fix it is in `docs/roadmap.md`: lock, then pages, then a broker.
+One process owns one log. A second process on the same directory is refused with
+`locked` and the owner's pid: an OS lock on `<directory>/lock` is taken on open and
+released on close or death, so nothing is silently corrupted. Several
+*connections* to one host work (each client has its own subscriptions and byte
+budget); several *processes* still do not *share* one database. The order to fix
+that is in `docs/roadmap.md`: pages, then a reader beside a writer, then a
+broker.
 
 There is no follower, no log shipping and no failover;
 a second process can read the same database only after the first one closes. The
