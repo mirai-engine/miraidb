@@ -21,7 +21,7 @@ Rules for this file:
 
 | # | Area | Today's cost | Gap | Effort | Priority |
 |---|---|---|---|---|---|
-| D1 | Full-text term index and BM25 | one scan of the term table per pattern; no `rank` | index on `term`, BM25 `rank`, `snippet` | M | P0 |
+| D1 | Full-text term index and BM25 | **done**: index on `term` in the same transaction, BM25 `rank`, `snippet`/`highlight`, scan narrowed to the matches (`test_full_text_ranking`, `test_full_text_cost`) | phrases, prefix, column filters | M | P0 |
 | D2 | Spatial index | overlap is a scan of the boxes | node file, tree descent | M | P2 |
 | D3 | Snapshot cost | **borrowed values, ~1 ms to freeze 50k rows** | `AS OF` history, GC | M | P2 |
 | D4 | Page backend | `.sqlite` is rewritten whole per commit | pages in place, WAL frames, free list | XL | P1 |
@@ -48,31 +48,35 @@ Rules for this file:
 
 ## D1 — Full-text: index the term column
 
-**Now.** `CREATE VIRTUAL TABLE … USING fts5(cols)` keeps an inverted index in
-`_fts_<name>_terms (term, doc)` and `MATCH` resolves a pattern **once per
-statement**, caching the document set in `Tx.fts_cache`. Resolution reads every
-row of the term table, because there is no index on `term`: a virtual table is
-created inside one statement and `CREATE INDEX` refuses to run in a transaction
-that also creates tables (`tx_create_index`).
+**Done.** `CREATE VIRTUAL TABLE … USING fts5(cols)` now creates, in the same
+transaction (D11 made that possible):
 
-**Cost.** O(terms) per distinct pattern per query, then one map lookup per
-scanned row. Small tables are unaffected; a corpus with a million tokens pays a
-full pass for every query.
+```sql
+_fts_<name>_terms (term, doc, tf)       -- one posting per distinct term per document
+_fts_<name>_docs  (doc, length)         -- tokens per document
+_fts_<name>_stats (id, docs, tokens)    -- corpus size and total tokens, one row
+```
 
-**Ranking.** There is no `rank` at all. BM25 needs two numbers the shadow table
-can keep: document frequency per term (a counter row per term) and document
-length (tokens per document). With both, `rank` is a scan over the matching
-documents only, ordered by the formula; without the term index it would need the
-vocabulary scan as well. So BM25 lands with the index, not before it.
+with an index on `term`, one on `doc` and one on the document length. A query
+walks the postings of its terms; the scan over the documents is narrowed to the
+matching rows (`fts_scan_candidates`), so the cost follows the postings of the
+query instead of the vocabulary or the corpus. `rank` is BM25 negated (lower is
+better, so `ORDER BY rank` puts the best first), computed from document frequency,
+term count and document length. `snippet()` and `highlight()` mark the tokens the
+pattern asks for, `AND` is accepted as the juxtaposition it already was, and the
+per-query work is cached per transaction.
 
-**Done when.** `_fts_<name>_terms` is created with an index on `term` in the same
-transaction as the table (this needs D11); `rank` is BM25 over the matching
-documents with a test per shape (a rare term outranks a common one, a short
-document outranks a long one at equal frequency); `snippet()`/`highlight()`
-return the surrounding text with the match marked; `AND` is an operator rather
-than a term. Cost of a query becomes O(matches + rows).
+**Cost now.** One index probe per query term plus one probe per matching posting;
+a term that every document carries costs its postings, because ranking has to
+look at every candidate. That bound is written down, not hidden.
 
-**Not claimed today.** "Full-text search" — not "ranked search".
+**Measured.** `test_full_text_cost`: 5000 documents, one rare term → at most 8
+rows visited; a term in every document → its postings, never the vocabulary. A
+bulk load stays linear: 5000 documents insert with one row visited per document.
+
+**Left.** Phrase queries (`"a b"`), prefix (`foo*`) and column filters
+(`body:foo`), and a `MATCH` whose pattern is a column of the row (only constants
+and parameters narrow the scan).
 
 ## D2 — Spatial: an actual tree
 

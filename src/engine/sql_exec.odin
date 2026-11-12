@@ -1339,9 +1339,31 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 	}
 	// A view already holds a materialized table: scan it directly.
 	if !base_is_view && !empty_row {
-		if candidate_ids, used := index_candidates(tx, base, stmt.from.name, stmt.from.alias, stmt.where_clause, params); used {
+		if candidate_ids, used, fts_err := fts_scan_candidates(
+			tx,
+			stmt.from.name,
+			stmt.from.alias,
+			stmt.where_clause,
+			params,
+		); used {
+			if fts_err.kind != .None {
+				free_partials(&partials)
+				return {}, fts_err
+			}
 			defer delete(candidate_ids)
 			for id in candidate_ids {
+				tx.rows_scanned += 1
+				if row, exists := tx_get(tx, stmt.from.name, id); exists {
+					one := make([]Source, 1)
+					one[0] = Source{table = base, row = row, alias = stmt.from.alias}
+					append(&partials, one)
+				}
+			}
+			used_index = true
+		} else if indexed_ids, indexed := index_candidates(tx, base, stmt.from.name, stmt.from.alias, stmt.where_clause, params); indexed {
+			defer delete(indexed_ids)
+			for id in indexed_ids {
+				tx.rows_scanned += 1
 				if row, exists := tx_get(tx, stmt.from.name, id); exists {
 					one := make([]Source, 1)
 					one[0] = Source{table = base, row = row, alias = stmt.from.alias}
@@ -1359,6 +1381,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			return {}, collect_err
 		}
 		for row in rows {
+			tx.rows_scanned += 1
 			one := make([]Source, 1)
 			one[0] = Source{table = base, row = row, alias = stmt.from.alias}
 			append(&partials, one)
@@ -1439,6 +1462,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			}
 			matched := false
 			for row in lateral_rows {
+				tx.rows_scanned += 1
 				candidate := make([]Source, len(partial) + 1)
 				copy(candidate, partial)
 				candidate[len(partial)] = Source{table = table, row = row, alias = join.table.alias}
@@ -2062,6 +2086,13 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 				if !matches do continue
 				index, found := schema_column_index(&source.table.schema, e.name)
 				if !found {
+					// rank is a hidden column of a full-text table: it is the
+					// score of the MATCH that this query ran.
+					if strings.equal_fold(e.name, "rank") {
+						if score, scored := fts_rank_value(ctx.tx, source.table.schema.name, source.row.id); scored {
+							return value_float(score), ERROR_NONE
+						}
+					}
 					return {}, errf(
 						.Column_Not_Found,
 						"column %s does not exist in %s",
@@ -2088,6 +2119,13 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 				found_value = source.row.values[index]
 			} else {
 				found_value = value_null()
+			}
+		}
+		if !found && strings.equal_fold(e.name, "rank") {
+			for source in ctx.sources {
+				if score, scored := fts_rank_value(ctx.tx, source.table.schema.name, source.row.id); scored {
+					return value_float(score), ERROR_NONE
+				}
 			}
 		}
 		if !found {
@@ -2703,6 +2741,16 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		return value, ERROR_NONE
 	}
 	switch strings.to_lower(call.name) {
+	case "snippet", "highlight":
+		if len(args) != 2 {
+			return {}, errf(.Invalid_Argument, "%s() takes text and a pattern", call.name)
+		}
+		if args[0].kind == .Null || args[1].kind == .Null do return value_null(), ERROR_NONE
+		if args[0].kind != .String || args[1].kind != .String {
+			return {}, errf(.Invalid_Type, "%s() expects text for both arguments", call.name)
+		}
+		window := strings.equal_fold(call.name, "snippet")
+		return value_string(fts_mark(args[0].s, args[1].s, window)), ERROR_NONE
 	case "lower":
 		if len(args) != 1 do return {}, errf(.Invalid_Argument, "lower() takes one argument")
 		if args[0].kind != .String do return {}, errf(.Invalid_Type, "lower() expects text")
@@ -3455,7 +3503,7 @@ sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Res
 		// values the table would hold.
 		row_id, insert_err := tx_insert(tx, stmt.table, values)
 		if insert_err.kind == .None {
-			if fts_err := fts_index_if_virtual(tx, stmt.table, row_id, values); fts_err.kind != .None {
+			if fts_err := fts_index_if_virtual(tx, stmt.table, row_id, values, true); fts_err.kind != .None {
 				return {}, fts_err
 			}
 		}
@@ -3490,7 +3538,7 @@ sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Res
 			if update_err := tx_update(tx, stmt.table, conflict.id, new_values); update_err.kind != .None {
 				return {}, update_err
 			}
-			if fts_err := fts_index_if_virtual(tx, stmt.table, conflict.id, new_values); fts_err.kind != .None {
+			if fts_err := fts_index_if_virtual(tx, stmt.table, conflict.id, new_values, false); fts_err.kind != .None {
 				return {}, fts_err
 			}
 			if returning := stmt.returning; returning != nil {
@@ -3651,7 +3699,7 @@ sql_exec_update :: proc(tx: ^Tx, stmt: Update_Stmt, params: []Value) -> (Sql_Res
 		if update_err := tx_update(tx, stmt.table, row.id, new_values); update_err.kind != .None {
 			return {}, update_err
 		}
-		if fts_err := fts_index_if_virtual(tx, stmt.table, row.id, new_values); fts_err.kind != .None {
+		if fts_err := fts_index_if_virtual(tx, stmt.table, row.id, new_values, false); fts_err.kind != .None {
 			return {}, fts_err
 		}
 		if returning_err := returning_append(&result, &returned, stmt.returning, table, Row{values = new_values}); returning_err.kind != .None {
@@ -4171,6 +4219,46 @@ sql_exec_drop_index :: proc(tx: ^Tx, stmt: Drop_Index_Stmt) -> (Sql_Result, Erro
 // using a single-column index. The caller still re-checks the whole predicate,
 // so the result only has to be a superset of the matching rows.
 @(private)
+// fts_scan_candidates narrows a scan to the documents a MATCH selects. Without
+// it the predicate would be evaluated on every row of the table; with it the scan
+// visits the matches only, which is what makes the cost follow the answer instead
+// of the corpus. The pattern has to be a constant (or a parameter), because a
+// row-dependent pattern cannot be answered from one lookup.
+fts_scan_candidates :: proc(
+	tx: ^Tx,
+	table_name: string,
+	table_alias: string,
+	predicate: ^Expr,
+	params: []Value,
+) -> (ids: [dynamic]Row_Id, used: bool, err: Error) {
+	if predicate == nil do return nil, false, ERROR_NONE
+	virtual, is_virtual := fts_virtual_lookup(tx, table_name)
+	if !is_virtual || !fts_is_full_text(virtual) do return nil, false, ERROR_NONE
+	conjuncts := make([dynamic]^Expr)
+	defer delete(conjuncts)
+	split_and(predicate, &conjuncts)
+	for expr in conjuncts {
+		match, is_match := expr^.(Match_Expr)
+		if !is_match do continue
+		column, is_column := match.operand^.(Column_Expr)
+		if !is_column do continue
+		names_table := len(column.table) > 0 ? column.table : column.name
+		named := strings.equal_fold(names_table, table_name) ||
+			(len(table_alias) > 0 && strings.equal_fold(names_table, table_alias))
+		if !named do continue
+		pattern, constant := eval_constant(match.pattern, params)
+		if !constant || pattern.kind != .String do continue
+		result, match_err := fts_match_docs(tx, virtual, pattern.s)
+		if match_err.kind != .None do return nil, true, match_err
+		for doc in result.docs do append(&ids, doc)
+		slice.sort_by(ids[:], proc(a, b: Row_Id) -> bool {
+			return a < b
+		})
+		return ids, true, ERROR_NONE
+	}
+	return nil, false, ERROR_NONE
+}
+
 index_candidates :: proc(
 	tx: ^Tx,
 	table: ^Table,

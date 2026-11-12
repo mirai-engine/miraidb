@@ -1,5 +1,7 @@
 package engine
 
+import "base:runtime"
+import "core:math"
 import "core:strings"
 
 // Full-text search as data. A virtual FTS table is a normal table of documents
@@ -7,8 +9,13 @@ import "core:strings"
 // not the documents, so the query cost follows the number of matching documents
 // rather than the size of the text.
 //
-//	_virtual (name, module, settings)  what virtual tables exist
-//	_fts_<name>_terms (term, doc)      one row per (token, document)
+//	_virtual (name, module, settings)      what virtual tables exist
+//	_fts_<name>_terms (term, doc, tf)     one row per (token, document), tf counts it
+//	_fts_<name>_docs  (doc, length)       tokens per document, for BM25
+//	_fts_<name>_stats (id, docs, tokens)  one row: corpus size and total tokens
+//
+// The terms table is indexed on `term` and on `doc`, so a query walks the postings
+// of its terms and a document rewrite touches only its own rows.
 //
 // Interior tables are ordinary tables: they are logged, replicated and dropped
 // like any other, so FTS needs no format change.
@@ -112,14 +119,46 @@ fts_create :: proc(tx: ^Tx, name: string, module: string, columns: []string) -> 
 
 	terms := fts_terms_name(name, tx.alloc)
 	terms_sql := strings.concatenate(
-		{"CREATE TABLE IF NOT EXISTS ", terms, " (term TEXT NOT NULL, doc INTEGER NOT NULL)"},
+		{"CREATE TABLE IF NOT EXISTS ", terms, " (term TEXT NOT NULL, doc INTEGER NOT NULL, tf INTEGER NOT NULL)"},
 		tx.alloc,
 	)
 	if err := fts_run(tx, terms_sql); err.kind != .None do return err
-	// No index on `term`: CREATE INDEX must run in a transaction of its own, and a
-	// virtual table is created inside one statement. MATCH therefore reads the
-	// shadow table once per distinct pattern (see fts_match_docs) rather than once
-	// per row, which is the cost that matters for a scan.
+	docs := fts_docs_name(name, tx.alloc)
+	docs_sql := strings.concatenate(
+		{"CREATE TABLE IF NOT EXISTS ", docs, " (doc INTEGER PRIMARY KEY, length INTEGER NOT NULL)"},
+		tx.alloc,
+	)
+	if err := fts_run(tx, docs_sql); err.kind != .None do return err
+	stats := fts_stats_name(name, tx.alloc)
+	stats_sql := strings.concatenate(
+		{"CREATE TABLE IF NOT EXISTS ", stats, " (id INTEGER PRIMARY KEY, docs INTEGER NOT NULL, tokens INTEGER NOT NULL)"},
+		tx.alloc,
+	)
+	if err := fts_run(tx, stats_sql); err.kind != .None do return err
+	// An INTEGER PRIMARY KEY is the row id, and the scan planner does not treat it
+	// as a probe target; the explicit index makes a length lookup a point read
+	// instead of a scan of every document (the difference between O(1) and O(N)
+	// per insert).
+	docs_index := strings.concatenate(
+		{"CREATE INDEX IF NOT EXISTS ", docs, "_doc ON ", docs, " (doc)"},
+		tx.alloc,
+	)
+	if err := fts_run(tx, docs_index); err.kind != .None do return err
+	seed := strings.concatenate({"INSERT INTO ", stats, " (id, docs, tokens) VALUES (1, 0, 0)"}, tx.alloc)
+	if err := fts_run(tx, seed); err.kind != .None do return err
+	// The postings index is created in this same transaction (index DDL is
+	// staged like rows), so the first query already reads an index. The cost of a
+	// query follows its matches; maintaining an index costs one probe per write.
+	term_index := strings.concatenate(
+		{"CREATE INDEX IF NOT EXISTS ", terms, "_term ON ", terms, " (term)"},
+		tx.alloc,
+	)
+	if err := fts_run(tx, term_index); err.kind != .None do return err
+	doc_index := strings.concatenate(
+		{"CREATE INDEX IF NOT EXISTS ", terms, "_doc ON ", terms, " (doc)"},
+		tx.alloc,
+	)
+	if err := fts_run(tx, doc_index); err.kind != .None do return err
 
 	values := []Value {
 		value_string(strings.clone(name, tx.alloc)),
@@ -151,16 +190,38 @@ fts_drop :: proc(tx: ^Tx, name: string, if_exists: bool) -> Error {
 
 // fts_index_row maintains the inverted index for one document. Every indexed
 // column is tokenized with the same rules MATCH uses, so what is stored and what
-// is searched can never disagree.
-fts_index_row :: proc(tx: ^Tx, table: Fts_Table, doc: Row_Id, values: []Value) -> Error {
-	if err := fts_remove_row(tx, table, doc); err.kind != .None do return err
-	seen := make(map[string]bool, 8, tx.alloc)
+// is searched can never disagree. The row keeps one posting per distinct term
+// with its count (what BM25 needs), the document length, and the corpus totals,
+// so ranking never scans the documents or the vocabulary.
+//
+// A row id this transaction handed out has no postings and no length yet, so it
+// skips both lookups; that is what keeps a bulk load linear instead of quadratic
+// in the size of the index.
+fts_index_row :: proc(tx: ^Tx, table: Fts_Table, doc: Row_Id, values: []Value, is_new: bool) -> Error {
+	if tx.fts_new_docs == nil do tx.fts_new_docs = make(map[string]map[Row_Id]bool)
+	documents := tx.fts_new_docs[table.name]
+	if documents == nil {
+		documents = make(map[Row_Id]bool)
+		tx.fts_new_docs[table.name] = documents
+	}
+	old_length := 0
+	had_doc := false
+	if !is_new {
+		length, existed := fts_doc_length(tx, table, doc)
+		old_length = length
+		had_doc = existed
+		del_terms := strings.concatenate({"DELETE FROM ", table.terms, " WHERE doc = ?"}, tx.alloc)
+		if delete_err := fts_run(tx, del_terms, []Value{value_int(i64(doc))}); delete_err.kind != .None {
+			return delete_err
+		}
+	}
+	seen := make(map[string]int, 8, tx.alloc)
 	defer delete(seen)
 	insert := strings.concatenate(
-		{"INSERT INTO ", table.terms, " (term, doc) VALUES (?, ?)"},
+		{"INSERT INTO ", table.terms, " (term, doc, tf) VALUES (?, ?, ?)"},
 		tx.alloc,
 	)
-	count := 0
+	total := 0
 	for value in values {
 		if value.kind != .String do continue
 		term := strings.builder_make(tx.alloc)
@@ -169,35 +230,152 @@ fts_index_row :: proc(tx: ^Tx, table: Fts_Table, doc: Row_Id, values: []Value) -
 				strings.write_byte(&term, fts_fold_byte(b))
 				continue
 			}
-			word := strings.to_string(term)
-			count += fts_insert_term(tx, insert, &seen, word, doc)
+			total += fts_count_term(&seen, strings.to_string(term))
 			strings.builder_reset(&term)
 			strings.builder_destroy(&term)
 			term = strings.builder_make(tx.alloc)
 		}
-		word := strings.to_string(term)
-		count += fts_insert_term(tx, insert, &seen, word, doc)
+		total += fts_count_term(&seen, strings.to_string(term))
 		strings.builder_destroy(&term)
 	}
-	_ = count
+	for word, count in seen {
+		err := fts_run(
+			tx,
+			insert,
+			[]Value{value_string(word), value_int(i64(doc)), value_int(i64(count))},
+		)
+		if err.kind != .None do return err
+	}
+	docs_table := fts_docs_name(table.name, tx.alloc)
+	if had_doc {
+		update := strings.concatenate({"UPDATE ", docs_table, " SET length = ? WHERE doc = ?"}, tx.alloc)
+		if err := fts_run(tx, update, []Value{value_int(i64(total)), value_int(i64(doc))}); err.kind != .None {
+			return err
+		}
+	} else {
+		insert_length := strings.concatenate({"INSERT INTO ", docs_table, " (doc, length) VALUES (?, ?)"}, tx.alloc)
+		if err := fts_run(tx, insert_length, []Value{value_int(i64(doc)), value_int(i64(total))}); err.kind != .None {
+			return err
+		}
+	}
+	add_docs := had_doc ? 0 : 1
+	if adjust_err := fts_stats_adjust(tx, table, add_docs, total - old_length); adjust_err.kind != .None {
+		return adjust_err
+	}
+	documents[doc] = true
 	return ERROR_NONE
 }
 
+// fts_count_term counts one token, capped so a pathological document cannot grow
+// the posting map without bound.
 @(private)
-fts_insert_term :: proc(tx: ^Tx, insert: string, seen: ^map[string]bool, word: string, doc: Row_Id) -> int {
+fts_count_term :: proc(seen: ^map[string]int, word: string) -> int {
 	if len(word) == 0 do return 0
-	if _, exists := seen[word]; exists do return 0
-	if len(seen) >= FTS_MAX_TERMS do return 0
-	key := strings.clone(word, tx.alloc)
-	seen[key] = true
-	err := fts_run(tx, insert, []Value{value_string(word), value_int(i64(doc))})
-	if err.kind != .None do return 0
+	if count, exists := seen[word]; exists {
+		seen[word] = count + 1
+		return 1
+	}
+	if len(seen) >= FTS_MAX_TERMS do return 1
+	seen[strings.clone(word, context.temp_allocator)] = 1
 	return 1
 }
 
 fts_remove_row :: proc(tx: ^Tx, table: Fts_Table, doc: Row_Id) -> Error {
-	sql := strings.concatenate({"DELETE FROM ", table.terms, " WHERE doc = ?"}, tx.alloc)
-	return fts_run(tx, sql, []Value{value_int(i64(doc))})
+	if documents, exists := tx.fts_new_docs[table.name]; exists {
+		delete_key(&documents, doc)
+	}
+	length, existed := fts_doc_length(tx, table, doc)
+	del_terms := strings.concatenate({"DELETE FROM ", table.terms, " WHERE doc = ?"}, tx.alloc)
+	if delete_err := fts_run(tx, del_terms, []Value{value_int(i64(doc))}); delete_err.kind != .None {
+		return delete_err
+	}
+	if !existed do return ERROR_NONE
+	del_docs := strings.concatenate(
+		{"DELETE FROM ", fts_docs_name(table.name, tx.alloc), " WHERE doc = ?"},
+		tx.alloc,
+	)
+	if delete_err := fts_run(tx, del_docs, []Value{value_int(i64(doc))}); delete_err.kind != .None {
+		return delete_err
+	}
+	return fts_stats_adjust(tx, table, -1, -length)
+}
+
+// fts_remove_row_length drops the postings and the length of one document and
+// returns what it had, so an update adjusts the corpus totals once.
+@(private)
+fts_remove_row_length :: proc(tx: ^Tx, table: Fts_Table, doc: Row_Id) -> (length: int, existed: bool, err: Error) {
+	length, existed = fts_doc_length(tx, table, doc)
+	del_terms := strings.concatenate({"DELETE FROM ", table.terms, " WHERE doc = ?"}, tx.alloc)
+	if delete_err := fts_run(tx, del_terms, []Value{value_int(i64(doc))}); delete_err.kind != .None {
+		return 0, false, delete_err
+	}
+	if !existed do return 0, false, ERROR_NONE
+	del_docs := strings.concatenate(
+		{"DELETE FROM ", fts_docs_name(table.name, tx.alloc), " WHERE doc = ?"},
+		tx.alloc,
+	)
+	if delete_err := fts_run(tx, del_docs, []Value{value_int(i64(doc))}); delete_err.kind != .None {
+		return 0, false, delete_err
+	}
+	if adjust_err := fts_stats_adjust(tx, table, -1, -length); adjust_err.kind != .None {
+		return 0, false, adjust_err
+	}
+	return length, true, ERROR_NONE
+}
+
+// --- Corpus statistics for BM25 -------------------------------------------
+
+@(private)
+fts_stats_name :: proc(name: string, alloc := context.temp_allocator) -> string {
+	return strings.concatenate({"_fts_", name, "_stats"}, alloc)
+}
+
+@(private)
+fts_docs_name :: proc(name: string, alloc := context.temp_allocator) -> string {
+	return strings.concatenate({"_fts_", name, "_docs"}, alloc)
+}
+
+// fts_stats_read returns the number of documents and the total number of tokens,
+// which is what BM25 needs for the average length.
+@(private)
+fts_stats_read :: proc(tx: ^Tx, table: Fts_Table) -> (docs: int, tokens: int) {
+	sql := strings.concatenate(
+		{"SELECT docs, tokens FROM ", fts_stats_name(table.name, tx.alloc), " WHERE id = 1"},
+		tx.alloc,
+	)
+	result, err := sql_execute_in_tx(tx, sql)
+	if err.kind != .None do return 0, 0
+	defer sql_result_destroy(&result)
+	if len(result.rows) == 0 || len(result.rows[0]) < 2 do return 0, 0
+	return int(result.rows[0][0].i), int(result.rows[0][1].i)
+}
+
+@(private)
+fts_stats_adjust :: proc(tx: ^Tx, table: Fts_Table, docs_delta: int, tokens_delta: int) -> Error {
+	docs, tokens := fts_stats_read(tx, table)
+	next_docs := docs + docs_delta
+	next_tokens := tokens + tokens_delta
+	if next_docs < 0 do next_docs = 0
+	if next_tokens < 0 do next_tokens = 0
+	sql := strings.concatenate(
+		{"UPDATE ", fts_stats_name(table.name, tx.alloc), " SET docs = ?, tokens = ? WHERE id = 1"},
+		tx.alloc,
+	)
+	return fts_run(tx, sql, []Value{value_int(i64(next_docs)), value_int(i64(next_tokens))})
+}
+
+// fts_doc_length reads the token count of one document through its primary key.
+@(private)
+fts_doc_length :: proc(tx: ^Tx, table: Fts_Table, doc: Row_Id) -> (length: int, found: bool) {
+	sql := strings.concatenate(
+		{"SELECT length FROM ", fts_docs_name(table.name, tx.alloc), " WHERE doc = ?"},
+		tx.alloc,
+	)
+	result, err := sql_execute_in_tx_params(tx, sql, []Value{value_int(i64(doc))})
+	if err.kind != .None do return 0, false
+	defer sql_result_destroy(&result)
+	if len(result.rows) == 0 || len(result.rows[0]) < 1 do return 0, false
+	return int(result.rows[0][0].i), true
 }
 
 @(private)
@@ -211,30 +389,50 @@ fts_fold_byte :: proc(byte: u8) -> u8 {
 	return byte
 }
 
-// fts_match_docs answers "which documents contain this query". The pattern is a
-// list separated by spaces: terms in a row must all be present, OR separates
-// alternatives, and NOT removes the documents that carry the next term. Results
-// are cached per statement, because every row of a scan asks the same question.
-fts_match_docs :: proc(tx: ^Tx, table: Fts_Table, pattern: string) -> (map[Row_Id]bool, Error) {
+// Fts_Match is the answer to one MATCH: the documents that satisfy it, and the
+// BM25 score of each. Both are computed once per (table, pattern) and cached in
+// the transaction, so the scan and ORDER BY rank share the work.
+Fts_Match :: struct {
+	docs:   map[Row_Id]bool,
+	scores: map[Row_Id]f64,
+}
+
+// BM25 constants: the usual saturation (k1) and length normalisation (b).
+FTS_BM25_K1 :: 1.2
+FTS_BM25_B :: 0.75
+
+// fts_match_docs answers "which documents contain this query, and how well".
+// The pattern is a list separated by spaces: terms in a row must all be present,
+// OR separates alternatives, AND is the juxtaposition it already is, and NOT
+// removes the documents that carry the next term. The score is BM25 over the
+// postings and the corpus totals, never over the documents: a query costs its
+// matches, not the vocabulary.
+fts_match_docs :: proc(tx: ^Tx, table: Fts_Table, pattern: string) -> (^Fts_Match, Error) {
 	key := strings.concatenate({table.name, "\x00", pattern}, tx.alloc)
-	if tx.fts_cache == nil do tx.fts_cache = make(map[string]map[Row_Id]bool)
+	if tx.fts_cache == nil do tx.fts_cache = make(map[string]^Fts_Match)
+	if tx.fts_rank == nil do tx.fts_rank = make(map[string]string)
 	if cached, found := tx.fts_cache[key]; found do return cached, ERROR_NONE
 
-	docs := make(map[Row_Id]bool)
-	group := make([dynamic]map[Row_Id]bool, 0, 4, context.temp_allocator)
-	negatives := make([dynamic]map[Row_Id]bool, 0, 2, context.temp_allocator)
+	match := new(Fts_Match)
+	match.docs = make(map[Row_Id]bool)
+	match.scores = make(map[Row_Id]f64)
+
+	group := make([dynamic]map[Row_Id]int, 0, 4, context.temp_allocator)
+	negative := make([dynamic]map[Row_Id]int, 0, 2, context.temp_allocator)
+	positive: [dynamic]string
 	defer {
 		for set in group do delete(set)
 		delete(group)
-		for set in negatives do delete(set)
-		delete(negatives)
+		for set in negative do delete(set)
+		delete(negative)
+		delete(positive)
 	}
 	negate_next := false
 	for piece in strings.split(pattern, " ") {
 		word := strings.trim_space(piece)
 		if len(word) == 0 do continue
 		if strings.equal_fold(word, "or") {
-			fts_merge_group(&docs, group[:])
+			fts_merge_group(&match.docs, group[:])
 			clear(&group)
 			continue
 		}
@@ -242,27 +440,56 @@ fts_match_docs :: proc(tx: ^Tx, table: Fts_Table, pattern: string) -> (map[Row_I
 			negate_next = true
 			continue
 		}
-		set, set_err := fts_term_docs(tx, table, word)
-		if set_err.kind != .None do return nil, set_err
+		// AND is the default between terms; spelling it out changes nothing.
+		if strings.equal_fold(word, "and") do continue
+		postings, postings_err := fts_term_rows(tx, table, word)
+		if postings_err.kind != .None do return nil, postings_err
 		if negate_next {
-			append(&negatives, set)
+			append(&negative, postings)
 			negate_next = false
 		} else {
-			append(&group, set)
+			append(&group, postings)
+			append(&positive, strings.clone(fts_fold_word(word, tx.alloc), tx.alloc))
 		}
 	}
-	fts_merge_group(&docs, group[:])
-	for set in negatives {
-		for doc in set do delete_key(&docs, doc)
+	fts_merge_group(&match.docs, group[:])
+	for set in negative {
+		for doc in set do delete_key(&match.docs, doc)
 	}
-	tx.fts_cache[key] = docs
-	return docs, ERROR_NONE
+
+	// Score every document that carries a query term. A document excluded by NOT
+	// keeps its score; nothing reads it.
+	docs_count, tokens := fts_stats_read(tx, table)
+	average := docs_count > 0 ? f64(tokens) / f64(docs_count) : 0
+	lengths := make(map[Row_Id]int, len(match.docs), context.temp_allocator)
+	defer delete(lengths)
+	for term in positive {
+		postings, postings_err := fts_term_rows(tx, table, term)
+		if postings_err.kind != .None do return nil, postings_err
+		df := len(postings)
+		// Okapi idf, shifted so it is never negative.
+		idf := math.log(1 + (f64(docs_count) - f64(df) + 0.5) / (f64(df) + 0.5), math.E)
+		for doc, tf in postings {
+			length, known := lengths[doc]
+			if !known {
+				length, _ = fts_doc_length(tx, table, doc)
+				lengths[doc] = length
+			}
+			length_ratio := average > 0 ? f64(length) / average : 0
+			denominator := f64(tf) + FTS_BM25_K1 * (1 - FTS_BM25_B + FTS_BM25_B * length_ratio)
+			match.scores[doc] += idf * f64(tf) * (FTS_BM25_K1 + 1) / denominator
+		}
+		delete(postings)
+	}
+	tx.fts_cache[key] = match
+	tx.fts_rank[table.name] = key
+	return match, ERROR_NONE
 }
 
-// fts_merge_group intersects the documents of one conjunction and adds them to the
+// fts_merge_group intersects the postings of one conjunction and adds them to the
 // result: `a b` is narrower than `a`, and `a OR b` is wider.
 @(private)
-fts_merge_group :: proc(docs: ^map[Row_Id]bool, group: []map[Row_Id]bool) {
+fts_merge_group :: proc(docs: ^map[Row_Id]bool, group: []map[Row_Id]int) {
 	if len(group) == 0 do return
 	if len(group) == 1 {
 		for doc in group[0] do docs[doc] = true
@@ -278,17 +505,19 @@ fts_merge_group :: proc(docs: ^map[Row_Id]bool, group: []map[Row_Id]bool) {
 	}
 }
 
+// fts_term_rows reads the postings of one term: document and count.
 @(private)
-fts_term_docs :: proc(tx: ^Tx, table: Fts_Table, word: string) -> (map[Row_Id]bool, Error) {
-	set := make(map[Row_Id]bool)
-	sql := strings.concatenate({"SELECT doc FROM ", table.terms, " WHERE term = ?"}, tx.alloc)
+fts_term_rows :: proc(tx: ^Tx, table: Fts_Table, word: string) -> (map[Row_Id]int, Error) {
+	postings := make(map[Row_Id]int)
+	sql := strings.concatenate({"SELECT doc, tf FROM ", table.terms, " WHERE term = ?"}, tx.alloc)
 	result, err := sql_execute_in_tx_params(tx, sql, []Value{value_string(fts_fold_word(word, tx.alloc))})
-	if err.kind != .None do return set, err
+	if err.kind != .None do return postings, err
 	defer sql_result_destroy(&result)
 	for row in result.rows {
-		if len(row) > 0 do set[Row_Id(row[0].i)] = true
+		if len(row) < 2 do continue
+		postings[Row_Id(row[0].i)] = int(row[1].i)
 	}
-	return set, ERROR_NONE
+	return postings, ERROR_NONE
 }
 
 @(private)
@@ -296,6 +525,98 @@ fts_fold_word :: proc(word: string, alloc := context.temp_allocator) -> string {
 	out := make([]u8, len(word), alloc)
 	for byte, i in transmute([]u8)word do out[i] = fts_fold_byte(byte)
 	return string(out)
+}
+
+// fts_rank_value is the `rank` column of a full-text table: BM25 negated, so
+// ORDER BY rank puts the best match first, the same convention SQLite's FTS5
+// uses.
+fts_rank_value :: proc(tx: ^Tx, table_name: string, doc: Row_Id) -> (f64, bool) {
+	if tx == nil do return 0, false
+	key, found := tx.fts_rank[table_name]
+	if !found do return 0, false
+	match := tx.fts_cache[key]
+	if match == nil do return 0, false
+	score, scored := match.scores[doc]
+	if !scored do return 0, false
+	return -score, true
+}
+
+// fts_query_terms splits a pattern into the positive terms it needs, folded the
+// same way the index is.
+@(private)
+fts_query_terms :: proc(pattern: string, alloc: runtime.Allocator) -> map[string]bool {
+	terms := make(map[string]bool, 8, alloc)
+	for piece in strings.split(pattern, " ") {
+		word := strings.trim_space(piece)
+		if len(word) == 0 do continue
+		if strings.equal_fold(word, "or") || strings.equal_fold(word, "and") || strings.equal_fold(word, "not") do continue
+		terms[fts_fold_word(word, alloc)] = true
+	}
+	return terms
+}
+
+// fts_mark wraps every token that the pattern asks for with `[` and `]`. With
+// `window` it keeps a few tokens around the first match instead of the whole
+// text, which is what snippet() returns.
+fts_mark :: proc(text: string, pattern: string, window: bool) -> string {
+	terms := fts_query_terms(pattern, context.temp_allocator)
+	defer delete(terms)
+	Fts_Token :: struct {
+		start: int,
+		end:   int,
+		word:  string,
+	}
+	tokens: [dynamic]Fts_Token
+	defer delete(tokens)
+	word := strings.builder_make(context.temp_allocator)
+	defer strings.builder_destroy(&word)
+	start := 0
+	flush := proc(tokens: ^[dynamic]Fts_Token, start, end: int, word: ^strings.Builder) {
+		if len(strings.to_string(word^)) == 0 do return
+		append(tokens, Fts_Token{start = start, end = end, word = strings.clone(strings.to_string(word^), context.temp_allocator)})
+		strings.builder_reset(word)
+	}
+	for b, i in transmute([]u8)text {
+		if fts_is_word_byte(b) {
+			if len(strings.to_string(word)) == 0 do start = i
+			strings.write_byte(&word, fts_fold_byte(b))
+			continue
+		}
+		flush(&tokens, start, i, &word)
+	}
+	flush(&tokens, start, len(text), &word)
+
+	first_match := -1
+	for token, i in tokens {
+		if terms[token.word] {
+			first_match = i
+			break
+		}
+	}
+	low, high := 0, len(tokens)
+	if window && first_match >= 0 {
+		low = first_match > 4 ? first_match - 4 : 0
+		high = first_match + 8 < len(tokens) ? first_match + 8 : len(tokens)
+	}
+	out := strings.builder_make()
+	position := low < len(tokens) ? tokens[low].start : len(text)
+	if window && low > 0 do strings.write_string(&out, "…")
+	for token, i in tokens {
+		if i < low do continue
+		if i >= high do break
+		strings.write_string(&out, text[position:token.start])
+		if terms[token.word] {
+			strings.write_string(&out, "[")
+			strings.write_string(&out, text[token.start:token.end])
+			strings.write_string(&out, "]")
+		} else {
+			strings.write_string(&out, text[token.start:token.end])
+		}
+		position = token.end
+	}
+	if position < len(text) do strings.write_string(&out, text[position:])
+	if window && high < len(tokens) do strings.write_string(&out, "…")
+	return strings.to_string(out)
 }
 
 // fts_match_eval evaluates `documents MATCH 'pattern'` against the row being
@@ -332,11 +653,11 @@ fts_match_eval :: proc(tx: ^Tx, ctx: ^Eval_Ctx, operand: ^Expr, pattern: Value) 
 	}
 	if !found do return {}, errf(.Table_Not_Found, "%s is not a full-text table", table_name)
 	if pattern.kind != .String do return {}, errf(.Sql_Syntax, "MATCH needs a text pattern")
-	docs, docs_err := fts_match_docs(tx, virtual, pattern.s)
-	if docs_err.kind != .None do return {}, docs_err
+	match, match_err := fts_match_docs(tx, virtual, pattern.s)
+	if match_err.kind != .None do return {}, match_err
 	for source in ctx.sources {
 		if strings.equal_fold(source.table.schema.name, virtual.name) {
-			return value_int(docs[source.row.id] ? 1 : 0), ERROR_NONE
+			return value_int(match.docs[source.row.id] ? 1 : 0), ERROR_NONE
 		}
 	}
 	return value_int(0), ERROR_NONE
@@ -345,10 +666,12 @@ fts_match_eval :: proc(tx: ^Tx, ctx: ^Eval_Ctx, operand: ^Expr, pattern: Value) 
 // fts_index_if_virtual maintains the index when `table_name` names a virtual
 // table, and does nothing (without touching the catalog) otherwise. A plain table
 // costs one lookup of a table whose size is the number of virtual tables.
-fts_index_if_virtual :: proc(tx: ^Tx, table_name: string, doc: Row_Id, values: []Value) -> Error {
+// `is_new` says the row did not exist before this statement, so the index can
+// skip looking for postings that cannot be there.
+fts_index_if_virtual :: proc(tx: ^Tx, table_name: string, doc: Row_Id, values: []Value, is_new: bool) -> Error {
 	virtual, found := fts_virtual_lookup(tx, table_name)
 	if !found || !fts_is_full_text(virtual) do return ERROR_NONE
-	return fts_index_row(tx, virtual, doc, values)
+	return fts_index_row(tx, virtual, doc, values, is_new)
 }
 
 fts_delete_if_virtual :: proc(tx: ^Tx, table_name: string, doc: Row_Id) -> Error {

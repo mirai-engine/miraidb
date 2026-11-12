@@ -22,6 +22,11 @@ honest measurement.
   at the snapshot boundary; validated lookups and rebuild on demand.
 - Recovery coverage: a torn tail and a flipped payload bit both stop the replay
   at the previous record and repair the file.
+- Full-text search: `CREATE VIRTUAL TABLE … USING fts5` keeps the postings, the
+  document lengths and the corpus totals in shadow tables created in the same
+  transaction. `MATCH` walks the term index, narrows the scan to the matching
+  documents, ranks with BM25 (`rank`, best first) and marks matches with
+  `snippet()`/`highlight()`.
 - Fault injection: `Fault_Vfs` fails the nth call of open/read/write/seek/
   truncate/sync/remove, or makes a write land part of its bytes. The test arms the
   fault at every write of a workload — log header, `CREATE TABLE` record, each

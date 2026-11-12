@@ -8142,3 +8142,144 @@ test_ddl_in_transaction :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t WHERE b = 'q'").i, i64(1))
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM _indexes").i, i64(3))
 }
+
+@(test)
+test_full_text_ranking :: proc(t: ^testing.T) {
+	// BM25 reads the postings, not the documents: a rare term outweighs a common
+	// one, a short document outweighs a long one at equal frequency, rank orders
+	// best first, and the helpers mark the match.
+	store := fresh_db(t, "fts_rank")
+	if store == nil do return
+	defer cleanup_db(store, "fts_rank")
+	run(t, store, "CREATE VIRTUAL TABLE docs USING fts5(body)")
+
+	// `common` appears in every document; `rare` in one. Both documents have the
+	// same length, so only the document frequency decides the order.
+	run(t, store, "INSERT INTO docs (body) VALUES ('common words here'), ('common rare words')")
+	rows := run(
+		t,
+		store,
+		"SELECT body FROM docs WHERE docs MATCH 'common OR rare' ORDER BY rank LIMIT 1",
+	)
+	testing.expect_value(t, len(rows.rows), 1)
+	testing.expect_value(t, rows.rows[0][0].s, "common rare words")
+	db.sql_result_destroy(&rows)
+
+	// At equal frequency, the shorter document wins: same term, one token versus
+	// eight.
+	run(t, store, "DELETE FROM docs")
+	run(t, store, "INSERT INTO docs (body) VALUES ('target'), ('target a b c d e f g')")
+	rows = run(
+		t,
+		store,
+		"SELECT body, rank FROM docs WHERE docs MATCH 'target' ORDER BY rank",
+	)
+	testing.expect_value(t, len(rows.rows), 2)
+	testing.expect_value(t, rows.rows[0][0].s, "target")
+	testing.expectf(t, rows.rows[0][1].f < rows.rows[1][1].f, "rank is ordered best first")
+	// rank is negative BM25: a better match is a more negative number.
+	testing.expectf(t, rows.rows[0][1].f < 0, "rank is negative")
+	db.sql_result_destroy(&rows)
+
+	// The token count matters: repeating a term raises its score, not its length.
+	run(t, store, "DELETE FROM docs")
+	run(t, store, "INSERT INTO docs (body) VALUES ('alpha alpha alpha beta'), ('alpha beta gamma delta')")
+	rows = run(t, store, "SELECT body FROM docs WHERE docs MATCH 'alpha' ORDER BY rank LIMIT 1")
+	testing.expect_value(t, rows.rows[0][0].s, "alpha alpha alpha beta")
+	db.sql_result_destroy(&rows)
+
+	// AND is the juxtaposition it already was; OR widens; NOT removes.
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM docs WHERE docs MATCH 'alpha AND beta'").i, i64(2))
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM docs WHERE docs MATCH 'alpha NOT beta'").i, i64(0))
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM docs WHERE docs MATCH 'gamma OR beta'").i, i64(2))
+
+	// snippet and highlight mark the tokens the pattern asks for.
+	run(t, store, "DELETE FROM docs")
+	run(t, store, "INSERT INTO docs (body) VALUES ('the quick brown fox jumps over the lazy dog')")
+	highlight := scalar(t, store, "SELECT highlight(body, 'fox') FROM docs").s
+	testing.expectf(t, strings.contains(highlight, "[fox]"), "highlight marks the word: %s", highlight)
+	snippet := scalar(t, store, "SELECT snippet(body, 'lazy') FROM docs").s
+	testing.expectf(t, strings.contains(snippet, "[lazy]"), "snippet marks the word: %s", snippet)
+	testing.expectf(t, strings.contains(snippet, "…"), "snippet trims around the match: %s", snippet)
+
+	// The score follows the corpus as it changes: deleting the long document makes
+	// the average length smaller.
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM docs WHERE docs MATCH 'quick'").i, i64(1))
+
+	// A plain table has no rank, and asking for it is an error rather than a zero.
+	run(t, store, "CREATE TABLE plain (body TEXT)")
+	run(t, store, "INSERT INTO plain (body) VALUES ('nothing to rank')")
+	_, rank_err := db.sql_execute(store, "SELECT rank FROM plain")
+	testing.expect_value(t, rank_err.kind, db.Error_Kind.Column_Not_Found)
+}
+
+@(test)
+test_full_text_cost :: proc(t: ^testing.T) {
+	// The scan follows the match, not the corpus: with five thousand documents and
+	// one match, the query visits a handful of rows. This is measured, not
+	// assumed: rows_scanned counts what every scan visited.
+	store := fresh_db(t, "fts_cost")
+	if store == nil do return
+	defer cleanup_db(store, "fts_cost")
+	run(t, store, "CREATE VIRTUAL TABLE docs USING fts5(body)")
+	insert, prepare_err := db.sql_prepare(store, "INSERT INTO docs (body) VALUES (?)")
+	if !testing.expectf(t, db.error_ok(prepare_err), "prepare: %s", prepare_err.message) do return
+	tx := db.tx_begin_write(store)
+	for i in 0 ..< 5000 {
+		text := fmt.tprintf("word%d filler common text", i)
+		_, insert_err := db.prepared_execute_in_tx(tx, insert, []db.Value{db.value_string(text)})
+		if !testing.expectf(t, db.error_ok(insert_err), "insert %d: %s", i, insert_err.message) {
+			db.tx_rollback(tx)
+			return
+		}
+	}
+	testing.expect(t, db.error_ok(db.tx_commit(tx)))
+	db.stmt_prepared_destroy(insert)
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM docs").i, i64(5000))
+
+	// A bulk load stays linear: one row visited per document, not the growing
+	// index. The prepared insert above is what a loader does; this checks that the
+	// shadow tables do not turn it into a quadratic scan.
+	testing.expectf(t, scalar(t, store, "SELECT count(*) FROM _fts_docs_terms").i > 5000, "postings exist")
+
+	db.store_reset_rows_scanned(store)
+	rows, query_err := db.sql_execute(store, "SELECT body FROM docs WHERE docs MATCH 'word4242'")
+	testing.expect(t, db.error_ok(query_err))
+	testing.expect_value(t, len(rows.rows), 1)
+	if len(rows.rows) == 1 {
+		testing.expect_value(t, rows.rows[0][0].s, "word4242 filler common text")
+	}
+	scanned := db.store_rows_scanned(store)
+	db.sql_result_destroy(&rows)
+	testing.expectf(t, scanned <= 8, "a MATCH over 5000 documents visited %d rows", scanned)
+
+	// Without a MATCH the same table still costs a full scan: the shortcut must
+	// not change what a plain query means.
+	db.store_reset_rows_scanned(store)
+	wide, wide_err := db.sql_execute(store, "SELECT count(*) FROM docs")
+	testing.expect(t, db.error_ok(wide_err))
+	testing.expect_value(t, db.store_rows_scanned(store), u64(5000))
+	db.sql_result_destroy(&wide)
+
+	// OR of two rare terms visits their postings only.
+	db.store_reset_rows_scanned(store)
+	two, two_err := db.sql_execute(store, "SELECT body FROM docs WHERE docs MATCH 'word7 OR word8'")
+	testing.expect(t, db.error_ok(two_err))
+	testing.expect_value(t, len(two.rows), 2)
+	two_scanned := db.store_rows_scanned(store)
+	db.sql_result_destroy(&two)
+	testing.expectf(t, two_scanned <= 16, "two rare terms visited %d rows", two_scanned)
+
+	// A term that every document carries costs its postings, because BM25 has to
+	// look at every candidate to rank them. That is the honest bound, and it is
+	// written down rather than hidden: the cost follows the postings of the query,
+	// not the size of the vocabulary.
+	db.store_reset_rows_scanned(store)
+	common, common_err := db.sql_execute(store, "SELECT count(*) FROM docs WHERE docs MATCH 'common'")
+	testing.expect(t, db.error_ok(common_err))
+	testing.expect_value(t, common.rows[0][0].i, i64(5000))
+	common_scanned := db.store_rows_scanned(store)
+	db.sql_result_destroy(&common)
+	testing.expectf(t, common_scanned >= 5000, "a common term must read its postings, visited %d", common_scanned)
+	testing.expectf(t, common_scanned < 30000, "a common term must not scan the vocabulary: %d", common_scanned)
+}

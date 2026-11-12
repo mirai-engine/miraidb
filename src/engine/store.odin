@@ -95,6 +95,9 @@ Store :: struct {
 	// unlimited. work_used accumulates what the store spent so far.
 	max_work_per_call: u64,
 	work_used:         u64,
+	// rows_scanned is how many rows every scan visited since the last reset. It is
+	// what proves a predicate narrows a scan instead of being checked per row.
+	rows_scanned: u64,
 	// apply_seq is the commit being applied; table versions are stamped with it.
 	apply_seq:           u64,
 	// attached holds the databases ATTACH opened, by name. They are read-only
@@ -819,6 +822,16 @@ store_prune_versions :: proc(store: ^Store, before_seq: u64) {
 	for _, table in store.tables {
 		table_prune_versions(table, before_seq)
 	}
+}
+
+// store_rows_scanned is how many rows scans visited since the last reset.
+store_rows_scanned :: proc(store: ^Store) -> u64 {
+	return sync.atomic_load(&store.rows_scanned)
+}
+
+// store_reset_rows_scanned starts a measurement from zero.
+store_reset_rows_scanned :: proc(store: ^Store) {
+	sync.atomic_store(&store.rows_scanned, 0)
 }
 
 store_reset_work :: proc(store: ^Store) {

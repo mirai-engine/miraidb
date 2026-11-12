@@ -307,8 +307,10 @@ selective. The tree layout is deliberately not claimed until it is measured.
 
 `CREATE VIRTUAL TABLE docs USING fts5(body, title)` makes a table of documents
 whose text columns are indexed. The documents are stored as an ordinary table
-and the index lives beside it in `_fts_docs_terms`, so the index is logged,
-replicated and repaired like any other data.
+and the index lives beside it in `_fts_docs_terms` (with `_fts_docs_docs` for the
+document lengths and `_fts_docs_stats` for the corpus totals), so the index is
+logged, replicated and repaired like any other data. The term index is created in
+the same transaction as the table.
 
 ```sql
 CREATE VIRTUAL TABLE docs USING fts5(body);
@@ -317,6 +319,9 @@ SELECT body FROM docs WHERE docs MATCH 'fox';          -- one row
 SELECT body FROM docs WHERE docs MATCH 'fox OR dog';   -- both
 SELECT body FROM docs WHERE docs MATCH 'the fox';      -- both terms, one row
 SELECT body FROM docs WHERE docs MATCH 'a NOT fox';    -- the second row
+SELECT body, rank FROM docs WHERE docs MATCH 'fox OR dog' ORDER BY rank;
+SELECT snippet(body, 'dog') FROM docs WHERE docs MATCH 'dog';
+SELECT highlight(body, 'dog') FROM docs WHERE docs MATCH 'dog';
 ```
 
 `MATCH` is case-insensitive over ASCII letters (`FOX` finds `fox`). Adjacent
@@ -324,10 +329,20 @@ terms are a conjunction, `OR` is a union, and `NOT` removes the documents that
 carry the following term. `UPDATE` and `DELETE` maintain the index, `DROP TABLE`
 removes the index with the table, and a reopen keeps searching.
 
-Two limits are worth knowing: `rank`, `snippet()` and `highlight()` are not
-implemented, and the pattern is resolved by one scan of the index per statement
-(there is no index on the term column yet), so `MATCH` costs a pass over the
-term rows plus one pass over the documents.
+`rank` is BM25 negated, so `ORDER BY rank` puts the best match first (the same
+convention as SQLite's FTS5). It is computed from the postings: a term that few
+documents contain weighs more than one they all contain, and at equal frequency a
+short document outranks a long one. `snippet(text, pattern)` marks the match with
+`[]` and keeps a window around the first one; `highlight(text, pattern)` marks
+every match in the whole text.
+
+The query walks the postings of its terms and the scan visits the matching
+documents only, so the cost follows the answer rather than the vocabulary. A term
+that every document carries costs its postings, because ranking has to look at
+every candidate. Three limits remain: phrase queries (`"a b"`), prefix matching
+(`foo*`) and column filters (`body:foo`) are not implemented, and a pattern taken
+from a column of the row cannot narrow the scan (a constant or a `?` parameter
+can).
 
 ## PRAGMAs
 

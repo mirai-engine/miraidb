@@ -40,9 +40,20 @@ Tx :: struct {
 	// work_units is what this transaction spent, summed from each statement's
 	// price (rows touched plus payload). A host budget compares it before commit.
 	work_units: u64,
-	// fts_cache holds the document set of each MATCH pattern for this
-	// transaction, so a scan asks the shadow table once per pattern.
-	fts_cache:           map[string]map[Row_Id]bool,
+	// rows_scanned counts the rows a scan visited. It is diagnostic: a test turns
+	// it into a statement about cost (a MATCH visits its matches, not the corpus).
+	rows_scanned: u64,
+	// fts_cache holds the match of each (table, pattern) for this transaction, so
+	// a scan and an ORDER BY rank ask the shadow tables once, not once per row.
+	fts_cache: map[string]^Fts_Match,
+	// fts_rank names, per virtual table, the cache entry that rank reads: the
+	// last MATCH on that table in this transaction.
+	fts_rank: map[string]string,
+	// fts_new_docs remembers, per full-text table, the documents this transaction
+	// inserted. A fresh row id cannot have postings from an earlier commit, so the
+	// maintenance skips the lookup for it: a bulk load costs its tokens, not the
+	// size of the index.
+	fts_new_docs: map[string]map[Row_Id]bool,
 	cte_tables:  map[string]^Table,
 	// savepoints is the open savepoint stack, innermost last.
 	savepoints:  [dynamic]Savepoint,
@@ -330,6 +341,9 @@ tx_begin_read_at :: proc(store: ^Store, seq: u64) -> ^Tx {
 // tx_end releases a transaction that was neither committed nor rolled back.
 tx_end :: proc(tx: ^Tx) {
 	if tx == nil || !tx.active do return
+	if tx.rows_scanned > 0 {
+		sync.atomic_add(&tx.store.rows_scanned, tx.rows_scanned)
+	}
 	tx_discard(tx)
 }
 
@@ -356,8 +370,16 @@ tx_discard :: proc(tx: ^Tx) {
 	}
 	for i in 0 ..< len(tx.savepoints) do tx_snapshot_destroy(tx, &tx.savepoints[i].snapshot)
 	delete(tx.savepoints)
-	for _, docs in tx.fts_cache do delete(docs)
+	for _, match in tx.fts_cache {
+		if match == nil do continue
+		delete(match.docs)
+		delete(match.scores)
+		free(match)
+	}
 	delete(tx.fts_cache)
+	delete(tx.fts_rank)
+	for _, documents in tx.fts_new_docs do delete(documents)
+	delete(tx.fts_new_docs)
 	delete(tx.cte_tables)
 	delete(tx.state.index_ops)
 	delete(tx.state.writes)
