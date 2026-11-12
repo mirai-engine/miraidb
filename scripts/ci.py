@@ -76,6 +76,7 @@ def main() -> int:
     )
     gates.append(Gate("shell smoke", [sys.executable, "scripts/shell_smoke.py"]))
     gates.append(Gate("performance baseline", [sys.executable, "scripts/bench.py", "--check"]))
+    gates.append(Gate("package manifest", [sys.executable, "scripts/package.py", "--check"]))
     if not args.skip_dll:
         if os.path.exists(args.windows_python):
             gates.append(Gate("C ABI smoke", [args.windows_python, "scripts/capi_smoke.py"]))

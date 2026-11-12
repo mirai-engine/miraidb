@@ -40,7 +40,7 @@ outranks the dependent.
 | 20 | **D12c — module VM** | Deterministic execution with enforced memory and time; today modules are processes with a work budget and the caller's clock. | L | — |
 | 21 | **D15 — network hardening** | TLS, HTTP/2, backpressure, per-route timeouts, a load test. | M | — |
 | 22 | **D16 — client generation from the catalog** | Emit the Python binding from the schema; the hand-written one is the contract it has to meet. | M | — |
-| 23 | **Release packaging** | Versioned `libmiraidb` + header + `pkg-config`, binaries per platform, changelog. | M | #13 |
+| 23 | **Release packaging** — *done* | `scripts/package.py` builds `dist/miraidb-<version>-<target>.zip` from the version the library reports: two programs, the shared library, the header, the Python binding, the licences, the notices, a `pkg-config` file and the changelog. `--check` runs as a CI gate and verifies the manifest. | M | #13 |
 | 24 | **Auth review** — *started* | It found that one client's identity was left on the store and inherited by the next; the wire now runs each request with its caller's identity (`test_connection_identity`). Left: rate limits, token lifetime policy, and the fact that without TLS (D15) a token travels in clear. | S | — |
 | 25 | **Licence and notice review** | MIT/Apache-2.0 with no vendored third-party source; confirm before each public release. | external | #23 |
 
@@ -144,7 +144,7 @@ after it, apply through `commitlog`, expose the last applied sequence.
 | **Fault injection** (D8) | Proves no third state after a failed write | S, then extended | #3 |
 | **Benchmark with thresholds** — *done* | Bytes per row within 10%; timings under a 3x catastrophe guard, because a shared machine cannot promise 10% (the 10% time rule is measured by hand with `--record`) | 1 day | #4 |
 | **CI on Linux and macOS** | Locking and the VFS are per-OS | 2–3 days | #13 |
-| **Release packaging** | Versioned library, header, `pkg-config`, binaries, changelog | 2–3 days | #23 |
+| **Release packaging** — *done* | `scripts/package.py --check`, one archive per target with the version the library reports | 2–3 days | #23 |
 | **Auth review** | Tokens, subscriptions, byte and work budgets under attack | 1 day | #24 |
 | **Licence and notice review** | MIT/Apache-2.0, nothing vendored | external | #25 |
 

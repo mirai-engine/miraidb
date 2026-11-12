@@ -87,6 +87,7 @@ The engine is a plain Odin package; there is no build system to install.
 ```sh
 python3 scripts/build.py          # builds the binaries and runs the suite
 python3 scripts/ci.py             # every gate: build, tests, conformance, smokes, vet, roadmap
+python3 scripts/package.py        # dist/miraidb-<version>-<target>.zip
 ```
 
 or directly:

@@ -25,3 +25,6 @@ __pycache__/
 # bench.py workspace
 /_bench_tmp/
 /_broker_tmp/
+
+# package.py output
+/dist/
