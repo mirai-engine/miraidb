@@ -45,9 +45,11 @@ Options:
   --memory-report                           print this process memory when a sql
                                             statement finishes
 
-The database is a directory holding a commit log. SQL supports CREATE/DROP
-TABLE, INSERT, UPDATE, DELETE and single-table SELECT with WHERE, ORDER BY,
-GROUP BY, LIMIT/OFFSET and the aggregate functions.
+The database is a directory holding a commit log. SQL covers CREATE, DROP and
+ALTER TABLE, INSERT, UPDATE, DELETE, UPSERT, SELECT with joins, common table
+expressions, window frames, aggregates, DISTINCT, GROUP BY/HAVING, ORDER BY and
+LIMIT/OFFSET, plus triggers, views, row policies, full-text and spatial tables,
+JSON functions, ATTACH and SAVEPOINT.
 
 In the REPL:
   .tables            list tables
