@@ -19,6 +19,10 @@
   writing, answers from the log it replays into memory, refuses every write and
   keeps compaction waiting. The lock has two roles now, so readers join and a
   second writer is still refused.
+- Memory: a subscription path freed transaction-allocated slices with the
+  caller's allocator, and several tests closed a store twice. The tracking
+  allocator reported 3058 bogus frees; it reports 44 now, with the rule written
+  down in `docs/architecture.md` ("Who frees a value").
 - Indexes on disk: each index of a paged table is a B+tree of 4 KiB pages with
   its own pool, leaves chained in key order, and a cursor that walks a range
   without a parent stack. The keys stop living in RAM, and `page_rss.py` checks

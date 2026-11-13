@@ -58,6 +58,30 @@ the engine can tell it apart from an explicit `NULL` (which violates `NOT NULL`)
 Numeric values compare across kinds; `1` (int), `1` (uint) and `1.0` (float) are
 equal. Strings compare byte-wise.
 
+### Who frees a value
+
+Odin has no destructors, so every buffer has exactly one owner and the rule is
+written down where the memory is made:
+
+- A **table** owns the values of its rows: `table_insert` clones them with the
+  context allocator (`clone_values`), and `table_destroy` frees them. A **read
+  snapshot** borrows them instead (`Table.borrowed`): it frees none, and the
+  source defers freeing while a snapshot shares its `Row_Store`.
+- A **transaction** owns everything made with `tx.alloc`: staged row values, the
+  sources and column lists of a query, and what `tx_collect` returns. Freeing
+  one of those with the context allocator is a bug the tracking allocator catches
+  (`bad free`), and the arena frees it at `tx_end` anyway. A slice allocated with
+  an explicit allocator is freed with that allocator:
+  `delete(star, tx.alloc)`, `delete(column, tx.alloc)`. A `[dynamic]T` remembers
+  its own allocator, so `delete(columns)` is enough.
+- A **statement result** (`Sql_Result`) owns its rows, columns and message;
+  `sql_result_destroy` frees them with the context allocator, so an engine path
+  that builds a result must hand it context-allocated strings (that is what
+  `pragma_text` does with its clone).
+- **Interning** outlives every caller: the identity table and other process-wide
+  maps grow on `runtime.heap_allocator()`, because a per-test or per-request
+  allocator would free them underneath the process.
+
 ## Encoding
 
 Two codecs:

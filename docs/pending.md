@@ -597,3 +597,21 @@ acceptance criteria, current cost and effort; this list is the short version.
 - No crash injection and no process-level load test yet; the fuzzer and the soak
   cover statements and long runs only. (backlog D8)
 - There is no replication: one process owns one log. (backlog D14)
+- **The suite still prints 44 `bad free` lines** under the tracking allocator,
+  down from 3058; they are memory frees the tracker refuses (the arena frees it
+  later, so nothing leaks). 42 of them are the metric strings of `PRAGMA stats`
+  reaching `sql_result_destroy` in `test_integrity_and_latency_stats`, plus one in
+  `tx_discard` and one in `frozen_cache_destroy`. Count them and find a caller
+  with:
+
+  ```sh
+  odin test src/tests 2>&1 | grep -c 'bad free'
+  # a probe inside the suspect, printed for every call, then sort by caller:
+  #   free_values :: proc(values: []Value, caller := #caller_location)
+  #   fmt.printfln("PROBE from %s:%d", caller.file_path, caller.line)
+  ```
+
+  The ones that mattered are fixed: a store closed twice by a test (one of them
+  held 3000 rows), a subscription path freeing transaction memory with the
+  caller's allocator, and `strings.to_string` of a builder that was then
+  destroyed.
