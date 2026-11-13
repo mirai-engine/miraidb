@@ -592,10 +592,22 @@ turns the row `done`; and a `CASE` in a policy or trigger works.
 
 **Cost.** M (one parser production, one evaluator case, tests).
 
-## D20 — A differential runner against SQLite
+## D20 — A differential runner against SQLite: **done**
 
-**Now.** `scripts/conformance.py` runs 20 statements through the CLI and checks
-substrings of the output. It is a smoke: no joins, CTEs, windows, triggers, JSON,
+**Done.** `scripts/differential.py` is the twenty-third gate: one schema, one set
+of rows and 55 queries go through this engine and the system `sqlite3`, and the
+answers must match (as sequences when the query says `ORDER BY`, as multisets
+otherwise). Seven statements are refused here and answered there, each with the
+reason in the script, and the runner fails when a refusal stops refusing; four
+differ on purpose and fail when they converge. It found two things on its first
+run: `ORDER BY` ties came back in map order instead of row id order (fixed, with
+the tiebreak in the sort key), and the scalar forms `min(a, b)`/`max(a, b)` and
+`trim(s, chars)` were missing (fixed). The corpus should keep growing; a
+correlated subquery is in the refusal list, because `features.md` E2 says the
+reference is not resolved.
+
+**Why it exists.** `scripts/conformance.py` runs 20 statements through the CLI
+and checks substrings of the output. It is a smoke: no joins, CTEs, windows, triggers, JSON,
 `ALTER`, `UPSERT`, three-valued logic or `DISTINCT` aggregates. The audit of this
 tree found two wrong answers (`IN`/`NOT IN` with `NULL`, `DISTINCT` inside an
 aggregate) that the suite could not see, and neither could this corpus.

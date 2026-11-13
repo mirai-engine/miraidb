@@ -76,6 +76,9 @@ def build_gates(args: argparse.Namespace) -> list[Gate]:
         Gate("plan regression", [sys.executable, "scripts/plan_check.py", "--bin", "./bin/miraidb.exe"])
     )
     gates.append(
+        Gate("differential vs sqlite3", [sys.executable, "scripts/differential.py", "--bin", "./bin/miraidb.exe"])
+    )
+    gates.append(
         Gate(
             "mirror cost",
             [

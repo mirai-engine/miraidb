@@ -112,14 +112,17 @@ the gaps are named rather than left to be discovered.
 ### Tooling
 
 - `python3 scripts/ci.py` runs every gate in one command and reports each one;
-  it is what "green" means.
+  it is what "green" means. Twenty-three gates: the suite, the corpus, the
+  smokes, the measurements and the document check.
 - `miraidb` has 17 commands: `create`, `sql`, `sqlite`, `import-sqlite`,
   `export-sqlite`, `repl`, `inspect`, `describe`, `bench`, `bench-read`,
   `codegen`, `export`, `call`, `subscribe`, `check`, `compact`, `snapshot`.
 - `miraidb sql --json <db> <statement>` prints a result as one JSON array of
-  rows, which is how `scripts/differential.py` compares answers against SQLite.
+  rows, which is how `scripts/differential.py` compares answers against SQLite:
+  one schema, one set of rows and 55 queries through both engines, with the
+  refusals and the intentional differences listed in the script.
 - `scripts/build.py` builds both binaries and runs the suite.
-- 216 integration tests covering CRUD, recovery, constraints, transactions,
+- 218 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.

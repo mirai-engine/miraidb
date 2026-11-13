@@ -19,36 +19,35 @@ releases is worth shipping.
 
 | # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
-| 1 | **D20 — differential runner against `sqlite3`** | Same schema, same rows, same query, through this engine and the system `sqlite3`; equal answers, or a listed refusal with a reason. The corpus grows past the 20-case smoke: joins, CTEs, windows, triggers, JSON, `ALTER`, `UPSERT`, three-valued logic, `DISTINCT` aggregates. `docs/backlog.md` D20. | M | — |
-| 2 | **D19 — `CASE` expressions** | Simple and searched `CASE` wherever an expression is allowed, including policies and triggers; `NULL` conditions are not true, no `ELSE` yields `NULL`. It is the only statement `docs/sqlite.md` still marks missing. D19. | M | — |
-| 3 | **D3 — the first read after a commit** | Three parts: clone a table's rows and indexes without re-inserting every row (measured 2.3 µs/row, 115–117 ms at 50 000), evict `store.retired` so the read cache keeps publishing past 16 snapshots, and make `bench-read` time a commit followed by a read. Two rows of the efficiency contract are marked not met until this lands. | L | — |
-| 4 | **D6 — the delta of a join subscription** | Index the join key per table so a commit costs the rows it touched instead of collecting every row of the other tables; then the smaller planner gaps: probe the joined side, `ORDER BY` from an index, calibrated constants, statistics that announce staleness, a histogram for a bound value, an estimate for a view, and the subscription path using the planned order. | L | — |
-| 5 | **D9 — the rest of the grammar** | `RANGE`/`GROUPS` frames, windows beside `GROUP BY`, `BEFORE` triggers, `ALTER` type changes, more collations, user functions. | L | — |
-| 6 | **ASAN pass** over the CLI, soak and conformance — *partly done* | Bounds and stack are covered today. Odin's heap allocator is not intercepted on Windows (a deliberate use-after-free is not reported), so the heap half runs with the POSIX toolchain in #13. | 1 round | 13 |
-| 7 | **D2 — spatial tree** | Node pages and a descent replace the scan over box columns. | M | — |
-| 8 | **D10 — precision and time** | Decimal arithmetic with scale, `TIMESTAMPTZ`, streaming blobs. | M | — |
-| 9 | **D14 — replication** | `GET /log?since=<seq>`, a follower applying through the replay path, tested against a lagging follower and a dead leader. Failover stays unclaimed. The networking plan is below. | XL | — |
-| 10 | **D12c — module sandbox** | Deterministic execution with enforced memory and time; today a module is a process with a work budget and the caller's clock. | L | — |
-| 11 | **D15 — network hardening** | TLS, HTTP/2, backpressure, per-route timeouts, a load test. | M | — |
-| 12 | **D16 — client generation from the catalog** | Emit the Python binding from the schema; the hand-written one is the contract it has to meet. | M | — |
-| 13 | **D1 — the rest of full-text search** | Phrase queries (`"a b"`), prefix matching (`foo*`) and column filters (`body:foo`); `AND` is still parsed as a term rather than an operator, and a pattern taken from a column cannot narrow the scan. The index, the ranking and `snippet`/`highlight` are done. | M | — |
-| 14 | **D4 — a secondary index in the mirror** | A table with a secondary index re-encodes the whole `.sqlite` file on every commit, because only table-b-tree leaves are patched. Patch the index b-trees too (a moved key can jump leaves), or state the fallback where a user will read it. | L | — |
-| 15 | **D5 / D17 — the rest of the page store** | Merge an index leaf that loses its last entry; keep more than one version per row so `AS OF` and `ALTER` work on a paged table; let a read of a paged store run without holding the shared lock for its whole life; let a read-only open trust the pages when it can prove nothing is in flight. | L | — |
-| 16 | **Diagnostics — a leak report a human can read** | The suite prints ~320k `+++ leak` lines (~9 per statement) and nobody has established whether they are real; `soak.py` does not watch the working set, and `test_soak_update_delete_prune` failed once opening its lock file. Make the tracker report a working set, settle the noise, and chase the flake. | M | — |
-| 17 | **CI on Linux and macOS** | File locking and the VFS are per-OS, so the lock must be proven on all three; `-sanitize:address` covers the heap there (#6). Six scripts hardcode a `.exe` binary: `ci.py`, `page_rss.py`, `plan_check.py`, `bench.py`, `lock_smoke.py`, `broker_smoke.py`. | M | — |
-| 18 | **Release and packaging** | `scripts/package.py` builds `dist/miraidb-<version>-<target>.zip` from the version the library reports and `--check` gates its manifest. Left: publish one archive per target, decide the version policy, and verify an archive builds twice byte for byte. | M | 17 |
-| 19 | **Auth review** | The internal pass found one client's identity leaking into the next (fixed, `test_connection_identity`). Left: rate limits, a token lifetime policy, adversarial tests over subscriptions and budgets, and the fact that without TLS (#11) a token travels in clear. | S | — |
-| 20 | **Licence and notice review** | MIT/Apache-2.0 with no vendored third-party source; confirm before each public release. | external | 18 |
+| 1 | **D19 — `CASE` expressions** | Simple and searched `CASE` wherever an expression is allowed, including policies and triggers; `NULL` conditions are not true, no `ELSE` yields `NULL`. It is the only statement `docs/sqlite.md` still marks missing. D19. | M | — |
+| 2 | **D3 — the first read after a commit** | Three parts: clone a table's rows and indexes without re-inserting every row (measured 2.3 µs/row, 115–117 ms at 50 000), evict `store.retired` so the read cache keeps publishing past 16 snapshots, and make `bench-read` time a commit followed by a read. Two rows of the efficiency contract are marked not met until this lands. | L | — |
+| 3 | **D6 — the delta of a join subscription** | Index the join key per table so a commit costs the rows it touched instead of collecting every row of the other tables; then the smaller planner gaps: probe the joined side, `ORDER BY` from an index, calibrated constants, statistics that announce staleness, a histogram for a bound value, an estimate for a view, and the subscription path using the planned order. | L | — |
+| 4 | **D9 — the rest of the grammar** | `RANGE`/`GROUPS` frames, windows beside `GROUP BY`, `BEFORE` triggers, `ALTER` type changes, more collations, user functions. | L | — |
+| 5 | **ASAN pass** over the CLI, soak and conformance — *partly done* | Bounds and stack are covered today. Odin's heap allocator is not intercepted on Windows (a deliberate use-after-free is not reported), so the heap half runs with the POSIX toolchain in #17. | 1 round | 13 |
+| 6 | **D2 — spatial tree** | Node pages and a descent replace the scan over box columns. | M | — |
+| 7 | **D10 — precision and time** | Decimal arithmetic with scale, `TIMESTAMPTZ`, streaming blobs. | M | — |
+| 8 | **D14 — replication** | `GET /log?since=<seq>`, a follower applying through the replay path, tested against a lagging follower and a dead leader. Failover stays unclaimed. The networking plan is below. | XL | — |
+| 9 | **D12c — module sandbox** | Deterministic execution with enforced memory and time; today a module is a process with a work budget and the caller's clock. | L | — |
+| 10 | **D15 — network hardening** | TLS, HTTP/2, backpressure, per-route timeouts, a load test. | M | — |
+| 11 | **D16 — client generation from the catalog** | Emit the Python binding from the schema; the hand-written one is the contract it has to meet. | M | — |
+| 12 | **D1 — the rest of full-text search** | Phrase queries (`"a b"`), prefix matching (`foo*`) and column filters (`body:foo`); `AND` is still parsed as a term rather than an operator, and a pattern taken from a column cannot narrow the scan. The index, the ranking and `snippet`/`highlight` are done. | M | — |
+| 13 | **D4 — a secondary index in the mirror** | A table with a secondary index re-encodes the whole `.sqlite` file on every commit, because only table-b-tree leaves are patched. Patch the index b-trees too (a moved key can jump leaves), or state the fallback where a user will read it. | L | — |
+| 14 | **D5 / D17 — the rest of the page store** | Merge an index leaf that loses its last entry; keep more than one version per row so `AS OF` and `ALTER` work on a paged table; let a read of a paged store run without holding the shared lock for its whole life; let a read-only open trust the pages when it can prove nothing is in flight. | L | — |
+| 15 | **Diagnostics — a leak report a human can read** | The suite prints ~320k `+++ leak` lines (~9 per statement) and nobody has established whether they are real; `soak.py` does not watch the working set, and `test_soak_update_delete_prune` failed once opening its lock file. Make the tracker report a working set, settle the noise, and chase the flake. | M | — |
+| 16 | **CI on Linux and macOS** | File locking and the VFS are per-OS, so the lock must be proven on all three; `-sanitize:address` covers the heap there (#6). Six scripts hardcode a `.exe` binary: `ci.py`, `page_rss.py`, `plan_check.py`, `bench.py`, `lock_smoke.py`, `broker_smoke.py`. | M | — |
+| 17 | **Release and packaging** | `scripts/package.py` builds `dist/miraidb-<version>-<target>.zip` from the version the library reports and `--check` gates its manifest. Left: publish one archive per target, decide the version policy, and verify an archive builds twice byte for byte. | M | 17 |
+| 18 | **Auth review** | The internal pass found one client's identity leaking into the next (fixed, `test_connection_identity`). Left: rate limits, a token lifetime policy, adversarial tests over subscriptions and budgets, and the fact that without TLS (#11) a token travels in clear. | S | — |
+| 19 | **Licence and notice review** | MIT/Apache-2.0 with no vendored third-party source; confirm before each public release. | external | 18 |
 
 The last four are the release gates, in the order they have to run: prove it on
 every platform, package it, review who may call it, review what it carries. The
 rest come before them because a release is only worth making once the engine
 answers correctly, ships its own weight, and can be replicated.
 
-Rounds map onto the list: **1–4** are the correctness-and-measurement round
-(this one), **5–16** the depth round (grammar, sanitizer, spatial, precision,
+Rounds map onto the list: **1–3** are the correctness-and-measurement round
+(this one), **4–15** the depth round (grammar, sanitizer, spatial, precision,
 replication, sandbox, network, clients, and the residuals of full-text, the
-mirror, the page store and diagnostics), **17–20** the release round.
+mirror, the page store and diagnostics), **16–19** the release round.
 
 ## Efficiency contract and current baseline
 
@@ -71,7 +70,7 @@ held to. Three rows are recorded as **not met** rather than quietly relaxed: the
 first read after a commit pays a full table clone, so a database that writes
 while it serves readers pays it per commit, and `bench-read` hides it because
 its preparation statement publishes the read cache before it starts timing.
-Items 3 and 4 carry the work.
+Items 2 and 3 carry the work.
 
 ## Reusing the engine's networking for D14
 
@@ -101,15 +100,15 @@ after it, apply through `commitlog`, expose the last applied sequence.
 
 | Work | New engine lines (order of magnitude) |
 |---|---|
-| Items 1–4 (runner, `CASE`, snapshot, join delta) | ~2.000 |
-| Items 5–16 (grammar, sanitizer, spatial, precision, replication, sandbox, network, clients, and the residuals) | ~14.000 |
-| Items 17–20 (release gates) | ~1.000 |
+| Items 1–3 (`CASE`, snapshot, join delta) | ~2.000 |
+| Items 4–15 (grammar, sanitizer, spatial, precision, replication, sandbox, network, clients, and the residuals) | ~14.000 |
+| Items 16–19 (release gates) | ~1.000 |
 
 ## Closed already (for the record)
 
 The items below were in this table and are done; each entry names the code and
 the test or gate that proves it. The engineering gates that watch them today are
-listed in `docs/status.md` and run by `scripts/ci.py` (22 gates).
+listed in `docs/status.md` and run by `scripts/ci.py` (23 gates).
 
 | Item | Evidence |
 |---|---|
@@ -122,8 +121,9 @@ listed in `docs/status.md` and run by `scripts/ci.py` (22 gates).
 | **D1 — full-text index and BM25** | The `term` index is created with the table, `rank` is BM25 over the postings, `snippet`/`highlight` mark the match, and a rare term visits at most 8 rows of 5 000 (`test_full_text_ranking`, `test_full_text_cost`). |
 | **D13 — the stored result on a retry** | The response commits with the request id and `host_call_once_result` answers a retry with it (`test_idempotent_result`). |
 | **D17 — rows on disk** | A store opened with `paged_tables` keeps each table in a 4 KiB-page file under `<db>/tables`: a cache over the log, flushed after the log record is durable, frame 0 reserved for the header. A single-table query streams the pages; `ORDER BY`/`GROUP BY`/`DISTINCT`/windows/`AS OF`/joins/staged writes fall back to collecting. `scripts/page_rss.py` is a gate: a table 63× the pool adds 316 KiB to the statement and four times the rows adds the same. |
+| **D20 — differential runner** | `scripts/differential.py` is a gate: 55 queries answer identically through this engine and the system `sqlite3`, 7 statements are refused with a reason and 4 differ on purpose. It found the ORDER BY tie order (fixed with a row-id tiebreak) and the missing scalar `min`/`max` and `trim(s, chars)` (fixed); a refusal that stops refusing fails the gate. |
 | **D5 — index keys in pages** | Each index of a paged table is a B+tree of 4 KiB pages under `<db>/indexes/…` with its own pool, chained leaves and a cursor without a parent stack; point lookups, ranges, `UNIQUE`, updates, deletes and `TRUNCATE` go through the pages. An empty leaf is not merged yet (a delete never answers wrongly). |
-| **D6 — the planner** (the first half) | `ANALYZE` measures rows, distinct values, NULLs, the numeric range and a sixteen-bucket histogram into `<db>/stats`; the planner prices scan against probe and prints `est. N rows, cost C`; joins run in the planned order with each `ON` attached to the step that completes the relations it names. `scripts/plan_check.py` guards the plans (`test_analyze_and_plan_estimates`, `test_plan_reorders_a_join`). The join delta is item 4. |
+| **D6 — the planner** (the first half) | `ANALYZE` measures rows, distinct values, NULLs, the numeric range and a sixteen-bucket histogram into `<db>/stats`; the planner prices scan against probe and prints `est. N rows, cost C`; joins run in the planned order with each `ON` attached to the step that completes the relations it names. `scripts/plan_check.py` guards the plans (`test_analyze_and_plan_estimates`, `test_plan_reorders_a_join`). The join delta is item 3. |
 | **D4 — `.sqlite` pages in place** | The mirror patches the leaf of every changed row, the separator its parent stores and page 1: three pages (12 KiB) per commit at 10k, 100k and 250k rows, where re-encoding wrote 172 KiB, 1.8 MB and 4.8 MB. Splits, empty-leaf unlink, free-list reuse and torn-commit recovery through a rollback journal in SQLite's format; `scripts/mirror_cost.py` checks the file with real `sqlite3`. |
 | **D3 — `AS OF` and version pruning** | `FROM t AS OF <seq>` reads the versions the table keeps and `store_prune_versions` discards what no reader can ask for (`test_as_of`). The snapshot cost is item 3; automatic retention and `AS OF` on a join remain in D3's backlog entry. |
 | **D7 — scheduler durability** | `_schedule.at_us` is a column and commits; a restart resumes pending work (`test_durability_after_restart`). |

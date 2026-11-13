@@ -10,7 +10,10 @@ drifts: `python3 scripts/sqlite_inventory.py --sqlite ../sqlite` writes
 `docs/sqlite-inventory.md` with every keyword, built-in function and pragma.
 
 This matrix records what is done, partial or missing. A row is `done` only when
-a test covers it.
+a test covers it, and `scripts/differential.py` checks the statements and
+functions listed here against the system `sqlite3`: the answers must match, or
+the statement must be one of the refusals or the intentional differences the
+script lists.
 
 ## File format
 

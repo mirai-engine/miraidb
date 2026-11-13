@@ -15,6 +15,11 @@
   by row id, so a query with equal keys answers the same sequence every run;
   `min`/`max` with two or more arguments compare their arguments, and
   `trim`/`ltrim`/`rtrim` take a set of characters.
+- `scripts/differential.py` runs one schema, one set of rows and 55 queries
+  through this engine and the system `sqlite3` and fails when the answers
+  differ; the statements this engine refuses, and the four semantic decisions
+  that differ on purpose, are listed in the script. `miraidb sql --json` exists
+  so the comparison reads values instead of scraping a table.
 - One owner per database directory (OS lock), and a broker that serves other
   processes over HTTP, WebSocket frames and Postgres.
 - Tables on disk: a page file per table with a buffer pool, a free list, a
