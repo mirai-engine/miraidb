@@ -80,6 +80,9 @@ def main() -> int:
     gates.append(
         Gate("page memory", [sys.executable, "scripts/page_rss.py", "--check", "--bin", "./bin/miraidb.exe"])
     )
+    gates.append(
+        Gate("plan regression", [sys.executable, "scripts/plan_check.py", "--bin", "./bin/miraidb.exe"])
+    )
     if not args.skip_dll:
         if os.path.exists(args.windows_python):
             gates.append(Gate("C ABI smoke", [args.windows_python, "scripts/capi_smoke.py"]))

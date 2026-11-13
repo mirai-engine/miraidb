@@ -26,7 +26,7 @@ Rules for this file:
 | D3 | Snapshot cost | **borrowed values, ~1 ms to freeze 50k rows** | `AS OF` history, GC | M | P2 |
 | D4 | Page backend | `.sqlite` is rewritten whole per commit | pages in place, WAL frames, free list | XL | P1 |
 | D5 | Persistent indexes | **done**: index keys live in B+trees of pages, with a pool, a cursor over chained leaves and a memory gate | merging empty leaves; a trusted open without replay (D18b) | L | P0 |
-| D6 | Query planner | **`ANALYZE` + statistics + estimates**: row counts and per-column distinct/NULL counts live in `<db>/stats`, `EXPLAIN` prints `est. N rows`, and an index over a column with fewer than four distinct values is refused (`test_analyze_and_plan_estimates`) | histograms (a range is one third), join reordering, pricing two index candidates, and the regression benchmark | L | P1 |
+| D6 | Query planner — *done* | `ANALYZE` measures row counts, per-column distinct/NULL counts, the numeric range and a sixteen-bucket histogram into `<db>/stats`; the plan prices scan against probe from those numbers, picks between index candidates, prints `est. N rows, cost C`, and orders joins by the rows each relation keeps per outer row with every ON travelling to the step that can answer it (`test_analyze_and_plan_estimates`, `test_plan_reorders_a_join`, `scripts/plan_check.py`) | probing an index for a joined table, `ORDER BY` from an index, calibrated cost constants | L | P1 |
 | D7 | Scheduler durability | **durable** (due time is a logged column) | recovery test | S | — |
 | D8 | Crash injection | **done**: `Fault_Vfs` fails any operation at any call, and `test_fault_injection` walks the write offsets | same for the snapshot and the mirror writes | S | P1 |
 | D9 | SQL grammar | 32 statements, **`ROWS` frames, trigger `WHEN` and `RENAME COLUMN` done** (`test_window_frames`, `test_trigger_when`, `test_alter_rename_column`) | windows beside `GROUP BY`, `RANGE`/`GROUPS`, `BEFORE`, `ALTER` type changes, collations, user functions | L | P2 |
@@ -250,12 +250,20 @@ is still correct, and the test deletes a third of 5000 keys to prove it.
 
 ## D6 — A planner with numbers
 
-**Now.** Single-table scans with index probes (`index_candidates`), nested-loop
-joins, no reordering. `ANALYZE` measures row counts and per-column distinct/NULL
-counts into `<db>/stats`, `EXPLAIN` prices a predicate with them (`est. N rows`),
-and an index that would keep most of the table is refused in favour of the scan
-(`src/engine/stats.odin`, `test_analyze_and_plan_estimates`). A plan still has no
-histogram (a range is one third by the classic rule) and never reorders a join.
+**Now.** `src/engine/stats.odin` measures each table once (rows, distinct non-null
+values, NULLs, and for numeric columns the range plus sixteen equi-width buckets)
+and keeps them in `<db>/stats`. `src/engine/plan.odin` prices a scan against an
+index probe, picks the cheapest of the predicates that have an index, and orders
+the relations of a join so the one that keeps the fewest rows per outer row runs
+first, attaching every ON to the step that completes the relations it names. The
+executor takes the same decisions the plan prints (`test_analyze_and_plan_estimates`,
+`test_plan_reorders_a_join`), and `scripts/plan_check.py` is the regression gate
+that fails when a known-good plan gets worse.
+
+**Not done.** A joined table is still scanned rather than probed, `ORDER BY` never
+comes from an index, and the cost constants are chosen by hand — they encode "a
+row through an index costs four rows in place" and have not been calibrated against
+a measurement.
 
 **Cost.** A join is evaluated in the order it was written; the only cardinality
 information is "this predicate has an index".

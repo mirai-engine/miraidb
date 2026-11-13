@@ -328,13 +328,17 @@ query answer depends on it, and a stale one only plans from older numbers.
     header  32 B: "MRST" | u32 version | u64 analyzed_seq | u64 payload_len |
                   u32 crc32c(payload) | u32 reserved
     payload      : u32 count | count * table
-    table        : string name | u64 rows | u32 columns |
-                   columns * {u64 distinct_count, u64 nulls, u8 saturated}
+    table        : string name | u64 rows | u32 columns | columns * column
+    column       : u64 distinct_count | u64 nulls | u8 saturated | u8 numeric |
+                   f64 min | f64 max | u64 buckets[16]
 
 `distinct_count` is capped at 20000 values per column; past the cap the count
 stops growing and `saturated` says so, which a plan reads as "at least this many".
-The file is replaced in place after the measurement, and an open that finds a
-missing or damaged one simply has no statistics.
+`numeric` says the range and the buckets are meaningful: `min` and `max` are the
+measured range and `buckets` counts the rows in each of sixteen equal-width
+slices of it, which is what a range predicate reads instead of assuming a third
+of the table. The file is replaced in place after the measurement, and an open
+that finds a missing or damaged one simply has no statistics.
 
 ## Index file
 

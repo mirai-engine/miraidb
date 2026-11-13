@@ -15,10 +15,19 @@
   fault-tested flush order, and a query pipeline that streams a single-table
   scan without holding the table in memory. Off by default; `--paged` turns it
   on.
-- `ANALYZE [table]`: row counts and per-column distinct/NULL counts are measured
-  once and kept in `<db>/stats`, `EXPLAIN` prints the estimate it used
-  (`est. N rows`), and an index over a column with fewer than four distinct
-  values is refused in favour of reading the rows.
+- `ANALYZE [table]`: row counts, per-column distinct/NULL counts, the numeric
+  range and a sixteen-bucket histogram are measured once and kept in `<db>/stats`.
+  The planner prices a scan against an index probe and prints `est. N rows,
+  cost C` in `EXPLAIN`; a range reads the histogram (50 of 400 rows for
+  `amount < 50`, not the one-third rule's 133) and a predicate that keeps most of
+  the table reads the rows instead of collecting that many ids.
+- Planned join order: a nested-loop join runs the relation that keeps the fewest
+  rows per outer row first, and every ON condition travels with the step that
+  completes the relations it names, so a relation may run before the join it was
+  written with. LEFT joins, `AS OF` and table functions keep the written order.
+- `scripts/plan_check.py` is the twentieth CI gate: it fails when a known-good
+  plan (point lookup, wide predicate, range estimate, join order, the row counter
+  behind them) regresses.
 - A paged database opens without replaying: `<db>/catalog` holds every schema and
   the counters, the log index names the last record, and the open trusts the page
   files only when all three sequences agree; a missing, stale or torn catalog

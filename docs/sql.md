@@ -74,11 +74,26 @@ the rows the plan expects to keep (`est. N rows`).
 
 `ANALYZE` measures the tables once and stores what a plan needs: the row count of
 each table and, per column, how many distinct non-null values and how many NULLs
-it holds. `ANALYZE t` measures one table. The numbers live in `<db>/stats` and
-are loaded on open; a plan without them assumes the table's full row count, which
-is what it did before statistics existed. An equality over a column with fewer
-than four distinct values estimates half the table or more, and the plan reads
-the rows instead of collecting that many ids through an index.
+it holds, plus the numeric range and a sixteen-bucket histogram over it.
+`ANALYZE t` measures one table. The numbers live in `<db>/stats` and are loaded on
+open; a plan without them assumes the table's full row count and keeps using the
+index for a predicate that names one, which is what it did before statistics
+existed.
+
+The plan prices the two ways to read a table and takes the cheaper one: a scan
+pays a row for every row of the table, a probe pays one descent plus a row for
+every id the index hands over. An equality keeps about `rows / distinct` rows; a
+range reads the histogram, so `amount < 50` over 400 rows with values 0..399 is
+estimated at 50, not at the one-third rule's 133. `EXPLAIN` prints the estimate
+and the cost it chose with (`est. N rows, cost C`).
+
+Joins run as nested loops, and the order is planned rather than written: the
+relation that keeps the fewest rows per outer row runs first, because it shrinks
+everything after it. The conditions that connect relations travel with the step
+that can answer them, so a relation may run before the join it was written with.
+A LEFT join, an `AS OF` pin or a table function keeps the written order, because
+there the order is part of the meaning. `EXPLAIN` prints `join order: a, c, b`
+when the order changed.
 
 `BEGIN`/`COMMIT`/`ROLLBACK` are session statements. The CLI keeps one open
 transaction across statements; `sql_execute` handles them per call and rejects

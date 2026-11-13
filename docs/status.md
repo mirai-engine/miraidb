@@ -179,16 +179,26 @@ the trusted open belongs to the process that owns the directory; a key longer
 than 1000 bytes cannot be indexed and the insert says so.
 
 
-- **Index use.** Only the base table of a query is narrowed by an index; joined
-  tables are scanned by the nested loop. `ANALYZE` measures each table once
-  (row count, distinct values and NULLs per column) and the plan reads those
-  numbers: an equality over a column with four or more distinct values uses its
-  index, one over a column with fewer does not, and `EXPLAIN` prints the estimate
-  it used (`est. N rows`). Statistics are a cache in `<db>/stats`, validated by
-  checksum, loaded on open, dropped with the table they describe; a plan without
-  them assumes the full row count, which is the behaviour before `ANALYZE`.
-  What is still missing is the rest of a cost model: no histograms (a range is
-  one third), no join reordering, and nothing compares two index candidates.
+- **Planning.** `ANALYZE` measures each table once — row count, distinct non-null
+  values and NULLs per column, the numeric range and a sixteen-bucket histogram
+  over it — and the planner prices every way to read a relation with those
+  numbers: a scan pays one row per row of the table, a probe pays a descent plus
+  a row per id it hands over, and the cheaper one wins (`src/engine/plan.odin`).
+  `EXPLAIN` prints the estimate and the cost (`est. N rows, cost C`), and the
+  executor takes the same decision. Statistics are a cache in `<db>/stats`
+  (checksummed, loaded on open, dropped with their table); a table nobody ran
+  `ANALYZE` on keeps the old behaviour of using its index.
+- **Join order.** A join is a nested loop, and its order is planned: the relation
+  that keeps the fewest rows per outer row runs first, and each ON condition runs
+  with the step that completes the relations it names, so a relation may run
+  before the join it was written with. LEFT joins, `AS OF` and table functions
+  keep the written order. `EXPLAIN` prints `join order: …` when it changed, and
+  `scripts/plan_check.py` is a CI gate over the plans a measured fixture must
+  produce.
+- **What the planner still does not do.** It cannot probe an index for a joined
+  table (the inner side is always scanned), it does not use an index to satisfy
+  `ORDER BY`, and its cost constants are hand-set rather than calibrated against
+  a measurement.
 - **Schema changes.** `ALTER TABLE` renames the table, adds and drops columns,
   and renames a column (keeping the rows and the indexes); text that names a
   column is not rewritten.
