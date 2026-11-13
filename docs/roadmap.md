@@ -19,7 +19,7 @@ releases is worth shipping.
 
 | # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
-| 1 | **D6 — the planner's remaining gaps** | The join delta and the inner-side probe are done: an equi-join is indexed by its key, a commit probes the matches, and a nested loop reads the inner rows the ON clause names (`test_join_probes_the_inner_index`). What is left is the pricing: serve `ORDER BY` from an index, calibrate the cost constants, consult the histogram for a bound value, estimate a view in `FROM`, and let the subscription path use the planned order. | L | — |
+| 1 | **D6 — the planner's remaining gaps** | The join delta and the inner-side probe are done: an equi-join is indexed by its key, a commit probes the matches, and a nested loop reads the inner rows the ON clause names (`test_join_probes_the_inner_index`). What is left is the pricing: serve `ORDER BY` from an index, calibrate the cost constants, estimate a view in `FROM`, and let the subscription path use the planned order. A bound value already reaches the histogram (`test_plan_reads_a_bound_value`). | L | — |
 | 2 | **D9 — the rest of the grammar** | `RANGE`/`GROUPS` frames, windows beside `GROUP BY`, `BEFORE` triggers, `ALTER` type changes, more collations, user functions. | L | — |
 | 3 | **ASAN pass** over the CLI, soak and conformance — *partly done* | Bounds and stack are covered today. Odin's heap allocator is not intercepted on Windows (a deliberate use-after-free is not reported), so the heap half runs with the POSIX toolchain in #14. | 1 round | 12 |
 | 4 | **D2 — spatial tree** | Node pages and a descent replace the scan over box columns. | M | — |

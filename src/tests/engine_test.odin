@@ -3,6 +3,7 @@ package tests
 import "core:fmt"
 import "core:mem"
 import "core:net"
+import "core:strconv"
 import "core:sync"
 import "core:thread"
 import "core:os"
@@ -10279,6 +10280,71 @@ test_explain_announces_stale_statistics :: proc(t: ^testing.T) {
 	note = explain_note(t, store, "EXPLAIN SELECT * FROM s WHERE v = 2")
 	testing.expectf(t, len(note) == 0, "a re-measured plan carried a note: %s", note)
 	delete(note)
+}
+
+@(private)
+plan_estimate :: proc(t: ^testing.T, store: ^db.Store, sql: string, params: []db.Value) -> int {
+	result, err := db.sql_execute_params(store, sql, params)
+	if !testing.expectf(t, db.error_ok(err), "explain failed: %s", err.message) do return -1
+	defer db.sql_result_destroy(&result)
+	for row in result.rows {
+		text := row[0].s
+		marker := strings.index(text, "est. ")
+		if marker < 0 do continue
+		rest := text[marker + len("est. "):]
+		end := strings.index(rest, " rows")
+		if end < 0 do continue
+		if value, ok := strconv.parse_int(rest[:end]); ok do return int(value)
+	}
+	return -1
+}
+
+@(test)
+test_plan_reads_a_bound_value :: proc(t: ^testing.T) {
+	// A prepared statement is priced with the value it was given, so `n < ?` keeps
+	// the same estimate as `n < 5` instead of falling back to a third of the table.
+	// The plan is chosen per execution, which is what lets the histogram answer.
+	store := fresh_db(t, "bound_plan")
+	if store == nil do return
+	defer cleanup_db(store, "bound_plan")
+
+	run(t, store, "CREATE TABLE b (id INTEGER PRIMARY KEY, n INTEGER)")
+	insert := strings.builder_make()
+	defer strings.builder_destroy(&insert)
+	strings.write_string(&insert, "INSERT INTO b (n) VALUES ")
+	for i in 0 ..< 400 {
+		if i > 0 do strings.write_string(&insert, ", ")
+		fmt.sbprintf(&insert, "(%d)", i + 1)
+	}
+	run(t, store, strings.to_string(insert))
+	run(t, store, "ANALYZE b")
+
+	literal := plan_estimate(t, store, "EXPLAIN SELECT * FROM b WHERE n < 50", nil)
+	bound := plan_estimate(
+		t,
+		store,
+		"EXPLAIN SELECT * FROM b WHERE n < ?",
+		[]db.Value{db.value_int(50)},
+	)
+	testing.expectf(t, literal > 20 && literal < 80, "literal estimate: %d", literal)
+	testing.expectf(t, bound == literal, "a bound value estimated %d, the literal %d", bound, literal)
+
+	// A statement that binds nothing keeps the old fallback: a third at most.
+	unbound := plan_estimate(t, store, "EXPLAIN SELECT * FROM b WHERE n < ?", nil)
+	testing.expectf(t, unbound > 100, "an unbound parameter estimated %d", unbound)
+
+	// The bound value also decides the access: 1 of 400 rows probes the index,
+	// 380 of 400 keeps the scan.
+	run(t, store, "CREATE INDEX b_n ON b (n)")
+	narrow, narrow_err := db.sql_execute_params(
+		store,
+		"EXPLAIN SELECT * FROM b WHERE n = ?",
+		[]db.Value{db.value_int(7)},
+	)
+	if testing.expectf(t, db.error_ok(narrow_err), "explain failed: %s", narrow_err.message) {
+		testing.expect(t, strings.contains(narrow.rows[0][0].s, "using index b_n"))
+		db.sql_result_destroy(&narrow)
+	}
 }
 
 @(test)

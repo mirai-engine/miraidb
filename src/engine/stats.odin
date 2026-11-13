@@ -236,7 +236,12 @@ stats_rows_below :: proc(stats: Table_Stats, column_index: int, number: f64, inc
 // Without statistics it returns the row count, which is the assumption a plan
 // made before any of this existed. A predicate with no recognizable conjunct
 // keeps everything for the same reason.
-stats_estimate_rows :: proc(store: ^Store, table: ^Table, predicate: ^Expr) -> u64 {
+stats_estimate_rows :: proc(
+	store: ^Store,
+	table: ^Table,
+	predicate: ^Expr,
+	params: []Value,
+) -> u64 {
 	total := u64(table_row_count(table))
 	stats, has_stats := stats_get(store, table.schema.name)
 	if has_stats do total = stats.rows
@@ -248,11 +253,11 @@ stats_estimate_rows :: proc(store: ^Store, table: ^Table, predicate: ^Expr) -> u
 	for expr in conjuncts {
 		if estimate <= 1 do break
 		if binary, is_binary := expr^.(Binary_Expr); is_binary {
-			estimate *= stats_binary_fraction(stats, table, binary)
+			estimate *= stats_binary_fraction(stats, table, binary, params)
 			continue
 		}
 		if between, is_between := expr^.(Between_Expr); is_between && !between.negated {
-			estimate *= stats_between_fraction(stats, table, between)
+			estimate *= stats_between_fraction(stats, table, between, params)
 			continue
 		}
 	}
@@ -262,7 +267,12 @@ stats_estimate_rows :: proc(store: ^Store, table: ^Table, predicate: ^Expr) -> u
 
 // stats_binary_fraction is the share of a table's rows one comparison keeps.
 @(private)
-stats_binary_fraction :: proc(stats: Table_Stats, table: ^Table, binary: Binary_Expr) -> f64 {
+stats_binary_fraction :: proc(
+	stats: Table_Stats,
+	table: ^Table,
+	binary: Binary_Expr,
+	params: []Value,
+) -> f64 {
 	#partial switch binary.op {
 	case .Eq, .Lt, .Le, .Gt, .Ge:
 	case:
@@ -292,7 +302,10 @@ stats_binary_fraction :: proc(stats: Table_Stats, table: ^Table, binary: Binary_
 		if column.nulls > 0 do distinct_count += 1
 		return 1 / f64(distinct_count)
 	}
-	bound, constant := eval_constant(value_expr, nil)
+	// A prepared statement prices its plan with the value it was given, so a
+	// bound parameter reads the histogram instead of estimating a third of the
+	// table.
+	bound, constant := eval_constant(value_expr, params)
 	number, is_number := value_as_f64(bound)
 	if !constant || !is_number || !column.numeric || stats.rows == 0 do return 1.0 / 3.0
 	// `<` and `<=` keep the rows below; `>` and `>=` keep the rest. The boundary
@@ -311,7 +324,12 @@ stats_binary_fraction :: proc(stats: Table_Stats, table: ^Table, binary: Binary_
 
 // stats_between_fraction is the share of a table's rows a BETWEEN keeps.
 @(private)
-stats_between_fraction :: proc(stats: Table_Stats, table: ^Table, between: Between_Expr) -> f64 {
+stats_between_fraction :: proc(
+	stats: Table_Stats,
+	table: ^Table,
+	between: Between_Expr,
+	params: []Value,
+) -> f64 {
 	if stats.rows == 0 do return 1
 	column, is_column := between.operand^.(Column_Expr)
 	if !is_column do return 0.25
@@ -319,8 +337,8 @@ stats_between_fraction :: proc(stats: Table_Stats, table: ^Table, between: Betwe
 	column_index, found := schema_column_index(&table.schema, column.name)
 	if !found || column_index >= len(stats.columns) do return 0.25
 	if !stats.columns[column_index].numeric do return 0.25
-	low_value, low_ok := eval_constant(between.low, nil)
-	high_value, high_ok := eval_constant(between.high, nil)
+	low_value, low_ok := eval_constant(between.low, params)
+	high_value, high_ok := eval_constant(between.high, params)
 	low, low_number := value_as_f64(low_value)
 	high, high_number := value_as_f64(high_value)
 	if !low_ok || !high_ok || !low_number || !high_number do return 0.25

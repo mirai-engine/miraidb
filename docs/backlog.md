@@ -346,10 +346,11 @@ expression key that cannot be probed, a LEFT join and the plan line.
 **Not done.** `ORDER BY` never comes from an index, and the cost constants are
 chosen by hand —
 they encode "a row through an index costs four rows in place" and have not been
-calibrated against a measurement. Two gaps come from choosing the plan off the statement
-text alone: a bound value never reaches the histogram (`v < ?` estimates a third of
-the table where `v < 50` estimates fifty of four hundred rows) and a view in
-`FROM` prints no estimate. The statistics announce their age: `EXPLAIN` ends with
+calibrated against a measurement. The plan reads the values it is given: a prepared
+`v < ?` bound to 50 keeps the estimate `v < 50` gets, so the histogram decides the
+access as well as the estimate (`test_plan_reads_a_bound_value`). One gap comes
+from choosing the plan off the statement text alone: a view in `FROM` prints no
+estimate. The statistics announce their age: `EXPLAIN` ends with
 `note: statistics measured at commit N, data at commit M`, or with `note: no
 statistics measured` when `ANALYZE` never ran, so an estimate never passes for a
 measurement (`test_explain_announces_stale_statistics`). The incremental subscription path (`host_join_prepare`) lays out the

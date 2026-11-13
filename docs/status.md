@@ -132,7 +132,7 @@ the gaps are named rather than left to be discovered.
   one schema, one set of rows and 55 queries through both engines, with the
   refusals and the intentional differences listed in the script.
 - `scripts/build.py` builds both binaries and runs the suite.
-- 225 integration tests covering CRUD, recovery, constraints, transactions,
+- 226 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
@@ -237,14 +237,16 @@ than 1000 bytes cannot be indexed and the insert says so.
   (`test_join_probes_the_inner_index`). `EXPLAIN` prints `join <name> using index
   <index> …`, `join order: …` when it changed, and `scripts/plan_check.py` is a CI
   gate over the plans a measured fixture must produce.
+- **The plan reads the values it is given.** A statement is priced per execution,
+  with the parameters that came with it, so `n < ?` bound to 50 keeps the estimate
+  `n < 50` gets and the same access decision (`test_plan_reads_a_bound_value`); a
+  statement that binds nothing keeps the old fallback of a third of the table.
 - **What the planner still does not do.** It does not use an index to satisfy
   `ORDER BY`, and its cost constants are hand-set rather than calibrated against a
-  measurement. Three smaller gaps share one cause: the plan is chosen from the
-  statement text, so a bound value never reaches the histogram (a prepared
-  `v < ?` estimates a third of the table, while `v < 50` reads the buckets), a
-  view in `FROM` gets no estimate at all, and the subscription path lays out its
-  walk in the written order rather than the planned one. Staleness is no longer
-  silent: `EXPLAIN` reprices with the numbers it has and names their age.
+  measurement. Two smaller gaps remain: a view in `FROM` gets no estimate, and the
+  subscription path lays out its walk in the written order rather than the planned
+  one. Staleness is no longer silent: `EXPLAIN` reprices with the numbers it has
+  and names their age.
 - **A join the grammar does not implement is refused, not approximated.**
   `NATURAL`, `RIGHT` and `FULL` joins used to parse as an alias for the table
   before them, which turned the first into a cross join and the other two into

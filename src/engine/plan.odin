@@ -45,7 +45,7 @@ plan_access :: proc(
 	predicate: ^Expr,
 	params: []Value,
 ) -> Plan_Access {
-	rows := stats_estimate_rows(store, table, predicate)
+	rows := stats_estimate_rows(store, table, predicate, params)
 	// A scan pays for every row it reads, not for the rows that survive the
 	// filter: the filter runs on all of them.
 	scan_rows := u64(table_row_count(table))
@@ -81,7 +81,7 @@ plan_access :: proc(
 		}
 		// What this index hands over, not what the whole predicate keeps: the
 		// filter that is left runs anyway.
-		kept := stats_estimate_rows(store, table, expr)
+		kept := stats_estimate_rows(store, table, expr, params)
 		cost := PLAN_PROBE + f64(kept) * PLAN_INDEX_ROW
 		if cost >= best.cost do continue
 		best = Plan_Access {
@@ -179,9 +179,9 @@ plan_join_order :: proc(
 ) -> Plan_Order {
 	relations := make([dynamic]Plan_Relation, 0, len(stmt.joins) + 1)
 	defer delete(relations)
-	append(&relations, plan_relation(store, tx, stmt.from, stmt.where_clause, nil))
+	append(&relations, plan_relation(store, tx, stmt.from, stmt.where_clause, nil, params))
 	for join in stmt.joins {
-		append(&relations, plan_relation(store, tx, join.table, stmt.where_clause, join.on))
+		append(&relations, plan_relation(store, tx, join.table, stmt.where_clause, join.on, params))
 	}
 	// The plan is computed either way: EXPLAIN prints the rows it expects from
 	// every step, and only the order itself changes when reordering is allowed.
@@ -352,12 +352,13 @@ plan_relation :: proc(
 	ref: Table_Ref,
 	filter: ^Expr,
 	on: ^Expr,
+	params: []Value,
 ) -> Plan_Relation {
 	table, table_err := tx_table(tx, ref.name)
 	if table_err.kind != .None do return Plan_Relation{ref = ref, on = on}
 	predicate := filter
 	if on != nil do predicate = on
-	rows := stats_estimate_rows(store, table, predicate)
+	rows := stats_estimate_rows(store, table, predicate, params)
 	scan_rows := u64(table_row_count(table))
 	if stats, has_stats := stats_get(store, table.schema.name); has_stats {
 		scan_rows = stats.rows
