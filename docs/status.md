@@ -72,13 +72,13 @@ the gaps are named rather than left to be discovered.
 ### Transactions
 
 - One writer, many readers, staged writes, read-your-writes.
-- A read transaction takes a snapshot at begin: the row map is copied, the values
-  are borrowed through a reference-counted store, and every index tree is copied
-  shape for shape (nodes and keys, no comparisons and no rebalancing). The
-  snapshot is cached by commit sequence, so a second read costs nothing, and a
-  retired one is freed as soon as no transaction holds it. A 50 000-row table
-  freezes in ~36 ms today (it was 117 ms before the shape-for-shape copy);
-  `bench-read` prints that first read and the steady state separately.
+- A read transaction copies nothing: it takes one reference per table, and a
+  commit that has to change a table a reader holds copies **that** table first.
+  Opening a read after a commit costs 38 µs on the gate (21 µs over 50 000 rows,
+  where it cost 24 ms); the commit that pays for a live reader costs 16.9 ms over
+  20 000 rows (46 ms over 50 000), once per read generation, because after the
+  copy the store owns the table again. A table a reader holds outlives the store
+  and a `DROP`.
 - Deterministic operation order in the log.
 - Validation before logging: a rejected statement never reaches the log.
 - Rewind of the log if applying a validated transaction ever fails.

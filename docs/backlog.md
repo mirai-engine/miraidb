@@ -24,7 +24,7 @@ Rules for this file:
 |---|---|---|---|---|---|
 | D1 | Full-text term index and BM25 | **done**: index on `term` in the same transaction, BM25 `rank`, `snippet`/`highlight`, scan narrowed to the matches (`test_full_text_ranking`, `test_full_text_cost`) | phrases, prefix, column filters | M | P0 |
 | D2 | Spatial index | overlap is a scan of the boxes | node file, tree descent | M | P2 |
-| D3 | Snapshot cost | **borrowed values, ~1 ms to freeze 50k rows** | `AS OF` history, GC | M | P2 |
+| D3 | Snapshot cost — *done* | a read copies nothing (one reference per table); a commit copies the table it writes when a reader holds it, once per read generation: read after a commit 38 µs on the gate, commit against a reader 16.9 ms (`test_a_commit_copies_the_table_a_reader_holds`) | automatic version retention | M | P2 |
 | D4 | Page backend | `.sqlite` is rewritten whole per commit | pages in place, WAL frames, free list | XL | P1 |
 | D5 | Persistent indexes | **done**: index keys live in B+trees of pages, with a pool, a cursor over chained leaves and a memory gate | merging empty leaves; a trusted open without replay (D18b) | L | P0 |
 | D6 | Query planner — *done* | `ANALYZE` measures row counts, per-column distinct/NULL counts, the numeric range and a sixteen-bucket histogram into `<db>/stats`; the plan prices scan against probe from those numbers, picks between index candidates, prints `est. N rows, cost C`, and orders joins by the rows each relation keeps per outer row with every ON travelling to the step that can answer it (`test_analyze_and_plan_estimates`, `test_plan_reorders_a_join`, `scripts/plan_check.py`) | probing an index for a joined table, `ORDER BY` from an index, calibrated cost constants | L | P1 |
@@ -96,37 +96,39 @@ as the fallback for `WITHOUT ROWID`-style tables if the tree cannot be built.
 
 ## D3 — Snapshot cost and history
 
-**Snapshot cost.** A read snapshot borrows the table's values instead of a deep
-copy: the freeze builds the row map and the index entries and hands both tables a
-reference-counted `Row_Store`, and the last owner out frees the values.
-`test_snapshot_shares_values_safely` proves isolation across an update and a
-truncate while the reader holds its view.
+**Done: a read copies nothing.** A read transaction takes one reference per table
+(`table_share`) instead of building a snapshot, so opening it after a commit costs
+38 µs on the gate and 21 µs over 50 000 rows, where it cost 24 ms. The copy moved
+to the write side, where it is also per table: `store_apply` calls
+`store_table_writable`, which clones the table (`table_cow_clone`) only when a
+reader holds it, and only for the table the commit writes. The clone copies the
+row map (presized) and the index trees shape for shape, borrows the values through
+the shared `Row_Store`, and leaves the old table to its readers; the old table
+becomes read-only and the copy frees the history and tombstones its readers can no
+longer see. After the copy the store owns the table again, so the commit after it
+mutates in place: a long reader costs one copy per table, not one per commit. The
+store's read cache, its reference-counted entries and the `READ_CACHE_LIMIT` guard
+are gone with it.
 
-What this file used to claim — "~11 µs per transaction including the first,
-before ~190 ms" — was measured wrong: `bench-read` ran a `SELECT count(*)` before
-it started the clock, and that statement published the read cache, so the timed
-loop never paid a freeze. Measured directly on a table of 50 000 rows (three
-columns, primary key and one index), `table_snapshot` cost **117 ms** — about
-2.3 µs per row — because it rebuilt every index with `table_insert_borrowed`.
+`bench-read` reports the read and the commit that pays for a live reader
+separately (`first_read_us`, `commit_with_reader_us`) and `scripts/bench.py` gates
+both, so a copy that reappears on the read side, or a commit that copies when
+nobody reads, fails CI. `test_a_commit_copies_the_table_a_reader_holds` proves the
+reader keeps its values, that the table a commit does not write is the same object
+before and after, and that a commit nobody reads copies nothing;
+`test_snapshot_survives_dropping_the_source` proves a reader outlives a `DROP`.
 
-**Done.** The index trees are copied **shape for shape**
-(`index_tree_clone`: node and key, no comparisons, no rebalancing) and the row
-map is presized. The same table snapshots in **36 ms** (0.7 µs per row), and with
-one extra index in **53 ms** instead of 198 ms. The read cache counts references
-and, when a new commit replaces it, frees every retired snapshot no transaction
-holds, so it keeps publishing instead of going dark after sixteen commits
-(`test_read_cache_keeps_publishing`). `bench-read` reports the first read after a
-commit and the steady state separately, and the gate records both
-(`first_read_us`). The snapshot owns its rows, tree nodes and keys: a writer may
-drop the source table under an open snapshot and the reader still answers
-(`test_snapshot_survives_dropping_the_source`).
+What this file used to claim — "~11 µs per transaction including the first" — was
+measured wrong: `bench-read` ran a `SELECT count(*)` before it started the clock,
+and that statement published the read cache. Measured directly, `table_snapshot`
+cost 117 ms on 50 000 rows because it rebuilt every index; the shape-for-shape
+clone of the index trees (no comparisons, no rebalancing) brought a copy to 36 ms,
+and moving the copy to the writer took it out of the read path entirely.
 
-**Left.** The copy is still *all* of it: a read transaction snapshots every table
-in the store, whether or not the statement reads it, so a first read after a
-commit is O(all rows). Copying a table the first time a statement names it (under
-the same lock, with the sequence pinned) or sharing tables copy-on-write is the
-next step, and it is what the contract row "should cost the rows the transaction
-touches" actually asks for.
+**Left.** The copy a commit pays is still O(rows of the written table) while a
+reader is open — that is the price of a reader that never blocks a writer. Nothing
+copies rows on the read side. Automatic version retention (below) is the only
+remaining piece of D3.
 
 **History (done).** `SELECT ... FROM t AS OF <seq>` reads the rows as they were at
 that commit: the scan walks the versions `row_values_at` keeps instead of the live

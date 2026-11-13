@@ -89,12 +89,6 @@ Store :: struct {
 	// background compactor) has its own context, so it must allocate and free
 	// with the same allocator the store's memory came from.
 	alloc:         mem.Allocator,
-	// read_cache is the most recent read snapshot, reused while commit_seq does
-	// not change; retired keeps the older ones alive while a transaction reads
-	// them, and cache_mutex serializes who publishes and who evicts.
-	read_cache:    ^Frozen_Cache,
-	retired:       [dynamic]^Frozen_Cache,
-	cache_mutex:   sync.Mutex,
 	variables:     map[string]Value,
 	// cancelled asks the next row loop to stop. It is cooperative: a running
 	// statement checks it between rows, so the caller still owns the outcome.
@@ -339,13 +333,10 @@ store_close :: proc(store: ^Store) {
 			store.last_error = flush_err
 		}
 	}
-	// Cached read snapshots own their cloned tables; release them before the
-	// live tables so nothing is destroyed twice.
-	frozen_cache_destroy(store.read_cache)
-	for cache in store.retired do frozen_cache_destroy(cache)
-	delete(store.retired)
+	// A table a read transaction still holds outlives the store: the reference
+	// count frees it when the last reader ends.
 	for _, table in store.tables {
-		table_destroy(table)
+		table_release(table)
 	}
 	delete(store.tables)
 	for _, attached in store.attached do store_close(attached)
@@ -913,11 +904,28 @@ store_apply_payload :: proc(store: ^Store, payload: []u8, seq: u64) -> Error {
 	return ERROR_NONE
 }
 
+// store_table_writable returns the table a commit is about to change. When a
+// read transaction holds it the commit takes a copy (table_cow_clone) and puts
+// the copy in the map, so the readers keep the table they opened with. The copy
+// costs the rows of the table this commit writes, and only while a reader is
+// open; a commit nobody is reading pays nothing.
+@(private)
+store_table_writable :: proc(store: ^Store, name: string) -> (^Table, Error) {
+	table, table_err := store_table(store, name)
+	if table_err.kind != .None do return nil, table_err
+	table.apply_seq = store.apply_seq
+	if sync.atomic_load(&table.refs) == 1 do return table, ERROR_NONE
+	clone := table_cow_clone(table)
+	if clone == nil do return table, ERROR_NONE
+	// The map key lives in the old table's arena, so the entry is replaced by the
+	// clone's own key.
+	map_erase(&store.tables, name)
+	table_release(table)
+	store.tables[clone.schema.name] = clone
+	return clone, ERROR_NONE
+}
+
 store_apply :: proc(store: ^Store, op: Store_Op) -> Error {
-	#partial switch op.kind {
-	case .Insert, .Update, .Delete, .Truncate:
-		if table, exists := store.tables[op.name]; exists do table.apply_seq = store.apply_seq
-	}
 	switch op.kind {
 	case .Create_Table:
 		if _, exists := store.tables[op.name]; exists {
@@ -950,7 +958,7 @@ store_apply :: proc(store: ^Store, op: Store_Op) -> Error {
 		replacement.next_row_id = existing.next_row_id
 		replacement.next_sequence = existing.next_sequence
 		map_erase(&store.tables, op.name)
-		table_destroy(existing)
+		table_release(existing)
 		store.tables[replacement.schema.name] = replacement
 		return ERROR_NONE
 	case .Drop_Table:
@@ -968,12 +976,12 @@ store_apply :: proc(store: ^Store, op: Store_Op) -> Error {
 					_ = system.ops.remove(system, index.pages.path)
 				}
 			}
-			table_destroy(table)
+			table_release(table)
 			if paged do store_remove_page_file(store, op.name)
 		}
 		return ERROR_NONE
 	case .Insert:
-		table, table_err := store_table(store, op.name)
+		table, table_err := store_table_writable(store, op.name)
 		if table_err.kind != .None do return table_err
 		if insert_err := table_insert(table, op.row_id, op.values); insert_err.kind != .None {
 			return insert_err
@@ -981,25 +989,25 @@ store_apply :: proc(store: ^Store, op: Store_Op) -> Error {
 		table.next_row_id = max(table.next_row_id, u64(op.row_id) + 1)
 		return ERROR_NONE
 	case .Update:
-		table, table_err := store_table(store, op.name)
+		table, table_err := store_table_writable(store, op.name)
 		if table_err.kind != .None do return table_err
 		return table_update(table, op.row_id, op.values)
 	case .Delete:
-		table, table_err := store_table(store, op.name)
+		table, table_err := store_table_writable(store, op.name)
 		if table_err.kind != .None do return table_err
 		table_delete(table, op.row_id)
 		return ERROR_NONE
 	case .Truncate:
-		table, table_err := store_table(store, op.name)
+		table, table_err := store_table_writable(store, op.name)
 		if table_err.kind != .None do return table_err
 		table_truncate(table)
 		return ERROR_NONE
 	case .Create_Index:
-		table, table_err := store_table(store, op.name)
+		table, table_err := store_table_writable(store, op.name)
 		if table_err.kind != .None do return table_err
 		return table_add_index(table, op.index)
 	case .Drop_Index:
-		table, table_err := store_table(store, op.name)
+		table, table_err := store_table_writable(store, op.name)
 		if table_err.kind != .None do return table_err
 		return table_drop_index(table, op.index.name)
 	}

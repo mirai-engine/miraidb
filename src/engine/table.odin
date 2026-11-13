@@ -97,8 +97,13 @@ Table :: struct {
 	arena:           virtual.Arena,
 	arena_allocator: mem.Allocator,
 	store:           ^Row_Store,
-	// borrowed is true for a snapshot: it reads another table's values and must
-	// not free them.
+	// refs counts the owners of this table object: the store, and every read
+	// transaction that opened while it was current. A commit that has to change
+	// a table with more than one owner copies it first (table_cow_clone), so a
+	// reader always reads a table nobody writes.
+	refs:            int,
+	// borrowed is true for a table whose rows belong to someone else: it reads
+	// the values and must not free them.
 	borrowed:        bool,
 	// index_dir, index_vfs and index_frames are what an index created after the
 	// table needs to open its own page file. A table without them (an in-memory
@@ -129,6 +134,7 @@ table_create :: proc(schema: ^Table_Schema) -> (^Table, Error) {
 		return nil, err
 	}
 	t := new(Table)
+	t.refs = 1
 	if arena_err := virtual.arena_init_growing(&t.arena); arena_err != .None {
 		free(t)
 		return nil, errf(.Out_Of_Memory, "cannot create the table arena: %v", arena_err)
@@ -152,6 +158,21 @@ table_create :: proc(schema: ^Table_Schema) -> (^Table, Error) {
 		rbtree.init_cmp(&t.indexes[i].tree, index_cmp)
 	}
 	return t, ERROR_NONE
+}
+
+// table_share adds one owner and returns the same table. A read transaction
+// takes one reference per table instead of a copy, which is what makes opening a
+// read cost the number of tables and not the number of rows.
+table_share :: proc(t: ^Table) -> ^Table {
+	if t == nil do return nil
+	sync.atomic_add(&t.refs, 1)
+	return t
+}
+
+// table_release drops one owner; the last one frees the table.
+table_release :: proc(t: ^Table) {
+	if t == nil do return
+	if sync.atomic_add(&t.refs, -1) == 1 do table_destroy(t)
 }
 
 table_destroy :: proc(t: ^Table) {
@@ -1110,6 +1131,34 @@ table_snapshot :: proc(source: ^Table) -> ^Table {
 		// The snapshot keeps the values (borrowed) and the creation sequence; the
 		// version chain belongs to the source table and is not copied.
 		clone.rows[row.id] = Row{id = row.id, values = row.values, created_seq = row.created_seq}
+	}
+	return clone
+}
+
+// table_cow_clone gives the store a writable table and leaves `source` to the
+// readers that hold it. The rows and the index trees are copied (a copy per
+// entry, and this is the only copy a commit takes); the source becomes read-only
+// for the rest of its life, because every row it shows now belongs to the clone.
+// Its history and its tombstones are not visible to a reader that began before
+// this commit, so they are freed here -- a borrowed table never frees anything.
+table_cow_clone :: proc(source: ^Table) -> ^Table {
+	// A paged table has no rows to copy and no reader can hold one: reads of a
+	// store with pages keep the lock for their whole life.
+	if source.paged != nil do return nil
+	clone := table_snapshot(source)
+	if clone == nil do return nil
+	owning := !source.borrowed
+	clone.borrowed = false
+	source.borrowed = true
+	if !owning do return clone
+	for _, &row in source.rows {
+		for version in row.versions do free_values(version.values)
+		delete(row.versions)
+		row.versions = nil
+		if row.deleted_seq != 0 {
+			free_values(row.values)
+			row.values = nil
+		}
 	}
 	return clone
 }

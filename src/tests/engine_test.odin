@@ -10414,20 +10414,61 @@ test_snapshot_survives_dropping_the_source :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_read_cache_keeps_publishing :: proc(t: ^testing.T) {
-	// The cache publishes one snapshot per commit and frees the retired ones no
-	// transaction holds. A list that only grew stopped publishing after sixteen
-	// commits, and every read after that copied the tables again.
-	store := fresh_db(t, "read_cache")
+test_a_commit_copies_the_table_a_reader_holds :: proc(t: ^testing.T) {
+	// A read transaction shares the tables instead of copying them, so a commit
+	// that has to change one takes the copy instead. The copy is per table: the
+	// table a commit does not write is the same object before and after, and a
+	// commit nobody is reading copies nothing.
+	store := fresh_db(t, "cow")
 	if store == nil do return
-	defer cleanup_db(store, "read_cache")
+	defer cleanup_db(store, "cow")
 
 	run(t, store, "CREATE TABLE c (id INTEGER PRIMARY KEY, v INTEGER)")
-	for _ in 0 ..< 25 {
-		run(t, store, "INSERT INTO c (v) VALUES (1)")
-		tx := db.tx_begin_read(store)
-		db.tx_end(tx)
-		testing.expect_value(t, store.read_cache.seq, store.commit_seq)
+	run(t, store, "CREATE TABLE other (id INTEGER PRIMARY KEY, w INTEGER)")
+	run(t, store, "INSERT INTO c (id, v) VALUES (1, 10)")
+	run(t, store, "INSERT INTO other (id, w) VALUES (1, 20)")
+
+	before, before_err := db.store_table(store, "c")
+	if !testing.expect(t, db.error_ok(before_err)) do return
+	other_before, other_err := db.store_table(store, "other")
+	if !testing.expect(t, db.error_ok(other_err)) do return
+	testing.expect_value(t, before.refs, 1)
+
+	// Two readers share one object: opening a read copies nothing.
+	first := db.tx_begin_read(store)
+	second := db.tx_begin_read(store)
+	shared_a, _ := db.tx_table(first, "c")
+	shared_b, _ := db.tx_table(second, "c")
+	testing.expect_value(t, shared_a, before)
+	testing.expect_value(t, shared_b, before)
+	testing.expect_value(t, before.refs, 3)
+
+	run(t, store, "UPDATE c SET v = 11 WHERE id = 1")
+	after, after_err := db.store_table(store, "c")
+	if !testing.expect(t, db.error_ok(after_err)) {
+		db.tx_end(first)
+		db.tx_end(second)
+		return
 	}
-	testing.expect(t, len(store.retired) < 4)
+	testing.expect(t, after != before)
+	// The reader keeps the table it opened with, values included.
+	frozen, frozen_err := db.tx_table(first, "c")
+	if testing.expect(t, db.error_ok(frozen_err)) {
+		seen := i64(0)
+		for _, row in frozen.rows do seen = row.values[1].i
+		testing.expect_value(t, seen, i64(10))
+	}
+	// The table the commit did not write is not copied.
+	other_after, _ := db.store_table(store, "other")
+	testing.expect_value(t, other_after, other_before)
+	db.tx_end(first)
+	db.tx_end(second)
+
+	// With no reader open a commit writes the table in place.
+	committed, committed_err := db.store_table(store, "c")
+	if testing.expect(t, db.error_ok(committed_err)) {
+		run(t, store, "UPDATE c SET v = 12 WHERE id = 1")
+		again, _ := db.store_table(store, "c")
+		testing.expect_value(t, again, committed)
+	}
 }

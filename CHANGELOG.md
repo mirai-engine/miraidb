@@ -25,12 +25,14 @@
   refusal so it fails the gate the day it works.
 - One owner per database directory (OS lock), and a broker that serves other
   processes over HTTP, WebSocket frames and Postgres.
-- A read snapshot copies the row map and every index tree shape for shape
-  instead of rebuilding the indexes, and retired snapshots are freed when no
-  transaction holds them: freezing a 50 000-row table fell from 117 ms to 36 ms,
-  a 50 000-row table with one extra index from 198 ms to 53 ms, and the read
-  cache keeps publishing past the sixteenth commit. `bench-read` reports the
-  first read after a commit and the steady state separately.
+- A read transaction copies nothing: it takes one reference per table, and a
+  commit that has to change a table a reader holds copies that table first, so
+  the cost is per written table and only while a reader is open. Opening a read
+  after a commit fell from 24 ms to 38 µs on the gate (21 µs over 50 000 rows);
+  the commit that pays for a live reader is 16.9 ms over 20 000 rows. The store's
+  read cache is gone with it, and so is the copy of every index tree it took.
+  `bench-read` reports the read and the commit that pays for a live reader
+  separately, and the gate watches both.
 - Tables on disk: a page file per table with a buffer pool, a free list, a
   fault-tested flush order, and a query pipeline that streams a single-table
   scan without holding the table in memory. Off by default; `--paged` turns it

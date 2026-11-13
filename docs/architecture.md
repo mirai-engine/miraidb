@@ -168,18 +168,27 @@ index entries and index bytes for diagnostics.
 
 ### Read snapshots
 
-A read transaction does not hold the store lock while it runs. At begin it builds
-one snapshot of the tables (`table_snapshot`): the row map is copied (presized),
-the values are borrowed through a reference-counted `Row_Store`, and every index
-tree is copied **shape for shape** — node and key, no comparisons and no
-rebalancing — so a snapshot costs one copy per entry instead of a lookup, an
-encoding and an insert. The snapshot is published as the store's read cache keyed
-by commit sequence, so the next read at that sequence borrows it in O(1). Each
-transaction holds a reference; a cache that a new commit replaced is freed as
-soon as no transaction holds it, so the cache keeps publishing instead of going
-dark after a fixed number of commits. A writer never waits for a reader: it keeps
-mutating its own tables, and the snapshot's rows, tree nodes and keys are its
-own — the test drops the source table under an open snapshot.
+A read transaction does not hold the store lock while it runs, and it does not
+copy anything. At begin it takes the shared lock, reads `commit_seq`, and takes
+**one reference per table** (`table_share`); the object it gets is the one the
+store has, and nothing writes it while the transaction holds it.
+
+The copy lives on the write side. Every live-table mutation goes through
+`store_apply`, and that calls `store_table_writable`: when the table has more than
+one owner, the commit copies it first (`table_cow_clone` — the row map presized,
+the index trees shape for shape, the values borrowed through the shared
+`Row_Store`) and puts the copy in the map, leaving the old table to its readers.
+The old table becomes read-only; the history and the tombstones it keeps are
+invisible to a reader that began before this commit, so the copy frees them. A
+commit pays for the tables it writes, once per read generation, and nothing at all
+when nobody is reading.
+
+That is why the two numbers differ: opening a read after a commit is 38 µs on the
+gate (21 µs over 50 000 rows, where it cost 24 ms), and a commit against a live
+reader is 16.9 ms (46 ms over 50 000). The reference count is what keeps the copy
+rare: after the first one the store owns the table again, so the next commit
+mutates it in place. A table a reader holds outlives the store (`table_release`),
+which is what lets a writer drop it while the reader answers.
 
 ## Compaction
 
