@@ -255,7 +255,8 @@ Scalar: `lower`, `upper`, `length`, `abs`, `coalesce`/`ifnull`, `now()`.
   through the index; the full `WHERE` is still re-checked, so the result is
   always exact.
 - `ORDER BY` accepts a column, an alias, or a 1-based projection ordinal. The
-  sort is stable and NULLs sort before values.
+  sort is stable and NULLs sort before values; rows that compare equal come back
+  in row id order, so the same query always answers the same sequence.
 - `GROUP BY` groups by equality of the encoded group expressions. Without
   `GROUP BY`, an aggregate query produces exactly one row, even when the table
   is empty.

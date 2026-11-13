@@ -10196,3 +10196,37 @@ test_aggregate_distinct :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, paged, "SELECT count(DISTINCT x) FROM p").i, i64(3))
 	testing.expect_value(t, scalar(t, paged, "SELECT sum(DISTINCT x) FROM p").i, i64(6))
 }
+
+@(test)
+test_order_by_ties_follow_the_row_id :: proc(t: ^testing.T) {
+	// A query with ties must answer the same rows in the same order on every run.
+	// The scan order of a table is a map, so without a tiebreaker the same
+	// statement could come back differently; the row id is the last sort key,
+	// which is also the order SQLite scans in.
+	store := fresh_db(t, "order_ties")
+	if store == nil do return
+	defer cleanup_db(store, "order_ties")
+
+	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+	run(t, store, "INSERT INTO t (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'a'), (4, 'a'), (5, 'b')")
+
+	for _ in 0 ..< 3 {
+		desc := run(t, store, "SELECT id FROM t ORDER BY name DESC")
+		if !testing.expect_value(t, len(desc.rows), 5) {
+			db.sql_result_destroy(&desc)
+			return
+		}
+		testing.expect_value(t, desc.rows[0][0].i, i64(2))
+		testing.expect_value(t, desc.rows[1][0].i, i64(5))
+		testing.expect_value(t, desc.rows[2][0].i, i64(1))
+		testing.expect_value(t, desc.rows[3][0].i, i64(3))
+		testing.expect_value(t, desc.rows[4][0].i, i64(4))
+		db.sql_result_destroy(&desc)
+	}
+	// A second key still decides first; the row id only breaks the ties.
+	second := run(t, store, "SELECT id FROM t ORDER BY name DESC, id DESC")
+	testing.expect_value(t, second.rows[0][0].i, i64(5))
+	testing.expect_value(t, second.rows[1][0].i, i64(2))
+	testing.expect_value(t, second.rows[4][0].i, i64(1))
+	db.sql_result_destroy(&second)
+}

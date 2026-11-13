@@ -2303,7 +2303,9 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 					continue
 				}
 			}
-			sort_key := build_order_key(&ctx, stmt.order_by, expanded, values, columns[:])
+			// A group has no row behind it: every group key answers the same
+			// tiebreak, which is what "unspecified order among equal groups" means.
+			sort_key := build_order_key(&ctx, stmt.order_by, expanded, values, columns[:], NO_ROW_ID)
 			append(
 				&output,
 				Output_Row{values = values, sort_key = sort_key, row_id = NO_ROW_ID},
@@ -2367,7 +2369,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			// The row id comes from the sources, which the non-window branch
 			// frees below: read it first, never after the delete.
 			row_id := len(partial) == 1 ? partial[0].row.id : NO_ROW_ID
-			sort_key := build_order_key(&ctx, stmt.order_by, expanded, values, columns[:])
+			sort_key := build_order_key(&ctx, stmt.order_by, expanded, values, columns[:], row_id)
 			if has_windows {
 				// The keys are rebuilt once the window values exist, so the
 				// sources have to outlive the loop.
@@ -2395,7 +2397,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		// projection sorts on its value.
 		for &row, i in output {
 			ctx.sources = window_sources[i]
-			row.sort_key = build_order_key(&ctx, stmt.order_by, expanded, row.values, columns[:])
+			row.sort_key = build_order_key(&ctx, stmt.order_by, expanded, row.values, columns[:], row.row_id)
 		}
 		ctx.sources = nil
 		for cells in window_cells {
@@ -2560,6 +2562,9 @@ projection_name :: proc(item: Select_Item) -> string {
 // build_order_key turns the ORDER BY clause of one output row into one byte
 // string: ascending parts keep their order-preserving encoding, descending parts
 // get every byte inverted. Comparing the strings then gives the requested order.
+// The row id comes last as a tiebreaker, so rows that compare equal come back in
+// the order they are stored -- the same row every run, which is what SQLite does
+// and what a test needs.
 @(private)
 build_order_key :: proc(
 	ctx: ^Eval_Ctx,
@@ -2567,6 +2572,7 @@ build_order_key :: proc(
 	projections: []^Expr,
 	values: []Value,
 	names: []string,
+	row_id: Row_Id,
 ) -> []u8 {
 	if len(order_by) == 0 do return nil
 	w: Byte_Writer
@@ -2589,6 +2595,7 @@ build_order_key :: proc(
 			}
 		}
 	}
+	write_be_u64(&w, u64(row_id))
 	raw := bw_bytes(&w)
 	out := make([]u8, len(raw))
 	copy(out, raw)
