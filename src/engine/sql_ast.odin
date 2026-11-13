@@ -433,6 +433,12 @@ Truncate_Stmt :: struct {
 	name: string,
 }
 
+// Analyze_Stmt measures the statistics a plan reads. An empty table means every
+// table.
+Analyze_Stmt :: struct {
+	table: string,
+}
+
 Statement :: union {
 	Select_Stmt,
 	Insert_Stmt,
@@ -458,6 +464,7 @@ Statement :: union {
 	Drop_Policy_Stmt,
 	Describe_Stmt,
 	Truncate_Stmt,
+	Analyze_Stmt,
 	Vacuum_Stmt,
 	Create_Trigger_Stmt,
 	Drop_Trigger_Stmt,
@@ -599,6 +606,8 @@ statement_name :: proc(statement: Statement) -> string {
 		return "DESCRIBE"
 	case Truncate_Stmt:
 		return "TRUNCATE"
+	case Analyze_Stmt:
+		return "ANALYZE"
 	case Vacuum_Stmt:
 		return "VACUUM"
 	case Create_Trigger_Stmt:

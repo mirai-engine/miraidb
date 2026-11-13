@@ -9626,3 +9626,78 @@ test_trusted_open_skips_the_replay :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, torn, "SELECT name FROM item WHERE id = 500").s, "later")
 	db.store_close(torn)
 }
+
+@(test)
+test_analyze_and_plan_estimates :: proc(t: ^testing.T) {
+	// ANALYZE measures the data; a plan reads the numbers; a table without them
+	// is planned exactly the way it was before statistics existed.
+	store := fresh_db(t, "analyze")
+	if store == nil do return
+	defer cleanup_db(store, "analyze")
+	run(t, store, "CREATE TABLE ev (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, amount INTEGER)")
+	run(t, store, "CREATE INDEX ev_kind ON ev (kind)")
+	run(t, store, "CREATE INDEX ev_amount ON ev (amount)")
+	for i in 0 ..< 400 {
+		run(t, store, fmt.tprintf("INSERT INTO ev (id, kind, amount) VALUES (%d, 'k%d', %d)", i, i % 2, i))
+	}
+
+	// Without statistics the plan falls back to the table's row count — the index
+	// is taken when it exists, which is what the executor did before ANALYZE —
+	// and the estimate says 400 because nothing has measured the column yet.
+	before := run(t, store, "EXPLAIN SELECT * FROM ev WHERE amount = 42")
+	testing.expect(t, strings_contains(before.rows[0][0].s, "using index ev_amount (est. 400 rows)"))
+	db.sql_result_destroy(&before)
+
+	analyzed := run(t, store, "ANALYZE")
+	testing.expect_value(t, analyzed.affected, 1)
+	db.sql_result_destroy(&analyzed)
+
+	// 400 rows with 400 distinct amounts: an equality keeps one, so the index
+	// answers and the estimate says so.
+	point := run(t, store, "EXPLAIN SELECT * FROM ev WHERE amount = 42")
+	testing.expect(t, strings_contains(point.rows[0][0].s, "using index ev_amount (est. 1 rows)"))
+	db.sql_result_destroy(&point)
+
+	// Two distinct kinds over 400 rows: an equality keeps half of them on
+	// average, so collecting the ids costs more than reading the rows.
+	wide := run(t, store, "EXPLAIN SELECT * FROM ev WHERE kind = 'k0'")
+	testing.expect(t, strings_contains(wide.rows[0][0].s, "full scan, est. 200 rows"))
+	db.sql_result_destroy(&wide)
+
+	// The executor makes the same choice the plan prints.
+	db.store_reset_rows_scanned(store)
+	wide_rows := run(t, store, "SELECT count(*) FROM ev WHERE kind = 'k0'")
+	testing.expect_value(t, wide_rows.rows[0][0].i, i64(200))
+	db.sql_result_destroy(&wide_rows)
+	testing.expect(t, db.store_rows_scanned(store) >= 400)
+	db.store_reset_rows_scanned(store)
+	point_rows := run(t, store, "SELECT count(*) FROM ev WHERE amount = 42")
+	testing.expect_value(t, point_rows.rows[0][0].i, i64(1))
+	db.sql_result_destroy(&point_rows)
+	testing.expect(t, db.store_rows_scanned(store) <= 4)
+
+	// The statistics are a file: a reopen loads them, so the plan keeps its
+	// numbers without measuring again.
+	db.store_close(store)
+	store = nil
+	reopened, open_err := db.store_open("_test_analyze", {persistent = true, create = false, durable = false})
+	if !testing.expectf(t, db.error_ok(open_err), "reopen: %s", open_err.message) do return
+	defer db.store_close(reopened)
+	after := run(t, reopened, "EXPLAIN SELECT * FROM ev WHERE amount = 42")
+	testing.expect(t, strings_contains(after.rows[0][0].s, "est. 1 rows"))
+	db.sql_result_destroy(&after)
+
+	// A table that is not there is an error, and DROP TABLE forgets what it
+	// measured instead of leaving a plan for a table nobody can read.
+	_, missing := db.sql_execute(reopened, "ANALYZE nope")
+	testing.expect_value(t, missing.kind, db.Error_Kind.Table_Not_Found)
+	run(t, reopened, "DROP TABLE ev")
+	gone := run(t, reopened, "EXPLAIN SELECT * FROM ev WHERE amount = 42")
+	testing.expect(t, strings_contains(gone.rows[0][0].s, "scan ev"))
+	testing.expect(t, !strings_contains(gone.rows[0][0].s, "est."))
+	db.sql_result_destroy(&gone)
+	// A second ANALYZE after the drop measures nothing and does not resurrect it.
+	again := run(t, reopened, "ANALYZE")
+	testing.expect_value(t, again.affected, 0)
+	db.sql_result_destroy(&again)
+}

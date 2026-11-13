@@ -320,6 +320,22 @@ with the same `commit_seq`. A crash between any two steps leaves a catalog whose
 sequence does not match the log's last record, and the next open discards the
 page files and replays.
 
+## Statistics file
+
+`<db>/stats` is the planner cache `ANALYZE` writes. It never holds the truth: no
+query answer depends on it, and a stale one only plans from older numbers.
+
+    header  32 B: "MRST" | u32 version | u64 analyzed_seq | u64 payload_len |
+                  u32 crc32c(payload) | u32 reserved
+    payload      : u32 count | count * table
+    table        : string name | u64 rows | u32 columns |
+                   columns * {u64 distinct_count, u64 nulls, u8 saturated}
+
+`distinct_count` is capped at 20000 values per column; past the cap the count
+stops growing and `saturated` says so, which a plan reads as "at least this many".
+The file is replaced in place after the measurement, and an open that finds a
+missing or damaged one simply has no statistics.
+
 ## Index file
 
 An index of a paged table is a B+tree of the same 4 KiB pages in

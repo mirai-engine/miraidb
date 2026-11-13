@@ -15,6 +15,10 @@
   fault-tested flush order, and a query pipeline that streams a single-table
   scan without holding the table in memory. Off by default; `--paged` turns it
   on.
+- `ANALYZE [table]`: row counts and per-column distinct/NULL counts are measured
+  once and kept in `<db>/stats`, `EXPLAIN` prints the estimate it used
+  (`est. N rows`), and an index over a column with fewer than four distinct
+  values is refused in favour of reading the rows.
 - A paged database opens without replaying: `<db>/catalog` holds every schema and
   the counters, the log index names the last record, and the open trusts the page
   files only when all three sequences agree; a missing, stale or torn catalog

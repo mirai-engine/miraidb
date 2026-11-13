@@ -10,6 +10,8 @@ backticks.
 ```sql
 SET name = expr
 SHOW [name | tables]
+ANALYZE [table]
+
 EXPLAIN statement
 
 TRUNCATE [TABLE] name
@@ -67,7 +69,16 @@ the policies see, `SHOW identity` reads it back and `current_identity()` (alias
 `SET`/`SHOW` read and write process-local variables (not persisted, not part of
 the log; a server would scope them per connection). `EXPLAIN` prints the access
 plan of a statement without running it: the scan or index chosen for each table,
-the join order and the post-processing steps.
+the join order, the post-processing steps and, when the predicate names a column,
+the rows the plan expects to keep (`est. N rows`).
+
+`ANALYZE` measures the tables once and stores what a plan needs: the row count of
+each table and, per column, how many distinct non-null values and how many NULLs
+it holds. `ANALYZE t` measures one table. The numbers live in `<db>/stats` and
+are loaded on open; a plan without them assumes the table's full row count, which
+is what it did before statistics existed. An equality over a column with fewer
+than four distinct values estimates half the table or more, and the plan reads
+the rows instead of collecting that many ids through an index.
 
 `BEGIN`/`COMMIT`/`ROLLBACK` are session statements. The CLI keeps one open
 transaction across statements; `sql_execute` handles them per call and rejects

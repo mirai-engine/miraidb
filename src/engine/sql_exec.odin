@@ -125,6 +125,8 @@ sql_run_statement :: proc(store: ^Store, statement: Statement, params: []Value) 
 		result, describe_err := sql_exec_describe(tx, stmt)
 		tx_end(tx)
 		return result, describe_err
+	case Analyze_Stmt:
+		return sql_exec_analyze(store, stmt)
 	case Vacuum_Stmt:
 		return sql_exec_vacuum(store, stmt)
 	case Attach_Stmt:
@@ -189,6 +191,8 @@ sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value) 
 		return {}, errf(.Sql_Not_A_Query, "transaction control is not allowed inside a transaction")
 	case Vacuum_Stmt:
 		return {}, errf(.Sql_Not_A_Query, "VACUUM is not allowed inside a transaction")
+	case Analyze_Stmt:
+		return {}, errf(.Sql_Not_A_Query, "ANALYZE is not allowed inside a transaction")
 	case Attach_Stmt, Detach_Stmt:
 		return {}, errf(
 			.Sql_Not_A_Query,
@@ -216,6 +220,9 @@ sql_exec_vacuum :: proc(store: ^Store, stmt: Vacuum_Stmt) -> (Sql_Result, Error)
 
 sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sql_Result, Error) {
 	switch stmt in statement {
+	case Analyze_Stmt:
+		// ANALYZE needs the tables, not the transaction: it belongs to the store.
+		return {}, errf(.Sql_Not_A_Query, "ANALYZE does not run inside a transaction")
 	case Load_Extension_Stmt:
 		if stmt.unload {
 			if unload_err := extension_unload(tx, stmt.name, stmt.if_exists); unload_err.kind != .None {
@@ -629,6 +636,8 @@ sql_exec_explain :: proc(
 		append(&lines, strings.concatenate({"truncate ", inner.name}))
 	case Vacuum_Stmt:
 		append(&lines, strings.clone(len(inner.path) > 0 ? "write a compacted copy" : "compact the log"))
+	case Analyze_Stmt:
+		append(&lines, strings.clone(len(inner.table) > 0 ? "analyze one table" : "analyze every table"))
 	case Create_Trigger_Stmt:
 		append(&lines, strings.concatenate({"create trigger ", inner.name, " on ", inner.table}))
 	case Drop_Trigger_Stmt:
@@ -658,11 +667,27 @@ sql_exec_explain :: proc(
 	return result, ERROR_NONE
 }
 
+// sql_exec_analyze measures the statistics a plan reads, under the write lock so
+// ANALYZE is not interleaved with a commit, and answers with the number of tables
+// it measured.
+@(private)
+sql_exec_analyze :: proc(store: ^Store, stmt: Analyze_Stmt) -> (Sql_Result, Error) {
+	measured, analyze_err := stats_analyze(store, stmt.table)
+	if analyze_err.kind != .None do return {}, analyze_err
+	result := Sql_Result{kind = .Ack, commit_seq = store.commit_seq}
+	result.affected = measured
+	result.message = fmt.aprintf("analyzed %d table(s)", measured)
+	return result, ERROR_NONE
+}
+
 @(private)
 explain_index_suffix :: proc(store: ^Store, ref: Table_Ref, predicate: ^Expr, params: []Value) -> string {
 	if predicate == nil do return " (full scan)"
 	table, table_err := store_table(store, ref.name)
 	if table_err.kind != .None do return ""
+	// The plan names the same choice the executor makes: an index only when it
+	// exists and the statistics do not say it keeps most of the table.
+	estimate := stats_estimate_rows(store, table, predicate)
 	conjuncts := make([dynamic]^Expr)
 	defer delete(conjuncts)
 	split_and(predicate, &conjuncts)
@@ -678,9 +703,14 @@ explain_index_suffix :: proc(store: ^Store, ref: Table_Ref, predicate: ^Expr, pa
 		if !found do continue
 		index_position, has_index := index_for_single_column(table, column_index)
 		if !has_index do continue
-		return strings.concatenate({" using index ", table.indexes[index_position].schema.name})
+		if !stats_selective(store, table, column_index) do break
+		return fmt.aprintf(
+			" using index %s (est. %d rows)",
+			table.indexes[index_position].schema.name,
+			estimate,
+		)
 	}
-	return " (full scan)"
+	return fmt.aprintf(" (full scan, est. %d rows)", estimate)
 }
 
 @(private)
@@ -4852,7 +4882,7 @@ index_candidates :: proc(
 	defer delete(conjuncts)
 	split_and(predicate, &conjuncts)
 	for expr in conjuncts {
-		if candidates, ok := candidates_from_conjunct(table, table_alias, expr, params); ok {
+		if candidates, ok := candidates_from_conjunct(tx.store, table, table_alias, expr, params); ok {
 			return candidates, true
 		}
 	}
@@ -4872,6 +4902,7 @@ split_and :: proc(expr: ^Expr, out: ^[dynamic]^Expr) {
 
 @(private)
 candidates_from_conjunct :: proc(
+	store: ^Store,
 	table: ^Table,
 	table_alias: string,
 	expr: ^Expr,
@@ -4893,6 +4924,10 @@ candidates_from_conjunct :: proc(
 		if !found do return nil, false
 		index_position, has_index := index_for_single_column(table, column_index)
 		if !has_index do return nil, false
+		// Measured statistics can say the index keeps most of the table, in which
+		// case collecting the ids costs more than reading the rows. Without them
+		// this is always true, which is the behaviour before ANALYZE existed.
+		if !stats_selective(store, table, column_index) do return nil, false
 		value, constant := eval_constant(value_expr, params)
 		if !constant do return nil, false
 		coerced, coerce_err := value_coerce(value, table.schema.columns[column_index].type)
@@ -4943,6 +4978,7 @@ candidates_from_conjunct :: proc(
 		if !found do return nil, false
 		index_position, has_index := index_for_single_column(table, column_index)
 		if !has_index do return nil, false
+		if !stats_selective(store, table, column_index) do return nil, false
 		low, low_ok := eval_constant(between.low, params)
 		high, high_ok := eval_constant(between.high, params)
 		if !low_ok || !high_ok do return nil, false

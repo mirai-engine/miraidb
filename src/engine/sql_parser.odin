@@ -211,6 +211,15 @@ parse_statement :: proc(p: ^Parser) -> Statement {
 		stmt.name = p_ident(p)
 		return stmt
 	}
+	if p_match_keyword(p, "analyze") {
+		analyze: Analyze_Stmt
+		// ANALYZE with no table measures every table, which is what the SQL
+		// statement means when the name is left out.
+		if p.current.kind == .Ident || p.current.kind == .Quoted_Ident {
+			analyze.table = p_ident(p)
+		}
+		return analyze
+	}
 	if p_match_keyword(p, "describe") || p_match_keyword(p, "desc") {
 		stmt: Describe_Stmt
 		stmt.name = p_ident(p)

@@ -26,7 +26,7 @@ Rules for this file:
 | D3 | Snapshot cost | **borrowed values, ~1 ms to freeze 50k rows** | `AS OF` history, GC | M | P2 |
 | D4 | Page backend | `.sqlite` is rewritten whole per commit | pages in place, WAL frames, free list | XL | P1 |
 | D5 | Persistent indexes | **done**: index keys live in B+trees of pages, with a pool, a cursor over chained leaves and a memory gate | merging empty leaves; a trusted open without replay (D18b) | L | P0 |
-| D6 | Query planner | nested loop + index probes | cost model, statistics, reordering | L | P1 |
+| D6 | Query planner | **`ANALYZE` + statistics + estimates**: row counts and per-column distinct/NULL counts live in `<db>/stats`, `EXPLAIN` prints `est. N rows`, and an index over a column with fewer than four distinct values is refused (`test_analyze_and_plan_estimates`) | histograms (a range is one third), join reordering, pricing two index candidates, and the regression benchmark | L | P1 |
 | D7 | Scheduler durability | **durable** (due time is a logged column) | recovery test | S | — |
 | D8 | Crash injection | **done**: `Fault_Vfs` fails any operation at any call, and `test_fault_injection` walks the write offsets | same for the snapshot and the mirror writes | S | P1 |
 | D9 | SQL grammar | 32 statements, **`ROWS` frames, trigger `WHEN` and `RENAME COLUMN` done** (`test_window_frames`, `test_trigger_when`, `test_alter_rename_column`) | windows beside `GROUP BY`, `RANGE`/`GROUPS`, `BEFORE`, `ALTER` type changes, collations, user functions | L | P2 |
@@ -251,7 +251,11 @@ is still correct, and the test deletes a third of 5000 keys to prove it.
 ## D6 — A planner with numbers
 
 **Now.** Single-table scans with index probes (`index_candidates`), nested-loop
-joins, no reordering, no statistics.
+joins, no reordering. `ANALYZE` measures row counts and per-column distinct/NULL
+counts into `<db>/stats`, `EXPLAIN` prices a predicate with them (`est. N rows`),
+and an index that would keep most of the table is refused in favour of the scan
+(`src/engine/stats.odin`, `test_analyze_and_plan_estimates`). A plan still has no
+histogram (a range is one third by the classic rule) and never reorders a join.
 
 **Cost.** A join is evaluated in the order it was written; the only cardinality
 information is "this predicate has an index".

@@ -153,6 +153,10 @@ Store :: struct {
 	// prove the log is not loaded whole.
 	replay_records:      u64,
 	replay_buffer_bytes: int,
+	// stats holds what ANALYZE measured, keyed by table name, and stats_seq the
+	// sequence it was measured at. It is a planner cache: see stats.odin.
+	stats:     map[string]Table_Stats,
+	stats_seq: u64,
 	// replays_skipped counts opens that used the catalog and the page files
 	// instead of replaying. One means the database opened without walking the log.
 	replays_skipped:     u64,
@@ -290,6 +294,9 @@ store_open :: proc(path: string, options: Store_Options) -> (^Store, Error) {
 			return nil, replay_err
 		}
 	}
+	// Statistics are a planner cache and load without a replay: the file carries
+	// its own checksum, and a stale one only means plans read older numbers.
+	stats_load(store)
 	// Databases ATTACH recorded come back with the principal; a path that no
 	// longer opens is reported, never fatal.
 	if attach_err := store_attach_restore(store); attach_err.kind != .None {
@@ -337,6 +344,7 @@ store_close :: proc(store: ^Store) {
 		value_deep_free(value, context.allocator)
 	}
 	delete(store.variables)
+	stats_destroy(store)
 	log_close(&store.log)
 	db_lock_release(&store.lock)
 	free(store)
@@ -880,6 +888,8 @@ store_apply :: proc(store: ^Store, op: Store_Op) -> Error {
 			// Remove the map entry before destroying the table: the stored key
 			// lives in the table's arena.
 			map_erase(&store.tables, op.name)
+			// The planner must not keep the shape of a table that is gone.
+			stats_forget(store, op.name)
 			paged := table.paged != nil
 			if paged {
 				system := log_vfs_or_os(store.vfs)

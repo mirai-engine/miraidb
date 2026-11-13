@@ -180,7 +180,15 @@ than 1000 bytes cannot be indexed and the insert says so.
 
 
 - **Index use.** Only the base table of a query is narrowed by an index; joined
-  tables are scanned by the nested loop. No cost-based planner.
+  tables are scanned by the nested loop. `ANALYZE` measures each table once
+  (row count, distinct values and NULLs per column) and the plan reads those
+  numbers: an equality over a column with four or more distinct values uses its
+  index, one over a column with fewer does not, and `EXPLAIN` prints the estimate
+  it used (`est. N rows`). Statistics are a cache in `<db>/stats`, validated by
+  checksum, loaded on open, dropped with the table they describe; a plan without
+  them assumes the full row count, which is the behaviour before `ANALYZE`.
+  What is still missing is the rest of a cost model: no histograms (a range is
+  one third), no join reordering, and nothing compares two index candidates.
 - **Schema changes.** `ALTER TABLE` renames the table, adds and drops columns,
   and renames a column (keeping the rows and the indexes); text that names a
   column is not rewritten.
