@@ -665,10 +665,45 @@ Row_Location :: struct {
 }
 
 Page_Rows :: struct {
-	file:      ^Page_File,
-	directory: map[Row_Id]Row_Location,
-	rows:      u64,
-	pages:     u32,
+	file: ^Page_File,
+	// dir is the directory of the table: row id -> {page, slot}, stored in a
+	// B+tree inside the same page file (root at byte 52 of page 0). Keeping it on
+	// disk instead of in a map is what makes opening a table read one page per
+	// level instead of one entry per row.
+	dir: ^Ordered_Pages,
+	// opened_from_directory is true when the open trusted the persisted directory
+	// instead of walking every page to rebuild it. Tests read it.
+	opened_from_directory: bool,
+	rows:                  u64,
+	pages:                 u32,
+}
+
+// row_dir_key is the directory key of a row: the row id big-endian, so the tree
+// orders rows the way the ids do.
+@(private)
+row_dir_key :: proc(row_id: Row_Id) -> [8]u8 {
+	key: [8]u8
+	for i in 0 ..< 8 do key[i] = u8(u64(row_id) >> u64(56 - i * 8))
+	return key
+}
+
+@(private)
+row_dir_value :: proc(page: Page_Id, slot: u16) -> u64 {
+	return u64(page) << 16 | u64(slot)
+}
+
+@(private)
+page_rows_locate :: proc(rows: ^Page_Rows, row_id: Row_Id) -> (Row_Location, bool) {
+	key := row_dir_key(row_id)
+	value, found := ordered_get(rows.dir, string(key[:]))
+	if !found do return {}, false
+	return Row_Location{page = Page_Id(value >> 16), slot = u16(value & 0xFFFF)}, true
+}
+
+@(private)
+page_rows_store_location :: proc(rows: ^Page_Rows, row_id: Row_Id, location: Row_Location) -> Error {
+	key := row_dir_key(row_id)
+	return ordered_put(rows.dir, string(key[:]), row_dir_value(location.page, location.slot))
 }
 
 page_rows_create :: proc(vfs: ^Vfs, path: string, frames: int) -> (^Page_Rows, Error) {
@@ -676,19 +711,54 @@ page_rows_create :: proc(vfs: ^Vfs, path: string, frames: int) -> (^Page_Rows, E
 	if err.kind != .None do return nil, err
 	rows := new(Page_Rows)
 	rows.file = file
-	rows.directory = make(map[Row_Id]Row_Location)
+	rows.dir = ordered_attach(file, 0, 0, 0)
+	if reset_err := ordered_reset_tree(rows.dir); reset_err.kind != .None {
+		page_rows_close(rows)
+		return nil, reset_err
+	}
 	return rows, ERROR_NONE
 }
 
-// page_rows_open reads the pages and rebuilds the row directory from them. It
-// does not trust the directory: the pages are the truth, and a page that fails
-// its checksum aborts the open so the caller can rebuild from the log.
+// page_rows_open reads an existing page file. When page 0 names a directory it
+// is trusted: the root page is read, not every row page, so a table larger than
+// memory opens in constant memory. A file without one (written before the
+// directory existed) is walked once and the directory is written back, which is
+// the migration. A page that fails its checksum aborts the open either way.
 page_rows_open :: proc(vfs: ^Vfs, path: string, frames: int) -> (^Page_Rows, Error) {
 	file, err := page_file_open(vfs, path, frames)
 	if err.kind != .None do return nil, err
 	rows := new(Page_Rows)
 	rows.file = file
-	rows.directory = make(map[Row_Id]Row_Location)
+	header := file.frames[0].data
+	root := Page_Id(get_u32_le(header[INDEX_HDR_ROOT:INDEX_HDR_ROOT + 4]))
+	height := get_u32_le(header[INDEX_HDR_HEIGHT:INDEX_HDR_HEIGHT + 4])
+	entries := get_u64_le(header[INDEX_HDR_ENTRIES:INDEX_HDR_ENTRIES + 8])
+	trusted := get_u32_le(header[INDEX_HDR_MAGIC:INDEX_HDR_MAGIC + 4]) == INDEX_PAGE_MAGIC &&
+		root != 0 &&
+		root < file.page_count &&
+		height > 0
+	if trusted {
+		rows.dir = ordered_attach(file, root, height, entries)
+		// Verify the root page verifies, so a torn directory is not trusted.
+		frame, load_err := page_load(file, root)
+		if load_err.kind != .None {
+			ordered_release(rows.dir)
+			page_rows_close(rows)
+			return nil, load_err
+		}
+		page_release(file, frame, false)
+		rows.dir.entries = entries
+		rows.rows = entries
+		rows.pages = file.page_count
+		rows.opened_from_directory = true
+		return rows, ERROR_NONE
+	}
+	rows.dir = ordered_attach(file, 0, 0, 0)
+	if reset_err := ordered_reset_tree(rows.dir); reset_err.kind != .None {
+		ordered_release(rows.dir)
+		page_rows_close(rows)
+		return nil, reset_err
+	}
 	for id in 1 ..< file.page_count {
 		frame, load_err := page_load(file, id)
 		if load_err.kind != .None {
@@ -701,19 +771,24 @@ page_rows_open :: proc(vfs: ^Vfs, path: string, frames: int) -> (^Page_Rows, Err
 				offset, length := page_slot_get(frame.data, u16(slot))
 				if length < 8 do continue
 				row_id := Row_Id(get_u64_le(frame.data[offset:offset + 8]))
-				rows.directory[row_id] = Row_Location{page = id, slot = u16(slot)}
+				if store_err := page_rows_store_location(rows, row_id, Row_Location{page = id, slot = u16(slot)}); store_err.kind != .None {
+					page_release(file, frame, false)
+					page_rows_close(rows)
+					return nil, store_err
+				}
 			}
 		}
 		page_release(file, frame, false)
 	}
-	rows.rows = u64(len(rows.directory))
+	rows.rows = ordered_entries(rows.dir)
+	rows.pages = file.page_count
 	return rows, ERROR_NONE
 }
 
 page_rows_close :: proc(rows: ^Page_Rows) {
 	if rows == nil do return
+	ordered_release(rows.dir)
 	page_file_close(rows.file)
-	delete(rows.directory)
 	free(rows)
 }
 
@@ -748,9 +823,10 @@ row_cell_decode :: proc(cell: []u8, alloc: mem.Allocator) -> (row: Row, ok: bool
 page_rows_put :: proc(rows: ^Page_Rows, row_id: Row_Id, values: []Value) -> Error {
 	cell := row_cell_encode(row_id, values)
 	defer delete(cell)
-	if location, exists := rows.directory[row_id]; exists {
+	if location, exists := page_rows_locate(rows, row_id); exists {
 		page_rows_erase_slot(rows, location)
-		delete_key(&rows.directory, row_id)
+		key := row_dir_key(row_id)
+		_ = ordered_remove(rows.dir, string(key[:]))
 	}
 	// Find a page with room: the last one first, because inserts arrive in order.
 	for attempt in 0 ..< 2 {
@@ -766,7 +842,13 @@ page_rows_put :: proc(rows: ^Page_Rows, row_id: Row_Id, values: []Value) -> Erro
 			if placed_slot, ok := page_insert_cell(frame.data, cell); ok {
 				slot := placed_slot
 				page_release(rows.file, frame, true)
-				rows.directory[row_id] = Row_Location{page = Page_Id(id), slot = slot}
+				if store_err := page_rows_store_location(
+					rows,
+					row_id,
+					Row_Location{page = Page_Id(id), slot = slot},
+				); store_err.kind != .None {
+					return store_err
+				}
 				rows.rows += 1
 				return ERROR_NONE
 			}
@@ -786,7 +868,13 @@ page_rows_put :: proc(rows: ^Page_Rows, row_id: Row_Id, values: []Value) -> Erro
 				return errf(.Invalid_Argument, "a row of %d bytes does not fit in a page", len(cell))
 			}
 			page_release(rows.file, frame, true)
-			rows.directory[row_id] = Row_Location{page = id, slot = placed_slot}
+			if store_err := page_rows_store_location(
+				rows,
+				row_id,
+				Row_Location{page = id, slot = placed_slot},
+			); store_err.kind != .None {
+				return store_err
+			}
 			rows.rows += 1
 			return ERROR_NONE
 		}
@@ -805,22 +893,24 @@ page_rows_erase_slot :: proc(rows: ^Page_Rows, location: Row_Location) {
 }
 
 page_rows_delete :: proc(rows: ^Page_Rows, row_id: Row_Id) -> bool {
-	location, exists := rows.directory[row_id]
+	location, exists := page_rows_locate(rows, row_id)
 	if !exists do return false
 	page_rows_erase_slot(rows, location)
-	delete_key(&rows.directory, row_id)
+	key := row_dir_key(row_id)
+	_ = ordered_remove(rows.dir, string(key[:]))
 	return true
 }
 
 // page_rows_contains reports whether a row is live. It reads the directory and
 // does not touch the pages, which is what a uniqueness or existence check needs.
 page_rows_contains :: proc(rows: ^Page_Rows, row_id: Row_Id) -> bool {
-	return row_id in rows.directory
+	key := row_dir_key(row_id)
+	return ordered_contains(rows.dir, string(key[:]))
 }
 
 // page_rows_get decodes one row into the caller's allocator.
 page_rows_get :: proc(rows: ^Page_Rows, row_id: Row_Id, alloc: mem.Allocator) -> (Row, bool) {
-	location, exists := rows.directory[row_id]
+	location, exists := page_rows_locate(rows, row_id)
 	if !exists do return {}, false
 	frame, load_err := page_load(rows.file, location.page)
 	if load_err.kind != .None do return {}, false
@@ -915,8 +1005,11 @@ page_rows_truncate :: proc(rows: ^Page_Rows) -> Error {
 	for id in Page_Id(1) ..< rows.file.page_count {
 		page_free(rows.file, id)
 	}
-	clear(&rows.directory)
+	// The directory lives in that same file, so it is recreated after the pages
+	// go back to the free list; the old one is covered by the free list anyway.
+	if reset_err := ordered_reset_tree(rows.dir); reset_err.kind != .None do return reset_err
 	rows.rows = 0
+	rows.pages = 0
 	return ERROR_NONE
 }
 
@@ -946,6 +1039,35 @@ page_rows_stats :: proc(rows: ^Page_Rows) -> Page_Rows_Stats {
 	}
 }
 
+// page_rows_forget_directory clears the directory marker from page 0 and reseals
+// it, so a test can open a file the way a version without the directory wrote
+// it. It is the only writer of that region besides the store.
+page_rows_forget_directory :: proc(vfs: ^Vfs, path: string) -> Error {
+	system := log_vfs_or_os(vfs)
+	handle, open_err := system.ops.open(system, path, {.Read, .Write})
+	if open_err.kind != .None do return open_err
+	defer system.ops.close(handle)
+	data := make([]u8, PAGE_SIZE)
+	defer delete(data)
+	if _, seek_err := system.ops.seek(handle, 0); seek_err.kind != .None do return seek_err
+	total := 0
+	for total < PAGE_SIZE {
+		n, read_err := system.ops.read(handle, data[total:])
+		if read_err.kind != .None do return read_err
+		if n <= 0 do break
+		total += n
+	}
+	if total != PAGE_SIZE do return errf(.Corrupt_Log, "%s is shorter than a page", path)
+	for i in INDEX_HDR_ROOT ..< INDEX_HDR_VERSION + 4 do data[i] = 0
+	page_seal(data)
+	if _, seek_err := system.ops.seek(handle, 0); seek_err.kind != .None do return seek_err
+	if _, write_err := system.ops.write(handle, data); write_err.kind != .None do return write_err
+	return system.ops.sync(handle)
+}
+
 page_rows_flush :: proc(rows: ^Page_Rows, applied_seq: u64) -> Error {
+	// The directory header goes into page 0 before the flush, which writes the
+	// data pages first and page 0 last: the root a header names is always on disk.
+	ip_header_sync(rows.dir)
 	return page_flush(rows.file, applied_seq)
 }

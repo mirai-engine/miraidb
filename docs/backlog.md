@@ -41,7 +41,7 @@ Rules for this file:
 | D16 | Clients | **Python binding over the C ABI, with a smoke gate** | generation per catalog | M | P3 |
 | D17 | Rows on disk | **done**: paged tables, pool, free list, flush order, streaming scan with aggregates, memory gate | index pages (D5), a trusted open without replay (D18b) | XL | P0 |
 | D18a | Second writer | **done**: `lock` file, OS lock, refusal naming the owner (`test_writer_lock`, `scripts/lock_smoke.py`) | — | S | P0 |
-| D18b | Reader beside writer | one process owns the directory; **the replay now streams the log one record at a time** | persisted row directory, trusted open, shared lock | L | P1 |
+| D18b | Reader beside writer | one process owns the directory; **the replay streams the log one record at a time and the row directory is persisted in the table file, so a paged table opens from its root** (`test_page_directory_survives_a_reopen`) | a trusted open that skips the replay, shared lock | L | P1 |
 | D18c | Broker mode | **done**: `miraidb-server` owns the directory, clients speak the wire over HTTP, TCP frames or Postgres; two processes proven by `scripts/broker_smoke.py` | — | M | P1 |
 
 ---

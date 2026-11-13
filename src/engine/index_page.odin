@@ -45,7 +45,8 @@ INDEX_HDR_HEIGHT :: 56
 @(private)
 INDEX_HDR_ENTRIES :: 60
 
-@(private)
+// INDEX_HDR_MAGIC is where a file marks that page 52.. holds a directory tree;
+// a row file without it is opened by walking its pages.
 INDEX_HDR_MAGIC :: 68
 
 @(private)
@@ -339,11 +340,32 @@ ordered_open :: proc(vfs: ^Vfs, path: string, frames: int) -> (^Ordered_Pages, E
 	return op, ERROR_NONE
 }
 
+// ordered_attach builds a tree over a page file another owner created, using the
+// root it names. It is how the row directory lives in the table's own file: one
+// pool, one free list, one header.
+ordered_attach :: proc(file: ^Page_File, root: Page_Id, height: u32, entries: u64) -> ^Ordered_Pages {
+	op := new(Ordered_Pages)
+	op.file = file
+	op.vfs = file.vfs
+	op.path = strings.clone(file.path)
+	op.frames = len(file.frames) - 1
+	op.root = root
+	op.height = height
+	op.entries = entries
+	return op
+}
+
+// ordered_release frees the tree handle and leaves the file to its owner.
+ordered_release :: proc(op: ^Ordered_Pages) {
+	if op == nil do return
+	delete(op.path)
+	free(op)
+}
+
 ordered_close :: proc(op: ^Ordered_Pages) {
 	if op == nil do return
 	page_file_close(op.file)
-	delete(op.path)
-	free(op)
+	ordered_release(op)
 }
 
 // ordered_flush writes the dirty pages, then the header with the sequence they
@@ -519,6 +541,39 @@ ordered_scan :: proc(
 		if !ordered_next(&cursor) do break
 	}
 	return ids
+}
+
+// ordered_get returns the value stored under `key`.
+ordered_get :: proc(op: ^Ordered_Pages, key: string) -> (value: u64, found: bool) {
+	cursor := ordered_seek(op, key)
+	buf: [INDEX_PAGE_MAX_KEY]u8
+	stored, stored_value, ok := ordered_cursor_read(&cursor, buf[:])
+	if !ok || stored != key do return 0, false
+	return stored_value, true
+}
+
+// ordered_reset_tree empties a tree that lives inside a file someone else owns.
+// The pages it used stay allocated; they are reclaimed when the file is rebuilt
+// from the log, which is the file's contract anyway.
+ordered_reset_tree :: proc(op: ^Ordered_Pages) -> Error {
+	root, alloc_err := page_alloc(op.file)
+	if alloc_err.kind != .None do return alloc_err
+	frame, load_err := page_load(op.file, root)
+	if load_err.kind != .None do return load_err
+	scratch: [IP_SCRATCH]u8
+	cells: Ip_Cells
+	ip_cells_begin(&cells, scratch[:])
+	defer delete(cells.items)
+	if write_err := ip_page_write(frame.data, .Index_Leaf, NO_PAGE_ID, &cells); write_err.kind != .None {
+		page_release(op.file, frame, false)
+		return write_err
+	}
+	page_release(op.file, frame, true)
+	op.root = root
+	op.height = 1
+	op.entries = 0
+	ip_header_sync(op)
+	return ERROR_NONE
 }
 
 // ordered_entries is how many keys the index holds.

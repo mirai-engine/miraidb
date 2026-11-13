@@ -267,6 +267,16 @@ Page 0 adds, from byte 20: `magic` "MRPG", `version` 1, `page_size` 4096,
   never used for rows; the pool is `page_frames` data frames plus that one.
   `page_rows_each` streams page by page, so a table larger than the pool is read
   without holding it.
+- **The directory lives in the same file.** Page 0 also carries the root of a
+  B+tree, `height` and `entries` at bytes 52, 56 and 60 and the "MRPI" magic at
+  68, mapping `Row_Id` (8 bytes, big-endian) to `u64(page) << 16 | slot`. Opening
+  a file that names a root reads that root and trusts it (`opened_from_directory`),
+  so a table larger than memory opens in constant memory; a file without the
+  marker is walked once and the directory written back. Every insert, move and
+  delete updates the tree, and `page_rows_flush` syncs its root into page 0 before
+  the flush writes the data pages and then page 0, so a header never names a page
+  that is not on disk. The store still discards and rebuilds the file on open:
+  trusting it is D18b.
 
 **A table on disk.** A store opened with `paged_tables` creates
 `<db>/tables/<table>` (non-alphanumeric bytes in the name are `%XX`). The commits

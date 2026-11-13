@@ -9130,7 +9130,8 @@ test_paged_table_churn :: proc(t: ^testing.T) {
 	table, table_err := db.store_table(store, "c")
 	testing.expect(t, db.error_ok(table_err))
 	testing.expect_value(t, db.page_rows_stats(table.paged).rows, u64(300))
-	testing.expect_value(t, u64(len(table.paged.directory)), u64(300))
+	// The directory is on disk now, so its entry count comes from the tree.
+	testing.expect_value(t, db.ordered_entries(table.paged.dir), u64(300))
 }
 
 @(test)
@@ -9393,4 +9394,74 @@ test_replay_streams_the_log :: proc(t: ^testing.T) {
 	defer db.store_close(again)
 	testing.expect_value(t, scalar(t, again, "SELECT count(*) FROM t").i, i64(total))
 	testing.expect_value(t, scalar(t, again, "SELECT v FROM t WHERE id = 9999").i, i64(9999))
+}
+
+@(test)
+test_page_directory_survives_a_reopen :: proc(t: ^testing.T) {
+	// The directory of a table is a B+tree in the table's own file. Opening must
+	// read its root instead of walking every row page, and a file that predates
+	// the directory must still open by walking once and writing it back.
+	vfs := db.vfs_memory_new()
+	defer db.vfs_memory_destroy(vfs)
+	rows, create_err := db.page_rows_create(vfs, "pages", 8)
+	if !testing.expectf(t, db.error_ok(create_err), "create: %s", create_err.message) do return
+	total :: 2000
+	for i in 0 ..< total {
+		values := []db.Value{db.value_int(i64(i)), db.value_string(fmt.tprintf("row-%d", i))}
+		put_err := db.page_rows_put(rows, db.Row_Id(i), values)
+		if !testing.expectf(t, db.error_ok(put_err), "put %d: %s", i, put_err.message) do return
+	}
+	// Updates move a row to another slot or page; the directory has to follow.
+	for i := 0; i < total; i += 7 {
+		values := []db.Value{db.value_int(i64(i)), db.value_string(fmt.tprintf("changed-%d", i))}
+		if put_err := db.page_rows_put(rows, db.Row_Id(i), values); !testing.expect(t, db.error_ok(put_err)) do return
+	}
+	testing.expect(t, db.error_ok(db.page_rows_flush(rows, 1)))
+	db.page_rows_close(rows)
+
+	reopened, open_err := db.page_rows_open(vfs, "pages", 8)
+	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
+	defer db.page_rows_close(reopened)
+	testing.expect(t, reopened.opened_from_directory)
+	testing.expect_value(t, db.ordered_entries(reopened.dir), u64(total))
+	testing.expect_value(t, reopened.rows, u64(total))
+	for i in 0 ..< total {
+		testing.expect(t, db.page_rows_contains(reopened, db.Row_Id(i)))
+		row, found := db.page_rows_get(reopened, db.Row_Id(i), context.temp_allocator)
+		if !testing.expectf(t, found, "row %d is missing", i) do return
+		if i % 7 == 0 {
+			testing.expect_value(t, row.values[1].s, fmt.tprintf("changed-%d", i))
+		} else {
+			testing.expect_value(t, row.values[1].s, fmt.tprintf("row-%d", i))
+		}
+	}
+	testing.expect_value(t, db.page_rows_delete(reopened, db.Row_Id(5)), true)
+	testing.expect_value(t, db.page_rows_delete(reopened, db.Row_Id(5)), false)
+	testing.expect(t, !db.page_rows_contains(reopened, db.Row_Id(5)))
+	// The delete is in a dirty page; a legacy reader sees the file, so flush it.
+	testing.expect(t, db.error_ok(db.page_rows_flush(reopened, 2)))
+
+	// A file written before the directory existed has no root in page 0. Wipe the
+	// magic to look like one: the open must rebuild it by walking and answer the
+	// same rows.
+	if forget_err := db.page_rows_forget_directory(vfs, "pages"); !testing.expect(t, db.error_ok(forget_err)) do return
+	legacy, legacy_err := db.page_rows_open(vfs, "pages", 8)
+	if !testing.expectf(t, db.error_ok(legacy_err), "legacy open: %s", legacy_err.message) do return
+	defer db.page_rows_close(legacy)
+	testing.expect(t, !legacy.opened_from_directory)
+	testing.expect_value(t, legacy.rows, u64(total - 1))
+	testing.expect(t, db.page_rows_contains(legacy, db.Row_Id(1999)))
+	testing.expect(t, !db.page_rows_contains(legacy, db.Row_Id(5)))
+
+	// Truncate clears the directory, and the table answers on the next insert.
+	testing.expect(t, db.error_ok(db.page_rows_truncate(legacy)))
+	testing.expect_value(t, legacy.rows, u64(0))
+	testing.expect(t, !db.page_rows_contains(legacy, db.Row_Id(1999)))
+	values := []db.Value{db.value_int(1), db.value_string("first")}
+	if testing.expect(t, db.error_ok(db.page_rows_put(legacy, db.Row_Id(1), values))) {
+		testing.expect_value(t, legacy.rows, u64(1))
+		row, found := db.page_rows_get(legacy, db.Row_Id(1), context.temp_allocator)
+		testing.expect(t, found)
+		if found do testing.expect_value(t, row.values[1].s, "first")
+	}
 }

@@ -131,9 +131,17 @@ honest measurement.
   `group_concat`) and `LIMIT` stops the scan. `ORDER BY`, `GROUP BY`, `DISTINCT`,
   a window, `AS OF`, a join, staged writes or an index that answers the filter
   fall back to collecting the table.
-- `scripts/page_rss.py --check` is a CI gate: 15k and 60k rows over an 8-frame
-  pool both add ~300 KiB to the statement, and the table file is 63 times the
-  pool.
+- **The directory is on disk too.** Page 0 of the table file carries the root of
+  a B+tree that maps `Row_Id → {page, slot}`, so opening a table reads its root
+  instead of walking every page: `page_rows_open` sets
+  `opened_from_directory` and the row map is gone. A file without that marker
+  (written before this change) is walked once and the directory is written back,
+  which is the migration.
+- `scripts/page_rss.py --check` is a CI gate over an 8-frame pool: the table file
+  is 36 times the pool at 15k rows and 145 times at 60k (it now holds the rows
+  and the directory), the statement's peak growth over the post-open process is
+  304 KiB and 2344 KiB (the second includes the peak of the one-transaction
+  load), and the statement stays under the 8 MiB cap either way.
 - **Indexes on disk.** Each index of a paged table is a B+tree of the same 4 KiB
   pages, one file under `<db>/indexes/<table>/<index>` with a 32-frame pool. A
   leaf holds `key | row id` in key order and points to the next leaf, so a range
@@ -152,9 +160,10 @@ is rebuilt (a delete never leaves a wrong answer: the cursor walks past empty
 leaves, and the test deletes a third of 5000 keys); a paged table keeps one
 version, so `AS OF` and `ALTER` refuse it; a read transaction of a store with
 pages holds the shared lock (writers wait); opening streams the log one record at
-a time, so it costs the largest commit rather than the whole history, but it still
-rebuilds every table and index from those records (a trusted open is D18b); a key
-longer than 1000 bytes cannot be indexed and the insert says so.
+a time, so it costs the largest commit rather than the whole history, but the
+store still rebuilds every table and index from those records instead of trusting
+the page files (a trusted open is the rest of D18b); a key longer than 1000 bytes
+cannot be indexed and the insert says so.
 
 
 - **Index use.** Only the base table of a query is narrowed by an index; joined
