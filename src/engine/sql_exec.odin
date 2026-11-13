@@ -1478,7 +1478,7 @@ agg_stream_destroy :: proc(stream: ^Agg_Stream) {
 		value_deep_free(acc.best, context.allocator)
 		if acc.builder.buf != nil do strings.builder_destroy(&acc.builder)
 		if acc.sep_owned do delete(acc.separator)
-		delete(acc.keys)
+		agg_distinct_destroy(&acc.keys)
 	}
 	delete(stream.accs)
 	free_values(stream.first_values)
@@ -1511,8 +1511,11 @@ agg_stream_add :: proc(row_ctx: ^Eval_Ctx, stream: ^Agg_Stream) -> Error {
 		if acc.fold_distinct {
 			key := agg_distinct_key(value)
 			_, repeated := acc.keys[key]
-			if !repeated do acc.keys[key] = true
-			delete(key)
+			if repeated {
+				delete(key)
+			} else {
+				acc.keys[key] = true
+			}
 			if repeated do continue
 		}
 		acc.seen += 1
@@ -2681,6 +2684,17 @@ agg_distinct_key :: proc(value: Value) -> string {
 	return encode_output_key([]Value{value})
 }
 
+// agg_distinct_destroy frees what a DISTINCT aggregate's key map owns. The map
+// stores the string header only, so the bytes handed to it must outlive every
+// lookup: freeing a key right after inserting it leaves the map pointing at freed
+// memory, and a later comparison reads it.
+@(private)
+agg_distinct_destroy :: proc(keys: ^map[string]bool) {
+	if keys^ == nil do return
+	for key in keys do delete(key)
+	delete(keys^)
+}
+
 // encode_output_key_alloc is encode_output_key with an explicit allocator, so a
 // subscription can keep the key of a cached row next to its arena.
 encode_output_key_alloc :: proc(values: []Value, alloc: mem.Allocator) -> string {
@@ -3815,7 +3829,7 @@ eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		count := 0
 		keys: map[string]bool
 		if call.is_distinct do keys = make(map[string]bool)
-		defer delete(keys)
+		defer agg_distinct_destroy(&keys)
 		for sources in rows {
 			sub := ctx^
 			sub.sources = sources
@@ -3825,8 +3839,11 @@ eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 			if call.is_distinct {
 				key := agg_distinct_key(value)
 				_, repeated := keys[key]
-				if !repeated do keys[key] = true
-				delete(key)
+				if repeated {
+					delete(key)
+				} else {
+					keys[key] = true
+				}
 				if repeated do continue
 			}
 			count += 1
@@ -3854,7 +3871,7 @@ eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		seen_any := false
 		keys: map[string]bool
 		if call.is_distinct do keys = make(map[string]bool)
-		defer delete(keys)
+		defer agg_distinct_destroy(&keys)
 		for sources in rows {
 			sub := ctx^
 			sub.sources = sources
@@ -3864,8 +3881,11 @@ eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 			if call.is_distinct {
 				key := agg_distinct_key(value)
 				_, repeated := keys[key]
-				if !repeated do keys[key] = true
-				delete(key)
+				if repeated {
+					delete(key)
+				} else {
+					keys[key] = true
+				}
 				if repeated do continue
 			}
 			if seen_any do strings.write_string(&builder, separator)
@@ -3887,7 +3907,7 @@ eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 	uses_128 := false
 	keys: map[string]bool
 	if call.is_distinct do keys = make(map[string]bool)
-	defer delete(keys)
+	defer agg_distinct_destroy(&keys)
 	for sources in rows {
 		sub := ctx^
 		sub.sources = sources
@@ -3900,8 +3920,11 @@ eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		if call.is_distinct {
 			key := agg_distinct_key(value)
 			_, repeated := keys[key]
-			if !repeated do keys[key] = true
-			delete(key)
+			if repeated {
+				delete(key)
+			} else {
+				keys[key] = true
+			}
 			if repeated do continue
 		}
 		seen += 1

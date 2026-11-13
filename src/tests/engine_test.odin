@@ -10195,6 +10195,25 @@ test_aggregate_distinct :: proc(t: ^testing.T) {
 	run(t, paged, "INSERT INTO p VALUES (1, 1), (2, 1), (3, 2), (4, 2), (5, 3)")
 	testing.expect_value(t, scalar(t, paged, "SELECT count(DISTINCT x) FROM p").i, i64(3))
 	testing.expect_value(t, scalar(t, paged, "SELECT sum(DISTINCT x) FROM p").i, i64(6))
+
+	// The key map owns the keys it stores. A key freed right after the insert
+	// would be overwritten by the next allocation, and the same aggregate would
+	// answer differently from run to run: 40 distinct values, twenty times, with
+	// string work in between to reuse whatever was freed.
+	run(t, store, "CREATE TABLE wide (x INTEGER)")
+	body: strings.Builder
+	strings.builder_init(&body)
+	defer strings.builder_destroy(&body)
+	strings.write_string(&body, "INSERT INTO wide (x) VALUES ")
+	for i in 0 ..< 200 {
+		if i > 0 do strings.write_string(&body, ", ")
+		fmt.sbprintf(&body, "(%d)", i % 40 + 1)
+	}
+	run(t, store, strings.to_string(body))
+	for _ in 0 ..< 20 {
+		testing.expect_value(t, scalar(t, store, "SELECT sum(DISTINCT x) FROM wide").i, i64(820))
+		testing.expect_value(t, scalar(t, store, "SELECT upper(concat('a', 'b', 'c') || 'd')").s, "ABCD")
+	}
 }
 
 @(test)
