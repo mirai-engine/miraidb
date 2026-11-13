@@ -40,6 +40,8 @@ Options:
   --read-only                               open as a reader: shared lock, no writes
   --paged                                   keep new tables in page files, not in RAM
   --page-frames=N                           pages of each table file kept in the pool
+  --mirror-report                           print what keeping a .sqlite mirror
+                                            current cost, when a sql statement commits
   --memory-report                           print this process memory when a sql
                                             statement finishes
 
@@ -69,6 +71,7 @@ main :: proc() {
 	paged := false
 	page_frames := 0
 	memory_report := false
+	mirror_report := false
 	read_only := false
 	filtered := make([dynamic]string, 0, len(rest))
 	defer delete(filtered)
@@ -90,6 +93,8 @@ main :: proc() {
 			paged = true
 		case "--memory-report":
 			memory_report = true
+		case "--mirror-report":
+			mirror_report = true
 		case:
 			if strings.has_prefix(arg, "--page-frames=") {
 				parsed, ok := strconv.parse_int(arg[len("--page-frames="):])
@@ -122,6 +127,14 @@ main :: proc() {
 		if !db.error_ok(exec_err) do fail(exec_err)
 		print_result(result)
 		db.sql_result_destroy(&result)
+		if mirror_report {
+			// A database opened from a .sqlite file patches that file after every
+			// commit; these are the pages it had to write.
+			fmt.printfln("mirror-pages: %d", store.mirror_pages_written)
+			fmt.printfln("mirror-bytes: %d", store.mirror_bytes_written)
+			fmt.printfln("mirror-rewrites: %d", store.mirror_full_writes)
+			if len(store.mirror_reason) > 0 do fmt.printfln("mirror-reason: %s", store.mirror_reason)
+		}
 		if memory_report {
 			// The peak covers the whole process, and opening a database already
 			// read the log, so the number the gate reads is how much the statement
@@ -373,6 +386,8 @@ open_database :: proc(
 			db.store_close(store)
 			return nil, import_err
 		}
+		// The file stays the user's database: every commit patches it back.
+		db.store_set_sqlite_mirror(store, path)
 		return store, db.ERROR_NONE
 	}
 	return db.store_open(
