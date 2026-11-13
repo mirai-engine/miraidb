@@ -1357,10 +1357,10 @@ test_durability_after_restart :: proc(t: ^testing.T) {
 	db.store_close(store)
 
 	store, open_err = db.store_open(path, {persistent = true, create = true, durable = false})
+	defer db.store_close(store)
 	if !testing.expectf(t, db.error_ok(open_err), "reopen: %s", open_err.message) do return
 	host = db.host_init(store)
 	defer db.host_destroy(host)
-	defer db.store_close(store)
 	testing.expect(t, db.error_ok(db.host_register(host, "bump", nil, bump)))
 
 	// The retry of the call that already committed does nothing.
@@ -1426,7 +1426,7 @@ test_idempotent_calls :: proc(t: ^testing.T) {
 test_integer_widths :: proc(t: ^testing.T) {
 	store := fresh_db(t, "widths")
 	if store == nil do return
-	defer cleanup_db(store, "widths")
+	// Closed and reopened below, so the cleanup at the end closes the new store.
 
 	run(t, store, `CREATE TABLE nums (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1879,8 +1879,8 @@ test_snapshot_restore :: proc(t: ^testing.T) {
 	db.store_close(store)
 
 	store, err = db.store_open(path, {persistent = true, durable = false})
-	if !testing.expectf(t, db.error_ok(err), "reopen after compact failed: %s", err.message) do return
 	defer db.store_close(store)
+	if !testing.expectf(t, db.error_ok(err), "reopen after compact failed: %s", err.message) do return
 	testing.expect_value(t, store.commit_seq, u64(4))
 	run(t, store, "INSERT INTO item (score) VALUES (40)")
 	testing.expect_value(t, store.commit_seq, u64(5))
@@ -1970,8 +1970,8 @@ test_view_persistence :: proc(t: ^testing.T) {
 	db.store_close(store)
 
 	store, err = db.store_open(path, {persistent = true, durable = false})
-	if !testing.expectf(t, db.error_ok(err), "reopen failed: %s", err.message) do return
 	defer db.store_close(store)
+	if !testing.expectf(t, db.error_ok(err), "reopen failed: %s", err.message) do return
 	rows := run(t, store, "SELECT name FROM everyone ORDER BY id")
 	testing.expect_value(t, len(rows.rows), 2)
 	testing.expect_value(t, rows.rows[1][0].s, "luis")
@@ -2180,8 +2180,8 @@ test_log_offset_index :: proc(t: ^testing.T) {
 	db.store_close(store)
 
 	store, err = db.store_open(path, {persistent = true, durable = false})
-	if !testing.expectf(t, db.error_ok(err), "reopen after snapshot: %s", err.message) do return
 	defer db.store_close(store)
+	if !testing.expectf(t, db.error_ok(err), "reopen after snapshot: %s", err.message) do return
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t").i, i64(4))
 	testing.expect(t, db.error_ok(db.store_compact(store)))
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t").i, i64(4))
@@ -2244,8 +2244,8 @@ test_log_segments :: proc(t: ^testing.T) {
 	db.store_close(store)
 
 	store, err = db.store_open(path, {persistent = true, durable = false})
-	if !testing.expectf(t, db.error_ok(err), "reopen after compact: %s", err.message) do return
 	defer db.store_close(store)
+	if !testing.expectf(t, db.error_ok(err), "reopen after compact: %s", err.message) do return
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM doc").i, i64(401))
 }
 
@@ -2952,8 +2952,8 @@ test_log_bit_flip :: proc(t: ^testing.T) {
 	os.close(file)
 
 	store, err = db.store_open(path, {persistent = true, durable = false})
-	if !testing.expectf(t, db.error_ok(err), "reopen: %s", err.message) do return
 	defer db.store_close(store)
+	if !testing.expectf(t, db.error_ok(err), "reopen: %s", err.message) do return
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t").i, i64(2))
 	// The tail was repaired, so appending keeps working.
 	run(t, store, "INSERT INTO t (v) VALUES (4)")
@@ -4484,7 +4484,8 @@ test_structural_types :: proc(t: ^testing.T) {
 	defer os.remove_all(path)
 	store, host := fresh_host(t, "structural")
 	if store == nil do return
-	defer destroy_host(store, host, "structural")
+	// The store and the host are closed below and reopened; the cleanup at the
+	// end closes the reopen, and nothing may close the first pair twice.
 
 	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, u UNIT, o OPTION(INT), r RESULT(INT, TEXT))")
 	run(t, store, "INSERT INTO t (id, u, o, r) VALUES (1, NULL, 5, NULL)")
@@ -4629,7 +4630,7 @@ test_hash_and_direct_indexes :: proc(t: ^testing.T) {
 	os.remove_all(path)
 	store, host := fresh_host(t, "hash_index")
 	if store == nil do return
-	defer destroy_host(store, host, "hash_index")
+	// Closed and reopened below: one owner per handle.
 
 	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, code TEXT, label TEXT)")
 	run(t, store, "CREATE INDEX t_label_hash ON t USING HASH (label)")
@@ -5646,7 +5647,9 @@ dump_database :: proc(t: ^testing.T, store: ^db.Store) -> string {
 			strings.write_string(&builder, "\n")
 		}
 	}
-	return strings.to_string(builder)
+	// to_string borrows the builder's buffer, so the caller gets its own copy and
+	// the builder below can still be destroyed.
+	return strings.clone(strings.to_string(builder))
 }
 
 @(test)
@@ -6179,7 +6182,6 @@ test_upsert :: proc(t: ^testing.T) {
 test_any_column_affinity :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "any_column")
 	if store == nil do return
-	defer destroy_host(store, host, "any_column")
 	run(t, store, "CREATE TABLE mixed (id INTEGER PRIMARY KEY, v ANY)")
 	run(t, store, "INSERT INTO mixed (id, v) VALUES (1, 10)")
 	run(t, store, "INSERT INTO mixed (id, v) VALUES (2, 'text')")
@@ -6736,7 +6738,7 @@ test_attach_and_detach :: proc(t: ^testing.T) {
 
 	store, host := fresh_host(t, "attach_principal")
 	if store == nil do return
-	defer destroy_host(store, host, "attach_principal")
+	// Closed below for the reopen, so the handles are released explicitly.
 	run(t, store, "CREATE TABLE mine (id INTEGER PRIMARY KEY, label TEXT NOT NULL)")
 	run(t, store, "INSERT INTO mine (id, label) VALUES (10, 'ten')")
 
@@ -6789,6 +6791,7 @@ test_attach_and_detach :: proc(t: ^testing.T) {
 	_, still_gone := db.sql_execute(again, "SELECT * FROM side.other_items")
 	testing.expect_value(t, still_gone.kind, db.Error_Kind.Table_Not_Found)
 	db.store_close(again)
+	db.host_destroy(host)
 	os.remove_all("_test_attach_principal")
 	os.remove_all(other_path)
 }
@@ -9383,7 +9386,6 @@ test_replay_streams_the_log :: proc(t: ^testing.T) {
 	os.close(handle)
 	torn, torn_err := db.store_open(path, options)
 	if !testing.expectf(t, db.error_ok(torn_err), "open after a torn tail: %s", torn_err.message) do return
-	defer db.store_close(torn)
 	testing.expect_value(t, scalar(t, torn, "SELECT count(*) FROM t").i, i64(total - 1))
 	testing.expect_value(t, torn.commit_seq, u64(total))
 	// The append works again and the record after the tear is the one we just wrote.
