@@ -153,6 +153,9 @@ Store :: struct {
 	// prove the log is not loaded whole.
 	replay_records:      u64,
 	replay_buffer_bytes: int,
+	// replays_skipped counts opens that used the catalog and the page files
+	// instead of replaying. One means the database opened without walking the log.
+	replays_skipped:     u64,
 	// read_only says the directory is open as a reader: the lock is shared, the
 	// page files are not touched, and every write is refused.
 	read_only:           bool,
@@ -230,35 +233,6 @@ store_open :: proc(path: string, options: Store_Options) -> (^Store, Error) {
 			return nil, errf(.Io, "cannot create %s: %v", path, mkdir_err)
 		}
 	}
-	if store.paged_tables {
-		if store.vfs == nil {
-			// The page files are a cache of the log, so the directory is discarded
-			// and rebuilt by the replay below. A page file that survived a crash
-			// is never trusted over the log.
-			page_dir := strings.concatenate({path, "/tables"})
-			defer delete(page_dir)
-			if remove_err := os.remove_all(page_dir); remove_err != nil && os.exists(page_dir) {
-				free(store)
-				return nil, errf(.Io, "cannot clear %s: %v", page_dir, remove_err)
-			}
-			if mkdir_err := os.make_directory_all(page_dir); mkdir_err != nil {
-				free(store)
-				return nil, errf(.Io, "cannot create %s: %v", page_dir, mkdir_err)
-			}
-			// The index files are rebuilt by the same replay, so they go with the
-			// table pages instead of being trusted across a crash.
-			index_dir := strings.concatenate({path, "/indexes"})
-			defer delete(index_dir)
-			if remove_err := os.remove_all(index_dir); remove_err != nil && os.exists(index_dir) {
-				free(store)
-				return nil, errf(.Io, "cannot clear %s: %v", index_dir, remove_err)
-			}
-			if mkdir_err := os.make_directory_all(index_dir); mkdir_err != nil {
-				free(store)
-				return nil, errf(.Io, "cannot create %s: %v", index_dir, mkdir_err)
-			}
-		}
-	}
 	// The directory is owned from here on. A second process that finds it held is
 	// refused with the owner's pid instead of appending to a log it does not own.
 	if options.vfs == nil {
@@ -281,17 +255,40 @@ store_open :: proc(path: string, options: Store_Options) -> (^Store, Error) {
 		return nil, log_err
 	}
 	store.log = log
-	if snapshot_err := store_load_snapshot(store); snapshot_err.kind != .None {
-		log_close(&store.log)
-		db_lock_release(&store.lock)
-		free(store)
-		return nil, snapshot_err
+	// A paged database whose page files and catalog name the sequence the log
+	// ends at needs no replay: the pages are the rows and the catalog is the
+	// schema. Anything short of that falls back to discarding the pages and
+	// rebuilding them from the log, which is what every open did before.
+	trusted := false
+	if store.paged_tables && store.vfs == nil && !store.read_only {
+		trusted_ok, trusted_err := store_open_trusted(store)
+		if trusted_err.kind != .None {
+			log_close(&store.log)
+			db_lock_release(&store.lock)
+			free(store)
+			return nil, trusted_err
+		}
+		trusted = trusted_ok
 	}
-	if replay_err := store_replay(store); replay_err.kind != .None {
-		log_close(&store.log)
-		db_lock_release(&store.lock)
-		free(store)
-		return nil, replay_err
+	if !trusted {
+		if discard_err := store_discard_pages(store); discard_err.kind != .None {
+			log_close(&store.log)
+			db_lock_release(&store.lock)
+			free(store)
+			return nil, discard_err
+		}
+		if snapshot_err := store_load_snapshot(store); snapshot_err.kind != .None {
+			log_close(&store.log)
+			db_lock_release(&store.lock)
+			free(store)
+			return nil, snapshot_err
+		}
+		if replay_err := store_replay(store); replay_err.kind != .None {
+			log_close(&store.log)
+			db_lock_release(&store.lock)
+			free(store)
+			return nil, replay_err
+		}
 	}
 	// Databases ATTACH recorded come back with the principal; a path that no
 	// longer opens is reported, never fatal.
@@ -681,6 +678,118 @@ store_table_new :: proc(store: ^Store, schema_in: Table_Schema) -> (^Table, Erro
 	return table, ERROR_NONE
 }
 
+// store_discard_pages throws away the page and index files and recreates their
+// directories. They are a cache over the log, so a file that does not match the
+// log is dropped and rebuilt by the replay.
+@(private)
+store_discard_pages :: proc(store: ^Store) -> Error {
+	if !store.paged_tables || store.vfs != nil do return ERROR_NONE
+	dirs := [?]string{"/tables", "/indexes"}
+	for suffix in dirs {
+		dir := strings.concatenate({store.path, suffix})
+		defer delete(dir)
+		if remove_err := os.remove_all(dir); remove_err != nil && os.exists(dir) {
+			return errf(.Io, "cannot clear %s: %v", dir, remove_err)
+		}
+		if mkdir_err := os.make_directory_all(dir); mkdir_err != nil {
+			return errf(.Io, "cannot create %s: %v", dir, mkdir_err)
+		}
+	}
+	return ERROR_NONE
+}
+
+// store_open_trusted opens a paged database from its page files. It reports true
+// only when the catalog validates, its sequence is the one the log ends at, and
+// every table and index file carries that same sequence; anything else reports
+// false with no error and the caller replays.
+//
+// The log index is what makes the test cheap: it names the last record without
+// reading the log, so comparing three numbers decides whether the pages are the
+// whole state.
+@(private)
+store_open_trusted :: proc(store: ^Store) -> (ok: bool, err: Error) {
+	log_path := store_log_path(store.path)
+	defer delete(log_path)
+	last, found := log_index_last(log_path)
+	if !found || last == 0 do return false, ERROR_NONE
+	seq, entries, valid := catalog_read(store)
+	if !valid do return false, ERROR_NONE
+	defer catalog_entries_destroy(entries)
+	if seq != last do return false, ERROR_NONE
+	opened := make([dynamic]^Table, 0, len(entries))
+	defer {
+		if !ok {
+			for table in opened do table_destroy(table)
+		}
+		delete(opened)
+	}
+	for &entry in entries {
+		table, open_err := store_table_open_paged(store, &entry, seq)
+		if open_err.kind != .None {
+			// A missing, stale or unreadable file is not an error: the log can
+			// rebuild it.
+			return false, ERROR_NONE
+		}
+		append(&opened, table)
+	}
+	for table in opened {
+		store.tables[table.schema.name] = table
+		store.next_table_id += 1
+		store.has_paged = true
+	}
+	store.commit_seq = last
+	store.apply_seq = last
+	store.replays_skipped += 1
+	return true, ERROR_NONE
+}
+
+// store_table_open_paged builds one table of a trusted open: the schema comes
+// from the catalog, the rows and the index keys from the files the last commit
+// flushed. Every file has to name `seq`, because that is the promise the catalog
+// makes.
+@(private)
+store_table_open_paged :: proc(store: ^Store, entry: ^Catalog_Entry, seq: u64) -> (^Table, Error) {
+	schema := entry.schema
+	table, table_err := table_create(&schema)
+	if table_err.kind != .None do return nil, table_err
+	if strings.has_prefix(table.schema.name, "_") {
+		table_destroy(table)
+		return nil, errf(.Corrupt_Log, "the catalog names the system table %s", entry.schema.name)
+	}
+	path := store_table_page_path(store, table.schema.name)
+	defer delete(path)
+	rows, rows_err := page_rows_open(store.vfs, path, store.page_frames)
+	if rows_err.kind != .None {
+		table_destroy(table)
+		return nil, rows_err
+	}
+	if rows.file.applied_seq != seq {
+		page_rows_close(rows)
+		table_destroy(table)
+		return nil, errf(.Io, "page file %s is at sequence %d, not %d", path, rows.file.applied_seq, seq)
+	}
+	table.paged = rows
+	table.index_dir = store_table_index_dir(store, table.schema.name)
+	table.index_vfs = store.vfs
+	table.index_frames = store.page_frames
+	for _, i in table.indexes {
+		if attach_err := table_index_open_pages(table, i); attach_err.kind != .None {
+			table_destroy(table)
+			return nil, attach_err
+		}
+		if table.indexes[i].pages.file.applied_seq != seq {
+			page_seq := table.indexes[i].pages.file.applied_seq
+			table_destroy(table)
+			return nil, errf(.Io, "index %s is at sequence %d, not %d", table.indexes[i].schema.name, page_seq, seq)
+		}
+	}
+	table.next_row_id = entry.next_row_id
+	table.next_sequence = entry.next_sequence
+	table.next_int_key = entry.next_int_key
+	table.apply_seq = seq
+	return table, ERROR_NONE
+}
+
 // store_flush_pages writes every dirty page and its header at `seq`. The log is
 // already durable when the commit path calls it, so a header that names a
 // sequence never promises a change the log does not have.
@@ -697,6 +806,12 @@ store_flush_pages :: proc(store: ^Store, seq: u64) -> Error {
 				return flush_err
 			}
 		}
+	}
+	// The catalog names the sequence the pages now carry, so the next open can
+	// read the schemas instead of replaying to find them. It is a cache: a failed
+	// write costs a replay, never the commit.
+	if catalog_err := catalog_write(store, seq); catalog_err.kind != .None {
+		store.last_error = catalog_err
 	}
 	return ERROR_NONE
 }

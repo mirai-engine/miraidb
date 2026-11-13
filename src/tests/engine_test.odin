@@ -9538,3 +9538,91 @@ test_read_only_opens_beside_a_writer :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, after, "SELECT count(*) FROM t").i, i64(4))
 	testing.expect_value(t, scalar(t, after, "SELECT v FROM t WHERE id = 3").i, i64(30))
 }
+
+@(test)
+test_trusted_open_skips_the_replay :: proc(t: ^testing.T) {
+	// A paged database that closed cleanly names one sequence in its catalog, in
+	// every page file and in the end of its log. Opening it should read those,
+	// not walk the log: the counters below are the proof.
+	path := "_test_trusted_open"
+	os.remove_all(path)
+	defer os.remove_all(path)
+	options := db.Store_Options {
+		persistent   = true,
+		create       = true,
+		durable      = false,
+		paged_tables = true,
+		page_frames  = 8,
+	}
+	store, open_err := db.store_open(path, options)
+	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
+	run(t, store, "CREATE TABLE item (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+	run(t, store, "CREATE INDEX item_name ON item (name)")
+	for i in 0 ..< 200 {
+		run(t, store, fmt.tprintf("INSERT INTO item (id, name) VALUES (%d, 'n%03d')", i, i))
+	}
+	run(t, store, "DELETE FROM item WHERE id = 7")
+	run(t, store, "UPDATE item SET name = 'changed' WHERE id = 8")
+	closed_seq := store.commit_seq
+	db.store_close(store)
+
+	// The offset index is what makes the trusted test cheap, so it has to exist
+	// and start with its header. A sidecar created by this build used to begin
+	// with an entry instead, which every lookup then rejected.
+	index_path := fmt.tprintf("%s/log.index", path)
+	index_bytes, index_err := os.read_entire_file_from_path(index_path, context.allocator)
+	if !testing.expect(t, index_err == nil, "the log index must exist") do return
+	testing.expect(t, len(index_bytes) >= 16 && string(index_bytes[:8]) == "MIRADX01")
+	delete(index_bytes)
+
+	reopen_options := options
+	reopen_options.create = false
+	reopened, reopen_err := db.store_open(path, reopen_options)
+	if !testing.expectf(t, db.error_ok(reopen_err), "reopen: %s", reopen_err.message) do return
+	testing.expect_value(t, reopened.replays_skipped, u64(1))
+	testing.expect_value(t, reopened.replay_records, u64(0))
+	testing.expect_value(t, reopened.commit_seq, closed_seq)
+	testing.expect_value(t, scalar(t, reopened, "SELECT count(*) FROM item").i, i64(199))
+	testing.expect_value(t, scalar(t, reopened, "SELECT name FROM item WHERE id = 8").s, "changed")
+	testing.expect_value(t, scalar(t, reopened, "SELECT count(*) FROM item WHERE id = 7").i, i64(0))
+	// The index file was opened, not rebuilt: a point lookup through it answers.
+	probe := run(t, reopened, "SELECT id FROM item WHERE name = 'n010'")
+	testing.expect_value(t, len(probe.rows), 1)
+	testing.expect_value(t, probe.rows[0][0].i, i64(10))
+	db.sql_result_destroy(&probe)
+
+	// A commit after a trusted open continues the sequence, and the next open
+	// trusts again.
+	run(t, reopened, "INSERT INTO item (id, name) VALUES (500, 'later')")
+	testing.expect_value(t, reopened.commit_seq, closed_seq + 1)
+	db.store_close(reopened)
+
+	again, again_err := db.store_open(path, reopen_options)
+	if !testing.expectf(t, db.error_ok(again_err), "reopen 2: %s", again_err.message) do return
+	testing.expect_value(t, again.replays_skipped, u64(1))
+	testing.expect_value(t, scalar(t, again, "SELECT count(*) FROM item").i, i64(200))
+	testing.expect_value(t, scalar(t, again, "SELECT name FROM item WHERE id = 500").s, "later")
+	db.store_close(again)
+
+	// A catalog that is not there, or does not validate, costs a replay and
+	// nothing else: the log still has everything.
+	catalog_path := fmt.tprintf("%s/catalog", path)
+	testing.expect(t, os.exists(catalog_path))
+	os.remove(catalog_path)
+	replayed, replayed_err := db.store_open(path, reopen_options)
+	if !testing.expectf(t, db.error_ok(replayed_err), "reopen without a catalog: %s", replayed_err.message) do return
+	testing.expect_value(t, replayed.replays_skipped, u64(0))
+	testing.expect(t, replayed.replay_records > 0)
+	testing.expect_value(t, scalar(t, replayed, "SELECT count(*) FROM item").i, i64(200))
+	testing.expect(t, os.exists(catalog_path))
+	db.store_close(replayed)
+
+	// A catalog whose bytes were damaged is rejected by the checksum.
+	if !testing.expect(t, os.write_entire_file(catalog_path, []u8{'n', 'o', 'p', 'e'}) == nil) do return
+	torn, torn_err := db.store_open(path, reopen_options)
+	if !testing.expectf(t, db.error_ok(torn_err), "reopen with a torn catalog: %s", torn_err.message) do return
+	testing.expect_value(t, torn.replays_skipped, u64(0))
+	testing.expect(t, torn.replay_records > 0)
+	testing.expect_value(t, scalar(t, torn, "SELECT name FROM item WHERE id = 500").s, "later")
+	db.store_close(torn)
+}

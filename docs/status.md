@@ -124,8 +124,21 @@ honest measurement.
   a crash and a buffer pool with a clock hand, pins and write-back. Frame 0 is
   reserved for the header: a flush writes the dirty data pages, then page 0 with
   `applied_seq`, then syncs. The fault test breaks each write of a flush.
-- The page file is a **cache over the log**: opening discards it and replays the
-  log, so a crash never leaves the pages as the only copy.
+- The page file is a **cache over the log**, and opening proves it before
+  trusting it: the catalog (below) names the sequence the log index says is the
+  last record, every table and index file carries that same sequence in its own
+  header, and only then does the open read the pages instead of the log. Any
+  disagreement — a crash, a stale file, a torn catalog — discards the page and
+  index files and rebuilds them by replay, which is what every open did before.
+  `store.replays_skipped` counts the opens that did not read the log at all and
+  `store.replay_records` the ones that did.
+- **The catalog is `<db>/catalog`**: the schema of every table plus the counters a
+  page file does not carry (`next_row_id`, `next_sequence`, `next_int_key`), all
+  at one sequence. It is written after the pages of a commit are durable and
+  before the commit is reported, and it is only trusted when its checksum holds,
+  its sequence is exactly the log's last, and every table in it is paged (a table
+  without a page file keeps its rows nowhere else, so a catalog with one is
+  refused). A failed write costs a replay, never the commit.
 - A single-table `SELECT` streams: rows are filtered and projected as they leave
   the pages, aggregates accumulate (`count`, `sum`, `total`, `avg`, `min`, `max`,
   `group_concat`) and `LIMIT` stops the scan. `ORDER BY`, `GROUP BY`, `DISTINCT`,
@@ -138,10 +151,11 @@ honest measurement.
   (written before this change) is walked once and the directory is written back,
   which is the migration.
 - `scripts/page_rss.py --check` is a CI gate over an 8-frame pool: the table file
-  is 36 times the pool at 15k rows and 145 times at 60k (it now holds the rows
-  and the directory), the statement's peak growth over the post-open process is
-  304 KiB and 2344 KiB (the second includes the peak of the one-transaction
-  load), and the statement stays under the 8 MiB cap either way.
+  is 36 times the pool at 15k rows and 145 times at 60k (it holds the rows and the
+  directory), and the whole process peaks at **6.4 MiB with 60k rows**, down from
+  33.9 MiB when every open rebuilt the pages from the log. The statement grows
+  the process by ~410 KiB either way (the 2344 KiB of the previous round included
+  the peak of the one-transaction load, which the trusted open no longer pays).
 - **Indexes on disk.** Each index of a paged table is a B+tree of the same 4 KiB
   pages, one file under `<db>/indexes/<table>/<index>` with a 32-frame pool. A
   leaf holds `key | row id` in key order and points to the next leaf, so a range
@@ -151,19 +165,18 @@ honest measurement.
   `table_memory` reports the pool, not one entry per row, and `page_rss.py`
   checks the index file grows with the rows (688 KiB → 2756 KiB for 4× the rows)
   while the statement stays near 300 KiB.
-- Index files are rebuilt on open together with the table pages: trusting them
-  without replay is D18b, not claimed here.
+- Index files are opened, not rebuilt, on a trusted open: each one is checked
+  against the sequence the catalog names and its tree is used as it stands.
 
 **Not claimed.** An index leaf that loses its last entry is not merged back into
 its neighbour, so an index that loses most of its keys keeps the leaves until it
 is rebuilt (a delete never leaves a wrong answer: the cursor walks past empty
 leaves, and the test deletes a third of 5000 keys); a paged table keeps one
 version, so `AS OF` and `ALTER` refuse it; a read transaction of a store with
-pages holds the shared lock (writers wait); opening streams the log one record at
-a time, so it costs the largest commit rather than the whole history, but the
-store still rebuilds every table and index from those records instead of trusting
-the page files (a trusted open is the rest of D18b); a key longer than 1000 bytes
-cannot be indexed and the insert says so.
+pages holds the shared lock (writers wait); a **read-only** open replays, because
+a reader cannot know whether the writer beside it has pages still in flight, so
+the trusted open belongs to the process that owns the directory; a key longer
+than 1000 bytes cannot be indexed and the insert says so.
 
 
 - **Index use.** Only the base table of a query is narrowed by an index; joined

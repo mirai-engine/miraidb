@@ -510,6 +510,23 @@ table_index_attach_pages :: proc(t: ^Table, index: int) -> Error {
 	return ERROR_NONE
 }
 
+// table_index_open_pages attaches an index whose file already exists, which is
+// the other half of table_index_attach_pages: opening a paged database reads the
+// tree the last commit left instead of building it from the table's rows.
+@(private)
+table_index_open_pages :: proc(t: ^Table, index: int) -> Error {
+	if t.paged == nil || len(t.index_dir) == 0 do return ERROR_NONE
+	path := table_index_path(t, t.indexes[index].schema.name)
+	if len(path) == 0 do return ERROR_NONE
+	defer delete(path)
+	frames := t.index_frames
+	if frames <= 0 do frames = INDEX_PAGE_FRAMES
+	pages, open_err := ordered_open(t.index_vfs, path, frames)
+	if open_err.kind != .None do return open_err
+	t.indexes[index].pages = pages
+	return ERROR_NONE
+}
+
 @(private)
 table_index_detach_pages :: proc(t: ^Table, index: int, remove_file: bool) {
 	pages := t.indexes[index].pages

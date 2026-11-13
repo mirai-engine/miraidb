@@ -41,7 +41,7 @@ Rules for this file:
 | D16 | Clients | **Python binding over the C ABI, with a smoke gate** | generation per catalog | M | P3 |
 | D17 | Rows on disk | **done**: paged tables, pool, free list, flush order, streaming scan with aggregates, memory gate | index pages (D5), a trusted open without replay (D18b) | XL | P0 |
 | D18a | Second writer | **done**: `lock` file, OS lock, refusal naming the owner (`test_writer_lock`, `scripts/lock_smoke.py`) | — | S | P0 |
-| D18b | Reader beside writer | **a reader opens beside the writer**: two lock bytes (writer exclusive, reader shared), `read_only` replays into memory, refuses every write and keeps compaction waiting (`test_read_only_opens_beside_a_writer`, `scripts/lock_smoke.py`); the replay streams one record at a time and the row directory is persisted in the table file | a trusted open that skips the replay; a follower | L | P1 |
+| D18b | Reader beside writer — *done* | **a reader opens beside the writer** (two lock bytes: writer exclusive, reader shared; `read_only` replays into memory, refuses every write and keeps compaction waiting) and **a paged database opens without replaying**: `<db>/catalog` names the schema and the log index names the last record, and the open trusts the page files only when both sequences agree (`test_read_only_opens_beside_a_writer`, `test_trusted_open_skips_the_replay`, `scripts/lock_smoke.py`) | a follower that tails commits; a read-only open of a quiescent database could trust the pages too, but a reader cannot know whether the writer beside it has pages in flight | L | P1 |
 | D18c | Broker mode | **done**: `miraidb-server` owns the directory, clients speak the wire over HTTP, TCP frames or Postgres; two processes proven by `scripts/broker_smoke.py` | — | M | P1 |
 
 ---

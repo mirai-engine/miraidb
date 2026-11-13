@@ -15,6 +15,11 @@
   fault-tested flush order, and a query pipeline that streams a single-table
   scan without holding the table in memory. Off by default; `--paged` turns it
   on.
+- A paged database opens without replaying: `<db>/catalog` holds every schema and
+  the counters, the log index names the last record, and the open trusts the page
+  files only when all three sequences agree; a missing, stale or torn catalog
+  falls back to the replay, which is what every open did before. Opening 60k
+  rows now peaks at 6.4 MiB instead of 33.9 MiB.
 - The log offset index was never usable for a database created by this build: its
   sidecar was created without the header every lookup validates, so replay always
   scanned. It is created with its header now, and the trusted open depends on it.

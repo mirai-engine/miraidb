@@ -292,6 +292,34 @@ Tests: `test_page_store_roundtrip`, `test_page_store_streams_within_the_pool`,
 `test_page_store_header_is_a_promise`, `test_paged_table_roundtrip` (a reopen
 with a different pool size), `test_paged_table_churn` (compaction under churn).
 
+## Catalog
+
+`<db>/catalog` is the schema cache that lets a paged database open without
+replaying the log. It is a cache with a proof attached: it is trusted only when
+its checksum holds and its sequence is exactly the one the log ends at.
+
+    header  32 B: "MRCT" | u32 version (1) | u64 commit_seq | u64 payload_len |
+                  u32 crc32c(payload) | u32 flags
+    payload      : u32 count | count * entry
+    entry        : string name | schema_encode(schema) | u64 next_row_id |
+                   i64 next_sequence | i64 next_int_key
+
+Bit 0 of `flags` promises that a page file backs every table in it, which is what
+makes the file sufficient on its own: a table without a page file keeps its rows
+only in the log, so a catalog that names one is refused (the store replays
+instead).
+
+The payload is written before the header, so a torn write leaves a header whose
+checksum no longer matches its payload. The file is replaced in place with a
+truncate; there is no temporary file, because a damaged catalog only costs a
+replay.
+
+Order within a commit: the log record is durable, the table and index pages are
+flushed with `applied_seq = commit_seq` (page 0 last), then this file is written
+with the same `commit_seq`. A crash between any two steps leaves a catalog whose
+sequence does not match the log's last record, and the next open discards the
+page files and replays.
+
 ## Index file
 
 An index of a paged table is a B+tree of the same 4 KiB pages in
