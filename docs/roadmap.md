@@ -19,7 +19,7 @@ releases is worth shipping.
 
 | # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
-| 1 | **D6 — the planner's remaining gaps** | The join delta and the inner-side probe are done: an equi-join is indexed by its key, a commit probes the matches, and a nested loop reads the inner rows the ON clause names (`test_join_probes_the_inner_index`). What is left is the pricing: serve `ORDER BY` from an index, calibrate the cost constants, and let the subscription path use the planned order. A bound value reaches the histogram (`test_plan_reads_a_bound_value`) and a view is priced from its own FROM (`test_plan_prices_a_view_from_its_own_from`). | L | — |
+| 1 | **D6 — the planner's remaining gaps** | The join delta and the inner-side probe are done: an equi-join is indexed by its key, a commit probes the matches, and a nested loop reads the inner rows the ON clause names (`test_join_probes_the_inner_index`). What is left is the pricing: calibrate the cost constants and let the subscription path use the planned order. `ORDER BY` already comes from an index when the key matches (`test_order_by_comes_from_the_index`), a bound value reaches the histogram (`test_plan_reads_a_bound_value`) and a view is priced from its own FROM (`test_plan_prices_a_view_from_its_own_from`). | L | — |
 | 2 | **D9 — the rest of the grammar** | `RANGE`/`GROUPS` frames, windows beside `GROUP BY`, `BEFORE` triggers, `ALTER` type changes, more collations, user functions. | L | — |
 | 3 | **ASAN pass** over the CLI, soak and conformance — *partly done* | Bounds and stack are covered today. Odin's heap allocator is not intercepted on Windows (a deliberate use-after-free is not reported), so the heap half runs with the POSIX toolchain in #14. | 1 round | 12 |
 | 4 | **D2 — spatial tree** | Node pages and a descent replace the scan over box columns. | M | — |
@@ -61,6 +61,7 @@ measurable dimension. Measured on this tree:
 | Compaction | 0.48 s for 50k rows, one file left | same |
 | Memory per row | `Row` 80 B, `Value` 24 B | no growth without a written reason |
 | Join, inner side | a nested loop reads the inner rows its ON clause names (`test_join_probes_the_inner_index`: 1 200 rows where a scan read 200 200) | O(rows the outer row matches) |
+| Ordered read | `ORDER BY <index key>` walks the index: 137 ms against 342 ms sorted over 50 000 rows, and `LIMIT 5` reads five rows in 4.6 ms where the sort took 115 ms | an ordered query costs the rows it returns, not a sort |
 | Subscription delta | O(rows touched), for a join too: an equi-join is indexed by its key, so a commit probes the matches (one candidate for an insert, six for a base-row change, in a fixture of 200 authors and 900 books, where it used to read 200 and 900) | O(rows touched) for the table the commit changed |
 
 These are the numbers the gate compares against and the targets the engine is

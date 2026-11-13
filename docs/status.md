@@ -132,7 +132,7 @@ the gaps are named rather than left to be discovered.
   one schema, one set of rows and 55 queries through both engines, with the
   refusals and the intentional differences listed in the script.
 - `scripts/build.py` builds both binaries and runs the suite.
-- 227 integration tests covering CRUD, recovery, constraints, transactions,
+- 228 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
@@ -237,6 +237,15 @@ than 1000 bytes cannot be indexed and the insert says so.
   (`test_join_probes_the_inner_index`). `EXPLAIN` prints `join <name> using index
   <index> …`, `join order: …` when it changed, and `scripts/plan_check.py` is a CI
   gate over the plans a measured fixture must produce.
+- **An index can serve the order.** When the ORDER BY names the whole key of one
+  in-memory index, in the index's own order and all in one direction, the executor
+  walks the index instead of collecting and sorting: 342 ms to 137 ms over 50 000
+  rows, and `ORDER BY id LIMIT 5` reads five rows in 4.6 ms instead of passing over
+  the table in 115 ms. A LIMIT ends the walk only when nothing else can drop a row
+  (a filter or a policy does, so those keep the full pass). Descending needs a
+  unique index, because a reversed walk would order the ties the other way.
+  `test_order_by_comes_from_the_index` checks the sequence against the sorted one,
+  ties included, and counts the rows a LIMIT reads.
 - **The plan reads the values it is given.** A statement is priced per execution,
   with the parameters that came with it, so `n < ?` bound to 50 keeps the estimate
   `n < 50` gets and the same access decision (`test_plan_reads_a_bound_value`); a
@@ -246,10 +255,9 @@ than 1000 bytes cannot be indexed and the insert says so.
   follows a view over a view), and `EXPLAIN` says where the number came from
   instead of passing a guess off as a measurement
   (`test_plan_prices_a_view_from_its_own_from`).
-- **What the planner still does not do.** It does not use an index to satisfy
-  `ORDER BY`, and its cost constants are hand-set rather than calibrated against a
-  measurement. The subscription path lays out its walk in the written order rather
-  than the planned one. Staleness is no longer silent: `EXPLAIN` reprices with the
+- **What the planner still does not do.** Its cost constants are hand-set rather
+  than calibrated against a measurement, and the subscription path lays out its
+  walk in the written order rather than the planned one. Staleness is no longer silent: `EXPLAIN` reprices with the
   numbers it has and names their age.
 - **A join the grammar does not implement is refused, not approximated.**
   `NATURAL`, `RIGHT` and `FULL` joins used to parse as an alias for the table

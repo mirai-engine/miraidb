@@ -663,6 +663,24 @@ node_next :: proc(n: ^rbtree.Node(string, Row_Id)) -> ^rbtree.Node(string, Row_I
 	return parent
 }
 
+// node_prev returns the in-order predecessor of a node, so an index can be read
+// backwards without materializing it.
+@(private)
+node_prev :: proc(n: ^rbtree.Node(string, Row_Id)) -> ^rbtree.Node(string, Row_Id) {
+	if n._left != nil {
+		prev := n._left
+		for prev._right != nil do prev = prev._right
+		return prev
+	}
+	current := n
+	parent := current._parent
+	for parent != nil && current == parent._left {
+		current = parent
+		parent = parent._parent
+	}
+	return parent
+}
+
 // lower_bound returns the first node whose key is >= `key`.
 @(private)
 lower_bound :: proc(tree: ^Index_Tree, key: string) -> ^rbtree.Node(string, Row_Id) {

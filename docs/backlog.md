@@ -343,7 +343,16 @@ which is why a wrong probe cannot shorten a result. `EXPLAIN` names the index, a
 read 200 200 over 200 authors and 1 000 books) and checks the answers, the
 expression key that cannot be probed, a LEFT join and the plan line.
 
-**Not done.** `ORDER BY` never comes from an index, and the cost constants are
+**Done: `ORDER BY` from an index.** `index_order_for` matches the ORDER BY against
+an index whose key it names completely, in order, all ascending (or descending on a
+unique index, where no two rows tie); `index_order_ids` walks the tree in order, or
+backwards with `node_prev`, and stops as soon as a LIMIT has the rows it needs when
+nothing else can drop one. The same statement over 50 000 rows takes 137 ms against
+342 ms sorted, and `ORDER BY id LIMIT 5` reads five rows in 4.6 ms.
+`test_order_by_comes_from_the_index` compares the sequence with the sorted one, ties
+included, and counts the rows a LIMIT reads.
+
+**Not done.** The cost constants are
 chosen by hand —
 they encode "a row through an index costs four rows in place" and have not been
 calibrated against a measurement. The plan reads the values it is given: a prepared

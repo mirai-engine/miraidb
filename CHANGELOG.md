@@ -32,6 +32,10 @@
   `FLOAT` key, a paged table) falls back to the full evaluation.
 - A join subscription walks the tables it reads instead of copying every row of
   them into the transaction arena, which was 80 bytes a row per commit.
+- `ORDER BY` on a column set that is exactly an index key walks that index instead
+  of sorting: 137 ms against 342 ms over 50 000 rows, and `ORDER BY id LIMIT 5`
+  reads five rows in 4.6 ms where the sort took 115 ms. A filter keeps the full
+  pass, because it is applied after the walk and could leave the answer short.
 - A nested loop probes the index of the inner table when the ON clause binds a
   column that leads it, so a join reads the rows one outer row matches instead of
   the whole relation per outer row: 200 authors and 1 000 books read about 1 200

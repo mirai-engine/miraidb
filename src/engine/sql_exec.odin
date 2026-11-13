@@ -622,7 +622,19 @@ sql_exec_explain :: proc(tx: ^Tx, stmt: Explain_Stmt, params: []Value) -> (Sql_R
 		if inner.where_clause != nil do append(&lines, result_own("filter"))
 		if len(inner.group_by) > 0 do append(&lines, result_own("group by"))
 		if inner.having != nil do append(&lines, result_own("having"))
-		if len(inner.order_by) > 0 do append(&lines, result_own("order by (sort)"))
+		if len(inner.order_by) > 0 {
+			ordered := false
+			if ordered_table, ordered_err := tx_table(tx, order.from.name); ordered_err.kind == .None {
+				if index, _, ordered_ok := index_order_for(tx, ordered_table, order.from, inner); ordered_ok {
+					append(&lines, fmt.aprintf(
+						"order by (index %s)",
+						ordered_table.indexes[index].schema.name,
+					))
+					ordered = true
+				}
+			}
+			if !ordered do append(&lines, result_own("order by (sort)"))
+		}
 		if inner.limit != nil || inner.offset != nil do append(&lines, result_own("limit/offset"))
 	case Update_Stmt:
 		append(&lines, strings.concatenate({"update ", inner.table, explain_index_suffix(store, Table_Ref{name = inner.table}, inner.where_clause, params)}))
@@ -1996,8 +2008,38 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		as_of_seq = u64(sequence)
 		if as_of_seq > tx.store.commit_seq do as_of_seq = tx.store.commit_seq
 	}
+	// An index that matches the ORDER BY hands the rows over in order, so the sort
+	// that follows has nothing to do.
+	ordered_ids: [dynamic]Row_Id
+	ordered := false
+	if !base_is_view && !empty_row && as_of_seq == 0 && !system_name {
+		if index, descending, ordered_ok := index_order_for(tx, base, exec.from, stmt); ordered_ok {
+			// LIMIT lets the walk stop as soon as it has the rows the statement can
+			// use, but only when nothing else can drop one: a filter or a policy is
+			// applied after the walk, so it would leave the answer short.
+			stop := 0
+			if stmt.where_clause == nil && !select_filters_rows(tx, exec.from.name) {
+				stop = select_row_limit(stmt, params)
+			}
+			ordered_ids = index_order_ids(base, index, descending, stop)
+			ordered = true
+			exec.order_by = nil
+		}
+	}
+	if ordered {
+		defer delete(ordered_ids)
+		for id in ordered_ids {
+			tx.rows_scanned += 1
+			if row, exists := tx_get(tx, exec.from.name, id); exists {
+				one := make([]Source, 1)
+				one[0] = Source{table = base, row = row, alias = exec.from.alias}
+				append(&partials, one)
+			}
+		}
+		used_index = true
+	}
 	// A view already holds a materialized table: scan it directly.
-	if !base_is_view && !empty_row && as_of_seq == 0 {
+	if !base_is_view && !empty_row && as_of_seq == 0 && !ordered {
 		if candidate_ids, used, fts_err := fts_scan_candidates(
 			tx,
 			exec.from.name,
@@ -2051,7 +2093,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		}
 		delete(rows)
 	}
-	if !empty_row {
+	if !empty_row && !ordered {
 		slice.sort_by(partials[:], proc(a, b: []Source) -> bool {
 			return u64(a[0].row.id) < u64(b[0].row.id)
 		})
@@ -5178,6 +5220,129 @@ index_candidates :: proc(
 		return candidates, true
 	}
 	return nil, false
+}
+
+// select_filters_rows reports whether the rows of a table can be dropped after the
+// base scan, which is what stops a LIMIT from ending the ordered walk early.
+@(private)
+select_filters_rows :: proc(tx: ^Tx, name: string) -> bool {
+	if len(name) == 0 || is_system_table(name) do return false
+	set, err := policy_load(tx, name)
+	if err.kind != .None do return true
+	active := len(set.using_exprs) > 0
+	policy_set_destroy(&set)
+	return active
+}
+
+// select_row_limit is how many rows an ordered walk has to collect for LIMIT and
+// OFFSET to have something to work with. Zero means "no limit".
+@(private)
+select_row_limit :: proc(stmt: Select_Stmt, params: []Value) -> int {
+	if stmt.limit == nil do return 0
+	offset := 0
+	if stmt.offset != nil {
+		if value, constant := eval_constant(stmt.offset, params); constant {
+			if number, is_integer := value_to_i64(value); is_integer && number > 0 do offset = int(number)
+		}
+	}
+	value, constant := eval_constant(stmt.limit, params)
+	if !constant do return 0
+	number, is_integer := value_to_i64(value)
+	if !is_integer || number < 0 do return 0
+	return int(number) + offset
+}
+
+// index_order_for finds an index that hands a statement its rows in the order the
+// statement asks for, which lets the sort go. The ORDER BY has to name the whole
+// key of one in-memory index, in the index's own order and all in one direction:
+// a prefix would order the ties by the rest of the index instead of by row id, and
+// the sequence would differ from the sorted one. Descending is served only by a
+// unique index, where no two rows tie.
+@(private)
+index_order_for :: proc(
+	tx: ^Tx,
+	table: ^Table,
+	ref: Table_Ref,
+	stmt: Select_Stmt,
+) -> (
+	index: int,
+	descending: bool,
+	ok: bool,
+) {
+	index = -1
+	if table == nil || table.paged != nil do return index, false, false
+	if len(stmt.order_by) == 0 || len(stmt.joins) != 0 do return index, false, false
+	if stmt.is_distinct || len(stmt.group_by) > 0 || stmt.having != nil do return index, false, false
+	if len(stmt.compound) > 0 || stmt.is_distinct do return index, false, false
+	for item in stmt.projections {
+		if item.expr == nil do continue
+		if expr_is_aggregate(item.expr) do return index, false, false
+		if _, is_window := item.expr^.(Window_Expr); is_window do return index, false, false
+	}
+	// An index lags the staged writes of its table, and a table created in this
+	// transaction has none worth reading.
+	if _, staged := tx.state.writes[ref.name]; staged do return index, false, false
+	if _, created := tx.state.created[ref.name]; created do return index, false, false
+	direction := stmt.order_by[0].descending
+	for item in stmt.order_by {
+		if item.descending != direction do return index, false, false
+	}
+	for &candidate, position in table.indexes {
+		if candidate.pages != nil do continue
+		if len(candidate.schema.columns) != len(stmt.order_by) do continue
+		if direction && !candidate.unique do continue
+		matched := true
+		for item, i in stmt.order_by {
+			reference, is_column := item.expr^.(Column_Expr)
+			if !is_column {
+				matched = false
+				break
+			}
+			if len(reference.table) > 0 &&
+			   !strings.equal_fold(reference.table, table.schema.name) &&
+			   !(len(ref.alias) > 0 && strings.equal_fold(reference.table, ref.alias)) {
+				matched = false
+				break
+			}
+			column_index, found := schema_column_index(&table.schema, reference.name)
+			if !found || column_index != candidate.schema.columns[i] {
+				matched = false
+				break
+			}
+		}
+		if matched do return position, direction, true
+	}
+	return index, false, false
+}
+
+// index_order_ids lists the row ids of one index in key order, or in the reverse
+// order when the statement is descending. `max_rows` stops the walk early, which
+// is what turns `ORDER BY id LIMIT 5` into five reads instead of a pass over the
+// whole table; zero means no stop.
+@(private)
+index_order_ids :: proc(
+	table: ^Table,
+	index: int,
+	descending: bool,
+	max_rows: int,
+) -> [dynamic]Row_Id {
+	ids := make([dynamic]Row_Id)
+	node := table.indexes[index].tree._root
+	if node == nil do return ids
+	if descending {
+		for node._right != nil do node = node._right
+		for node != nil && (max_rows <= 0 || len(ids) < max_rows) {
+			append(&ids, node.value)
+			node = node_prev(node)
+		}
+		return ids
+	}
+	for node._left != nil do node = node._left
+	for node != nil && (max_rows <= 0 || len(ids) < max_rows) {
+		append(&ids, node.value)
+		node = node_next(node)
+	}
+	return ids
 }
 
 // Index_Probe is how a nested loop finds the inner rows one outer row joins to:

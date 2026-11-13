@@ -29,6 +29,9 @@ __pycache__/
 /auditdb/
 /benchdb/
 /tmpq*/
+/_ot/
+/_br/
+/_cw/
 /_broker_tmp/
 
 # package.py output

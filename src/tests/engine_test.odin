@@ -10283,6 +10283,18 @@ test_explain_announces_stale_statistics :: proc(t: ^testing.T) {
 }
 
 @(private)
+check_plan_marker :: proc(t: ^testing.T, store: ^db.Store, sql: string, marker: string) {
+	result, err := db.sql_execute(store, sql)
+	if !testing.expectf(t, db.error_ok(err), "%s: %s", sql, err.message) do return
+	defer db.sql_result_destroy(&result)
+	found := false
+	for row in result.rows {
+		if strings.contains(row[0].s, marker) do found = true
+	}
+	testing.expectf(t, found, "%s: no %q in the plan", sql, marker)
+}
+
+@(private)
 plan_estimate :: proc(t: ^testing.T, store: ^db.Store, sql: string, params: []db.Value) -> int {
 	result, err := db.sql_execute_params(store, sql, params)
 	if !testing.expectf(t, db.error_ok(err), "explain failed: %s", err.message) do return -1
@@ -10345,6 +10357,130 @@ test_plan_reads_a_bound_value :: proc(t: ^testing.T) {
 		testing.expect(t, strings.contains(narrow.rows[0][0].s, "using index b_n"))
 		db.sql_result_destroy(&narrow)
 	}
+}
+
+@(private)
+order_sequence :: proc(t: ^testing.T, store: ^db.Store, sql: string) -> [dynamic]string {
+	out: [dynamic]string
+	result, err := db.sql_execute(store, sql)
+	if !testing.expectf(t, db.error_ok(err), "%s: %s", sql, err.message) do return out
+	defer db.sql_result_destroy(&result)
+	for row in result.rows do append(&out, row_set_key(row))
+	return out
+}
+
+@(test)
+test_order_by_comes_from_the_index :: proc(t: ^testing.T) {
+	// An index whose key is exactly the ORDER BY hands the rows over in order, so
+	// the sort has nothing to do. The answer has to be the same sequence the sort
+	// would produce, ties included, which is why the key has to be complete and why
+	// a descending sort needs a unique index.
+	store := fresh_db(t, "order_index")
+	if store == nil do return
+	defer cleanup_db(store, "order_index")
+
+	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
+	run(t, store, "CREATE TABLE u (id INTEGER PRIMARY KEY, n INTEGER)")
+	insert_t := strings.builder_make()
+	defer strings.builder_destroy(&insert_t)
+	insert_u := strings.builder_make()
+	defer strings.builder_destroy(&insert_u)
+	strings.write_string(&insert_t, "INSERT INTO t (n) VALUES ")
+	strings.write_string(&insert_u, "INSERT INTO u (n) VALUES ")
+	rows := 300
+	for i in 0 ..< rows {
+		if i > 0 {
+			strings.write_string(&insert_t, ", ")
+			strings.write_string(&insert_u, ", ")
+		}
+		// A key that repeats, written out of order, so ties exist and the insert
+		// order is not the key order.
+		fmt.sbprintf(&insert_t, "(%d)", ((i * 7) % 50) + 1)
+		fmt.sbprintf(&insert_u, "(%d)", ((i * 7) % 50) + 1)
+	}
+	run(t, store, strings.to_string(insert_t))
+	run(t, store, strings.to_string(insert_u))
+	run(t, store, "CREATE INDEX t_n ON t (n)")
+
+	check_plan_marker(t, store, "EXPLAIN SELECT * FROM t ORDER BY id", "order by (index t_pkey)")
+	check_plan_marker(t, store, "EXPLAIN SELECT * FROM t ORDER BY id DESC", "order by (index t_pkey)")
+	check_plan_marker(t, store, "EXPLAIN SELECT * FROM t ORDER BY n", "order by (index t_n)")
+	// A non-unique index cannot answer a descending sort: the ties would come back
+	// in the opposite row order.
+	check_plan_marker(t, store, "EXPLAIN SELECT * FROM t ORDER BY n DESC", "order by (sort)")
+	check_plan_marker(t, store, "EXPLAIN SELECT * FROM t ORDER BY id, n", "order by (sort)")
+
+	// The same statement over a table without that index sorts, and both have to
+	// answer the same sequence, ties included.
+	from_index := order_sequence(t, store, "SELECT id, n FROM t ORDER BY n")
+	from_sort := order_sequence(t, store, "SELECT id, n FROM u ORDER BY n")
+	testing.expect_value(t, len(from_index), rows)
+	testing.expect_value(t, len(from_sort), rows)
+	same := len(from_index) == len(from_sort)
+	if same {
+		for key, i in from_index {
+			if strings.compare(key, from_sort[i]) != 0 {
+				same = false
+				break
+			}
+		}
+	}
+	testing.expect(t, same)
+	for key in from_index do delete(key)
+	for key in from_sort do delete(key)
+	delete(from_index)
+	delete(from_sort)
+
+	ascending := order_sequence(t, store, "SELECT id FROM t ORDER BY id")
+	testing.expect_value(t, len(ascending), rows)
+	if len(ascending) == rows {
+		testing.expect_value(t, ascending[0], "1")
+		testing.expect_value(t, ascending[rows - 1], fmt.aprintf("%d", rows))
+	}
+	for key in ascending do delete(key)
+	delete(ascending)
+
+	descending := order_sequence(t, store, "SELECT id FROM t ORDER BY id DESC LIMIT 3")
+	testing.expect_value(t, len(descending), 3)
+	if len(descending) == 3 {
+		testing.expect_value(t, descending[0], fmt.aprintf("%d", rows))
+		testing.expect_value(t, descending[2], fmt.aprintf("%d", rows - 2))
+	}
+	for key in descending do delete(key)
+	delete(descending)
+
+	// A filter still runs, and LIMIT still counts what survives it.
+	filtered := order_sequence(t, store, "SELECT id, n FROM t WHERE n > 40 ORDER BY n LIMIT 4")
+	testing.expect_value(t, len(filtered), 4)
+	for key in filtered do delete(key)
+	delete(filtered)
+
+	// A LIMIT with nothing else to drop a row ends the walk: three rows read for
+	// three rows asked, instead of a pass over the table.
+	db.store_reset_rows_scanned(store)
+	tail := order_sequence(t, store, "SELECT id FROM t ORDER BY id DESC LIMIT 3")
+	testing.expect_value(t, len(tail), 3)
+	testing.expectf(t, db.store_rows_scanned(store) <= 4, "a LIMIT read %d rows", db.store_rows_scanned(store))
+	for key in tail do delete(key)
+	delete(tail)
+
+	// A filter means the walk cannot stop early, and the answer is still right.
+	db.store_reset_rows_scanned(store)
+	tail = order_sequence(t, store, "SELECT id FROM t WHERE n > 40 ORDER BY id DESC LIMIT 3")
+	testing.expect_value(t, len(tail), 3)
+	testing.expectf(t, db.store_rows_scanned(store) > 3, "a filtered LIMIT stopped early")
+	for key in tail do delete(key)
+	delete(tail)
+
+	// OFFSET is taken from the same ordered read.
+	window := order_sequence(t, store, "SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 2")
+	testing.expect_value(t, len(window), 2)
+	if len(window) == 2 {
+		testing.expect_value(t, window[0], "3")
+		testing.expect_value(t, window[1], "4")
+	}
+	for key in window do delete(key)
+	delete(window)
 }
 
 @(test)
