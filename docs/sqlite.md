@@ -23,75 +23,122 @@ a test covers it.
 | Varints and serial types | done | all widths, 0/1 shortcuts, floats, text, blob |
 | Overflow chains | done | read and write |
 | Write a valid database | done | `export-sqlite`, integrity-check clean, freelist trunk |
-| Freelist reuse | todo | export always packs fresh |
-| WAL and journal replay | todo | the engine has its own log |
+| Freelist reuse | partial | a live mirror frees and reuses pages; an export always packs fresh |
+| WAL and journal replay | done | a file with a `-wal` or a hot `-journal` is read through it; the mirror writes a journal in SQLite's format |
 | Page-level checksums (reserved bytes) | todo | reserved byte is written as 0 |
 
 ## Statements
 
 | Feature | Status | Notes |
 |---|---|---|
-| SELECT with joins, subqueries, aggregates | done | engine syntax |
+| SELECT with joins, subqueries, aggregates | done | engine syntax; `INNER`/`LEFT`/`CROSS`, no `NATURAL`/`RIGHT`/`FULL` (refused with a reason) |
 | INSERT / UPDATE / DELETE | done | `RETURNING` with `*` or a column list |
-| CREATE/DROP TABLE, ALTER ADD COLUMN | done | `ALTER` is add-only |
+| CREATE/DROP TABLE, ALTER | done | `ALTER` adds, drops and renames columns and renames the table; type changes are refused |
 | CREATE/DROP INDEX, UNIQUE | done | btree, hash, direct |
-| CREATE/DROP VIEW | done | views with parameters |
+| CREATE/DROP VIEW | done | `OR REPLACE`, parameters, materialization |
 | CREATE TYPE | done | engine extension |
 | CREATE EVENT TABLE | done | engine extension |
 | TRUNCATE | done | engine extension |
 | BEGIN/COMMIT/ROLLBACK | done | session API and CLI REPL |
-| SAVEPOINT/RELEASE/ROLLBACK TO | todo | |
-| UPSERT (ON CONFLICT DO UPDATE) | partial | `DO NOTHING` and `DO UPDATE`; `excluded` pending |
-| WITH (common table expressions) | todo | |
-| ATTACH/DETACH | todo | single database |
-| VACUUM / ANALYZE / REINDEX | partial | `compact` is the engine's VACUUM |
-| PRAGMA | partial | see the list below |
-| EXPLAIN / EXPLAIN QUERY PLAN | partial | engine plan output |
-| CREATE TRIGGER | todo | reducers cover the use case |
-| CREATE VIRTUAL TABLE (FTS5, R-Tree) | todo | extension modules |
-| GENERATED / STRICT / WITHOUT ROWID DDL | partial | accepted where harmless |
+| SAVEPOINT/RELEASE/ROLLBACK TO | done | nested, inside one transaction |
+| UPSERT (ON CONFLICT DO UPDATE) | done | `DO NOTHING`, `DO UPDATE`, `excluded.*`, with `RETURNING` |
+| WITH (common table expressions) | done | recursive included |
+| ATTACH/DETACH | done | attaches engine directories, and reads a `.sqlite` file |
+| VACUUM / ANALYZE / REINDEX | partial | `compact` is the engine's VACUUM, `VACUUM INTO` writes a copy, `ANALYZE` measures statistics; `REINDEX` does not exist |
+| PRAGMA | partial | four classes below: 25 answer, 18 are accepted as no-ops, 11 are refused |
+| EXPLAIN / EXPLAIN QUERY PLAN | partial | `EXPLAIN` prints the chosen access path, the estimate and the join order; there is no `EXPLAIN QUERY PLAN` row format |
+| CREATE TRIGGER | done | `AFTER` triggers with `WHEN`, `NEW` and `OLD`; `BEFORE` is refused |
+| CREATE VIRTUAL TABLE (FTS5, R-Tree) | done | FTS5 with BM25, `snippet` and `highlight`; spatial tables store their boxes as columns |
+| GENERATED / STRICT / WITHOUT ROWID DDL | partial | `GENERATED … STORED` and `STRICT` work; `WITHOUT ROWID` is refused for writing and supported for reading |
 | `ANY` columns (dynamic typing) | done | storage classes kept per value, `typeof()` reports them |
+| CASE | todo | `CASE` is neither parsed nor documented as an expression: a query that uses it fails with `sql_unsupported` |
 
 ## Expressions and clauses
 
 | Feature | Status | Notes |
 |---|---|---|
-| WHERE, ORDER BY, LIMIT/OFFSET | done | |
-| GROUP BY, HAVING | done | |
-| DISTINCT | done | |
-| IN, EXISTS, scalar subqueries | done | |
-| CASE, COALESCE, NULLIF | done | |
+| WHERE, ORDER BY, LIMIT/OFFSET | done | stable sort, NULLs first |
+| GROUP BY, HAVING | done | `HAVING` takes the expression, not a projection alias |
+| DISTINCT | done | over the projected row, and inside an aggregate (`count(DISTINCT x)`) |
+| IN, EXISTS, scalar subqueries | done | three-valued logic: a `NULL` in the list makes a non-match unknown |
+| CASE, COALESCE, NULLIF | partial | `COALESCE` and `NULLIF` are functions; `CASE` is not implemented |
 | LIKE, GLOB, ESCAPE | done | LIKE ignores ASCII case; GLOB is exact with `*`, `?`, `[...]` |
 | `||` string concatenation | done | tested with text and numbers |
-| COLLATE (BINARY, NOCASE, RTRIM) | todo | |
-| Window functions, FILTER | todo | |
-| UPSERT | partial | `excluded` pending |
+| COLLATE (BINARY, NOCASE, RTRIM) | done | on a column, in comparisons, in unique keys and index probes |
+| Window functions, FILTER | partial | `OVER` with `PARTITION BY`/`ORDER BY` and `ROWS BETWEEN`; `RANGE`/`GROUPS` are refused, and aggregate `FILTER (WHERE …)` is not implemented |
+| Foreign keys | done | `ON DELETE`/`ON UPDATE` `RESTRICT`/`CASCADE`, enforced on every path |
+| `AS OF <seq>` | done | engine extension: read a table as it was |
 
 ## Functions
 
-Implemented: `abs`, `ceil`, `char`, `coalesce`, `concat`, `format`/`printf`,
-`floor`, `hex`, `iif`, `ifnull`, `instr`, `length`, `lower`, `ltrim`, `mod`,
-`now`/`current_timestamp`, `nullif`, `pow`, `quote`, `random`-free `uuid`,
-`replace`, `round`, `rtrim`, `sign`, `sqlite_version`, `sqrt`, `substr`,
-`substring`, `trim`, `typeof`, `upper`, plus `count`, `sum`, `avg`, `min`,
-`max`, `total`.
+**Implemented (66 of the 131 names the inventory lists, plus aliases and
+families):** `abs` and the trigonometric/logarithmic set (`acos`, `asin`,
+`atan`, `atan2`, `cos`, `sin`, `tan`, `degrees`, `radians`, `pi`, `exp`,
+`log`, `log2`, `log10`), `ceil`/`floor`/`round`/`trunc`/`sign`/`sqrt`/`pow`/
+`mod`, `char`, `unicode`, `hex`, `unhex`, `quote`, `format`/`printf`,
+`coalesce`, `iif`, `ifnull`, `nullif`, `length`, `octet_length`, `lower`,
+`upper`, `ltrim`, `rtrim`, `trim`, `replace`, `concat`, `concat_ws`, `instr`,
+`substr`/`substring`, `glob`, `like`, `typeof`, `random`, `zeroblob`,
+`uuid` (only when the host supplies a randomness source), `randomblob`,
+`changes`, `total_changes`, `last_insert_rowid`, `sqlite_version`, `date`,
+`time`, `datetime`, `strftime`, `now`, eleven `json_*` scalars and the
+`json_each`/`json_tree` table functions,
+`group_concat`/`string_agg`, `rank`, `snippet`, `highlight`, `current_identity`
+and `has_role` (engine extensions), plus `count`, `sum`, `avg`, `min`, `max`,
+`total`.
 
-Missing, in rough order of value: `date`/`time`/`datetime`/`strftime`/
-`julianday` (the engine has timestamps but no calendar arithmetic),
-`json_*` / `jsonb_*`, `unhex`, `printf` width and precision flags, `random`,
-`zeroblob`, `soundex`, `group_concat`, `changes`, `last_insert_rowid`,
-the math library beyond the basic set, and the ordered-set aggregates.
+**Missing, verified by running each one:** `CASE` (a statement, not a function),
+`current_timestamp` as a keyword, `ceiling`, `ln`, `power`, `timediff`,
+`median`/`percentile`/`percentile_cont`/`percentile_disc`, `soundex`,
+`json_patch`/`json_insert`/`json_pretty`/`json_array_insert`/`json_group_array`/
+`json_group_object`/`json_error_position`, the whole `jsonb_*` family,
+`unistr`/`unistr_quote`, `likelihood`/`likely`/`unlikely`/`unknown`,
+`sqlite_compileoption_used`/`sqlite_compileoption_get`, `sqlite_source_id`,
+`sqlite_offset`, `sqlite_filestat`, `sqlite_walstat`, and the names SQLite keeps
+for its own internals (`expr_compare`, `fpdecode`, `datedebug`, `oom`,
+`affinity`, `parseuri`, `implies_nonnull_row`).
 
 ## Pragmas
 
-done: `table_info`, `index_list`, `index_info`, `foreign_key_list`,
-`database_list`, `table_list`, `user_version` (get and set), `application_id`,
-`schema_version`, `page_size`, `encoding`, `journal_mode`, `foreign_keys`,
-`integrity_check`, `quick_check`, `sqlite_version`, `compile_options`.
+The engine sorts the 63 names in the inventory into four classes:
 
-todo: `cache_size`, `busy_timeout`, `mmap_size`, `synchronous`, `temp_store`,
-`wal_checkpoint*`, `freelist_count`, `page_count`, `optimize`, `pragma_list`,
-`function_list`, `module_list`, `collation_list`, `data_version`.
+- **25 answer with data**: `application_id`, `cache_size`, `compile_options`,
+  `data_version`, `database_list`, `encoding`, `foreign_key_check`,
+  `foreign_key_list`, `foreign_keys`, `freelist_count`, `function_list`,
+  `index_info`, `index_list`, `integrity_check`, `journal_mode`,
+  `max_page_count`, `mmap_size`, `page_count`, `page_size`, `pragma_list`,
+  `quick_check`, `schema_version`, `sqlite_version`, `stats` (engine
+  extension), `synchronous`, `table_info`, `table_list`, `table_xinfo`,
+  `user_version`.
+- **18 are accepted as no-ops** because the engine has no equivalent knob:
+  `auto_vacuum`, `automatic_index`, `busy_timeout`, `cache_spill`,
+  `cell_size_check`, `checkpoint_fullfsync`, `count_changes`,
+  `default_cache_size`, `fullfsync`, `full_column_names`, `hard_heap_limit`,
+  `journal_size_limit`, `optimize`, `secure_delete`, `short_column_names`,
+  `soft_heap_limit`, `threads`, `wal_autocheckpoint`, `wal_checkpoint`.
+- **11 are refused with a reason**, because accepting them would promise a
+  guarantee the engine does not give: `case_sensitive_like`,
+  `defer_foreign_keys`, `ignore_check_constraints`, `legacy_alter_table`,
+  `locking_mode`, `query_only`, `read_uncommitted`, `recursive_triggers`,
+  `reverse_unordered_selects`, `trusted_schema`, `writable_schema`.
+- **The rest are unknown** and answer an error (`collation_list`,
+  `module_list`, `incremental_vacuum`, `shrink_memory`, `legacy_file_format`,
+  `soft_heap_limit64`, `data_store_directory`, `temp_store_directory`,
+  `temp_store`).
+
+## Semantics that differ from SQLite
+
+These are decisions, not accidents, and a program that relies on SQLite's
+behaviour here will see different results:
+
+| Case | SQLite | This engine |
+|---|---|---|
+| `1/0` | `NULL` | error `invalid_argument: division by zero` |
+| `CAST('abc' AS INTEGER)` | `0` | error `invalid_type` |
+| `9223372036854775807 + 1` | a float | wraps to `-9223372036854775808` |
+| `CAST(300 AS TINYINT)` | `300` (INTEGER affinity) | error: the value does not fit the declared width |
+| `WHERE int_col = '1'` | compares through affinity | error `cannot compare int with string` |
+| `HAVING c > 1` where `c` aliases `count(*)` | works | error `column c does not exist` |
 
 ## Embedding and tooling
 
@@ -101,9 +148,9 @@ todo: `cache_size`, `busy_timeout`, `mmap_size`, `synchronous`, `temp_store`,
 | C ABI and header | done | `src/capi`, `include/miraidb.h`, ctypes smoke test |
 | CLI `.dbinfo`, `.tables`, `.schema` on SQLite files | done | `miraidb sqlite` |
 | Import/export | done | `import-sqlite`, `export-sqlite`, auto-detect on open |
-| Extension loading | todo | no `load_extension` |
-| VFS layer | partial | interface and memory/quota backends; the log is not wired yet |
-| Backup API | todo | snapshots cover the case |
+| Extension loading | done | `LOAD EXTENSION <name> AT 'host:port'` runs it out of process; the ABI is v1/v2 |
+| VFS layer | done | OS, memory and quota backends; the commit log, the page files and the statistics file go through it |
+| Backup API | done | `miraidb_backup` in the C ABI, `VACUUM INTO` in SQL |
 
 ## The course harness
 
