@@ -592,6 +592,18 @@ sql_exec_explain :: proc(tx: ^Tx, stmt: Explain_Stmt, params: []Value) -> (Sql_R
 			append(&lines, strings.concatenate({"scan ", first.name}))
 		}
 		for step in order.steps[1:] {
+			if inner_table, inner_err := store_table(store, step.ref.name); inner_err.kind == .None {
+				probe, probed := join_index_probe(inner_table, step.ref.alias, step.predicate)
+				if probed {
+					append(&lines, fmt.aprintf(
+						"join %s using index %s (nested loop, est. %d rows)",
+						step.name,
+						inner_table.indexes[probe.index].schema.name,
+						step.rows,
+					))
+					continue
+				}
+			}
 			append(&lines, fmt.aprintf("join %s (nested loop, est. %d rows)", step.name, step.rows))
 		}
 		if order.reordered {
@@ -2079,6 +2091,18 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 				return {}, collect_err
 			}
 		}
+		// The inner side is probed when its ON clause binds a column that leads an
+		// index: a nested loop then reads the rows the outer row matches instead
+		// of the whole relation, once per outer row.
+		probe: Index_Probe
+		probe.index = -1
+		if !lateral && !join_is_view {
+			_, staged := tx.state.writes[step.ref.name]
+			_, created := tx.state.created[step.ref.name]
+			if !staged && !created {
+				probe, _ = join_index_probe(table, step.ref.alias, step.predicate)
+			}
+		}
 		next := make([dynamic][]Source)
 		for partial in partials {
 			if tx.store.cancelled {
@@ -2088,6 +2112,22 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 				return {}, errf(.Cancelled, "query cancelled")
 			}
 			lateral_rows := rows
+			probe_rows: [dynamic]Row
+			using_probe := false
+			if probe.index >= 0 {
+				if candidates, probed := join_probe_rows(
+					tx,
+					table,
+					step.ref.name,
+					probe,
+					partial,
+					&ctx,
+				); probed {
+					probe_rows = candidates
+					lateral_rows = probe_rows
+					using_probe = true
+				}
+			}
 			if lateral {
 				lateral_args, lateral_args_err := view_args(tx, step.ref, params, partial)
 				if lateral_args_err.kind != .None {
@@ -2141,6 +2181,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 				append(&next, candidate)
 			}
 			if lateral do delete(lateral_rows)
+			if using_probe do delete(probe_rows)
 		}
 		delete(rows)
 		free_partials(&partials)
@@ -5130,6 +5171,89 @@ index_candidates :: proc(
 		return candidates, true
 	}
 	return nil, false
+}
+
+// Index_Probe is how a nested loop finds the inner rows one outer row joins to:
+// the equality binds one column of the inner table to an expression over the
+// outer sources, and that column leads one of its indexes. index is -1 when the
+// loop has to scan.
+@(private)
+Index_Probe :: struct {
+	index:  int,
+	column: int,
+	value:  ^Expr,
+}
+
+// join_index_probe reads the ON clause of one join step and finds an equality it
+// can answer with an index of the inner table: `inner.column = <outer
+// expression>`. A multi-column index answers it when the bound column leads the
+// index, because a prefix scan still narrows the tree.
+@(private)
+join_index_probe :: proc(
+	table: ^Table,
+	alias: string,
+	predicate: ^Expr,
+) -> (probe: Index_Probe, ok: bool) {
+	probe.index = -1
+	if table == nil || predicate == nil do return probe, false
+	conjuncts := make([dynamic]^Expr)
+	defer delete(conjuncts)
+	split_and(predicate, &conjuncts)
+	for expr in conjuncts {
+		binary, is_binary := expr^.(Binary_Expr)
+		if !is_binary || binary.op != .Eq do continue
+		// Either side may be the inner column; the other is the value to probe.
+		sides := [2][2]^Expr{{binary.left, binary.right}, {binary.right, binary.left}}
+		for side in sides {
+			reference, is_column := side[0]^.(Column_Expr)
+			if !is_column do continue
+			if len(reference.table) > 0 &&
+			   !strings.equal_fold(reference.table, table.schema.name) &&
+			   !(len(alias) > 0 && strings.equal_fold(reference.table, alias)) {
+				continue
+			}
+			column_index, found := schema_column_index(&table.schema, reference.name)
+			if !found do continue
+			for &index, i in table.indexes {
+				if len(index.schema.columns) == 0 do continue
+				// A probe answers an index that leads with the column it binds.
+				if index.schema.columns[0] != column_index do continue
+				return Index_Probe{index = i, column = column_index, value = side[1]}, true
+			}
+		}
+	}
+	return probe, false
+}
+
+// join_probe_rows evaluates the probe for one outer row and returns the rows its
+// key names. It reports false when the value cannot be turned into a key (an
+// error the scan will report, a value that does not coerce), so the caller scans
+// instead of answering a query with fewer rows than it has.
+@(private)
+join_probe_rows :: proc(
+	tx: ^Tx,
+	table: ^Table,
+	name: string,
+	probe: Index_Probe,
+	partial: []Source,
+	ctx: ^Eval_Ctx,
+) -> (rows: [dynamic]Row, ok: bool) {
+	ctx.sources = partial
+	value, eval_err := eval_expr(ctx, probe.value)
+	if eval_err.kind != .None do return nil, false
+	coerced, coerce_err := value_coerce(value, table.schema.columns[probe.column].type)
+	if coerce_err.kind != .None do return nil, false
+	if len(table.schema.columns[probe.column].collation) > 0 {
+		coerced = collate_ordered_value(coerced, table.schema.columns[probe.column].collation)
+	}
+	key := value_key_bytes(coerced)
+	defer delete(key)
+	ids := table_index_scan_prefix(table, probe.index, string(key))
+	defer delete(ids)
+	for id in ids {
+		if row, exists := tx_get(tx, name, id); exists do append(&rows, row)
+	}
+	return rows, true
 }
 
 @(private)

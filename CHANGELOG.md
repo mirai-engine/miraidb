@@ -32,6 +32,10 @@
   `FLOAT` key, a paged table) falls back to the full evaluation.
 - A join subscription walks the tables it reads instead of copying every row of
   them into the transaction arena, which was 80 bytes a row per commit.
+- A nested loop probes the index of the inner table when the ON clause binds a
+  column that leads it, so a join reads the rows one outer row matches instead of
+  the whole relation per outer row: 200 authors and 1 000 books read about 1 200
+  rows where the scan read 200 200. `EXPLAIN` prints the index it probes.
 - `EXPLAIN` ends with the age of the numbers it priced the plan with:
   `note: statistics measured at commit N, data at commit M`, or a note that nothing
   was ever measured, so an estimate never passes for a measurement.

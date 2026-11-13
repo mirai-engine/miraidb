@@ -853,6 +853,95 @@ join_set_matches_fresh :: proc(
 }
 
 @(test)
+test_join_probes_the_inner_index :: proc(t: ^testing.T) {
+	// A nested loop reads the inner rows its ON clause names, not the whole
+	// relation once per outer row. The row counter is what proves it: with the
+	// probe the statement reads about one row per outer row plus the outer scan,
+	// and without it the same statement reads outer times inner.
+	store := fresh_db(t, "join_probe")
+	if store == nil do return
+	defer cleanup_db(store, "join_probe")
+
+	run(t, store, "CREATE TABLE author (id INTEGER PRIMARY KEY, name TEXT)")
+	run(t, store, "CREATE TABLE book (id INTEGER PRIMARY KEY, author_id INTEGER, title TEXT)")
+	run(t, store, "CREATE INDEX book_author ON book (author_id)")
+	authors := 200
+	books := 1000
+	insert_authors := strings.builder_make()
+	defer strings.builder_destroy(&insert_authors)
+	strings.write_string(&insert_authors, "INSERT INTO author (id, name) VALUES ")
+	for i in 0 ..< authors {
+		if i > 0 do strings.write_string(&insert_authors, ", ")
+		fmt.sbprintf(&insert_authors, "(%d, 'a%d')", i + 1, i + 1)
+	}
+	run(t, store, strings.to_string(insert_authors))
+	insert_books := strings.builder_make()
+	defer strings.builder_destroy(&insert_books)
+	strings.write_string(&insert_books, "INSERT INTO book (id, author_id, title) VALUES ")
+	for i in 0 ..< books {
+		if i > 0 do strings.write_string(&insert_books, ", ")
+		fmt.sbprintf(&insert_books, "(%d, %d, 'b%d')", i + 1, (i % authors) + 1, i + 1)
+	}
+	run(t, store, strings.to_string(insert_books))
+
+	db.store_reset_rows_scanned(store)
+	junction, err := db.sql_execute(store, `
+		SELECT author.name, book.title
+		FROM author JOIN book ON author.id = book.author_id`)
+	if !testing.expectf(t, db.error_ok(err), "join failed: %s", err.message) do return
+	scanned := db.store_rows_scanned(store)
+	testing.expect_value(t, len(junction.rows), books)
+	// A scan of the inner relation would visit 200 * 1000 rows.
+	testing.expectf(t, scanned < 4000, "the join read %d rows of %d", scanned, books)
+	db.sql_result_destroy(&junction)
+
+	// Every row arrives with the right author, which is what a wrong key or a
+	// missing candidate would break.
+	one, one_err := db.sql_execute(store, `
+		SELECT author.name FROM author JOIN book ON author.id = book.author_id
+		WHERE book.id = 3`)
+	if testing.expectf(t, db.error_ok(one_err), "point join failed: %s", one_err.message) {
+		testing.expect_value(t, len(one.rows), 1)
+		if len(one.rows) == 1 do testing.expect_value(t, one.rows[0][0].s, "a3")
+		db.sql_result_destroy(&one)
+	}
+
+	// A join the probe cannot answer still answers: the ON compares two columns of
+	// the inner table, so the value side cannot be evaluated from the outer row.
+	inner, inner_err := db.sql_execute(store, `
+		SELECT count(*) FROM author JOIN book ON author.id = book.author_id + 0`)
+	if testing.expectf(t, db.error_ok(inner_err), "expression join failed: %s", inner_err.message) {
+		testing.expect_value(t, inner.rows[0][0].i, i64(books))
+		db.sql_result_destroy(&inner)
+	}
+
+	// A LEFT join keeps the outer row that matched nothing, with or without the
+	// probe.
+	run(t, store, "INSERT INTO author (id, name) VALUES (999, 'lonely')")
+	left, left_err := db.sql_execute(store, `
+		SELECT author.name, book.title
+		FROM author LEFT JOIN book ON author.id = book.author_id
+		WHERE author.id = 999`)
+	if testing.expectf(t, db.error_ok(left_err), "left join failed: %s", left_err.message) {
+		testing.expect_value(t, len(left.rows), 1)
+		db.sql_result_destroy(&left)
+	}
+
+	// The plan says which index the loop probes, so the name in the plan and the
+	// work the statement did cannot disagree.
+	plan, plan_err := db.sql_execute(store, `
+		EXPLAIN SELECT author.name FROM author JOIN book ON author.id = book.author_id`)
+	if testing.expectf(t, db.error_ok(plan_err), "explain failed: %s", plan_err.message) {
+		joined := false
+		for row in plan.rows {
+			if strings.has_prefix(row[0].s, "join book using index book_author") do joined = true
+		}
+		testing.expect(t, joined)
+		db.sql_result_destroy(&plan)
+	}
+}
+
+@(test)
 test_incremental_join_subscription :: proc(t: ^testing.T) {
 	store := fresh_db(t, "joinsub_inc")
 	if store == nil do return

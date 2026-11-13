@@ -331,8 +331,20 @@ authors and 900 books an insert walks one and a base-row change walks six, where
 the collect walked 200 and 900; the answers are checked against a fresh
 subscription after every step.
 
-**Not done.** A joined table is still scanned rather than probed by the *planner*,
-`ORDER BY` never comes from an index, and the cost constants are chosen by hand —
+**Done: the inner side of a join is probed.** `join_index_probe` reads the ON
+clause of a nested-loop step and finds an equality that binds a column leading one
+of the inner table's indexes; `join_probe_rows` evaluates the outer side per outer
+row, coerces the value, folds it by the column's collation and prefix-scans the
+index, so the loop reads the matches. A probe that cannot be answered — the value
+side names the inner table, the value does not coerce, the table has staged
+writes, it is a view or a table function — falls back to the scan for that step,
+which is why a wrong probe cannot shorten a result. `EXPLAIN` names the index, and
+`test_join_probes_the_inner_index` bounds the rows read (about 1 200 where the scan
+read 200 200 over 200 authors and 1 000 books) and checks the answers, the
+expression key that cannot be probed, a LEFT join and the plan line.
+
+**Not done.** `ORDER BY` never comes from an index, and the cost constants are
+chosen by hand —
 they encode "a row through an index costs four rows in place" and have not been
 calibrated against a measurement. Two gaps come from choosing the plan off the statement
 text alone: a bound value never reaches the histogram (`v < ?` estimates a third of

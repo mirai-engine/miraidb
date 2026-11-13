@@ -19,7 +19,7 @@ releases is worth shipping.
 
 | # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
-| 1 | **D6 — the planner's remaining gaps** | The join delta is done: an equi-join is indexed by its key and a commit probes the matches. What is left is the pricing: probe an index for the joined side, serve `ORDER BY` from an index, calibrate the cost constants, consult the histogram for a bound value, estimate a view in `FROM`, and let the subscription path use the planned order. `EXPLAIN` already announces stale statistics with both sequences (`test_explain_announces_stale_statistics`). | L | — |
+| 1 | **D6 — the planner's remaining gaps** | The join delta and the inner-side probe are done: an equi-join is indexed by its key, a commit probes the matches, and a nested loop reads the inner rows the ON clause names (`test_join_probes_the_inner_index`). What is left is the pricing: serve `ORDER BY` from an index, calibrate the cost constants, consult the histogram for a bound value, estimate a view in `FROM`, and let the subscription path use the planned order. | L | — |
 | 2 | **D9 — the rest of the grammar** | `RANGE`/`GROUPS` frames, windows beside `GROUP BY`, `BEFORE` triggers, `ALTER` type changes, more collations, user functions. | L | — |
 | 3 | **ASAN pass** over the CLI, soak and conformance — *partly done* | Bounds and stack are covered today. Odin's heap allocator is not intercepted on Windows (a deliberate use-after-free is not reported), so the heap half runs with the POSIX toolchain in #14. | 1 round | 12 |
 | 4 | **D2 — spatial tree** | Node pages and a descent replace the scan over box columns. | M | — |
@@ -60,6 +60,7 @@ measurable dimension. Measured on this tree:
 | Commit record | one record, CRC32C, group commit | durability never traded for speed silently |
 | Compaction | 0.48 s for 50k rows, one file left | same |
 | Memory per row | `Row` 80 B, `Value` 24 B | no growth without a written reason |
+| Join, inner side | a nested loop reads the inner rows its ON clause names (`test_join_probes_the_inner_index`: 1 200 rows where a scan read 200 200) | O(rows the outer row matches) |
 | Subscription delta | O(rows touched), for a join too: an equi-join is indexed by its key, so a commit probes the matches (one candidate for an insert, six for a base-row change, in a fixture of 200 authors and 900 books, where it used to read 200 and 900) | O(rows touched) for the table the commit changed |
 
 These are the numbers the gate compares against and the targets the engine is

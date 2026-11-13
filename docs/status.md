@@ -132,7 +132,7 @@ the gaps are named rather than left to be discovered.
   one schema, one set of rows and 55 queries through both engines, with the
   refusals and the intentional differences listed in the script.
 - `scripts/build.py` builds both binaries and runs the suite.
-- 224 integration tests covering CRUD, recovery, constraints, transactions,
+- 225 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
@@ -226,22 +226,25 @@ than 1000 bytes cannot be indexed and the insert says so.
   executor takes the same decision. Statistics are a cache in `<db>/stats`
   (checksummed, loaded on open, dropped with their table); a table nobody ran
   `ANALYZE` on keeps the old behaviour of using its index.
-- **Join order.** A join is a nested loop, and its order is planned: the relation
-  that keeps the fewest rows per outer row runs first, and each ON condition runs
-  with the step that completes the relations it names, so a relation may run
-  before the join it was written with. LEFT joins, `AS OF` and table functions
-  keep the written order. `EXPLAIN` prints `join order: …` when it changed, and
-  `scripts/plan_check.py` is a CI gate over the plans a measured fixture must
-  produce.
-- **What the planner still does not do.** It cannot probe an index for a joined
-  table (the inner side is always scanned) and it does not use an index to
-  satisfy `ORDER BY`. Its cost constants are hand-set rather than calibrated
-  against a measurement. Three smaller gaps share one cause: the plan is chosen
-  from the statement text, so a bound value never reaches the histogram (a
-  prepared `v < ?` estimates a third of the table, while `v < 50` reads the
-  buckets), a view in `FROM` gets no estimate at all, and nothing notices that
-  the statistics are older than the data — `<db>/stats` carries the sequence it
-  was measured at and the planner never compares it with the current one.
+- **Join order and the inner probe.** A join is a nested loop, and its order is
+  planned: the relation that keeps the fewest rows per outer row runs first, and
+  each ON condition runs with the step that completes the relations it names, so
+  a relation may run before the join it was written with. LEFT joins, `AS OF` and
+  table functions keep the written order. The inner side is **probed** when the ON
+  clause binds a column that leads one of its indexes: the loop reads the rows one
+  outer row matches instead of the whole relation, so the same join over 200
+  authors and 1 000 books reads about 1 200 rows where the scan read 200 200
+  (`test_join_probes_the_inner_index`). `EXPLAIN` prints `join <name> using index
+  <index> …`, `join order: …` when it changed, and `scripts/plan_check.py` is a CI
+  gate over the plans a measured fixture must produce.
+- **What the planner still does not do.** It does not use an index to satisfy
+  `ORDER BY`, and its cost constants are hand-set rather than calibrated against a
+  measurement. Three smaller gaps share one cause: the plan is chosen from the
+  statement text, so a bound value never reaches the histogram (a prepared
+  `v < ?` estimates a third of the table, while `v < 50` reads the buckets), a
+  view in `FROM` gets no estimate at all, and the subscription path lays out its
+  walk in the written order rather than the planned one. Staleness is no longer
+  silent: `EXPLAIN` reprices with the numbers it has and names their age.
 - **A join the grammar does not implement is refused, not approximated.**
   `NATURAL`, `RIGHT` and `FULL` joins used to parse as an alias for the table
   before them, which turned the first into a cross join and the other two into
