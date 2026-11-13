@@ -20,6 +20,9 @@
   differ; the statements this engine refuses, and the four semantic decisions
   that differ on purpose, are listed in the script. `miraidb sql --json` exists
   so the comparison reads values instead of scraping a table.
+- `CASE`, in both forms, wherever an expression is allowed; `GROUP BY` does not
+  resolve a projection alias yet, and the differential runner records that
+  refusal so it fails the gate the day it works.
 - One owner per database directory (OS lock), and a broker that serves other
   processes over HTTP, WebSocket frames and Postgres.
 - Tables on disk: a page file per table with a buffer pool, a free list, a

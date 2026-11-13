@@ -54,7 +54,7 @@ script lists.
 | CREATE VIRTUAL TABLE (FTS5, R-Tree) | done | FTS5 with BM25, `snippet` and `highlight`; spatial tables store their boxes as columns |
 | GENERATED / STRICT / WITHOUT ROWID DDL | partial | `GENERATED … STORED` and `STRICT` work; `WITHOUT ROWID` is refused for writing and supported for reading |
 | `ANY` columns (dynamic typing) | done | storage classes kept per value, `typeof()` reports them |
-| CASE | todo | `CASE` is neither parsed nor documented as an expression: a query that uses it fails with `sql_unsupported` |
+| CASE | done | simple (`CASE x WHEN …`) and searched (`CASE WHEN …`) forms, anywhere an expression is allowed, including policies and triggers |
 
 ## Expressions and clauses
 
@@ -64,7 +64,7 @@ script lists.
 | GROUP BY, HAVING | done | `HAVING` takes the expression, not a projection alias |
 | DISTINCT | done | over the projected row, and inside an aggregate (`count(DISTINCT x)`) |
 | IN, EXISTS, scalar subqueries | done | three-valued logic: a `NULL` in the list makes a non-match unknown |
-| CASE, COALESCE, NULLIF | partial | `COALESCE` and `NULLIF` are functions; `CASE` is not implemented |
+| CASE, COALESCE, NULLIF | done | `CASE` in both forms; `COALESCE` and `NULLIF` as functions |
 | LIKE, GLOB, ESCAPE | done | LIKE ignores ASCII case; GLOB is exact with `*`, `?`, `[...]` |
 | `||` string concatenation | done | tested with text and numbers |
 | COLLATE (BINARY, NOCASE, RTRIM) | done | on a column, in comparisons, in unique keys and index probes |

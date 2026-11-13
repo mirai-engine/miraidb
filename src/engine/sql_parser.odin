@@ -1759,8 +1759,7 @@ parse_primary :: proc(p: ^Parser) -> ^Expr {
 			return e
 		}
 		if p_is_keyword(p, "case") {
-			p_fail(p, .Sql_Unsupported, "CASE expressions are not supported")
-			return nil
+			return parse_case_expression(p)
 		}
 		name := p_ident(p)
 		if p_is_punct(p, "(") {
@@ -1940,4 +1939,35 @@ expr_unary :: proc(p: ^Parser, op: Unary_Op, operand: ^Expr) -> ^Expr {
 	e := new(Expr, p.alloc)
 	e^ = Unary_Expr{op = op, operand = operand}
 	return e
+}
+
+// parse_case_expression parses CASE [operand] WHEN ... THEN ... [ELSE ...] END.
+// Both forms go through the same expression evaluator, so a CASE works in a
+// projection, a WHERE clause, a policy, a trigger or a generated column.
+@(private)
+parse_case_expression :: proc(p: ^Parser) -> ^Expr {
+	p_advance(p) // CASE
+	operand: ^Expr
+	if !p_is_keyword(p, "when") {
+		operand = parse_expression(p)
+	}
+	branches := make([dynamic]Case_When, 0, 2, p.alloc)
+	for p_match_keyword(p, "when") {
+		condition := parse_expression(p)
+		p_expect_keyword(p, "then")
+		result := parse_expression(p)
+		append(&branches, Case_When{condition = condition, result = result})
+	}
+	if len(branches) == 0 {
+		p_fail(p, .Sql_Syntax, "CASE needs at least one WHEN branch")
+		return nil
+	}
+	fallback: ^Expr
+	if p_match_keyword(p, "else") {
+		fallback = parse_expression(p)
+	}
+	p_expect_keyword(p, "end")
+	expression := new(Expr, p.alloc)
+	expression^ = Case_Expr{operand = operand, branches = branches[:], fallback = fallback}
+	return expression
 }

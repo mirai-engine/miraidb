@@ -423,6 +423,13 @@ plan_expr_qualifiers :: proc(expr: ^Expr, out: ^map[string]bool) -> bool {
 		return true
 	case Literal_Expr, Param_Expr, Star_Expr:
 		return true
+	case Case_Expr:
+		if !plan_expr_qualifiers(e.operand, out) do return false
+		for branch in e.branches {
+			if !plan_expr_qualifiers(branch.condition, out) do return false
+			if !plan_expr_qualifiers(branch.result, out) do return false
+		}
+		return plan_expr_qualifiers(e.fallback, out)
 	case Binary_Expr:
 		return plan_expr_qualifiers(e.left, out) && plan_expr_qualifiers(e.right, out)
 	case Unary_Expr:

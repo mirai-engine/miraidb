@@ -45,6 +45,20 @@ Expr :: union {
 	Subquery_Expr,
 	Collate_Expr,
 	Window_Expr,
+	Case_Expr,
+}
+
+// Case_Expr is CASE [operand] WHEN ... THEN ... [ELSE ...] END. With an operand
+// every WHEN is compared against it; without one every WHEN is a condition.
+Case_When :: struct {
+	condition: ^Expr,
+	result:    ^Expr,
+}
+
+Case_Expr :: struct {
+	operand:  ^Expr,
+	branches: []Case_When,
+	fallback: ^Expr,
 }
 
 // Window_Expr is a function call with an OVER clause. It cannot be evaluated

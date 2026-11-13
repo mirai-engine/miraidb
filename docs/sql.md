@@ -214,6 +214,10 @@ rejects `ALICE` beside `Alice` and `WHERE name = 'ALICE'` still uses the index.
 
 - Literals: numbers (`42`, `-1.5`, `1e9`), strings (`'text'`, `''` escapes a
   quote), blobs (`x'00ff'`), `TRUE`, `FALSE`, `NULL`.
+- `CASE [x] WHEN … THEN … [ELSE …] END`, both the simple form (every `WHEN` is
+  compared with `x`) and the searched form (every `WHEN` is a condition). The
+  first match wins, a `NULL` condition or operand never matches, no `ELSE` gives
+  `NULL`, and only the chosen branch is evaluated.
 - Column references (`name`, `table.name`).
 - Arithmetic `+ - * / %`, string concatenation `||`, unary `-`/`+`.
 - Scalar functions: `lower`, `upper`, `length`, `substr`/`substring`, `trim`,

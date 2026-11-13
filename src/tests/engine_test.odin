@@ -10281,3 +10281,42 @@ test_scalar_minmax_and_trim_sets :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT min(x) FROM m").i, i64(2))
 	testing.expect_value(t, scalar(t, store, "SELECT max(x) FROM m").i, i64(9))
 }
+
+@(test)
+test_case_expressions :: proc(t: ^testing.T) {
+	// Both forms of CASE, wherever an expression is allowed. The branch is only
+	// evaluated when it is chosen, which is what makes the division guard safe.
+	store := fresh_db(t, "case_expr")
+	if store == nil do return
+	defer cleanup_db(store, "case_expr")
+
+	run(t, store, "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept INTEGER, salary REAL)")
+	run(t, store, "INSERT INTO emp VALUES (1, 'ana', 1, 100.5), (2, 'luis', 1, NULL), (3, 'maria', 2, 90.0), (4, NULL, NULL, 75.25)")
+
+	searched := run(t, store, "SELECT id, CASE WHEN salary IS NULL THEN 'none' WHEN salary > 90 THEN 'high' ELSE 'low' END AS band FROM emp ORDER BY id")
+	testing.expect_value(t, len(searched.rows), 4)
+	testing.expect_value(t, searched.rows[0][1].s, "high")
+	testing.expect_value(t, searched.rows[1][1].s, "none")
+	testing.expect_value(t, searched.rows[2][1].s, "low")
+	db.sql_result_destroy(&searched)
+
+	testing.expect_value(t, scalar(t, store, "SELECT CASE dept WHEN 1 THEN 'eng' WHEN 2 THEN 'sales' ELSE 'other' END FROM emp WHERE id = 3").s, "sales")
+	// A NULL operand matches no branch: ELSE runs. Without ELSE the answer is NULL.
+	testing.expect_value(t, scalar(t, store, "SELECT CASE dept WHEN 1 THEN 'eng' ELSE 'other' END FROM emp WHERE id = 4").s, "other")
+	testing.expect_value(t, scalar(t, store, "SELECT CASE dept WHEN 1 THEN 'eng' END FROM emp WHERE id = 4").kind, db.Value_Kind.Null)
+	testing.expect_value(t, scalar(t, store, "SELECT CASE WHEN NULL THEN 1 ELSE 2 END").i, i64(2))
+	// The branch that is not chosen is not evaluated.
+	testing.expect_value(t, scalar(t, store, "SELECT CASE WHEN 1 = 0 THEN 1 / 0 ELSE 7 END").i, i64(7))
+	// A CASE filters and aggregates like any other expression.
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM emp WHERE CASE WHEN salary IS NULL THEN 0 ELSE 1 END = 1").i, i64(3))
+	testing.expect_value(t, scalar(t, store, "SELECT count(CASE WHEN dept = 1 THEN 1 END) FROM emp").i, i64(2))
+	// Nested, and used as the grouping expression.
+	grouped := run(t, store, "SELECT CASE WHEN CASE WHEN dept = 2 THEN 2 ELSE 1 END = 2 THEN 'two' ELSE 'one' END AS g, count(*) FROM emp GROUP BY CASE WHEN dept = 2 THEN 2 ELSE 1 END ORDER BY g")
+	if testing.expect_value(t, len(grouped.rows), 2) {
+		testing.expect_value(t, grouped.rows[0][0].s, "one")
+		testing.expect_value(t, grouped.rows[0][1].i, i64(3))
+		testing.expect_value(t, grouped.rows[1][0].s, "two")
+		testing.expect_value(t, grouped.rows[1][1].i, i64(1))
+	}
+	db.sql_result_destroy(&grouped)
+}

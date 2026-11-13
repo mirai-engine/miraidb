@@ -83,6 +83,9 @@ the gaps are named rather than left to be discovered.
 - `ORDER BY` breaks ties by row id, so a query with equal keys answers the same
   sequence on every run; `min`/`max` with two or more arguments are scalar
   comparisons, and `trim`/`ltrim`/`rtrim` take a set of characters.
+- `CASE`, in both the simple and the searched form, wherever an expression is
+  allowed (a projection, a predicate, a grouping expression, a policy or a
+  trigger).
 - `SELECT` with aliases, `INNER`/`LEFT`/`CROSS` joins, `WHERE`, `DISTINCT`,
   `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`/`OFFSET`, `LIKE`/`ILIKE` with
   `ESCAPE`.
@@ -122,7 +125,7 @@ the gaps are named rather than left to be discovered.
   one schema, one set of rows and 55 queries through both engines, with the
   refusals and the intentional differences listed in the script.
 - `scripts/build.py` builds both binaries and runs the suite.
-- 218 integration tests covering CRUD, recovery, constraints, transactions,
+- 219 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.

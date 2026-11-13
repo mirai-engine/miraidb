@@ -30,7 +30,7 @@ Rules for this file:
 | D6 | Query planner — *done* | `ANALYZE` measures row counts, per-column distinct/NULL counts, the numeric range and a sixteen-bucket histogram into `<db>/stats`; the plan prices scan against probe from those numbers, picks between index candidates, prints `est. N rows, cost C`, and orders joins by the rows each relation keeps per outer row with every ON travelling to the step that can answer it (`test_analyze_and_plan_estimates`, `test_plan_reorders_a_join`, `scripts/plan_check.py`) | probing an index for a joined table, `ORDER BY` from an index, calibrated cost constants | L | P1 |
 | D7 | Scheduler durability | **durable** (due time is a logged column) | recovery test | S | — |
 | D8 | Crash injection | **done**: `Fault_Vfs` fails any operation at any call, and `test_fault_injection` walks the write offsets | same for the snapshot and the mirror writes | S | P1 |
-| D9 | SQL grammar | 32 statements, **`ROWS` frames, trigger `WHEN` and `RENAME COLUMN` done** (`test_window_frames`, `test_trigger_when`, `test_alter_rename_column`) | windows beside `GROUP BY`, `RANGE`/`GROUPS`, `BEFORE`, `ALTER` type changes, collations, user functions | L | P2 |
+| D9 | SQL grammar | 32 statements, **`ROWS` frames, trigger `WHEN` and `RENAME COLUMN` done** (`test_window_frames`, `test_trigger_when`, `test_alter_rename_column`) | windows beside `GROUP BY`, `RANGE`/`GROUPS`, `BEFORE`, `ALTER` type changes, collations, user functions, `GROUP BY` on an alias | L | P2 |
 | D10 | Types and precision | `Int128` as two `u64` | decimal arithmetic, time zones | M | P3 |
 | D11 | Virtual-table breadth | **done**: index DDL is staged and applied after the rows (`test_ddl_in_transaction`) | triggers/policies in the same transaction | S | P1 |
 | D12a | Metering granularity | **per row read and written, with a budget that aborts** | — | S | done |
@@ -376,9 +376,10 @@ walk that exists now.
 ## D9 — The rest of the grammar
 
 **Now.** 32 statement kinds. Refused with `sql_unsupported`: windows beside
-`GROUP BY`, `BEFORE` triggers and trigger `WHEN` clauses, `RANGE`/`GROUPS`
-frames, `ALTER TABLE` beyond rename/drop/add column, collations beyond
-`BINARY`/`NOCASE`/`RTRIM`, user-defined functions.
+`GROUP BY`, `BEFORE` triggers, `RANGE`/`GROUPS` frames, `ALTER TABLE` beyond
+rename/drop/add column, collations beyond `BINARY`/`NOCASE`/`RTRIM`,
+user-defined functions. `GROUP BY` does not resolve a projection alias
+(`GROUP BY d` where `d` is `dept AS d`), although `ORDER BY` does.
 
 **Done: `ALTER TABLE RENAME COLUMN`.** A rename keeps the rows and the indexes:
 indexes refer to columns by position and a rename keeps the count, so the stored
@@ -566,12 +567,18 @@ stay listed so the order can be read as a whole.
 8. **D12c**, **D15**, **D14**: the module sandbox, the network, replication.
 9. **Licences** and the release review last, before each public release.
 
-## D19 — CASE expressions
+## D19 — CASE expressions: **done**
 
-**Now.** `CASE` is not parsed: `SELECT CASE WHEN x > 1 THEN 'b' ELSE 'a' END`
-fails with `sql_unsupported: CASE expressions are not supported`, and
-`docs/sqlite.md` used to mark the row `done` until the audit of this tree
-corrected it.
+**Done.** Both forms parse and evaluate anywhere an expression is allowed:
+projections, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `UPDATE … SET`, policies
+and triggers. A `NULL` operand or condition matches nothing, no `ELSE` gives
+`NULL`, and only the chosen branch is evaluated, so
+`CASE WHEN d = 0 THEN NULL ELSE n / d END` is safe. `test_case_expressions`
+covers the forms, the NULL rules, the grouping expression and a nested `CASE`,
+and `scripts/differential.py` compares seven `CASE` queries against `sqlite3`.
+What it did not fix: `GROUP BY` still does not resolve a projection alias
+(`GROUP BY d` for `dept AS d`), which is in D9 and in the runner's refusal
+list.
 
 **Why it matters.** It is the most used conditional expression in SQLite queries
 (conditional aggregation, bucketing, `ORDER BY` keys) and the only statement the

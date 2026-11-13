@@ -112,6 +112,14 @@ QUERIES = [
     # Common table expression and a window frame.
     "WITH big AS (SELECT * FROM emp WHERE salary > 60) SELECT name FROM big ORDER BY name",
     "SELECT id, sum(salary) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM emp WHERE salary IS NOT NULL ORDER BY id",
+    # CASE, both forms and as a grouping expression.
+    "SELECT id, CASE WHEN salary IS NULL THEN 'none' WHEN salary > 90 THEN 'high' ELSE 'low' END AS band FROM emp ORDER BY id",
+    "SELECT id, CASE dept WHEN 1 THEN 'eng' WHEN 2 THEN 'sales' ELSE 'other' END FROM emp ORDER BY id",
+    "SELECT CASE WHEN dept = 2 THEN 1 ELSE 0 END AS s, count(*) FROM emp GROUP BY CASE WHEN dept = 2 THEN 1 ELSE 0 END ORDER BY s",
+    "SELECT count(CASE WHEN dept = 1 THEN 1 END), sum(CASE WHEN dept = 2 THEN salary ELSE 0 END) FROM emp",
+    "SELECT id FROM emp WHERE CASE WHEN salary IS NULL THEN 0 ELSE 1 END = 1 ORDER BY id",
+    "SELECT CASE WHEN 1 = 0 THEN 1 / 0 ELSE 7 END",
+    "SELECT CASE WHEN NULL THEN 1 ELSE 2 END, CASE WHEN 1 THEN 'a' END",
     # JSON and dates.
     "SELECT typeof(1), typeof(1.5), typeof('a'), typeof(NULL)",
     "SELECT json_extract('{\"a\":[10,20]}', '$.a[1]'), json_valid('[1,2]'), json_type('{\"a\":1}')",
@@ -131,9 +139,9 @@ REFUSED = {
     "SELECT emp.id FROM emp FULL JOIN dept ON emp.dept = dept.id": "FULL joins are refused, not approximated",
     "SELECT emp.id FROM emp NATURAL JOIN dept": "NATURAL joins are refused, not approximated",
     "SELECT emp.id FROM emp JOIN dept USING (id)": "JOIN ... USING is refused, not approximated",
-    "SELECT * FROM emp WHERE CASE WHEN salary > 60 THEN 1 ELSE 0 END = 1": "CASE is backlog D19",
     "SELECT * FROM (SELECT id FROM emp) AS sub": "a subquery in FROM is not supported",
     "SELECT id FROM emp WHERE EXISTS (SELECT 1 FROM dept WHERE dept.id = emp.dept)": "a correlated reference is not resolved (features.md E2)",
+    "SELECT dept AS d, count(*) FROM emp GROUP BY d": "GROUP BY does not resolve a projection alias (backlog D9)",
 }
 
 # Both engines answer, differently, on purpose. These are the decisions listed

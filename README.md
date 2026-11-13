@@ -203,7 +203,7 @@ Integer widths are enforced on store.
 
 **SQL.** `CREATE`/`DROP`/`ALTER TABLE` (add, drop, rename), `INSERT`, `UPDATE`,
 `DELETE`, `UPSERT … ON CONFLICT DO UPDATE` (with `excluded`) and `RETURNING`;
-`SELECT` with `INNER`/`LEFT`/`CROSS` joins, common table expressions
+`SELECT` with `INNER`/`LEFT`/`CROSS` joins, `CASE`, common table expressions
 (recursive included), `DISTINCT`, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`,
 `LIMIT`/`OFFSET`, scalar and aggregate functions (`count(DISTINCT x)` included),
 window frames with `ROWS BETWEEN`, subqueries (`IN`, `EXISTS`, scalar) and

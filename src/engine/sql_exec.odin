@@ -2889,6 +2889,8 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 		}
 		if !found && unknown do return value_null(), ERROR_NONE
 		return value_bool(e.negated ? !found : found), ERROR_NONE
+	case Case_Expr:
+		return eval_case(ctx, e)
 	case Call_Expr:
 		return eval_call(ctx, e)
 	case Window_Expr:
@@ -3213,6 +3215,13 @@ expr_is_aggregate :: proc(expr: ^Expr) -> bool {
 		// A window aggregate is not a group aggregate: it is computed once every
 		// row is known, not while scanning.
 		return false
+	case Case_Expr:
+		if expr_is_aggregate(e.operand) do return true
+		for branch in e.branches {
+			if expr_is_aggregate(branch.condition) do return true
+			if expr_is_aggregate(branch.result) do return true
+		}
+		return expr_is_aggregate(e.fallback)
 	case Call_Expr:
 		if scalar_minmax(e) do return false
 		if is_aggregate_name(e.name) do return true
@@ -3384,7 +3393,35 @@ is_aggregate_name :: proc(name: string) -> bool {
 	return false
 }
 
+// eval_case is CASE [operand] WHEN ... THEN ... [ELSE ...] END. With an operand
+// every WHEN is compared against it (a NULL on either side never matches); with
+// no operand every WHEN is a condition and only TRUE takes the branch. The first
+// match wins and the branch is evaluated only then, which is what makes
+// `CASE WHEN d = 0 THEN NULL ELSE n / d END` safe.
 @(private)
+eval_case :: proc(ctx: ^Eval_Ctx, e: Case_Expr) -> (Value, Error) {
+	searched := e.operand == nil
+	operand: Value
+	if !searched {
+		value, operand_err := eval_expr(ctx, e.operand)
+		if operand_err.kind != .None do return {}, operand_err
+		operand = value
+	}
+	for branch in e.branches {
+		condition, condition_err := eval_expr(ctx, branch.condition)
+		if condition_err.kind != .None do return {}, condition_err
+		matched := false
+		if searched {
+			matched = value_is_truthy(condition)
+		} else if condition.kind != .Null && operand.kind != .Null {
+			matched = value_equal(operand, condition)
+		}
+		if matched do return eval_expr(ctx, branch.result)
+	}
+	if e.fallback != nil do return eval_expr(ctx, e.fallback)
+	return value_null(), ERROR_NONE
+}
+
 eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 
 	if scalar_minmax(call) {
@@ -5205,6 +5242,10 @@ eval_constant :: proc(expr: ^Expr, params: []Value) -> (Value, bool) {
 		return result, cast_err.kind == .None
 	case Match_Expr:
 		// MATCH reads the shadow table, so it is never a constant.
+		return {}, false
+	case Case_Expr:
+		// A CASE is constant when every condition and every result is, but the
+		// values still have to be evaluated in context, so it never folds here.
 		return {}, false
 	case Column_Expr, Star_Expr, Binary_Expr, Is_Null_Expr, Between_Expr, In_Expr, Call_Expr, Like_Expr, Subquery_Expr:
 	}
