@@ -1138,7 +1138,8 @@ test_integrity_and_latency_stats :: proc(t: ^testing.T) {
 	}
 	testing.expect_value(t, commit_total, metrics["commits"])
 	testing.expect_value(t, query_total, metrics["queries"])
-	for key, _ in metrics do delete(key)
+	// The map borrows the strings the result rows own, so the keys must not be
+	// freed here: sql_result_destroy frees them once.
 	delete(metrics)
 	db.sql_result_destroy(&stats)
 	delete(orphan_values)
