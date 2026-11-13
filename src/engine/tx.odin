@@ -343,6 +343,10 @@ tx_begin_read_at :: proc(store: ^Store, seq: u64) -> ^Tx {
 		delete(tx.frozen_list)
 		delete(tx.frozen)
 	}
+	// The snapshot is gone either way: freed here when this transaction owned
+	// it, or left to the store's read cache when it borrowed it. Clearing both
+	// pointers keeps tx_discard from freeing the cache's map a second time.
+	tx.frozen = nil
 	tx.frozen_shared = false
 	tx.frozen_list = nil
 	tx.use_frozen = false
