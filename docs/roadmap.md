@@ -31,10 +31,14 @@ releases is worth shipping.
 | 10 | **D12c — module sandbox** | Deterministic execution with enforced memory and time; today a module is a process with a work budget and the caller's clock. | L | — |
 | 11 | **D15 — network hardening** | TLS, HTTP/2, backpressure, per-route timeouts, a load test. | M | — |
 | 12 | **D16 — client generation from the catalog** | Emit the Python binding from the schema; the hand-written one is the contract it has to meet. | M | — |
-| 13 | **CI on Linux and macOS** | File locking and the VFS are per-OS, so the lock must be proven on all three; `-sanitize:address` covers the heap there (#6). Six scripts hardcode a `.exe` binary: `ci.py`, `docs_check.py` (the binary it reads), `page_rss.py`, `plan_check.py`, `bench.py`, `lock_smoke.py`, `broker_smoke.py`. | M | — |
-| 14 | **Release and packaging** | `scripts/package.py` builds `dist/miraidb-<version>-<target>.zip` from the version the library reports and `--check` gates its manifest. Left: publish one archive per target, decide the version policy, and verify an archive builds twice byte for byte. | M | 13 |
-| 15 | **Auth review** | The internal pass found one client's identity leaking into the next (fixed, `test_connection_identity`). Left: rate limits, a token lifetime policy, adversarial tests over subscriptions and budgets, and the fact that without TLS (#11) a token travels in clear. | S | — |
-| 16 | **Licence and notice review** | MIT/Apache-2.0 with no vendored third-party source; confirm before each public release. | external | 14 |
+| 13 | **D1 — the rest of full-text search** | Phrase queries (`"a b"`), prefix matching (`foo*`) and column filters (`body:foo`); `AND` is still parsed as a term rather than an operator, and a pattern taken from a column cannot narrow the scan. The index, the ranking and `snippet`/`highlight` are done. | M | — |
+| 14 | **D4 — a secondary index in the mirror** | A table with a secondary index re-encodes the whole `.sqlite` file on every commit, because only table-b-tree leaves are patched. Patch the index b-trees too (a moved key can jump leaves), or state the fallback where a user will read it. | L | — |
+| 15 | **D5 / D17 — the rest of the page store** | Merge an index leaf that loses its last entry; keep more than one version per row so `AS OF` and `ALTER` work on a paged table; let a read of a paged store run without holding the shared lock for its whole life; let a read-only open trust the pages when it can prove nothing is in flight. | L | — |
+| 16 | **Diagnostics — a leak report a human can read** | The suite prints ~320k `+++ leak` lines (~9 per statement) and nobody has established whether they are real; `soak.py` does not watch the working set, and `test_soak_update_delete_prune` failed once opening its lock file. Make the tracker report a working set, settle the noise, and chase the flake. | M | — |
+| 17 | **CI on Linux and macOS** | File locking and the VFS are per-OS, so the lock must be proven on all three; `-sanitize:address` covers the heap there (#6). Six scripts hardcode a `.exe` binary: `ci.py`, `page_rss.py`, `plan_check.py`, `bench.py`, `lock_smoke.py`, `broker_smoke.py`. | M | — |
+| 18 | **Release and packaging** | `scripts/package.py` builds `dist/miraidb-<version>-<target>.zip` from the version the library reports and `--check` gates its manifest. Left: publish one archive per target, decide the version policy, and verify an archive builds twice byte for byte. | M | 17 |
+| 19 | **Auth review** | The internal pass found one client's identity leaking into the next (fixed, `test_connection_identity`). Left: rate limits, a token lifetime policy, adversarial tests over subscriptions and budgets, and the fact that without TLS (#11) a token travels in clear. | S | — |
+| 20 | **Licence and notice review** | MIT/Apache-2.0 with no vendored third-party source; confirm before each public release. | external | 18 |
 
 The last four are the release gates, in the order they have to run: prove it on
 every platform, package it, review who may call it, review what it carries. The
@@ -42,7 +46,9 @@ rest come before them because a release is only worth making once the engine
 answers correctly, ships its own weight, and can be replicated.
 
 Rounds map onto the list: **1–4** are the correctness-and-measurement round
-(this one), **5–12** the feature-depth round, **13–16** the release round.
+(this one), **5–16** the depth round (grammar, sanitizer, spatial, precision,
+replication, sandbox, network, clients, and the residuals of full-text, the
+mirror, the page store and diagnostics), **17–20** the release round.
 
 ## Efficiency contract and current baseline
 
@@ -96,8 +102,8 @@ after it, apply through `commitlog`, expose the last applied sequence.
 | Work | New engine lines (order of magnitude) |
 |---|---|
 | Items 1–4 (runner, `CASE`, snapshot, join delta) | ~2.000 |
-| Items 5–12 (grammar, sanitizer, spatial, precision, replication, sandbox, network, clients) | ~9.000 |
-| Items 13–16 (release gates) | ~1.000 |
+| Items 5–16 (grammar, sanitizer, spatial, precision, replication, sandbox, network, clients, and the residuals) | ~14.000 |
+| Items 17–20 (release gates) | ~1.000 |
 
 ## Closed already (for the record)
 
