@@ -84,6 +84,12 @@ def measure(binary: str, rows: int, iterations: int) -> dict:
         if not read_match:
             raise SystemExit(f"cannot read the read cost from: {out}")
         read_us = float(read_match.group(1))
+        # The first read after a commit copies the tables into a snapshot; it is
+        # the number the efficiency contract talks about, so the gate records it.
+        first_match = re.search(r"first read after a commit: ([\d.]+) us", out)
+        if not first_match:
+            raise SystemExit(f"cannot read the first-read cost from: {out}")
+        first_read_us = float(first_match.group(1))
 
         started = time.time()
         run(binary, "compact", relative, "--no-sync")
@@ -96,6 +102,7 @@ def measure(binary: str, rows: int, iterations: int) -> dict:
             "insert_per_s": insert_per_s,
             "insert_seconds": round(insert_seconds, 3),
             "read_us_per_tx": read_us,
+            "first_read_us": first_read_us,
             "compact_seconds": round(compact_seconds, 3),
             "database_bytes": size,
             "bytes_per_row": round(size / rows, 3),
@@ -145,6 +152,13 @@ def compare(payload: dict, current: dict) -> int:
     check("bytes per row", current["bytes_per_row"], baseline["bytes_per_row"], True, BYTES_TOLERANCE)
     check("insert per second", current["insert_per_s"], baseline["insert_per_s"], False, TIME_CATASTROPHE)
     check("read us per tx", current["read_us_per_tx"], baseline["read_us_per_tx"], True, TIME_CATASTROPHE)
+    check(
+        "first read us",
+        current.get("first_read_us", 0),
+        baseline.get("first_read_us", 0),
+        True,
+        TIME_CATASTROPHE,
+    )
     check("compact seconds", current["compact_seconds"], baseline["compact_seconds"], True, TIME_CATASTROPHE)
     return failures
 

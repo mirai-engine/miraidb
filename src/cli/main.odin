@@ -288,6 +288,17 @@ main :: proc() {
 			if commit_err := db.tx_commit(tx); !db.error_ok(commit_err) do fail(commit_err)
 			db.stmt_prepared_destroy(insert)
 		}
+		// The first read after a commit is the expensive one: it copies the tables
+		// into a snapshot. The steady state reuses that snapshot, so both numbers
+		// are reported and a gate can watch the one it cares about.
+		if _, commit_err := db.sql_execute(store, "INSERT INTO reads (v) VALUES (1)"); !db.error_ok(commit_err) {
+			fail(commit_err)
+		}
+		cold_start := time.now()
+		cold := db.tx_begin_read(store)
+		db.tx_end(cold)
+		fmt.printfln("first read after a commit: %.1f us", time.duration_microseconds(time.since(cold_start)))
+
 		start := time.now()
 		for _ in 0 ..< iterations {
 			tx := db.tx_begin_read(store)

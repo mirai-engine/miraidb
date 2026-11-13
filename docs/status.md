@@ -77,7 +77,8 @@ the gaps are named rather than left to be discovered.
   shape for shape (nodes and keys, no comparisons and no rebalancing). The
   snapshot is cached by commit sequence, so a second read costs nothing, and a
   retired one is freed as soon as no transaction holds it. A 50 000-row table
-  freezes in ~36 ms today (it was 117 ms before the shape-for-shape copy).
+  freezes in ~36 ms today (it was 117 ms before the shape-for-shape copy);
+  `bench-read` prints that first read and the steady state separately.
 - Deterministic operation order in the log.
 - Validation before logging: a rejected statement never reaches the log.
 - Rewind of the log if applying a validated transaction ever fails.

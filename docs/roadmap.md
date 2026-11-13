@@ -19,7 +19,7 @@ releases is worth shipping.
 
 | # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
-| 1 | **D3 — the first read after a commit** | Three parts: clone a table's rows and indexes without re-inserting every row (measured 2.3 µs/row, 115–117 ms at 50 000), evict `store.retired` so the read cache keeps publishing past 16 snapshots, and make `bench-read` time a commit followed by a read. Two rows of the efficiency contract are marked not met until this lands. | L | — |
+| 1 | **D3 — a read snapshot that stops copying every table** | Three parts are done: the index trees are copied shape for shape (a 50 000-row table freezes in 36 ms, was 117), the read cache evicts the snapshots no transaction holds, and `bench-read` times a commit followed by a read. What is left is the shape of the copy: a read transaction still copies **every table the query could read**, so the first read after a commit is O(all rows). Copying a table the first time a statement names it, or sharing it copy-on-write, is the work. Two rows of the efficiency contract stay marked not met. | L | — |
 | 2 | **D6 — the delta of a join subscription** | Index the join key per table so a commit costs the rows it touched instead of collecting every row of the other tables; then the smaller planner gaps: probe the joined side, `ORDER BY` from an index, calibrated constants, statistics that announce staleness, a histogram for a bound value, an estimate for a view, and the subscription path using the planned order. | L | — |
 | 3 | **D9 — the rest of the grammar** | `RANGE`/`GROUPS` frames, windows beside `GROUP BY`, `BEFORE` triggers, `ALTER` type changes, more collations, user functions. | L | — |
 | 4 | **ASAN pass** over the CLI, soak and conformance — *partly done* | Bounds and stack are covered today. Odin's heap allocator is not intercepted on Windows (a deliberate use-after-free is not reported), so the heap half runs with the POSIX toolchain in #15. | 1 round | 13 |
@@ -56,20 +56,21 @@ measurable dimension. Measured on this tree:
 | Dimension | Baseline today | Contract |
 |---|---|---|
 | Insert throughput | 46 838 /s on the 20k gate (baseline 42 219); 54 580 /s over 50k, run directly | not worse on the same hardware; 10% regression fails the gate |
-| Read transaction, cache warm | 11.4 µs over 50k rows | same |
-| Read transaction, first after a commit | **116 ms**: it clones the table | should cost the rows the transaction touches; today it is O(rows) at ~2.3 µs per row (D3, not met) |
-| Freeze a 50k-row table | **115–117 ms** (`table_snapshot` measured three times) | was recorded as ~1 ms; the real cost is 2.3 µs per row (D3, not met) |
+| Read transaction, cache warm | 10.4 µs over 50k rows | same |
+| Read transaction, first after a commit | **24 ms** over 20 000 rows on the gate, **39 ms** over 50 000: it still copies every table | should cost the rows the transaction touches; today it is O(all rows) at ~0.7 µs per row (D3, 3× better, not met) |
+| Freeze a 50k-row table | **36 ms** (one primary key), **53 ms** with one more index | was recorded as ~1 ms and measured at 117 ms; the cost is now a copy per entry, not a rebuild per index (D3, 3× better, not met) |
 | Commit record | one record, CRC32C, group commit | durability never traded for speed silently |
 | Compaction | 0.48 s for 50k rows, one file left | same |
 | Memory per row | `Row` 80 B, `Value` 24 B | no growth without a written reason |
 | Subscription delta | O(rows touched) for one table; a join re-collects every row of the other tables on each commit | O(rows touched) for the table the commit changed (D6, not met for joins) |
 
 These are the numbers the gate compares against and the targets the engine is
-held to. Three rows are recorded as **not met** rather than quietly relaxed: the
-first read after a commit pays a full table clone, so a database that writes
-while it serves readers pays it per commit, and `bench-read` hides it because
-its preparation statement publishes the read cache before it starts timing.
-Items 1 and 2 carry the work.
+held to. Three rows are recorded as **not met** rather than quietly relaxed: a
+read still copies every table it could read, so a database that writes while it
+serves readers pays a copy per commit, a join subscription re-collects the other
+tables, and the freeze stays O(rows) even after the shape-for-shape copy made it
+three times cheaper. Items 1 and 2 carry the work; `bench-read` now reports the
+first read and the steady state separately, and the gate checks both.
 
 ## Reusing the engine's networking for D14
 

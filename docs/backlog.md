@@ -115,8 +115,9 @@ map is presized. The same table snapshots in **36 ms** (0.7 µs per row), and wi
 one extra index in **53 ms** instead of 198 ms. The read cache counts references
 and, when a new commit replaces it, frees every retired snapshot no transaction
 holds, so it keeps publishing instead of going dark after sixteen commits
-(`test_read_cache_keeps_publishing`). The snapshot owns its rows, tree nodes and
-keys: a writer may
+(`test_read_cache_keeps_publishing`). `bench-read` reports the first read after a
+commit and the steady state separately, and the gate records both
+(`first_read_us`). The snapshot owns its rows, tree nodes and keys: a writer may
 drop the source table under an open snapshot and the reader still answers
 (`test_snapshot_survives_dropping_the_source`).
 
