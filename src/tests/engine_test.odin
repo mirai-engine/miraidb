@@ -1044,6 +1044,40 @@ test_incremental_aggregate_subscription :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_unsupported_joins_are_refused :: proc(t: ^testing.T) {
+	store := fresh_db(t, "join_refused")
+	if store == nil do return
+	defer cleanup_db(store, "join_refused")
+	run(t, store, "CREATE TABLE a (id INTEGER PRIMARY KEY)")
+	run(t, store, "CREATE TABLE b (id INTEGER PRIMARY KEY)")
+	run(t, store, "INSERT INTO a (id) VALUES (1), (2), (3)")
+	run(t, store, "INSERT INTO b (id) VALUES (2), (3), (4)")
+
+	// Read as an alias for the preceding table, NATURAL would become a cross
+	// join (nine rows here) and RIGHT or FULL an inner join (two): both answer a
+	// question nobody asked, so they are refused instead.
+	for sql in ([]string {
+		"SELECT * FROM a NATURAL JOIN b",
+		"SELECT * FROM a RIGHT JOIN b ON a.id = b.id",
+		"SELECT * FROM a FULL JOIN b ON a.id = b.id",
+		"SELECT * FROM a FULL OUTER JOIN b ON a.id = b.id",
+	}) {
+		result, err := db.sql_execute(store, sql)
+		db.sql_result_destroy(&result)
+		testing.expectf(t, err.kind == .Sql_Syntax, "%s must be refused, got %v", sql, err.kind)
+	}
+
+	// LEFT OUTER still parses, and keeps the three rows of the left side.
+	left := run(t, store, "SELECT count(*) FROM a LEFT OUTER JOIN b ON a.id = b.id")
+	testing.expect_value(t, left.rows[0][0].i, i64(3))
+	db.sql_result_destroy(&left)
+	// The inner join is the answer RIGHT and FULL would have had to extend.
+	inner := run(t, store, "SELECT count(*) FROM a JOIN b ON a.id = b.id")
+	testing.expect_value(t, inner.rows[0][0].i, i64(2))
+	db.sql_result_destroy(&inner)
+}
+
+@(test)
 test_integrity_and_latency_stats :: proc(t: ^testing.T) {
 	store := fresh_db(t, "integrity")
 	if store == nil do return

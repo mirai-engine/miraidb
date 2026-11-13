@@ -409,6 +409,14 @@ parse_select :: proc(p: ^Parser) -> Statement {
 			} else if p_is_keyword(p, "cross") {
 				p_advance(p)
 				if !p_expect_keyword(p, "join") do break
+			} else if p_is_keyword(p, "natural") || p_is_keyword(p, "right") || p_is_keyword(p, "full") {
+				// Read as an alias, these turn the join into a cross join or an
+				// inner join and answer a different question than SQLite would.
+				// Refusing is the only honest answer until they exist.
+				upper := strings.to_upper(p.current.text)
+				defer delete(upper)
+				p_fail(p, .Sql_Syntax, "%v join is not supported: write an inner or left join with an ON condition", upper)
+				break
 			} else if !p_match_keyword(p, "join") {
 				break
 			}
@@ -494,7 +502,7 @@ return select
 @(private)
 p_is_table_clause_keyword :: proc(p: ^Parser) -> bool {
 	if p.current.kind != .Ident do return false
-	for keyword in ([]string{"where", "group", "having", "order", "limit", "offset", "join", "inner", "left", "cross", "on", "union", "using", "set", "values", "returning"}) {
+	for keyword in ([]string{"where", "group", "having", "order", "limit", "offset", "join", "inner", "left", "cross", "outer", "natural", "right", "full", "on", "union", "using", "set", "values", "returning"}) {
 		if strings.equal_fold(p.current.text, keyword) do return true
 	}
 	return false
