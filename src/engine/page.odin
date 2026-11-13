@@ -35,6 +35,25 @@ NO_PAGE_ID :: Page_Id(0xFFFF_FFFF)
 Page_Kind :: enum u8 {
 	Free = 0,
 	Rows = 1,
+	// The ordered index file (index_page.odin) uses three kinds: page 0 is the
+	// header, leaves carry the keys in order and chained by `next_free`, and
+	// branches carry a separator and a child page per cell.
+	Index_Header = 2,
+	Index_Leaf = 3,
+	Index_Branch = 4,
+}
+
+// page_kind_has_slots reports whether a kind uses the slot directory, so the
+// checksum check can validate the structure the same way for every kind. The
+// header pages carry no slots: their bytes past the file header are theirs.
+@(private)
+page_kind_has_slots :: proc(kind: Page_Kind) -> bool {
+	return kind == .Rows || kind == .Index_Leaf || kind == .Index_Branch
+}
+
+@(private)
+page_kind_known :: proc(kind: Page_Kind) -> bool {
+	return kind == .Free || page_kind_has_slots(kind) || kind == .Index_Header
 }
 
 // Page_Header is the decoded form of the first bytes of every page.
@@ -104,8 +123,8 @@ page_seal :: proc(data: []u8) {
 @(private)
 page_valid :: proc(data: []u8) -> bool {
 	header := page_header_decode(data)
-	if header.kind != .Rows && header.kind != .Free do return false
-	if header.kind == .Rows {
+	if !page_kind_known(header.kind) do return false
+	if page_kind_has_slots(header.kind) {
 		if header.slot_start < PAGE_HEADER_LEN || header.slot_start > PAGE_SIZE do return false
 		if header.free_start < PAGE_HEADER_LEN || header.free_start > PAGE_SIZE do return false
 		if header.free_start > header.slot_start do return false
@@ -138,6 +157,9 @@ Page_File :: struct {
 	free_head:    Page_Id,
 	free_pages:   u32,
 	applied_seq:  u64,
+	// header_kind is the kind page 0 is written with, so a flush keeps a row
+	// file and an index file distinguishable.
+	header_kind:  Page_Kind,
 	// stats, for tests and for honest documentation
 	writes:    u64,
 	reads:     u64,
@@ -145,7 +167,12 @@ Page_File :: struct {
 	pins_live: u32,
 }
 
-page_file_create :: proc(vfs: ^Vfs, path: string, frames: int) -> (^Page_File, Error) {
+page_file_create :: proc(
+	vfs: ^Vfs,
+	path: string,
+	frames: int,
+	kind: Page_Kind = .Rows,
+) -> (^Page_File, Error) {
 	count := frames
 	if count <= 0 do count = 16
 	if count > PAGE_MAX_FRAMES do count = PAGE_MAX_FRAMES
@@ -158,6 +185,7 @@ page_file_create :: proc(vfs: ^Vfs, path: string, frames: int) -> (^Page_File, E
 	pf.vfs = system
 	pf.file = file
 	pf.path = strings.clone(path)
+	pf.header_kind = kind
 	// Frame 0 is reserved for the header page. If it could be evicted, a flush
 	// would later write header bytes over the row page that had taken it, losing
 	// the rows of that page; the pool is data pages plus this one.
@@ -174,7 +202,7 @@ page_file_create :: proc(vfs: ^Vfs, path: string, frames: int) -> (^Page_File, E
 	// crash before it lands leaves an empty file, which `open` reports as
 	// unformatted instead of pretending it has data.
 	header := pf.frames[0].data
-	page_header_encode(header, Page_Header{kind = .Rows, slot_start = PAGE_SIZE, free_start = PAGE_HEADER_LEN})
+	page_header_encode(header, Page_Header{kind = kind, slot_start = PAGE_SIZE, free_start = PAGE_HEADER_LEN})
 	page_file_header_encode(header, pf)
 	page_seal(header)
 	if write_err := page_write_raw(pf, 0, header); write_err.kind != .None {
@@ -226,6 +254,7 @@ page_file_open :: proc(vfs: ^Vfs, path: string, frames: int) -> (^Page_File, Err
 		return nil, errf(.Corrupt_Log, "the page file %s has a corrupt header", path)
 	}
 	page_file_header_decode(pf, header)
+	pf.header_kind = page_header_decode(header).kind
 	if pf.page_count == 0 {
 		page_file_destroy_unopened(pf)
 		return nil, errf(.Corrupt_Log, "the page file %s declares no pages", path)
@@ -322,7 +351,7 @@ page_flush :: proc(pf: ^Page_File, applied_seq: u64) -> Error {
 	}
 	if pf.applied_seq != applied_seq do pf.applied_seq = applied_seq
 	header := pf.frames[0].data
-	page_header_encode(header, Page_Header{kind = .Rows, slot_start = PAGE_SIZE, free_start = PAGE_HEADER_LEN})
+	page_header_encode(header, Page_Header{kind = pf.header_kind, slot_start = PAGE_SIZE, free_start = PAGE_HEADER_LEN})
 	page_file_header_encode(header, pf)
 	page_seal(header)
 	if write_err := page_write_raw(pf, 0, header); write_err.kind != .None do return write_err
