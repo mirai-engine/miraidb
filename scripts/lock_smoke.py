@@ -22,6 +22,7 @@ import time
 import shutil
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BIN = os.path.join(ROOT, "bin", "miraidb.exe")
 sys.path.insert(0, os.path.join(ROOT, "sdk", "python"))
 
 import miraidb  # noqa: E402
@@ -79,6 +80,43 @@ def main() -> int:
         check("second process is refused", refused, message)
         check("refusal names the owner", "pid" in message, message)
         check("refusal names the database", path in message, message)
+
+        # A reader opens beside the writer: the writer byte is exclusive, the
+        # reader byte is shared, so the reader joins instead of colliding.
+        if not os.path.exists(BIN):
+            print(f"FAIL missing {BIN}; run scripts/build.py first")
+            return 1
+
+        def cli(*args: str) -> subprocess.CompletedProcess:
+            return subprocess.run([BIN, *args], capture_output=True, text=True)
+
+        first = cli("sql", "--read-only", path, "SELECT count(*) FROM held")
+        check(
+            "a reader opens beside the writer",
+            first.returncode == 0 and "1" in first.stdout,
+            first.stderr.strip(),
+        )
+        second = cli("sql", "--read-only", path, "SELECT count(*) FROM held")
+        check(
+            "two readers coexist",
+            second.returncode == 0 and "1" in second.stdout,
+            second.stderr.strip(),
+        )
+        write = cli("sql", "--read-only", path, "INSERT INTO held (id) VALUES (2)")
+        check(
+            "a reader cannot write",
+            write.returncode != 0 and "read" in write.stderr.lower(),
+            write.stderr.strip() or write.stdout.strip(),
+        )
+        # Another process cannot compact a database this one owns; the writer's own
+        # refusal while a reader is open is covered by the engine test, because it
+        # needs the lock holder in the same process.
+        compact = cli("compact", path)
+        check(
+            "compaction from another process is refused",
+            compact.returncode != 0 and "locked" in compact.stderr.lower(),
+            compact.stderr.strip() or compact.stdout.strip(),
+        )
 
         # Kill the owner: the operating system drops the lock with the process.
         child.kill()

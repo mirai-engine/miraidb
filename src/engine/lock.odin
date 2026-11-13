@@ -24,6 +24,21 @@ import "core:time"
 // lock and the name of the owner.
 LOCK_FILE_NAME :: "lock"
 
+// Two bytes, two questions. The writer byte is taken exclusively and only by a
+// writer, so a second writer is refused no matter who is reading. The reader byte
+// is taken shared by readers and writers alike: a reader can open beside a
+// writer, and a writer can tell that readers are around by trying to take it
+// exclusively for the moment it rewrites the log.
+LOCK_WRITER_OFFSET :: u64(0xFFFF_FFFC)
+LOCK_READER_OFFSET :: u64(0xFFFF_FFFD)
+
+// Db_Lock_Role is what the opener intends to do with the directory. A reader can
+// join a writer; a writer cannot join a writer.
+Db_Lock_Role :: enum u8 {
+	Reader,
+	Writer,
+}
+
 // Db_Lock is the exclusive ownership of one database directory.
 Db_Lock :: struct {
 	// handle is the platform's file descriptor or handle. It is a uintptr so the
@@ -32,14 +47,22 @@ Db_Lock :: struct {
 	path:   string,
 	// key is the absolute path, the identity of the lock in the registry.
 	key:  string,
-	held: bool,
+	role: Db_Lock_Role,
+	// reader_held says the shared reader byte is held; compacting says it was
+	// upgraded to exclusive for a log rewrite.
+	reader_held: bool,
+	compacting:  bool,
+	held:        bool,
 }
 
 @(private)
 lock_registry_mutex: sync.Mutex
 
 @(private)
-lock_registry: map[string]bool
+lock_registry_writers: map[string]bool
+
+@(private)
+lock_registry_readers: map[string]int
 
 // The registry is only needed where the kernel would hand a second lock of the
 // same file to the same process. POSIX fcntl locks are per process; Windows
@@ -49,10 +72,12 @@ lock_registry_needed :: proc() -> bool {
 	return ODIN_OS != .Windows
 }
 
-// db_lock_acquire takes ownership of `directory`. It creates the lock file when
-// it is missing and records the owner in it, so a refusal can name the process
-// that has the database open.
-db_lock_acquire :: proc(directory: string) -> (Db_Lock, Error) {
+// db_lock_acquire opens the directory in `role`. A writer is exclusive against
+// other writers and joins the readers; a reader only joins the reader byte, so it
+// can open while a writer works. It creates the lock file when it is missing and
+// records the owner in it, so a refusal can name the process that has the
+// database open.
+db_lock_acquire :: proc(directory: string, role: Db_Lock_Role = .Writer) -> (Db_Lock, Error) {
 	path, join_err := filepath.join({directory, LOCK_FILE_NAME}, context.temp_allocator)
 	if join_err != nil {
 		return {}, errf(.Io, "cannot build the lock path for %s: %v", directory, join_err)
@@ -68,10 +93,15 @@ db_lock_acquire :: proc(directory: string) -> (Db_Lock, Error) {
 		defer if registry {
 			sync.unlock(&lock_registry_mutex)
 		}
-		if lock_registry == nil {
-			lock_registry = make(map[string]bool)
+		if lock_registry_writers == nil {
+			lock_registry_writers = make(map[string]bool)
 		}
-		if key in lock_registry {
+		if lock_registry_readers == nil {
+			lock_registry_readers = make(map[string]int)
+		}
+		// A writer is exclusive against another writer. A reader joins whoever is
+		// there: that is the whole point of the role.
+		if role == .Writer && key in lock_registry_writers {
 			return {}, lock_refusal(directory, path)
 		}
 	}
@@ -80,31 +110,81 @@ db_lock_acquire :: proc(directory: string) -> (Db_Lock, Error) {
 	if open_err.kind != .None {
 		return {}, open_err
 	}
-	if !lock_os_acquire(handle) {
-		lock_os_close(handle)
-		return {}, lock_refusal(directory, path)
+	if role == .Writer {
+		if !lock_os_acquire(handle, LOCK_WRITER_OFFSET, true) {
+			lock_os_close(handle)
+			return {}, lock_refusal(directory, path)
+		}
 	}
-	lock_write_owner(path)
+	if !lock_os_acquire(handle, LOCK_READER_OFFSET, false) {
+		if role == .Writer do lock_os_release(handle, LOCK_WRITER_OFFSET)
+		lock_os_close(handle)
+		return {}, errf(.Locked, "database %s is being rewritten", directory)
+	}
+	if role == .Writer {
+		lock_write_owner(path)
+		if registry {
+			lock_registry_writers[key] = true
+		}
+	}
 	if registry {
-		lock_registry[key] = true
+		lock_registry_readers[key] += 1
 	}
 	return Db_Lock {
 		handle = handle,
 		path = strings.clone(path, context.allocator),
 		key = strings.clone(key, context.allocator),
+		role = role,
+		reader_held = true,
 		held = true,
 	}, ERROR_NONE
+}
+
+// db_lock_rewriting takes the reader byte exclusively for the duration of a log
+// rewrite, so no reader is replaying the file being replaced. It returns false
+// when a reader holds it, and leaves the lock as it found it.
+db_lock_rewriting :: proc(lock: ^Db_Lock, wanted: bool) -> bool {
+	if lock == nil || !lock.held || lock.role != .Writer do return false
+	if wanted {
+		if lock.compacting do return true
+		if lock.reader_held {
+			lock_os_release(lock.handle, LOCK_READER_OFFSET)
+			lock.reader_held = false
+		}
+		if !lock_os_acquire(lock.handle, LOCK_READER_OFFSET, true) {
+			// Put the shared hold back; if that fails too the writer simply keeps
+			// being refused for rewrites, which is the safe side.
+			lock.reader_held = lock_os_acquire(lock.handle, LOCK_READER_OFFSET, false)
+			return false
+		}
+		lock.compacting = true
+		return true
+	}
+	if !lock.compacting do return true
+	lock_os_release(lock.handle, LOCK_READER_OFFSET)
+	lock.compacting = false
+	lock.reader_held = lock_os_acquire(lock.handle, LOCK_READER_OFFSET, false)
+	return lock.reader_held
 }
 
 // db_lock_release gives the directory back. It is safe on a zero lock, so close
 // paths do not need to branch.
 db_lock_release :: proc(lock: ^Db_Lock) {
 	if lock == nil || !lock.held do return
-	lock_os_release(lock.handle)
+	if lock.compacting do lock_os_release(lock.handle, LOCK_READER_OFFSET)
+	if lock.reader_held do lock_os_release(lock.handle, LOCK_READER_OFFSET)
+	if lock.role == .Writer do lock_os_release(lock.handle, LOCK_WRITER_OFFSET)
 	lock_os_close(lock.handle)
-	if lock_registry != nil {
+	if lock_registry_readers != nil {
 		sync.lock(&lock_registry_mutex)
-		delete_key(&lock_registry, lock.key)
+		if lock_registry_readers[lock.key] > 1 {
+			lock_registry_readers[lock.key] -= 1
+		} else {
+			delete_key(&lock_registry_readers, lock.key)
+		}
+		if lock.role == .Writer && lock_registry_writers != nil {
+			delete_key(&lock_registry_writers, lock.key)
+		}
 		sync.unlock(&lock_registry_mutex)
 	}
 	delete(lock.path)

@@ -232,6 +232,11 @@ tx_rollback_to_savepoint :: proc(tx: ^Tx, name: string) -> Error {
 }
 
 tx_begin_write :: proc(store: ^Store) -> ^Tx {
+	if store.read_only {
+		// Every write path already checks tx.read_only, so a read-only store
+		// answers a write with the error a read transaction gives.
+		return tx_begin_read(store)
+	}
 	tx := new(Tx)
 	tx.store = store
 	tx.active = true

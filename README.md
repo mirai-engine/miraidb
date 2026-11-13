@@ -263,10 +263,12 @@ trusted without a replay (D18b). Tables can already live in page files: open a
 store with `--paged` (or `Store_Options.paged_tables`) and a scan streams them
 through a bounded buffer pool, with each index a B+tree of pages beside them.
 
-There is no follower, no log shipping and no failover;
-a second process can read the same database only after the first one closes. The
-replay path, the segmented log and the wire layer are the pieces a follower would
-reuse, and `docs/backlog.md` (D14) carries the plan. Everything else the engine
+A second process can **read** the same database while the first one writes:
+`--read-only` (or `Store_Options.read_only`) takes the shared side of the lock,
+answers from a replay of the log at open, refuses writes, and makes a compaction
+wait. There is no follower, no log shipping and no failover. The replay path, the
+segmented log and the wire layer are the pieces a follower would reuse, and
+`docs/backlog.md` (D14) carries the plan. Everything else the engine
 does not do is depth, not absence: see `docs/status.md`.
 
 ## Data model and limits

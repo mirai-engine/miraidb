@@ -37,6 +37,7 @@ Usage:
 Options:
   --no-sync                                 do not fsync every commit (faster, less safe)
   --memory                                  run against an in-memory database
+  --read-only                               open as a reader: shared lock, no writes
   --paged                                   keep new tables in page files, not in RAM
   --page-frames=N                           pages of each table file kept in the pool
   --memory-report                           print this process memory when a sql
@@ -68,6 +69,7 @@ main :: proc() {
 	paged := false
 	page_frames := 0
 	memory_report := false
+	read_only := false
 	filtered := make([dynamic]string, 0, len(rest))
 	defer delete(filtered)
 	for arg in rest {
@@ -82,6 +84,8 @@ main :: proc() {
 			durable = false
 		case "--memory":
 			persistent = false
+		case "--read-only":
+			read_only = true
 		case "--paged":
 			paged = true
 		case "--memory-report":
@@ -110,7 +114,7 @@ main :: proc() {
 		fmt.printfln("created %s", arguments[0])
 	case "sql":
 		if len(arguments) < 2 do usage_error("sql needs a database path and a statement")
-		store, err := open_database(arguments[0], persistent, durable, durability, paged, page_frames)
+		store, err := open_database(arguments[0], persistent, durable, durability, paged, page_frames, read_only)
 		if !db.error_ok(err) do fail(err)
 		baseline := memory_report ? cli_current_rss_bytes() : 0
 		statement := strings.join(arguments[1:], " ")
@@ -357,6 +361,7 @@ open_database :: proc(
 	durability: db.Durability,
 	paged := false,
 	page_frames := 0,
+	read_only := false,
 ) -> (^db.Store, db.Error) {
 	if db.sqlite_is_file(path) {
 		file, file_err := db.sqlite_file_open(path)
@@ -374,11 +379,13 @@ open_database :: proc(
 		path,
 		{
 			persistent = persistent,
-			create = true,
+			// A reader never creates: it joins a database that exists.
+			create = !read_only,
 			durable = durable,
 			durability = durability,
 			paged_tables = paged,
 			page_frames = page_frames,
+			read_only = read_only,
 		},
 	)
 }

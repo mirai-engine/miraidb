@@ -40,6 +40,10 @@ Store_Options :: struct {
 	// cache of the log: it is rebuilt from the log when it is opened, so a
 	// crash never leaves it as the only copy. Existing tables stay in memory.
 	paged_tables: bool,
+	// read_only opens the directory as a reader: it takes the shared side of the
+	// lock, so it can run beside a writer, and it refuses to write. A reader
+	// replays the log into memory, so it never touches the writer's page files.
+	read_only: bool,
 	// page_frames is how many 4 KiB pages of each table file stay in the buffer
 	// pool. Zero means the default.
 	page_frames: int,
@@ -149,6 +153,9 @@ Store :: struct {
 	// prove the log is not loaded whole.
 	replay_records:      u64,
 	replay_buffer_bytes: int,
+	// read_only says the directory is open as a reader: the lock is shared, the
+	// page files are not touched, and every write is refused.
+	read_only:           bool,
 	// paged_tables and page_frames are the options new tables inherit, and
 	// has_paged says whether any table of this store is paged: a read then keeps
 	// the store lock for the whole transaction instead of taking a snapshot.
@@ -190,6 +197,15 @@ store_open :: proc(path: string, options: Store_Options) -> (^Store, Error) {
 	store.vfs = options.vfs
 	store.path = path
 	store.paged_tables = options.paged_tables
+	store.read_only = options.read_only
+	if store.read_only {
+		if options.create {
+			free(store)
+			return nil, errf(.Invalid_Argument, "a read-only open cannot create the database")
+		}
+		// The page files belong to the writer: a reader replays into memory.
+		store.paged_tables = false
+	}
 	store.page_frames = options.page_frames
 	if store.page_frames <= 0 do store.page_frames = STORE_DEFAULT_PAGE_FRAMES
 	if options.in_memory_log {
@@ -246,7 +262,8 @@ store_open :: proc(path: string, options: Store_Options) -> (^Store, Error) {
 	// The directory is owned from here on. A second process that finds it held is
 	// refused with the owner's pid instead of appending to a log it does not own.
 	if options.vfs == nil {
-		lock, lock_err := db_lock_acquire(path)
+		role := store.read_only ? Db_Lock_Role.Reader : Db_Lock_Role.Writer
+		lock, lock_err := db_lock_acquire(path, role)
 		if lock_err.kind != .None {
 			free(store)
 			return nil, lock_err
@@ -301,8 +318,10 @@ store_close :: proc(store: ^Store) {
 	store_stop_background_compaction(store)
 	// A paged table is flushed before it is closed so a clean shutdown leaves the
 	// page files current; a crash leaves them stale, which the next open rebuilds.
-	if flush_err := store_flush_pages(store, store.commit_seq); flush_err.kind != .None {
-		store.last_error = flush_err
+	if !store.read_only {
+		if flush_err := store_flush_pages(store, store.commit_seq); flush_err.kind != .None {
+			store.last_error = flush_err
+		}
 	}
 	// Cached read snapshots own their cloned tables; release them before the
 	// live tables so nothing is destroyed twice.
@@ -555,8 +574,9 @@ store_replay :: proc(store: ^Store) -> Error {
 	if ctx.err.kind != .None do return ctx.err
 	store.replay_records = stats.records
 	store.replay_buffer_bytes = stats.buffer_bytes
-	// Drop a torn tail so the next append starts on a clean record boundary.
-	if len(last_path) > 0 && store.log.file != nil {
+	// Drop a torn tail so the next append starts on a clean record boundary. A
+	// reader never truncates: the log belongs to the writer.
+	if len(last_path) > 0 && store.log.file != nil && !store.read_only {
 		if log_file_size(store.log.file) != valid_len {
 			if trunc_err := log_truncate(last_path, valid_len, store.vfs); trunc_err.kind != .None {
 				return trunc_err
@@ -569,8 +589,10 @@ store_replay :: proc(store: ^Store) -> Error {
 	// The pages were rebuilt from the log, so they may now claim the sequence the
 	// replay reached. Until this flush the header names a sequence no page
 	// supports, which a later open would notice and rebuild.
-	if flush_err := store_flush_pages(store, store.commit_seq); flush_err.kind != .None {
-		return flush_err
+	if !store.read_only {
+		if flush_err := store_flush_pages(store, store.commit_seq); flush_err.kind != .None {
+			return flush_err
+		}
 	}
 	return ERROR_NONE
 }
@@ -875,6 +897,9 @@ store_vacuum_into :: proc(store: ^Store, path: string) -> Error {
 // whole state. Startup becomes O(state) instead of O(history) and the file
 // shrinks. The snapshot makes the checkpoint reusable for the next rounds.
 store_compact :: proc(store: ^Store) -> Error {
+	if store.read_only {
+		return errf(.Transaction_Read_Only, "a read-only database cannot be compacted")
+	}
 	if store.log.memory_mode {
 		return errf(.Invalid_Argument, "an in-memory log has nothing to compact")
 	}
@@ -888,6 +913,12 @@ store_compact :: proc(store: ^Store) -> Error {
 	defer sync.unlock(&store.mutex)
 	payload := store_state_payload(store)
 	defer delete(payload)
+	// Compaction replaces the log file, so it needs the reader byte exclusively:
+	// a reader replaying that file must not have it open while it is rewritten.
+	if !db_lock_rewriting(&store.lock, true) {
+		return errf(.Locked, "database %s has a reader open; compacting waits", store.path)
+	}
+	defer db_lock_rewriting(&store.lock, false)
 	// Publish the snapshot before touching the log: if the log swap fails, the
 	// old log still holds every record and replay ignores the extra snapshot.
 	if snapshot_err := store_write_snapshot_payload(store, payload); snapshot_err.kind != .None {

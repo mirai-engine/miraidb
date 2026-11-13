@@ -198,16 +198,25 @@ cannot be indexed and the insert says so.
   (`scripts/broker_smoke.py` proves it with two processes). The identity a
   connection authenticated as is kept **per connection** (`test_connection_identity`):
   two clients never share the identity policies see, and `SET identity` inside a
-  request persists for that client only. What is still missing is opening the
-  directory *directly* beside a writer, which needs the page files to be trusted
-  without a replay (D18b).
+  request persists for that client only.
+- **A reader can open beside the writer (D18b).** The lock file has two bytes: the
+  writer byte is taken exclusively, the reader byte shared by readers and writers
+  alike. `store_open(..., read_only = true)` (CLI `--read-only`) therefore opens
+  while another process is writing. A reader replays the log into memory, so it
+  never touches the writer's page files; it cannot write (`Transaction_Read_Only`
+  from every mutation path, including DDL and `compact`); and it is a snapshot of
+  the state at open, not a follower. While a reader is open the writer keeps
+  committing but a **compaction is refused** with `locked`, because compaction
+  replaces the log file the reader may be replaying. Two writers are still
+  refused, and `scripts/lock_smoke.py` proves all of it with two processes
+  (`test_read_only_opens_beside_a_writer` covers the in-process cases).
 
-This is the one capability the engine does **not** have at all, as opposed to
-having a shallow version of it. There is no code for it in the tree.
+What is still missing is opening the directory *directly* with the page files
+trusted instead of replayed, and streaming commits to a follower.
 
-- **Nothing streams commits between processes**; a second process can read the
-  same database only after the first one closes (the second opener is refused, it
-  does not wait).
+- **Nothing streams commits between processes**; a reader sees the state at open
+  and has to reopen to see later commits. The second *writer* is refused, not
+  queued.
 - **No follower.** There is no way to run a read-only copy that catches up, and
   no way to promote one.
 - **No failover, no leader election, no consistency story for a partition.**

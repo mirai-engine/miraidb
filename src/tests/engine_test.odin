@@ -9465,3 +9465,74 @@ test_page_directory_survives_a_reopen :: proc(t: ^testing.T) {
 		if found do testing.expect_value(t, row.values[1].s, "first")
 	}
 }
+
+@(test)
+test_read_only_opens_beside_a_writer :: proc(t: ^testing.T) {
+	// "Varios procesos" needs a reader that can open while the writer works. The
+	// lock has two bytes: the writer byte is exclusive, the reader byte is shared,
+	// so a reader joins and a second writer is still refused.
+	path := "_test_read_only"
+	os.remove_all(path)
+	defer os.remove_all(path)
+	writer, open_err := db.store_open(path, {persistent = true, create = true, durable = false})
+	if !testing.expectf(t, db.error_ok(open_err), "writer: %s", open_err.message) do return
+	writer_open := true
+	defer if writer_open do db.store_close(writer)
+	run(t, writer, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+	run(t, writer, "INSERT INTO t (id, v) VALUES (1, 10), (2, 20)")
+
+	reader, reader_err := db.store_open(path, {
+		persistent = true,
+		create     = false,
+		durable    = false,
+		read_only  = true,
+	})
+	if !testing.expectf(t, db.error_ok(reader_err), "reader: %s", reader_err.message) do return
+	reader_open := true
+	defer if reader_open do db.store_close(reader)
+	testing.expect_value(t, scalar(t, reader, "SELECT count(*) FROM t").i, i64(2))
+	testing.expect_value(t, scalar(t, reader, "SELECT v FROM t WHERE id = 2").i, i64(20))
+
+	// A reader is a snapshot of the state at open, and it cannot write.
+	run(t, writer, "INSERT INTO t (id, v) VALUES (3, 30)")
+	testing.expect_value(t, scalar(t, reader, "SELECT count(*) FROM t").i, i64(2))
+	insert_err := run_error(t, reader, "INSERT INTO t (id, v) VALUES (4, 40)")
+	testing.expect_value(t, insert_err.kind, db.Error_Kind.Transaction_Read_Only)
+	create_err := run_error(t, reader, "CREATE TABLE other (id INTEGER PRIMARY KEY)")
+	testing.expect_value(t, create_err.kind, db.Error_Kind.Transaction_Read_Only)
+	compact_err := db.store_compact(reader)
+	testing.expect_value(t, compact_err.kind, db.Error_Kind.Transaction_Read_Only)
+
+	// The writer can keep writing, but it cannot rewrite the log while a reader
+	// holds the reader byte.
+	run(t, writer, "INSERT INTO t (id, v) VALUES (4, 40)")
+	testing.expect_value(t, scalar(t, writer, "SELECT count(*) FROM t").i, i64(4))
+	writer_compact := db.store_compact(writer)
+	testing.expect_value(t, writer_compact.kind, db.Error_Kind.Locked)
+
+	// A second writer is still refused, even though the reader is allowed in.
+	second, second_err := db.store_open(path, {persistent = true, create = false, durable = false})
+	if !testing.expect(t, !db.error_ok(second_err), "a second writer must be refused") {
+		db.store_close(second)
+	}
+	testing.expect_value(t, second_err.kind, db.Error_Kind.Locked)
+
+	// With the reader gone the writer compacts, and what it wrote survives.
+	db.store_close(reader)
+	reader_open = false
+	testing.expect(t, db.error_ok(db.store_compact(writer)))
+	testing.expect_value(t, scalar(t, writer, "SELECT count(*) FROM t").i, i64(4))
+	db.store_close(writer)
+	writer_open = false
+
+	// And a reader of the compacted log sees the same rows.
+	after, after_err := db.store_open(path, {
+		persistent = true,
+		create     = false,
+		read_only  = true,
+	})
+	if !testing.expectf(t, db.error_ok(after_err), "reader after compact: %s", after_err.message) do return
+	defer db.store_close(after)
+	testing.expect_value(t, scalar(t, after, "SELECT count(*) FROM t").i, i64(4))
+	testing.expect_value(t, scalar(t, after, "SELECT v FROM t WHERE id = 3").i, i64(30))
+}

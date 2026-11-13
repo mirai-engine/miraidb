@@ -112,7 +112,9 @@ def main() -> int:
         if not ok:
             failed.append(gate.name)
             if output:
-                for line in tail(output).splitlines():
+                # More than the last few lines: a suite that fails once in ten runs
+                # is only diagnosable if the reason survives the report.
+                for line in tail(output, 20).splitlines():
                     print(f"     | {line}")
     if failed:
         print(f"\nci: {len(failed)} gate(s) failed: {', '.join(failed)}")

@@ -37,23 +37,27 @@ lock_os_open :: proc(path: string) -> (uintptr, Error) {
 	return uintptr(handle), ERROR_NONE
 }
 
-// The locked byte sits far past any content the lock file will hold. A Windows
+// lock_os_overlapped splits a 64-bit byte offset the way OVERLAPPED wants it.
+@(private)
+lock_os_overlapped :: proc(offset: u64) -> win.OVERLAPPED {
+	overlapped: win.OVERLAPPED
+	overlapped.Offset = u32(offset & 0xFFFF_FFFF)
+	overlapped.OffsetHigh = u32(offset >> 32)
+	return overlapped
+}
+
+// The locked bytes sit past any content the lock file will hold. A Windows
 // byte-range lock also applies to other handles of the same file, even in the
 // same process, so locking byte zero would make the owner text unwritable.
-LOCK_BYTE_OFFSET :: u32(0xFFFF_FFFE)
-
-lock_os_acquire :: proc(handle: uintptr) -> bool {
-	overlapped: win.OVERLAPPED
-	overlapped.Offset = LOCK_BYTE_OFFSET
-	overlapped.OffsetHigh = LOCK_BYTE_OFFSET
-	flags := win.LOCKFILE_EXCLUSIVE_LOCK | win.LOCKFILE_FAIL_IMMEDIATELY
+lock_os_acquire :: proc(handle: uintptr, offset: u64, exclusive: bool) -> bool {
+	overlapped := lock_os_overlapped(offset)
+	flags := u32(win.LOCKFILE_FAIL_IMMEDIATELY)
+	if exclusive do flags |= win.LOCKFILE_EXCLUSIVE_LOCK
 	return win.LockFileEx(win.HANDLE(handle), flags, 0, 1, 0, &overlapped) != false
 }
 
-lock_os_release :: proc(handle: uintptr) {
-	overlapped: win.OVERLAPPED
-	overlapped.Offset = LOCK_BYTE_OFFSET
-	overlapped.OffsetHigh = LOCK_BYTE_OFFSET
+lock_os_release :: proc(handle: uintptr, offset: u64) {
+	overlapped := lock_os_overlapped(offset)
 	_ = win.UnlockFileEx(win.HANDLE(handle), 0, 1, 0, &overlapped)
 }
 
