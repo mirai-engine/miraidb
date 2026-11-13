@@ -965,6 +965,97 @@ test_incremental_join_subscription :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_join_subscription_probes_the_join_key :: proc(t: ^testing.T) {
+	// An equi-join is indexed by its key: a commit visits the rows the key names,
+	// not every row of the joined table. The counter is what proves it -- the
+	// answers were already right when the walk read the whole table.
+	store := fresh_db(t, "joinsub_probe")
+	if store == nil do return
+	host := db.host_init(store)
+	defer db.host_destroy(host)
+	defer cleanup_db(store, "joinsub_probe")
+
+	run(t, store, "CREATE TABLE author (id INTEGER PRIMARY KEY, name TEXT)")
+	run(t, store, "CREATE TABLE book (id INTEGER PRIMARY KEY, author_id INTEGER, title TEXT)")
+	authors := 200
+	books := 900
+	insert_authors := strings.builder_make()
+	defer strings.builder_destroy(&insert_authors)
+	strings.write_string(&insert_authors, "INSERT INTO author (id, name) VALUES ")
+	for i in 0 ..< authors {
+		if i > 0 do strings.write_string(&insert_authors, ", ")
+		fmt.sbprintf(&insert_authors, "(%d, 'a%d')", i + 1, i + 1)
+	}
+	run(t, store, strings.to_string(insert_authors))
+	insert_books := strings.builder_make()
+	defer strings.builder_destroy(&insert_books)
+	strings.write_string(&insert_books, "INSERT INTO book (id, author_id, title) VALUES ")
+	for i in 0 ..< books {
+		if i > 0 do strings.write_string(&insert_books, ", ")
+		fmt.sbprintf(&insert_books, "(%d, %d, 'b%d')", i + 1, (i % authors) + 1, i + 1)
+	}
+	run(t, store, strings.to_string(insert_books))
+
+	sql := "SELECT author.name, book.title FROM author JOIN book ON author.id = book.author_id"
+	id, snapshot, sub_err := db.host_subscribe(host, sql)
+	if !testing.expectf(t, db.error_ok(sub_err), "subscribe: %s", sub_err.message) do return
+	set := join_set_from_snapshot(snapshot)
+	testing.expect_value(t, len(set), books)
+	for row in snapshot do db.free_values(row)
+	delete(snapshot)
+
+	deltas := new(Join_Deltas)
+	defer free(deltas)
+	host.on_update = join_delta_capture
+	host.on_update_ctx = deltas
+
+	// A new book probes its author: one candidate, not `authors` of them.
+	before := db.host_join_rows_walked(host)
+	run(t, store, "INSERT INTO book (author_id, title) VALUES (7, 'n1')")
+	walked := db.host_join_rows_walked(host) - before
+	join_set_apply(t, &set, deltas, 2)
+	inserts, deletes := join_deltas_clear(deltas)
+	testing.expectf(t, inserts == 1 && deletes == 0, "insert published %d/%d", inserts, deletes)
+	testing.expectf(t, walked <= 4, "an insert walked %d rows of %d authors", walked, authors)
+
+	// A change on the base side probes the books of that author: the five that
+	// point at it, not all 900 books.
+	before = db.host_join_rows_walked(host)
+	run(t, store, "UPDATE author SET name = 'renamed' WHERE id = 7")
+	walked = db.host_join_rows_walked(host) - before
+	join_set_apply(t, &set, deltas, 2)
+	inserts, deletes = join_deltas_clear(deltas)
+	testing.expectf(t, inserts == deletes && inserts >= 4, "update published %d/%d", inserts, deletes)
+	testing.expectf(t, walked <= 8, "an update walked %d rows of %d books", walked, books)
+	join_set_matches_fresh(t, host, sql, &set, "after the probe")
+
+	// Moving a book to another author takes it out of the old key and files it
+	// under the new one, so both sides answer correctly afterwards.
+	run(t, store, "UPDATE book SET author_id = 1 WHERE id = 8")
+	join_set_apply(t, &set, deltas, 2)
+	inserts, deletes = join_deltas_clear(deltas)
+	testing.expectf(t, inserts == 1 && deletes == 1, "move published %d/%d", inserts, deletes)
+	join_set_matches_fresh(t, host, sql, &set, "after the move")
+
+	// A join that cannot be indexed still answers: the key here is an expression,
+	// so the walk reads the table and the deltas stay correct.
+	expr_sql := "SELECT author.name, book.title FROM author JOIN book ON author.id + 0 = book.author_id"
+	expr_id, expr_snapshot, expr_err := db.host_subscribe(host, expr_sql)
+	if testing.expectf(t, db.error_ok(expr_err), "subscribe: %s", expr_err.message) {
+		testing.expect_value(t, len(expr_snapshot), books + 1)
+		for row in expr_snapshot do db.free_values(row)
+		delete(expr_snapshot)
+		updates_before := deltas.updates
+		run(t, store, "INSERT INTO book (author_id, title) VALUES (3, 'n2')")
+		testing.expect(t, deltas.updates > updates_before)
+		join_deltas_clear(deltas)
+		db.host_unsubscribe(host, expr_id)
+	}
+	db.host_unsubscribe(host, id)
+	join_set_destroy(&set)
+}
+
+@(test)
 test_incremental_aggregate_subscription :: proc(t: ^testing.T) {
 	store := fresh_db(t, "aggsub_inc")
 	if store == nil do return

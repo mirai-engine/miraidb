@@ -25,6 +25,13 @@
   refusal so it fails the gate the day it works.
 - One owner per database directory (OS lock), and a broker that serves other
   processes over HTTP, WebSocket frames and Postgres.
+- A join subscription indexes the key of its equi-join, so a commit probes the
+  matches instead of walking the joined tables: over 200 authors and 900 books an
+  insert visits one candidate and a base-row change six, where it used to read
+  200 and 900. A join that cannot be indexed (an expression key, two types, a
+  `FLOAT` key, a paged table) falls back to the full evaluation.
+- A join subscription walks the tables it reads instead of copying every row of
+  them into the transaction arena, which was 80 bytes a row per commit.
 - A read transaction copies nothing: it takes one reference per table, and a
   commit that has to change a table a reader holds copies that table first, so
   the cost is per written table and only while a reader is open. Opening a read

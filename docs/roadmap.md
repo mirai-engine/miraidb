@@ -19,7 +19,7 @@ releases is worth shipping.
 
 | # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
-| 1 | **D6 — the delta of a join subscription** | Index the join key per table so a commit costs the rows it touched instead of collecting every row of the other tables; then the smaller planner gaps: probe the joined side, `ORDER BY` from an index, calibrated constants, statistics that announce staleness, a histogram for a bound value, an estimate for a view, and the subscription path using the planned order. | L | — |
+| 1 | **D6 — the planner's remaining gaps** | The join delta is done: an equi-join is indexed by its key and a commit probes the matches. What is left is the pricing: probe an index for the joined side, serve `ORDER BY` from an index, calibrate the cost constants, let the statistics announce staleness (`analyzed_seq` against `commit_seq`), consult the histogram for a bound value, estimate a view in `FROM`, and let the subscription path use the planned order. | L | — |
 | 2 | **D9 — the rest of the grammar** | `RANGE`/`GROUPS` frames, windows beside `GROUP BY`, `BEFORE` triggers, `ALTER` type changes, more collations, user functions. | L | — |
 | 3 | **ASAN pass** over the CLI, soak and conformance — *partly done* | Bounds and stack are covered today. Odin's heap allocator is not intercepted on Windows (a deliberate use-after-free is not reported), so the heap half runs with the POSIX toolchain in #14. | 1 round | 12 |
 | 4 | **D2 — spatial tree** | Node pages and a descent replace the scan over box columns. | M | — |
@@ -60,15 +60,16 @@ measurable dimension. Measured on this tree:
 | Commit record | one record, CRC32C, group commit | durability never traded for speed silently |
 | Compaction | 0.48 s for 50k rows, one file left | same |
 | Memory per row | `Row` 80 B, `Value` 24 B | no growth without a written reason |
-| Subscription delta | O(rows touched) for one table; a join re-collects every row of the other tables on each commit | O(rows touched) for the table the commit changed (D6, not met for joins) |
+| Subscription delta | O(rows touched), for a join too: an equi-join is indexed by its key, so a commit probes the matches (one candidate for an insert, six for a base-row change, in a fixture of 200 authors and 900 books, where it used to read 200 and 900) | O(rows touched) for the table the commit changed |
 
 These are the numbers the gate compares against and the targets the engine is
-held to. One row is recorded as **not met** rather than quietly relaxed: a join
-subscription re-collects every row of the other tables on each commit, which is
-item 1. The read row is met by moving the copy rather than hiding it: a read
-copies nothing, and the commit pays for the table it writes while a reader holds
-it, once per read generation. `bench-read` reports the read and that commit
-separately, and `scripts/bench.py` gates both.
+held to, and every row is met today. The read row is met by moving the copy
+rather than hiding it: a read copies nothing, and the commit pays for the table it
+writes while a reader holds it, once per read generation. `bench-read` reports the
+read and that commit separately, and `scripts/bench.py` gates both. The
+subscription row is met by the join index, and
+`test_join_subscription_probes_the_join_key` counts the candidates a commit
+walks, so a regression to the scan fails the suite.
 
 ## Reusing the engine's networking for D14
 

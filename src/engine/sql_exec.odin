@@ -2740,6 +2740,8 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 				}
 			}
 			for source in ctx.sources {
+				// A source the caller has not bound yet has no columns.
+				if source.table == nil do continue
 				matches := strings.equal_fold(e.table, source.table.schema.name) ||
 					(len(source.alias) > 0 && strings.equal_fold(e.table, source.alias))
 				if !matches do continue
@@ -2767,7 +2769,7 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 		found_value: Value
 		found := false
 		for source in ctx.sources {
-			if source.hidden_unqualified do continue
+			if source.table == nil || source.hidden_unqualified do continue
 			index, exists := schema_column_index(&source.table.schema, e.name)
 			if !exists do continue
 			if found {
@@ -2782,6 +2784,7 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 		}
 		if !found && strings.equal_fold(e.name, "rank") {
 			for source in ctx.sources {
+				if source.table == nil do continue
 				if score, scored := fts_rank_value(ctx.tx, source.table.schema.name, source.row.id); scored {
 					return value_float(score), ERROR_NONE
 				}

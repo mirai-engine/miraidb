@@ -27,7 +27,7 @@ Rules for this file:
 | D3 | Snapshot cost — *done* | a read copies nothing (one reference per table); a commit copies the table it writes when a reader holds it, once per read generation: read after a commit 38 µs on the gate, commit against a reader 16.9 ms (`test_a_commit_copies_the_table_a_reader_holds`) | automatic version retention | M | P2 |
 | D4 | Page backend | `.sqlite` is rewritten whole per commit | pages in place, WAL frames, free list | XL | P1 |
 | D5 | Persistent indexes | **done**: index keys live in B+trees of pages, with a pool, a cursor over chained leaves and a memory gate | merging empty leaves; a trusted open without replay (D18b) | L | P0 |
-| D6 | Query planner — *done* | `ANALYZE` measures row counts, per-column distinct/NULL counts, the numeric range and a sixteen-bucket histogram into `<db>/stats`; the plan prices scan against probe from those numbers, picks between index candidates, prints `est. N rows, cost C`, and orders joins by the rows each relation keeps per outer row with every ON travelling to the step that can answer it (`test_analyze_and_plan_estimates`, `test_plan_reorders_a_join`, `scripts/plan_check.py`) | probing an index for a joined table, `ORDER BY` from an index, calibrated cost constants | L | P1 |
+| D6 | Query planner — *done, the pricing half open* | `ANALYZE` measures row counts, per-column distinct/NULL counts, the numeric range and a sixteen-bucket histogram into `<db>/stats`; the plan prices scan against probe from those numbers, picks between index candidates, prints `est. N rows, cost C`, and orders joins by the rows each relation keeps per outer row with every ON travelling to the step that can answer it (`test_analyze_and_plan_estimates`, `test_plan_reorders_a_join`, `scripts/plan_check.py`) | probing an index for a joined table, `ORDER BY` from an index, calibrated cost constants | L | P1 |
 | D7 | Scheduler durability | **durable** (due time is a logged column) | recovery test | S | — |
 | D8 | Crash injection | **done**: `Fault_Vfs` fails any operation at any call, and `test_fault_injection` walks the write offsets | same for the snapshot and the mirror writes | S | P1 |
 | D9 | SQL grammar | 32 statements, **`ROWS` frames, trigger `WHEN` and `RENAME COLUMN` done** (`test_window_frames`, `test_trigger_when`, `test_alter_rename_column`) | windows beside `GROUP BY`, `RANGE`/`GROUPS`, `BEFORE`, `ALTER` type changes, collations, user functions, `GROUP BY` on an alias | L | P2 |
@@ -316,25 +316,32 @@ executor takes the same decisions the plan prints (`test_analyze_and_plan_estima
 `test_plan_reorders_a_join`), and `scripts/plan_check.py` is the regression gate
 that fails when a known-good plan gets worse.
 
-**Not done.** A joined table is still scanned rather than probed, `ORDER BY` never
-comes from an index, and the cost constants are chosen by hand — they encode "a
-row through an index costs four rows in place" and have not been calibrated against
-a measurement. Three gaps come from choosing the plan off the statement text
-alone: a bound value never reaches the histogram (`v < ?` estimates a third of the
-table where `v < 50` estimates fifty of four hundred rows), a view in `FROM`
-prints no estimate, and the statistics never announce that they are older than
-the data — the file stores `analyzed_seq` and no one compares it with
-`commit_seq`. The incremental subscription path (`host_join_prepare`) still walks
-a join in the written order, so a subscription and the same query can do
-different work for the same delta. Worse, `host_apply_incremental_join` calls
-`host_join_tables`, which `tx_collect`s **every row of every joined table on
-each commit**: only the changed row is fixed, the rest are enumerated to test the
-`ON`. The tuple index is used to remove a stale tuple, not to find candidates, so
-a join subscription over two 50 000-row tables copies ~100 000 rows per commit
-instead of the rows the commit touched. Indexing the join key per table
-(`host_join_index_row` already builds the tuple index at subscription creation)
-is the work, and `docs/roadmap.md` records the contract row as not met for
-joins.
+**Done: the join delta.** A join subscription indexes the key of an equi-join
+instead of collecting the joined tables. `host_join_plan_probes` reads every `ON`
+clause and, for each equality between two plain columns of the same type, records
+a probe in both directions: the later source is found from the values of the
+earlier ones, and the earlier source is found from the changed row when the commit
+touched the later one. `host_join_index` files each source's rows under that key
+(buckets live in the subscription's arena) and follows inserts, updates and deletes,
+so a commit evaluates the matches and not the table. An expression that cannot be
+indexed (an arithmetic key, two different types, a `FLOAT` key, a paged source)
+takes the full re-evaluation instead, which is correct and slow rather than wrong.
+`test_join_subscription_probes_the_join_key` counts the candidates: over 200
+authors and 900 books an insert walks one and a base-row change walks six, where
+the collect walked 200 and 900; the answers are checked against a fresh
+subscription after every step.
+
+**Not done.** A joined table is still scanned rather than probed by the *planner*,
+`ORDER BY` never comes from an index, and the cost constants are chosen by hand —
+they encode "a row through an index costs four rows in place" and have not been
+calibrated against a measurement. Three gaps come from choosing the plan off the
+statement text alone: a bound value never reaches the histogram (`v < ?` estimates
+a third of the table where `v < 50` estimates fifty of four hundred rows), a view
+in `FROM` prints no estimate, and the statistics never announce that they are
+older than the data — the file stores `analyzed_seq` and no one compares it with
+`commit_seq`. The incremental subscription path (`host_join_prepare`) lays out the
+walk in the order the query was written, so a subscription and the same query can
+do different work for the same delta.
 
 **Cost.** A join is evaluated in the order it was written; the only cardinality
 information is "this predicate has an index".

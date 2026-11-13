@@ -64,6 +64,15 @@ Subscription_Query :: struct {
 	join_tuples:    map[string]Join_Tuple,
 	join_by_row:    map[Source_Row][dynamic]string,
 	join_counts:    map[string]int,
+	// join_probes holds, for every source after the first, the equality that
+	// binds it to the sources before it (or column = -1 when there is none), and
+	// join_index is that equality as a hash of the source's rows, so a commit
+	// probes the matches instead of walking the table. join_keys remembers the
+	// key of every indexed row, so an update or a delete can take it back out.
+	join_probes:    []Join_Probe,
+	join_reverse:   []Join_Probe,
+	join_index:     []map[string][dynamic]Row_Id,
+	join_keys:      map[Source_Row]string,
 	// agg marks a grouped query over one table (or one aggregate over all of
 	// it). Its state is one entry per group with the rows that feed it and the
 	// row last published, so a commit recomputes only the groups it touches.
@@ -87,6 +96,20 @@ Agg_Group :: struct {
 Source_Row :: struct {
 	source: int,
 	id:     Row_Id,
+}
+
+// Join_Probe is how one source of a join subscription is found from the sources
+// bound before it: `left` evaluates to a value from those sources, and `column`
+// is the source column its rows are indexed by. A probe exists only when the ON
+// clause compares two plain columns of the same type, because the key is a
+// typed encoding of the value.
+Join_Probe :: struct {
+	left:   ^Expr,
+	column: int,
+	// other is the source `left` reads. A probe whose other source is bound --
+	// the sources before this one, or the source the commit changed -- can be
+	// used; any other is skipped.
+	other:  int,
 }
 
 // Join_Tuple is one combination of source rows in a join subscription. `ids`
@@ -151,6 +174,9 @@ Host :: struct {
 	// incremental_updates counts the deltas applied row by row instead of by
 	// re-evaluating the query.
 	incremental_updates:  u64,
+	// join_rows_walked counts the candidate rows the incremental join path
+	// visited. It is diagnostic: a test proves a commit costs the matches.
+	join_rows_walked:     u64,
 	now_us:               i64,
 	// token_counter keeps issued tokens distinct within one process.
 	token_counter:        u64,
@@ -558,6 +584,212 @@ host_join_key :: proc(ids: []Row_Id, alloc: mem.Allocator) -> string {
 	return string(bytes)
 }
 
+// host_join_columns resolves an expression to the source and column it names. It
+// accepts only a plain column reference, qualified by alias or table name, or
+// unqualified when exactly one source has that column.
+@(private)
+host_join_columns :: proc(
+	expr: ^Expr,
+	tables: []^Table,
+	aliases: []string,
+) -> (
+	source: int,
+	column: int,
+	ok: bool,
+) {
+	if expr == nil do return 0, 0, false
+	reference, is_column := expr^.(Column_Expr)
+	if !is_column do return 0, 0, false
+	if len(reference.table) > 0 {
+		for table, i in tables {
+			alias := aliases[i]
+			if !strings.equal_fold(alias, reference.table) &&
+			   !strings.equal_fold(table.schema.name, reference.table) {
+				continue
+			}
+			index, found := schema_column_index(&table.schema, reference.name)
+			if !found do return 0, 0, false
+			return i, index, true
+		}
+		return 0, 0, false
+	}
+	seen := -1
+	seen_column := 0
+	for table, i in tables {
+		index, found := schema_column_index(&table.schema, reference.name)
+		if !found do continue
+		// An unqualified name that two sources have cannot be resolved here.
+		if seen >= 0 do return 0, 0, false
+		seen = i
+		seen_column = index
+	}
+	if seen < 0 do return 0, 0, false
+	return seen, seen_column, true
+}
+
+// host_join_keyed reports whether a column type can index a join equality. The
+// key is the typed encoding of a value, so the two sides must agree on the type,
+// and floats are left out because a key distinguishes -0.0 from 0.0 while `=`
+// does not.
+@(private)
+host_join_keyed :: proc(t: Column_Type) -> bool {
+	switch t.kind {
+	case .Bool, .Int, .Uint, .String, .Bytes, .Timestamp, .Uuid, .Duration, .Identity, .Connection:
+		return true
+	case .Float, .Unit, .Option, .Result, .Array, .Product, .Any:
+		return false
+	}
+	return false
+}
+
+// host_join_plan_on reads the equality terms of one ON clause and records, for
+// both sources it names, how the other one finds them.
+@(private)
+host_join_plan_on :: proc(
+	entry: ^Subscription_Query,
+	on: ^Expr,
+	tables: []^Table,
+	aliases: []string,
+	level: int,
+) {
+	if on == nil do return
+	binary, is_binary := on^.(Binary_Expr)
+	if !is_binary do return
+	if binary.op == .And {
+		host_join_plan_on(entry, binary.left, tables, aliases, level)
+		host_join_plan_on(entry, binary.right, tables, aliases, level)
+		return
+	}
+	if binary.op != .Eq do return
+	left_source, left_column, left_ok := host_join_columns(binary.left, tables, aliases)
+	right_source, right_column, right_ok := host_join_columns(binary.right, tables, aliases)
+	if !left_ok || !right_ok || left_source == right_source do return
+	left_type := tables[left_source].schema.columns[left_column].type
+	right_type := tables[right_source].schema.columns[right_column].type
+	if !host_join_keyed(left_type) do return
+	if left_type.kind != right_type.kind || left_type.width != right_type.width do return
+	// The later source is the one the walk reaches second, so it is probed from
+	// the values of the earlier ones; the earlier source is probed from the
+	// changed row when the commit touched the later one.
+	later := max(left_source, right_source)
+	earlier := min(left_source, right_source)
+	later_column := left_source == later ? left_column : right_column
+	earlier_column := left_source == earlier ? left_column : right_column
+	later_expr := left_source == later ? binary.left : binary.right
+	earlier_expr := left_source == earlier ? binary.left : binary.right
+	if entry.join_probes[later].column < 0 {
+		entry.join_probes[later] = Join_Probe{left = earlier_expr, column = later_column, other = earlier}
+	}
+	// The reverse probe only helps when it indexes the same column, because a
+	// source keeps one index.
+	if entry.join_reverse[earlier].column < 0 {
+		indexed := host_join_index_column(entry, earlier)
+		if indexed < 0 || indexed == earlier_column {
+			entry.join_reverse[earlier] = Join_Probe{
+				left   = later_expr,
+				column = earlier_column,
+				other  = later,
+			}
+		}
+	}
+	_ = level
+}
+
+// host_join_index_column is the column a source is indexed by, or -1 when no
+// equality names one.
+@(private)
+host_join_index_column :: proc(entry: ^Subscription_Query, level: int) -> int {
+	if level < 0 || level >= len(entry.join_probes) do return -1
+	if entry.join_probes[level].column >= 0 do return entry.join_probes[level].column
+	if level < len(entry.join_reverse) do return entry.join_reverse[level].column
+	return -1
+}
+
+// host_join_plan_probes decides how each source is found and allocates the index
+// that holds its rows.
+@(private)
+host_join_plan_probes :: proc(
+	entry: ^Subscription_Query,
+	stmt: Select_Stmt,
+	tables: []^Table,
+	aliases: []string,
+) {
+	count := len(tables)
+	entry.join_probes = make([]Join_Probe, count, entry.join_allocator)
+	entry.join_reverse = make([]Join_Probe, count, entry.join_allocator)
+	entry.join_index = make([]map[string][dynamic]Row_Id, count, entry.join_allocator)
+	for level in 0 ..< count {
+		entry.join_probes[level] = Join_Probe{column = -1, other = -1}
+		entry.join_reverse[level] = Join_Probe{column = -1, other = -1}
+	}
+	for level in 1 ..< count {
+		host_join_plan_on(entry, stmt.joins[level - 1].on, tables, aliases, level)
+	}
+	for level in 0 ..< count {
+		if host_join_index_column(entry, level) < 0 do continue
+		entry.join_index[level] = make(map[string][dynamic]Row_Id)
+	}
+}
+
+// host_join_index_add files one row under its key. The bucket lives in the
+// subscription's arena, so it is released with the subscription.
+@(private)
+host_join_index_add :: proc(
+	entry: ^Subscription_Query,
+	source: int,
+	id: Row_Id,
+	values: []Value,
+) {
+	column := host_join_index_column(entry, source)
+	if column < 0 || column >= len(values) do return
+	value := values[column]
+	if value.kind == .Null do return
+	previous := context.allocator
+	context.allocator = entry.join_allocator
+	defer context.allocator = previous
+	key := encode_output_key_alloc([]Value{value}, entry.join_allocator)
+	bucket := entry.join_index[source][key]
+	append(&bucket, id)
+	entry.join_index[source][key] = bucket
+	entry.join_keys[Source_Row{source = source, id = id}] = key
+}
+
+// host_join_index_remove takes a row back out of the index, using the key it was
+// filed under. The bucket is rebuilt in the arena; the old one is released with
+// the subscription.
+@(private)
+host_join_index_remove :: proc(entry: ^Subscription_Query, source: int, id: Row_Id) {
+	row := Source_Row{source = source, id = id}
+	key, had := entry.join_keys[row]
+	if !had do return
+	delete_key(&entry.join_keys, row)
+	if source < 0 || source >= len(entry.join_index) do return
+	bucket, found := entry.join_index[source][key]
+	if !found do return
+	kept := make([dynamic]Row_Id, 0, len(bucket), entry.join_allocator)
+	for other in bucket {
+		if other != id do append(&kept, other)
+	}
+	if len(kept) == 0 {
+		delete_key(&entry.join_index[source], key)
+		return
+	}
+	entry.join_index[source][key] = kept
+}
+
+// host_join_index_build files every live row of every probed source.
+@(private)
+host_join_index_build :: proc(entry: ^Subscription_Query, tables: []^Table) {
+	for level in 0 ..< len(tables) {
+		// A source with no equality of its own keeps no index.
+		if host_join_index_column(entry, level) < 0 do continue
+		for _, row in tables[level].rows {
+			if row.deleted_seq != 0 do continue
+			host_join_index_add(entry, level, row.id, row.values)
+		}
+	}
+}
+
 // host_join_index_row records that a row takes part in a tuple.
 @(private)
 host_join_index_row :: proc(
@@ -681,6 +913,9 @@ Join_Walk :: struct {
 	tables:   []^Table,
 	aliases:  []string,
 	sources:  []Source,
+	// walked counts the candidate rows this walk visited. The engine keeps it so
+	// a test can prove a commit costs the matches and not the table.
+	walked:   ^u64,
 	// fixed is the source that holds the row the commit changed, or -1 when the
 	// enumeration walks every table (the rebuild).
 	fixed:    int,
@@ -703,6 +938,9 @@ host_join_walk :: proc(walk: ^Join_Walk, level: int) -> bool {
 		walk.sources[level] = Source{table = table, row = row, alias = alias}
 		return host_join_walk(walk, level + 1)
 	}
+	if probe, has := host_join_level_probe(walk, level); has {
+		return host_join_walk_probe(walk, level, probe)
+	}
 	// The table cannot move under this transaction: a commit that has to change
 	// a table a reader holds copies it first, so walking the live rows is stable
 	// and costs no copy of its own.
@@ -710,6 +948,58 @@ host_join_walk :: proc(walk: ^Join_Walk, level: int) -> bool {
 		if row.deleted_seq != 0 do continue
 		if walk.tx.store.cancelled do return false
 		walk.sources[level] = Source{table = table, row = row, alias = alias}
+		if walk.walked != nil do walk.walked^ += 1
+		if !host_join_walk(walk, level + 1) do return false
+	}
+	return true
+}
+
+// host_join_level_probe returns a probe for one source when the source its left
+// side reads is already bound: the sources before it, or the row the commit
+// changed. Otherwise the rows have to be walked.
+@(private)
+host_join_level_probe :: proc(walk: ^Join_Walk, level: int) -> (Join_Probe, bool) {
+	entry := walk.entry
+	if level < len(entry.join_probes) {
+		probe := entry.join_probes[level]
+		if probe.column >= 0 && probe.other >= 0 && walk.sources[probe.other].table != nil {
+			return probe, true
+		}
+	}
+	if level < len(entry.join_reverse) {
+		probe := entry.join_reverse[level]
+		if probe.column >= 0 && probe.other >= 0 && walk.sources[probe.other].table != nil {
+			return probe, true
+		}
+	}
+	return {}, false
+}
+
+// host_join_walk_probe finds the rows of one source that match the sources bound
+// before it. It evaluates the left side against the bound rows, so an ON clause
+// like `a.id = b.author_id` costs the rows the key names, not the table.
+@(private)
+host_join_walk_probe :: proc(walk: ^Join_Walk, level: int, probe: Join_Probe) -> bool {
+	table := walk.tables[level]
+	ctx := Eval_Ctx {
+		tx     = walk.tx,
+		now_us = now_microseconds(),
+	}
+	ctx.sources = walk.sources
+	value, eval_err := eval_expr(&ctx, probe.left)
+	if eval_err.kind != .None do return false
+	// NULL never equals anything, so it matches no row.
+	if value.kind == .Null do return true
+	key := encode_output_key_alloc([]Value{value}, context.allocator)
+	defer delete(key)
+	bucket, found := walk.entry.join_index[level][key]
+	if !found do return true
+	for id in bucket {
+		row, exists := table.rows[id]
+		if !exists || row.deleted_seq != 0 do continue
+		if walk.tx.store.cancelled do return false
+		walk.sources[level] = Source{table = table, row = row, alias = walk.aliases[level]}
+		if walk.walked != nil do walk.walked^ += 1
 		if !host_join_walk(walk, level + 1) do return false
 	}
 	return true
@@ -1213,7 +1503,15 @@ host_join_rebuild :: proc(
 	entry.join_by_row = make(map[Source_Row][dynamic]string)
 	delete(entry.join_counts)
 	entry.join_counts = make(map[string]int)
+	delete(entry.join_keys)
+	entry.join_keys = make(map[Source_Row]string)
+	// The probes and their buckets live in the arena, so they go with it.
+	entry.join_probes = nil
+	entry.join_reverse = nil
+	entry.join_index = nil
 	virtual.arena_free_all(&entry.join_arena)
+	host_join_plan_probes(entry, stmt, tables, aliases)
+	host_join_index_build(entry, tables)
 
 	sources := make([]Source, len(tables), tx.alloc)
 	defer delete(sources, tx.alloc)
@@ -1225,6 +1523,7 @@ host_join_rebuild :: proc(
 		tables   = tables,
 		aliases  = aliases,
 		sources  = sources,
+		walked   = &host.join_rows_walked,
 		fixed    = -1,
 		inserts  = nil,
 	}
@@ -1340,6 +1639,19 @@ host_apply_incremental_join :: proc(
 			}
 		}
 		if changed < 0 do continue
+		// Keep the probe index of the changed source current: the walk finds
+		// its candidates there, so it must not see the row under its old key.
+		if op.kind == .Update || op.kind == .Delete {
+			host_join_index_remove(entry, changed, op.row_id)
+		}
+		if op.kind == .Insert || op.kind == .Update {
+			host_join_index_add(entry, changed, op.row_id, op.values)
+		}
+		// The changed row is bound before the enumeration starts: that is what
+		// lets a probe read its values from an earlier level.
+		if row, exists := tables[changed].rows[op.row_id]; exists && row.deleted_seq == 0 {
+			sources[changed] = Source{table = tables[changed], row = row, alias = aliases[changed]}
+		}
 		switch op.kind {
 		case .Insert, .Update:
 			host_join_remove_row(entry, changed, op.row_id, &deletes)
@@ -1350,7 +1662,8 @@ host_apply_incremental_join :: proc(
 				expanded = expanded,
 				tables   = tables,
 				aliases  = aliases,
-						sources  = sources,
+				sources  = sources,
+				walked   = &host.join_rows_walked,
 				fixed    = changed,
 				fixed_id = op.row_id,
 				inserts  = &inserts,
@@ -2248,6 +2561,12 @@ host_client_should_drop :: proc(host: ^Host, owner: u64) -> bool {
 // host_incremental_updates reports how many deltas were applied row by row.
 host_incremental_updates :: proc(host: ^Host) -> u64 {
 	return host.incremental_updates
+}
+
+// host_join_rows_walked reports how many candidate rows the incremental join path
+// has visited. A commit over an equi-join should visit the matches, not the table.
+host_join_rows_walked :: proc(host: ^Host) -> u64 {
+	return host.join_rows_walked
 }
 
 host_client_count :: proc(host: ^Host) -> int {
