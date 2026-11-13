@@ -1,10 +1,11 @@
 # Backlog: depth work
 
-The roadmap is closed: every feature in `docs/features.md` has an interface, a
-test and a documented cost. This file is the other axis — **depth**. It lists the
-places where the implementation answers the interface at a lower cost than a
-mature engine would, what the current behaviour actually costs, what "done"
-means, and how big the work is.
+The parity matrix is closed: every feature in `docs/features.md` has an
+interface, a test and a documented cost, and `docs/roadmap.md` orders what is
+left. This file is the other axis — **depth**. It lists the places where the
+implementation answers the interface at a lower cost than a mature engine would,
+what the current behaviour actually costs, what "done" means, and how big the
+work is.
 
 Rules for this file:
 
@@ -564,3 +565,86 @@ stay listed so the order can be read as a whole.
 7. **D9**, **D2**, **D10**, **D16**: independent surface work.
 8. **D12c**, **D15**, **D14**: the module sandbox, the network, replication.
 9. **Licences** and the release review last, before each public release.
+
+## D19 — CASE expressions
+
+**Now.** `CASE` is not parsed: `SELECT CASE WHEN x > 1 THEN 'b' ELSE 'a' END`
+fails with `sql_unsupported: CASE expressions are not supported`, and
+`docs/sqlite.md` used to mark the row `done` until the audit of this tree
+corrected it.
+
+**Why it matters.** It is the most used conditional expression in SQLite queries
+(conditional aggregation, bucketing, `ORDER BY` keys) and the only statement the
+compatibility matrix still lists as missing. A query ported from SQLite either
+fails or is rewritten as several `iif()` calls.
+
+**Scope.** Simple (`CASE x WHEN a THEN …`) and searched (`CASE WHEN cond THEN …`)
+forms, evaluated wherever an expression is allowed: projections, `WHERE`,
+`GROUP BY`, `HAVING`, `ORDER BY`, `UPDATE … SET` and generated columns. Evaluate
+it as an expression, not as syntax sugar, so policies and triggers see it too.
+`ELSE` absent yields `NULL`; a `NULL` condition is not true; the result type is
+the common type of the chosen branch, as `value_compare`/coercion already decide
+for `iif`.
+
+**Done when.** Both forms parse, the tests cover the branch chosen, the missing
+`ELSE`, a `NULL` condition, a `NULL` branch and a nested `CASE`; `docs/sqlite.md`
+turns the row `done`; and a `CASE` in a policy or trigger works.
+
+**Cost.** M (one parser production, one evaluator case, tests).
+
+## D20 — A differential runner against SQLite
+
+**Now.** `scripts/conformance.py` runs 20 statements through the CLI and checks
+substrings of the output. It is a smoke: no joins, CTEs, windows, triggers, JSON,
+`ALTER`, `UPSERT`, three-valued logic or `DISTINCT` aggregates. The audit of this
+tree found two wrong answers (`IN`/`NOT IN` with `NULL`, `DISTINCT` inside an
+aggregate) that the suite could not see, and neither could this corpus.
+
+**Why it matters.** A hand-written suite tests what its author thought of. A
+differential runner tests the engine against a reference implementation over a
+corpus: same schema, same rows, same query, and the answers must match exactly
+(or the engine must refuse the statement with a reason, and the refusal is listed
+as intentional). That is the only cheap way to find the next `IN`/`NULL`.
+
+**Scope.** Build the same database through both engines (avoiding features that
+are intentionally absent), run a corpus of queries and compare the rows, the
+column names and the order where the query says `ORDER BY`. Start with the
+existing 20 cases plus: inner/left/cross joins, aggregates with `DISTINCT`,
+`GROUP BY`/`HAVING`, window frames, `LIKE`/`GLOB`/`ESCAPE`, `CAST`, integer
+overflow, `IN`/`NOT IN`/`BETWEEN` with `NULL`, subqueries, `UPSERT` with
+`excluded`, `RETURNING`, CTEs, triggers, JSON functions and `ALTER`. A statement
+the engine refuses is recorded in a list with the reason, so a new refusal fails
+the gate until someone writes it down.
+
+**Not in scope.** Cases where SQLite's behaviour is deliberately different
+(`1/0`, `CAST('abc' AS INTEGER)`, integer overflow, comparing text with a
+number). They are listed in `docs/sqlite.md` and in this file, so the runner
+skips them with a comment.
+
+**Done when.** The runner is a CI gate, the corpus covers the areas above, and a
+deliberate wrong answer (e.g. `count(DISTINCT x)` returning the row count) makes
+it fail.
+
+**Cost.** M (a generator for the corpus, the two databases, the comparison and
+the refusal list).
+
+## D21 — Documentation that cannot drift
+
+**Done.** `scripts/docs_check.py` is a CI gate: it reads the version the library
+reports and compares it with `CHANGELOG.md`; counts the `@(test)` declarations
+and compares them with `status.md`; asks `ci.py --list` how many gates exist and
+compares every document that states the number; compares the CLI commands the
+usage text lists with the list in `status.md`; resolves every relative link in
+`README.md` and `docs/*.md`; checks that every `D<n>` named in the roadmap exists
+in this file and that each roadmap row has the five cells the table needs;
+refuses an orphan document (one no other document links to); and scans the tree
+for the names the project does not use.
+
+**Why.** Three of the findings in the audit were sentences that had stopped being
+true — a test count, a gate count, and a matrix row that claimed a feature nobody
+had written — and nothing failed when the engine moved on.
+
+**Left.** It checks numbers and links, not prose: a paragraph that describes an
+old design (the kind of thing the audit found in `sql.md` and `README.md`) still
+needs a reader. The gate makes the cheap half impossible; the other half stays an
+editorial duty, listed in `CONTRIBUTING.md`.

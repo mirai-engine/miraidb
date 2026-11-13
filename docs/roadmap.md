@@ -1,121 +1,71 @@
-# Roadmap: every pending item, in priority order
+# Roadmap: what is left, in priority order
 
-The feature matrix is closed (`docs/features.md`, 94 rows, 100/100). This file is
-the authoritative order for the work that is left; [backlog.md](backlog.md) holds
-the detail and the cost of each item, and [status.md](status.md) the honest
-measurement of today.
+The parity matrix is closed (`docs/features.md`, 94 rows, 100/100) and the work
+that closed it is recorded at the end of this file. This file is the
+authoritative order for what is left; [backlog.md](backlog.md) carries the detail
+and the cost of each item, and [status.md](status.md) the measurements.
 
-**Scope note.** End-user documentation (guide, SQL reference, tutorials) is out of
-scope here: it is maintained outside this repository. This file plans engine work
-only — features, acceptance criteria and order.
+**Scope note.** End-user documentation (guide, SQL reference, tutorials) is out
+of scope here: it is maintained outside this repository. This file plans engine
+work only — features, acceptance criteria and order.
 
 **Priority rule.** Order is set by what blocks real use and what protects
-everything else, not by what is most interesting. An item that removes a way to
-lose data outranks an item that adds a capability; an item another item depends on
-outranks the dependent.
+everything else, not by what is most interesting. An item that removes a risk of
+a wrong answer outranks an item that adds a capability; an item another item
+depends on outranks the dependent; a release gate waits until the thing it
+releases is worth shipping.
 
-## Priority order (authoritative)
+## Open items
 
-| # | Item | Why at this position | Effort | Depends on |
+| # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
-| 1 | **D18a — writer lock** — *done* | Two processes on one directory corrupted each other silently; now the second open is refused with `locked` and the owner's pid, proven in-process and with two real processes. | S | — |
-| 2 | **ASAN pass** over CLI, soak and conformance — *partly done* | The whole suite ran under `-sanitize:address` and found no bounds or stack errors. Odin's heap allocator is not intercepted on this toolchain (a deliberate use-after-free is not reported), so heap safety rests on the fault walk, the leak tracker and the tests until the Linux CI (#13) runs the same pass with a working heap sanitizer. | 1 round | — |
-| 3 | **D8 — fault injection** — *done* | `Fault_Vfs` fails any operation at any call; `test_fault_injection` walks every write of a workload and proves the reopened state is exactly the commits that reported success. The page store will reuse the harness. | S | — |
-| 4 | **Benchmark gate** — *done* | `scripts/bench.py` records bytes per row, insert rate, read cost and compaction in `benchmarks/baseline.json` and fails the build beyond the recorded limits; the efficiency contract is now enforced, not remembered. | S | — |
-| 5 | **D11 — DDL inside a transaction** — *done* | Index DDL is staged like row changes and applied after them, so a table, its rows and its index commit together and roll back together. Unblocks the FTS index. | S | — |
-| 6 | **D1 — FTS term index + BM25** — *done* | The term index is created with the table, `rank` is BM25 over the postings, `snippet`/`highlight` mark the match, and the scan visits only the matching documents (5000 documents: at most 8 rows visited for a rare term). | M | D11 |
-| 7 | **D13 — return the stored result on a retry** — *done* | The result commits with the request id, and `host_call_once_result` answers a retry with it instead of "already ran". | S | — |
-| 8 | **D17 — rows on disk (page store)** — *done* | A store opened with `paged_tables` keeps each user table in a 4 KiB-page file under `<db>/tables`. The page file is a cache over the log: opening discards it and the replay rebuilds it, a commit flushes it after the log record is durable, and frame 0 is reserved for the header. A single-table query streams the pages (`ORDER BY`/`GROUP BY`/`DISTINCT`/windows/`AS OF`/joins/staged writes fall back to collecting), aggregates accumulate as rows pass, and `LIMIT` stops the scan. `scripts/page_rss.py` is a CI gate: a table 63 times the pool adds 316 KiB to the statement, and four times the rows adds the same. `AS OF` and `ALTER` refuse a paged table, and a read transaction holds the shared lock, because one version lives in the pages. | XL | D8, bench |
-| 9 | **D5 — index keys in pages** — *done* | Each index of a paged table is a B+tree of 4 KiB pages under `<db>/indexes/<table>/<index>`, with its own 32-frame pool, leaves chained in key order and a cursor that walks them without a parent stack. Point lookups, ranges, `UNIQUE`, updates, deletes, `TRUNCATE` and `CREATE INDEX` after a reopen go through the pages; `table_memory` reports the pool, and `scripts/page_rss.py` now also checks the index file grows with the rows (688 KiB → 2756 KiB for 4× the rows) while the statement stays near 300 KiB. An empty leaf is not merged yet, so an index that loses most of its keys keeps its leaves until it is rebuilt. Opening still rebuilds the trees with the rows: trusting the header is D18b. | L | D17 |
-| 10 | **D18b — a reader in another process** — *done* | A read-only open coexists with a writer: "varios procesos" is true, not just safe. Two lock bytes let readers join a writer, a reader replays into memory, refuses every write and keeps compaction waiting (`test_read_only_opens_beside_a_writer`, `scripts/lock_smoke.py` with two processes). Opening a paged database no longer walks the log either: `<db>/catalog` holds the schemas and the counters, the log index names the last record, and the open trusts the page files only when every sequence agrees — the process peak for 60k rows fell from 33.9 MiB to 6.4 MiB (`test_trusted_open_skips_the_replay`, which also proves a missing or torn catalog falls back to the replay). What is left of the idea is a follower that tails commits, which is D14, and a read-only open of a quiescent database trusting the pages, which a reader cannot check while a writer may be flushing. | L | D17, D18a |
-| 11 | **D6 — planner with statistics** — *done* | `ANALYZE` measures per-column statistics **with a sixteen-bucket histogram** into `<db>/stats`; the planner prices scan against probe, picks the cheapest candidate and prints `est. N rows, cost C`; joins run in the planned order (the relation with the fewest rows per outer row first, every ON attached to the step that can answer it) and `scripts/plan_check.py` is the twentieth CI gate that fails when a known-good plan regresses (`test_analyze_and_plan_estimates`, `test_plan_reorders_a_join`). Left for later: probing an index for a joined table, `ORDER BY` from an index, calibrated constants. | L | D5 (statistics live in pages) |
-| 12 | **D4 — `.sqlite` pages in place** — *done* | The mirror reads the file's layout once and patches the leaf of every changed row plus its separator and the header: three pages (12 KiB) per commit at 10k, 100k and 250k rows, where re-encoding wrote 172 KiB, 1.8 MB and 4.8 MB. Splits, empty-leaf unlink, free-list reuse and torn-commit recovery through a rollback journal in SQLite's format are covered by `test_mirror_patches_only_the_pages_it_touched`, `test_mirror_grows_and_reopens`, `test_mirror_survives_a_torn_commit` and the `mirror cost` gate, which checks the file with real `sqlite3`. | XL | D17, D5 |
-| 13 | **CI on Linux and macOS** | The suite runs on Windows only; file locking (D18a) and the VFS are per-OS, so the lock must be proven on all three, and `-sanitize:address` can cover the heap on POSIX (on Windows it cannot see the engine's allocator). The scripts need teaching: `ci.py`, `page_rss.py`, `plan_check.py`, `bench.py`, `lock_smoke.py` and `broker_smoke.py` all hardcode a `.exe` binary. A differential runner against the system `sqlite3` (backlog, "Correctness") belongs in this gate. | M | D18a |
-| 14 | **D3 — `AS OF` and version GC** — *done* | `FROM t AS OF <seq>` reads the versions the table keeps, and `store_prune_versions` discards what no reader can ask for (`test_as_of`). What is left is an automatic retention policy and `AS OF` on a join. | M | — |
-| 15 | **D9 — the rest of the grammar** — *started* | `ROWS` window frames, trigger `WHEN` and `ALTER TABLE RENAME COLUMN` landed with their own tests. Left: windows beside `GROUP BY`, `RANGE`/`GROUPS`, `BEFORE` triggers, `ALTER` type changes, more collations, user functions. | L | — |
-| 16 | **D2 — spatial tree** | Boxes as columns today; node pages and a descent replace the scan. | M | D17, D5 |
-| 17 | **D10 — precision and time** | Decimal arithmetic with scale, `TIMESTAMPTZ`, streaming blobs. | M | — |
-| 18 | **D18c — broker mode** — *done* | `miraidb-server` owns the directory and serves HTTP wire messages, TCP frames with a per-connection owner, and Postgres; `scripts/broker_smoke.py` runs two real processes, reads a write from a second client, and checks a second server is refused with `locked`. It found and fixed a server that parsed a request from one `recv`. | M | D18a |
-| 19 | **D14 — replication** | `GET /log?since=<seq>`, a follower applying through the replay path, tested against a lagging follower and a dead leader; reuses the engine's `net` package. Failover stays unclaimed. | XL | D18c |
-| 20 | **D12c — module VM** | Deterministic execution with enforced memory and time; today modules are processes with a work budget and the caller's clock. | L | — |
-| 21 | **D15 — network hardening** | TLS, HTTP/2, backpressure, per-route timeouts, a load test. | M | — |
-| 22 | **D16 — client generation from the catalog** | Emit the Python binding from the schema; the hand-written one is the contract it has to meet. | M | — |
-| 23 | **Release packaging** — *done* | `scripts/package.py` builds `dist/miraidb-<version>-<target>.zip` from the version the library reports: two programs, the shared library, the header, the Python binding, the licences, the notices, a `pkg-config` file and the changelog. `--check` runs as a CI gate and verifies the manifest. | M | #13 |
-| 24 | **Auth review** — *started* | It found that one client's identity was left on the store and inherited by the next; the wire now runs each request with its caller's identity (`test_connection_identity`). Left: rate limits, token lifetime policy, and the fact that without TLS (D15) a token travels in clear. | S | — |
-| 25 | **Licence and notice review** | MIT/Apache-2.0 with no vendored third-party source; confirm before each public release. | external | #23 |
+| 1 | **D20 — differential runner against `sqlite3`** | Same schema, same rows, same query, through this engine and the system `sqlite3`; equal answers, or a listed refusal with a reason. The corpus grows past the 20-case smoke: joins, CTEs, windows, triggers, JSON, `ALTER`, `UPSERT`, three-valued logic, `DISTINCT` aggregates. `docs/backlog.md` D20. | M | — |
+| 2 | **D19 — `CASE` expressions** | Simple and searched `CASE` wherever an expression is allowed, including policies and triggers; `NULL` conditions are not true, no `ELSE` yields `NULL`. It is the only statement `docs/sqlite.md` still marks missing. D19. | M | — |
+| 3 | **D3 — the first read after a commit** | Three parts: clone a table's rows and indexes without re-inserting every row (measured 2.3 µs/row, 115–117 ms at 50 000), evict `store.retired` so the read cache keeps publishing past 16 snapshots, and make `bench-read` time a commit followed by a read. Two rows of the efficiency contract are marked not met until this lands. | L | — |
+| 4 | **D6 — the delta of a join subscription** | Index the join key per table so a commit costs the rows it touched instead of collecting every row of the other tables; then the smaller planner gaps: probe the joined side, `ORDER BY` from an index, calibrated constants, statistics that announce staleness, a histogram for a bound value, an estimate for a view, and the subscription path using the planned order. | L | — |
+| 5 | **D9 — the rest of the grammar** | `RANGE`/`GROUPS` frames, windows beside `GROUP BY`, `BEFORE` triggers, `ALTER` type changes, more collations, user functions. | L | — |
+| 6 | **ASAN pass** over the CLI, soak and conformance — *partly done* | Bounds and stack are covered today. Odin's heap allocator is not intercepted on Windows (a deliberate use-after-free is not reported), so the heap half runs with the POSIX toolchain in #13. | 1 round | 13 |
+| 7 | **D2 — spatial tree** | Node pages and a descent replace the scan over box columns. | M | — |
+| 8 | **D10 — precision and time** | Decimal arithmetic with scale, `TIMESTAMPTZ`, streaming blobs. | M | — |
+| 9 | **D14 — replication** | `GET /log?since=<seq>`, a follower applying through the replay path, tested against a lagging follower and a dead leader. Failover stays unclaimed. The networking plan is below. | XL | — |
+| 10 | **D12c — module sandbox** | Deterministic execution with enforced memory and time; today a module is a process with a work budget and the caller's clock. | L | — |
+| 11 | **D15 — network hardening** | TLS, HTTP/2, backpressure, per-route timeouts, a load test. | M | — |
+| 12 | **D16 — client generation from the catalog** | Emit the Python binding from the schema; the hand-written one is the contract it has to meet. | M | — |
+| 13 | **CI on Linux and macOS** | File locking and the VFS are per-OS, so the lock must be proven on all three; `-sanitize:address` covers the heap there (#6). Six scripts hardcode a `.exe` binary: `ci.py`, `docs_check.py` (the binary it reads), `page_rss.py`, `plan_check.py`, `bench.py`, `lock_smoke.py`, `broker_smoke.py`. | M | — |
+| 14 | **Release and packaging** | `scripts/package.py` builds `dist/miraidb-<version>-<target>.zip` from the version the library reports and `--check` gates its manifest. Left: publish one archive per target, decide the version policy, and verify an archive builds twice byte for byte. | M | 13 |
+| 15 | **Auth review** | The internal pass found one client's identity leaking into the next (fixed, `test_connection_identity`). Left: rate limits, a token lifetime policy, adversarial tests over subscriptions and budgets, and the fact that without TLS (#11) a token travels in clear. | S | — |
+| 16 | **Licence and notice review** | MIT/Apache-2.0 with no vendored third-party source; confirm before each public release. | external | 14 |
 
-Priority 1 landed first; the numbers are position, not rank, so the work
-continues at 2. Rounds map onto the list: **1–7** are one round of small,
-mutually unblocking work; **8–12** are the storage round; **13–17** the surface round; **18–22** the
-sharing round; **23–25** are release gates that can run in parallel from #13.
+The last four are the release gates, in the order they have to run: prove it on
+every platform, package it, review who may call it, review what it carries. The
+rest come before them because a release is only worth making once the engine
+answers correctly, ships its own weight, and can be replicated.
 
-## The three asks, in detail
+Rounds map onto the list: **1–4** are the correctness-and-measurement round
+(this one), **5–12** the feature-depth round, **13–16** the release round.
 
-### 1. Access from several processes or connections (D18a, D18b, D18c)
+## Efficiency contract and current baseline
 
-Today: several *connections* to one host work — each client gets its own
-subscriptions, its own byte budget and its own last-applied sequence. Several
-*processes* on one database do not: there is no lock, so two writers would corrupt
-each other.
+The engine must stay **equal or better** than the reference model in every
+measurable dimension. Measured on this tree:
 
-- **D18a** (priority 1): an exclusive lock on open, so a second writer is refused
-  with an error that names the owner. Scope: per-OS lock (Windows `LockFileEx`,
-  POSIX `flock`), a lock file beside the log, released on close and on crash.
-- **D18b** (10): once pages exist, a read-only open beside a writer sees only
-  committed state; the writer appends pages and log records, the reader pins a
-  sequence.
-- **D18c** (18): broker mode — one process owns the database and the others speak
-  the wire protocol, reusing the caps, timeouts and work budgets that already
-  exist. This is the cheap path, and the one to prefer until D18b lands.
+| Dimension | Baseline today | Contract |
+|---|---|---|
+| Insert throughput | 46 838 /s on the 20k gate (baseline 42 219); 54 580 /s over 50k, run directly | not worse on the same hardware; 10% regression fails the gate |
+| Read transaction, cache warm | 11.4 µs over 50k rows | same |
+| Read transaction, first after a commit | **116 ms**: it clones the table | should cost the rows the transaction touches; today it is O(rows) at ~2.3 µs per row (D3, not met) |
+| Freeze a 50k-row table | **115–117 ms** (`table_snapshot` measured three times) | was recorded as ~1 ms; the real cost is 2.3 µs per row (D3, not met) |
+| Commit record | one record, CRC32C, group commit | durability never traded for speed silently |
+| Compaction | 0.48 s for 50k rows, one file left | same |
+| Memory per row | `Row` 80 B, `Value` 24 B | no growth without a written reason |
+| Subscription delta | O(rows touched) for one table; a join re-collects every row of the other tables on each commit | O(rows touched) for the table the commit changed (D6, not met for joins) |
 
-**Acceptance.** Opening the same directory twice answers `io`/`locked` naming the
-owner; a read-only open beside a writer sees only committed rows; broker mode
-serves two clients with independent subscriptions from one owner, and killing one
-client does not disturb the other.
-
-### 2. FTS with a per-term index and BM25 (D1)
-
-Today: an inverted table `_fts_<name>_terms (term, doc)` exists, but `MATCH`
-resolves each pattern with **one scan of the term table**, and there is no
-`rank`.
-
-- The index on `term` cannot be created inside the transaction that creates the
-  table (D11), which is the only reason for the scan.
-- **BM25** needs two numbers: document frequency per term (a counter per term) and
-  document length (tokens per document). Both fit in the shadow tables, so `rank`
-  is a pass over the **matching** documents only.
-- `snippet()` / `highlight()` mark the match in the stored text.
-- `AND` becomes an operator instead of being a term; `OR`/`NOT` already work.
-
-**Acceptance.** A rare term outranks a common one; a short document outranks a
-long one at equal frequency; `rank` is computed from the index, not from a
-document scan; `snippet()` marks the match; `AND`/`OR`/`NOT` parse as operators;
-cost follows matches, not vocabulary.
-
-### 3. Pages on disk instead of everything in RAM (D17, D5, D4, D18b)
-
-Today: every table is a `map[Row_Id]Row` in memory.
-
-- **D17** (8): fixed-size pages, a page file (or one file with an allocation
-  map), a buffer pool with a clock hand and a memory cap, dirty-page flushing
-  ordered **after** the commit record that describes it, and a free list that
-  survives a crash. Recovery stays "replay what the pages are missing".
-- **D5** (9): index pages, so an index stops costing one RAM entry per row.
-  **Done**; opening still rebuilds them until D18b trusts the headers.
-- **D6** (11): `ANALYZE` statistics stored in pages, then a cost model and join
-  reordering.
-- **D4** (12): the `.sqlite` mirror writes touched pages instead of the whole
-  state.
-- **D18b** (10): the reader-in-another-process case that pages make possible.
-
-**Acceptance.** A table ten times the buffer pool reads correctly with RSS under
-the configured cap — `scripts/page_rss.py --check` reads 15k and 60k rows through
-an 8-frame pool and measures what the statement added over the open (316 KiB for
-both; the file is 63 times the pool). A kill during a dirty flush reopens to the
-last committed state (the page file is rebuilt from the log, and the flush writes
-pages before the header). `bench` and `bench-read` stay within 10% for data that
-fits in memory; `EXPLAIN` shows index pages being probed rather than a scan is
-still D5.
+These are the numbers the gate compares against and the targets the engine is
+held to. Three rows are recorded as **not met** rather than quietly relaxed: the
+first read after a commit pays a full table clone, so a database that writes
+while it serves readers pays it per commit, and `bench-read` hides it because
+its preparation statement publishes the read cache before it starts timing.
+Items 3 and 4 carry the work.
 
 ## Reusing the engine's networking for D14
 
@@ -141,108 +91,42 @@ the snapshot with an offset index. What the engine brings: transport, ordering
 guarantees and the harness. D14 is mostly wiring: name a baseline, stream records
 after it, apply through `commitlog`, expose the last applied sequence.
 
-## Engineering gates (parallel, and some are priorities)
-
-| Gate | Why | Effort | Priority |
-|---|---|---|---|
-| **Address sanitizer** over CLI, soak and conformance — *partly done* | Memory bugs have been the real risk; bounds and stack are covered here, the heap needs the Linux toolchain | 1 round per phase | #2 |
-| **Fault injection** (D8) | Proves no third state after a failed write | S, then extended | #3 |
-| **Benchmark with thresholds** — *done* | Bytes per row within 10%; timings under a 3x catastrophe guard, because a shared machine cannot promise 10% (the 10% time rule is measured by hand with `--record`) | 1 day | #4 |
-| **Page memory** — *done* | `scripts/page_rss.py --check` reads a table far larger than the pool and bounds what the statement adds; `scripts/plan_check.py` guards the plans a measured fixture must produce; 22 gates in total | 1 day | #8 |
-| **CI on Linux and macOS** | Locking and the VFS are per-OS | 2–3 days | #13 |
-| **Release packaging** — *done* | `scripts/package.py --check`, one archive per target with the version the library reports | 2–3 days | #23 |
-| **Auth review** | Tokens, subscriptions, byte and work budgets under attack | 1 day | #24 |
-| **Licence and notice review** | MIT/Apache-2.0, nothing vendored | external | #25 |
-
-A round is done when `ci.py` is green **and** the baseline below did not regress.
-
-## Efficiency contract and current baseline
-
-The engine must stay **equal or better** than the reference model in every
-measurable dimension. Measured on this tree:
-
-| Dimension | Baseline today | Contract |
-|---|---|---|
-| Insert throughput | 46 838 /s on the 20k gate (baseline 42 219); 54 580 /s over 50k, run directly | not worse on the same hardware; 10% regression fails the gate |
-| Read transaction, cache warm | 11.4 µs over 50k rows | same |
-| Read transaction, first after a commit | **116 ms**: it clones the table | should cost the rows the transaction touches; today it is O(rows) at ~2.3 µs per row (D3, not met) |
-| Freeze a 50k-row table | **115–117 ms** (`table_snapshot` measured three times) | was recorded as ~1 ms; the real cost is 2.3 µs per row (D3, not met) |
-| Commit record | one record, CRC32C, group commit | durability never traded for speed silently |
-| Compaction | 0.48 s for 50k rows, one file left | same |
-| Memory per row | `Row` 80 B, `Value` 24 B | no growth without a written reason |
-| Subscription delta | O(rows touched) for one table; a join re-collects every row of the other tables on each commit | O(rows touched) for the table the commit changed (D6, not met for joins) |
-
-These are the numbers the gate compares against and the targets the engine is
-held to. Four rows are recorded as **not met** rather than quietly relaxed: the
-first read after a commit pays a full table clone, so a database that writes
-while it serves readers pays it per commit, and `bench-read` hides it because
-its preparation statement publishes the read cache before it starts timing. D3
-(snapshot cost) and D6 (join delta) carry the work.
-
 ## What this costs
 
-| Round | New engine lines (order of magnitude) |
+| Work | New engine lines (order of magnitude) |
 |---|---|
-| Priorities 1–7 | ~2.000 |
-| Priorities 8–12 | ~12.000 |
-| Priorities 13–17 | ~7.000 |
-| Priorities 18–22 | ~12.000 |
-| **Total** | **~33.000**, roughly doubling the tree |
+| Items 1–4 (runner, `CASE`, snapshot, join delta) | ~2.000 |
+| Items 5–12 (grammar, sanitizer, spatial, precision, replication, sandbox, network, clients) | ~9.000 |
+| Items 13–16 (release gates) | ~1.000 |
 
 ## Closed already (for the record)
 
-- **Benchmark gate** — `benchmarks/baseline.json` plus `scripts/bench.py --check`
-  as a CI gate: bytes per row within 10%, insert rate, read cost and compaction
-  under a 3x guard, with the machine recorded beside the numbers.
-- **D18c broker mode** — one owner process, clients over HTTP wire messages,
-  TCP frames and Postgres, with per-connection subscriptions; two-process proof in
-  `scripts/broker_smoke.py`, including the refusal of a second owner.
-- **D3 `AS OF`** — historical reads over the versions the table keeps, with
-  pruning as the bound (`test_as_of`); the snapshot cost was already solved.
-- **Sanitizer pass** — 190 tests run under `-sanitize:address` on Windows with no
-  bounds or stack report; the heap half waits for the Linux CI, because Odin's
-  allocator on Windows bypasses the sanitizer's interception (verified with a
-  deliberate use-after-free).
-- **D13 stored result** — the response is recorded with the request id and
-  returned on a retry (`host_call_once_result`, `test_idempotent_result`).
-- **D1 full-text ranking** — index on `term` created with the table, BM25
-  `rank` (negated, best first), `snippet()`/`highlight()`, `AND`, and a scan
-  narrowed to the matches measured by `rows_scanned`
-  (`test_full_text_ranking`, `test_full_text_cost`). The shadow tables keep the
-  document lengths and the corpus totals, so ranking never reads the documents.
-- **D11 DDL inside a transaction** — index operations are part of the
-  transaction: `DROP INDEX` without `ON` also finds an index created earlier in
-  the same transaction, and two creates of one name are refused before apply
-  (`test_ddl_in_transaction`).
-- **D8 fault injection** — `Fault_Vfs` (open/read/write/seek/truncate/sync/remove,
-  or a short write) and `test_fault_injection`, which arms the fault at every write
-  of a workload and checks that the reopen sees only successful commits. A short
-  write is now an error in the log, not a silent success.
-- **D18a writer lock** — `<directory>/lock` held with an OS lock (Windows
-  `LockFileEx`, POSIX `fcntl`), released on close and on death; the refusal names
-  the owner (`test_writer_lock`, and `scripts/lock_smoke.py`, which opens the
-  database from one process, is refused in another, and reopens after the owner is
-  killed). `miraidb_errmsg(NULL)` reports the reason a failed open failed.
+The items below were in this table and are done; each entry names the code and
+the test or gate that proves it. The engineering gates that watch them today are
+listed in `docs/status.md` and run by `scripts/ci.py` (22 gates).
 
-- **D7 scheduler durability** — `_schedule.at_us` is a column and commits; a
-  restart resumes pending work (`test_durability_after_restart`).
-- **D12a work budget** — one unit per row touched, a per-statement and a per-call
-  budget that rolls the call back (`test_work_budget`).
-- **D12b module latency** — one pooled socket per module, one frame each way.
-- **D13 (partly)** — the request id commits with the effects; what remains is
-  priority 7, returning the stored result.
-- **D3 snapshot cost** — snapshots borrow values through a reference-counted
-  store: freezing 50k rows costs ~1 ms
-  (`test_snapshot_shares_values_safely`).
-- **Audit corrections** — two items that had been written down as gaps (D7, D13)
-  were already durable; the claim was wrong and the tests now prove the truth.
-- **Metering unified** — one counter (`result.work`, `store.work_used`,
-  `max_work_per_call`) instead of two parallel accounts.
+| Item | Evidence |
+|---|---|
+| **D18a — writer lock** | `<directory>/lock` held with an OS lock (Windows `LockFileEx`, POSIX `fcntl`), released on close and on death; the refusal names the owner. `test_writer_lock` and `scripts/lock_smoke.py` with two processes. |
+| **D18b — a reader beside the writer** | Two lock bytes: the writer's exclusive, the reader's shared. A read-only open replays, refuses every mutation and waits out a compaction; a paged database opens from `<db>/catalog` and trusts the page files only when every sequence agrees (the 60k-row peak fell from 33.9 MiB to 6.4 MiB). `test_read_only_opens_beside_a_writer`, `test_trusted_open_skips_the_replay`. |
+| **D18c — broker mode** | `miraidb-server` owns the directory and serves HTTP wire messages, TCP frames with a per-connection owner, and Postgres; `scripts/broker_smoke.py` runs two processes, reads a write from a second client and refuses a second owner. |
+| **D8 — fault injection** | `Fault_Vfs` fails any operation at any call, or writes short; `test_fault_injection` arms every write of a workload and proves the reopen sees exactly the commits that reported success. |
+| **Benchmark gate** | `benchmarks/baseline.json` plus `scripts/bench.py --check`: bytes per row within 10%, insert rate, read cost and compaction under a 3x guard, with the machine recorded beside the numbers. |
+| **D11 — DDL inside a transaction** | Index operations are staged like row changes, applied after them, and rolled back with them; `DROP INDEX` finds an index created earlier in the same transaction and a duplicate create is refused before apply (`test_ddl_in_transaction`). |
+| **D1 — full-text index and BM25** | The `term` index is created with the table, `rank` is BM25 over the postings, `snippet`/`highlight` mark the match, and a rare term visits at most 8 rows of 5 000 (`test_full_text_ranking`, `test_full_text_cost`). |
+| **D13 — the stored result on a retry** | The response commits with the request id and `host_call_once_result` answers a retry with it (`test_idempotent_result`). |
+| **D17 — rows on disk** | A store opened with `paged_tables` keeps each table in a 4 KiB-page file under `<db>/tables`: a cache over the log, flushed after the log record is durable, frame 0 reserved for the header. A single-table query streams the pages; `ORDER BY`/`GROUP BY`/`DISTINCT`/windows/`AS OF`/joins/staged writes fall back to collecting. `scripts/page_rss.py` is a gate: a table 63× the pool adds 316 KiB to the statement and four times the rows adds the same. |
+| **D5 — index keys in pages** | Each index of a paged table is a B+tree of 4 KiB pages under `<db>/indexes/…` with its own pool, chained leaves and a cursor without a parent stack; point lookups, ranges, `UNIQUE`, updates, deletes and `TRUNCATE` go through the pages. An empty leaf is not merged yet (a delete never answers wrongly). |
+| **D6 — the planner** (the first half) | `ANALYZE` measures rows, distinct values, NULLs, the numeric range and a sixteen-bucket histogram into `<db>/stats`; the planner prices scan against probe and prints `est. N rows, cost C`; joins run in the planned order with each `ON` attached to the step that completes the relations it names. `scripts/plan_check.py` guards the plans (`test_analyze_and_plan_estimates`, `test_plan_reorders_a_join`). The join delta is item 4. |
+| **D4 — `.sqlite` pages in place** | The mirror patches the leaf of every changed row, the separator its parent stores and page 1: three pages (12 KiB) per commit at 10k, 100k and 250k rows, where re-encoding wrote 172 KiB, 1.8 MB and 4.8 MB. Splits, empty-leaf unlink, free-list reuse and torn-commit recovery through a rollback journal in SQLite's format; `scripts/mirror_cost.py` checks the file with real `sqlite3`. |
+| **D3 — `AS OF` and version pruning** | `FROM t AS OF <seq>` reads the versions the table keeps and `store_prune_versions` discards what no reader can ask for (`test_as_of`). The snapshot cost is item 3; automatic retention and `AS OF` on a join remain in D3's backlog entry. |
+| **D7 — scheduler durability** | `_schedule.at_us` is a column and commits; a restart resumes pending work (`test_durability_after_restart`). |
+| **D12a / D12b — work budget and module latency** | One unit per row touched, a per-statement and a per-call budget that rolls the call back (`test_work_budget`); one pooled socket per module, one frame each way. |
+| **Page memory gate** | `scripts/page_rss.py --check` reads a table far larger than the pool and bounds what the statement adds; `scripts/plan_check.py` guards the plans a measured fixture must produce. |
+| **Sanitizer pass (bounds and stack)** | The suite runs under `-sanitize:address` with no bounds or stack report; the heap half is item 6, because Odin's allocator on Windows bypasses the sanitizer's interception (verified with a deliberate use-after-free). |
+| **Documentation consistency gate** | `scripts/docs_check.py`: version, test count, gate count, CLI commands, relative links, roadmap/backlog cross-references, orphan documents and the names the project does not use. Backlog D21. |
+| **Audit corrections** | Two items once written down as gaps (D7, D13) were already durable, two wrong answers in `IN`/`NOT IN` and `DISTINCT` aggregates were found and fixed with tests, and the capabilities that three documents understated (the README, the CLI usage and the SQLite matrix) were rewritten. |
 
-## Rules that do not change
-
-- A row moves onto this list only when its acceptance block is tests.
-- Nothing is described as more than it is: no "ranked search" before BM25, no
-  "pages on disk" before the buffer pool, no "multi-process" before the lock and
-  the reader/writer split, no "replication" before the follower.
-- Every round keeps `ci.py` green; an item that cannot land green waits.
+The three asks of the original plan — access from several processes, a per-term
+full-text index, and pages on disk — are all closed above. What remains is
+depth, not absence.
