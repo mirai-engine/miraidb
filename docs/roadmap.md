@@ -19,34 +19,33 @@ releases is worth shipping.
 
 | # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
-| 1 | **D3 — a read snapshot that stops copying every table** | Three parts are done: the index trees are copied shape for shape (a 50 000-row table freezes in 36 ms, was 117), the read cache evicts the snapshots no transaction holds, and `bench-read` times a commit followed by a read. What is left is the shape of the copy: a read transaction still copies **every table the query could read**, so the first read after a commit is O(all rows). Copying a table the first time a statement names it, or sharing it copy-on-write, is the work. Two rows of the efficiency contract stay marked not met. | L | — |
-| 2 | **D6 — the delta of a join subscription** | Index the join key per table so a commit costs the rows it touched instead of collecting every row of the other tables; then the smaller planner gaps: probe the joined side, `ORDER BY` from an index, calibrated constants, statistics that announce staleness, a histogram for a bound value, an estimate for a view, and the subscription path using the planned order. | L | — |
-| 3 | **D9 — the rest of the grammar** | `RANGE`/`GROUPS` frames, windows beside `GROUP BY`, `BEFORE` triggers, `ALTER` type changes, more collations, user functions. | L | — |
-| 4 | **ASAN pass** over the CLI, soak and conformance — *partly done* | Bounds and stack are covered today. Odin's heap allocator is not intercepted on Windows (a deliberate use-after-free is not reported), so the heap half runs with the POSIX toolchain in #15. | 1 round | 13 |
-| 5 | **D2 — spatial tree** | Node pages and a descent replace the scan over box columns. | M | — |
-| 6 | **D10 — precision and time** | Decimal arithmetic with scale, `TIMESTAMPTZ`, streaming blobs. | M | — |
-| 7 | **D14 — replication** | `GET /log?since=<seq>`, a follower applying through the replay path, tested against a lagging follower and a dead leader. Failover stays unclaimed. The networking plan is below. | XL | — |
-| 8 | **D12c — module sandbox** | Deterministic execution with enforced memory and time; today a module is a process with a work budget and the caller's clock. | L | — |
-| 9 | **D15 — network hardening** | TLS, HTTP/2, backpressure, per-route timeouts, a load test. | M | — |
-| 10 | **D16 — client generation from the catalog** | Emit the Python binding from the schema; the hand-written one is the contract it has to meet. | M | — |
-| 11 | **D1 — the rest of full-text search** | Phrase queries (`"a b"`), prefix matching (`foo*`) and column filters (`body:foo`); `AND` is still parsed as a term rather than an operator, and a pattern taken from a column cannot narrow the scan. The index, the ranking and `snippet`/`highlight` are done. | M | — |
-| 12 | **D4 — a secondary index in the mirror** | A table with a secondary index re-encodes the whole `.sqlite` file on every commit, because only table-b-tree leaves are patched. Patch the index b-trees too (a moved key can jump leaves), or state the fallback where a user will read it. | L | — |
-| 13 | **D5 / D17 — the rest of the page store** | Merge an index leaf that loses its last entry; keep more than one version per row so `AS OF` and `ALTER` work on a paged table; let a read of a paged store run without holding the shared lock for its whole life; let a read-only open trust the pages when it can prove nothing is in flight. | L | — |
-| 14 | **Diagnostics — a leak report a human can read** | The suite prints ~320k `+++ leak` lines (~9 per statement) and nobody has established whether they are real; `soak.py` does not watch the working set, and `test_soak_update_delete_prune` failed once opening its lock file. Make the tracker report a working set, settle the noise, and chase the flake. | M | — |
-| 15 | **CI on Linux and macOS** | File locking and the VFS are per-OS, so the lock must be proven on all three; `-sanitize:address` covers the heap there (#6). Six scripts hardcode a `.exe` binary: `ci.py`, `page_rss.py`, `plan_check.py`, `bench.py`, `lock_smoke.py`, `broker_smoke.py`. | M | — |
-| 16 | **Release and packaging** | `scripts/package.py` builds `dist/miraidb-<version>-<target>.zip` from the version the library reports and `--check` gates its manifest. Left: publish one archive per target, decide the version policy, and verify an archive builds twice byte for byte. | M | 17 |
-| 17 | **Auth review** | The internal pass found one client's identity leaking into the next (fixed, `test_connection_identity`). Left: rate limits, a token lifetime policy, adversarial tests over subscriptions and budgets, and the fact that without TLS (#11) a token travels in clear. | S | — |
-| 18 | **Licence and notice review** | MIT/Apache-2.0 with no vendored third-party source; confirm before each public release. | external | 18 |
+| 1 | **D6 — the delta of a join subscription** | Index the join key per table so a commit costs the rows it touched instead of collecting every row of the other tables; then the smaller planner gaps: probe the joined side, `ORDER BY` from an index, calibrated constants, statistics that announce staleness, a histogram for a bound value, an estimate for a view, and the subscription path using the planned order. | L | — |
+| 2 | **D9 — the rest of the grammar** | `RANGE`/`GROUPS` frames, windows beside `GROUP BY`, `BEFORE` triggers, `ALTER` type changes, more collations, user functions. | L | — |
+| 3 | **ASAN pass** over the CLI, soak and conformance — *partly done* | Bounds and stack are covered today. Odin's heap allocator is not intercepted on Windows (a deliberate use-after-free is not reported), so the heap half runs with the POSIX toolchain in #14. | 1 round | 12 |
+| 4 | **D2 — spatial tree** | Node pages and a descent replace the scan over box columns. | M | — |
+| 5 | **D10 — precision and time** | Decimal arithmetic with scale, `TIMESTAMPTZ`, streaming blobs. | M | — |
+| 6 | **D14 — replication** | `GET /log?since=<seq>`, a follower applying through the replay path, tested against a lagging follower and a dead leader. Failover stays unclaimed. The networking plan is below. | XL | — |
+| 7 | **D12c — module sandbox** | Deterministic execution with enforced memory and time; today a module is a process with a work budget and the caller's clock. | L | — |
+| 8 | **D15 — network hardening** | TLS, HTTP/2, backpressure, per-route timeouts, a load test. | M | — |
+| 9 | **D16 — client generation from the catalog** | Emit the Python binding from the schema; the hand-written one is the contract it has to meet. | M | — |
+| 10 | **D1 — the rest of full-text search** | Phrase queries (`"a b"`), prefix matching (`foo*`) and column filters (`body:foo`); `AND` is still parsed as a term rather than an operator, and a pattern taken from a column cannot narrow the scan. The index, the ranking and `snippet`/`highlight` are done. | M | — |
+| 11 | **D4 — a secondary index in the mirror** | A table with a secondary index re-encodes the whole `.sqlite` file on every commit, because only table-b-tree leaves are patched. Patch the index b-trees too (a moved key can jump leaves), or state the fallback where a user will read it. | L | — |
+| 12 | **D5 / D17 — the rest of the page store** | Merge an index leaf that loses its last entry; keep more than one version per row so `AS OF` and `ALTER` work on a paged table; let a read of a paged store run without holding the shared lock for its whole life; let a read-only open trust the pages when it can prove nothing is in flight. | L | — |
+| 13 | **Diagnostics — a leak report a human can read** | The suite prints ~320k `+++ leak` lines (~9 per statement) and nobody has established whether they are real; `soak.py` does not watch the working set, and `test_soak_update_delete_prune` failed once opening its lock file. Make the tracker report a working set, settle the noise, and chase the flake. | M | — |
+| 14 | **CI on Linux and macOS** | File locking and the VFS are per-OS, so the lock must be proven on all three; `-sanitize:address` covers the heap there (#3). Six scripts hardcode a `.exe` binary: `ci.py`, `page_rss.py`, `plan_check.py`, `bench.py`, `lock_smoke.py`, `broker_smoke.py`. | M | — |
+| 15 | **Release and packaging** | `scripts/package.py` builds `dist/miraidb-<version>-<target>.zip` from the version the library reports and `--check` gates its manifest. Left: publish one archive per target, decide the version policy, and verify an archive builds twice byte for byte. | M | 16 |
+| 16 | **Auth review** | The internal pass found one client's identity leaking into the next (fixed, `test_connection_identity`). Left: rate limits, a token lifetime policy, adversarial tests over subscriptions and budgets, and the fact that without TLS (#8) a token travels in clear. | S | — |
+| 17 | **Licence and notice review** | MIT/Apache-2.0 with no vendored third-party source; confirm before each public release. | external | — |
 
 The last four are the release gates, in the order they have to run: prove it on
 every platform, package it, review who may call it, review what it carries. The
 rest come before them because a release is only worth making once the engine
 answers correctly, ships its own weight, and can be replicated.
 
-Rounds map onto the list: **1–2** are the correctness-and-measurement round
-(this one), **3–14** the depth round (grammar, sanitizer, spatial, precision,
-replication, sandbox, network, clients, and the residuals of full-text, the
-mirror, the page store and diagnostics), **15–18** the release round.
+Rounds map onto the list: **1** is the last measurement item, **2–13** the depth
+round (grammar, sanitizer, spatial, precision, replication, sandbox, network,
+clients, and the residuals of full-text, the mirror, the page store and
+diagnostics), **14–17** the release round.
 
 ## Efficiency contract and current baseline
 
@@ -56,21 +55,20 @@ measurable dimension. Measured on this tree:
 | Dimension | Baseline today | Contract |
 |---|---|---|
 | Insert throughput | 46 838 /s on the 20k gate (baseline 42 219); 54 580 /s over 50k, run directly | not worse on the same hardware; 10% regression fails the gate |
-| Read transaction, cache warm | 10.4 µs over 50k rows | same |
-| Read transaction, first after a commit | **24 ms** over 20 000 rows on the gate, **39 ms** over 50 000: it still copies every table | should cost the rows the transaction touches; today it is O(all rows) at ~0.7 µs per row (D3, 3× better, not met) |
-| Freeze a 50k-row table | **36 ms** (one primary key), **53 ms** with one more index | was recorded as ~1 ms and measured at 117 ms; the cost is now a copy per entry, not a rebuild per index (D3, 3× better, not met) |
+| Read transaction, anyone reading | **10.7 µs** over 50k rows warm; opening one after a commit is **38 µs** on the gate (21 µs over 50 000 rows): it copies nothing | should cost the rows the transaction touches; it costs one reference per table |
+| Commit with a read open | **16.9 ms** over 20 000 rows, **46 ms** over 50 000: it copies the table it writes and leaves the old one to the reader | the copy a commit pays is the rows of the table it writes, and only while a reader is open (D3) |
 | Commit record | one record, CRC32C, group commit | durability never traded for speed silently |
 | Compaction | 0.48 s for 50k rows, one file left | same |
 | Memory per row | `Row` 80 B, `Value` 24 B | no growth without a written reason |
 | Subscription delta | O(rows touched) for one table; a join re-collects every row of the other tables on each commit | O(rows touched) for the table the commit changed (D6, not met for joins) |
 
 These are the numbers the gate compares against and the targets the engine is
-held to. Three rows are recorded as **not met** rather than quietly relaxed: a
-read still copies every table it could read, so a database that writes while it
-serves readers pays a copy per commit, a join subscription re-collects the other
-tables, and the freeze stays O(rows) even after the shape-for-shape copy made it
-three times cheaper. Items 1 and 2 carry the work; `bench-read` now reports the
-first read and the steady state separately, and the gate checks both.
+held to. One row is recorded as **not met** rather than quietly relaxed: a join
+subscription re-collects every row of the other tables on each commit, which is
+item 1. The read row is met by moving the copy rather than hiding it: a read
+copies nothing, and the commit pays for the table it writes while a reader holds
+it, once per read generation. `bench-read` reports the read and that commit
+separately, and `scripts/bench.py` gates both.
 
 ## Reusing the engine's networking for D14
 
@@ -100,9 +98,9 @@ after it, apply through `commitlog`, expose the last applied sequence.
 
 | Work | New engine lines (order of magnitude) |
 |---|---|
-| Items 1–2 (snapshot, join delta) | ~2.000 |
-| Items 3–14 (grammar, sanitizer, spatial, precision, replication, sandbox, network, clients, and the residuals) | ~14.000 |
-| Items 15–18 (release gates) | ~1.000 |
+| Item 1 (join delta) | ~1.000 |
+| Items 2–13 (grammar, sanitizer, spatial, precision, replication, sandbox, network, clients, and the residuals) | ~14.000 |
+| Items 14–17 (release gates) | ~1.000 |
 
 ## Closed already (for the record)
 
@@ -126,7 +124,8 @@ listed in `docs/status.md` and run by `scripts/ci.py` (23 gates).
 | **D5 — index keys in pages** | Each index of a paged table is a B+tree of 4 KiB pages under `<db>/indexes/…` with its own pool, chained leaves and a cursor without a parent stack; point lookups, ranges, `UNIQUE`, updates, deletes and `TRUNCATE` go through the pages. An empty leaf is not merged yet (a delete never answers wrongly). |
 | **D6 — the planner** (the first half) | `ANALYZE` measures rows, distinct values, NULLs, the numeric range and a sixteen-bucket histogram into `<db>/stats`; the planner prices scan against probe and prints `est. N rows, cost C`; joins run in the planned order with each `ON` attached to the step that completes the relations it names. `scripts/plan_check.py` guards the plans (`test_analyze_and_plan_estimates`, `test_plan_reorders_a_join`). The join delta is item 2. |
 | **D4 — `.sqlite` pages in place** | The mirror patches the leaf of every changed row, the separator its parent stores and page 1: three pages (12 KiB) per commit at 10k, 100k and 250k rows, where re-encoding wrote 172 KiB, 1.8 MB and 4.8 MB. Splits, empty-leaf unlink, free-list reuse and torn-commit recovery through a rollback journal in SQLite's format; `scripts/mirror_cost.py` checks the file with real `sqlite3`. |
-| **D3 — `AS OF` and version pruning** | `FROM t AS OF <seq>` reads the versions the table keeps and `store_prune_versions` discards what no reader can ask for (`test_as_of`). The snapshot cost is item 3; automatic retention and `AS OF` on a join remain in D3's backlog entry. |
+| **D3 — `AS OF` and version pruning** | `FROM t AS OF <seq>` reads the versions the table keeps and `store_prune_versions` discards what no reader can ask for (`test_as_of`); automatic retention and `AS OF` on a join remain in D3's backlog entry. |
+| **D3 — a read that copies nothing** | A read transaction shares the tables: one reference per table, no rows copied, and the store's read cache is gone with it. A commit that has to change a table a reader holds copies **that** table (`table_cow_clone`), so the copy is per written table and only while a reader is open. The first read after a commit fell from 24 ms to 38 µs on the gate (21 µs over 50 000 rows); the commit that pays for a live reader is 16.9 ms (46 ms over 50 000). `test_a_commit_copies_the_table_a_reader_holds` proves the reader keeps its values, that the table a commit does not write is not copied, and that a commit nobody reads copies nothing; `bench-read` reports both numbers and `scripts/bench.py` gates both. |
 | **D7 — scheduler durability** | `_schedule.at_us` is a column and commits; a restart resumes pending work (`test_durability_after_restart`). |
 | **D12a / D12b — work budget and module latency** | One unit per row touched, a per-statement and a per-call budget that rolls the call back (`test_work_budget`); one pooled socket per module, one frame each way. |
 | **Page memory gate** | `scripts/page_rss.py --check` reads a table far larger than the pool and bounds what the statement adds; `scripts/plan_check.py` guards the plans a measured fixture must produce. |

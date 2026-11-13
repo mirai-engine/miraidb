@@ -288,9 +288,11 @@ main :: proc() {
 			if commit_err := db.tx_commit(tx); !db.error_ok(commit_err) do fail(commit_err)
 			db.stmt_prepared_destroy(insert)
 		}
-		// The first read after a commit is the expensive one: it copies the tables
-		// into a snapshot. The steady state reuses that snapshot, so both numbers
-		// are reported and a gate can watch the one it cares about.
+		// Opening a read copies nothing: it takes a reference per table, and a
+		// commit that has to change a table a reader holds copies that table
+		// instead. Both numbers are reported, because the copy moved rather than
+		// vanished: a read nobody watches the commit for, and the commit that has
+		// to pay for a live reader.
 		if _, commit_err := db.sql_execute(store, "INSERT INTO reads (v) VALUES (1)"); !db.error_ok(commit_err) {
 			fail(commit_err)
 		}
@@ -298,6 +300,15 @@ main :: proc() {
 		cold := db.tx_begin_read(store)
 		db.tx_end(cold)
 		fmt.printfln("first read after a commit: %.1f us", time.duration_microseconds(time.since(cold_start)))
+
+		held := db.tx_begin_read(store)
+		copy_start := time.now()
+		if _, commit_err := db.sql_execute(store, "INSERT INTO reads (v) VALUES (1)"); !db.error_ok(commit_err) {
+			db.tx_end(held)
+			fail(commit_err)
+		}
+		fmt.printfln("commit with a read open: %.1f us", time.duration_microseconds(time.since(copy_start)))
+		db.tx_end(held)
 
 		start := time.now()
 		for _ in 0 ..< iterations {

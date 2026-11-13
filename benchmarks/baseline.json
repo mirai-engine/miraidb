@@ -8,12 +8,13 @@
   "metrics": {
     "rows": 20000,
     "iterations": 2000,
-    "insert_per_s": 55941.0,
-    "insert_seconds": 0.435,
-    "read_us_per_tx": 10.4,
-    "first_read_us": 24014.3,
-    "compact_seconds": 0.365,
-    "database_bytes": 1600336,
-    "bytes_per_row": 80.017
+    "insert_per_s": 55713.0,
+    "insert_seconds": 0.483,
+    "read_us_per_tx": 10.7,
+    "first_read_us": 38.3,
+    "commit_with_reader_us": 16882.0,
+    "compact_seconds": 0.361,
+    "database_bytes": 1600375,
+    "bytes_per_row": 80.019
   }
 }

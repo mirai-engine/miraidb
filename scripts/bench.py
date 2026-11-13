@@ -84,12 +84,18 @@ def measure(binary: str, rows: int, iterations: int) -> dict:
         if not read_match:
             raise SystemExit(f"cannot read the read cost from: {out}")
         read_us = float(read_match.group(1))
-        # The first read after a commit copies the tables into a snapshot; it is
-        # the number the efficiency contract talks about, so the gate records it.
+        # Opening a read copies nothing; a commit that has to change a table a
+        # reader holds copies it. Both are contract numbers, so the gate records
+        # them together: one moving into the other is not a regression, and a gate
+        # that watched only one of them would not notice.
         first_match = re.search(r"first read after a commit: ([\d.]+) us", out)
         if not first_match:
             raise SystemExit(f"cannot read the first-read cost from: {out}")
         first_read_us = float(first_match.group(1))
+        copy_match = re.search(r"commit with a read open: ([\d.]+) us", out)
+        if not copy_match:
+            raise SystemExit(f"cannot read the copy cost of a commit from: {out}")
+        commit_with_reader_us = float(copy_match.group(1))
 
         started = time.time()
         run(binary, "compact", relative, "--no-sync")
@@ -103,6 +109,7 @@ def measure(binary: str, rows: int, iterations: int) -> dict:
             "insert_seconds": round(insert_seconds, 3),
             "read_us_per_tx": read_us,
             "first_read_us": first_read_us,
+            "commit_with_reader_us": commit_with_reader_us,
             "compact_seconds": round(compact_seconds, 3),
             "database_bytes": size,
             "bytes_per_row": round(size / rows, 3),
@@ -156,6 +163,13 @@ def compare(payload: dict, current: dict) -> int:
         "first read us",
         current.get("first_read_us", 0),
         baseline.get("first_read_us", 0),
+        True,
+        TIME_CATASTROPHE,
+    )
+    check(
+        "commit w/ reader us",
+        current.get("commit_with_reader_us", 0),
+        baseline.get("commit_with_reader_us", 0),
         True,
         TIME_CATASTROPHE,
     )
