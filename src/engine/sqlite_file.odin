@@ -162,9 +162,11 @@ sqlite_wal_load :: proc(file: ^Sqlite_File, path: string) -> bool {
 // sqlite_journal_rollback restores the pages a hot rollback journal recorded.
 // SQLite writes the original page images there before touching the database, so
 // a journal next to the file means the transaction never committed and the
-// images win. Records start on sector boundaries.
+// images win. Records start on sector boundaries. Once the images are back the
+// journal is deleted, which is what makes this recovery rather than a replay
+// that would undo the next commit as well.
 @(private)
-sqlite_journal_rollback :: proc(file: ^Sqlite_File, path: string) -> bool {
+sqlite_journal_rollback :: proc(file: ^Sqlite_File, path: string, recover := false) -> bool {
 	data, read_err := os.read_entire_file(path, file.alloc)
 	if read_err != nil do return false
 	defer delete(data, file.alloc)
@@ -190,6 +192,12 @@ sqlite_journal_rollback :: proc(file: ^Sqlite_File, path: string) -> bool {
 		}
 		record := 4 + int(page_size) + 4
 		at += (record + int(sector) - 1) / int(sector) * int(sector)
+	}
+	if applied && recover {
+		// The owner is about to write the file: the transaction is rolled back
+		// and keeping the journal would restore these pages over the next
+		// commit. A plain reader leaves it alone.
+		os.remove(path)
 	}
 	return applied
 }
@@ -530,7 +538,15 @@ sqlite_affinity :: proc(declared: string) -> Type_Kind {
 	return .Any
 }
 
-sqlite_file_open :: proc(path: string, alloc := context.allocator) -> (Sqlite_File, Error) {
+// sqlite_file_open reads a SQLite database into memory. `recover` is for a
+// caller that owns the file and is about to write it: it makes a hot rollback
+// journal win and then removes it, which is what recovery means. A plain reader
+// leaves the journal on disk for whoever does own it.
+sqlite_file_open :: proc(
+	path: string,
+	alloc := context.allocator,
+	recover := false,
+) -> (Sqlite_File, Error) {
 	data, read_err := os.read_entire_file(path, alloc)
 	if read_err != nil {
 		return {}, errf(.Io, "cannot read %s: %v", path, read_err)
@@ -558,7 +574,7 @@ sqlite_file_open :: proc(path: string, alloc := context.allocator) -> (Sqlite_Fi
 	// restore, so it wins over the database file.
 	journal_path := fmt.aprintf("%s-journal", path, allocator = alloc)
 	defer delete(journal_path, alloc)
-	sqlite_journal_rollback(&file, journal_path)
+	sqlite_journal_rollback(&file, journal_path, recover)
 	// A write-ahead log keeps the most recent commits out of the database file.
 	wal_path := fmt.aprintf("%s-wal", path, allocator = alloc)
 	defer delete(wal_path, alloc)

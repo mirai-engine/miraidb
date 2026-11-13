@@ -6712,6 +6712,314 @@ test_sqlite_live_mirror :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_mirror_patches_only_the_pages_it_touched :: proc(t: ^testing.T) {
+	path := "_test_mirror_patch.db"
+	journal := "_test_mirror_patch.db-journal"
+	os.remove(path)
+	os.remove(journal)
+
+	// Build a database and export it, then open it the way a caller would.
+	source := fresh_db(t, "mirror_patch_source")
+	if source == nil do return
+	run(t, source, "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)")
+	{
+		tx := db.tx_begin_write(source)
+		for i in 1 ..= 400 {
+			_, insert_err := db.sql_execute_in_tx_params(
+				tx,
+				"INSERT INTO items (id, name, score) VALUES (?, ?, ?)",
+				[]db.Value{db.value_int(i64(i)), db.value_string(fmt.aprintf("row%d", i)), db.value_int(i64(i % 10))},
+			)
+			testing.expect(t, db.error_ok(insert_err))
+		}
+		testing.expect(t, db.error_ok(db.tx_commit(tx)))
+	}
+	_, _, export_err := db.sqlite_file_write(source, path)
+	testing.expect(t, db.error_ok(export_err), "export must succeed")
+	db.store_close(source)
+	os.remove_all("_test_mirror_patch_source")
+
+	conn, open_err := db.embed_open(path, {persistent = true, create = false, durable = false})
+	if !testing.expectf(t, db.error_ok(open_err), "embed_open: %s", open_err.message) do return
+	store := conn.store
+
+	// One row of each kind: a commit should rewrite a leaf and the header, not
+	// the table.
+	insert, insert_err := db.sql_execute(store, "INSERT INTO items (id, name, score) VALUES (900, 'late', 3)")
+	testing.expect(t, db.error_ok(insert_err))
+	db.sql_result_destroy(&insert)
+	pages_after_insert := store.mirror_pages_written
+	testing.expectf(t, pages_after_insert > 0, "the insert must write something")
+	testing.expectf(t, pages_after_insert <= 4, "an insert wrote %d pages", pages_after_insert)
+	testing.expect_value(t, store.mirror_full_writes, 0)
+
+	update, update_err := db.sql_execute(store, "UPDATE items SET name = 'renamed' WHERE id = 900")
+	testing.expect(t, db.error_ok(update_err))
+	db.sql_result_destroy(&update)
+	testing.expectf(t, store.mirror_pages_written - pages_after_insert <= 4, "an update wrote too much")
+	testing.expect_value(t, store.mirror_full_writes, 0)
+
+	remove, remove_err := db.sql_execute(store, "DELETE FROM items WHERE id = 5")
+	testing.expect(t, db.error_ok(remove_err))
+	db.sql_result_destroy(&remove)
+	testing.expect_value(t, store.mirror_full_writes, 0)
+	testing.expect(t, store.mirror_bytes_written < 64 * 1024, "three commits must not rewrite the table")
+
+	// No journal is left behind once the commits are durable.
+	_, journal_err := os.stat(journal, context.temp_allocator)
+	testing.expect(t, journal_err != nil, "the journal must be gone after a commit")
+	db.embed_close(conn)
+
+	// The file is still a database: every row but the deleted one is there, and
+	// the renamed one carries its new value.
+	file, file_err := db.sqlite_file_open(path)
+	if !testing.expectf(t, db.error_ok(file_err), "sqlite_file_open: %s", file_err.message) do return
+	defer db.sqlite_file_destroy(&file)
+	rows, rows_err := db.sqlite_table_rows(&file, &file.tables[0], context.allocator)
+	if !testing.expectf(t, db.error_ok(rows_err), "read: %s", rows_err.message) do return
+	defer {
+		for row in rows do db.free_values(row)
+		delete(rows)
+	}
+	testing.expect_value(t, len(rows), 400)
+	found_late := false
+	found_five := false
+	for row in rows {
+		if row[0].i == 900 {
+			found_late = true
+			testing.expect_value(t, row[1].s, "renamed")
+		}
+		if row[0].i == 5 do found_five = true
+	}
+	testing.expect(t, found_late, "the inserted row must be in the file")
+	testing.expect(t, !found_five, "the deleted row must be gone")
+	os.remove(path)
+	os.remove(journal)
+}
+
+@(test)
+test_mirror_survives_a_torn_commit :: proc(t: ^testing.T) {
+	path := "_test_mirror_torn.db"
+	journal := "_test_mirror_torn.db-journal"
+	os.remove(path)
+	os.remove(journal)
+
+	source := fresh_db(t, "mirror_torn_source")
+	if source == nil do return
+	run(t, source, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+	{
+		tx := db.tx_begin_write(source)
+		for i in 1 ..= 200 {
+			_, err := db.sql_execute_in_tx_params(
+				tx,
+				"INSERT INTO t (id, v) VALUES (?, ?)",
+				[]db.Value{db.value_int(i64(i)), db.value_string(fmt.aprintf("v%d", i))},
+			)
+			testing.expect(t, db.error_ok(err))
+		}
+		testing.expect(t, db.error_ok(db.tx_commit(tx)))
+	}
+	_, _, export_err := db.sqlite_file_write(source, path)
+	testing.expect(t, db.error_ok(export_err))
+	db.store_close(source)
+	os.remove_all("_test_mirror_torn_source")
+
+	conn, open_err := db.embed_open(path, {persistent = true, create = false, durable = false})
+	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
+	// The first commit builds the layout and patches it; the second one is the
+	// one that dies between its data pages and the header.
+	first, first_err := db.sql_execute(conn.store, "INSERT INTO t (id, v) VALUES (900, 'nine')")
+	testing.expect(t, db.error_ok(first_err))
+	testing.expect_value(t, conn.store.last_error.kind, db.Error_Kind.None)
+	db.sql_result_destroy(&first)
+	db.store_mirror_crash_before_header(conn.store)
+	second, second_err := db.sql_execute(conn.store, "INSERT INTO t (id, v) VALUES (901, 'ten')")
+	// The commit itself is safe -- the log is the truth -- but the mirror says it
+	// could not finish.
+	testing.expect(t, db.error_ok(second_err))
+	testing.expect_value(t, conn.store.last_error.kind, db.Error_Kind.Io)
+	db.sql_result_destroy(&second)
+	_, journal_err := os.stat(journal, context.temp_allocator)
+	testing.expect(t, journal_err == nil, "the crash must leave its journal behind")
+	db.embed_close(conn)
+
+	// Opening the file as its owner rolls the torn commit back: the journal wins
+	// and is deleted, so the file is the state before the crash.
+	file, file_err := db.sqlite_file_open(path, context.allocator, true)
+	if !testing.expectf(t, db.error_ok(file_err), "sqlite_file_open: %s", file_err.message) do return
+	rows, rows_err := db.sqlite_table_rows(&file, &file.tables[0], context.allocator)
+	testing.expect(t, db.error_ok(rows_err))
+	testing.expect_value(t, len(rows), 201)
+	recovered_nine := false
+	recovered_ten := false
+	for row in rows {
+		if row[0].i == 900 do recovered_nine = true
+		if row[0].i == 901 do recovered_ten = true
+	}
+	testing.expect(t, recovered_nine, "the committed row before the crash must survive")
+	testing.expect(t, !recovered_ten, "the torn row must not be in the file")
+	for row in rows do db.free_values(row)
+	delete(rows)
+	db.sqlite_file_destroy(&file)
+	_, stale_err := os.stat(journal, context.temp_allocator)
+	testing.expect(t, stale_err != nil, "recovery must delete the journal")
+
+	// The file still takes commits after the recovery.
+	again, again_err := db.embed_open(path, {persistent = true, create = false, durable = false})
+	if !testing.expectf(t, db.error_ok(again_err), "reopen: %s", again_err.message) do return
+	last, last_err := db.sql_execute(again.store, "INSERT INTO t (id, v) VALUES (902, 'eleven')")
+	testing.expect(t, db.error_ok(last_err))
+	testing.expect_value(t, again.store.mirror_full_writes, 0)
+	db.sql_result_destroy(&last)
+	db.embed_close(again)
+	os.remove(path)
+	os.remove(journal)
+}
+
+// file_pages reads a SQLite file's own page count from its header.
+@(private)
+file_pages :: proc(t: ^testing.T, path: string) -> int {
+	data, read_err := os.read_entire_file(path, context.allocator)
+	if !testing.expectf(t, read_err == nil, "cannot read %s", path) do return 0
+	defer delete(data)
+	if len(data) < 32 do return 0
+	pages := int(data[28]) << 24 | int(data[29]) << 16 | int(data[30]) << 8 | int(data[31])
+	return pages
+}
+
+@(test)
+test_mirror_grows_and_reopens :: proc(t: ^testing.T) {
+	path := "_test_mirror_grow.db"
+	os.remove(path)
+	source := fresh_db(t, "mirror_grow_source")
+	if source == nil do return
+	run(t, source, "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)")
+	run(t, source, "CREATE TABLE others (id INTEGER PRIMARY KEY, tag TEXT)")
+	run(t, source, "CREATE TABLE indexed (id INTEGER PRIMARY KEY, code INTEGER)")
+	run(t, source, "CREATE INDEX indexed_code ON indexed (code)")
+	{
+		tx := db.tx_begin_write(source)
+		for i in 1 ..= 400 {
+			_, err := db.sql_execute_in_tx_params(
+				tx,
+				"INSERT INTO items (id, name, score) VALUES (?, ?, ?)",
+				[]db.Value{db.value_int(i64(i)), db.value_string(fmt.aprintf("row%d", i)), db.value_int(i64(i % 10))},
+			)
+			testing.expect(t, db.error_ok(err))
+		}
+		for i in 1 ..= 50 {
+			_, err := db.sql_execute_in_tx_params(
+				tx,
+				"INSERT INTO others (id, tag) VALUES (?, ?)",
+				[]db.Value{db.value_int(i64(i)), db.value_string(fmt.aprintf("tag%d", i))},
+			)
+			testing.expect(t, db.error_ok(err))
+		}
+		testing.expect(t, db.error_ok(db.tx_commit(tx)))
+	}
+	_, _, export_err := db.sqlite_file_write(source, path)
+	testing.expect(t, db.error_ok(export_err))
+	db.store_close(source)
+	os.remove_all("_test_mirror_grow_source")
+
+	conn, open_err := db.embed_open(path, {persistent = true, create = false, durable = false})
+	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
+	mirror_check :: proc(t: ^testing.T, path: string) {
+		ok, reason := db.sqlite_mirror_validate(path)
+		testing.expectf(t, ok, "the mirrored tree is broken: %s", reason)
+	}
+	mirror_statement :: proc(t: ^testing.T, store: ^db.Store, sql: string) {
+		result, err := db.sql_execute(store, sql)
+		testing.expectf(t, db.error_ok(err), "%s: %s", sql, err.message)
+		db.sql_result_destroy(&result)
+	}
+	mirror_statement(t, conn.store, "INSERT INTO items (id, name, score) VALUES (900, 'late', 3)")
+	mirror_statement(t, conn.store, "UPDATE items SET name = 'renamed' WHERE id = 900")
+	mirror_statement(t, conn.store, "DELETE FROM items WHERE id = 5")
+	mirror_statement(t, conn.store, "INSERT INTO others (id, tag) VALUES (77, 'extra')")
+	// Growth: enough rows to split leaves and make the tree taller than one page.
+	{
+		tx := db.tx_begin_write(conn.store)
+		for i in 1000 ..= 2500 {
+			_, err := db.sql_execute_in_tx_params(
+				tx,
+				"INSERT INTO items (id, name, score) VALUES (?, ?, ?)",
+				[]db.Value{db.value_int(i64(i)), db.value_string(fmt.aprintf("bulk%d", i)), db.value_int(i64(i % 7))},
+			)
+			testing.expect(t, db.error_ok(err))
+		}
+		testing.expect(t, db.error_ok(db.tx_commit(tx)))
+	}
+	testing.expectf(
+		t,
+		conn.store.mirror_full_writes == 0,
+		"growth must patch in place, full=%d reason=%s",
+		conn.store.mirror_full_writes,
+		conn.store.mirror_reason,
+	)
+	mirror_check(t, path)
+	mirror_statement(t, conn.store, "DELETE FROM items WHERE id > 2400")
+	mirror_check(t, path)
+	// A table with a secondary index cannot be patched: it re-encodes the file.
+	mirror_statement(t, conn.store, "INSERT INTO indexed (id, code) VALUES (1, 10)")
+	testing.expect(t, conn.store.mirror_full_writes > 0, "an indexed table must re-encode")
+	// A schema change re-encodes too, and patching resumes afterwards.
+	mirror_statement(t, conn.store, "CREATE TABLE fresh (id INTEGER PRIMARY KEY, v TEXT)")
+	fulls := conn.store.mirror_full_writes
+	mirror_statement(t, conn.store, "INSERT INTO items (id, name, score) VALUES (9999, 'after', 1)")
+	testing.expect_value(t, conn.store.mirror_full_writes, fulls)
+	mirror_check(t, path)
+
+	// Emptying a leaf unlinks it and puts its page on the free list; the next
+	// growth takes that page back instead of making the file longer.
+	before := file_pages(t, path)
+	mirror_statement(t, conn.store, "DELETE FROM items WHERE id BETWEEN 2300 AND 2400")
+	after_delete := file_pages(t, path)
+	mirror_statement(t, conn.store, "INSERT INTO items (id, name, score) VALUES (3001, 'refill', 1), (3002, 'refill', 1), (3003, 'refill', 1)")
+	after_insert := file_pages(t, path)
+	mirror_check(t, path)
+	testing.expectf(
+		t,
+		after_insert <= after_delete + 1,
+		"a freed page was not reused: %d pages after the delete, %d after the insert",
+		after_delete,
+		after_insert,
+	)
+	testing.expect(t, after_delete <= before, "a delete must not grow the file")
+	testing.expect_value(t, conn.store.mirror_full_writes, fulls)
+	db.embed_close(conn)
+
+	// Reopening reads the layout back from the file and keeps patching.
+	again, again_err := db.embed_open(path, {persistent = true, create = false, durable = false})
+	if !testing.expectf(t, db.error_ok(again_err), "reopen: %s", again_err.message) do return
+	mirror_statement(t, again.store, "INSERT INTO items (id, name, score) VALUES (10000, 'third', 2)")
+	mirror_statement(t, again.store, "DELETE FROM items WHERE id = 1000")
+	testing.expect_value(t, again.store.mirror_full_writes, 0)
+	db.embed_close(again)
+
+	file, file_err := db.sqlite_file_open(path)
+	if !testing.expectf(t, db.error_ok(file_err), "sqlite_file_open: %s", file_err.message) do return
+	defer db.sqlite_file_destroy(&file)
+	// Every table the commits touched is still there, with the right rows.
+	counts := make(map[string]int)
+	for &table in file.tables {
+		rows, rows_err := db.sqlite_table_rows(&file, &table, context.allocator)
+		testing.expectf(t, db.error_ok(rows_err), "read %s: %s", table.name, rows_err.message)
+		counts[table.name] = len(rows)
+		for row in rows do db.free_values(row)
+		delete(rows)
+	}
+	defer delete(counts)
+	// 400 + one late row + 1501 bulk rows - 100 over 2400 - 101 emptied from a
+	// leaf + 3 that refilled the freed page - 2 deleted around the reopen.
+	testing.expect_value(t, counts["items"], 1704)
+	testing.expect_value(t, counts["others"], 51)
+	testing.expect_value(t, counts["indexed"], 1)
+	testing.expect_value(t, counts["fresh"], 0)
+	os.remove(path)
+}
+
+@(test)
 test_column_collation_and_generated :: proc(t: ^testing.T) {
 	path := fmt.aprintf("_test_%s", "collgen")
 	defer delete(path)

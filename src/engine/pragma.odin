@@ -457,6 +457,10 @@ pragma_stats :: proc(store: ^Store) -> Sql_Result {
 	// A scan counts every row it visits: the number a plan is judged by.
 	append_counts(&rows, "rows_scanned", store.rows_scanned)
 	append_counts(&rows, "stream_scans", store.stream_scans)
+	// What keeping a .sqlite mirror current cost: pages written and the number
+	// of commits that had to re-encode the whole file.
+	append_counts(&rows, "mirror_pages", u64(store.mirror_pages_written))
+	append_counts(&rows, "mirror_rewrites", u64(store.mirror_full_writes))
 	bound: u64 = 1
 	for bucket in 0 ..< LATENCY_BUCKETS {
 		append_counts(&rows, fmt.aprintf("commit_us_lt_%d", bound), stats.commit_bucket[bucket])

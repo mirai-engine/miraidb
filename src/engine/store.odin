@@ -123,9 +123,19 @@ Store :: struct {
 	// and their catalog lives in `_attach`.
 	attached:            map[string]^Store,
 	// sqlite_mirror is the .sqlite file this database was opened from. After a
-	// commit the whole state is written back to it, so the file stays a SQLite
-	// database a client can open. The commit log is still the truth.
+	// commit the pages the commit touched are written back to it, so the file
+	// stays a SQLite database a client can open. The commit log is still the
+	// truth; the mirror is a cache of it in another format.
 	sqlite_mirror:       string,
+	// mirror is that file's layout, read once and then patched page by page.
+	mirror:              ^Sqlite_Mirror,
+	// The cost of the mirror, in pages: what a commit had to write, and how many
+	// commits fell back to re-encoding the whole file.
+	mirror_pages_written: int,
+	mirror_bytes_written: u64,
+	mirror_full_writes:   int,
+	// mirror_reason says why the last commit re-encoded the mirrored file.
+	mirror_reason:        string,
 	log:           Commit_Log,
 	vfs:           ^Vfs,
 	persistent:    bool,
@@ -338,6 +348,8 @@ store_close :: proc(store: ^Store) {
 	delete(store.tables)
 	for _, attached in store.attached do store_close(attached)
 	delete(store.attached)
+	mirror_destroy(store.mirror)
+	delete(store.mirror_reason)
 	delete(store.sqlite_mirror)
 	for name, value in store.variables {
 		delete(name)
@@ -356,17 +368,73 @@ store_set_sqlite_mirror :: proc(store: ^Store, path: string) {
 	if store == nil do return
 	delete(store.sqlite_mirror)
 	store.sqlite_mirror = strings.clone(path)
+	// The layout is read now, while every row the file holds is still in the
+	// store: a delete is the one operation that has no values to name its row
+	// with, so it needs the map a commit would otherwise build too late.
+	mirror_destroy(store.mirror)
+	store.mirror = nil
+	if built, build_err := mirror_build(store, store.sqlite_mirror); build_err.kind == .None {
+		store.mirror = built
+	}
 }
 
-// store_sqlite_mirror_flush rewrites the mirrored file. It takes the read lock,
-// so the commit path calls it after releasing its own write lock; a failure is
-// reported and never fails the commit, because the log is the truth.
-store_sqlite_mirror_flush :: proc(store: ^Store) -> Error {
+// store_sqlite_mirror_flush brings the mirrored file up to date with a commit.
+// It patches the pages the commit touched; a commit it cannot express that way
+// (a schema change, a table it cannot address by rowid, a page that no longer
+// fits) re-encodes the file instead. It takes the read lock, so the commit path
+// calls it after releasing its own write lock; a failure is reported and never
+// fails the commit, because the log is the truth.
+store_sqlite_mirror_flush :: proc(store: ^Store, ops: []Store_Op = nil) -> Error {
 	if store == nil || len(store.sqlite_mirror) == 0 do return ERROR_NONE
 	sync.shared_lock(&store.mutex)
 	defer sync.shared_unlock(&store.mutex)
+	if store.mirror == nil {
+		built, build_err := mirror_build(store, store.sqlite_mirror)
+		if build_err.kind != .None {
+			delete(store.mirror_reason)
+			store.mirror_reason = strings.clone(build_err.message)
+			return store_sqlite_mirror_rewrite(store)
+		}
+		store.mirror = built
+	}
+	before_pages := store.mirror.pages_written
+	before_bytes := store.mirror.bytes_written
+	needs_full, apply_err := mirror_apply_commit(store, store.mirror, ops)
+	store.mirror_pages_written += store.mirror.pages_written - before_pages
+	store.mirror_bytes_written += store.mirror.bytes_written - before_bytes
+	if apply_err.kind != .None do return apply_err
+	if needs_full {
+		delete(store.mirror_reason)
+		store.mirror_reason = strings.clone(store.mirror.fallback_reason)
+		return store_sqlite_mirror_rewrite(store)
+	}
+	return ERROR_NONE
+}
+
+// store_mirror_crash_before_header arms the crash seam: the next mirror commit
+// writes its data pages and stops, leaving the journal behind, which is what a
+// process that dies mid-commit leaves on disk. Tests use it to prove the journal
+// restores the previous state.
+store_mirror_crash_before_header :: proc(store: ^Store) {
+	if store == nil || store.mirror == nil do return
+	store.mirror.crash_before_header = true
+}
+
+// store_sqlite_mirror_rewrite writes the whole state to the mirrored file and
+// reads the layout back, which is how a commit the page patcher cannot express
+// is handled.
+store_sqlite_mirror_rewrite :: proc(store: ^Store) -> Error {
+	if store == nil || len(store.sqlite_mirror) == 0 do return ERROR_NONE
+	store.mirror_full_writes += 1
+	mirror_destroy(store.mirror)
+	store.mirror = nil
 	_, _, write_err := sqlite_file_write(store, store.sqlite_mirror)
-	return write_err
+	if write_err.kind != .None do return write_err
+	built, build_err := mirror_build(store, store.sqlite_mirror)
+	if build_err.kind != .None do return build_err
+	store.mirror = built
+	store.mirror_bytes_written += u64(store.mirror.page_count * store.mirror.page_size)
+	return ERROR_NONE
 }
 
 // store_log_bytes reports the bytes the log currently occupies, counting the

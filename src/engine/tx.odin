@@ -1302,7 +1302,7 @@ tx_commit :: proc(tx: ^Tx) -> Error {
 	// A database opened from a .sqlite file keeps that file current, so a client
 	// reading it with any SQLite driver sees the commit. O(state) per commit, by
 	// design: the file is a materialized export, the log is the truth.
-	if mirror_err := store_sqlite_mirror_flush(store); mirror_err.kind != .None {
+	if mirror_err := store_sqlite_mirror_flush(store, notify_ops); mirror_err.kind != .None {
 		store.last_error = mirror_err
 	}
 	if notify != nil {
