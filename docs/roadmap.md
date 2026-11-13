@@ -26,7 +26,7 @@ outranks the dependent.
 | 6 | **D1 — FTS term index + BM25** — *done* | The term index is created with the table, `rank` is BM25 over the postings, `snippet`/`highlight` mark the match, and the scan visits only the matching documents (5000 documents: at most 8 rows visited for a rare term). | M | D11 |
 | 7 | **D13 — return the stored result on a retry** — *done* | The result commits with the request id, and `host_call_once_result` answers a retry with it instead of "already ran". | S | — |
 | 8 | **D17 — rows on disk (page store)** — *done* | A store opened with `paged_tables` keeps each user table in a 4 KiB-page file under `<db>/tables`. The page file is a cache over the log: opening discards it and the replay rebuilds it, a commit flushes it after the log record is durable, and frame 0 is reserved for the header. A single-table query streams the pages (`ORDER BY`/`GROUP BY`/`DISTINCT`/windows/`AS OF`/joins/staged writes fall back to collecting), aggregates accumulate as rows pass, and `LIMIT` stops the scan. `scripts/page_rss.py` is a CI gate: a table 63 times the pool adds 316 KiB to the statement, and four times the rows adds the same. `AS OF` and `ALTER` refuse a paged table, and a read transaction holds the shared lock, because one version lives in the pages. | XL | D8, bench |
-| 9 | **D5 — persistent index pages** | Indexes are rebuilt on open and their keys still live in the table arena; they become pages now that tables are pages. | L | D17 |
+| 9 | **D5 — index keys in pages** — *done* | Each index of a paged table is a B+tree of 4 KiB pages under `<db>/indexes/<table>/<index>`, with its own 32-frame pool, leaves chained in key order and a cursor that walks them without a parent stack. Point lookups, ranges, `UNIQUE`, updates, deletes, `TRUNCATE` and `CREATE INDEX` after a reopen go through the pages; `table_memory` reports the pool, and `scripts/page_rss.py` now also checks the index file grows with the rows (688 KiB → 2756 KiB for 4× the rows) while the statement stays near 300 KiB. An empty leaf is not merged yet, so an index that loses most of its keys keeps its leaves until it is rebuilt. Opening still rebuilds the trees with the rows: trusting the header is D18b. | L | D17 |
 | 10 | **D18b — a reader in another process** | With pages and a lock, a read-only open can coexist with a writer: "varios procesos" becomes true, not just safe. | L | D17, D18a |
 | 11 | **D6 — planner with statistics** | `ANALYZE`, a cost model, join reordering; the largest query-level win and a prerequisite for calling the engine fast on real schemas. | L | D5 (statistics live in pages) |
 | 12 | **D4 — `.sqlite` pages in place** | The mirror re-encodes the whole state per commit; with pages it writes only what changed. Until then it stays a documented O(state) export. | XL | D17 |
@@ -100,7 +100,8 @@ Today: every table is a `map[Row_Id]Row` in memory.
   map), a buffer pool with a clock hand and a memory cap, dirty-page flushing
   ordered **after** the commit record that describes it, and a free list that
   survives a crash. Recovery stays "replay what the pages are missing".
-- **D5** (9): index pages, so opening a database stops rebuilding indexes.
+- **D5** (9): index pages, so an index stops costing one RAM entry per row.
+  **Done**; opening still rebuilds them until D18b trusts the headers.
 - **D6** (11): `ANALYZE` statistics stored in pages, then a cost model and join
   reordering.
 - **D4** (12): the `.sqlite` mirror writes touched pages instead of the whole

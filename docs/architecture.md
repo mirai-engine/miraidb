@@ -24,17 +24,21 @@ A table is a `Table_Schema` plus:
 
 - `rows: map[Row_Id]Row`, where a `Row` is an ordered `[]Value` matching the
   schema columns.
-- One `Index` per index in the schema, backed by a red-black tree keyed by the
-  order-preserving encoding. A unique index stores the key alone; a non-unique
-  index appends the row id, so every entry is distinct and iteration is ordered.
+- One `Index` per index in the schema, keyed by the order-preserving encoding. A
+  unique index stores the key alone; a non-unique index appends the row id, so
+  every entry is distinct and iteration is ordered. The keys live in a red-black
+  tree, or — for a paged table — in a B+tree of 4 KiB pages (`index_page.odin`,
+  one file per index with its own pool), where leaves are chained in key order
+  and a range scan is a cursor over that chain.
 - `next_row_id`, the id the next inserted row receives.
 
 The primary key and every `UNIQUE` column get an implicit unique index during
 schema normalization, so constraint checking has exactly one code path.
 
 Rows and index buckets are heap allocated and freed when a row is deleted. The
-schema and the *stored* index keys live in a per-table arena that is released
-when the table is dropped.
+schema and the *stored* index keys of an in-memory table live in a per-table arena
+that is released when the table is dropped; a paged table keeps the keys in the
+index files instead.
 
 ## Values and types
 

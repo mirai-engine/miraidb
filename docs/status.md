@@ -132,12 +132,28 @@ honest measurement.
   a window, `AS OF`, a join, staged writes or an index that answers the filter
   fall back to collecting the table.
 - `scripts/page_rss.py --check` is a CI gate: 15k and 60k rows over an 8-frame
-  pool both add 316 KiB to the statement, and the file is 63 times the pool.
+  pool both add ~300 KiB to the statement, and the table file is 63 times the
+  pool.
+- **Indexes on disk.** Each index of a paged table is a B+tree of the same 4 KiB
+  pages, one file under `<db>/indexes/<table>/<index>` with a 32-frame pool. A
+  leaf holds `key | row id` in key order and points to the next leaf, so a range
+  scan is one pass and a cursor needs no parent stack; a branch holds a separator
+  and a child per cell. Point lookups, range scans, `UNIQUE`/primary-key checks,
+  updates that move a key, deletes and `TRUNCATE` all go through those pages.
+  `table_memory` reports the pool, not one entry per row, and `page_rss.py`
+  checks the index file grows with the rows (688 KiB → 2756 KiB for 4× the rows)
+  while the statement stays near 300 KiB.
+- Index files are rebuilt on open together with the table pages: trusting them
+  without replay is D18b, not claimed here.
 
-**Not claimed.** Index keys still live in the table arena (D5); a paged table
-keeps one version, so `AS OF` and `ALTER` refuse it; a read transaction of a store
-with pages holds the shared lock (writers wait); opening reads the whole log into
-memory, so a very large log still costs its size at startup.
+**Not claimed.** An index leaf that loses its last entry is not merged back into
+its neighbour, so an index that loses most of its keys keeps the leaves until it
+is rebuilt (a delete never leaves a wrong answer: the cursor walks past empty
+leaves, and the test deletes a third of 5000 keys); a paged table keeps one
+version, so `AS OF` and `ALTER` refuse it; a read transaction of a store with
+pages holds the shared lock (writers wait); opening reads the whole log into
+memory, so a very large log still costs its size at startup; a key longer than
+1000 bytes cannot be indexed and the insert says so.
 
 
 - **Index use.** Only the base table of a query is narrowed by an index; joined

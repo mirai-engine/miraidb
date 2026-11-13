@@ -282,6 +282,47 @@ Tests: `test_page_store_roundtrip`, `test_page_store_streams_within_the_pool`,
 `test_page_store_header_is_a_promise`, `test_paged_table_roundtrip` (a reopen
 with a different pool size), `test_paged_table_churn` (compaction under churn).
 
+## Index file
+
+An index of a paged table is a B+tree of the same 4 KiB pages in
+`<db>/indexes/<table>/<index>`. Keys are the order-preserving encoding the
+in-memory tree used, so a comparison on the bytes is a comparison on the values.
+
+```
+page 0   header page: kind 2, plus magic "MRPI", version 1, root, height, entries
+leaf     kind 3: cells {u16 key_len | key | u64 row id} in key order,
+         next leaf in the page header's next_free  (0xFFFFFFFF = last)
+branch   kind 4: cells {u16 key_len | key | u32 child} in key order,
+         leftmost child in next_free
+```
+
+- Routing: child *i* holds the keys in `[separator i, separator i+1)`; the
+  leftmost child holds everything below `separator 0`. So a descent is a binary
+  search per level, and the height is the number of pages it reads.
+- Leaves are chained in order, so a range scan or a prefix lookup is a single
+  walk with a cursor that carries only `{page, slot, count}`; the key is copied
+  out before the page is released, because the pool may evict it.
+- A full page is split at the cell nearest half a page; the first key of the new
+  right page is promoted to the parent, and a split at the root adds a level.
+  A delete removes the cell and leaves an empty leaf in place: the cursor walks
+  past it, which keeps lookups correct; merging is future work, so an index that
+  loses most of its keys keeps its leaves until it is rebuilt.
+- Index page 0 carries `root`, `height` and `entries` at bytes 52, 56 and 60 and
+  the "MRPI" magic at 68; the row-file fields (`page_count`, `free_head`,
+  `free_pages`, `applied_seq`) are shared.
+- A key is limited to 1000 bytes so a cell always fits a page; a longer key is
+  refused at insert with the limit in the message, instead of writing a cell the
+  page cannot hold.
+- The file is flushed after the log record, page 0 last, exactly like a table
+  file, and it is discarded and rebuilt on open for the same reason.
+
+Tests: `test_ordered_index_pages` (5000 keys over a 4-frame pool, a third of them
+deleted, then closed, reopened and cleared),
+`test_ordered_index_rejects_a_key_that_cannot_fit`, and
+`test_paged_index_pages` (a paged table with two indexes: lookups, ranges,
+constraints, an update that moves a key, `TRUNCATE`, a reopen and a `CREATE
+INDEX` after it).
+
 ## Durability
 
 `store_open(..., durable = true)` opens the log and calls `fsync` after writing

@@ -61,6 +61,10 @@ def measure(binary: str, rows: int) -> dict:
     if not result or not growth or not peak:
         raise SystemExit(f"cannot read the report from:\n{out}")
     file_bytes = os.path.getsize(os.path.join(directory, "db", "tables", "bench"))
+    # The primary key is an index, and with paging on it is its own page file. It
+    # has to be there and grow with the rows, while the memory above does not.
+    index_path = os.path.join(directory, "db", "indexes", "bench", "bench_pkey")
+    index_bytes = os.path.getsize(index_path) if os.path.exists(index_path) else 0
     return {
         "rows": rows,
         "count": int(result.group(1)),
@@ -68,6 +72,7 @@ def measure(binary: str, rows: int) -> dict:
         "growth": int(growth.group(1)),
         "peak": int(peak.group(1)),
         "file_bytes": file_bytes,
+        "index_bytes": index_bytes,
     }
 
 
@@ -90,7 +95,8 @@ def main() -> int:
         print(
             f"{label}: rows={metric['rows']} file={metric['file_bytes'] // 1024} KiB "
             f"({metric['file_bytes'] // pool_bytes}x pool) "
-            f"growth={metric['growth'] // 1024} KiB peak={metric['peak'] // 1024} KiB"
+            f"growth={metric['growth'] // 1024} KiB peak={metric['peak'] // 1024} KiB "
+            f"index={metric['index_bytes'] // 1024} KiB"
         )
 
     failures: list[str] = []
@@ -104,6 +110,13 @@ def main() -> int:
                 f"{label}: the statement added {metric['growth'] // 1024} KiB over the open, "
                 f"over the {GROWTH_CAP // 1024} KiB cap"
             )
+    if small["index_bytes"] == 0 or big["index_bytes"] == 0:
+        failures.append("an index file is missing; the keys are not being paged")
+    elif big["index_bytes"] < small["index_bytes"] * 2:
+        failures.append(
+            f"big: the index file is {big['index_bytes'] // 1024} KiB against "
+            f"{small['index_bytes'] // 1024} KiB for the small table"
+        )
     if big["file_bytes"] < FILE_FLOOR:
         failures.append(f"big: the file is smaller than ten times the pool ({FILE_FLOOR} bytes)")
     if big["growth"] > small["growth"] + GROWTH_SLACK:

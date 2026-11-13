@@ -334,7 +334,11 @@ cost and two refusals:
 - `AS OF` on a paged table is refused (`Sql_Unsupported`): a page keeps one
   version of a row;
 - `ALTER TABLE` on a paged table is refused: the rewrite walks the row map that a
-  paged table does not have.
+  paged table does not have;
+- an index of a paged table lives in its own page file, so a filtered lookup or a
+  range does not pay for the keys of the whole table in memory. A key longer than
+  1000 bytes cannot be indexed: the insert fails with the limit in the message,
+  and the same value held in a table without that index is fine.
 
 ## Reading the past
 

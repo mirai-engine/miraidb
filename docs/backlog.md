@@ -25,7 +25,7 @@ Rules for this file:
 | D2 | Spatial index | overlap is a scan of the boxes | node file, tree descent | M | P2 |
 | D3 | Snapshot cost | **borrowed values, ~1 ms to freeze 50k rows** | `AS OF` history, GC | M | P2 |
 | D4 | Page backend | `.sqlite` is rewritten whole per commit | pages in place, WAL frames, free list | XL | P1 |
-| D5 | Persistent indexes | rebuilt in memory when a database opens | index pages on disk | L | P2 |
+| D5 | Persistent indexes | **done**: index keys live in B+trees of pages, with a pool, a cursor over chained leaves and a memory gate | merging empty leaves; a trusted open without replay (D18b) | L | P0 |
 | D6 | Query planner | nested loop + index probes | cost model, statistics, reordering | L | P1 |
 | D7 | Scheduler durability | **durable** (due time is a logged column) | recovery test | S | — |
 | D8 | Crash injection | **done**: `Fault_Vfs` fails any operation at any call, and `test_fault_injection` walks the write offsets | same for the snapshot and the mirror writes | S | P1 |
@@ -221,19 +221,32 @@ previous state readable (a torn-write test).
 
 **Not claimed today.** "SQLite as a storage backend" — it is a live export.
 
-## D5 — Indexes that survive a restart
+## D5 — Index keys in pages: **done** (a trusted open is D18b)
 
-**Now.** Indexes are in-memory structures built when the database opens and
-maintained in memory afterwards; three algorithms exist (Btree, Hash, Direct).
+**Now.** An index of a paged table is a B+tree of 4 KiB pages in
+`<db>/indexes/<table>/<index>`, with the same pool, checksum, free list and flush
+order as the row files. Leaf cells hold `key | row id` in key order and each leaf
+links to the next, so a cursor walks a range without a parent stack; a branch
+holds a separator and a child per cell; page 0 holds the root, the height and the
+entry count. The keys leave the table arena, so `table_memory` reports the pool
+instead of one entry per row, and a point lookup on 3000 rows visits at most four
+rows. `CREATE INDEX` on a paged table walks the row pages and fills the tree,
+`DROP INDEX` closes and removes the file, `TRUNCATE` starts a fresh one, and a
+reopen rebuilds them with the table pages (the replay is still the source of
+truth).
 
-**Cost.** Opening a large database rebuilds them from the rows; the log carries
-no index pages.
+**Cost / bugs found.** The first version of `table_add_index` built its visitor
+context without the table pointer, so a `CREATE INDEX` after a reopen crashed
+with a segmentation fault while the same statement in a fresh session sometimes
+worked — the stack happened to hold the right pointer. `test_paged_index_pages`
+now creates an index after a reopen. A leaf that loses its last entry is left in
+place (no merge yet); the cursor walks past empty leaves, which is why a delete
+is still correct, and the test deletes a third of 5000 keys to prove it.
 
-**Done when.** An index is a persisted structure with pages in the log, opening
-does not rebuild it, and a crash mid-build leaves either the old index or none,
-never a partial one.
+**Left.** A merge between neighbours, and trusting the header when its
+`applied_seq` matches the log (D18b) instead of replaying.
 
-**Not claimed today.** "Persistent indexes".
+**Not claimed today.** "Persistent indexes" as in "opening does not touch them".
 
 ## D6 — A planner with numbers
 

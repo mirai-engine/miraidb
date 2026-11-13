@@ -1,5 +1,6 @@
 package engine
 
+import "core:fmt"
 import "core:mem"
 import "core:mem/virtual"
 import "core:sync"
@@ -47,6 +48,10 @@ Index :: struct {
 	// lookup is the equality map for HASH and DIRECT indexes. The tree is still
 	// maintained so ordering, range scans and the primary-key path keep working.
 	lookup: map[string]^Index_Bucket,
+	// pages holds the same keys in a B+tree of pages. It is set for the indexes
+	// of a paged table: the keys then live in the index file and the pool bounds
+	// what a lookup costs, instead of every key staying in RAM.
+	pages: ^Ordered_Pages,
 }
 
 // Index_Bucket holds the rows that share one indexed key.
@@ -95,6 +100,12 @@ Table :: struct {
 	// borrowed is true for a snapshot: it reads another table's values and must
 	// not free them.
 	borrowed:        bool,
+	// index_dir, index_vfs and index_frames are what an index created after the
+	// table needs to open its own page file. A table without them (an in-memory
+	// store, or a test that made the page file itself) keeps its indexes in RAM.
+	index_dir:    string,
+	index_vfs:    ^Vfs,
+	index_frames: int,
 	// paged holds the rows in a page file. When it is set the map above stays
 	// empty: the page file is the storage, not a copy of a map, which is what
 	// keeps a table larger than the pool out of RAM. A paged table keeps one
@@ -161,12 +172,14 @@ table_destroy :: proc(t: ^Table) {
 	for i in 0 ..< len(t.indexes) {
 		rbtree.destroy(&t.indexes[i].tree)
 		table_index_map_free(t, i)
+		ordered_close(t.indexes[i].pages)
 	}
 	delete(t.indexes)
 	// A paged table is closed, not deleted: the caller removes the file when the
 	// table is dropped. Dirty frames are dropped with it, which is safe because
 	// the log holds every committed change.
 	page_rows_close(t.paged)
+	if len(t.index_dir) > 0 do delete(t.index_dir)
 	virtual.arena_destroy(&t.arena)
 	if t.store != nil do row_store_release(t.store)
 	free(t)
@@ -429,6 +442,88 @@ table_index_map_free :: proc(t: ^Table, index: int) {
 	delete(t.indexes[index].lookup)
 }
 
+// --- Index backends --------------------------------------------------------
+
+// table_index_put stores one entry. A paged index writes it to the B+tree of
+// pages; a memory index upserts the rbtree.
+@(private)
+table_index_put :: proc(t: ^Table, index: int, key: string, id: Row_Id) -> Error {
+	if t.indexes[index].pages != nil {
+		if put_err := ordered_put(t.indexes[index].pages, key, u64(id)); put_err.kind != .None {
+			return errf(
+				put_err.kind,
+				"cannot grow index %s: %s",
+				t.indexes[index].schema.name,
+				put_err.message,
+			)
+		}
+		return ERROR_NONE
+	}
+	_, _, insert_err := rbtree.upsert(&t.indexes[index].tree, key, id)
+	if insert_err != nil {
+		return errf(.Out_Of_Memory, "cannot grow index %s", t.indexes[index].schema.name)
+	}
+	return ERROR_NONE
+}
+
+@(private)
+table_index_remove_key :: proc(t: ^Table, index: int, key: string) {
+	if t.indexes[index].pages != nil {
+		_ = ordered_remove(t.indexes[index].pages, key)
+		return
+	}
+	rbtree.remove_key(&t.indexes[index].tree, key)
+}
+
+// table_index_count is how many entries an index holds.
+table_index_count :: proc(t: ^Table, index: int) -> u64 {
+	if t.indexes[index].pages != nil do return ordered_entries(t.indexes[index].pages)
+	count: u64
+	node := rbtree.first(&t.indexes[index].tree)
+	for node != nil {
+		count += 1
+		node = node_next(node)
+	}
+	return count
+}
+
+// table_index_path is the file an index of this table lives in. It is empty when
+// the table has no index directory, which is the signal to stay in memory.
+table_index_path :: proc(t: ^Table, name: string) -> string {
+	if len(t.index_dir) == 0 do return ""
+	file := store_paged_file_name(name)
+	defer delete(file)
+	return fmt.aprintf("%s/%s", t.index_dir, file)
+}
+
+@(private)
+table_index_attach_pages :: proc(t: ^Table, index: int) -> Error {
+	if t.paged == nil || len(t.index_dir) == 0 do return ERROR_NONE
+	path := table_index_path(t, t.indexes[index].schema.name)
+	if len(path) == 0 do return ERROR_NONE
+	defer delete(path)
+	frames := t.index_frames
+	if frames <= 0 do frames = INDEX_PAGE_FRAMES
+	pages, create_err := ordered_create(t.index_vfs, path, frames)
+	if create_err.kind != .None do return create_err
+	t.indexes[index].pages = pages
+	return ERROR_NONE
+}
+
+@(private)
+table_index_detach_pages :: proc(t: ^Table, index: int, remove_file: bool) {
+	pages := t.indexes[index].pages
+	if pages == nil do return
+	path := strings.clone(pages.path)
+	ordered_close(pages)
+	t.indexes[index].pages = nil
+	defer delete(path)
+	if remove_file {
+		system := log_vfs_or_os(t.index_vfs)
+		_ = system.ops.remove(system, path)
+	}
+}
+
 @(private)
 value_storage_size :: proc(v: Value) -> int {
 	#partial switch v.kind {
@@ -471,11 +566,14 @@ index_key_len :: proc(t: ^Table, index: int, values: []Value, id: Row_Id) -> int
 table_memory :: proc(t: ^Table) -> Table_Memory {
 	memory: Table_Memory
 	if t.paged != nil {
-		// The values live in the page file and the index keys still live here.
+		// The values live in the page file and so do the index keys: what an
+		// index costs here is its buffer pool, not one entry per row.
 		memory.rows = int(t.paged.rows)
-		for _ in t.indexes {
-			memory.index_entries += memory.rows
-			memory.index_bytes += 40 * memory.rows
+		for index in t.indexes {
+			if index.pages != nil {
+				memory.index_entries += int(ordered_entries(index.pages))
+				memory.index_bytes += page_resident(index.pages.file) * PAGE_SIZE
+			}
 		}
 		return memory
 	}
@@ -556,9 +654,12 @@ table_index_lookup :: proc(t: ^Table, index: int, values: []Value) -> [dynamic]R
 		}
 		return ids
 	}
-	ids := make([dynamic]Row_Id)
 	prefix := index_prefix_temp(t, index, values)
 	defer delete(prefix)
+	if t.indexes[index].pages != nil {
+		return ordered_lookup_prefix(t.indexes[index].pages, prefix)
+	}
+	ids := make([dynamic]Row_Id)
 	node := lower_bound(&t.indexes[index].tree, prefix)
 	for node != nil {
 		if !strings.has_prefix(node.key, prefix) do break
@@ -572,6 +673,9 @@ table_index_lookup :: proc(t: ^Table, index: int, values: []Value) -> [dynamic]R
 // `prefix`. It is the equality lookup for a non-unique index, whose stored keys
 // carry the row id after the tuple.
 table_index_scan_prefix :: proc(t: ^Table, index: int, prefix: string) -> [dynamic]Row_Id {
+	if t.indexes[index].pages != nil {
+		return ordered_lookup_prefix(t.indexes[index].pages, prefix)
+	}
 	ids := make([dynamic]Row_Id)
 	tree := &t.indexes[index].tree
 	node := lower_bound(tree, prefix)
@@ -593,6 +697,9 @@ table_index_scan :: proc(
 	end: string,
 	inclusive_end: bool,
 ) -> [dynamic]Row_Id {
+	if t.indexes[index].pages != nil {
+		return ordered_scan(t.indexes[index].pages, start, end, inclusive_end)
+	}
 	ids := make([dynamic]Row_Id)
 	tree := &t.indexes[index].tree
 	node := start == "" ? rbtree.first(tree) : lower_bound(tree, start)
@@ -698,10 +805,7 @@ table_touch_sequence :: proc(t: ^Table, values: []Value) {
 table_index_add_all :: proc(t: ^Table, values: []Value, id: Row_Id) -> Error {
 	for _, i in t.indexes {
 		key := index_entry_key(t, i, values, id)
-		_, _, insert_err := rbtree.upsert(&t.indexes[i].tree, key, id)
-		if insert_err != nil {
-			return errf(.Out_Of_Memory, "cannot grow index %s", t.indexes[i].schema.name)
-		}
+		if put_err := table_index_put(t, i, key, id); put_err.kind != .None do return put_err
 		if map_err := table_index_map_add(t, i, values, id); map_err.kind != .None {
 			return map_err
 		}
@@ -713,7 +817,7 @@ table_index_add_all :: proc(t: ^Table, values: []Value, id: Row_Id) -> Error {
 table_index_remove_all :: proc(t: ^Table, values: []Value, id: Row_Id) {
 	for _, i in t.indexes {
 		key := index_entry_key(t, i, values, id)
-		rbtree.remove_key(&t.indexes[i].tree, key)
+		table_index_remove_key(t, i, key)
 		table_index_map_remove(t, i, values, id)
 	}
 }
@@ -750,10 +854,7 @@ table_insert :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
 	t.rows[id] = Row{id = id, values = stored, created_seq = t.apply_seq}
 	for _, i in t.indexes {
 		key := index_entry_key(t, i, stored, id)
-		_, _, insert_err := rbtree.upsert(&t.indexes[i].tree, key, id)
-		if insert_err != nil {
-			return errf(.Out_Of_Memory, "cannot grow index %s", t.indexes[i].schema.name)
-		}
+		if put_err := table_index_put(t, i, key, id); put_err.kind != .None do return put_err
 		if map_err := table_index_map_add(t, i, stored, id); map_err.kind != .None {
 			return map_err
 		}
@@ -788,7 +889,7 @@ table_update :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
 	}
 	for _, i in t.indexes {
 		key := index_entry_key(t, i, row.values, id)
-		rbtree.remove_key(&t.indexes[i].tree, key)
+		table_index_remove_key(t, i, key)
 		table_index_map_remove(t, i, row.values, id)
 	}
 	// The current values become a version, so a reader that started earlier
@@ -814,10 +915,7 @@ table_update :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
 	}
 	for _, i in t.indexes {
 		key := index_entry_key(t, i, stored, id)
-		_, _, insert_err := rbtree.upsert(&t.indexes[i].tree, key, id)
-		if insert_err != nil {
-			return errf(.Out_Of_Memory, "cannot grow index %s", t.indexes[i].schema.name)
-		}
+		if put_err := table_index_put(t, i, key, id); put_err.kind != .None do return put_err
 		if map_err := table_index_map_add(t, i, stored, id); map_err.kind != .None {
 			return map_err
 		}
@@ -838,7 +936,7 @@ table_delete :: proc(t: ^Table, id: Row_Id) -> bool {
 	if !exists do return false
 	for _, i in t.indexes {
 		key := index_entry_key(t, i, row.values, id)
-		rbtree.remove_key(&t.indexes[i].tree, key)
+		table_index_remove_key(t, i, key)
 		table_index_map_remove(t, i, row.values, id)
 	}
 	// Tombstone instead of erasing: the live values stay owned by the row and are
@@ -854,8 +952,12 @@ table_truncate :: proc(t: ^Table) {
 		_ = page_rows_truncate(t.paged)
 		t.next_int_key = 0
 		for _, i in t.indexes {
-			rbtree.destroy(&t.indexes[i].tree, false)
-			rbtree.init_cmp(&t.indexes[i].tree, index_cmp)
+			if t.indexes[i].pages != nil {
+				_ = ordered_clear(t.indexes[i].pages)
+			} else {
+				rbtree.destroy(&t.indexes[i].tree, false)
+				rbtree.init_cmp(&t.indexes[i].tree, index_cmp)
+			}
 			table_index_map_free(t, i)
 			t.indexes[i].lookup = make(map[string]^Index_Bucket)
 		}
@@ -887,8 +989,7 @@ table_insert_borrowed :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
 	t.rows[id] = Row{id = id, values = values, created_seq = t.apply_seq}
 	for _, i in t.indexes {
 		key := index_entry_key(t, i, values, id)
-		_, _, insert_err := rbtree.upsert(&t.indexes[i].tree, key, id)
-		if insert_err != nil do return errf(.Out_Of_Memory, "cannot grow index %s", t.indexes[i].schema.name)
+		if put_err := table_index_put(t, i, key, id); put_err.kind != .None do return put_err
 		if map_err := table_index_map_add(t, i, values, id); map_err.kind != .None do return map_err
 	}
 	return ERROR_NONE
@@ -1097,8 +1198,14 @@ table_add_index :: proc(t: ^Table, index: Index_Schema) -> Error {
 		lookup = make(map[string]^Index_Bucket),
 	}
 	rbtree.init_cmp(&t.indexes[position].tree, index_cmp)
+	if attach_err := table_index_attach_pages(t, position); attach_err.kind != .None {
+		return attach_err
+	}
 	if t.paged != nil {
-		ctx := Add_Index_Ctx{position = position}
+		// The visitor needs the table, not only its position: the previous version
+		// left this field nil and only worked when the stack happened to hold the
+		// right pointer, which is exactly what a reopened database did not.
+		ctx := Add_Index_Ctx{table = t, position = position}
 		if scan_err := page_rows_each(t.paged, &ctx, add_index_visit); scan_err.kind != .None {
 			return scan_err
 		}
@@ -1106,8 +1213,8 @@ table_add_index :: proc(t: ^Table, index: Index_Schema) -> Error {
 	}
 	for _, row in t.rows {
 		key := index_entry_key(t, position, row.values, row.id)
-		if _, _, insert_err := rbtree.upsert(&t.indexes[position].tree, key, row.id); insert_err != nil {
-			return errf(.Out_Of_Memory, "cannot grow index %s", index.name)
+		if put_err := table_index_put(t, position, key, row.id); put_err.kind != .None {
+			return errf(put_err.kind, "cannot grow index %s: %s", index.name, put_err.message)
 		}
 		if map_err := table_index_map_add(t, position, row.values, row.id); map_err.kind != .None {
 			return map_err
@@ -1127,8 +1234,8 @@ Add_Index_Ctx :: struct {
 add_index_visit :: proc(ctx: rawptr, row: Row) -> bool {
 	add := cast(^Add_Index_Ctx)ctx
 	key := index_entry_key(add.table, add.position, row.values, row.id)
-	if _, _, insert_err := rbtree.upsert(&add.table.indexes[add.position].tree, key, row.id); insert_err != nil {
-		add.err = errf(.Out_Of_Memory, "cannot grow index")
+	if put_err := table_index_put(add.table, add.position, key, row.id); put_err.kind != .None {
+		add.err = put_err
 		return false
 	}
 	if map_err := table_index_map_add(add.table, add.position, row.values, row.id); map_err.kind != .None {
@@ -1148,6 +1255,7 @@ table_drop_index :: proc(t: ^Table, name: string) -> Error {
 		}
 		rbtree.destroy(&t.indexes[i].tree)
 		table_index_map_free(t, i)
+		table_index_detach_pages(t, i, true)
 		shorter := make([]Index, len(t.indexes) - 1)
 		copy(shorter[:i], t.indexes[:i])
 		copy(shorter[i:], t.indexes[i + 1:])

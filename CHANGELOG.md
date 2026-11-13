@@ -15,3 +15,7 @@
   fault-tested flush order, and a query pipeline that streams a single-table
   scan without holding the table in memory. Off by default; `--paged` turns it
   on.
+- Indexes on disk: each index of a paged table is a B+tree of 4 KiB pages with
+  its own pool, leaves chained in key order, and a cursor that walks a range
+  without a parent stack. The keys stop living in RAM, and `page_rss.py` checks
+  the index file grows with the rows while the statement cost does not.

@@ -261,7 +261,7 @@ Postgres, with per-connection subscriptions and byte budgets
 opening the directory *directly* beside a writer, which needs the page files to be
 trusted without a replay (D18b). Tables can already live in page files: open a
 store with `--paged` (or `Store_Options.paged_tables`) and a scan streams them
-through a bounded buffer pool.
+through a bounded buffer pool, with each index a B+tree of pages beside them.
 
 There is no follower, no log shipping and no failover;
 a second process can read the same database only after the first one closes. The

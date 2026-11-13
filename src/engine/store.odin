@@ -224,6 +224,18 @@ store_open :: proc(path: string, options: Store_Options) -> (^Store, Error) {
 				free(store)
 				return nil, errf(.Io, "cannot create %s: %v", page_dir, mkdir_err)
 			}
+			// The index files are rebuilt by the same replay, so they go with the
+			// table pages instead of being trusted across a crash.
+			index_dir := strings.concatenate({path, "/indexes"})
+			defer delete(index_dir)
+			if remove_err := os.remove_all(index_dir); remove_err != nil && os.exists(index_dir) {
+				free(store)
+				return nil, errf(.Io, "cannot clear %s: %v", index_dir, remove_err)
+			}
+			if mkdir_err := os.make_directory_all(index_dir); mkdir_err != nil {
+				free(store)
+				return nil, errf(.Io, "cannot create %s: %v", index_dir, mkdir_err)
+			}
 		}
 	}
 	// The directory is owned from here on. A second process that finds it held is
@@ -555,6 +567,12 @@ store_table_page_path :: proc(store: ^Store, name: string) -> string {
 	return fmt.aprintf("%s/tables/%s", store.path, file)
 }
 
+store_table_index_dir :: proc(store: ^Store, name: string) -> string {
+	file := store_paged_file_name(name)
+	defer delete(file)
+	return fmt.aprintf("%s/indexes/%s", store.path, file)
+}
+
 store_remove_page_file :: proc(store: ^Store, name: string) {
 	path := store_table_page_path(store, name)
 	defer delete(path)
@@ -585,6 +603,25 @@ store_table_new :: proc(store: ^Store, schema_in: Table_Schema) -> (^Table, Erro
 	}
 	table.paged = rows
 	store.has_paged = true
+	// Each index gets its own page file next to the table's, and the keys stop
+	// living in the table arena. A store without a directory (a memory VFS) still
+	// gets files, they just share one flat name space.
+	index_dir := store_table_index_dir(store, table.schema.name)
+	table.index_dir = index_dir
+	table.index_vfs = store.vfs
+	table.index_frames = store.page_frames
+	if store.vfs == nil {
+		if mkdir_err := os.make_directory_all(index_dir); mkdir_err != nil {
+			table_destroy(table)
+			return nil, errf(.Io, "cannot create %s: %v", index_dir, mkdir_err)
+		}
+	}
+	for _, i in table.indexes {
+		if attach_err := table_index_attach_pages(table, i); attach_err.kind != .None {
+			table_destroy(table)
+			return nil, attach_err
+		}
+	}
 	return table, ERROR_NONE
 }
 
@@ -597,6 +634,12 @@ store_flush_pages :: proc(store: ^Store, seq: u64) -> Error {
 		if table.paged == nil do continue
 		if flush_err := page_rows_flush(table.paged, seq); flush_err.kind != .None {
 			return flush_err
+		}
+		for &index in table.indexes {
+			if index.pages == nil do continue
+			if flush_err := ordered_flush(index.pages, seq); flush_err.kind != .None {
+				return flush_err
+			}
 		}
 	}
 	return ERROR_NONE
@@ -667,6 +710,13 @@ store_apply :: proc(store: ^Store, op: Store_Op) -> Error {
 			// lives in the table's arena.
 			map_erase(&store.tables, op.name)
 			paged := table.paged != nil
+			if paged {
+				system := log_vfs_or_os(store.vfs)
+				for &index in table.indexes {
+					if index.pages == nil do continue
+					_ = system.ops.remove(system, index.pages.path)
+				}
+			}
 			table_destroy(table)
 			if paged do store_remove_page_file(store, op.name)
 		}

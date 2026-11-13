@@ -9218,3 +9218,112 @@ test_paged_commit_survives_a_failed_write :: proc(t: ^testing.T) {
 	}
 	testing.expectf(t, fired_cases > 0, "no write index fired during a commit")
 }
+
+@(test)
+test_paged_index_pages :: proc(t: ^testing.T) {
+	// A paged table keeps its index keys in the index file, not in the table
+	// arena: the point-lookup path, the range path, constraints, updates,
+	// deletes, TRUNCATE and a reopen all have to work through those pages.
+	path := "_test_paged_index"
+	os.remove_all(path)
+	defer os.remove_all(path)
+	options := db.Store_Options {
+		persistent   = true,
+		create       = true,
+		durable      = false,
+		paged_tables = true,
+		page_frames  = 4,
+	}
+	store, open_err := db.store_open(path, options)
+	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
+	closed := false
+	defer if !closed do db.store_close(store)
+
+	run(t, store, "CREATE TABLE doc (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, body TEXT)")
+	run(t, store, "CREATE INDEX doc_slug ON doc (slug)")
+	total :: 3000
+	body: strings.Builder
+	strings.builder_init(&body)
+	defer strings.builder_destroy(&body)
+	strings.write_string(&body, "INSERT INTO doc (id, slug, body) VALUES ")
+	// id_for_slug remembers which row took which key, so every expectation below
+	// is derived from the data instead of guessed.
+	id_for_slug := make([]int, total)
+	defer delete(id_for_slug)
+	for i in 0 ..< total {
+		scrambled := (i * 7919) % total
+		id_for_slug[scrambled] = i
+		if i > 0 do strings.write_string(&body, ", ")
+		fmt.sbprintf(&body, "(%d, 'slug-%05d', 'body %d')", i, scrambled, i)
+	}
+	run(t, store, strings.to_string(body))
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM doc").i, i64(total))
+
+	table, table_err := db.store_table(store, "doc")
+	if !testing.expect(t, db.error_ok(table_err)) do return
+
+	// The keys are in pages: memory per index is the pool, not one entry per row.
+	memory := db.table_memory(table)
+	testing.expect_value(t, memory.rows, total)
+	testing.expect_value(t, memory.index_entries, 2 * total)
+	testing.expect(t, memory.index_bytes > 0)
+	testing.expect(t, memory.index_bytes <= 2 * (db.INDEX_PAGE_FRAMES + 1) * db.PAGE_SIZE)
+
+	// A point lookup through the index visits a handful of rows, not the table.
+	db.store_reset_rows_scanned(store)
+	found := scalar(t, store, "SELECT id FROM doc WHERE slug = 'slug-01234'")
+	testing.expect_value(t, found.i, i64(id_for_slug[1234]))
+	testing.expect(t, db.store_rows_scanned(store) <= 4)
+
+	// Range scan across pages, both ends included as SQL says.
+	range_count := scalar(t, store, "SELECT count(*) FROM doc WHERE slug >= 'slug-01000' AND slug < 'slug-01100'")
+	testing.expect_value(t, range_count.i, i64(100))
+
+	// The primary key index answers too, and it refuses a duplicate.
+	old_slug := fmt.tprintf("slug-%05d", (77 * 7919) % total)
+	testing.expect_value(t, scalar(t, store, "SELECT slug FROM doc WHERE id = 77").s, old_slug)
+	duplicate := run_error(t, store, "INSERT INTO doc (id, slug, body) VALUES (77, 'another', 'x')")
+	testing.expect_value(t, duplicate.kind, db.Error_Kind.Duplicate_Primary_Key)
+
+	// An update moves the entry: the old key stops matching and the new one works.
+	run(t, store, "UPDATE doc SET slug = 'slug-99999' WHERE id = 77")
+	testing.expect_value(t, scalar(t, store, fmt.tprintf("SELECT count(*) FROM doc WHERE slug = '%s'", old_slug)).i, i64(0))
+	testing.expect_value(t, scalar(t, store, "SELECT id FROM doc WHERE slug = 'slug-99999'").i, i64(77))
+
+	// A delete removes it from both indexes.
+	run(t, store, "DELETE FROM doc WHERE id = 77")
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM doc WHERE slug = 'slug-99999'").i, i64(0))
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM doc WHERE id = 77").i, i64(0))
+
+	// TRUNCATE empties the index files and the table answers again afterwards.
+	run(t, store, "TRUNCATE TABLE doc")
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM doc").i, i64(0))
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM doc WHERE slug = 'slug-00001'").i, i64(0))
+	run(t, store, "INSERT INTO doc (id, slug, body) VALUES (1, 'slug-00001', 'reborn')")
+	testing.expect_value(t, scalar(t, store, "SELECT id FROM doc WHERE slug = 'slug-00001'").i, i64(1))
+	run(t, store, "DELETE FROM doc WHERE id = 1")
+
+	// Reopen: the index files are discarded with the table pages and rebuilt by
+	// the replay, so a lookup must find the rows the log holds.
+	run(t, store, "INSERT INTO doc (id, slug, body) VALUES (5, 'kept', 'x')")
+	db.store_close(store)
+	closed = true
+	reopened, reopen_err := db.store_open(path, options)
+	if !testing.expectf(t, db.error_ok(reopen_err), "reopen: %s", reopen_err.message) do return
+	defer db.store_close(reopened)
+	testing.expect_value(t, scalar(t, reopened, "SELECT count(*) FROM doc").i, i64(1))
+	testing.expect_value(t, scalar(t, reopened, "SELECT id FROM doc WHERE slug = 'kept'").i, i64(5))
+
+	// An index created after a reopen walks rows that the replay put in pages: the
+	// visitor needs the table pointer, which the first version left unset.
+	run(t, reopened, "CREATE INDEX doc_body ON doc (body)")
+	testing.expect_value(t, scalar(t, reopened, "SELECT id FROM doc WHERE body = 'x'").i, i64(5))
+
+	// Dropping the index closes its file and the table keeps answering by scan.
+	reopened_table, reopened_err := db.store_table(reopened, "doc")
+	if testing.expect(t, db.error_ok(reopened_err)) {
+		testing.expect_value(t, db.table_index_count(reopened_table, 1), u64(1))
+	}
+	run(t, reopened, "DROP INDEX doc_slug")
+	testing.expect_value(t, scalar(t, reopened, "SELECT id FROM doc WHERE slug = 'kept'").i, i64(5))
+}
