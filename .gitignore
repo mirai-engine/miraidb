@@ -24,6 +24,11 @@ __pycache__/
 
 # bench.py workspace
 /_bench_tmp/
+
+# databases left by a manual benchmark run
+/auditdb/
+/benchdb/
+/tmpq*/
 /_broker_tmp/
 
 # package.py output
