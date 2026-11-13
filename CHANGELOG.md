@@ -15,6 +15,9 @@
   fault-tested flush order, and a query pipeline that streams a single-table
   scan without holding the table in memory. Off by default; `--paged` turns it
   on.
+- The log offset index was never usable for a database created by this build: its
+  sidecar was created without the header every lookup validates, so replay always
+  scanned. It is created with its header now, and the trusted open depends on it.
 - A reader beside the writer: `--read-only` opens a database another process is
   writing, answers from the log it replays into memory, refuses every write and
   keeps compaction waiting. The lock has two roles now, so readers join and a

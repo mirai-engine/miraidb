@@ -452,11 +452,47 @@ log_index_append :: proc(log_path: string, seq: u64, offset: i64) {
 	file, open_err := os.open(index_path, {.Read, .Write, .Create})
 	if open_err != nil do return
 	defer os.close(file)
+	size, size_err := os.file_size(file)
+	if size_err != nil do return
+	if size == 0 {
+		// A sidecar created here starts with its header. Without it every lookup
+		// rejects the file and the index is dead weight: a database created by
+		// this build used to have no usable index at all.
+		if header_err := log_index_write_header(file); header_err.kind != .None do return
+	}
 	if _, seek_err := os.seek(file, 0, .End); seek_err != nil do return
 	entry: [LOG_INDEX_ENTRY_LEN]u8
 	put_u64_le(entry[0:8], seq)
 	put_u64_le(entry[8:16], u64(offset))
 	_, _ = os.write(file, entry[:])
+}
+
+// log_index_last returns the highest sequence the sidecar names, which is the
+// sequence of the last record in the log. It is derived data: a missing or
+// unreadable index reports found = false, and the caller replays instead.
+log_index_last :: proc(log_path: string) -> (seq: u64, found: bool) {
+	index_path := log_index_path(log_path)
+	defer delete(index_path)
+	file, open_err := os.open(index_path, {.Read})
+	if open_err != nil do return 0, false
+	defer os.close(file)
+	header: [LOG_INDEX_HEADER_LEN]u8
+	n, read_err := os.read(file, header[:])
+	if read_err != nil || n != LOG_INDEX_HEADER_LEN do return 0, false
+	if string(header[:8]) != LOG_INDEX_MAGIC do return 0, false
+	if get_u32_le(header[8:12]) != LOG_VERSION do return 0, false
+	if get_u32_le(header[12:16]) != LOG_INDEX_ENTRY_LEN do return 0, false
+	size, size_err := os.file_size(file)
+	entries := (size - LOG_INDEX_HEADER_LEN) / LOG_INDEX_ENTRY_LEN
+	if size_err != nil || entries <= 0 do return 0, false
+	// The sidecar is append-only, so the last entry is the last record.
+	if _, seek_err := os.seek(file, size - LOG_INDEX_ENTRY_LEN, .Start); seek_err != nil {
+		return 0, false
+	}
+	entry: [LOG_INDEX_ENTRY_LEN]u8
+	got, entry_err := os.read(file, entry[:])
+	if entry_err != nil || got != LOG_INDEX_ENTRY_LEN do return 0, false
+	return get_u64_le(entry[0:8]), true
 }
 
 // log_index_ensure creates the sidecar for a log that predates it, or whose
