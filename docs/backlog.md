@@ -209,10 +209,22 @@ serves two clients with independent subscriptions from one owner.
 ## D4 — A page-oriented backend
 
 **Now.** A database opened from a `.sqlite` file is mirrored back after every
-commit by `sqlite_file_write`: the whole state is re-encoded.
+commit by `sqlite_file_write`: the whole state is re-encoded. The engine has what
+this needs on the other side already: D17 keeps the rows in paged files and D5
+keeps the indexes in paged B+trees, so the pages a commit touched are known when
+the commit is durable.
 
 **Cost.** O(state) per commit. Correct and inspectable by any SQLite driver,
 expensive for a large database with small transactions.
+
+**Where to start.** Keep a map from the mirrored file's pages to the tables and
+indexes that wrote them, filled during `sqlite_file_write`'s first full export,
+then on each commit re-encode only the rows of the pages the commit dirtied
+(`Table.dirty_pages`, or a per-commit list of `{table, row_id}` for the memory
+backend). The file stays readable between commits because the header is written
+last, exactly like the page files. Measure with `bench.py`: bytes written per
+commit at 1k and 100k rows, and the time it takes; the gate is that a
+one-row commit writes a bounded number of pages, not a fraction of the state.
 
 **Done when.** Pages are allocated from the free list and written in place, a
 commit writes only the touched pages plus a header, `PRAGMA page_count` and the
@@ -263,7 +275,14 @@ that fails when a known-good plan gets worse.
 **Not done.** A joined table is still scanned rather than probed, `ORDER BY` never
 comes from an index, and the cost constants are chosen by hand — they encode "a
 row through an index costs four rows in place" and have not been calibrated against
-a measurement.
+a measurement. Three gaps come from choosing the plan off the statement text
+alone: a bound value never reaches the histogram (`v < ?` estimates a third of the
+table where `v < 50` estimates fifty of four hundred rows), a view in `FROM`
+prints no estimate, and the statistics never announce that they are older than
+the data — the file stores `analyzed_seq` and no one compares it with
+`commit_seq`. The incremental subscription path (`host_join_prepare`) still walks
+a join in the written order, so a subscription and the same query can do
+different work for the same delta.
 
 **Cost.** A join is evaluated in the order it was written; the only cardinality
 information is "this predicate has an index".
@@ -441,13 +460,63 @@ hand-written module is the contract a generated one has to meet.
 
 ---
 
+## Correctness — nothing accepted may answer a different question
+
+**Found while auditing this list, and fixed.** `NATURAL`, `RIGHT` and `FULL` were
+not keywords the parser knew, so each was read as an alias for the table before
+it: `FROM a NATURAL JOIN b` became a cross join and `FROM a RIGHT JOIN b ON …` an
+inner join. Both returned rows; nothing in the suite complained, because the
+suite asserts what the engine answers, not what it should have refused.
+`test_unsupported_joins_are_refused` pins the three refusals now (`JOIN … USING`
+was already refused).
+
+**The gate that would have caught it.** `scripts/conformance.py` holds twenty
+hand-written cases with substrings they must contain. That checks what someone
+thought to write down. What the parser *accepts* needs a second oracle:
+`sqlite3` answers the same statements, so a corpus can be run through both and the
+answers compared — equal rows, or a parse-time refusal on our side with a reason.
+Anything else is a silent difference in meaning, which is the one class of bug a
+test suite written by the same hand cannot find. `sqlite3` 3.53.4 is on the WSL
+image (`/usr/bin/sqlite3`), so the runner belongs with the POSIX CI work; the
+corpus can be generated from the grammar (`docs/sql.md`) plus the shapes that bit
+us: aliases, keyword lookalikes, `AS OF`, `TRUNCATE`, `RETURNING`.
+
+## Diagnostics — the leak report is unreadable
+
+The debug allocator prints `+++ leak` for every block it still knows at exit:
+**~320k lines per suite run**, about nine per statement, dominated by
+`builder.odin:173`, `sql_exec_insert`, `sql_exec_select`, `projection_name`,
+`br_read_len_bytes`, `lexer_next` and `plan_join_order`. The count has been flat
+across rounds (312k before D6), so it is not a regression, and nobody has
+established whether they are real leaks or allocations a bulk free releases out of
+the tracker's sight. Two things would settle it and both are cheap: run 20k
+statements in one process and compare the working set from `--memory-report` with
+20k more (a real leak grows ~400 B per statement), and make `scripts/soak.py`
+assert the working set stays flat instead of only checking the log and the reopen.
+Until then the leak report cannot be used to judge a change, and a real leak
+would hide inside it.
+
 ## Ordering, if this becomes the roadmap again
 
-1. **D8** first: it is small and it protects everything else.
-2. **D11** then **D1**: the index restriction is the only thing making full-text
-   slow, and both are small.
-3. **D6** and **D4**: the two largest wins a user can feel, in that order —
-   planning first, because a faster file with a bad plan is still slow.
-4. **D3**, **D7**, **D13**: correctness under failure and history.
-5. **D2**, **D5**, **D9**, **D10**, **D12**, **D15**, **D16**: independent.
-6. **D14** last: nothing needs it yet, and it is the biggest.
+Ordered by what protects the rest, not by what is most interesting. Fixed items
+stay listed so the order can be read as a whole.
+
+1. **D8** (done), **D11** (done), **D1** (done): the small items that protect
+   everything else.
+2. **Correctness gate** (above): a differential runner against `sqlite3`. It is
+   the only protection against the class of bug that just bit — an accepted
+   statement that means something else — and it is worth more than any feature
+   because a wrong answer costs more than a slow one.
+3. **D4**: the largest win a user can feel, and the engine now has the pieces.
+4. **POSIX CI**: `-sanitize:address` for the whole suite, `lock_posix.odin` and
+   `rss_linux.odin` exercised, and the scripts taught to find `bin/miraidb`
+   without `.exe` (`ci.py`, `page_rss.py`, `plan_check.py`, `bench.py`,
+   `lock_smoke.py` and `broker_smoke.py` all hardcode a Windows binary).
+5. **D6 leftovers**: probe the inner side of a join, `ORDER BY` from an index,
+   calibrated constants, statistics that say they are stale, and the histogram
+   for a bound parameter (a plan chosen at bind time, or a re-plan when a value
+   lands).
+6. **Leak report** (above): make the diagnostics usable again.
+7. **D9**, **D2**, **D10**, **D16**: independent surface work.
+8. **D12c**, **D15**, **D14**: the module sandbox, the network, replication.
+9. **Licences** and the release review last, before each public release.

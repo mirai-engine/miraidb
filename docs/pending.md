@@ -42,11 +42,13 @@ Every change must leave this green:
 python3 scripts/ci.py
 
 python3 scripts/build.py                                   # builds and tests
-odin test src/tests                                        # 186 tests
+odin test src/tests                                        # 211 tests
 python3 scripts/conformance.py --bin ./bin/miraidb.exe     # 20/20
 python3 scripts/shell_smoke.py                             # 11/11
 python3 scripts/lock_smoke.py                              # two processes, one owner
 python3 scripts/bench.py --check                           # against benchmarks/baseline.json
+python3 scripts/page_rss.py --check                        # the pool bounds a read
+python3 scripts/plan_check.py                              # 6 plan checks
 python3 scripts/roadmap.py --check                         # 100/100
 
 # The DLL smokes need an interpreter that can load the DLL; when it is not on
@@ -60,18 +62,24 @@ for pkg in src/engine src/cli src/capi src/sqlite_compat src/server src/tests; d
 done
 ```
 
+`scripts/ci.py` runs those twenty times over (build, the suite, conformance, the
+shell, the benchmark baseline, the package manifest, page memory, plan
+regression, five DLL smokes, five `-vet` packages and the roadmap check).
+
 The optional harnesses (`python3 scripts/fuzz.py --statements 1000 --seed 1`,
 `python3 scripts/soak.py --seconds 30`) must be run before claiming anything in
-P5; the state of the soak harness is defect D1 below.
+P5; the soak harness checks the log and a reopen but not the working set, which is
+the diagnostics gap in [backlog.md](backlog.md).
 
 Measured baselines to keep or beat (Windows, warm cache, `bin/miraidb.exe`):
 
 | Metric | Command | Value |
 |---|---|---|
-| Inserts, one transaction | `bench ./db 1000` | 60.5k/s |
-| Inserts, one transaction, 100k | `bench ./db 100000` | 58.2k/s |
-| Read snapshot, steady state | `bench-read ./db 50000 20000` | 12.1 µs/tx |
-| Read snapshot, first read in the process | `bench-read ./db 50000 200` | 960 µs/tx (≈190 ms once) |
+| Inserts, one transaction | `scripts/bench.py --check` | 54.8k/s (baseline 42.2k) |
+| Read snapshot, steady state | `scripts/bench.py --check` | 48.9 µs/tx (baseline 50.9) |
+| Compact | `scripts/bench.py --check` | 0.813 s (baseline 0.374, tolerated) |
+| Cost of a row on disk | `scripts/bench.py --check` | 80.015 bytes |
+| Peak working set, 60k paged rows | `scripts/page_rss.py --check` | 6.4 MiB |
 | Value / five values / column | `test_value_layout` | 24 B / 120 B / 128 B |
 
 The first read of a process pays to copy every table (lock-free snapshots trade

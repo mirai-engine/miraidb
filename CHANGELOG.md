@@ -25,6 +25,11 @@
   rows per outer row first, and every ON condition travels with the step that
   completes the relations it names, so a relation may run before the join it was
   written with. LEFT joins, `AS OF` and table functions keep the written order.
+- `NATURAL`, `RIGHT` and `FULL` joins are refused at parse time. They used to be
+  read as an alias for the preceding table, which silently turned the first into
+  a cross join and the other two into inner joins — a wrong answer that returned
+  rows. `JOIN … USING (col)` was already refused; `LEFT [OUTER]`, `INNER`,
+  `CROSS` and the comma form keep working.
 - `scripts/plan_check.py` is the twentieth CI gate: it fails when a known-good
   plan (point lookup, wide predicate, range estimate, join order, the row counter
   behind them) regresses.

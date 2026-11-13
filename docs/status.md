@@ -196,9 +196,29 @@ than 1000 bytes cannot be indexed and the insert says so.
   `scripts/plan_check.py` is a CI gate over the plans a measured fixture must
   produce.
 - **What the planner still does not do.** It cannot probe an index for a joined
-  table (the inner side is always scanned), it does not use an index to satisfy
-  `ORDER BY`, and its cost constants are hand-set rather than calibrated against
-  a measurement.
+  table (the inner side is always scanned) and it does not use an index to
+  satisfy `ORDER BY`. Its cost constants are hand-set rather than calibrated
+  against a measurement. Three smaller gaps share one cause: the plan is chosen
+  from the statement text, so a bound value never reaches the histogram (a
+  prepared `v < ?` estimates a third of the table, while `v < 50` reads the
+  buckets), a view in `FROM` gets no estimate at all, and nothing notices that
+  the statistics are older than the data — `<db>/stats` carries the sequence it
+  was measured at and the planner never compares it with the current one.
+- **A join the grammar does not implement is refused, not approximated.**
+  `NATURAL`, `RIGHT` and `FULL` joins used to parse as an alias for the table
+  before them, which turned the first into a cross join and the other two into
+  inner joins: rows came back and the answer was wrong. They now fail at parse
+  time with a reason (`test_unsupported_joins_are_refused`), and `JOIN … USING`
+  was already refused. `LEFT [OUTER]`, `INNER`, `CROSS` and the comma form work.
+- **The suite reports no bad free.** The debug allocator used to print 3058
+  unfreed-or-mis-freed lines; the last two causes were a pinned read that freed
+  the read cache's snapshot a second time and a test that freed the metric
+  strings its result still owned. The remaining noise is `+++ leak`, ~320k lines
+  per suite run (~9 blocks per statement, dominated by the string builder, the
+  lexer and statement decoding); nobody has established yet whether those are
+  real leaks or allocations released by a bulk free the tracker does not see, and
+  `scripts/soak.py` does not measure the working set, so nothing would notice if
+  they were real.
 - **Schema changes.** `ALTER TABLE` renames the table, adds and drops columns,
   and renames a column (keeping the rows and the indexes); text that names a
   column is not rewritten.

@@ -39,6 +39,9 @@ DELETE FROM name [WHERE expr]
 SELECT [DISTINCT] projection [, ...]
 FROM table [[AS] alias]
     [[INNER | LEFT [OUTER] | CROSS] JOIN table [[AS] alias] [ON expr]]...
+
+`NATURAL`, `RIGHT` and `FULL` joins are refused by the parser, and so is
+`JOIN … USING (col)`: write the condition in `ON` instead.
 [WHERE expr]
 [GROUP BY expr [, ...]]
 [HAVING expr]
