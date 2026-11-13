@@ -194,45 +194,58 @@ host.on_update = proc(ctx: rawptr, update: ^db.Subscription_Update) {
 
 ## Current capabilities
 
-- `CREATE TABLE` with `PRIMARY KEY [AUTOINCREMENT]`, `UNIQUE`, `NOT NULL` and
-  `DEFAULT`; `DROP TABLE [IF EXISTS]`; `CREATE [UNIQUE] INDEX` and `DROP INDEX`.
-- `INSERT ... VALUES` (multiple rows), `UPDATE ... SET ... WHERE`,
-  `DELETE FROM ... WHERE`; positional `?` bind parameters.
-- `SELECT` over one or more tables: projections, aliases, `INNER`/`LEFT`/
-  `CROSS` joins, `DISTINCT`, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`,
-  `LIMIT`/`OFFSET`, `count/sum/avg/min/max`, and the scalar functions `lower`,
-  `upper`, `length`, `abs`, `coalesce`, `now`.
-- `CREATE VIEW` / `DROP VIEW`, `CREATE POLICY` row-level security,
-  `SET`/`SHOW` session variables, `DESCRIBE` for the catalog and `EXPLAIN` for
-  the access plan.
-- Ordered indexes on any column tuple, created implicitly for the primary key
-  and for `UNIQUE` columns. Equality and range predicates narrow the scan
-  through the index.
-- Segmented durable commit log with CRC32C per record, replay on open, tail repair,
-  snapshots (`miraidb snapshot`), compaction (`miraidb compact`), an offset
-  index for fast replay, three durability modes
-  (`--durability=full|batched|none`) and an in-memory log for simulation.
-- A persisted scheduler: `host_schedule`, `host_schedule_now` and
-  `host_schedule_every` queue reducer calls and `host_tick` runs the due ones,
-  each in its own transaction.
-- Idempotent calls: `host_call_once` records the request id in the same
-  transaction as the reducer's changes.
-- Cooperative cancellation (`store_cancel` / `store_clear_cancel`) between rows
-  and subscriptions owned by a connection (dropped when it closes).
-- Session tokens (`host_issue_token` / `host_authenticate`), `WIRE_AUTH` and
-  `Authorization: Bearer`, feeding the identity row-level policies check.
-- Wire messages for reducer calls, queries and subscriptions, served over HTTP
-  by `miraidb-server` (`POST /call`, `/query`, `/subscribe`, `/unsubscribe`,
-  `GET /health`) and over WebSocket (RFC 6455, binary frames).
-- HMAC-hashed session tokens, `_meta` metadata, `_var` module variables and
-  `/metrics` counters;
-  `miraidb describe <db> <table>` and `miraidb bench <db> [rows]`.
-- A persisted reducer/procedure catalog (`_reducer`) that clients and codegen
-  can read with SQL.
-- Procedures with their own transaction phases (`procedure_commit`,
-  `procedure_sleep`), callable over the wire.
-- Reducers, row-level subscriptions (single or multi-query sets, with one delta
-  per query) and row-level security policies.
+**Data.** Nineteen column types, including `INT128`, `FLOAT4`, `UUID`,
+`DURATION`, `IDENTITY`, `ARRAY(T)`, `PRODUCT(T…)` and named types; composite
+primary keys, named unique constraints, sequences, generated columns, collations
+(`BINARY`, `NOCASE`, `RTRIM`) and foreign keys with `RESTRICT`/`CASCADE`.
+Integer widths are enforced on store.
+
+**SQL.** `CREATE`/`DROP`/`ALTER TABLE` (add, drop, rename), `INSERT`, `UPDATE`,
+`DELETE`, `UPSERT … ON CONFLICT DO UPDATE` (with `excluded`) and `RETURNING`;
+`SELECT` with `INNER`/`LEFT`/`CROSS` joins, common table expressions
+(recursive included), `DISTINCT`, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`,
+`LIMIT`/`OFFSET`, scalar and aggregate functions (`count(DISTINCT x)` included),
+window frames with `ROWS BETWEEN`, subqueries (`IN`, `EXISTS`, scalar) and
+positional `?` parameters; views (with parameters and `OR REPLACE`), `AFTER`
+triggers with `WHEN`, row-level security policies, `SET`/`SHOW`, `DESCRIBE`,
+`EXPLAIN` with cost estimates and the planned join order, `SAVEPOINT`,
+`ATTACH`/`DETACH`, `AS OF <seq>` for a past commit, and `TRUNCATE`.
+
+**Search and documents.** FTS5 virtual tables with BM25 ranking (`rank`),
+`snippet` and `highlight`, backed by an index in ordinary tables; spatial
+tables of bounding boxes; JSON functions and the `json_each`/`json_tree` table
+functions; dates and times.
+
+**Storage.** A segmented commit log with CRC32C per record, an offset index,
+three durability modes, replay with tail repair, snapshots, compaction, and
+opt-in page files per table with a buffer pool, a free list and a fault-tested
+flush order. One owner per directory (OS lock), and a reader that opens beside
+the writer.
+
+**Programmable layer.** Reducers, procedures with their own transaction phases,
+a persisted scheduler (one-shot, immediate, interval), idempotent calls by
+request id, cooperative cancellation, row-level subscriptions (single,
+multi-query and incremental for plain queries, joins and aggregates) and a
+module ABI v1/v2 for out-of-process extensions.
+
+**Network.** `miraidb-server` over HTTP (`/call`, `/query`, `/subscribe`,
+`/unsubscribe`, `/wire`, `/health`, `/metrics`), WebSocket binary frames and the
+PostgreSQL wire protocol; HMAC-hashed session tokens, HS256 JWTs, per-connection
+identity, connection limits, byte accounting, a bounded outbox, deflate
+compression and per-call work budgets.
+
+**Files and clients.** Import a `.sqlite` file, export one deterministically, or
+keep one current: every commit patches only the pages it changed, with a
+rollback journal in SQLite's format. A C ABI with a header (`include/miraidb.h`),
+a `sqlite3_*` facade, an Odin client SDK, a Python binding, code generation for
+Odin, and a CLI with seventeen commands (`create`, `sql`, `sqlite`,
+`import-sqlite`, `export-sqlite`, `repl`, `inspect`, `describe`, `bench`,
+`bench-read`, `codegen`, `export`, `call`, `subscribe`, `check`, `compact`,
+`snapshot`).
+
+Everything above is covered by the test suite; `docs/status.md` records the
+measurements and what is deliberately not claimed, and `docs/sql.md` is the SQL
+reference.
 
 ## Roadmap
 

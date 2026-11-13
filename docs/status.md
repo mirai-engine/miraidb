@@ -109,7 +109,9 @@ honest measurement.
 
 - `python3 scripts/ci.py` runs every gate in one command and reports each one;
   it is what "green" means.
-- `miraidb create | sql | repl | inspect | check | compact | bench | bench-read`.
+- `miraidb` has seventeen commands: `create`, `sql`, `sqlite`, `import-sqlite`,
+  `export-sqlite`, `repl`, `inspect`, `describe`, `bench`, `bench-read`,
+  `codegen`, `export`, `call`, `subscribe`, `check`, `compact`, `snapshot`.
 - `scripts/build.py` builds both binaries and runs the suite.
 - 214 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
