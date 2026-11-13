@@ -945,12 +945,12 @@ host_agg_prepare :: proc(host: ^Host, entry: ^Subscription_Query) -> bool {
 	base, table_err := tx_table(tx, stmt.from.name)
 	if table_err.kind != .None do return false
 	star := make([]Source, 1, tx.alloc)
-	defer delete(star)
+	defer delete(star, tx.alloc)
 	star[0] = Source{table = base, alias = stmt.from.alias}
 	columns := make([dynamic]string, 0, len(stmt.projections), tx.alloc)
 	expanded := expand_projections(star, stmt.projections, &columns, tx.alloc)
 	defer {
-		for column in columns do delete(column)
+		for column in columns do delete(column, tx.alloc)
 		delete(columns)
 	}
 	live := make([dynamic]Row)
@@ -1056,12 +1056,12 @@ host_apply_incremental_aggregate :: proc(
 	policy_set_destroy(&policies)
 	if active do return false
 	star := make([]Source, 1, tx.alloc)
-	defer delete(star)
+	defer delete(star, tx.alloc)
 	star[0] = Source{table = base, alias = stmt.from.alias}
 	columns := make([dynamic]string, 0, len(stmt.projections), tx.alloc)
 	expanded := expand_projections(star, stmt.projections, &columns, tx.alloc)
 	defer {
-		for column in columns do delete(column)
+		for column in columns do delete(column, tx.alloc)
 		delete(columns)
 	}
 
@@ -1174,7 +1174,8 @@ host_join_prepare :: proc(host: ^Host, entry: ^Subscription_Query) -> bool {
 	rows := make([][]Row, source_count)
 	aliases := make([]string, source_count)
 	defer {
-		for list in rows do delete(list)
+		// rows holds what tx_collect filled, which lives in the transaction
+		// arena: freeing it here would free memory this proc never allocated.
 		delete(rows)
 		delete(tables)
 		delete(aliases)
@@ -1183,12 +1184,12 @@ host_join_prepare :: proc(host: ^Host, entry: ^Subscription_Query) -> bool {
 	defer tx_end(tx)
 	if !host_join_tables(tx, stmt, tables, rows, aliases) do return false
 	star := make([]Source, source_count, tx.alloc)
-	defer delete(star)
+	defer delete(star, tx.alloc)
 	for table, i in tables do star[i] = Source{table = table, alias = aliases[i]}
 	columns := make([dynamic]string, 0, len(stmt.projections), tx.alloc)
 	expanded := expand_projections(star[:], stmt.projections, &columns, tx.alloc)
 	defer {
-		for column in columns do delete(column)
+		for column in columns do delete(column, tx.alloc)
 		delete(columns)
 	}
 	return host_join_rebuild(host, tx, entry, stmt, tables, aliases, rows, expanded)
@@ -1220,7 +1221,7 @@ host_join_rebuild :: proc(
 	virtual.arena_free_all(&entry.join_arena)
 
 	sources := make([]Source, len(tables), tx.alloc)
-	defer delete(sources)
+	defer delete(sources, tx.alloc)
 	walk := Join_Walk {
 		entry    = entry,
 		tx       = tx,
@@ -1278,7 +1279,6 @@ host_join_tables :: proc(
 		aliases[index] = alias_text
 		list: [dynamic]Row
 		if collect_err := tx_collect(tx, name, &list); collect_err.kind != .None {
-			delete(list)
 			return false
 		}
 		rows[index] = list[:]
@@ -1303,7 +1303,8 @@ host_apply_incremental_join :: proc(
 	rows := make([][]Row, source_count)
 	aliases := make([]string, source_count)
 	defer {
-		for list in rows do delete(list)
+		// rows holds what tx_collect filled, which lives in the transaction
+		// arena: freeing it here would free memory this proc never allocated.
 		delete(rows)
 		delete(tables)
 		delete(aliases)
@@ -1322,12 +1323,12 @@ host_apply_incremental_join :: proc(
 	}
 
 	star := make([]Source, source_count, tx.alloc)
-	defer delete(star)
+	defer delete(star, tx.alloc)
 	for table, i in tables do star[i] = Source{table = table, alias = aliases[i]}
 	columns := make([dynamic]string, 0, len(stmt.projections), tx.alloc)
 	expanded := expand_projections(star[:], stmt.projections, &columns, tx.alloc)
 	defer {
-		for column in columns do delete(column)
+		for column in columns do delete(column, tx.alloc)
 		delete(columns)
 	}
 	if len(expanded) == 0 do return false
@@ -1343,7 +1344,7 @@ host_apply_incremental_join :: proc(
 		delete(deletes)
 	}
 	sources := make([]Source, source_count, tx.alloc)
-	defer delete(sources)
+	defer delete(sources, tx.alloc)
 	for op in ops {
 		changed := -1
 		for index_name, i in aliases {
@@ -1461,7 +1462,7 @@ host_project_row :: proc(
 	}
 	columns := make([dynamic]string, 0, len(stmt.projections), tx.alloc)
 	expanded := expand_projections([]Source{source}, stmt.projections, &columns, tx.alloc)
-	for column in columns do delete(column)
+	for column in columns do delete(column, tx.alloc)
 	delete(columns)
 	out := make([]Value, len(expanded))
 	for expr, i in expanded {
