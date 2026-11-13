@@ -76,7 +76,7 @@ rather than hidden in this table.
 | C3 | Transaction offsets and read sets | done | `tx_read_seq` (start offset) and `tx_read_tables` (touched tables) |
 | C4 | Transaction time fixed at commit | done | the commit stamps `last_commit_us` when it lands; `store_last_commit_us` reads it |
 | C5 | Truncate with table-level tombstones | done | `TRUNCATE` stages one table-level op |
-| C6 | Range scans through an index | done | available to SQL; expose it in the Odin API |
+| C6 | Range scans through an index | done | the SQL planner and executor use them; there is no public Odin call for a range scan yet |
 | C7 | Update in place | done | — |
 | C8 | Ephemeral tables | done | `CREATE TEMPORARY TABLE`: applied in the session, never logged, gone on reopen |
 | C9 | Per-table memory accounting | done | `store_table_memory`, shown by `inspect` |
@@ -105,11 +105,11 @@ rather than hidden in this table.
 | E2 | Semijoins | done | uncorrelated `IN`/`NOT IN`, `EXISTS`/`NOT EXISTS` and scalar subqueries; correlated references are not resolved |
 | E3 | Index-driven update and delete | done | both narrow the scan through an index when possible |
 | E4 | Complete scalar and aggregate function set | done | text, numeric and null functions plus six aggregates |
-| E5 | `SET` and `SHOW` | done | process-local variables; the wire protocol will scope them per connection |
+| E5 | `SET` and `SHOW` | done | session variables through the engine API; a server connection keeps its own identity and variables |
 | E6 | `EXPLAIN` | done | scan/index choice, joins and post-processing steps |
 | E7 | Row-level security in queries | done | policies filter reads and validate writes; subscriptions inherit them |
 | E8 | Multi-query subscription sets | done | `host_subscribe_many`; one row set and one delta per query |
-| E9 | Incremental subscription evaluation | done | a commit projects only the changed rows and diffs them against the cache; joins, aggregates, ordering, DISTINCT and policies fall back to a full re-evaluation |
+| E9 | Incremental subscription evaluation | done | a commit projects only the changed rows and diffs them against the cache; joins and aggregates have their own incremental paths, and ordering, `DISTINCT`, policies or DDL fall back to a full re-evaluation |
 | E10 | Confirmed-read offsets in responses | done | every result carries `commit_seq`; F10 exposes it on the wire |
 | E11 | `LIKE` escapes, casts between all types | done | `ESCAPE` supported; casts cover numbers, text, bool, timestamp, uuid, identity |
 | E12 | Views as query sources | done | materialized per reference inside the transaction |
@@ -165,23 +165,12 @@ rather than hidden in this table.
 | H9 | Test fixtures and harness | done | `fresh_host`/`destroy_host` and `run_params` fixtures |
 | H10 | Benchmarks | done | `miraidb bench <db> [rows]` times inserts in one transaction |
 
-## Execution order
+## Order the work followed
 
-Dependency order for what is left:
-
-1. **E9** — row-level evaluator for subscriptions (the ops plumbing is done).
-2. **F7, F9** — HMAC/JWT tokens; client registry, limits and backpressure.
-3. **G1–G3** — minimal module host: ABI, scans, DML from a module.
-4. **G5–G7, G9, G10** — console/timers, identity in modules, HTTP from
-   procedures, bytes sources, native registration.
-5. **H2, H6** — codegen and typed metrics (both build on `DESCRIBE`/`_meta`).
-6. **H1, H3–H5, H8, H9** — CLI gaps, SDKs, conformance, DST, hot swap,
-   richer fixtures.
-7. **E2, E13, E14** — semijoins, system tables, `ALTER`/`OR REPLACE`.
-8. **C1–C4, C8** — MVCC, non-blocking reads, read sets, commit time,
-   ephemeral tables.
-9. **B3, B5, B12, B14, B16; A4–A6, A8–A10; D4, D6, D7; F8, F11, F12, F14** —
-   the long tail.
+This section used to list the dependency order for the rows still open. All 94
+are closed, so the order is history: the last engine rows landed in this order
+(E9, F7/F9, G1–G3, G5–G7/G9/G10, H2/H6, then the L rows). What is left is not
+parity: it is depth, and `docs/roadmap.md` orders it.
 
 ## Parity notes
 

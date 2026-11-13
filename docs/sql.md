@@ -236,8 +236,13 @@ Scalar: `lower`, `upper`, `length`, `abs`, `coalesce`/`ifnull`, `now()`.
 
 ## Behaviour worth knowing
 
-- Joins run as nested loops over the right-hand table: correct, but not planned
-  yet. An `ON` clause is optional; without it the join is a cross product.
+- A join is a nested loop, and its order is planned from `ANALYZE` statistics:
+  the relation that keeps the fewest rows per outer row runs first and every
+  `ON` travels with the step that completes the relations it names, so a
+  relation may run before the join it was written with. `LEFT` joins, `AS OF`
+  and table functions keep the written order, and `EXPLAIN` prints
+  `join order: …`. An `ON` clause is optional; without it the join is a cross
+  product.
 - `LEFT JOIN` extends a partial row with NULLs when no right row matches.
 - Unqualified column names must be unique across the joined tables; qualify
   with the table name or its alias otherwise.
