@@ -588,6 +588,13 @@ sql_exec_explain :: proc(tx: ^Tx, stmt: Explain_Stmt, params: []Value) -> (Sql_R
 		base_table, table_err := tx_table(tx, order.from.name)
 		if table_err.kind == .None {
 			append(&lines, fmt.aprintf("scan %s%s", first.name, explain_access(store, base_table, order.from, inner.where_clause, params)))
+		} else if _, is_view := view_sql(tx, order.from.name); is_view {
+			// The number is the view's own FROM: it has no rows to measure yet.
+			append(&lines, fmt.aprintf(
+				"scan %s (a view; est. %d rows from the relation it reads)",
+				first.name,
+				first.rows,
+			))
 		} else {
 			append(&lines, strings.concatenate({"scan ", first.name}))
 		}

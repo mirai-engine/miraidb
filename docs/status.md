@@ -132,7 +132,7 @@ the gaps are named rather than left to be discovered.
   one schema, one set of rows and 55 queries through both engines, with the
   refusals and the intentional differences listed in the script.
 - `scripts/build.py` builds both binaries and runs the suite.
-- 226 integration tests covering CRUD, recovery, constraints, transactions,
+- 227 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
@@ -241,12 +241,16 @@ than 1000 bytes cannot be indexed and the insert says so.
   with the parameters that came with it, so `n < ?` bound to 50 keeps the estimate
   `n < 50` gets and the same access decision (`test_plan_reads_a_bound_value`); a
   statement that binds nothing keeps the old fallback of a third of the table.
+- **A view is priced from its own FROM.** A view has no rows to measure until the
+  statement runs, so the planner follows its query to the relation it reads (and
+  follows a view over a view), and `EXPLAIN` says where the number came from
+  instead of passing a guess off as a measurement
+  (`test_plan_prices_a_view_from_its_own_from`).
 - **What the planner still does not do.** It does not use an index to satisfy
   `ORDER BY`, and its cost constants are hand-set rather than calibrated against a
-  measurement. Two smaller gaps remain: a view in `FROM` gets no estimate, and the
-  subscription path lays out its walk in the written order rather than the planned
-  one. Staleness is no longer silent: `EXPLAIN` reprices with the numbers it has
-  and names their age.
+  measurement. The subscription path lays out its walk in the written order rather
+  than the planned one. Staleness is no longer silent: `EXPLAIN` reprices with the
+  numbers it has and names their age.
 - **A join the grammar does not implement is refused, not approximated.**
   `NATURAL`, `RIGHT` and `FULL` joins used to parse as an alias for the table
   before them, which turned the first into a cross join and the other two into

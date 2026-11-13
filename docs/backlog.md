@@ -348,9 +348,9 @@ chosen by hand —
 they encode "a row through an index costs four rows in place" and have not been
 calibrated against a measurement. The plan reads the values it is given: a prepared
 `v < ?` bound to 50 keeps the estimate `v < 50` gets, so the histogram decides the
-access as well as the estimate (`test_plan_reads_a_bound_value`). One gap comes
-from choosing the plan off the statement text alone: a view in `FROM` prints no
-estimate. The statistics announce their age: `EXPLAIN` ends with
+access as well as the estimate (`test_plan_reads_a_bound_value`). A view is priced from the relation its own
+query reads, and `EXPLAIN` says so
+(`test_plan_prices_a_view_from_its_own_from`). The statistics announce their age: `EXPLAIN` ends with
 `note: statistics measured at commit N, data at commit M`, or with `note: no
 statistics measured` when `ANALYZE` never ran, so an estimate never passes for a
 measurement (`test_explain_announces_stale_statistics`). The incremental subscription path (`host_join_prepare`) lays out the

@@ -335,6 +335,46 @@ give_up_dependencies :: proc(dependencies: [][]int) {
 	delete(dependencies)
 }
 
+// plan_view_relation prices a view by the relation its own query reads: a view is
+// materialized when the statement runs, and a plan that estimated nothing would
+// put it first in every join order. It gives up (ok = false) on a view it cannot
+// read -- another view in its FROM is followed, a self-reference or an unreadable
+// definition is not -- and the caller then keeps the default.
+@(private)
+plan_view_relation :: proc(
+	store: ^Store,
+	tx: ^Tx,
+	ref: Table_Ref,
+	on: ^Expr,
+	params: []Value,
+	depth: int,
+) -> (relation: Plan_Relation, ok: bool) {
+	if depth >= VIEW_MAX_DEPTH do return {}, false
+	if len(ref.args) > 0 do return {}, false
+	sql, found := view_sql(tx, ref.name)
+	if !found do return {}, false
+	query, parse_err := sql_parse(sql)
+	if parse_err.kind != .None do return {}, false
+	defer query_destroy(&query)
+	inner, is_select := query.statement.(Select_Stmt)
+	if !is_select do return {}, false
+	base, base_err := tx_table(tx, inner.from.name)
+	if base_err.kind != .None {
+		nested, nested_ok := plan_view_relation(store, tx, inner.from, nil, params, depth + 1)
+		if !nested_ok do return {}, false
+		nested.ref = ref
+		nested.on = on
+		return nested, true
+	}
+	rows := stats_estimate_rows(store, base, inner.where_clause, params)
+	scan_rows := u64(table_row_count(base))
+	if stats, has_stats := stats_get(store, base.schema.name); has_stats do scan_rows = stats.rows
+	matches := rows
+	if on != nil do matches = plan_join_matches(store, base, on)
+	if matches == 0 do matches = 1
+	return Plan_Relation{ref = ref, on = on, rows = rows, scan_rows = scan_rows, matches = matches}, true
+}
+
 // Plan_Relation is one relation of a join while the order is being chosen.
 @(private)
 Plan_Relation :: struct {
@@ -355,7 +395,14 @@ plan_relation :: proc(
 	params: []Value,
 ) -> Plan_Relation {
 	table, table_err := tx_table(tx, ref.name)
-	if table_err.kind != .None do return Plan_Relation{ref = ref, on = on}
+	if table_err.kind != .None {
+		// A view has no rows of its own until the statement runs. Its own FROM is
+		// the one number that exists before that, so the plan borrows it.
+		if estimated, priced := plan_view_relation(store, tx, ref, on, params, 0); priced {
+			return estimated
+		}
+		return Plan_Relation{ref = ref, on = on}
+	}
 	predicate := filter
 	if on != nil do predicate = on
 	rows := stats_estimate_rows(store, table, predicate, params)

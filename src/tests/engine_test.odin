@@ -10348,6 +10348,62 @@ test_plan_reads_a_bound_value :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_plan_prices_a_view_from_its_own_from :: proc(t: ^testing.T) {
+	// A view has no rows to measure until the statement runs. The plan prices it
+	// by the relation its own query reads, so it is not "zero rows" -- which would
+	// put it first in every join order -- and EXPLAIN says where the number came
+	// from instead of passing a guess off as a measurement.
+	store := fresh_db(t, "view_plan")
+	if store == nil do return
+	defer cleanup_db(store, "view_plan")
+
+	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
+	insert := strings.builder_make()
+	defer strings.builder_destroy(&insert)
+	strings.write_string(&insert, "INSERT INTO t (n) VALUES ")
+	for i in 0 ..< 400 {
+		if i > 0 do strings.write_string(&insert, ", ")
+		fmt.sbprintf(&insert, "(%d)", i + 1)
+	}
+	run(t, store, strings.to_string(insert))
+	run(t, store, "ANALYZE t")
+	run(t, store, "CREATE VIEW v AS SELECT * FROM t WHERE n < 100")
+	run(t, store, "CREATE VIEW w AS SELECT * FROM v")
+
+	estimate := plan_estimate(t, store, "EXPLAIN SELECT * FROM v", nil)
+	testing.expectf(t, estimate > 80 && estimate < 130, "a view estimated %d rows", estimate)
+
+	// A view over a view keeps the number: the planner follows the chain.
+	nested := plan_estimate(t, store, "EXPLAIN SELECT * FROM w", nil)
+	testing.expectf(t, nested == estimate, "a nested view estimated %d, the view %d", nested, estimate)
+
+	// The plan tells the truth about where the number came from.
+	result, err := db.sql_execute(store, "EXPLAIN SELECT * FROM v")
+	if testing.expectf(t, db.error_ok(err), "explain failed: %s", err.message) {
+		testing.expect(t, strings.contains(result.rows[0][0].s, "a view"))
+		testing.expect(t, strings.contains(result.rows[0][0].s, "from the relation it reads"))
+		db.sql_result_destroy(&result)
+	}
+
+	// The estimate is what the plan decides with: over 400 rows a join to the view
+	// must not treat it as empty.
+	run(t, store, "CREATE TABLE other (id INTEGER PRIMARY KEY, n INTEGER)")
+	run(t, store, "INSERT INTO other (n) VALUES (1), (2), (3)")
+	run(t, store, "ANALYZE other")
+	order, order_err := db.sql_execute(store, `
+		EXPLAIN SELECT * FROM other JOIN v ON other.n = v.n`)
+	if testing.expectf(t, db.error_ok(order_err), "explain failed: %s", order_err.message) {
+		joined := false
+		for row in order.rows {
+			if strings.has_prefix(row[0].s, "join ") do joined = true
+			testing.expectf(t, !strings.contains(row[0].s, "est. 0 rows"), "the plan priced a relation at zero: %s", row[0].s)
+		}
+		testing.expect(t, joined)
+		db.sql_result_destroy(&order)
+	}
+}
+
+@(test)
 test_plan_reorders_a_join :: proc(t: ^testing.T) {
 	// A nested loop reads the whole inner relation per outer row, so the order of
 	// the joins decides how many rows are read. The planner picks the join that

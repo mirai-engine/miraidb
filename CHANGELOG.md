@@ -36,6 +36,8 @@
   column that leads it, so a join reads the rows one outer row matches instead of
   the whole relation per outer row: 200 authors and 1 000 books read about 1 200
   rows where the scan read 200 200. `EXPLAIN` prints the index it probes.
+- A view in `FROM` is priced from the relation its own query reads, and `EXPLAIN`
+  says where that number came from rather than pricing the view at zero rows.
 - A prepared statement is priced with the parameters it was given, so `n < ?`
   bound to 50 keeps the estimate and the access decision `n < 50` gets instead of
   falling back to a third of the table.
