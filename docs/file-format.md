@@ -326,7 +326,11 @@ INDEX` after it).
 ## Durability
 
 `store_open(..., durable = true)` opens the log and calls `fsync` after writing
-each record, before the in-memory state is updated. With `durable = false` the
+each record, before the in-memory state is updated. The replay walks the records
+one at a time through a buffer that only grows to the largest commit, so opening a
+database costs one record, not its history; it stops at the first record whose
+CRC or sequence does not verify and truncates the torn tail before the next
+append. With `durable = false` the
 data reaches the OS but not necessarily the disk.
 
 On a crash, the worst case is a torn record at the tail; replay ignores it and

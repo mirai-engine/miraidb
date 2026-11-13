@@ -25,6 +25,10 @@ LOG_VERSION :: u32(16)
 LOG_HEADER_LEN :: 24
 LOG_RECORD_HEADER_LEN :: 16
 
+// LOG_STREAM_INITIAL is the buffer a streaming replay starts with. It grows to the
+// largest record it meets, so the cost is one record, not one log.
+LOG_STREAM_INITIAL :: 64 * 1024
+
 // Durability selects when the log waits for stable storage.
 // Checksum selects the record integrity check stored in the log header.
 Checksum :: enum u32 {
@@ -574,15 +578,163 @@ log_read_segments :: proc(
 	min_seq: u64,
 	vfs: ^Vfs = nil,
 ) -> (records: []Log_Record, valid_len: i64, last_path: string, err: Error) {
+	out := make([dynamic]Log_Record)
+	ctx := Log_Read_Ctx{out = &out}
+	valid, last, read_err := log_stream_segments(db_path, min_seq, vfs, &ctx, log_read_visit)
+	if read_err.kind != .None {
+		return nil, 0, "", read_err
+	}
+	return out[:], valid, last, ERROR_NONE
+}
+// Log_Stream_Stats records what a streaming replay actually held in memory, so a
+// test can prove the whole log never entered it at once.
+Log_Stream_Stats :: struct {
+	records:      u64,
+	bytes_read:   u64,
+	// buffer_bytes is the largest record the walk had to hold, which is the bound
+	// the replay costs, instead of the size of the log.
+	buffer_bytes: int,
+}
+
+// Log_Stream_Visitor receives one validated record. The payload lives in the
+// walk's buffer and is only valid during the call; a visitor that needs it later
+// must copy it.
+Log_Stream_Visitor :: proc(ctx: rawptr, record: Log_Record) -> bool
+
+// log_stream_read fills `buffer` completely or reports how many bytes it got.
+@(private)
+log_stream_read :: proc(handle: ^Log_File, buffer: []u8) -> (int, Error) {
+	total := 0
+	for total < len(buffer) {
+		read, read_err := log_file_read(handle, buffer[total:])
+		if read_err.kind != .None do return total, read_err
+		if read <= 0 do break
+		total += read
+	}
+	return total, ERROR_NONE
+}
+
+// log_stream_at replays one log file from `start`, record by record. It holds one
+// record at a time: the same validation the whole-file reader did (magic and
+// checksum id from the header, CRC per record, consecutive sequences, a torn
+// tail stops the walk), with a buffer that only grows to the largest record.
+log_stream_at :: proc(
+	vfs: ^Vfs,
+	path: string,
+	start: i64,
+	ctx: rawptr,
+	visit: Log_Stream_Visitor,
+	stats: ^Log_Stream_Stats = nil,
+) -> (valid_len: i64, base_seq: u64, err: Error) {
+	file, open_err := log_file_open(vfs, path, {.Read})
+	if open_err.kind != .None {
+		return 0, 0, errf(.Io, "cannot read the commit log %s: %v", path, open_err.message)
+	}
+	defer log_file_close(file)
+	header: [LOG_HEADER_LEN]u8
+	header_len, header_err := log_stream_read(file, header[:])
+	if header_err.kind != .None {
+		return 0, 0, errf(.Io, "cannot read the commit log %s: %v", path, header_err.message)
+	}
+	if header_len < LOG_HEADER_LEN {
+		return 0, 0, errf(.Corrupt_Log, "%s is shorter than a log header", path)
+	}
+	if string(header[:8]) != LOG_MAGIC {
+		return 0, 0, errf(.Corrupt_Log, "%s is not a miraidb log (bad magic)", path)
+	}
+	checksum_id := get_u32_le(header[12:16])
+	if checksum_id != u32(Checksum.None) && checksum_id != u32(Checksum.CRC32C) {
+		return 0, 0, errf(.Corrupt_Log, "%s uses an unknown checksum id %d", path, checksum_id)
+	}
+	base_seq = get_u64_le(header[16:24])
+	size := log_file_size(file)
+	pos := start
+	if pos < LOG_HEADER_LEN || pos > size {
+		return 0, base_seq, errf(.Io, "log offset %d is outside %s", start, path)
+	}
+	if _, seek_err := log_file_seek(file, pos); seek_err.kind != .None do return 0, base_seq, seek_err
+	buffer := make([]u8, LOG_STREAM_INITIAL)
+	defer delete(buffer)
+	expected_seq := base_seq + 1
+	first := true
+	valid_len = pos
+	for pos + LOG_RECORD_HEADER_LEN <= size {
+		record_header: [LOG_RECORD_HEADER_LEN]u8
+		n, read_err := log_stream_read(file, record_header[:])
+		if read_err.kind != .None do break
+		if n < LOG_RECORD_HEADER_LEN do break
+		length := int(get_u32_le(record_header[0:4]))
+		stored_crc := get_u32_le(record_header[4:8])
+		seq := get_u64_le(record_header[8:16])
+		if length < 0 || pos + LOG_RECORD_HEADER_LEN + i64(length) > size do break
+		if len(buffer) < length {
+			delete(buffer)
+			buffer = make([]u8, length)
+			if stats != nil {
+				stats.buffer_bytes = length
+			}
+		}
+		payload := buffer[:length]
+		payload_n, payload_err := log_stream_read(file, payload)
+		if payload_err.kind != .None || payload_n != length do break
+		if checksum_id == u32(Checksum.CRC32C) && crc32c(payload) != stored_crc do break
+		if first {
+			expected_seq = seq
+			first = false
+		}
+		if seq != expected_seq do break
+		pos += LOG_RECORD_HEADER_LEN + i64(length)
+		valid_len = pos
+		expected_seq += 1
+		if stats != nil {
+			stats.records += 1
+			stats.bytes_read += u64(LOG_RECORD_HEADER_LEN + length)
+		}
+		keep := visit(ctx, Log_Record{seq = seq, offset = pos - i64(length) - LOG_RECORD_HEADER_LEN, payload = payload})
+		if !keep do break
+	}
+	return valid_len, base_seq, ERROR_NONE
+}
+
+// Log_Read_Ctx collects the whole log, for the callers that need the records
+// after the walk (the sidecar rebuild). Each payload is copied out.
+@(private)
+Log_Read_Ctx :: struct {
+	out: ^[dynamic]Log_Record,
+}
+
+@(private)
+log_read_visit :: proc(ctx: rawptr, record: Log_Record) -> bool {
+	collect := cast(^Log_Read_Ctx)ctx
+	payload := make([]u8, len(record.payload))
+	copy(payload, record.payload)
+	append(collect.out, Log_Record{seq = record.seq, offset = record.offset, payload = payload})
+	return true
+}
+
+// log_stream_segments is log_read_segments without the materialisation: it walks
+// the segments that may hold records after `min_seq` and hands each one to the
+// visitor. `last_path` is allocated and belongs to the caller.
+log_stream_segments :: proc(
+	db_path: string,
+	min_seq: u64,
+	vfs: ^Vfs,
+	ctx: rawptr,
+	visit: Log_Stream_Visitor,
+	stats: ^Log_Stream_Stats = nil,
+) -> (valid_len: i64, last_path: string, err: Error) {
 	count := log_last_segment_index(db_path, vfs) + 1
 	paths := make([]string, count)
 	for i in 0 ..< count do paths[i] = log_segment_path(db_path, i)
+	defer {
+		for path in paths do delete(path)
+		delete(paths)
+	}
 	start_index := 0
 	for i in 0 ..< count {
 		start_index = i
 		if log_segment_base(paths[i], vfs) + 1 > min_seq do break
 	}
-	out := make([dynamic]Log_Record)
 	for i in start_index ..< count {
 		start := i64(LOG_HEADER_LEN)
 		if i == start_index && vfs == nil {
@@ -592,15 +744,13 @@ log_read_segments :: proc(
 				}
 			}
 		}
-		chunk, valid, _, read_err := log_read_at(paths[i], start, vfs)
-		if read_err.kind != .None {
-			return nil, 0, "", read_err
-		}
-		for record in chunk do append(&out, record)
-		valid_len = valid
-		last_path = paths[i]
+		segment_valid, _, segment_err := log_stream_at(vfs, paths[i], start, ctx, visit, stats)
+		if segment_err.kind != .None do return 0, "", segment_err
+		valid_len = segment_valid
+		if last_path != "" do delete(last_path)
+		last_path = strings.clone(paths[i])
 	}
-	return out[:], valid_len, last_path, ERROR_NONE
+	return valid_len, last_path, ERROR_NONE
 }
 
 @(private)
@@ -609,56 +759,14 @@ log_read_at :: proc(
 	start: i64,
 	vfs: ^Vfs = nil,
 ) -> (records: []Log_Record, valid_len: i64, base_seq: u64, err: Error) {
-	data, read_err := log_file_read_all(vfs, path)
-	if read_err.kind != .None {
-		return nil, 0, 0, errf(.Io, "cannot read the commit log %s: %v", path, read_err.message)
-	}
-	// The records point into this image, so it outlives the call; the replay is
-	// a startup cost and the file is read once.
-	if len(data) < LOG_HEADER_LEN {
-		return nil, 0, 0, errf(.Corrupt_Log, "%s is shorter than a log header", path)
-	}
-	if string(data[:8]) != LOG_MAGIC {
-		return nil, 0, 0, errf(.Corrupt_Log, "%s is not a miraidb log (bad magic)", path)
-	}
-	checksum_id := get_u32_le(data[12:16])
-	if checksum_id != u32(Checksum.None) && checksum_id != u32(Checksum.CRC32C) {
-		return nil, 0, 0, errf(.Corrupt_Log, "%s uses an unknown checksum id %d", path, checksum_id)
-	}
-	header_base := get_u64_le(data[16:24])
 	out := make([dynamic]Log_Record)
-	pos := int(start)
-	if pos < LOG_HEADER_LEN || pos > len(data) {
-		return nil, 0, header_base, errf(.Io, "log offset %d is outside %s", start, path)
+	ctx := Log_Read_Ctx{out = &out}
+	valid, base, read_err := log_stream_at(vfs, path, start, &ctx, log_read_visit)
+	if read_err.kind != .None {
+		return nil, 0, 0, read_err
 	}
-	expected_seq := header_base + 1
-	first := true
-	for pos + LOG_RECORD_HEADER_LEN <= len(data) {
-		length := int(get_u32_le(data[pos:pos + 4]))
-		stored_crc := get_u32_le(data[pos + 4:pos + 8])
-		seq := get_u64_le(data[pos + 8:pos + 16])
-		payload_start := pos + LOG_RECORD_HEADER_LEN
-		if length < 0 || payload_start + length > len(data) {
-			break
-		}
-		payload := data[payload_start:payload_start + length]
-		if checksum_id == u32(Checksum.CRC32C) && crc32c(payload) != stored_crc {
-			break
-		}
-		if first {
-			expected_seq = seq
-			first = false
-		}
-		if seq != expected_seq {
-			break
-		}
-		append(&out, Log_Record{seq = seq, offset = i64(pos), payload = payload})
-		expected_seq += 1
-		pos = payload_start + length
-	}
-	return out[:], i64(pos), header_base, ERROR_NONE
+	return out[:], valid, base, ERROR_NONE
 }
-
 // log_truncate cuts the file back to a known-good length.
 log_truncate :: proc(path: string, size: i64, vfs: ^Vfs = nil) -> Error {
 	file, open_err := log_file_open(vfs, path, {.Read, .Write})

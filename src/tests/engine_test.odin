@@ -9327,3 +9327,70 @@ test_paged_index_pages :: proc(t: ^testing.T) {
 	run(t, reopened, "DROP INDEX doc_slug")
 	testing.expect_value(t, scalar(t, reopened, "SELECT id FROM doc WHERE slug = 'kept'").i, i64(5))
 }
+
+@(test)
+test_replay_streams_the_log :: proc(t: ^testing.T) {
+	// Opening a database must not read the whole log into memory. This builds a
+	// log larger than the stream buffer out of many small commits, reopens it and
+	// checks the replay never had to grow past its starting buffer, then tears the
+	// tail off and checks the record that was cut is the only one dropped.
+	path := "_test_replay_stream"
+	os.remove_all(path)
+	defer os.remove_all(path)
+	options := db.Store_Options {
+		persistent = true,
+		create     = true,
+		durable    = false,
+	}
+	store, open_err := db.store_open(path, options)
+	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
+	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+	total :: 3000
+	for i in 0 ..< total {
+		run(t, store, fmt.tprintf("INSERT INTO t (id, v) VALUES (%d, %d)", i, i))
+	}
+	db.store_close(store)
+
+	log_path := fmt.tprintf("%s/log", path)
+	handle, file_err := os.open(log_path, {.Read, .Write})
+	if !testing.expect(t, file_err == nil, "cannot open the log") do return
+	log_bytes, size_err := os.file_size(handle)
+	os.close(handle)
+	if !testing.expect(t, size_err == nil, "cannot size the log") do return
+	// Every record is far smaller than the stream buffer, so the file has to be
+	// bigger than it for this test to mean anything.
+	if !testing.expect(t, log_bytes > 64 * 1024, "the log is too small to prove anything") do return
+
+	reopened, reopen_err := db.store_open(path, options)
+	if !testing.expectf(t, db.error_ok(reopen_err), "reopen: %s", reopen_err.message) do return
+	testing.expect_value(t, scalar(t, reopened, "SELECT count(*) FROM t").i, i64(total))
+	testing.expect_value(t, reopened.replay_records, u64(total) + 1)
+	// Zero means the walk never had to grow past LOG_STREAM_INITIAL: the replay
+	// held one record, not the file.
+	testing.expect_value(t, reopened.replay_buffer_bytes, 0)
+	db.store_close(reopened)
+
+	// Cut the last record in half. The replay has to stop at the last complete
+	// record, drop the torn tail and keep appending on a clean boundary.
+	handle, file_err = os.open(log_path, {.Read, .Write})
+	if !testing.expect(t, file_err == nil, "cannot reopen the log") do return
+	if trunc_err := os.truncate(handle, log_bytes - 5); trunc_err != nil {
+		os.close(handle)
+		testing.expect(t, false, "cannot truncate the log")
+		return
+	}
+	os.close(handle)
+	torn, torn_err := db.store_open(path, options)
+	if !testing.expectf(t, db.error_ok(torn_err), "open after a torn tail: %s", torn_err.message) do return
+	defer db.store_close(torn)
+	testing.expect_value(t, scalar(t, torn, "SELECT count(*) FROM t").i, i64(total - 1))
+	testing.expect_value(t, torn.commit_seq, u64(total))
+	// The append works again and the record after the tear is the one we just wrote.
+	run(t, torn, "INSERT INTO t (id, v) VALUES (9999, 9999)")
+	db.store_close(torn)
+	again, again_err := db.store_open(path, options)
+	if !testing.expectf(t, db.error_ok(again_err), "reopen after the repair: %s", again_err.message) do return
+	defer db.store_close(again)
+	testing.expect_value(t, scalar(t, again, "SELECT count(*) FROM t").i, i64(total))
+	testing.expect_value(t, scalar(t, again, "SELECT v FROM t WHERE id = 9999").i, i64(9999))
+}

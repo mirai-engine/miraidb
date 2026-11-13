@@ -144,6 +144,11 @@ Store :: struct {
 	// references are borrowed). Subscriptions use it to publish deltas.
 	on_commit:     proc(ctx: rawptr, store: ^Store, ops: []Store_Op),
 	on_commit_ctx: rawptr,
+	// replay_records and replay_buffer_bytes are what the last replay walked and
+	// the largest record it had to hold. They are diagnostics a test reads to
+	// prove the log is not loaded whole.
+	replay_records:      u64,
+	replay_buffer_bytes: int,
 	// paged_tables and page_frames are the options new tables inherit, and
 	// has_paged says whether any table of this store is paged: a read then keeps
 	// the store lock for the whole transaction instead of taking a snapshot.
@@ -510,17 +515,46 @@ store_variable_names_locked :: proc(store: ^Store, alloc: mem.Allocator) -> []st
 
 // --- Replay ----------------------------------------------------------------
 
-store_replay :: proc(store: ^Store) -> Error {
-	records, valid_len, last_path, read_err := log_read_segments(store.path, store.commit_seq, store.vfs)
-	if read_err.kind != .None do return read_err
-	for record in records {
-		// A snapshot already covers everything at or below its base sequence.
-		if record.seq <= store.commit_seq do continue
-		if err := store_apply_payload(store, record.payload, record.seq); err.kind != .None {
-			return errf(.Corrupt_Log, "commit %d cannot be replayed: %s", record.seq, err.message)
-		}
-		store.commit_seq = record.seq
+// Replay_Ctx carries the store and the first failure through the record visitor.
+@(private)
+Replay_Ctx :: struct {
+	store: ^Store,
+	err:   Error,
+}
+
+@(private)
+replay_visit :: proc(ctx: rawptr, record: Log_Record) -> bool {
+	replay := cast(^Replay_Ctx)ctx
+	// A snapshot already covers everything at or below its base sequence.
+	if record.seq <= replay.store.commit_seq do return true
+	if err := store_apply_payload(replay.store, record.payload, record.seq); err.kind != .None {
+		replay.err = errf(.Corrupt_Log, "commit %d cannot be replayed: %s", record.seq, err.message)
+		return false
 	}
+	replay.store.commit_seq = record.seq
+	return true
+}
+
+// store_replay applies the commits the snapshot does not cover. It walks the log
+// record by record: the buffer holds the largest commit it meets, not the whole
+// file, so opening a database with a long history costs the largest record
+// instead of the history.
+store_replay :: proc(store: ^Store) -> Error {
+	stats: Log_Stream_Stats
+	ctx := Replay_Ctx{store = store}
+	valid_len, last_path, read_err := log_stream_segments(
+		store.path,
+		store.commit_seq,
+		store.vfs,
+		&ctx,
+		replay_visit,
+		&stats,
+	)
+	defer if len(last_path) > 0 do delete(last_path)
+	if read_err.kind != .None do return read_err
+	if ctx.err.kind != .None do return ctx.err
+	store.replay_records = stats.records
+	store.replay_buffer_bytes = stats.buffer_bytes
 	// Drop a torn tail so the next append starts on a clean record boundary.
 	if len(last_path) > 0 && store.log.file != nil {
 		if log_file_size(store.log.file) != valid_len {

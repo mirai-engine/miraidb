@@ -151,9 +151,10 @@ its neighbour, so an index that loses most of its keys keeps the leaves until it
 is rebuilt (a delete never leaves a wrong answer: the cursor walks past empty
 leaves, and the test deletes a third of 5000 keys); a paged table keeps one
 version, so `AS OF` and `ALTER` refuse it; a read transaction of a store with
-pages holds the shared lock (writers wait); opening reads the whole log into
-memory, so a very large log still costs its size at startup; a key longer than
-1000 bytes cannot be indexed and the insert says so.
+pages holds the shared lock (writers wait); opening streams the log one record at
+a time, so it costs the largest commit rather than the whole history, but it still
+rebuilds every table and index from those records (a trusted open is D18b); a key
+longer than 1000 bytes cannot be indexed and the insert says so.
 
 
 - **Index use.** Only the base table of a query is narrowed by an index; joined
