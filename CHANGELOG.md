@@ -25,6 +25,11 @@
   refusal so it fails the gate the day it works.
 - One owner per database directory (OS lock), and a broker that serves other
   processes over HTTP, WebSocket frames and Postgres.
+- A read snapshot copies the row map and every index tree shape for shape
+  instead of rebuilding the indexes, and retired snapshots are freed when no
+  transaction holds them: freezing a 50 000-row table fell from 117 ms to 36 ms,
+  a 50 000-row table with one extra index from 198 ms to 53 ms, and the read
+  cache keeps publishing past the sixteenth commit.
 - Tables on disk: a page file per table with a buffer pool, a free list, a
   fault-tested flush order, and a query pipeline that streams a single-table
   scan without holding the table in memory. Off by default; `--paged` turns it

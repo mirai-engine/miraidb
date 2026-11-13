@@ -1012,11 +1012,61 @@ table_insert_borrowed :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
 	return ERROR_NONE
 }
 
+// index_tree_clone copies an index tree into a tree of the same shape: every node
+// and every key is copied, nothing is compared and nothing is rebalanced. It is
+// what makes a snapshot cost a copy per entry instead of a lookup and an insert
+// per entry, which is where freezing a table used to spend its time.
+@(private)
+index_tree_clone :: proc(source: ^Index_Tree, target: ^Index_Tree, keys: mem.Allocator) {
+	target.user_data = source.user_data
+	target.on_remove = source.on_remove
+	target._cmp_fn = source._cmp_fn
+	target._node_allocator = source._node_allocator
+	target._size = source._size
+	target._root = index_node_clone(source._root, nil, target._node_allocator, keys)
+}
+
+@(private)
+index_node_clone :: proc(
+	node: ^rbtree.Node(string, Row_Id),
+	parent: ^rbtree.Node(string, Row_Id),
+	node_allocator: mem.Allocator,
+	key_allocator: mem.Allocator,
+) -> ^rbtree.Node(string, Row_Id) {
+	if node == nil do return nil
+	copy := new_clone(rbtree.Node(string, Row_Id){
+		key = strings.clone(node.key, key_allocator),
+		value = node.value,
+		_color = node._color,
+		_parent = parent,
+	}, node_allocator)
+	copy._left = index_node_clone(node._left, copy, node_allocator, key_allocator)
+	copy._right = index_node_clone(node._right, copy, node_allocator, key_allocator)
+	return copy
+}
+
+// index_lookup_clone copies the equality map of a HASH or DIRECT index. The keys
+// and the buckets are allocated the way table_index_map_add allocates them, so
+// table_index_map_free frees them the same way; the clone is independent of the
+// source, which may be dropped while a snapshot reads it.
+@(private)
+index_lookup_clone :: proc(source: ^Index, target: ^Index, keys: mem.Allocator) {
+	if len(source.lookup) == 0 do return
+	target.lookup = make(map[string]^Index_Bucket, len(source.lookup))
+	for key, bucket in source.lookup {
+		copied := new(Index_Bucket)
+		copied.ids = make([dynamic]Row_Id, 0, len(bucket.ids))
+		append(&copied.ids, ..bucket.ids[:])
+		target.lookup[strings.clone(key, keys)] = copied
+	}
+}
+
 // table_snapshot copies a table for a read transaction: structure and indexes are
 // its own, the values are borrowed from the source through a shared Row_Store.
-// That turns freezing into one map build and index fill per table instead of a
-// deep copy of every value, which is what made the first read of a large database
-// slow. The source defers freeing values while a snapshot that shares them lives.
+// The rows are copied as a map (presized) and the index trees shape for shape, so
+// freezing is one allocation and one copy per entry instead of a lookup, an
+// encoding and an insert. The source defers freeing values while a snapshot that
+// shares them lives.
 table_snapshot :: proc(source: ^Table) -> ^Table {
 	// A paged table can be copied, but the copy has to hold the values: it has no
 	// page file to read them from. Reads of a store with pages take the lock for
@@ -1048,9 +1098,18 @@ table_snapshot :: proc(source: ^Table) -> ^Table {
 	clone.borrowed = true
 	clone.next_row_id = source.next_row_id
 	clone.next_sequence = source.next_sequence
+	clone.next_int_key = source.next_int_key
+	for _, index in clone.indexes {
+		if index >= len(source.indexes) do break
+		index_tree_clone(&source.indexes[index].tree, &clone.indexes[index].tree, clone.arena_allocator)
+		index_lookup_clone(&source.indexes[index], &clone.indexes[index], context.allocator)
+	}
+	clone.rows = make(map[Row_Id]Row, len(source.rows))
 	for _, row in source.rows {
 		if row.deleted_seq != 0 do continue
-		_ = table_insert_borrowed(clone, row.id, row.values)
+		// The snapshot keeps the values (borrowed) and the creation sequence; the
+		// version chain belongs to the source table and is not copied.
+		clone.rows[row.id] = Row{id = row.id, values = row.values, created_seq = row.created_seq}
 	}
 	return clone
 }

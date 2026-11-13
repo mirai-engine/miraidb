@@ -90,9 +90,11 @@ Store :: struct {
 	// with the same allocator the store's memory came from.
 	alloc:         mem.Allocator,
 	// read_cache is the most recent read snapshot, reused while commit_seq does
-	// not change; retired keeps the older ones alive until close.
+	// not change; retired keeps the older ones alive while a transaction reads
+	// them, and cache_mutex serializes who publishes and who evicts.
 	read_cache:    ^Frozen_Cache,
 	retired:       [dynamic]^Frozen_Cache,
+	cache_mutex:   sync.Mutex,
 	variables:     map[string]Value,
 	// cancelled asks the next row loop to stop. It is cooperative: a running
 	// statement checks it between rows, so the caller still owns the outcome.

@@ -72,6 +72,12 @@ the gaps are named rather than left to be discovered.
 ### Transactions
 
 - One writer, many readers, staged writes, read-your-writes.
+- A read transaction takes a snapshot at begin: the row map is copied, the values
+  are borrowed through a reference-counted store, and every index tree is copied
+  shape for shape (nodes and keys, no comparisons and no rebalancing). The
+  snapshot is cached by commit sequence, so a second read costs nothing, and a
+  retired one is freed as soon as no transaction holds it. A 50 000-row table
+  freezes in ~36 ms today (it was 117 ms before the shape-for-shape copy).
 - Deterministic operation order in the log.
 - Validation before logging: a rejected statement never reaches the log.
 - Rewind of the log if applying a validated transaction ever fails.
@@ -125,7 +131,7 @@ the gaps are named rather than left to be discovered.
   one schema, one set of rows and 55 queries through both engines, with the
   refusals and the intentional differences listed in the script.
 - `scripts/build.py` builds both binaries and runs the suite.
-- 219 integration tests covering CRUD, recovery, constraints, transactions,
+- 222 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.

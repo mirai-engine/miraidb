@@ -33,8 +33,10 @@ Tx :: struct {
 	frozen:       map[string]^Table,
 	frozen_list:  [dynamic]^Table,
 	// frozen_shared says the snapshot belongs to the store's read cache, so this
-	// transaction must not destroy it.
+	// transaction must not destroy it; frozen_cache is the entry whose reference
+	// count it holds until tx_discard.
 	frozen_shared: bool,
+	frozen_cache:  ^Frozen_Cache,
 	// cte_tables holds the common table expressions materialized for the current
 	// statement; they live in temp_tables and are destroyed with the transaction.
 	// work_units is what this transaction spent, summed from each statement's
@@ -282,12 +284,19 @@ tx_begin_read :: proc(store: ^Store) -> ^Tx {
 		tx.locked = true
 		return tx
 	}
+	// cache_mutex serializes the readers that publish or evict a snapshot. It is
+	// always taken after the store's shared lock, never the other way around.
+	sync.lock(&store.cache_mutex)
 	// Reuse the snapshot published for this exact commit sequence: when nothing
 	// committed in between, opening a read is O(1) and copies nothing.
 	if store.read_cache != nil && store.read_cache.seq == store.commit_seq {
-		tx.frozen = store.read_cache.frozen
-		tx.frozen_list = store.read_cache.list
+		cache := store.read_cache
+		sync.atomic_add(&cache.refs, 1)
+		tx.frozen = cache.frozen
+		tx.frozen_list = cache.list
+		tx.frozen_cache = cache
 		tx.frozen_shared = true
+		sync.unlock(&store.cache_mutex)
 		sync.shared_unlock(&store.mutex)
 		return tx
 	}
@@ -299,29 +308,54 @@ tx_begin_read :: proc(store: ^Store) -> ^Tx {
 		append(&tx.frozen_list, clone)
 	}
 	// Publish this snapshot for later readers; the cache owns it now, so the
-	// transaction must not destroy it.
-	if len(store.retired) < READ_CACHE_LIMIT {
-		if store.read_cache != nil do append(&store.retired, store.read_cache)
-		cache := new(Frozen_Cache)
-		cache.seq = tx.read_seq
-		cache.frozen = tx.frozen
-		cache.list = tx.frozen_list
-		store.read_cache = cache
-		tx.frozen_shared = true
+	// transaction must not destroy it. The previous cache goes to `retired` and
+	// every entry there that no transaction holds is freed: a list that is never
+	// pruned would stop the cache from publishing after sixteen commits, and
+	// every read after that would copy the tables again.
+	if store.read_cache != nil do append(&store.retired, store.read_cache)
+	cache := new(Frozen_Cache)
+	cache.seq = tx.read_seq
+	cache.frozen = tx.frozen
+	cache.list = tx.frozen_list
+	cache.refs = 1
+	store.read_cache = cache
+	tx.frozen_cache = cache
+	tx.frozen_shared = true
+	kept := make([dynamic]^Frozen_Cache, 0, len(store.retired))
+	for old in store.retired {
+		if sync.atomic_load(&old.refs) == 0 {
+			frozen_cache_destroy(old)
+		} else {
+			append(&kept, old)
+		}
 	}
+	delete(store.retired)
+	store.retired = kept
+	sync.unlock(&store.cache_mutex)
 	sync.shared_unlock(&store.mutex)
 	return tx
 }
 
-// READ_CACHE_LIMIT bounds how many read snapshots stay alive; past it, reads
-// copy again instead of pinning more memory.
-READ_CACHE_LIMIT :: 16
+// frozen_cache_release drops the reference a transaction took on a published
+// snapshot. Only the readers decrement it, and only the publisher reads it, so it
+// is atomic.
+@(private)
+frozen_cache_release :: proc(tx: ^Tx) {
+	if tx.frozen_shared && tx.frozen_cache != nil {
+		sync.atomic_add(&tx.frozen_cache.refs, -1)
+	}
+	tx.frozen_shared = false
+	tx.frozen_cache = nil
+}
 
 // Frozen_Cache is one published read snapshot, owned by the store.
 Frozen_Cache :: struct {
 	seq:    u64,
 	frozen: map[string]^Table,
 	list:   [dynamic]^Table,
+	// refs counts the transactions reading this snapshot. A retired entry with no
+	// readers is freed at the next publish; one still in use stays until they end.
+	refs:   int,
 }
 
 frozen_cache_destroy :: proc(cache: ^Frozen_Cache) {
@@ -347,7 +381,7 @@ tx_begin_read_at :: proc(store: ^Store, seq: u64) -> ^Tx {
 	// it, or left to the store's read cache when it borrowed it. Clearing both
 	// pointers keeps tx_discard from freeing the cache's map a second time.
 	tx.frozen = nil
-	tx.frozen_shared = false
+	frozen_cache_release(tx)
 	tx.frozen_list = nil
 	tx.use_frozen = false
 	sync.shared_lock(&store.mutex)
@@ -408,7 +442,7 @@ tx_discard :: proc(tx: ^Tx) {
 		delete(tx.frozen_list)
 		delete(tx.frozen)
 	}
-	tx.frozen_shared = false
+	frozen_cache_release(tx)
 	virtual.arena_destroy(&tx.arena)
 	if tx.locked {
 		if tx.read_only {

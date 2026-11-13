@@ -166,6 +166,21 @@ the source of truth.
 `store_table_memory` (and `miraidb inspect`) reports per-table rows, row bytes,
 index entries and index bytes for diagnostics.
 
+### Read snapshots
+
+A read transaction does not hold the store lock while it runs. At begin it builds
+one snapshot of the tables (`table_snapshot`): the row map is copied (presized),
+the values are borrowed through a reference-counted `Row_Store`, and every index
+tree is copied **shape for shape** — node and key, no comparisons and no
+rebalancing — so a snapshot costs one copy per entry instead of a lookup, an
+encoding and an insert. The snapshot is published as the store's read cache keyed
+by commit sequence, so the next read at that sequence borrows it in O(1). Each
+transaction holds a reference; a cache that a new commit replaced is freed as
+soon as no transaction holds it, so the cache keeps publishing instead of going
+dark after a fixed number of commits. A writer never waits for a reader: it keeps
+mutating its own tables, and the snapshot's rows, tree nodes and keys are its
+own — the test drops the source table under an open snapshot.
+
 ## Compaction
 
 `store_compact` first writes the snapshot, then rewrites the log as one record

@@ -10320,3 +10320,114 @@ test_case_expressions :: proc(t: ^testing.T) {
 	}
 	db.sql_result_destroy(&grouped)
 }
+
+@(test)
+test_snapshot_indexes_are_its_own :: proc(t: ^testing.T) {
+	// A snapshot copies the index trees, not just the rows. After the source
+	// changes, a lookup on the frozen table still answers the state it was taken
+	// at, and the source answers the new one: the two never share a tree.
+	store := fresh_db(t, "snapshot_index")
+	if store == nil do return
+	defer cleanup_db(store, "snapshot_index")
+
+	run(t, store, "CREATE TABLE item (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)")
+	run(t, store, "CREATE INDEX item_qty ON item (qty)")
+	run(t, store, "INSERT INTO item (id, name, qty) VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)")
+
+	tx := db.tx_begin_read(store)
+	frozen, frozen_err := db.tx_table(tx, "item")
+	if !testing.expectf(t, db.error_ok(frozen_err), "frozen table: %s", frozen_err.message) {
+		db.tx_end(tx)
+		return
+	}
+	position := -1
+	for index, i in frozen.indexes {
+		if index.schema.name == "item_qty" do position = i
+	}
+	if !testing.expect(t, position >= 0) {
+		db.tx_end(tx)
+		return
+	}
+
+	run(t, store, "UPDATE item SET qty = 99 WHERE id = 1")
+	run(t, store, "DELETE FROM item WHERE id = 2")
+	run(t, store, "INSERT INTO item (id, name, qty) VALUES (4, 'd', 40)")
+
+	testing.expect_value(t, db.table_row_count(frozen), 3)
+	// The probe carries every column of the row: an index names its columns by
+	// position, so `qty` is the third one.
+	old_ids := db.table_index_lookup(frozen, position, []db.Value{db.value_null(), db.value_null(), db.value_int(10)})
+	testing.expect_value(t, len(old_ids), 1)
+	if len(old_ids) == 1 {
+		// The id the frozen index names is the row whose qty is 10 in the frozen
+		// table, whatever the row-id counter did.
+		row, exists := frozen.rows[old_ids[0]]
+		testing.expect(t, exists)
+		testing.expect_value(t, row.values[2].i, i64(10))
+	}
+	delete(old_ids)
+	new_ids := db.table_index_lookup(frozen, position, []db.Value{db.value_null(), db.value_null(), db.value_int(99)})
+	testing.expect_value(t, len(new_ids), 0)
+	delete(new_ids)
+
+	live, live_err := db.store_table(store, "item")
+	if testing.expect(t, db.error_ok(live_err)) {
+		live_ids := db.table_index_lookup(live, position, []db.Value{db.value_null(), db.value_null(), db.value_int(99)})
+		testing.expect_value(t, len(live_ids), 1)
+		delete(live_ids)
+	}
+	db.tx_end(tx)
+}
+
+@(test)
+test_snapshot_survives_dropping_the_source :: proc(t: ^testing.T) {
+	// The frozen copy owns its rows, its tree nodes and its keys. A writer may
+	// drop the source table while a reader holds the snapshot, and the reader must
+	// still answer from what it copied: anything shared would be freed by the drop.
+	store := fresh_db(t, "snapshot_drop")
+	if store == nil do return
+	defer cleanup_db(store, "snapshot_drop")
+
+	run(t, store, "CREATE TABLE item (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)")
+	run(t, store, "CREATE INDEX item_qty ON item (qty)")
+	run(t, store, "INSERT INTO item (id, name, qty) VALUES (1, 'a', 10), (2, 'b', 20)")
+
+	tx := db.tx_begin_read(store)
+	frozen, frozen_err := db.tx_table(tx, "item")
+	if !testing.expectf(t, db.error_ok(frozen_err), "frozen table: %s", frozen_err.message) {
+		db.tx_end(tx)
+		return
+	}
+	run(t, store, "DROP TABLE item")
+
+	testing.expect_value(t, db.table_row_count(frozen), 2)
+	position := -1
+	for index, i in frozen.indexes {
+		if index.schema.name == "item_qty" do position = i
+	}
+	if testing.expect(t, position >= 0) {
+		ids := db.table_index_lookup(frozen, position, []db.Value{db.value_null(), db.value_null(), db.value_int(10)})
+		testing.expect_value(t, len(ids), 1)
+		delete(ids)
+	}
+	db.tx_end(tx)
+}
+
+@(test)
+test_read_cache_keeps_publishing :: proc(t: ^testing.T) {
+	// The cache publishes one snapshot per commit and frees the retired ones no
+	// transaction holds. A list that only grew stopped publishing after sixteen
+	// commits, and every read after that copied the tables again.
+	store := fresh_db(t, "read_cache")
+	if store == nil do return
+	defer cleanup_db(store, "read_cache")
+
+	run(t, store, "CREATE TABLE c (id INTEGER PRIMARY KEY, v INTEGER)")
+	for _ in 0 ..< 25 {
+		run(t, store, "INSERT INTO c (v) VALUES (1)")
+		tx := db.tx_begin_read(store)
+		db.tx_end(tx)
+		testing.expect_value(t, store.read_cache.seq, store.commit_seq)
+	}
+	testing.expect(t, len(store.retired) < 4)
+}

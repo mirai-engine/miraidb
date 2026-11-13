@@ -103,25 +103,29 @@ reference-counted `Row_Store`, and the last owner out frees the values.
 truncate while the reader holds its view.
 
 What this file used to claim — "~11 µs per transaction including the first,
-before ~190 ms" — was measured wrong. `bench-read` runs a `SELECT count(*)`
-before it starts the clock, and that statement publishes the read cache, so the
-timed loop never pays a freeze. Measured directly on a table of 50 000 rows
-(three columns, primary key and one index), calling `table_snapshot` three
-times: **117.0 ms, 115.7 ms, 114.7 ms** — about **2.3 µs per row**. A read
-transaction after a commit costs the same 116 ms, and the cached reads around it
-are 11.4 µs. So the snapshot is O(rows) with a large constant:
-`table_insert_borrowed` re-inserts each row into every index of the clone.
+before ~190 ms" — was measured wrong: `bench-read` ran a `SELECT count(*)` before
+it started the clock, and that statement published the read cache, so the timed
+loop never paid a freeze. Measured directly on a table of 50 000 rows (three
+columns, primary key and one index), `table_snapshot` cost **117 ms** — about
+2.3 µs per row — because it rebuilt every index with `table_insert_borrowed`.
 
-**Where the clones go.** `store.retired` takes every published snapshot and is
-only emptied by `store_close`. When it reaches `READ_CACHE_LIMIT` (16) no new
-cache is published for the rest of the process, so every later read clones, and
-17 frozen snapshots stay resident. Evicting the oldest and publishing again is
-the fix; it is small and it is not done.
+**Done.** The index trees are copied **shape for shape**
+(`index_tree_clone`: node and key, no comparisons, no rebalancing) and the row
+map is presized. The same table snapshots in **36 ms** (0.7 µs per row), and with
+one extra index in **53 ms** instead of 198 ms. The read cache counts references
+and, when a new commit replaces it, frees every retired snapshot no transaction
+holds, so it keeps publishing instead of going dark after sixteen commits
+(`test_read_cache_keeps_publishing`). The snapshot owns its rows, tree nodes and
+keys: a writer may
+drop the source table under an open snapshot and the reader still answers
+(`test_snapshot_survives_dropping_the_source`).
 
-**Work.** Clone the row store and the indexes without re-inserting each row,
-evict retired snapshots so the read cache keeps working, and teach `bench-read`
-to time a commit followed by a read so the gate measures the number the contract
-talks about. `docs/roadmap.md` records the rows as not met until then.
+**Left.** The copy is still *all* of it: a read transaction snapshots every table
+in the store, whether or not the statement reads it, so a first read after a
+commit is O(all rows). Copying a table the first time a statement names it (under
+the same lock, with the sequence pinned) or sharing tables copy-on-write is the
+next step, and it is what the contract row "should cost the rows the transaction
+touches" actually asks for.
 
 **History (done).** `SELECT ... FROM t AS OF <seq>` reads the rows as they were at
 that commit: the scan walks the versions `row_values_at` keeps instead of the live
