@@ -83,6 +83,20 @@ def main() -> int:
     gates.append(
         Gate("plan regression", [sys.executable, "scripts/plan_check.py", "--bin", "./bin/miraidb.exe"])
     )
+    gates.append(
+        Gate(
+            "mirror cost",
+            [
+                sys.executable,
+                "scripts/mirror_cost.py",
+                "--check",
+                "--rows",
+                "10000",
+                "--text",
+                "200",
+            ],
+        )
+    )
     if not args.skip_dll:
         if os.path.exists(args.windows_python):
             gates.append(Gate("C ABI smoke", [args.windows_python, "scripts/capi_smoke.py"]))
