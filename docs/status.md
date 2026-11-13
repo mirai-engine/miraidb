@@ -1,9 +1,10 @@
 # Status
 
 What the engine does today, what is partial, and what it does not attempt. The
-feature matrix is closed. [roadmap.md](roadmap.md) is the plan for what comes
-next and [backlog.md](backlog.md) is the detail of every item. This file is the
-honest measurement.
+feature matrix is closed (94/94); [roadmap.md](roadmap.md) orders what is left
+and [backlog.md](backlog.md) carries the detail of every item. This file is the
+honest measurement: every number here was produced by a command in this tree, and
+the gaps are named rather than left to be discovered.
 
 ## Done
 
@@ -257,12 +258,13 @@ than 1000 bytes cannot be indexed and the insert says so.
 - **Cancellation.** A long query holds the read lock until it finishes. There
   is no statement timeout or cancel handle.
 
-## Not implemented: a second opener, and replication
+## Not implemented: a second writer, and replication
 
-- **One process owns one log.** A second process that opens the same directory is
-  refused with `locked` and the owner's pid: an OS lock on `<directory>/lock`
-  (Windows `LockFileEx`, POSIX `fcntl`) is taken on open and released on close or
-  death. A second process can still **use** the database through the owner:
+- **One process writes one log.** A second process that opens the same directory
+  for writing is refused with `locked` and the owner's pid: an OS lock on
+  `<directory>/lock` (Windows `LockFileEx`, POSIX `fcntl`) is taken on open and
+  released on close or death. A second process can still **use** the database,
+  through the owner:
   `miraidb-server` serves HTTP wire messages, WebSocket frames and Postgres, and
   each connection has its own subscriptions and byte budget
   (`scripts/broker_smoke.py` proves it with two processes). The identity a

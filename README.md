@@ -30,12 +30,13 @@ The engine exists to make three deployment styles share one implementation:
 | Style | What the host gets |
 |---|---|
 | Embedded | Link the `engine` package, open a directory, run SQL and reducers in-process |
-| Hosted (planned) | A server process owning the files, exposing reducers and subscriptions over RPC |
-| Portable files (planned) | Import/export to ordinary SQLite databases and a versioned miraidb container |
+| Hosted | `miraidb-server` owns the files and serves reducers, queries and subscriptions over HTTP, WebSocket frames and Postgres |
+| Portable files | Read and write an ordinary `.sqlite` file, and keep one current by patching the pages each commit touched |
 
 The storage engine is ours from the start, so the file format, transaction order
-and change stream are all under our control. Compatibility with SQLite is a
-planned adapter, not the foundation: the engine never depends on SQLite to run.
+and change stream are all under our control. Compatibility with SQLite is an
+adapter, not the foundation: the engine reads and writes the file format and the
+SQL surface, but never links SQLite and never needs it to run.
 
 ## Design principles
 
@@ -263,8 +264,7 @@ Status and planning:
 [features.md](docs/features.md) (the parity matrix, 94 rows),
 [roadmap.md](docs/roadmap.md) (the pending order),
 [backlog.md](docs/backlog.md) (the depth work, with cost) and
-[pending.md](docs/pending.md) (the weighted closing plan `roadmap.py`
-regenerates).
+[pending.md](docs/pending.md) (the weighted roadmap `roadmap.py` regenerates).
 
 ## Roadmap
 
