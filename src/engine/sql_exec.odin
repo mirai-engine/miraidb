@@ -117,7 +117,7 @@ sql_run_statement :: proc(store: ^Store, statement: Statement, params: []Value) 
 		return sql_exec_show(store, stmt)
 	case Explain_Stmt:
 		tx := tx_begin_read(store)
-		result, explain_err := sql_exec_explain(tx.store, stmt, params)
+		result, explain_err := sql_exec_explain(tx, stmt, params)
 		tx_end(tx)
 		return result, explain_err
 	case Describe_Stmt:
@@ -184,7 +184,7 @@ sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value) 
 	case Show_Stmt:
 		return sql_exec_show(tx.store, stmt, tx.locked)
 	case Explain_Stmt:
-		return sql_exec_explain(tx.store, stmt, params, tx.locked)
+		return sql_exec_explain(tx, stmt, params)
 	case Describe_Stmt:
 		return sql_exec_describe(tx, stmt)
 	case Begin_Stmt, Commit_Stmt, Rollback_Stmt, Savepoint_Stmt:
@@ -576,24 +576,29 @@ sql_exec_show :: proc(store: ^Store, stmt: Show_Stmt, locked := false) -> (Sql_R
 	return result, ERROR_NONE
 }
 
-sql_exec_explain :: proc(
-	store: ^Store,
-	stmt: Explain_Stmt,
-	params: []Value,
-	locked := false,
-) -> (Sql_Result, Error) {
-	if !locked {
-		sync.shared_lock(&store.mutex)
-		defer sync.shared_unlock(&store.mutex)
-	}
+sql_exec_explain :: proc(tx: ^Tx, stmt: Explain_Stmt, params: []Value) -> (Sql_Result, Error) {
+	store := tx.store
 	if stmt.inner == nil do return {}, errf(.Invalid_Argument, "EXPLAIN needs a statement")
 	lines := make([dynamic]string)
 	defer delete(lines)
 	switch inner in stmt.inner^ {
 	case Select_Stmt:
-		append(&lines, strings.concatenate({"scan ", inner.from.name, explain_index_suffix(store, inner.from, inner.where_clause, params)}))
-		for join in inner.joins {
-			append(&lines, strings.concatenate({"join ", join.table.name, " (nested loop)"}))
+		order := plan_join_order(store, tx, inner, params)
+		first := order.steps[0]
+		base_table, table_err := tx_table(tx, order.from.name)
+		if table_err.kind == .None {
+			append(&lines, fmt.aprintf("scan %s%s", first.name, explain_access(store, base_table, order.from, inner.where_clause, params)))
+		} else {
+			append(&lines, strings.concatenate({"scan ", first.name}))
+		}
+		for step in order.steps[1:] {
+			append(&lines, fmt.aprintf("join %s (nested loop, est. %d rows)", step.name, step.rows))
+		}
+		if order.reordered {
+			names := make([dynamic]string, 0, len(order.steps))
+			defer delete(names)
+			for step in order.steps do append(&names, step.name)
+			append(&lines, fmt.aprintf("join order: %s", strings.join(names[:], ", ")))
 		}
 		if inner.where_clause != nil do append(&lines, strings.clone("filter"))
 		if len(inner.group_by) > 0 do append(&lines, strings.clone("group by"))
@@ -680,37 +685,33 @@ sql_exec_analyze :: proc(store: ^Store, stmt: Analyze_Stmt) -> (Sql_Result, Erro
 	return result, ERROR_NONE
 }
 
+// explain_access prints the same choice the executor makes, with the estimate and
+// the cost it made it with.
 @(private)
-explain_index_suffix :: proc(store: ^Store, ref: Table_Ref, predicate: ^Expr, params: []Value) -> string {
-	if predicate == nil do return " (full scan)"
-	table, table_err := store_table(store, ref.name)
-	if table_err.kind != .None do return ""
-	// The plan names the same choice the executor makes: an index only when it
-	// exists and the statistics do not say it keeps most of the table.
-	estimate := stats_estimate_rows(store, table, predicate)
-	conjuncts := make([dynamic]^Expr)
-	defer delete(conjuncts)
-	split_and(predicate, &conjuncts)
-	for expr in conjuncts {
-		qualifier, column_name, _, ok := comparison_details(expr)
-		if !ok do continue
-		if len(qualifier) > 0 &&
-		   !strings.equal_fold(qualifier, table.schema.name) &&
-		   !(len(ref.alias) > 0 && strings.equal_fold(qualifier, ref.alias)) {
-			continue
-		}
-		column_index, found := schema_column_index(&table.schema, column_name)
-		if !found do continue
-		index_position, has_index := index_for_single_column(table, column_index)
-		if !has_index do continue
-		if !stats_selective(store, table, column_index) do break
+explain_access :: proc(
+	store: ^Store,
+	table: ^Table,
+	ref: Table_Ref,
+	predicate: ^Expr,
+	params: []Value,
+) -> string {
+	access := plan_access(store, table, ref, predicate, params)
+	if access.kind == .Index && access.index >= 0 && access.index < len(table.indexes) {
 		return fmt.aprintf(
-			" using index %s (est. %d rows)",
-			table.indexes[index_position].schema.name,
-			estimate,
+			" using index %s (est. %d rows, cost %.1f)",
+			table.indexes[access.index].schema.name,
+			access.rows,
+			access.cost,
 		)
 	}
-	return fmt.aprintf(" (full scan, est. %d rows)", estimate)
+	return fmt.aprintf(" (full scan, est. %d rows, cost %.1f)", access.rows, access.cost)
+}
+
+@(private)
+explain_index_suffix :: proc(store: ^Store, ref: Table_Ref, predicate: ^Expr, params: []Value) -> string {
+	table, table_err := store_table(store, ref.name)
+	if table_err.kind != .None do return ""
+	return explain_access(store, table, ref, predicate, params)
 }
 
 @(private)
@@ -1836,21 +1837,30 @@ sql_exec_stream_select :: proc(
 
 sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Result, Error) {
 	if len(stmt.compound) > 0 do return sql_exec_compound(tx, stmt, params)
+	// The planner may run the relations of a join in another order. The output
+	// order of `SELECT *` stays the written one (star_sources below reads the
+	// statement), so only what is executed moves.
+	exec := stmt
+	order := plan_join_order(tx.store, tx, stmt, params)
+	if order.reordered {
+		exec.from = order.from
+		exec.joins = order.joins
+	}
 	// A SELECT without FROM evaluates its projections once against an empty row.
 	// System tables are synthesized from the catalog instead of being scanned.
-	empty_row := len(stmt.from.name) == 0
-	system_name := is_system_table(stmt.from.name)
+	empty_row := len(exec.from.name) == 0
+	system_name := is_system_table(exec.from.name)
 	synthetic: Table
 	base: ^Table
 	base_is_view := false
 	if !empty_row && !system_name {
-		base_args, args_err := view_args(tx, stmt.from, params)
+		base_args, args_err := view_args(tx, exec.from, params)
 		if args_err.kind != .None do return {}, args_err
 		source_table, source_view, table_err := tx_source_table(
 			tx,
-			stmt.from.name,
+			exec.from.name,
 			base_args,
-			stmt.from.schema,
+			exec.from.schema,
 		)
 		if table_err.kind != .None do return {}, table_err
 		base = source_table
@@ -1883,14 +1893,14 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 	partials := make([dynamic][]Source)
 	used_index := false
 	if system_name {
-		synthetic.schema = system_table_schema(stmt.from.name, tx.alloc)
-		catalog_rows := system_table_rows(tx, stmt.from.name, tx.alloc)
+		synthetic.schema = system_table_schema(exec.from.name, tx.alloc)
+		catalog_rows := system_table_rows(tx, exec.from.name, tx.alloc)
 		for row in catalog_rows {
 			// The source slice is freed by the filter below, so it cannot come
 			// from the transaction arena (the row values inside still do: they
 			// are only read, never freed here).
 			one := make([]Source, 1)
-			one[0] = Source{table = base, row = row, alias = stmt.from.alias}
+			one[0] = Source{table = base, row = row, alias = exec.from.alias}
 			append(&partials, one)
 		}
 		used_index = true
@@ -1903,11 +1913,11 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 	// use an index (the keys of that commit are not the live ones) and it ignores
 	// the staged writes: it reads what committed.
 	as_of_seq: u64 = 0
-	if stmt.from.as_of != nil {
+	if exec.from.as_of != nil {
 		if base_is_view {
 			return {}, errf(.Sql_Unsupported, "AS OF reads a table, not a view")
 		}
-		moment, constant := eval_constant(stmt.from.as_of, params)
+		moment, constant := eval_constant(exec.from.as_of, params)
 		if !constant {
 			return {}, errf(.Invalid_Argument, "AS OF needs a constant commit sequence")
 		}
@@ -1922,8 +1932,8 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 	if !base_is_view && !empty_row && as_of_seq == 0 {
 		if candidate_ids, used, fts_err := fts_scan_candidates(
 			tx,
-			stmt.from.name,
-			stmt.from.alias,
+			exec.from.name,
+			exec.from.alias,
 			stmt.where_clause,
 			params,
 		); used {
@@ -1934,20 +1944,20 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			defer delete(candidate_ids)
 			for id in candidate_ids {
 				tx.rows_scanned += 1
-				if row, exists := tx_get(tx, stmt.from.name, id); exists {
+				if row, exists := tx_get(tx, exec.from.name, id); exists {
 					one := make([]Source, 1)
-					one[0] = Source{table = base, row = row, alias = stmt.from.alias}
+					one[0] = Source{table = base, row = row, alias = exec.from.alias}
 					append(&partials, one)
 				}
 			}
 			used_index = true
-		} else if indexed_ids, indexed := index_candidates(tx, base, stmt.from.name, stmt.from.alias, stmt.where_clause, params); indexed {
+		} else if indexed_ids, indexed := index_candidates(tx, base, exec.from.name, exec.from.alias, stmt.where_clause, params); indexed {
 			defer delete(indexed_ids)
 			for id in indexed_ids {
 				tx.rows_scanned += 1
-				if row, exists := tx_get(tx, stmt.from.name, id); exists {
+				if row, exists := tx_get(tx, exec.from.name, id); exists {
 					one := make([]Source, 1)
-					one[0] = Source{table = base, row = row, alias = stmt.from.alias}
+					one[0] = Source{table = base, row = row, alias = exec.from.alias}
 					append(&partials, one)
 				}
 			}
@@ -1959,16 +1969,16 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		if base_is_view {
 			table_collect(base, &rows, tx.read_seq)
 		} else if as_of_seq > 0 {
-			if collect_err := tx_collect_at(tx, stmt.from.name, &rows, as_of_seq); collect_err.kind != .None {
+			if collect_err := tx_collect_at(tx, exec.from.name, &rows, as_of_seq); collect_err.kind != .None {
 				return {}, collect_err
 			}
-		} else if collect_err := tx_collect(tx, stmt.from.name, &rows); collect_err.kind != .None {
+		} else if collect_err := tx_collect(tx, exec.from.name, &rows); collect_err.kind != .None {
 			return {}, collect_err
 		}
 		for row in rows {
 			tx.rows_scanned += 1
 			one := make([]Source, 1)
-			one[0] = Source{table = base, row = row, alias = stmt.from.alias}
+			one[0] = Source{table = base, row = row, alias = exec.from.alias}
 			append(&partials, one)
 		}
 		delete(rows)
@@ -1979,9 +1989,11 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		})
 	}
 
-	// Nested-loop joins. Each partial is one bound combination of rows.
-	for join in stmt.joins {
-		if join.table.as_of != nil {
+	// Nested-loop joins. Each partial is one bound combination of rows, and each
+	// step carries the ON conditions that become answerable when it runs (which is
+	// what lets the planner move a relation ahead of the join it was written in).
+	for step in order.steps[1:] {
+		if step.ref.as_of != nil {
 			free_partials(&partials)
 			return {}, errf(.Sql_Unsupported, "AS OF is only supported on the first table of a join")
 		}
@@ -1989,21 +2001,21 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		// is materialized once per outer row (a lateral join). Everything else is
 		// collected once. The materialized tables stay in tx.temp_tables until the
 		// statement ends, because the rows the join reads point into them.
-		lateral := is_json_table_function(join.table.name)
+		lateral := is_json_table_function(step.ref.name)
 		table: ^Table
 		join_is_view: bool
 		rows := make([dynamic]Row)
 		if !lateral {
-			join_args, join_args_err := view_args(tx, join.table, params)
+			join_args, join_args_err := view_args(tx, step.ref, params)
 			if join_args_err.kind != .None {
 				free_partials(&partials)
 				return {}, join_args_err
 			}
 			resolved, resolved_is_view, join_err := tx_source_table(
 				tx,
-				join.table.name,
+				step.ref.name,
 				join_args,
-				join.table.schema,
+				step.ref.schema,
 			)
 			if join_err.kind != .None {
 				free_partials(&partials)
@@ -2013,7 +2025,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			join_is_view = resolved_is_view
 			if join_is_view {
 				table_collect(table, &rows, tx.read_seq)
-			} else if collect_err := tx_collect(tx, join.table.name, &rows); collect_err.kind != .None {
+			} else if collect_err := tx_collect(tx, step.ref.name, &rows); collect_err.kind != .None {
 				free_partials(&partials)
 				return {}, collect_err
 			}
@@ -2028,7 +2040,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			}
 			lateral_rows := rows
 			if lateral {
-				lateral_args, lateral_args_err := view_args(tx, join.table, params, partial)
+				lateral_args, lateral_args_err := view_args(tx, step.ref, params, partial)
 				if lateral_args_err.kind != .None {
 					free_partials(&partials)
 					free_partials(&next)
@@ -2036,9 +2048,9 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 				}
 				lateral_table, _, lateral_err := tx_source_table(
 					tx,
-					join.table.name,
+					step.ref.name,
 					lateral_args,
-					join.table.schema,
+					step.ref.schema,
 				)
 				if lateral_err.kind != .None {
 					free_partials(&partials)
@@ -2054,10 +2066,10 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 				tx.rows_scanned += 1
 				candidate := make([]Source, len(partial) + 1)
 				copy(candidate, partial)
-				candidate[len(partial)] = Source{table = table, row = row, alias = join.table.alias}
-				if join.on != nil {
+				candidate[len(partial)] = Source{table = table, row = row, alias = step.ref.alias}
+				if step.predicate != nil {
 					ctx.sources = candidate
-					value, eval_err := eval_expr(&ctx, join.on)
+					value, eval_err := eval_expr(&ctx, step.predicate)
 					if eval_err.kind != .None {
 						delete(candidate)
 						delete(rows)
@@ -2073,10 +2085,10 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 				append(&next, candidate)
 				matched = true
 			}
-			if join.left && !matched {
+			if step.left && !matched {
 				candidate := make([]Source, len(partial) + 1)
 				copy(candidate, partial)
-				candidate[len(partial)] = Source{table = table, row = Row{}, alias = join.table.alias}
+				candidate[len(partial)] = Source{table = table, row = Row{}, alias = step.ref.alias}
 				append(&next, candidate)
 			}
 			if lateral do delete(lateral_rows)
@@ -2153,6 +2165,8 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 	}
 	delete(partials)
 
+	// The written order, not the execution order: `SELECT *` must emit columns in
+	// the order the query asked for, and a projection resolves names, not slots.
 	star_sources := make([dynamic]Source)
 	if !empty_row {
 		append(&star_sources, Source{table = base, alias = stmt.from.alias})
@@ -4878,13 +4892,12 @@ index_candidates :: proc(
 	// Staged writes are not in the index yet, so the scan would miss them.
 	if _, staged := tx.state.writes[table_name]; staged do return nil, false
 	if _, created := tx.state.created[table_name]; created do return nil, false
-	conjuncts := make([dynamic]^Expr)
-	defer delete(conjuncts)
-	split_and(predicate, &conjuncts)
-	for expr in conjuncts {
-		if candidates, ok := candidates_from_conjunct(tx.store, table, table_alias, expr, params); ok {
-			return candidates, true
-		}
+	// The planner compares every index the predicate could use against the scan
+	// and hands back the cheapest one, or none when the scan wins.
+	plan := plan_access(tx.store, table, Table_Ref{name = table_name, alias = table_alias}, predicate, params)
+	if plan.kind != .Index do return nil, false
+	if candidates, ok := candidates_from_conjunct(plan.conjunct, table, table_alias, plan.index, params); ok {
+		return candidates, true
 	}
 	return nil, false
 }
@@ -4902,10 +4915,10 @@ split_and :: proc(expr: ^Expr, out: ^[dynamic]^Expr) {
 
 @(private)
 candidates_from_conjunct :: proc(
-	store: ^Store,
+	expr: ^Expr,
 	table: ^Table,
 	table_alias: string,
-	expr: ^Expr,
+	index_position: int,
 	params: []Value,
 ) -> ([dynamic]Row_Id, bool) {
 	binary, is_binary := expr^.(Binary_Expr)
@@ -4922,12 +4935,6 @@ candidates_from_conjunct :: proc(
 		}
 		column_index, found := schema_column_index(&table.schema, column_name)
 		if !found do return nil, false
-		index_position, has_index := index_for_single_column(table, column_index)
-		if !has_index do return nil, false
-		// Measured statistics can say the index keeps most of the table, in which
-		// case collecting the ids costs more than reading the rows. Without them
-		// this is always true, which is the behaviour before ANALYZE existed.
-		if !stats_selective(store, table, column_index) do return nil, false
 		value, constant := eval_constant(value_expr, params)
 		if !constant do return nil, false
 		coerced, coerce_err := value_coerce(value, table.schema.columns[column_index].type)
@@ -4976,9 +4983,6 @@ candidates_from_conjunct :: proc(
 		}
 		column_index, found := schema_column_index(&table.schema, column.name)
 		if !found do return nil, false
-		index_position, has_index := index_for_single_column(table, column_index)
-		if !has_index do return nil, false
-		if !stats_selective(store, table, column_index) do return nil, false
 		low, low_ok := eval_constant(between.low, params)
 		high, high_ok := eval_constant(between.high, params)
 		if !low_ok || !high_ok do return nil, false

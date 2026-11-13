@@ -19,15 +19,22 @@ import "core:sync"
 //
 //	header  32 B: "MRST" | u32 version | u64 analyzed_seq | u64 payload_len | u32 crc32c | u32 reserved
 //	payload      : u32 count | count * table
-//	table        : string name | u64 rows | u32 columns | columns * {u64 distinct_count, u64 nulls, u8 saturated}
+//	table        : string name | u64 rows | u32 columns | columns * column
+//	column       : u64 distinct_count | u64 nulls | u8 saturated | u8 numeric |
+//	               f64 min | f64 max | u64 buckets * STATS_HISTOGRAM_BUCKETS
 STATS_FILE_MAGIC :: "MRST"
-STATS_FILE_VERSION :: u32(2)
+STATS_FILE_VERSION :: u32(3)
 STATS_FILE_HEADER_LEN :: 32
 
 // STATS_DISTINCT_CAP bounds the set ANALYZE builds per column. Past it the count
 // stops growing and the column is marked saturated, which a plan reads as "at
 // least this many", never as an answer.
 STATS_DISTINCT_CAP :: 20_000
+
+// STATS_HISTOGRAM_BUCKETS is how many equi-width buckets a numeric column keeps.
+// Sixteen is enough for a range estimate to follow the data instead of assuming a
+// third of the table: the buckets span [min, max] and count the rows in each.
+STATS_HISTOGRAM_BUCKETS :: 16
 
 // Column_Stats is what one pass over a column remembers.
 Column_Stats :: struct {
@@ -36,6 +43,13 @@ Column_Stats :: struct {
 	distinct_count: u64,
 	nulls:          u64,
 	saturated:      bool,
+	// numeric says the histogram is meaningful: min, max and the bucket counts
+	// were measured. Text and blobs keep only the counts, so a range over them
+	// falls back to the one-third rule.
+	numeric:  bool,
+	min:      f64,
+	max:      f64,
+	buckets:  [STATS_HISTOGRAM_BUCKETS]u64,
 }
 
 // Table_Stats is the measured shape of one table. The columns slice belongs to
@@ -123,12 +137,30 @@ stats_measure_table :: proc(tx: ^Tx, table: ^Table) -> (Table_Stats, Error) {
 		delete(sets)
 	}
 	for i in 0 ..< len(sets) do sets[i] = make(map[string]bool)
+	// First pass: distinct values, NULLs and the numeric range of each column.
+	numeric := make([]bool, len(columns))
+	for i in 0 ..< len(columns) do numeric[i] = true
+	seen_numeric := make([]bool, len(columns))
 	for row in rows {
 		for column, i in row.values {
 			if i >= len(columns) do break
 			if column.kind == .Null {
 				columns[i].nulls += 1
 				continue
+			}
+			if i < len(numeric) {
+				if number, ok := value_as_f64(column); ok {
+					if !seen_numeric[i] {
+						columns[i].min = number
+						columns[i].max = number
+						seen_numeric[i] = true
+					} else {
+						columns[i].min = min(columns[i].min, number)
+						columns[i].max = max(columns[i].max, number)
+					}
+				} else {
+					numeric[i] = false
+				}
 			}
 			if columns[i].saturated do continue
 			key := value_key_bytes(column)
@@ -144,7 +176,60 @@ stats_measure_table :: proc(tx: ^Tx, table: ^Table) -> (Table_Stats, Error) {
 			delete(key)
 		}
 	}
+	// Second pass: count the rows in each bucket of the range measured above. The
+	// rows are already in memory, so this costs nothing but the walk.
+	for i in 0 ..< len(columns) {
+		columns[i].numeric = numeric[i] && seen_numeric[i]
+	}
+	for row in rows {
+		for column, i in row.values {
+			if i >= len(columns) || !columns[i].numeric do continue
+			if column.kind == .Null do continue
+			number, ok := value_as_f64(column)
+			if !ok do continue
+			columns[i].buckets[stats_bucket(columns[i], number)] += 1
+		}
+	}
 	return Table_Stats{rows = u64(len(rows)), columns = columns}, ERROR_NONE
+}
+
+// stats_bucket maps a number into the bucket of a column's histogram.
+@(private)
+stats_bucket :: proc(column: Column_Stats, number: f64) -> int {
+	span := column.max - column.min
+	if span <= 0 do return 0
+	fraction := (number - column.min) / span
+	bucket := int(fraction * f64(STATS_HISTOGRAM_BUCKETS))
+	if bucket < 0 do return 0
+	if bucket >= STATS_HISTOGRAM_BUCKETS do return STATS_HISTOGRAM_BUCKETS - 1
+	return bucket
+}
+
+// stats_rows_below how many rows of a column hold a value under `number`, read
+// from the histogram. The bucket that contains the value is counted in
+// proportion to where the value falls inside it, which is what makes a range
+// follow the data instead of assuming a third of the table.
+@(private)
+stats_rows_below :: proc(stats: Table_Stats, column_index: int, number: f64, inclusive: bool) -> u64 {
+	if column_index >= len(stats.columns) do return 0
+	column := stats.columns[column_index]
+	if !column.numeric do return stats.rows / 3
+	if number < column.min do return 0
+	if number > column.max do return stats.rows - column.nulls
+	bucket := stats_bucket(column, number)
+	below := u64(0)
+	for i in 0 ..< bucket do below += column.buckets[i]
+	span := column.max - column.min
+	within: f64 = 1
+	if span > 0 {
+		low := column.min + f64(bucket) * span / f64(STATS_HISTOGRAM_BUCKETS)
+		width := span / f64(STATS_HISTOGRAM_BUCKETS)
+		if width > 0 do within = (number - low) / width
+	}
+	within = max(0, min(within, 1))
+	below += u64(f64(column.buckets[bucket]) * within)
+	if inclusive && below + 1 <= stats.rows do below += 1
+	return min(below, stats.rows)
 }
 
 // stats_estimate_rows predicts how many of a table's rows a predicate keeps.
@@ -162,47 +247,105 @@ stats_estimate_rows :: proc(store: ^Store, table: ^Table, predicate: ^Expr) -> u
 	estimate := f64(stats.rows)
 	for expr in conjuncts {
 		if estimate <= 1 do break
-		qualifier, column_name, op, ok := comparison_details(expr)
-		if !ok do continue
-		if len(qualifier) > 0 && !strings.equal_fold(qualifier, table.schema.name) do continue
-		column_index, found := schema_column_index(&table.schema, column_name)
-		if !found || column_index >= len(stats.columns) do continue
-		column := stats.columns[column_index]
-		fraction: f64
-		switch {
-		case op == .Eq:
-			// An equality keeps one of the distinct values, or everything when the
-			// column holds a single one.
-			distinct_count := max(column.distinct_count, 1)
-			fraction = 1 / f64(distinct_count)
-			if column.nulls > 0 {
-				fraction = 1 / f64(distinct_count + 1)
-			}
-		case op == .Lt, op == .Le, op == .Gt, op == .Ge:
-			// Half-open ranges have no histogram to read, so this is the classic
-			// one-third rule: it is a guess and it says so.
-			fraction = 1.0 / 3.0
-		case:
+		if binary, is_binary := expr^.(Binary_Expr); is_binary {
+			estimate *= stats_binary_fraction(stats, table, binary)
 			continue
 		}
-		estimate *= fraction
+		if between, is_between := expr^.(Between_Expr); is_between && !between.negated {
+			estimate *= stats_between_fraction(stats, table, between)
+			continue
+		}
 	}
+	_ = estimate
 	return u64(max(estimate, 1.0))
 }
 
-// stats_selective reports whether an index over `column` is worth using: a
-// lookup that keeps most of the table costs more than the scan it replaces,
-// because the ids have to be collected first. Only statistics can answer this,
-// so a table without them keeps using the index as it always did.
-stats_selective :: proc(store: ^Store, table: ^Table, column: int) -> bool {
-	stats, has_stats := stats_get(store, table.schema.name)
-	if !has_stats || stats.rows == 0 || column >= len(stats.columns) do return true
-	distinct_count := max(stats.columns[column].distinct_count, 1)
-	// An equality keeps about rows/distinct rows. With four distinct values that
-	// is a quarter of the table, which is where the probe stops paying: the ids
-	// have to be collected first, and half a table of ids costs more than reading
-	// the rows. Fewer than four distinct values therefore means a scan.
-	return distinct_count >= 4
+// stats_binary_fraction is the share of a table's rows one comparison keeps.
+@(private)
+stats_binary_fraction :: proc(stats: Table_Stats, table: ^Table, binary: Binary_Expr) -> f64 {
+	#partial switch binary.op {
+	case .Eq, .Lt, .Le, .Gt, .Ge:
+	case:
+		return 1
+	}
+	qualifier, column_name, value_expr, reversed, ok := comparison_sides(binary)
+	if !ok do return 1
+	if len(qualifier) > 0 && !strings.equal_fold(qualifier, table.schema.name) do return 1
+	column_index, found := schema_column_index(&table.schema, column_name)
+	if !found || column_index >= len(stats.columns) do return 1
+	column := stats.columns[column_index]
+	op := binary.op
+	if reversed {
+		#partial switch op {
+		case .Lt:
+			op = .Gt
+		case .Le:
+			op = .Ge
+		case .Gt:
+			op = .Lt
+		case .Ge:
+			op = .Le
+		}
+	}
+	if op == .Eq {
+		distinct_count := max(column.distinct_count, 1)
+		if column.nulls > 0 do distinct_count += 1
+		return 1 / f64(distinct_count)
+	}
+	bound, constant := eval_constant(value_expr, nil)
+	number, is_number := value_as_f64(bound)
+	if !constant || !is_number || !column.numeric || stats.rows == 0 do return 1.0 / 3.0
+	// `<` and `<=` keep the rows below; `>` and `>=` keep the rest. The boundary
+	// itself is counted for the inclusive operators only, which is the one row a
+	// histogram cannot place precisely.
+	inclusive := op == .Le || op == .Gt
+	below := stats_rows_below(stats, column_index, number, inclusive)
+	kept := below
+	#partial switch op {
+	case .Gt, .Ge:
+		kept = stats.rows - below
+	}
+	if stats.rows == 0 do return 0
+	return f64(max(kept, 1)) / f64(stats.rows)
+}
+
+// stats_between_fraction is the share of a table's rows a BETWEEN keeps.
+@(private)
+stats_between_fraction :: proc(stats: Table_Stats, table: ^Table, between: Between_Expr) -> f64 {
+	if stats.rows == 0 do return 1
+	column, is_column := between.operand^.(Column_Expr)
+	if !is_column do return 0.25
+	if len(column.table) > 0 && !strings.equal_fold(column.table, table.schema.name) do return 0.25
+	column_index, found := schema_column_index(&table.schema, column.name)
+	if !found || column_index >= len(stats.columns) do return 0.25
+	if !stats.columns[column_index].numeric do return 0.25
+	low_value, low_ok := eval_constant(between.low, nil)
+	high_value, high_ok := eval_constant(between.high, nil)
+	low, low_number := value_as_f64(low_value)
+	high, high_number := value_as_f64(high_value)
+	if !low_ok || !high_ok || !low_number || !high_number do return 0.25
+	below_high := stats_rows_below(stats, column_index, high, true)
+	below_low := stats_rows_below(stats, column_index, low, false)
+	kept := below_high - min(below_high, below_low)
+	return f64(max(kept, 1)) / f64(stats.rows)
+}
+
+// value_as_f64 reads a value as a number for histogram work. It is statistics
+// only and never answers a query, so it accepts the numeric kinds and refuses
+// everything else.
+@(private)
+value_as_f64 :: proc(v: Value) -> (number: f64, ok: bool) {
+	#partial switch v.kind {
+	case .Int:
+		return f64(v.i), true
+	case .Uint:
+		return f64(v.u), true
+	case .Float:
+		return v.f, true
+	case .Timestamp, .Duration:
+		return f64(v.i), true
+	}
+	return 0, false
 }
 
 // --- Storage ---------------------------------------------------------------
@@ -267,6 +410,10 @@ stats_save :: proc(store: ^Store) -> Error {
 			bw_write_u64(&payload, column.distinct_count)
 			bw_write_u64(&payload, column.nulls)
 			bw_write_u8(&payload, u8(1) if column.saturated else u8(0))
+			bw_write_u8(&payload, u8(1) if column.numeric else u8(0))
+			bw_write_u64(&payload, transmute(u64)column.min)
+			bw_write_u64(&payload, transmute(u64)column.max)
+			for bucket in column.buckets do bw_write_u64(&payload, bucket)
 		}
 	}
 	body := bw_bytes(&payload)
@@ -336,10 +483,19 @@ stats_load :: proc(store: ^Store) {
 			distinct_count := br_read_u64(&r)
 			nulls := br_read_u64(&r)
 			saturated := br_read_u8(&r) != 0
+			numeric := br_read_u8(&r) != 0
+			minimum := transmute(f64)br_read_u64(&r)
+			maximum := transmute(f64)br_read_u64(&r)
 			measured[i] = Column_Stats {
 				distinct_count = distinct_count,
 				nulls          = nulls,
 				saturated      = saturated,
+				numeric        = numeric,
+				min            = minimum,
+				max            = maximum,
+			}
+			for bucket in 0 ..< STATS_HISTOGRAM_BUCKETS {
+				measured[i].buckets[bucket] = br_read_u64(&r)
 			}
 		}
 		if r.bad {

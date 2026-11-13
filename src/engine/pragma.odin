@@ -454,6 +454,9 @@ pragma_stats :: proc(store: ^Store) -> Sql_Result {
 	}
 	append_counts(&rows, "commits", stats.commits)
 	append_counts(&rows, "queries", stats.queries)
+	// A scan counts every row it visits: the number a plan is judged by.
+	append_counts(&rows, "rows_scanned", store.rows_scanned)
+	append_counts(&rows, "stream_scans", store.stream_scans)
 	bound: u64 = 1
 	for bucket in 0 ..< LATENCY_BUCKETS {
 		append_counts(&rows, fmt.aprintf("commit_us_lt_%d", bound), stats.commit_bucket[bucket])

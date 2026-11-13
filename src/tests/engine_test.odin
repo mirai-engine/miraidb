@@ -9277,7 +9277,7 @@ test_paged_index_pages :: proc(t: ^testing.T) {
 	db.store_reset_rows_scanned(store)
 	found := scalar(t, store, "SELECT id FROM doc WHERE slug = 'slug-01234'")
 	testing.expect_value(t, found.i, i64(id_for_slug[1234]))
-	testing.expect(t, db.store_rows_scanned(store) <= 4)
+	testing.expectf(t, db.store_rows_scanned(store) <= 4, "point lookup scanned %d", db.store_rows_scanned(store))
 
 	// Range scan across pages, both ends included as SQL says.
 	range_count := scalar(t, store, "SELECT count(*) FROM doc WHERE slug >= 'slug-01000' AND slug < 'slug-01100'")
@@ -9645,7 +9645,8 @@ test_analyze_and_plan_estimates :: proc(t: ^testing.T) {
 	// is taken when it exists, which is what the executor did before ANALYZE —
 	// and the estimate says 400 because nothing has measured the column yet.
 	before := run(t, store, "EXPLAIN SELECT * FROM ev WHERE amount = 42")
-	testing.expect(t, strings_contains(before.rows[0][0].s, "using index ev_amount (est. 400 rows)"))
+	testing.expect(t, strings_contains(before.rows[0][0].s, "using index ev_amount"))
+	testing.expect(t, strings_contains(before.rows[0][0].s, "est. 400 rows"))
 	db.sql_result_destroy(&before)
 
 	analyzed := run(t, store, "ANALYZE")
@@ -9655,13 +9656,15 @@ test_analyze_and_plan_estimates :: proc(t: ^testing.T) {
 	// 400 rows with 400 distinct amounts: an equality keeps one, so the index
 	// answers and the estimate says so.
 	point := run(t, store, "EXPLAIN SELECT * FROM ev WHERE amount = 42")
-	testing.expect(t, strings_contains(point.rows[0][0].s, "using index ev_amount (est. 1 rows)"))
+	testing.expect(t, strings_contains(point.rows[0][0].s, "using index ev_amount"))
+	testing.expect(t, strings_contains(point.rows[0][0].s, "est. 1 rows"))
 	db.sql_result_destroy(&point)
 
 	// Two distinct kinds over 400 rows: an equality keeps half of them on
 	// average, so collecting the ids costs more than reading the rows.
 	wide := run(t, store, "EXPLAIN SELECT * FROM ev WHERE kind = 'k0'")
-	testing.expect(t, strings_contains(wide.rows[0][0].s, "full scan, est. 200 rows"))
+	testing.expect(t, strings_contains(wide.rows[0][0].s, "full scan"))
+	testing.expect(t, strings_contains(wide.rows[0][0].s, "est. 200 rows"))
 	db.sql_result_destroy(&wide)
 
 	// The executor makes the same choice the plan prints.
@@ -9674,7 +9677,7 @@ test_analyze_and_plan_estimates :: proc(t: ^testing.T) {
 	point_rows := run(t, store, "SELECT count(*) FROM ev WHERE amount = 42")
 	testing.expect_value(t, point_rows.rows[0][0].i, i64(1))
 	db.sql_result_destroy(&point_rows)
-	testing.expect(t, db.store_rows_scanned(store) <= 4)
+	testing.expectf(t, db.store_rows_scanned(store) <= 4, "point lookup scanned %d", db.store_rows_scanned(store))
 
 	// The statistics are a file: a reopen loads them, so the plan keeps its
 	// numbers without measuring again.
@@ -9700,4 +9703,71 @@ test_analyze_and_plan_estimates :: proc(t: ^testing.T) {
 	again := run(t, reopened, "ANALYZE")
 	testing.expect_value(t, again.affected, 0)
 	db.sql_result_destroy(&again)
+}
+
+@(test)
+test_plan_reorders_a_join :: proc(t: ^testing.T) {
+	// A nested loop reads the whole inner relation per outer row, so the order of
+	// the joins decides how many rows are read. The planner picks the join that
+	// keeps few rows first, and the executor follows the plan.
+	store := fresh_db(t, "plan_join")
+	if store == nil do return
+	defer cleanup_db(store, "plan_join")
+	run(t, store, "CREATE TABLE a (id INTEGER PRIMARY KEY, name TEXT)")
+	run(t, store, "CREATE TABLE b (id INTEGER PRIMARY KEY, code INTEGER)")
+	run(t, store, "CREATE TABLE c (id INTEGER PRIMARY KEY, num INTEGER)")
+	for i in 0 ..< 10 {
+		run(t, store, fmt.tprintf("INSERT INTO a (id, name) VALUES (%d, 'a%d')", i, i))
+	}
+	// b is large and its code column has 10 distinct values: each outer row
+	// matches 100 rows, so joining it early multiplies everything after it.
+	for i in 0 ..< 1000 {
+		run(t, store, fmt.tprintf("INSERT INTO b (id, code) VALUES (%d, %d)", i, i % 10))
+	}
+	run(t, store, "INSERT INTO c (id, num) VALUES (1, 1), (2, 2)")
+	run(t, store, "ANALYZE")
+
+	plan := run(t, store, "EXPLAIN SELECT count(*) FROM a JOIN b ON a.id = b.code JOIN c ON a.id = c.num")
+	testing.expect(t, strings_contains(plan.rows[0][0].s, "scan c"))
+	joined_lines := make([dynamic]string, 0, 4)
+	defer delete(joined_lines)
+	for row in plan.rows {
+		if strings.has_prefix(row[0].s, "join ") && !strings_contains(row[0].s, "join order") {
+			append(&joined_lines, row[0].s)
+		}
+	}
+	testing.expect_value(t, len(joined_lines), 2)
+	// c keeps two rows, a ten and b a thousand: c runs first, a second (ten rows
+	// per outer row), b last, so b is scanned twice instead of once per outer row
+	// of a.
+	testing.expect(t, strings_contains(joined_lines[0], "join a "))
+	testing.expect(t, strings_contains(joined_lines[1], "join b "))
+	order_line := false
+	for row in plan.rows {
+		if strings_contains(row[0].s, "join order:") do order_line = true
+	}
+	testing.expect(t, order_line)
+	db.sql_result_destroy(&plan)
+
+	// The executor reads what the plan promised: the reordered join visits about
+	// a thousand rows, the written order about twelve thousand.
+	db.store_reset_rows_scanned(store)
+	count := scalar(t, store, "SELECT count(*) FROM a JOIN b ON a.id = b.code JOIN c ON a.id = c.num")
+	testing.expect_value(t, count.i, i64(200))
+	testing.expectf(
+		t,
+		db.store_rows_scanned(store) < 3000,
+		"the reordered join scanned %d rows",
+		db.store_rows_scanned(store),
+	)
+	db.store_reset_rows_scanned(store)
+	written := scalar(t, store, "SELECT count(*) FROM a JOIN c ON a.id = c.num JOIN b ON a.id = b.code")
+	testing.expect_value(t, written.i, i64(200))
+	testing.expect(t, db.store_rows_scanned(store) < 3000)
+
+	// A LEFT join keeps the written order: moving the null-supplying relation
+	// ahead of the join would change which rows survive.
+	left := run(t, store, "EXPLAIN SELECT count(*) FROM a LEFT JOIN b ON a.id = b.code")
+	testing.expect(t, !strings_contains(left.rows[0][0].s, "join order:"))
+	db.sql_result_destroy(&left)
 }
