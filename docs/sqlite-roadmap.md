@@ -6,9 +6,11 @@ shell. This file splits that surface into what is already in the engine, what
 can be added, and what is deliberately incompatible.
 
 **Status: the sections marked done are delivered and tested.** What remains is
-depth, not surface: an index on the full-text term column (D1), in-place page
-writes instead of a whole-file mirror (D4), the rest of the grammar (D9) and DDL
-inside one transaction (D11) — see [backlog.md](backlog.md).
+depth, not surface: the rest of the grammar (D9), an index on the full-text term
+column shape (D1 is done; a `MATCH` that a plan can narrow further is not), the
+sensitivity of the cost model to bound values (D6), and secondary indexes inside
+the page-patched `.sqlite` mirror (D4 re-encodes those tables) — see
+[backlog.md](backlog.md).
 
 ## 1. Done
 

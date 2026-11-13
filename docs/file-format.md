@@ -381,6 +381,42 @@ deleted, then closed, reopened and cleared),
 constraints, an update that moves a key, `TRUNCATE`, a reopen and a `CREATE
 INDEX` after it).
 
+## A `.sqlite` mirror, patched page by page
+
+A database opened from a `.sqlite` file keeps that file a valid SQLite database.
+The first version re-encoded the whole state after every commit; the file is now
+patched instead, which the format allows because page 1 names each table's root:
+
+    the layout is read from the file at open
+      per table: its root page, every leaf page in key order, the rowids each
+      leaf holds, and the rowid the store's rows map to (map[Row_Id]i64)
+
+    a commit writes
+      the leaf of every row it inserted, updated or deleted
+      the separator the leaf's parent stores for it, when its largest rowid moved
+      the parent page and its ancestors when a page had to split, and a new root
+      when the old one filled
+      page 1: change counter (24), page count (28), free-list head (32) and
+              count (36), version-valid-for (92)
+
+A leaf that loses its last row is unlinked from its parent and its page goes on
+the free list (a trunk page holds up to usable/4 - 2 page numbers); the next page
+a split needs comes from that list before the file grows.
+
+The pages are journalled before they move. The journal is SQLite's own rollback
+format: the eight magic bytes `d9 d5 05 f9 20 a1 63 d7`, a 28-byte header with
+the record count, the nonce, the original page count, the sector size and the
+page size, then one record per page at a sector boundary — the page number, the
+original page image and the checksum SQLite computes (every two-hundredth byte of
+the page added to the nonce). Page 1 is written last, so a torn commit leaves a
+file whose header still describes the state the journal restores. Whoever owns
+the file applies the journal and deletes it; a plain reader applies it in memory
+and leaves it alone.
+
+What the patcher cannot express is re-encoded whole: a table with no single
+INTEGER primary key, a table with a secondary index, any schema change, a file
+that carries a write-ahead log, and a tree deeper than three levels.
+
 ## Durability
 
 `store_open(..., durable = true)` opens the log and calls `fsync` after writing

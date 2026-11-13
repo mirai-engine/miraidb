@@ -36,6 +36,23 @@ honest measurement.
   rate, read cost and compaction; `scripts/bench.py --check` runs as a CI gate.
 - Durability modes: `Full` (fsync per commit), `Batched` (every 64 commits and
   on close) and `None`; the CLI exposes `--durability=full|batched|none`.
+- **A `.sqlite` file stays current, page by page.** Opening a database from a
+  `.sqlite` file reads that file's layout once and keeps it a valid SQLite
+  database: after a commit only the leaf of each changed row, the separator its
+  parent stores and page 1 are rewritten — three pages, 12 KiB, at 10k, 100k and
+  250k rows, where re-encoding the state would write 172 KiB, 1.8 MB and 4.8 MB.
+  A full page splits into as many pages as it needs, a leaf that loses its last
+  row is unlinked and its page goes back on the free list, and a commit that the
+  patcher cannot express (a table without a single INTEGER primary key, a
+  secondary index, a schema change, a write-ahead log) re-encodes the file
+  instead. `scripts/mirror_cost.py --check` is the gate and it verifies the
+  result with real `sqlite3`; `PRAGMA stats` reports `mirror_pages` and
+  `mirror_rewrites`, and `miraidb sql --mirror-report` prints them.
+- An interrupted mirror commit is rolled back, not guessed at: the pages are
+  journalled in SQLite's own rollback-journal format (magic, nonce, per-page
+  checksum, sector-padded records), page 1 is written last, and whoever owns the
+  file applies the journal and deletes it. A plain reader applies it in memory
+  and leaves it on disk.
 - Replay on open, torn-tail detection and truncation.
 - Log compaction (`store_compact`, `miraidb compact`) with continuous commit
   sequences; compaction also writes a snapshot.
@@ -94,7 +111,7 @@ honest measurement.
   it is what "green" means.
 - `miraidb create | sql | repl | inspect | check | compact | bench | bench-read`.
 - `scripts/build.py` builds both binaries and runs the suite.
-- 169 integration tests covering CRUD, recovery, constraints, transactions,
+- 214 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.

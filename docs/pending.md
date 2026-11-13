@@ -49,6 +49,7 @@ python3 scripts/lock_smoke.py                              # two processes, one 
 python3 scripts/bench.py --check                           # against benchmarks/baseline.json
 python3 scripts/page_rss.py --check                        # the pool bounds a read
 python3 scripts/plan_check.py                              # 6 plan checks
+python3 scripts/mirror_cost.py --check --text 200          # a commit is a patch
 python3 scripts/roadmap.py --check                         # 100/100
 
 # The DLL smokes need an interpreter that can load the DLL; when it is not on
@@ -62,9 +63,10 @@ for pkg in src/engine src/cli src/capi src/sqlite_compat src/server src/tests; d
 done
 ```
 
-`scripts/ci.py` runs those twenty times over (build, the suite, conformance, the
-shell, the benchmark baseline, the package manifest, page memory, plan
-regression, five DLL smokes, five `-vet` packages and the roadmap check).
+`scripts/ci.py` runs those twenty-one times over (build, the suite, conformance,
+the shell, the benchmark baseline, the package manifest, page memory, plan
+regression, mirror cost, five DLL smokes, five `-vet` packages and the roadmap
+check).
 
 The optional harnesses (`python3 scripts/fuzz.py --statements 1000 --seed 1`,
 `python3 scripts/soak.py --seconds 30`) must be run before claiming anything in
@@ -215,7 +217,7 @@ so a tool that sets them does not fail.
 | 18 | WAL and rollback-journal replay on import | 3 | done: frames overlaid by salt and commit size, hot journal restored first |
 | 19 | Deterministic export | 2 | done: two exports of one state are byte-identical, also after replay; an export has no free pages |
 | 20 | Native FTS and R-Tree | 2 | done: FTS5 (`MATCH` with `OR`/`NOT`/conjunctions, index maintained on every write, survives reopen) and R-Tree (`rtree`/`rtree_i32` with min/max pairs, overlap answered by range predicates) |
-| 21 | SQLite pages as an alternative storage backend | 2 | done as a live mirror: a database opened from a `.sqlite` file writes the whole state back after every commit, so any SQLite driver reads the committed rows and `PRAGMA database_list` names the file; the commit log stays the truth (O(state) per commit, documented) |
+| 21 | SQLite pages as an alternative storage backend | 2 | done as a live mirror, patched page by page: a database opened from a `.sqlite` file rewrites only the leaf of each changed row, its separator and the header (three pages per commit at any size), so any SQLite driver reads the committed rows and `PRAGMA database_list` names the file; the commit log stays the truth, splits and free-list reuse are covered by tests, and an interrupted commit is rolled back from a journal in SQLite's format |
 
 ### Delivered in #20 (for the record): FTS5
 
@@ -268,21 +270,25 @@ Honest gaps:
 
 ### Delivered in #21 (for the record)
 
-The page backend shipped as the **live mirror**, the first version the plan
-called for: `embed_open` on a `.sqlite` file imports it into memory **and sets
-`store.sqlite_mirror`**, so after a commit — once the write lock is released —
-the store writes the whole state back with `sqlite_file_write`. The file stays a
-valid SQLite database: a different driver opens it and sees the committed rows,
-and `PRAGMA database_list` reports it as `main`.
+The page backend shipped as the **live mirror**: `embed_open` on a `.sqlite` file
+imports it into memory **and sets `store.sqlite_mirror`**, so after a commit —
+once the write lock is released — the store brings the file up to date. It first
+rewrote the whole state with `sqlite_file_write`; the page patcher in
+`src/engine/sqlite_mirror.odin` replaced that (`docs/backlog.md` D4), so a commit
+now writes the leaf of each changed row, its separator and the header. The file
+stays a valid SQLite database: a different driver opens it and sees the committed
+rows, and `PRAGMA database_list` reports it as `main`.
 
 - `store_set_sqlite_mirror` / `store_sqlite_mirror_flush` live in `store.odin`;
   the flush takes the read lock, so it runs after `tx_discard` and never inside
   the commit's write section.
 - A failed mirror write is **reported** (`last_error`) and never fails the commit:
   the log is the truth, and a mirror is an export.
-- Cost, stated honestly: O(state) per commit. That is fine for a dual-format
-  database a tool inspects and slow for a hot one; the in-place page allocator
-  (free list, page-aligned writes) remains future work and is not claimed.
+- Cost: three pages (12 KiB) per commit at any table size, measured by
+  `scripts/mirror_cost.py --check`. What the patcher cannot express — a table
+  with no single INTEGER primary key, a secondary index, a schema change, a
+  write-ahead log, a tree deeper than three levels — re-encodes the file, which
+  is correct and slow; patching those is the remaining work.
 - Test: `test_sqlite_live_mirror` — export a database, `embed_open` it, insert,
   close, then reopen the file with the engine's own SQLite reader and find both
   rows (and the table name in `sqlite_master`).
@@ -572,8 +578,9 @@ acceptance criteria, current cost and effort; this list is the short version.
   (backlog D1, D11)
 - A spatial table stores its boxes as columns: overlap is answered by range
   predicates, which is a scan when the query has no bound. (backlog D2)
-- The `.sqlite` mirror rewrites the whole state after every commit: O(state) per
-  commit, correct and inspectable, expensive for a large database. (backlog D4)
+- The `.sqlite` mirror patches the pages a commit touched, but a table with a
+  secondary index still re-encodes the file, because the index b-trees are not
+  patched yet. (backlog D4)
 - Indexes are rebuilt in memory when a database opens; the log has no index
   pages. Joins are nested loops in the order written; there is no cost model or
   `ANALYZE` statistics. (backlog D5, D6)

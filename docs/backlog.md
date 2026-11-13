@@ -206,32 +206,52 @@ serves two clients with independent subscriptions from one owner.
 
 **Not claimed today.** "Multi-process access" beyond refusing a second writer.
 
-## D4 — A page-oriented backend
+## D4 — A page-oriented backend: **done**
 
-**Now.** A database opened from a `.sqlite` file is mirrored back after every
-commit by `sqlite_file_write`: the whole state is re-encoded. The engine has what
-this needs on the other side already: D17 keeps the rows in paged files and D5
-keeps the indexes in paged B+trees, so the pages a commit touched are known when
-the commit is durable.
+**Now.** `src/engine/sqlite_mirror.odin`. A database opened from a `.sqlite` file
+reads the file's layout once — for every table, the leaf pages its b-tree is made
+of, the rowids each leaf holds, and the rowid the store's rows map to — and after
+a commit it rewrites only what changed: the leaf page of each row the commit
+inserted, updated or deleted, the separator that leaf's parent stores for it, the
+parent page and its ancestors when a page has to split, and page 1, whose header
+carries the change counter, the page count and the free list. A full page splits
+into as many pages as its cells need; a leaf that loses its last row is unlinked
+and put on the free list, and the next growth takes that page back instead of
+making the file longer.
 
-**Cost.** O(state) per commit. Correct and inspectable by any SQLite driver,
-expensive for a large database with small transactions.
+**Cost.** Three pages (12 KiB) per commit, whatever the table holds, because a
+commit touches one leaf, its parent and the header: `scripts/mirror_cost.py
+--check` builds a 1828 KiB table and asserts three commits write less than the
+file, and prints the numbers — 12 KiB per commit at 10k, 100k and 250k rows,
+where re-encoding would write 172 KiB, 1.8 MB and 4.8 MB.
 
-**Where to start.** Keep a map from the mirrored file's pages to the tables and
-indexes that wrote them, filled during `sqlite_file_write`'s first full export,
-then on each commit re-encode only the rows of the pages the commit dirtied
-(`Table.dirty_pages`, or a per-commit list of `{table, row_id}` for the memory
-backend). The file stays readable between commits because the header is written
-last, exactly like the page files. Measure with `bench.py`: bytes written per
-commit at 1k and 100k rows, and the time it takes; the gate is that a
-one-row commit writes a bounded number of pages, not a fraction of the state.
+**How it keeps the promise under a crash.** Before a page moves, its original
+goes into a rollback journal in SQLite's own format (magic, nonce, per-page
+checksum, sector-padded records); the data pages are written, then page 1, then
+the journal is deleted. An engine or a SQLite that finds the journal restores the
+pages and removes it, so an interrupted commit leaves the previous state readable
+(`test_mirror_survives_a_torn_commit`). Recovery belongs to the file's owner: a
+plain reader applies a hot journal in memory and leaves it on disk.
 
-**Done when.** Pages are allocated from the free list and written in place, a
-commit writes only the touched pages plus a header, `PRAGMA page_count` and the
-freelist stay accurate between commits, and an interrupted commit leaves the
-previous state readable (a torn-write test).
+**What it re-encodes instead.** A table with no single INTEGER primary key (its
+rowid would not be stable), a table with a secondary index (the index b-trees are
+not patched yet, and a stale index is worse than a slow commit), any schema
+change, a file with a write-ahead log, and a tree deeper than three levels. The
+fallback is `sqlite_file_write` plus a fresh map, so a commit never fails over it.
 
-**Not claimed today.** "SQLite as a storage backend" — it is a live export.
+**Bugs this cost.** (1) `direct` — the check for "the parent is the root" was
+written as "the parent's first child is the first leaf", which is also true of the
+left-most interior page of a three-level tree: deleting a row on a 250k-row table
+then tried to pack 1183 children into one page and re-encoded the file. It is
+`len(chain) == 1` now. (2) An empty leaf breaks SQLite's cursor: a delete that
+emptied a page left it in the tree, our own reader accepted it, and SQLite said
+`database disk image is malformed`. Emptying a leaf now unlinks and frees it.
+(3) The journal was written after the header was patched, so a rollback restored
+the new header; page 1's original is captured before anything is staged.
+
+**Not claimed today.** "SQLite as a storage backend" — it is a mirror: the commit
+log is the truth, a secondary index re-encodes its table, and writing the file
+with another driver while the engine holds it open is not detected.
 
 ## D5 — Index keys in pages: **done** (a trusted open is D18b)
 

@@ -25,6 +25,16 @@
   rows per outer row first, and every ON condition travels with the step that
   completes the relations it names, so a relation may run before the join it was
   written with. LEFT joins, `AS OF` and table functions keep the written order.
+- A database opened from a `.sqlite` file is still kept a valid SQLite database,
+  but a commit now patches the pages it touched instead of re-encoding the whole
+  file: the leaf of every changed row, the separator its parent stores and the
+  header — three pages, 12 KiB, at 10k, 100k and 250k rows, where the old export
+  wrote 172 KiB, 1.8 MB and 4.8 MB. Splits, empty-leaf unlink, free-list reuse, a
+  new root when one fills, and a rollback journal in SQLite's own format (so an
+  interrupted commit is undone by this engine or by SQLite) are covered by tests;
+  `scripts/mirror_cost.py --check` is the gate and verifies the file with real
+  `sqlite3`. `PRAGMA stats` reports `mirror_pages` and `mirror_rewrites`, and
+  `miraidb sql --mirror-report` prints them.
 - `NATURAL`, `RIGHT` and `FULL` joins are refused at parse time. They used to be
   read as an alias for the preceding table, which silently turned the first into
   a cross join and the other two into inner joins — a wrong answer that returned

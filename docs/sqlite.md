@@ -115,11 +115,16 @@ full-table scan and an indexed lookup. All nine pass.
 ## A live `.sqlite` file
 
 Opening a database with `embed_open` (or any path whose magic bytes are SQLite)
-imports it into memory and remembers the file: **every later commit writes the
-whole state back to it**, so the file stays a SQLite database another driver can
-read, and `PRAGMA database_list` names it. The commit log is still the truth; the
-mirror is a materialized export, O(state) per commit. A failed mirror write is
-reported through `last_error` and never fails the commit.
+imports it into memory and remembers the file: **every later commit patches that
+file**, so it stays a SQLite database another driver can read and
+`PRAGMA database_list` names it. Only the pages a commit changed are rewritten —
+the leaf of each changed row, the separator its parent stores, and page 1 — three
+pages (12 KiB) at any table size; `docs/file-format.md` describes the layout, the
+free list and the rollback journal that makes a torn commit harmless. The commit
+log is still the truth. A table with a secondary index, a schema change, a file
+with a write-ahead log and a tree deeper than three levels re-encode the whole
+file instead (`scripts/mirror_cost.py --check` measures it). A failed mirror write
+is reported through `last_error` and never fails the commit.
 
 ## Export determinism
 

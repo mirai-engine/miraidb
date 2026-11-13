@@ -2,9 +2,11 @@
 
 **An embeddable relational database runtime written in Odin.**
 
-> Status: embedded engine working (`M1`). Server, snapshots and SQLite
-> compatibility are design targets, not shipped features. The interfaces below
-> are the ones the current code implements unless marked otherwise.
+> Status: the engine, the server, snapshots, compaction, the SQLite reader and
+> writer, the C ABI and the Python SDK are implemented and covered by tests
+> (`docs/status.md` is the honest measurement; `docs/features.md` is the closed
+> 94-row parity matrix). What is deliberately not claimed is listed at the end of
+> that document. The interfaces below are the ones the code implements.
 
 miraidb is a small database engine meant to be linked into a program. It gives you:
 
@@ -238,38 +240,39 @@ host.on_update = proc(ctx: rawptr, update: ^db.Subscription_Update) {
 |---|---|
 | M1 | Embedded engine: tables, transactions, commit log, SQL, reducers, subscriptions **(done)** |
 | M2 | Ordered and range-scan indexes, `CREATE INDEX`, bind parameters, `HAVING`, log compaction **(done)** |
-| M3 | Snapshots for fast startup, join planning (index nested loops), more functions |
-| M4 | Portable files: SQLite import/export, then a SQLite-compatible VFS adapter |
-| M5 | Hosted mode: `miraidbd`, authentication, connection-scoped authorization |
-| M6 | Retries with backoff, request timeouts, connection limits |
-| M7 | Module ABI: trusted native Odin extensions, then sandboxed WASM modules |
-| M8 | Hardening: statement fuzzing and a soak harness (`scripts/fuzz.py`, `scripts/soak.py`), fault injection at every write of a workload (`Fault_Vfs`), latency histograms, `PRAGMA integrity_check` and `foreign_key_check`, transport caps, opt-in background compaction, a benchmark gate against a recorded baseline; process-level load tests remain |
+| M3 | Snapshots for fast startup **(done)**, cost-based join planning and `ANALYZE` statistics **(done, D6)**, the language surface of `docs/sql.md` **(done; what is left is `docs/roadmap.md`)** |
+| M4 | Portable files: SQLite import/export **(done)**, a `.sqlite` file kept current by patching its pages **(done, D4)**, the `sqlite3_*` facade **(done, `bin/sqlite3_miraidb.dll`)** |
+| M5 | Hosted mode: `miraidb-server` over HTTP/WebSocket/Postgres, authentication, connection-scoped authorization **(done)** |
+| M6 | Retries with backoff, request timeouts, connection limits **(transport caps done; retry policy and per-route timeouts remain, `docs/backlog.md` D15)** |
+| M7 | Module ABI: trusted native Odin extensions **(done out of process: `LOAD EXTENSION … AT 'host:port'`)**, sandboxed modules with enforced memory and time **(remaining, D12c)** |
+| M8 | Hardening: statement fuzzing and a soak harness (`scripts/fuzz.py`, `scripts/soak.py`), fault injection at every write of a workload (`Fault_Vfs`), latency histograms, `PRAGMA integrity_check` and `foreign_key_check`, transport caps, opt-in background compaction, a benchmark gate against a recorded baseline **(done)**; process-level load tests and a readable leak report remain |
 
 Snapshots and compaction came before the network layer on purpose: without
 them, recovery time grows with the log and range queries scan the table.
 
-## Not implemented: a second opener, and replication
+## Not implemented: a second writer, and replication
 
-One process owns one log. A second process on the same directory is refused with
+One process **owns** one log. A second writer on the same directory is refused with
 `locked` and the owner's pid: an OS lock on `<directory>/lock` is taken on open and
 released on close or death, so nothing is silently corrupted.
 
-A second process can still **use** the database through the owner:
+A second process can **read** while the first one writes. The lock file has two
+bytes — the writer's, exclusive, and a reader's, shared by readers and the writer —
+so `--read-only` (or `Store_Options.read_only`) opens beside a live writer, answers
+from a replay of the log at open, refuses every mutation and makes a compaction
+wait. The writer, in turn, opens its page files without replaying them: the
+catalog names the sequence, every page file carries it, and a mismatch means a
+replay, never a wrong answer (`docs/backlog.md` D18b).
+
+A second process can also **use** the database through the owner:
 `miraidb-server` serves the wire protocol over HTTP, WebSocket frames and
 Postgres, with per-connection subscriptions and byte budgets
-(`scripts/broker_smoke.py` proves it with two processes). What is missing is
-opening the directory *directly* beside a writer, which needs the page files to be
-trusted without a replay (D18b). Tables can already live in page files: open a
-store with `--paged` (or `Store_Options.paged_tables`) and a scan streams them
-through a bounded buffer pool, with each index a B+tree of pages beside them.
+(`scripts/broker_smoke.py` proves it with two processes).
 
-A second process can **read** the same database while the first one writes:
-`--read-only` (or `Store_Options.read_only`) takes the shared side of the lock,
-answers from a replay of the log at open, refuses writes, and makes a compaction
-wait. There is no follower, no log shipping and no failover. The replay path, the
-segmented log and the wire layer are the pieces a follower would reuse, and
-`docs/backlog.md` (D14) carries the plan. Everything else the engine
-does not do is depth, not absence: see `docs/status.md`.
+What is missing is a **follower**: no log shipping, no failover, no multi-writer.
+The replay path, the segmented log and the wire layer are the pieces a follower
+would reuse, and `docs/backlog.md` (D14) carries the plan. Everything else the
+engine does not do is depth, not absence: see `docs/status.md`.
 
 ## Data model and limits
 
