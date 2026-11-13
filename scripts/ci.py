@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Run every gate in one command: build, tests, conformance, smokes, vet, roadmap.
+"""Run every gate in one command: build, tests, conformance, smokes, vet, docs.
 
     python3 scripts/ci.py
     python3 scripts/ci.py --skip-dll          # no Windows Python available
     python3 scripts/ci.py --odin /path/to/odin --windows-python /path/to/python.exe
+    python3 scripts/ci.py --list              # print the gate names and exit
 
 Each gate is reported on its own line with its duration; the run keeps going
 after a failure so one pass shows everything that is wrong, and the exit code is
@@ -55,17 +56,8 @@ def tail(text: str, lines: int = 6) -> str:
     return "\n".join(text.splitlines()[-lines:])
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--odin", default=os.environ.get("ODIN", DEFAULT_ODIN))
-    parser.add_argument("--windows-python", default=DEFAULT_WINDOWS_PYTHON)
-    parser.add_argument("--skip-dll", action="store_true", help="skip the DLL smokes")
-    parser.add_argument("--skip-build", action="store_true", help="reuse the existing binaries")
-    args = parser.parse_args()
-
-    if not os.path.exists(args.odin):
-        print(f"ci: odin not found at {args.odin}; pass --odin", file=sys.stderr)
-        return 2
+def build_gates(args: argparse.Namespace) -> list[Gate]:
+    """The gates, in the order they run. `--list` prints them; docs_check.py counts them."""
     odin_env = {"ODIN": args.odin}
     gates: list[Gate] = []
     if not args.skip_build:
@@ -98,7 +90,10 @@ def main() -> int:
         )
     )
     if not args.skip_dll:
-        if os.path.exists(args.windows_python):
+        # --list enumerates every gate, even when this machine cannot run the DLL
+        # smokes, so the count docs_check.py compares against does not depend on
+        # where it runs.
+        if args.list or os.path.exists(args.windows_python):
             gates.append(Gate("C ABI smoke", [args.windows_python, "scripts/capi_smoke.py"]))
             gates.append(
                 Gate("sqlite3_* smoke", [args.windows_python, "scripts/sqlite_abi_smoke.py"])
@@ -118,8 +113,29 @@ def main() -> int:
         gates.append(
             Gate(f"vet {package}", [args.odin, "check", package, "-no-entry-point", "-vet"])
         )
+    gates.append(Gate("documentation consistency", [sys.executable, "scripts/docs_check.py"]))
     gates.append(Gate("roadmap is consistent", [sys.executable, "scripts/roadmap.py", "--check"]))
+    return gates
 
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--odin", default=os.environ.get("ODIN", DEFAULT_ODIN))
+    parser.add_argument("--windows-python", default=DEFAULT_WINDOWS_PYTHON)
+    parser.add_argument("--skip-dll", action="store_true", help="skip the DLL smokes")
+    parser.add_argument("--skip-build", action="store_true", help="reuse the existing binaries")
+    parser.add_argument("--list", action="store_true", help="print the gate names and exit")
+    args = parser.parse_args()
+
+    if args.list:
+        for gate in build_gates(args):
+            print(gate.name)
+        return 0
+    if not os.path.exists(args.odin):
+        print(f"ci: odin not found at {args.odin}; pass --odin", file=sys.stderr)
+        return 2
+
+    gates = build_gates(args)
     failed: list[str] = []
     print(f"ci: {len(gates)} gates\n")
     for gate in gates:

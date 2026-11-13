@@ -247,6 +247,25 @@ Everything above is covered by the test suite; `docs/status.md` records the
 measurements and what is deliberately not claimed, and `docs/sql.md` is the SQL
 reference.
 
+## Documentation
+
+Design and reference:
+[architecture](docs/architecture.md) (modules, transactions, the value layout
+link below), [file-format](docs/file-format.md) (the log, snapshots, pages and
+the `.sqlite` mirror), [value-layout](docs/value-layout.md) (what a `Value` and
+a `Row` carry), [sql.md](docs/sql.md) (the SQL reference) and the SQLite
+compatibility documents: [sqlite.md](docs/sqlite.md) (what is done, partial or
+missing), [sqlite-roadmap.md](docs/sqlite-roadmap.md) and
+[sqlite-inventory.md](docs/sqlite-inventory.md) (generated from the reference).
+
+Status and planning:
+[status.md](docs/status.md) (measurements, what is deliberately not claimed),
+[features.md](docs/features.md) (the parity matrix, 94 rows),
+[roadmap.md](docs/roadmap.md) (the pending order),
+[backlog.md](docs/backlog.md) (the depth work, with cost) and
+[pending.md](docs/pending.md) (the weighted closing plan `roadmap.py`
+regenerates).
+
 ## Roadmap
 
 | Milestone | Deliverable |

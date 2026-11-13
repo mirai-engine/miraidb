@@ -148,7 +148,7 @@ after it, apply through `commitlog`, expose the last applied sequence.
 | **Address sanitizer** over CLI, soak and conformance — *partly done* | Memory bugs have been the real risk; bounds and stack are covered here, the heap needs the Linux toolchain | 1 round per phase | #2 |
 | **Fault injection** (D8) | Proves no third state after a failed write | S, then extended | #3 |
 | **Benchmark with thresholds** — *done* | Bytes per row within 10%; timings under a 3x catastrophe guard, because a shared machine cannot promise 10% (the 10% time rule is measured by hand with `--record`) | 1 day | #4 |
-| **Page memory** — *done* | `scripts/page_rss.py --check` reads a table far larger than the pool and bounds what the statement adds; `scripts/plan_check.py` guards the plans a measured fixture must produce; 21 gates in total | 1 day | #8 |
+| **Page memory** — *done* | `scripts/page_rss.py --check` reads a table far larger than the pool and bounds what the statement adds; `scripts/plan_check.py` guards the plans a measured fixture must produce; 22 gates in total | 1 day | #8 |
 | **CI on Linux and macOS** | Locking and the VFS are per-OS | 2–3 days | #13 |
 | **Release packaging** — *done* | `scripts/package.py --check`, one archive per target with the version the library reports | 2–3 days | #23 |
 | **Auth review** | Tokens, subscriptions, byte and work budgets under attack | 1 day | #24 |
