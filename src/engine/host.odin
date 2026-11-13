@@ -680,7 +680,6 @@ Join_Walk :: struct {
 	expanded: []^Expr,
 	tables:   []^Table,
 	aliases:  []string,
-	rows:     [][]Row,
 	sources:  []Source,
 	// fixed is the source that holds the row the commit changed, or -1 when the
 	// enumeration walks every table (the rebuild).
@@ -696,20 +695,21 @@ host_join_walk :: proc(walk: ^Join_Walk, level: int) -> bool {
 	if level == len(walk.tables) {
 		return host_join_emit(walk)
 	}
+	table := walk.tables[level]
+	alias := walk.aliases[level]
 	if level == walk.fixed {
-		table := walk.tables[level]
 		row, exists := table.rows[walk.fixed_id]
-		if !exists do return true
-		walk.sources[level] = Source{table = table, row = row, alias = walk.aliases[level]}
+		if !exists || row.deleted_seq != 0 do return true
+		walk.sources[level] = Source{table = table, row = row, alias = alias}
 		return host_join_walk(walk, level + 1)
 	}
-	for row in walk.rows[level] {
+	// The table cannot move under this transaction: a commit that has to change
+	// a table a reader holds copies it first, so walking the live rows is stable
+	// and costs no copy of its own.
+	for _, row in table.rows {
+		if row.deleted_seq != 0 do continue
 		if walk.tx.store.cancelled do return false
-		walk.sources[level] = Source{
-			table = walk.tables[level],
-			row   = row,
-			alias = walk.aliases[level],
-		}
+		walk.sources[level] = Source{table = table, row = row, alias = alias}
 		if !host_join_walk(walk, level + 1) do return false
 	}
 	return true
@@ -1171,18 +1171,14 @@ host_join_prepare :: proc(host: ^Host, entry: ^Subscription_Query) -> bool {
 	if !is_select do return false
 	source_count := 1 + len(stmt.joins)
 	tables := make([]^Table, source_count)
-	rows := make([][]Row, source_count)
 	aliases := make([]string, source_count)
 	defer {
-		// rows holds what tx_collect filled, which lives in the transaction
-		// arena: freeing it here would free memory this proc never allocated.
-		delete(rows)
 		delete(tables)
 		delete(aliases)
 	}
 	tx := tx_begin_read(host.store)
 	defer tx_end(tx)
-	if !host_join_tables(tx, stmt, tables, rows, aliases) do return false
+	if !host_join_tables(tx, stmt, tables, aliases) do return false
 	star := make([]Source, source_count, tx.alloc)
 	defer delete(star, tx.alloc)
 	for table, i in tables do star[i] = Source{table = table, alias = aliases[i]}
@@ -1192,7 +1188,7 @@ host_join_prepare :: proc(host: ^Host, entry: ^Subscription_Query) -> bool {
 		for column in columns do delete(column, tx.alloc)
 		delete(columns)
 	}
-	return host_join_rebuild(host, tx, entry, stmt, tables, aliases, rows, expanded)
+	return host_join_rebuild(host, tx, entry, stmt, tables, aliases, expanded)
 }
 
 // host_join_rebuild derives the tuple index and the row cache from scratch. It
@@ -1206,7 +1202,6 @@ host_join_rebuild :: proc(
 	stmt: Select_Stmt,
 	tables: []^Table,
 	aliases: []string,
-	rows: [][]Row,
 	expanded: []^Expr,
 ) -> bool {
 	for _, row in entry.rows do free_values(row)
@@ -1229,7 +1224,6 @@ host_join_rebuild :: proc(
 		expanded = expanded,
 		tables   = tables,
 		aliases  = aliases,
-		rows     = rows,
 		sources  = sources,
 		fixed    = -1,
 		inserts  = nil,
@@ -1255,14 +1249,14 @@ host_query_is_incremental_join :: proc(entry: ^Subscription_Query) -> bool {
 	return true
 }
 
-// host_join_tables resolves the sources of a join query and collects their live
-// rows once per commit. It reports false when a source is not a plain table.
+// host_join_tables resolves the sources of a join query. It reports false when a
+// source is not a plain in-memory table: the incremental path walks `table.rows`,
+// which a paged table does not keep.
 @(private)
 host_join_tables :: proc(
 	tx: ^Tx,
 	stmt: Select_Stmt,
 	tables: []^Table,
-	rows: [][]Row,
 	aliases: []string,
 ) -> bool {
 	for join in stmt.joins {
@@ -1273,15 +1267,11 @@ host_join_tables :: proc(
 		alias := index == 0 ? stmt.from.alias : stmt.joins[index - 1].table.alias
 		table, table_err := tx_table(tx, name)
 		if table_err.kind != .None do return false
+		if table.paged != nil do return false
 		tables[index] = table
 		alias_text := alias
 		if len(alias_text) == 0 do alias_text = name
 		aliases[index] = alias_text
-		list: [dynamic]Row
-		if collect_err := tx_collect(tx, name, &list); collect_err.kind != .None {
-			return false
-		}
-		rows[index] = list[:]
 	}
 	return true
 }
@@ -1300,18 +1290,14 @@ host_apply_incremental_join :: proc(
 	if !is_select || !entry.join || !host_query_is_incremental_join(entry) do return false
 	source_count := 1 + len(stmt.joins)
 	tables := make([]^Table, source_count)
-	rows := make([][]Row, source_count)
 	aliases := make([]string, source_count)
 	defer {
-		// rows holds what tx_collect filled, which lives in the transaction
-		// arena: freeing it here would free memory this proc never allocated.
-		delete(rows)
 		delete(tables)
 		delete(aliases)
 	}
 	tx := tx_begin_read(host.store)
 	defer tx_end(tx)
-	if !host_join_tables(tx, stmt, tables, rows, aliases) do return false
+	if !host_join_tables(tx, stmt, tables, aliases) do return false
 	// Row policies and views need the full evaluation.
 	for name_index in 0 ..< source_count {
 		name := name_index == 0 ? stmt.from.name : stmt.joins[name_index - 1].table.name
@@ -1364,8 +1350,7 @@ host_apply_incremental_join :: proc(
 				expanded = expanded,
 				tables   = tables,
 				aliases  = aliases,
-				rows     = rows,
-				sources  = sources,
+						sources  = sources,
 				fixed    = changed,
 				fixed_id = op.row_id,
 				inserts  = &inserts,
