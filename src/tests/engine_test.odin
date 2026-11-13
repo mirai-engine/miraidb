@@ -10114,3 +10114,37 @@ test_plan_reorders_a_join :: proc(t: ^testing.T) {
 	testing.expect(t, !strings_contains(left.rows[0][0].s, "join order:"))
 	db.sql_result_destroy(&left)
 }
+
+@(test)
+test_in_and_not_in_with_null :: proc(t: ^testing.T) {
+	// SQL three-valued logic: a NULL in the list makes a non-match unknown, so
+	// neither IN nor NOT IN answers TRUE for a row it did not find. Skipping the
+	// NULL instead turns NOT IN into "every row that is not equal", which is a
+	// wrong answer and not a missing feature.
+	store := fresh_db(t, "in_null")
+	if store == nil do return
+	defer cleanup_db(store, "in_null")
+
+	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+	run(t, store, "INSERT INTO t VALUES (1, 1), (2, 2), (3, NULL)")
+
+	testing.expect_value(t, scalar(t, store, "SELECT 2 IN (1, NULL)").kind, db.Value_Kind.Null)
+	testing.expect_value(t, scalar(t, store, "SELECT 2 NOT IN (1, NULL)").kind, db.Value_Kind.Null)
+	testing.expect_value(t, scalar(t, store, "SELECT 1 IN (1, NULL)").b, true)
+	testing.expect_value(t, scalar(t, store, "SELECT 1 NOT IN (1, NULL)").b, false)
+	testing.expect_value(t, scalar(t, store, "SELECT 2 IN (1, 2)").b, true)
+	testing.expect_value(t, scalar(t, store, "SELECT 2 NOT IN (1, 2)").b, false)
+	testing.expect_value(t, scalar(t, store, "SELECT 2 IN (1, 3)").b, false)
+	testing.expect_value(t, scalar(t, store, "SELECT 2 NOT IN (1, 3)").b, true)
+
+	// WHERE keeps only what is TRUE, so an unknown never becomes a row.
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t WHERE v NOT IN (1, NULL)").i, i64(0))
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t WHERE v NOT IN (1)").i, i64(1))
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t WHERE v IN (1, NULL)").i, i64(1))
+
+	// The subquery form follows the same rule.
+	testing.expect_value(t, scalar(t, store, "SELECT 2 IN (SELECT NULL)").kind, db.Value_Kind.Null)
+	testing.expect_value(t, scalar(t, store, "SELECT 2 NOT IN (SELECT NULL)").kind, db.Value_Kind.Null)
+	testing.expect_value(t, scalar(t, store, "SELECT 1 IN (SELECT v FROM t WHERE v = 1)").b, true)
+	testing.expect_value(t, scalar(t, store, "SELECT 2 IN (SELECT v FROM t WHERE v = 1)").b, false)
+}

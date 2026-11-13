@@ -2800,26 +2800,38 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 			if sub_err.kind != .None do return {}, sub_err
 			defer sql_result_destroy(&sub)
 			found := false
+			unknown := false
 			for row in sub.rows {
 				if len(row) == 0 do continue
-				if row[0].kind == .Null do continue
+				if row[0].kind == .Null {
+					unknown = true
+					continue
+				}
 				if value_equal(operand, row[0]) {
 					found = true
 					break
 				}
 			}
+			// A NULL in the set makes a non-match unknown, not false: neither
+			// IN nor NOT IN can answer TRUE for a row it did not find.
+			if !found && unknown do return value_null(), ERROR_NONE
 			return value_bool(e.negated ? !found : found), ERROR_NONE
 		}
 		found := false
+		unknown := false
 		for item in e.items {
 			value, item_err := eval_expr(ctx, item)
 			if item_err.kind != .None do return {}, item_err
-			if value.kind == .Null do continue
+			if value.kind == .Null {
+				unknown = true
+				continue
+			}
 			if value_equal(operand, value) {
 				found = true
 				break
 			}
 		}
+		if !found && unknown do return value_null(), ERROR_NONE
 		return value_bool(e.negated ? !found : found), ERROR_NONE
 	case Call_Expr:
 		return eval_call(ctx, e)

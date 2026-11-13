@@ -223,6 +223,9 @@ rejects `ALICE` beside `Alice` and `WHERE name = 'ALICE'` still uses the index.
   `ESCAPE 'c'` to make the next wildcard literal.
 - Boolean `AND`, `OR`, `NOT` with SQL three-valued logic: `NULL` propagates
   through comparisons, `WHERE` treats `NULL` as false.
+- `[NOT] IN` follows the same rule: a `NULL` in the list (or in the subquery)
+  makes a non-match unknown, so `x NOT IN (1, NULL)` returns no row unless
+  `x = 1`, rather than every row whose value is not 1.
 - `CAST(expr AS type)`.
 
 ## Functions
