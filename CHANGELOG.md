@@ -32,6 +32,12 @@
   `FLOAT` key, a paged table) falls back to the full evaluation.
 - A join subscription walks the tables it reads instead of copying every row of
   them into the transaction arena, which was 80 bytes a row per commit.
+- `EXPLAIN` ends with the age of the numbers it priced the plan with:
+  `note: statistics measured at commit N, data at commit M`, or a note that nothing
+  was ever measured, so an estimate never passes for a measurement.
+- A result row now always owns its text. `EXPLAIN`, `DESCRIBE` and `SHOW` handed a
+  read-only literal to a caller that frees what it gets, which the debug allocator
+  reported as a bad free (and which could abort a release build on Windows).
 - A read transaction copies nothing: it takes one reference per table, and a
   commit that has to change a table a reader holds copies that table first, so
   the cost is per written table and only while a reader is open. Opening a read

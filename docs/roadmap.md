@@ -19,7 +19,7 @@ releases is worth shipping.
 
 | # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
-| 1 | **D6 — the planner's remaining gaps** | The join delta is done: an equi-join is indexed by its key and a commit probes the matches. What is left is the pricing: probe an index for the joined side, serve `ORDER BY` from an index, calibrate the cost constants, let the statistics announce staleness (`analyzed_seq` against `commit_seq`), consult the histogram for a bound value, estimate a view in `FROM`, and let the subscription path use the planned order. | L | — |
+| 1 | **D6 — the planner's remaining gaps** | The join delta is done: an equi-join is indexed by its key and a commit probes the matches. What is left is the pricing: probe an index for the joined side, serve `ORDER BY` from an index, calibrate the cost constants, consult the histogram for a bound value, estimate a view in `FROM`, and let the subscription path use the planned order. `EXPLAIN` already announces stale statistics with both sequences (`test_explain_announces_stale_statistics`). | L | — |
 | 2 | **D9 — the rest of the grammar** | `RANGE`/`GROUPS` frames, windows beside `GROUP BY`, `BEFORE` triggers, `ALTER` type changes, more collations, user functions. | L | — |
 | 3 | **ASAN pass** over the CLI, soak and conformance — *partly done* | Bounds and stack are covered today. Odin's heap allocator is not intercepted on Windows (a deliberate use-after-free is not reported), so the heap half runs with the POSIX toolchain in #14. | 1 round | 12 |
 | 4 | **D2 — spatial tree** | Node pages and a descent replace the scan over box columns. | M | — |

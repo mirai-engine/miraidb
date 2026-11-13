@@ -371,16 +371,16 @@ sql_exec_describe :: proc(tx: ^Tx, stmt: Describe_Stmt) -> (Sql_Result, Error) {
 	if table_err.kind != .None do return {}, table_err
 	result := Sql_Result{kind = .Rows, commit_seq = tx.store.commit_seq}
 	result.columns = make([]string, 6)
-	result.columns[0] = strings.clone("kind")
-	result.columns[1] = strings.clone("name")
-	result.columns[2] = strings.clone("type")
-	result.columns[3] = strings.clone("not_null")
-	result.columns[4] = strings.clone("unique")
-	result.columns[5] = strings.clone("default")
+	result.columns[0] = result_own("kind")
+	result.columns[1] = result_own("name")
+	result.columns[2] = result_own("type")
+	result.columns[3] = result_own("not_null")
+	result.columns[4] = result_own("unique")
+	result.columns[5] = result_own("default")
 	rows := make([dynamic][]Value)
 	for column in table.schema.columns {
 		row := make([]Value, 6)
-		row[0] = value_string(strings.clone("column"))
+		row[0] = value_string(result_own("column"))
 		row[1] = value_string(strings.clone(column.name))
 		row[2] = value_string(strings.clone(column_type_name(column.type)))
 		row[3] = value_bool(column.not_null)
@@ -402,7 +402,7 @@ sql_exec_describe :: proc(tx: ^Tx, stmt: Describe_Stmt) -> (Sql_Result, Error) {
 			}
 		}
 		row := make([]Value, 6)
-		row[0] = value_string(strings.clone("index"))
+		row[0] = value_string(result_own("index"))
 		row[1] = value_string(strings.clone(index.name))
 		row[2] = value_string(strings.clone(strings.to_string(names)))
 		row[3] = value_bool(false)
@@ -451,8 +451,8 @@ sql_exec_show :: proc(store: ^Store, stmt: Show_Stmt, locked := false) -> (Sql_R
 	}
 	result := Sql_Result{kind = .Rows, commit_seq = store.commit_seq}
 	result.columns = make([]string, 2)
-	result.columns[0] = strings.clone("name")
-	result.columns[1] = strings.clone("value")
+	result.columns[0] = result_own("name")
+	result.columns[1] = result_own("value")
 	rows := make([dynamic][]Value)
 	if len(stmt.name) > 0 && strings.equal_fold(stmt.name, "tables") {
 		names := store_table_names(store, context.allocator)
@@ -464,7 +464,7 @@ sql_exec_show :: proc(store: ^Store, stmt: Show_Stmt, locked := false) -> (Sql_R
 			row[0] = value_string(strings.clone(name))
 			append(&rows_out, row)
 		}
-		result.columns[0] = strings.clone("table")
+		result.columns[0] = result_own("table")
 		delete(result.columns[1])
 		result.columns = result.columns[:1]
 		result.rows = make([][]Value, len(rows_out))
@@ -476,7 +476,7 @@ sql_exec_show :: proc(store: ^Store, stmt: Show_Stmt, locked := false) -> (Sql_R
 		sql_result_destroy(&result)
 		out := Sql_Result{kind = .Rows, commit_seq = store.commit_seq}
 		if _, exists := store.tables[TYPE_TABLE]; !exists {
-			out.columns = []string{strings.clone("name"), strings.clone("base")}
+			out.columns = []string{result_own("name"), result_own("base")}
 			return out, ERROR_NONE
 		}
 		catalog := store.tables[TYPE_TABLE]
@@ -486,7 +486,7 @@ sql_exec_show :: proc(store: ^Store, stmt: Show_Stmt, locked := false) -> (Sql_R
 		slice.sort_by(entries[:], proc(a, b: Row) -> bool {
 			return strings.compare(a.values[0].s, b.values[0].s) < 0
 		})
-		out.columns = []string{strings.clone("name"), strings.clone("base")}
+		out.columns = []string{result_own("name"), result_own("base")}
 		out.rows = make([][]Value, len(entries))
 		for entry, i in entries {
 			row := make([]Value, 2)
@@ -499,7 +499,7 @@ sql_exec_show :: proc(store: ^Store, stmt: Show_Stmt, locked := false) -> (Sql_R
 	if len(stmt.name) > 0 && strings.equal_fold(stmt.name, "events") {
 		sql_result_destroy(&result)
 		out := Sql_Result{kind = .Rows, commit_seq = store.commit_seq}
-		out.columns = []string{strings.clone("table")}
+		out.columns = []string{result_own("table")}
 		names := event_tables(store, context.allocator)
 		rows_out := make([][]Value, len(names))
 		for name, i in names {
@@ -513,7 +513,7 @@ sql_exec_show :: proc(store: ^Store, stmt: Show_Stmt, locked := false) -> (Sql_R
 	if len(stmt.name) > 0 && strings.equal_fold(stmt.name, "indexes") {
 		sql_result_destroy(&result)
 		out := Sql_Result{kind = .Rows, commit_seq = store.commit_seq}
-		out.columns = []string{strings.clone("table"), strings.clone("index"), strings.clone("columns")}
+		out.columns = []string{result_own("table"), result_own("index"), result_own("columns")}
 		rows_out := make([dynamic][]Value)
 		names := store_table_names(store, context.allocator)
 		defer delete(names)
@@ -541,7 +541,7 @@ sql_exec_show :: proc(store: ^Store, stmt: Show_Stmt, locked := false) -> (Sql_R
 	if len(stmt.name) > 0 {
 		if strings.equal_fold(stmt.name, "identity") {
 			row := make([]Value, 2)
-			row[0] = value_string(strings.clone("identity"))
+			row[0] = value_string(result_own("identity"))
 			row[1] = value_identity(store_identity(store))
 			append(&rows, row)
 			result.rows = make([][]Value, len(rows))
@@ -600,11 +600,11 @@ sql_exec_explain :: proc(tx: ^Tx, stmt: Explain_Stmt, params: []Value) -> (Sql_R
 			for step in order.steps do append(&names, step.name)
 			append(&lines, fmt.aprintf("join order: %s", strings.join(names[:], ", ")))
 		}
-		if inner.where_clause != nil do append(&lines, strings.clone("filter"))
-		if len(inner.group_by) > 0 do append(&lines, strings.clone("group by"))
-		if inner.having != nil do append(&lines, strings.clone("having"))
-		if len(inner.order_by) > 0 do append(&lines, strings.clone("order by (sort)"))
-		if inner.limit != nil || inner.offset != nil do append(&lines, strings.clone("limit/offset"))
+		if inner.where_clause != nil do append(&lines, result_own("filter"))
+		if len(inner.group_by) > 0 do append(&lines, result_own("group by"))
+		if inner.having != nil do append(&lines, result_own("having"))
+		if len(inner.order_by) > 0 do append(&lines, result_own("order by (sort)"))
+		if inner.limit != nil || inner.offset != nil do append(&lines, result_own("limit/offset"))
 	case Update_Stmt:
 		append(&lines, strings.concatenate({"update ", inner.table, explain_index_suffix(store, Table_Ref{name = inner.table}, inner.where_clause, params)}))
 	case Delete_Stmt:
@@ -640,15 +640,15 @@ sql_exec_explain :: proc(tx: ^Tx, stmt: Explain_Stmt, params: []Value) -> (Sql_R
 	case Truncate_Stmt:
 		append(&lines, strings.concatenate({"truncate ", inner.name}))
 	case Vacuum_Stmt:
-		append(&lines, strings.clone(len(inner.path) > 0 ? "write a compacted copy" : "compact the log"))
+		append(&lines, result_own(len(inner.path) > 0 ? "write a compacted copy" : "compact the log"))
 	case Analyze_Stmt:
-		append(&lines, strings.clone(len(inner.table) > 0 ? "analyze one table" : "analyze every table"))
+		append(&lines, result_own(len(inner.table) > 0 ? "analyze one table" : "analyze every table"))
 	case Create_Trigger_Stmt:
 		append(&lines, strings.concatenate({"create trigger ", inner.name, " on ", inner.table}))
 	case Drop_Trigger_Stmt:
 		append(&lines, strings.concatenate({"drop trigger ", inner.name}))
 	case Grant_Stmt:
-		append(&lines, strings.clone(inner.revoke ? "revoke" : "grant"))
+		append(&lines, result_own(inner.revoke ? "revoke" : "grant"))
 	case Create_Virtual_Table_Stmt:
 		append(&lines, strings.concatenate({"create virtual table ", inner.name, " using ", inner.module}))
 	case Load_Extension_Stmt:
@@ -658,11 +658,12 @@ sql_exec_explain :: proc(tx: ^Tx, stmt: Explain_Stmt, params: []Value) -> (Sql_R
 	case Detach_Stmt:
 		append(&lines, strings.concatenate({"detach ", inner.name}))
 	case Explain_Stmt, With_Stmt, Begin_Stmt, Commit_Stmt, Rollback_Stmt, Savepoint_Stmt:
-		append(&lines, strings.clone("no plan"))
+		append(&lines, result_own("no plan"))
 	}
+	if note := explain_staleness(store); len(note) > 0 do append(&lines, note)
 	result := Sql_Result{kind = .Rows, commit_seq = store.commit_seq}
 	result.columns = make([]string, 1)
-	result.columns[0] = strings.clone("plan")
+	result.columns[0] = result_own("plan")
 	rows := make([][]Value, len(lines))
 	for line, i in lines {
 		rows[i] = make([]Value, 1)
@@ -683,6 +684,36 @@ sql_exec_analyze :: proc(store: ^Store, stmt: Analyze_Stmt) -> (Sql_Result, Erro
 	result.affected = measured
 	result.message = fmt.aprintf("analyzed %d table(s)", measured)
 	return result, ERROR_NONE
+}
+
+// result_own makes a string the result owns. A cell or a column name is handed to
+// the caller, and the caller frees it, so it cannot be a literal: `strings.clone`
+// hands a constant back unchanged when it lives in read-only memory, and freeing
+// that is a bad free. This always allocates.
+@(private)
+result_own :: proc(text: string) -> string {
+	out := make([]u8, len(text), context.allocator)
+	copy(out, text)
+	return string(out)
+}
+
+// explain_staleness names the gap between the numbers the planner used and the
+// data it plans against. A plan built on an old measurement is still the best
+// guess available, but the reader is told it is a guess: without the note an
+// estimate looks like a fact.
+@(private)
+explain_staleness :: proc(store: ^Store) -> string {
+	if store.stats_seq == 0 {
+		return result_own("note: no statistics measured; run ANALYZE to price this plan")
+	}
+	if store.stats_seq < store.commit_seq {
+		return fmt.aprintf(
+			"note: statistics measured at commit %d, data at commit %d",
+			store.stats_seq,
+			store.commit_seq,
+		)
+	}
+	return ""
 }
 
 // explain_access prints the same choice the executor makes, with the estimate and
@@ -2559,7 +2590,7 @@ projection_name :: proc(item: Select_Item) -> string {
 			return strings.clone(column.name)
 		}
 	}
-	return strings.clone("?column?")
+	return result_own("?column?")
 }
 
 // build_order_key turns the ORDER BY clause of one output row into one byte
@@ -4928,7 +4959,7 @@ sql_exec_create_table :: proc(tx: ^Tx, stmt: Create_Table_Stmt, params: []Value)
 			// the caller prints the message.
 			return Sql_Result{
 				kind = .Ack,
-				message = strings.clone("table already exists"),
+				message = result_own("table already exists"),
 			}, ERROR_NONE
 		}
 		return {}, create_err

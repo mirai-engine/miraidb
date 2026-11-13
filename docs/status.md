@@ -132,7 +132,7 @@ the gaps are named rather than left to be discovered.
   one schema, one set of rows and 55 queries through both engines, with the
   refusals and the intentional differences listed in the script.
 - `scripts/build.py` builds both binaries and runs the suite.
-- 223 integration tests covering CRUD, recovery, constraints, transactions,
+- 224 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
@@ -249,9 +249,11 @@ than 1000 bytes cannot be indexed and the insert says so.
   time with a reason (`test_unsupported_joins_are_refused`), and `JOIN … USING`
   was already refused. `LEFT [OUTER]`, `INNER`, `CROSS` and the comma form work.
 - **The suite reports no bad free.** The debug allocator used to print 3058
-  unfreed-or-mis-freed lines; the last two causes were a pinned read that freed
-  the read cache's snapshot a second time and a test that freed the metric
-  strings its result still owned. The remaining noise is `+++ leak`, ~320k lines
+  unfreed-or-mis-freed lines; the last causes were a pinned read that freed the
+  read cache's snapshot a second time, a test that freed the metric strings its
+  result still owned, and every `EXPLAIN`, `DESCRIBE` and `SHOW` result, which
+  handed a read-only literal to a caller that frees what it gets
+  (`result_own`). The remaining noise is `+++ leak`, ~320k lines
   per suite run (~9 blocks per statement, dominated by the string builder, the
   lexer and statement decoding); nobody has established yet whether those are
   real leaks or allocations released by a bulk free the tracker does not see, and

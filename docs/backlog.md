@@ -334,12 +334,13 @@ subscription after every step.
 **Not done.** A joined table is still scanned rather than probed by the *planner*,
 `ORDER BY` never comes from an index, and the cost constants are chosen by hand —
 they encode "a row through an index costs four rows in place" and have not been
-calibrated against a measurement. Three gaps come from choosing the plan off the
-statement text alone: a bound value never reaches the histogram (`v < ?` estimates
-a third of the table where `v < 50` estimates fifty of four hundred rows), a view
-in `FROM` prints no estimate, and the statistics never announce that they are
-older than the data — the file stores `analyzed_seq` and no one compares it with
-`commit_seq`. The incremental subscription path (`host_join_prepare`) lays out the
+calibrated against a measurement. Two gaps come from choosing the plan off the statement
+text alone: a bound value never reaches the histogram (`v < ?` estimates a third of
+the table where `v < 50` estimates fifty of four hundred rows) and a view in
+`FROM` prints no estimate. The statistics announce their age: `EXPLAIN` ends with
+`note: statistics measured at commit N, data at commit M`, or with `note: no
+statistics measured` when `ANALYZE` never ran, so an estimate never passes for a
+measurement (`test_explain_announces_stale_statistics`). The incremental subscription path (`host_join_prepare`) lays out the
 walk in the order the query was written, so a subscription and the same query can
 do different work for the same delta.
 

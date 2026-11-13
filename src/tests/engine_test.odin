@@ -10139,6 +10139,59 @@ test_analyze_and_plan_estimates :: proc(t: ^testing.T) {
 	db.sql_result_destroy(&again)
 }
 
+@(private)
+explain_note :: proc(t: ^testing.T, store: ^db.Store, sql: string) -> string {
+	result, err := db.sql_execute(store, sql)
+	if !testing.expectf(t, db.error_ok(err), "explain failed: %s", err.message) do return ""
+	defer db.sql_result_destroy(&result)
+	for row in result.rows {
+		text := row[0].s
+		if strings.has_prefix(text, "note:") do return strings.clone(text)
+	}
+	return ""
+}
+
+@(test)
+test_explain_announces_stale_statistics :: proc(t: ^testing.T) {
+	// The planner prices a query from numbers ANALYZE measured, and a commit after
+	// that makes them a guess. The plan says so, with both sequences, instead of
+	// printing an estimate that looks like a measurement.
+	store := fresh_db(t, "stale_stats")
+	if store == nil do return
+	defer cleanup_db(store, "stale_stats")
+
+	run(t, store, "CREATE TABLE s (id INTEGER PRIMARY KEY, v INTEGER)")
+	run(t, store, "INSERT INTO s (v) VALUES (1), (2), (3)")
+
+	// Nothing measured yet: the plan is a guess and says so.
+	note := explain_note(t, store, "EXPLAIN SELECT * FROM s WHERE v = 2")
+	testing.expectf(t, strings.has_prefix(note, "note: no statistics"), "fresh note: %s", note)
+	delete(note)
+
+	run(t, store, "ANALYZE s")
+	note = explain_note(t, store, "EXPLAIN SELECT * FROM s WHERE v = 2")
+	testing.expectf(t, len(note) == 0, "a measured plan carried a note: %s", note)
+	delete(note)
+
+	// A commit after the measurement makes the numbers older than the data.
+	run(t, store, "INSERT INTO s (v) VALUES (4)")
+	note = explain_note(t, store, "EXPLAIN SELECT * FROM s WHERE v = 2")
+	testing.expectf(
+		t,
+		strings.has_prefix(note, "note: statistics measured at commit"),
+		"stale note: %s",
+		note,
+	)
+	testing.expect(t, strings.contains(note, "data at commit"))
+	delete(note)
+
+	// Measuring again clears it.
+	run(t, store, "ANALYZE s")
+	note = explain_note(t, store, "EXPLAIN SELECT * FROM s WHERE v = 2")
+	testing.expectf(t, len(note) == 0, "a re-measured plan carried a note: %s", note)
+	delete(note)
+}
+
 @(test)
 test_plan_reorders_a_join :: proc(t: ^testing.T) {
 	// A nested loop reads the whole inner relation per outer row, so the order of
