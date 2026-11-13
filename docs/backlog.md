@@ -95,16 +95,32 @@ as the fallback for `WITHOUT ROWID`-style tables if the tree cannot be built.
 
 ## D3 — Snapshot cost and history
 
-**Snapshot cost (done).** A read snapshot borrows the table's values instead of
-copying them: the freeze builds the row map and the index entries and hands both
-tables a reference-counted `Row_Store`. The source defers freeing values while a
-snapshot that shares them is alive (an update keeps the old values as a version, a
-delete tombstones the row, a truncate hands the rows to the store), and the last
-owner out frees them. Four hundred fifty thousand rows freeze in the noise of one
-statement: `bench-read <db> 50000 100` reports ~11 µs per transaction including
-the first (before, the first read alone cost ~190 ms).
+**Snapshot cost.** A read snapshot borrows the table's values instead of a deep
+copy: the freeze builds the row map and the index entries and hands both tables a
+reference-counted `Row_Store`, and the last owner out frees the values.
 `test_snapshot_shares_values_safely` proves isolation across an update and a
 truncate while the reader holds its view.
+
+What this file used to claim — "~11 µs per transaction including the first,
+before ~190 ms" — was measured wrong. `bench-read` runs a `SELECT count(*)`
+before it starts the clock, and that statement publishes the read cache, so the
+timed loop never pays a freeze. Measured directly on a table of 50 000 rows
+(three columns, primary key and one index), calling `table_snapshot` three
+times: **117.0 ms, 115.7 ms, 114.7 ms** — about **2.3 µs per row**. A read
+transaction after a commit costs the same 116 ms, and the cached reads around it
+are 11.4 µs. So the snapshot is O(rows) with a large constant:
+`table_insert_borrowed` re-inserts each row into every index of the clone.
+
+**Where the clones go.** `store.retired` takes every published snapshot and is
+only emptied by `store_close`. When it reaches `READ_CACHE_LIMIT` (16) no new
+cache is published for the rest of the process, so every later read clones, and
+17 frozen snapshots stay resident. Evicting the oldest and publishing again is
+the fix; it is small and it is not done.
+
+**Work.** Clone the row store and the indexes without re-inserting each row,
+evict retired snapshots so the read cache keeps working, and teach `bench-read`
+to time a commit followed by a read so the gate measures the number the contract
+talks about. `docs/roadmap.md` records the rows as not met until then.
 
 **History (done).** `SELECT ... FROM t AS OF <seq>` reads the rows as they were at
 that commit: the scan walks the versions `row_values_at` keeps instead of the live
@@ -302,7 +318,15 @@ prints no estimate, and the statistics never announce that they are older than
 the data — the file stores `analyzed_seq` and no one compares it with
 `commit_seq`. The incremental subscription path (`host_join_prepare`) still walks
 a join in the written order, so a subscription and the same query can do
-different work for the same delta.
+different work for the same delta. Worse, `host_apply_incremental_join` calls
+`host_join_tables`, which `tx_collect`s **every row of every joined table on
+each commit**: only the changed row is fixed, the rest are enumerated to test the
+`ON`. The tuple index is used to remove a stale tuple, not to find candidates, so
+a join subscription over two 50 000-row tables copies ~100 000 rows per commit
+instead of the rows the commit touched. Indexing the join key per table
+(`host_join_index_row` already builds the tuple index at subscription creation)
+is the work, and `docs/roadmap.md` records the contract row as not met for
+joins.
 
 **Cost.** A join is evaluated in the order it was written; the only cardinality
 information is "this predicate has an index".

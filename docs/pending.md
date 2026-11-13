@@ -536,15 +536,17 @@ is clean, and check that before dismissing a report.
 
 ---
 
-## Next, in order (nothing left)
+## Next
 
-Every row of the matrix is `done`: **100 / 100**. The next work is the audit
-queue in the section above, then the open defects, not new features.
+This roadmap is closed: **100 / 100**, every row `done` with a test. It is not
+the whole plan. `docs/roadmap.md` is the authoritative order for what is left,
+and its list still carries nine open items (POSIX CI, spatial tree, decimal and
+time zones, replication, the module sandbox, TLS and HTTP/2, generated clients,
+licences) plus the rows of the efficiency contract recorded as not met. The open
+defects are in the section above; they come first.
 
-Rationale: correctness and memory first, then the features a user can see
-(modules, search, a real file format), then the cheap independent gaps. #8 and
-#9 share the v16 format bump, so they must land together; everything else is
-independent.
+Rationale, unchanged: correctness and memory first, then the features a user can
+see, then the cheap independent gaps.
 
 ---
 

@@ -148,7 +148,7 @@ after it, apply through `commitlog`, expose the last applied sequence.
 | **Address sanitizer** over CLI, soak and conformance — *partly done* | Memory bugs have been the real risk; bounds and stack are covered here, the heap needs the Linux toolchain | 1 round per phase | #2 |
 | **Fault injection** (D8) | Proves no third state after a failed write | S, then extended | #3 |
 | **Benchmark with thresholds** — *done* | Bytes per row within 10%; timings under a 3x catastrophe guard, because a shared machine cannot promise 10% (the 10% time rule is measured by hand with `--record`) | 1 day | #4 |
-| **Page memory** — *done* | `scripts/page_rss.py --check` reads a table far larger than the pool and bounds what the statement adds; `scripts/plan_check.py` guards the plans a measured fixture must produce; 20 gates in total | 1 day | #8 |
+| **Page memory** — *done* | `scripts/page_rss.py --check` reads a table far larger than the pool and bounds what the statement adds; `scripts/plan_check.py` guards the plans a measured fixture must produce; 21 gates in total | 1 day | #8 |
 | **CI on Linux and macOS** | Locking and the VFS are per-OS | 2–3 days | #13 |
 | **Release packaging** — *done* | `scripts/package.py --check`, one archive per target with the version the library reports | 2–3 days | #23 |
 | **Auth review** | Tokens, subscriptions, byte and work budgets under attack | 1 day | #24 |
@@ -163,16 +163,21 @@ measurable dimension. Measured on this tree:
 
 | Dimension | Baseline today | Contract |
 |---|---|---|
-| Insert throughput | 50.264 /s (20k rows), 48.270 /s (50k) | not worse on the same hardware; 10% regression fails the gate |
-| Read transaction | 10.7 µs over 50k rows, first read included | same |
-| Freeze a 50k-row table | ~1 ms | same |
+| Insert throughput | 46 838 /s on the 20k gate (baseline 42 219); 54 580 /s over 50k, run directly | not worse on the same hardware; 10% regression fails the gate |
+| Read transaction, cache warm | 11.4 µs over 50k rows | same |
+| Read transaction, first after a commit | **116 ms**: it clones the table | should cost the rows the transaction touches; today it is O(rows) at ~2.3 µs per row (D3, not met) |
+| Freeze a 50k-row table | **115–117 ms** (`table_snapshot` measured three times) | was recorded as ~1 ms; the real cost is 2.3 µs per row (D3, not met) |
 | Commit record | one record, CRC32C, group commit | durability never traded for speed silently |
 | Compaction | 0.48 s for 50k rows, one file left | same |
 | Memory per row | `Row` 80 B, `Value` 24 B | no growth without a written reason |
-| Subscription delta | O(rows touched) | never a full re-evaluation |
+| Subscription delta | O(rows touched) for one table; a join re-collects every row of the other tables on each commit | O(rows touched) for the table the commit changed (D6, not met for joins) |
 
-If an item cannot meet a row, it does not land: the number is recorded and the
-reason written down instead.
+These are the numbers the gate compares against and the targets the engine is
+held to. Four rows are recorded as **not met** rather than quietly relaxed: the
+first read after a commit pays a full table clone, so a database that writes
+while it serves readers pays it per commit, and `bench-read` hides it because
+its preparation statement publishes the read cache before it starts timing. D3
+(snapshot cost) and D6 (join delta) carry the work.
 
 ## What this costs
 
