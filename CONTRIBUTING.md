@@ -42,3 +42,40 @@ so no squashing is needed and none is expected.
 
 `bin/`, `_test_*` and any local `*.db` directory are ignored by git. Do not
 commit generated indexes, logs or databases.
+
+## Documentation
+
+The documents in `docs/` are part of the product: they are what a reader uses to
+decide whether the engine can do their job. They are held to the same rule as
+the code — **a claim is true only while something checks it** — and
+`scripts/docs_check.py` (a CI gate) checks the mechanical half: the version, the
+test count, the gate count, the CLI command list, every relative link, the
+`D<n>` cross-references between the roadmap and the backlog, and that no
+document is orphaned. The rest is editorial:
+
+- **One claim per sentence.** "The mirror patches three pages per commit" is a
+  claim; "it is fast and modern" is not. Numbers carry their unit and the way
+  they were measured.
+- **State the present, not a wish.** Write what the tree does today. If it does
+  not do it, it belongs in `docs/backlog.md` or `docs/roadmap.md`, not in the
+  middle of a paragraph about what works.
+- **Say where the edge is.** A feature that works for a subset says which subset
+  (`LEFT` joins but not `RIGHT`; a page store but one version per row). An
+  undocumented edge is read as a promise.
+- **Name the proof.** A paragraph that claims behaviour ends with the test, gate
+  or script that shows it: ``test_mirror_grows_and_reopens``,
+  ``scripts/plan_check.py``. A claim nobody can run is a rumour.
+- **Do not repeat; link.** Each fact lives in one document: measurements in
+  `status.md`, order in `roadmap.md`, cost and design in `backlog.md`, SQL in
+  `sql.md`, the file layout in `file-format.md`. The others link to it.
+- **Same words for the same thing.** "commit log", "page file", "snapshot",
+  "mirror", "work budget": one term each, spelled the same everywhere. SQL
+  keywords and identifiers appear in `code spans`, in the case the engine prints.
+- **Tables for state, prose for reasons.** A status table answers "what works";
+  the paragraph under it answers "why it is that way".
+- **Short paragraphs, one idea each.** A heading that needs three sentences to
+  explain itself is the wrong heading.
+
+When a change makes a sentence in `docs/` false, changing that sentence is part
+of the change, not a follow-up: the gate catches the counts and the links, a
+reader catches the rest, and a stale paragraph is a bug report waiting to happen.

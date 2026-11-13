@@ -11,9 +11,10 @@ A persistent miraidb database is a directory:
 ```
 
 The log is the database. There is no separate data file: opening a database
-replays every valid record in order and rebuilds the tables. A future milestone
-adds snapshots (`M2`), which will be an optimization for startup time, not a
-second source of truth.
+replays every valid record in order and rebuilds the tables. A snapshot is a
+startup optimization, not a second source of truth: `compact` writes one, and an
+open applies it and then replays only the records after its sequence. A snapshot
+that is missing, damaged or older than the log is ignored.
 
 All integers are little-endian. CRC32C is the Castagnoli polynomial
 (`0x82f63b78`, reflected).
@@ -230,7 +231,7 @@ renames it over `log`, and reopens it.
 
 ## Page file
 
-The page file is the on-disk materialisation the page store uses: fixed 4 KiB
+The page file is the on-disk materialization the page store uses: fixed 4 KiB
 pages, a slotted layout for variable-length rows, a free list and a checksum per
 page. It is a **cache over the log**, not a second source of truth: a page file
 that does not match the log is discarded and rebuilt by replay.

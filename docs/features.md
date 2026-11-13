@@ -1,10 +1,11 @@
 # Feature matrix
 
-The work list for reaching full parity with the feature set this engine targets.
-Each row is one capability, with its status in this tree. IDs are stable. The
-matrix is closed; [pending.md](pending.md) records how each row was closed and
-[backlog.md](backlog.md) holds the depth work that is deliberately not part of
-parity.
+The record of the feature set this engine targets. Each row is one capability,
+with its status in this tree and the evidence that closed it. IDs are stable.
+The matrix is closed: 94 rows, all `done`, each with a test. [pending.md](pending.md)
+records how each row was closed, [backlog.md](backlog.md) holds the depth work
+that is deliberately not part of parity, and [roadmap.md](roadmap.md) orders
+what is left.
 
 - **done** — implemented and covered by tests.
 - **partial** — implemented for a subset; the gap is described.

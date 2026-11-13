@@ -1,8 +1,9 @@
 # SQL subset
 
-miraidb speaks its own small SQL dialect. The grammar is fixed and hand written;
-anything outside it is a syntax error rather than something silently
-misinterpreted. Identifiers are case-insensitive unless quoted with `"` or
+miraidb speaks its own SQL dialect. The grammar is fixed and hand written;
+anything outside it is an error at parse time rather than something silently
+misinterpreted, which is why this document is a list of what works and what is
+refused. Identifiers are case-insensitive unless quoted with `"` or
 backticks.
 
 ## Statements
@@ -290,7 +291,8 @@ instead of O(history), and a history of many small commits collapses, so the
 directory shrinks (500 small commits of a 120-byte row: 94 KiB to 76 KiB). A
 database written in one transaction already is a single record, so it keeps its
 size; either way the standalone `snapshot` copy is removed, so a compacted
-database is one artifact. 50k rows compact in 0.48 s for the whole command. `VACUUM INTO 'path'` writes that
+database is one artifact. 50k rows compact in 0.48 s for the whole command.
+`VACUUM INTO 'path'` writes that
 same compacted copy somewhere else and leaves the live database alone; the copy
 is a complete database (it opens, reads and takes commits). It also gives an
 in-memory database a way to reach disk. Both are refused inside a transaction,
