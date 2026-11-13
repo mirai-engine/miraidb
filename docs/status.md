@@ -80,6 +80,9 @@ the gaps are named rather than left to be discovered.
 
 - `CREATE TABLE`, `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`.
 - `INSERT` (multi-row), `UPDATE`, `DELETE`, positional `?` parameters.
+- `ORDER BY` breaks ties by row id, so a query with equal keys answers the same
+  sequence on every run; `min`/`max` with two or more arguments are scalar
+  comparisons, and `trim`/`ltrim`/`rtrim` take a set of characters.
 - `SELECT` with aliases, `INNER`/`LEFT`/`CROSS` joins, `WHERE`, `DISTINCT`,
   `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`/`OFFSET`, `LIKE`/`ILIKE` with
   `ESCAPE`.

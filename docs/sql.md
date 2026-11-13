@@ -217,8 +217,11 @@ rejects `ALICE` beside `Alice` and `WHERE name = 'ALICE'` still uses the index.
 - Column references (`name`, `table.name`).
 - Arithmetic `+ - * / %`, string concatenation `||`, unary `-`/`+`.
 - Scalar functions: `lower`, `upper`, `length`, `substr`/`substring`, `trim`,
-  `ltrim`, `rtrim`, `replace`, `concat`, `abs`, `sign`, `round`, `floor`, `ceil`,
-  `sqrt`, `pow`, `mod`, `coalesce`, `nullif`, `now`.
+  `ltrim`, `rtrim` (the second argument is the set of characters to remove; the
+  default is the space), `replace`, `concat`, `abs`, `sign`, `round`, `floor`,
+  `ceil`, `sqrt`, `pow`, `mod`, `coalesce`, `nullif`, `now`, and `min`/`max`
+  with two or more arguments, which compare their arguments instead of folding a
+  column.
 - Comparisons `= == != <> < <= > >=`, `IS [NOT] NULL`, `[NOT] BETWEEN`,
   `[NOT] IN (...)`, `[NOT] LIKE` / `ILIKE` with `%` and `_`, and
   `ESCAPE 'c'` to make the next wildcard literal.
@@ -233,7 +236,8 @@ rejects `ALICE` beside `Alice` and `WHERE name = 'ALICE'` still uses the index.
 
 Aggregates: `count(*)`, `count(expr)`, `sum`, `avg`, `min`, `max`, `total`.
 
-Scalar: `lower`, `upper`, `length`, `abs`, `coalesce`/`ifnull`, `now()`.
+Scalar: `lower`, `upper`, `length`, `abs`, `coalesce`/`ifnull`, `now()`,
+`min(a, b, …)`/`max(a, b, …)`, and `trim(s[, chars])` with its two variants.
 
 ## Behaviour worth knowing
 

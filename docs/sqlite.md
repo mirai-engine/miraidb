@@ -78,7 +78,8 @@ families):** `abs` and the trigonometric/logarithmic set (`acos`, `asin`,
 `mod`, `char`, `unicode`, `hex`, `unhex`, `quote`, `format`/`printf`,
 `coalesce`, `iif`, `ifnull`, `nullif`, `length`, `octet_length`, `lower`,
 `upper`, `ltrim`, `rtrim`, `trim`, `replace`, `concat`, `concat_ws`, `instr`,
-`substr`/`substring`, `glob`, `like`, `typeof`, `random`, `zeroblob`,
+`substr`/`substring`, `glob`, `like`, `typeof`, `min(a, b, …)`/`max(a, b, …)`
+as scalars, `trim`/`ltrim`/`rtrim` with a character set, `random`, `zeroblob`,
 `uuid` (only when the host supplies a randomness source), `randomblob`,
 `changes`, `total_changes`, `last_insert_rowid`, `sqlite_version`, `date`,
 `time`, `datetime`, `strftime`, `now`, eleven `json_*` scalars and the

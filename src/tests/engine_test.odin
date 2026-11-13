@@ -10230,3 +10230,35 @@ test_order_by_ties_follow_the_row_id :: proc(t: ^testing.T) {
 	testing.expect_value(t, second.rows[4][0].i, i64(1))
 	db.sql_result_destroy(&second)
 }
+
+@(test)
+test_scalar_minmax_and_trim_sets :: proc(t: ^testing.T) {
+	// SQLite answers min/max with two or more arguments as scalar functions, and
+	// trims a set of characters given as the second argument; both are used in
+	// migrations and neither was implemented.
+	store := fresh_db(t, "sqlite_scalars")
+	if store == nil do return
+	defer cleanup_db(store, "sqlite_scalars")
+
+	testing.expect_value(t, scalar(t, store, "SELECT min(2, 3)").i, i64(2))
+	testing.expect_value(t, scalar(t, store, "SELECT max(2, 3)").i, i64(3))
+	testing.expect_value(t, scalar(t, store, "SELECT min(2.5, 3)").f, f64(2.5))
+	testing.expect_value(t, scalar(t, store, "SELECT min('b', 'a')").s, "a")
+	testing.expect_value(t, scalar(t, store, "SELECT max('b', 'a')").s, "b")
+	testing.expect_value(t, scalar(t, store, "SELECT min(1, NULL)").kind, db.Value_Kind.Null)
+	testing.expect_value(t, scalar(t, store, "SELECT min(3, 1, 2)").i, i64(1))
+
+	testing.expect_value(t, scalar(t, store, "SELECT trim('  x  ')").s, "x")
+	testing.expect_value(t, scalar(t, store, "SELECT trim('xxaxx', 'x')").s, "a")
+	testing.expect_value(t, scalar(t, store, "SELECT ltrim('xxaxx', 'x')").s, "axx")
+	testing.expect_value(t, scalar(t, store, "SELECT rtrim('xxaxx', 'x')").s, "xxa")
+	// The default set is the space, as in SQLite, not every whitespace character.
+	testing.expect_value(t, scalar(t, store, "SELECT length(ltrim(char(9) || 'x'))").i, i64(2))
+	testing.expect_value(t, scalar(t, store, "SELECT trim(NULL)").kind, db.Value_Kind.Null)
+
+	// The aggregate forms are unchanged: min(x) still folds a column.
+	run(t, store, "CREATE TABLE m (x INTEGER)")
+	run(t, store, "INSERT INTO m VALUES (5), (2), (9)")
+	testing.expect_value(t, scalar(t, store, "SELECT min(x) FROM m").i, i64(2))
+	testing.expect_value(t, scalar(t, store, "SELECT max(x) FROM m").i, i64(9))
+}

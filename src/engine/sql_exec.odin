@@ -3183,6 +3183,14 @@ value_cast :: proc(v: Value, target: Column_Type) -> (Value, Error) {
 	)
 }
 
+// scalar_minmax reports a min()/max() call that takes its value from two or more
+// arguments: SQLite answers that as a scalar function, not as a group aggregate.
+@(private)
+scalar_minmax :: proc(call: Call_Expr) -> bool {
+	if len(call.args) < 2 do return false
+	return strings.equal_fold(call.name, "min") || strings.equal_fold(call.name, "max")
+}
+
 @(private)
 expr_is_aggregate :: proc(expr: ^Expr) -> bool {
 	if expr == nil do return false
@@ -3192,6 +3200,7 @@ expr_is_aggregate :: proc(expr: ^Expr) -> bool {
 		// row is known, not while scanning.
 		return false
 	case Call_Expr:
+		if scalar_minmax(e) do return false
 		if is_aggregate_name(e.name) do return true
 		for arg in e.args {
 			if expr_is_aggregate(arg) do return true
@@ -3364,6 +3373,9 @@ is_aggregate_name :: proc(name: string) -> bool {
 @(private)
 eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 
+	if scalar_minmax(call) {
+		return eval_scalar_minmax(ctx, call)
+	}
 	if is_aggregate_name(call.name) {
 		return eval_aggregate(ctx, call)
 	}
@@ -3451,15 +3463,30 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		}
 		return value_string(text[begin:end]), ERROR_NONE
 	case "trim", "ltrim", "rtrim":
-		if len(args) != 1 do return {}, errf(.Invalid_Argument, "%s() takes one argument", call.name)
-		if args[0].kind != .String do return {}, errf(.Invalid_Type, "%s() expects text", call.name)
-		switch strings.to_lower(call.name) {
-		case "ltrim":
-			return value_string(strings.trim_left_space(args[0].s)), ERROR_NONE
-		case "rtrim":
-			return value_string(strings.trim_right_space(args[0].s)), ERROR_NONE
+		if len(args) < 1 || len(args) > 2 {
+			return {}, errf(.Invalid_Argument, "%s() takes one or two arguments", call.name)
 		}
-		return value_string(strings.trim_space(args[0].s)), ERROR_NONE
+		if args[0].kind == .Null do return value_null(), ERROR_NONE
+		if args[0].kind != .String do return {}, errf(.Invalid_Type, "%s() expects text", call.name)
+		// The second argument is the set of characters to remove; the default is
+		// the space, as in SQLite (not every whitespace).
+		set := " "
+		if len(args) == 2 {
+			if args[1].kind == .Null do return value_null(), ERROR_NONE
+			if args[1].kind != .String do return {}, errf(.Invalid_Type, "%s() expects a text set", call.name)
+			set = args[1].s
+		}
+		text := args[0].s
+		begin := 0
+		end := len(text)
+		lower := strings.to_lower(call.name)
+		if lower != "rtrim" {
+			for begin < end && strings.index_byte(set, text[begin]) >= 0 do begin += 1
+		}
+		if lower != "ltrim" {
+			for end > begin && strings.index_byte(set, text[end - 1]) >= 0 do end -= 1
+		}
+		return value_string(strings.clone(text[begin:end])), ERROR_NONE
 	case "replace":
 		if len(args) != 3 do return {}, errf(.Invalid_Argument, "replace() takes three arguments")
 		for arg in args {
@@ -3740,7 +3767,31 @@ abs_f64 :: proc(f: f64) -> f64 {
 	return f < 0 ? -f : f
 }
 
+// eval_scalar_minmax is min(a, b, ...) as SQLite answers it: NULL if any
+// argument is NULL, otherwise the smallest or largest of them.
 @(private)
+eval_scalar_minmax :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
+	want_min := strings.equal_fold(call.name, "min")
+	best: Value
+	have := false
+	for arg in call.args {
+		value, eval_err := eval_expr(ctx, arg)
+		if eval_err.kind != .None do return {}, eval_err
+		if value.kind == .Null do return value_null(), ERROR_NONE
+		if !have {
+			best = value
+			have = true
+			continue
+		}
+		order, comparable := value_compare(value, best)
+		if !comparable {
+			return {}, errf(.Invalid_Type, "%s() mixes incompatible types", call.name)
+		}
+		if (want_min && order == .Less) || (!want_min && order == .Greater) do best = value
+	}
+	return value_clone(best, context.allocator), ERROR_NONE
+}
+
 eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 	if ctx.stream != nil {
 		acc := agg_stream_lookup(ctx.stream, call)
