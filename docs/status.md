@@ -116,6 +116,8 @@ the gaps are named rather than left to be discovered.
 - `miraidb` has 17 commands: `create`, `sql`, `sqlite`, `import-sqlite`,
   `export-sqlite`, `repl`, `inspect`, `describe`, `bench`, `bench-read`,
   `codegen`, `export`, `call`, `subscribe`, `check`, `compact`, `snapshot`.
+- `miraidb sql --json <db> <statement>` prints a result as one JSON array of
+  rows, which is how `scripts/differential.py` compares answers against SQLite.
 - `scripts/build.py` builds both binaries and runs the suite.
 - 216 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,

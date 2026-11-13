@@ -11,7 +11,10 @@
   reads. `IN` and `NOT IN` keep SQL's three-valued logic when the list holds a
   `NULL`: a non-match is unknown, so `NOT IN` does not return rows it cannot
   decide. `DISTINCT` inside an aggregate is honoured instead of parsed and
-  dropped, so `count(DISTINCT x)` counts each value once.
+  dropped, so `count(DISTINCT x)` counts each value once. `ORDER BY` breaks ties
+  by row id, so a query with equal keys answers the same sequence every run;
+  `min`/`max` with two or more arguments compare their arguments, and
+  `trim`/`ltrim`/`rtrim` take a set of characters.
 - One owner per database directory (OS lock), and a broker that serves other
   processes over HTTP, WebSocket frames and Postgres.
 - Tables on disk: a page file per table with a buffer pool, a free list, a

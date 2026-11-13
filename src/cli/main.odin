@@ -44,6 +44,8 @@ Options:
                                             current cost, when a sql statement commits
   --memory-report                           print this process memory when a sql
                                             statement finishes
+  --json                                    print a query result as one JSON
+                                            array of rows, for a tool to compare
 
 The database is a directory holding a commit log. SQL covers CREATE, DROP and
 ALTER TABLE, INSERT, UPDATE, DELETE, UPSERT, SELECT with joins, common table
@@ -74,6 +76,7 @@ main :: proc() {
 	page_frames := 0
 	memory_report := false
 	mirror_report := false
+	json_output := false
 	read_only := false
 	filtered := make([dynamic]string, 0, len(rest))
 	defer delete(filtered)
@@ -97,6 +100,8 @@ main :: proc() {
 			memory_report = true
 		case "--mirror-report":
 			mirror_report = true
+		case "--json":
+			json_output = true
 		case:
 			if strings.has_prefix(arg, "--page-frames=") {
 				parsed, ok := strconv.parse_int(arg[len("--page-frames="):])
@@ -108,6 +113,10 @@ main :: proc() {
 		}
 	}
 	arguments := filtered[:]
+	if json_output {
+		shell.mode = .Json
+		shell.headers = false
+	}
 
 	switch command {
 	case "help", "--help", "-h":
@@ -510,6 +519,7 @@ Shell_Mode :: enum {
 	List,
 	Csv,
 	Tabs,
+	Json,
 }
 
 Shell_Settings :: struct {
@@ -550,6 +560,8 @@ shell_mode_name :: proc(mode: Shell_Mode) -> string {
 		return "csv"
 	case .Tabs:
 		return "tabs"
+	case .Json:
+		return "json"
 	}
 	return "column"
 }
@@ -574,6 +586,10 @@ print_result :: proc(result: db.Sql_Result) {
 
 print_rows :: proc(columns: []string, rows: [][]db.Value) {
 	if len(columns) == 0 {
+		return
+	}
+	if shell.mode == .Json {
+		print_rows_json(rows)
 		return
 	}
 	if shell.mode == .List {
@@ -656,6 +672,85 @@ csv_cell :: proc(text: string, quoting: bool) -> string {
 	if !needs_quotes do return text
 	escaped, _ := strings.replace_all(text, "\"", "\"\"")
 	return fmt.aprintf("\"%s\"", escaped)
+}
+
+// print_rows_json writes one JSON array holding every row, so a tool can parse
+// the result instead of scraping a table. Values keep their kind: numbers are
+// numbers, NULL is null, a blob is {"$blob":"<hex>"} and everything else is the
+// text value_format produces.
+@(private)
+print_rows_json :: proc(rows: [][]db.Value) {
+	builder := strings.builder_make()
+	defer strings.builder_destroy(&builder)
+	strings.write_byte(&builder, '[')
+	for row, r in rows {
+		if r > 0 do strings.write_byte(&builder, ',')
+		strings.write_byte(&builder, '[')
+		for value, c in row {
+			if c > 0 do strings.write_byte(&builder, ',')
+			json_value(&builder, value)
+		}
+		strings.write_byte(&builder, ']')
+	}
+	strings.write_byte(&builder, ']')
+	fmt.println(strings.to_string(builder))
+}
+
+@(private)
+json_value :: proc(builder: ^strings.Builder, value: db.Value) {
+	#partial switch value.kind {
+	case .Null, .Default:
+		strings.write_string(builder, "null")
+	case .Bool:
+		strings.write_string(builder, value.b ? "true" : "false")
+	case .Int:
+		fmt.sbprintf(builder, "%d", value.i)
+	case .Uint:
+		fmt.sbprintf(builder, "%d", value.u)
+	case .Int128, .Uint128:
+		strings.write_string(builder, db.value_format(value, context.temp_allocator))
+	case .Float:
+		if value.f != value.f || value.f - value.f != 0 {
+			// NaN and infinity are not JSON numbers: keep them as text so a
+			// comparison can still see what the engine produced.
+			fmt.sbprintf(builder, "%q", db.value_format(value, context.temp_allocator))
+			return
+		}
+		fmt.sbprintf(builder, "%.17g", value.f)
+	case .Bytes:
+		strings.write_string(builder, `{"$blob":"`)
+		for byte in value.bytes do fmt.sbprintf(builder, "%02x", byte)
+		strings.write_string(builder, `"}`)
+	case:
+		json_string(builder, db.value_format(value, context.temp_allocator))
+	}
+}
+
+@(private)
+json_string :: proc(builder: ^strings.Builder, text: string) {
+	strings.write_byte(builder, '"')
+	for i := 0; i < len(text); i += 1 {
+		byte := text[i]
+		switch byte {
+		case '"':
+			strings.write_string(builder, `\"`)
+		case '\\':
+			strings.write_string(builder, `\\`)
+		case '\n':
+			strings.write_string(builder, `\n`)
+		case '\r':
+			strings.write_string(builder, `\r`)
+		case '\t':
+			strings.write_string(builder, `\t`)
+		case:
+			if byte < 0x20 {
+				fmt.sbprintf(builder, `\u%04x`, byte)
+			} else {
+				strings.write_byte(builder, byte)
+			}
+		}
+	}
+	strings.write_byte(builder, '"')
 }
 
 cell_text :: proc(value: db.Value) -> string {
@@ -928,8 +1023,10 @@ repl_command :: proc(store: ^db.Store, line: string, session: ^^db.Tx) -> (handl
 			shell.mode = .Csv
 		case "tabs":
 			shell.mode = .Tabs
+		case "json":
+			shell.mode = .Json
 		case:
-			fmt.eprintfln("unknown mode %q (column, list, csv, tabs)", words[1])
+			fmt.eprintfln("unknown mode %q (column, list, csv, tabs, json)", words[1])
 			return true, false
 		}
 		fmt.printfln("mode: %s", shell_mode_name(shell.mode))
