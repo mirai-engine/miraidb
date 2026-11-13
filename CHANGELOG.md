@@ -10,7 +10,8 @@
   full-text search with BM25 ranking, spatial tables and attached `.sqlite`
   reads. `IN` and `NOT IN` keep SQL's three-valued logic when the list holds a
   `NULL`: a non-match is unknown, so `NOT IN` does not return rows it cannot
-  decide.
+  decide. `DISTINCT` inside an aggregate is honoured instead of parsed and
+  dropped, so `count(DISTINCT x)` counts each value once.
 - One owner per database directory (OS lock), and a broker that serves other
   processes over HTTP, WebSocket frames and Postgres.
 - Tables on disk: a page file per table with a buffer pool, a free list, a

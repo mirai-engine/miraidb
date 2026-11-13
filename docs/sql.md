@@ -254,7 +254,10 @@ Scalar: `lower`, `upper`, `length`, `abs`, `coalesce`/`ifnull`, `now()`.
   `GROUP BY`, an aggregate query produces exactly one row, even when the table
   is empty.
 - `LIMIT`/`OFFSET` take constant non-negative integers.
-- `DISTINCT` compares the whole projected row.
+- `DISTINCT` compares the whole projected row. Inside an aggregate it folds each
+  value once: `count(DISTINCT x)`, `sum(DISTINCT x)` and `group_concat(DISTINCT
+  x)` count, add or join the distinct values only, and `NULL` is not a value.
+  An integral float and an integer that compare equal count as one.
 - Updates and deletes narrow their target rows through an index when the `WHERE`
   clause allows it, then stage one write per row; `affected` reports how many
   rows matched.

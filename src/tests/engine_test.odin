@@ -10148,3 +10148,51 @@ test_in_and_not_in_with_null :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT 1 IN (SELECT v FROM t WHERE v = 1)").b, true)
 	testing.expect_value(t, scalar(t, store, "SELECT 2 IN (SELECT v FROM t WHERE v = 1)").b, false)
 }
+
+@(test)
+test_aggregate_distinct :: proc(t: ^testing.T) {
+	// DISTINCT inside an aggregate folds each value once. It was parsed into the
+	// call and then ignored, so count(DISTINCT x) answered the row count.
+	store := fresh_db(t, "agg_distinct")
+	if store == nil do return
+	defer cleanup_db(store, "agg_distinct")
+
+	run(t, store, "CREATE TABLE d (id INTEGER PRIMARY KEY, x INTEGER, label TEXT)")
+	run(t, store, "INSERT INTO d (id, x, label) VALUES (1, 1, 'a'), (2, 1, 'a'), (3, 2, 'b'), (4, 3, 'b'), (5, 3, 'b'), (6, NULL, NULL)")
+
+	testing.expect_value(t, scalar(t, store, "SELECT count(x) FROM d").i, i64(5))
+	testing.expect_value(t, scalar(t, store, "SELECT count(DISTINCT x) FROM d").i, i64(3))
+	testing.expect_value(t, scalar(t, store, "SELECT sum(DISTINCT x) FROM d").i, i64(6))
+	testing.expect_value(t, scalar(t, store, "SELECT avg(DISTINCT x) FROM d").f, f64(2))
+	testing.expect_value(t, scalar(t, store, "SELECT min(DISTINCT x) FROM d").i, i64(1))
+	testing.expect_value(t, scalar(t, store, "SELECT max(DISTINCT x) FROM d").i, i64(3))
+	testing.expect_value(t, scalar(t, store, "SELECT count(DISTINCT label) FROM d").i, i64(2))
+	testing.expect_value(t, scalar(t, store, "SELECT group_concat(DISTINCT label) FROM d").s, "a,b")
+	// 1 and 1.0 compare equal, so a DISTINCT aggregate folds them once.
+	run(t, store, "CREATE TABLE mixed (x ANY)")
+	run(t, store, "INSERT INTO mixed VALUES (1), (1.0), (2), ('1')")
+	testing.expect_value(t, scalar(t, store, "SELECT count(DISTINCT x) FROM mixed").i, i64(3))
+
+	// A grouped DISTINCT aggregate and the streaming path (paged tables) agree
+	// with the collected one.
+	grouped := run(t, store, "SELECT label, count(DISTINCT x) AS n FROM d GROUP BY label ORDER BY label")
+	testing.expect_value(t, len(grouped.rows), 3)
+	db.sql_result_destroy(&grouped)
+
+	paged_path := "_test_agg_distinct_paged"
+	os.remove_all(paged_path)
+	defer os.remove_all(paged_path)
+	paged, open_err := db.store_open(paged_path, {
+		persistent  = true,
+		create      = true,
+		durable     = false,
+		paged_tables = true,
+		page_frames = 4,
+	})
+	if !testing.expectf(t, db.error_ok(open_err), "open paged: %s", open_err.message) do return
+	defer db.store_close(paged)
+	run(t, paged, "CREATE TABLE p (id INTEGER PRIMARY KEY, x INTEGER)")
+	run(t, paged, "INSERT INTO p VALUES (1, 1), (2, 1), (3, 2), (4, 2), (5, 3)")
+	testing.expect_value(t, scalar(t, paged, "SELECT count(DISTINCT x) FROM p").i, i64(3))
+	testing.expect_value(t, scalar(t, paged, "SELECT sum(DISTINCT x) FROM p").i, i64(6))
+}

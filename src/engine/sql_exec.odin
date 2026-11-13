@@ -1455,6 +1455,11 @@ Agg_Acc :: struct {
 	has_text:   bool,
 	separator:  string,
 	sep_owned:  bool,
+	// keys remembers the values a DISTINCT aggregate has already seen, so a
+	// repeated one is skipped instead of folded twice. `fold_distinct` is a
+	// separate flag because a map value cannot be compared against nil in Odin.
+	keys:          map[string]bool,
+	fold_distinct: bool,
 }
 
 // Agg_Stream is the set of aggregates a streaming scan is accumulating, plus the
@@ -1473,6 +1478,7 @@ agg_stream_destroy :: proc(stream: ^Agg_Stream) {
 		value_deep_free(acc.best, context.allocator)
 		if acc.builder.buf != nil do strings.builder_destroy(&acc.builder)
 		if acc.sep_owned do delete(acc.separator)
+		delete(acc.keys)
 	}
 	delete(stream.accs)
 	free_values(stream.first_values)
@@ -1502,6 +1508,13 @@ agg_stream_add :: proc(row_ctx: ^Eval_Ctx, stream: ^Agg_Stream) -> Error {
 		value, value_err := eval_expr(row_ctx, acc.call.args[0])
 		if value_err.kind != .None do return value_err
 		if value.kind == .Null do continue
+		if acc.fold_distinct {
+			key := agg_distinct_key(value)
+			_, repeated := acc.keys[key]
+			if !repeated do acc.keys[key] = true
+			delete(key)
+			if repeated do continue
+		}
 		acc.seen += 1
 		switch acc.name {
 		case "count":
@@ -1736,7 +1749,9 @@ sql_exec_stream_select :: proc(
 			}
 		}
 		aggregate = true
-		append(&stream.accs, Agg_Acc{call = call, name = strings.to_lower(call.name)})
+		acc := Agg_Acc{call = call, name = strings.to_lower(call.name), fold_distinct = call.is_distinct}
+		if acc.fold_distinct do acc.keys = make(map[string]bool)
+		append(&stream.accs, acc)
 	}
 
 	limit := -1
@@ -2637,6 +2652,26 @@ Output_Key :: proc(values: []Value) -> string {
 @(private)
 encode_output_key :: proc(values: []Value) -> string {
 	return encode_output_key_alloc(values, context.allocator)
+}
+
+// agg_distinct_key encodes one aggregate argument so a value a DISTINCT
+// aggregate already folded can be skipped. Numbers that compare equal key the
+// same even across kinds: an integral float keys as its integer, the way SQLite
+// compares them, so count(DISTINCT x) over 1 and 1.0 answers one.
+@(private)
+agg_distinct_key :: proc(value: Value) -> string {
+	INTEGRAL_LIMIT :: f64(9.0e18)
+	switch value.kind {
+	case .Float:
+		if value.f >= -INTEGRAL_LIMIT && value.f <= INTEGRAL_LIMIT {
+			whole := i64(value.f)
+			if f64(whole) == value.f do return encode_output_key([]Value{value_int(whole)})
+		}
+	case .Uint:
+		if value.u <= u64(0x7fff_ffff_ffff_ffff) do return encode_output_key([]Value{value_int(i64(value.u))})
+	case .Null, .Default, .Int, .Int128, .Uint128, .Bool, .String, .Bytes, .Timestamp, .Duration, .Uuid, .Identity, .Connection, .Array, .Product:
+	}
+	return encode_output_key([]Value{value})
 }
 
 // encode_output_key_alloc is encode_output_key with an explicit allocator, so a
@@ -3720,12 +3755,23 @@ eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 			return value_int(i64(len(rows))), ERROR_NONE
 		}
 		count := 0
+		keys: map[string]bool
+		if call.is_distinct do keys = make(map[string]bool)
+		defer delete(keys)
 		for sources in rows {
 			sub := ctx^
 			sub.sources = sources
 			value, eval_err := eval_expr(&sub, call.args[0])
 			if eval_err.kind != .None do return {}, eval_err
-			if value.kind != .Null do count += 1
+			if value.kind == .Null do continue
+			if call.is_distinct {
+				key := agg_distinct_key(value)
+				_, repeated := keys[key]
+				if !repeated do keys[key] = true
+				delete(key)
+				if repeated do continue
+			}
+			count += 1
 		}
 		return value_int(i64(count)), ERROR_NONE
 	}
@@ -3748,12 +3794,22 @@ eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		builder := strings.builder_make()
 		defer strings.builder_destroy(&builder)
 		seen_any := false
+		keys: map[string]bool
+		if call.is_distinct do keys = make(map[string]bool)
+		defer delete(keys)
 		for sources in rows {
 			sub := ctx^
 			sub.sources = sources
 			value, eval_err := eval_expr(&sub, call.args[0])
 			if eval_err.kind != .None do return {}, eval_err
 			if value.kind == .Null do continue
+			if call.is_distinct {
+				key := agg_distinct_key(value)
+				_, repeated := keys[key]
+				if !repeated do keys[key] = true
+				delete(key)
+				if repeated do continue
+			}
 			if seen_any do strings.write_string(&builder, separator)
 			piece := value_format(value, context.allocator)
 			strings.write_string(&builder, piece)
@@ -3771,6 +3827,9 @@ eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 	sum_128 := i128(0)
 	uses_float := false
 	uses_128 := false
+	keys: map[string]bool
+	if call.is_distinct do keys = make(map[string]bool)
+	defer delete(keys)
 	for sources in rows {
 		sub := ctx^
 		sub.sources = sources
@@ -3780,6 +3839,13 @@ eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		value, eval_err := eval_expr(&sub, call.args[0])
 		if eval_err.kind != .None do return {}, eval_err
 		if value.kind == .Null do continue
+		if call.is_distinct {
+			key := agg_distinct_key(value)
+			_, repeated := keys[key]
+			if !repeated do keys[key] = true
+			delete(key)
+			if repeated do continue
+		}
 		seen += 1
 		switch name {
 		case "min":
