@@ -297,21 +297,36 @@ than 1000 bytes cannot be indexed and the insert says so.
 - **Schema changes.** `ALTER TABLE` renames the table, adds and drops columns,
   and renames a column (keeping the rows and the indexes); text that names a
   column is not rewritten.
-- **Trigger `WHEN`.** A trigger may carry a condition over `NEW` and `OLD`; a
-  false or NULL condition skips it for that row. `BEFORE` triggers are still
-  refused.
-- **Window frames.** `ROWS BETWEEN … AND …` works for aggregates and value
-  functions; `RANGE`/`GROUPS` are refused with a message. A window beside
-  `GROUP BY` is refused.
-- **Ordering.** `ORDER BY` sorts after projection. It does not read an index
-  order; `LIMIT` stops a paged scan early but not a memory one.
+- **Triggers.** `BEFORE` and `AFTER` for `INSERT`, `UPDATE` and `DELETE`, with
+  `WHEN`, `NEW` and `OLD`; a `BEFORE` body that fails stops the write. A
+  column-specific (`OF`) trigger is refused.
+- **Window frames.** `ROWS`, `RANGE` and `GROUPS` work for aggregates and value
+  functions, with offsets measured in the ordering value where the unit says so.
+  A window beside `GROUP BY` is refused, and so is `FILTER (WHERE …)`.
+- **Ordering.** `ORDER BY` sorts after projection, and reads an index order when
+  the clause names a whole index key in one direction (`LIMIT` then stops the
+  walk early); otherwise it sorts.
 - **Types.** One 64-bit integer width, one float width, no decimal, no
   interval, no nested row types in columns.
 - **Memory.** Deleted rows are freed, but index key bytes stay in the table
   arena until the table is dropped or the process exits. There is no arena
   reset.
-- **Cancellation.** A long query holds the read lock until it finishes. There
-  is no statement timeout or cancel handle.
+- **Cancellation.** `store_cancel` ends a running statement with `.Cancelled` and
+  is tested, but nothing outside the tests calls it: the CLI, the server and the C
+  ABI have no cancel handle or statement timeout, and `store_set_work_budget` is
+  in the same state. A long query holds the read lock until it finishes.
+- **Limits.** An expression nested about two hundred deep is a stack overflow that
+  ends the process rather than a parse error, and `max_rows_per_query` is read
+  after the rows exist, so it cannot prevent the memory it exists to cap
+  (`AUDIT-9` A4/A5, backlog D23).
+- **The server serves one client at a time.** `serve` never returns while a
+  WebSocket subscription is open, so a subscriber blocks every other client; and
+  a wire request runs under whatever identity its token named, including none,
+  which leaves DDL, `ATTACH` and `LOAD EXTENSION` open to any client unless grants
+  were created (`AUDIT-9` A1/A2, backlog D22).
+- **A mirrored `.sqlite` file is exact for rows and unproven for DDL.**
+  `DROP TABLE` on a table that held rows leaves the file malformed for `sqlite3`,
+  and an imported file's indexes are not read (`AUDIT-9` A3/B2, backlog D24).
 
 ## Not implemented: a second writer, and replication
 

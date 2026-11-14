@@ -20,7 +20,7 @@ script lists.
 | Feature | Status | Notes |
 |---|---|---|
 | Header, page size, encoding | done | 512..65536 pages, reserved bytes, UTF-8 |
-| sqlite_master and schema SQL | done | tables and their CREATE statements |
+| sqlite_master and schema SQL | done | tables and their CREATE statements; **an imported file's indexes are not read**, so a plan scans and `DROP INDEX` fails (backlog D24) |
 | Table b-trees, leaf and interior | done | rowid tables, multi-level trees |
 | WITHOUT ROWID (index b-trees) | done | read path |
 | Varints and serial types | done | all widths, 0/1 shortcuts, floats, text, blob |
@@ -50,7 +50,7 @@ script lists.
 | VACUUM / ANALYZE / REINDEX | partial | `compact` is the engine's VACUUM, `VACUUM INTO` writes a copy, `ANALYZE` measures statistics; `REINDEX` does not exist |
 | PRAGMA | partial | four classes below: 25 answer, 18 are accepted as no-ops, 11 are refused |
 | EXPLAIN / EXPLAIN QUERY PLAN | partial | `EXPLAIN` prints the chosen access path, the estimate and the join order; there is no `EXPLAIN QUERY PLAN` row format |
-| CREATE TRIGGER | done | `AFTER` triggers with `WHEN`, `NEW` and `OLD`; `BEFORE` is refused |
+| CREATE TRIGGER | done | `BEFORE` and `AFTER` triggers with `WHEN`, `NEW` and `OLD`; a `BEFORE` body that fails stops the write. Column-specific (`OF`) triggers are refused |
 | CREATE VIRTUAL TABLE (FTS5, R-Tree) | done | FTS5 with BM25, `snippet` and `highlight`; spatial tables store their boxes as columns |
 | GENERATED / STRICT / WITHOUT ROWID DDL | partial | `GENERATED … STORED` and `STRICT` work; `WITHOUT ROWID` is refused for writing and supported for reading |
 | `ANY` columns (dynamic typing) | done | storage classes kept per value, `typeof()` reports them |
@@ -68,7 +68,7 @@ script lists.
 | LIKE, GLOB, ESCAPE | done | LIKE ignores ASCII case; GLOB is exact with `*`, `?`, `[...]` |
 | `||` string concatenation | done | tested with text and numbers |
 | COLLATE (BINARY, NOCASE, RTRIM) | done | on a column, in comparisons, in unique keys and index probes |
-| Window functions, FILTER | partial | `OVER` with `PARTITION BY`/`ORDER BY` and `ROWS BETWEEN`; `RANGE`/`GROUPS` are refused, and aggregate `FILTER (WHERE …)` is not implemented |
+| Window functions, FILTER | partial | `OVER` with `PARTITION BY`/`ORDER BY` and `ROWS`/`RANGE`/`GROUPS` frames; aggregate `FILTER (WHERE …)` is not implemented, and windows beside `GROUP BY` are refused |
 | Foreign keys | done | `ON DELETE`/`ON UPDATE` `RESTRICT`/`CASCADE`, enforced on every path |
 | `AS OF <seq>` | done | engine extension: read a table as it was |
 
@@ -172,10 +172,14 @@ file**, so it stays a SQLite database another driver can read and
 the leaf of each changed row, the separator its parent stores, and page 1 — three
 pages (12 KiB) at any table size; `docs/file-format.md` describes the layout, the
 free list and the rollback journal that makes a torn commit harmless. The commit
-log is still the truth. A table with a secondary index, a schema change, a file
-with a write-ahead log and a tree deeper than three levels re-encode the whole
-file instead (`scripts/mirror_cost.py --check` measures it). A failed mirror write
-is reported through `last_error` and never fails the commit.
+log is still the truth. A table with a secondary index, a file with a
+write-ahead log, a tree deeper than three levels **or any schema change**
+re-encode the whole file instead (`scripts/mirror_cost.py --check` measures it).
+That full rewrite is the path a `DROP TABLE` takes, and it is where the audit
+found a file left malformed for `sqlite3` when the dropped table held rows
+(backlog D24): treat the mirror as exact for rows and *unproven* for DDL until
+that item says otherwise. A failed mirror write is reported through `last_error`
+and never fails the commit.
 
 ## Export determinism
 
