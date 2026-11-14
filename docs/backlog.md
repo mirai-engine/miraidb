@@ -724,7 +724,19 @@ carries the caller's identity while a statement executes (`store_set_identity`),
 so two statements at once would see each other's. A slow query therefore queues
 the others rather than running beside them, which is what step 2 is for.
 
-**Still open: who may ask, and what bounds one statement.**
+**Done: the host-touching statements.** `ATTACH`, `LOAD EXTENSION` and
+`VACUUM INTO` name a path or a module the client chose, so the server refuses
+them with `Permission_Denied` unless it was started with `--allow-host`
+(`Store.host_access`, set from the server; an embedded open starts with it on).
+`test_host_statements_need_host_access` proves the refusal, the unchanged commit
+sequence, that reading/writing/DDL still work, and that turning it back on
+restores the statement; `broker_smoke.py` proves it over the wire. `docs/security.md`
+is the written model: what a token buys, that grants are opt-in, and what is not
+defended. The gate also turned up a bug in the gate itself: `decode` in
+`broker_smoke.py` read the error *kind* as the message length, so no error text
+had ever been matched.
+
+**Still open: what bounds one statement, and who a token-less client is.**
 
 **Second half: who may ask.** A wire request runs under the connection's identity,
 and identity is whatever the bearer token said — or nothing. Grants are opt-in:

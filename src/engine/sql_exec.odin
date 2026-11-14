@@ -130,6 +130,7 @@ sql_run_statement :: proc(store: ^Store, statement: Statement, params: []Value) 
 	case Vacuum_Stmt:
 		return sql_exec_vacuum(store, stmt)
 	case Attach_Stmt:
+		if !store.host_access do return {}, host_access_refusal("ATTACH")
 		return sql_exec_attach(store, stmt)
 	case Detach_Stmt:
 		return sql_exec_detach(store, stmt)
@@ -206,6 +207,9 @@ sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value) 
 // sql_exec_vacuum compacts the live log, or writes a compacted copy.
 @(private)
 sql_exec_vacuum :: proc(store: ^Store, stmt: Vacuum_Stmt) -> (Sql_Result, Error) {
+	if len(stmt.path) != 0 && !store.host_access {
+		return {}, host_access_refusal("VACUUM INTO")
+	}
 	if len(stmt.path) == 0 {
 		if compact_err := store_compact(store); compact_err.kind != .None {
 			return {}, compact_err
@@ -224,6 +228,9 @@ sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sq
 		// ANALYZE needs the tables, not the transaction: it belongs to the store.
 		return {}, errf(.Sql_Not_A_Query, "ANALYZE does not run inside a transaction")
 	case Load_Extension_Stmt:
+		if !stmt.unload && !tx.store.host_access {
+			return {}, host_access_refusal("LOAD EXTENSION")
+		}
 		if stmt.unload {
 			if unload_err := extension_unload(tx, stmt.name, stmt.if_exists); unload_err.kind != .None {
 				return {}, unload_err

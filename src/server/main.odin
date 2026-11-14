@@ -15,7 +15,12 @@ import db "../engine"
 USAGE :: `miraidb-server - HTTP front end for a miraidb database
 
 Usage:
-  miraidb-server <database> [--port=8080] [--any]
+  miraidb-server <database> [--port=8080] [--any] [--allow-host]
+
+The three statements that reach outside the database are refused to clients
+unless --allow-host is given: ATTACH reads a file path, LOAD EXTENSION runs host
+code, and VACUUM INTO writes a file. A client can name any path or module, so the
+default is to believe none of them.
 
 Each connection is served on its own thread, so a subscription that stays open
 does not stop another client from connecting. Statements are still run one at a
@@ -37,6 +42,7 @@ main :: proc() {
 	path := ""
 	port := 8080
 	any_interface := false
+	allow_host := false
 	for arg in os.args[1:] {
 		switch {
 		case strings.has_prefix(arg, "--port="):
@@ -48,6 +54,8 @@ main :: proc() {
 			port = int(parsed)
 		case arg == "--any":
 			any_interface = true
+		case arg == "--allow-host":
+			allow_host = true
 		case strings.has_prefix(arg, "-"):
 			fmt.eprintfln("miraidb-server: unknown option %s", arg)
 			os.exit(2)
@@ -65,6 +73,9 @@ main :: proc() {
 		os.exit(1)
 	}
 	defer db.store_close(store)
+	// The default refuses the statements that reach outside the database; a
+	// deployment that trusts every client it serves says so on the command line.
+	db.store_set_host_access(store, allow_host)
 	host := db.host_init(store)
 	defer db.host_destroy(host)
 	server := Server{host = host}

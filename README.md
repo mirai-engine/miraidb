@@ -76,6 +76,7 @@ miraidb/
 │   ├── features.md        the parity matrix and its execution order
 │   ├── roadmap.md         the plan: phases, what is asked for, what "done" means
 │   ├── backlog.md         depth work: what is shallow today and what "done" means
+│   ├── security.md        what the server trusts, refuses and does not defend
 │   └── status.md          what is done, partial and not started
 ├── CONTRIBUTING.md
 ├── LICENSE-APACHE
@@ -254,7 +255,8 @@ Design and reference:
 [architecture](docs/architecture.md) (modules, transactions, the value layout
 link below), [file-format](docs/file-format.md) (the log, snapshots, pages and
 the `.sqlite` mirror), [value-layout](docs/value-layout.md) (what a `Value` and
-a `Row` carry), [sql.md](docs/sql.md) (the SQL reference) and the SQLite
+a `Row` carry), [security.md](docs/security.md) (what the server trusts and
+refuses), [sql.md](docs/sql.md) (the SQL reference) and the SQLite
 compatibility documents: [sqlite.md](docs/sqlite.md) (what is done, partial or
 missing), [sqlite-roadmap.md](docs/sqlite-roadmap.md) and
 [sqlite-inventory.md](docs/sqlite-inventory.md) (generated from the reference).

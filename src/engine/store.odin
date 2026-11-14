@@ -100,6 +100,12 @@ Store :: struct {
 	// identity is the caller the policies see. A server would set it per
 	// connection; the embedded API sets it per store.
 	identity:      Identity,
+	// host_access allows the statements that reach outside the database: ATTACH
+	// reads a file path, LOAD EXTENSION runs host code, VACUUM INTO writes one.
+	// An embedded caller is the host and starts with it enabled; a server turns it
+	// off unless it was started to trust its clients, because these statements
+	// believe whatever path or module name the statement holds.
+	host_access:   bool,
 	// max_rows_per_query caps how many rows one SELECT may produce; zero is
 	// unlimited. Quotas are per store, so a host sets them per database.
 	max_rows_per_query: u64,
@@ -211,6 +217,7 @@ store_open :: proc(path: string, options: Store_Options) -> (^Store, Error) {
 	store.path = path
 	store.paged_tables = options.paged_tables
 	store.read_only = options.read_only
+	store.host_access = true
 	if store.read_only {
 		if options.create {
 			free(store)
@@ -1224,6 +1231,30 @@ store_set_row_quota :: proc(store: ^Store, max_rows: u64) {
 	sync.lock(&store.mutex)
 	store.max_rows_per_query = max_rows
 	sync.unlock(&store.mutex)
+}
+
+// store_set_host_access decides whether ATTACH, LOAD EXTENSION and VACUUM INTO
+// are allowed. A transport in front of the database turns it off unless the
+// deployment trusts every client it serves.
+store_set_host_access :: proc(store: ^Store, allowed: bool) {
+	sync.lock(&store.mutex)
+	defer sync.unlock(&store.mutex)
+	store.host_access = allowed
+}
+
+store_host_access :: proc(store: ^Store) -> bool {
+	return store.host_access
+}
+
+// host_access_refusal is the one message the three statements give when the
+// store was opened without host access, so a caller learns what to ask for.
+@(private)
+host_access_refusal :: proc(statement: string) -> Error {
+	return errf(
+		.Permission_Denied,
+		"%s is disabled for this database: it reaches outside it (backlog D22)",
+		statement,
+	)
 }
 
 store_row_quota :: proc(store: ^Store) -> u64 {

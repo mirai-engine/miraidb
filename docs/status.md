@@ -132,7 +132,7 @@ the gaps are named rather than left to be discovered.
   one schema, one set of rows and 55 queries through both engines, with the
   refusals and the intentional differences listed in the script.
 - `scripts/build.py` builds both binaries and runs the suite.
-- 238 integration tests covering CRUD, recovery, constraints, transactions,
+- 239 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
@@ -328,10 +328,14 @@ than 1000 bytes cannot be indexed and the insert says so.
   subscription delivered its snapshot and then nothing. Statements still run one
   at a time — the store carries the caller's identity while it executes — so a
   slow query queues the others instead of running beside them.
-  **What is still open:** a wire request runs under whatever identity its token
-  named, including none, which leaves DDL, `ATTACH` and `LOAD EXTENSION` open to
-  any client unless grants were created, and nothing bounds a statement's work or
-  lets the server cancel it (`AUDIT-9` A2/B4, backlog D22 steps 2-4).
+  **What it refuses:** `ATTACH`, `LOAD EXTENSION` and `VACUUM INTO` to a client,
+  because each names a path or a module the client chose; `--allow-host` turns
+  them back on for a deployment that trusts every client. Reading, writing and
+  DDL stay available, and grants still decide who may do them (a database with no
+  grants allows everyone, which is the default). `docs/security.md` states the
+  model. **What is still open:** nothing bounds a statement's work or lets the
+  server cancel it, and the transport is plain TCP (`AUDIT-9` B4, backlog D22
+  step 2, D23, D15).
 - **A mirrored `.sqlite` file is exact for rows and unproven for DDL.**
   `DROP TABLE` on a table that held rows leaves the file malformed for `sqlite3`,
   and an imported file's indexes are not read (`AUDIT-9` A3/B2, backlog D24).

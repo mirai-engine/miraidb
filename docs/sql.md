@@ -335,7 +335,10 @@ readable as `name.table`, including in joins and with three-part references
 table, so reopening the principal restores the set. `DETACH name` forgets it.
 Writes against an attached database are refused with
 `writes to an attached database are read-only`, and both statements are refused
-inside a transaction. Reading an attached table copies it whole for the
+inside a transaction. A database opened *without* host access refuses `ATTACH`
+with `Permission_Denied` before it looks at the path: the path is the caller's,
+not the operator's. `miraidb-server` opens without host access unless it was
+started with `--allow-host` (`docs/security.md`). Reading an attached table copies it whole for the
 statement, which is what keeps the read path free of a second consistency model.
 
 ## Extensions
@@ -351,6 +354,8 @@ UNLOAD EXTENSION notes;
 UNLOAD EXTENSION IF EXISTS notes;
 ```
 
+Like `ATTACH`, a load is refused with `Permission_Denied` when the database was
+opened without host access; `UNLOAD` stays allowed, because it only forgets.
 The row is kept in `_extension`, so a restart registers the extension again
 without connecting to it: a database whose extension is down still opens, and
 the extension's calls fail until it is back. The optional `USING` list names the

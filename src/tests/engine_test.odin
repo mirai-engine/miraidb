@@ -11694,3 +11694,64 @@ test_subscription_knows_its_connection :: proc(t: ^testing.T) {
 	// An id nobody created belongs to no connection, so nothing is written.
 	testing.expect_value(t, db.host_subscription_owner(host, first + second + 100), u64(0))
 }
+
+// A database served to clients refuses the statements that reach outside it: a
+// file path, a module, an export path. The embedded open still allows them,
+// because the embedded caller is the host.
+@(test)
+test_host_statements_need_host_access :: proc(t: ^testing.T) {
+	store := fresh_db(t, "hostaccess")
+	if store == nil do return
+	defer cleanup_db(store, "hostaccess")
+
+	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+	testing.expect(t, db.store_host_access(store))
+
+	// The file the two statements would name. ATTACH checks that it exists, so a
+	// missing path would fail for the wrong reason.
+	path := "_test_hostaccess_source.db"
+	_ = os.write_entire_file(path, "not a database")
+	defer os.remove(path)
+
+	allowed, allowed_err := db.sql_execute(
+		store,
+		strings.concatenate({"ATTACH '", path, "' AS attached"}),
+	)
+	testing.expectf(t, allowed_err.kind != .None || allowed.commit_seq > 0, "%v", allowed_err)
+
+	db.store_set_host_access(store, false)
+	testing.expect(t, !db.store_host_access(store))
+
+	// A refused statement changes nothing and says why.
+	before := store.commit_seq
+	refusals := []string{
+		strings.concatenate({"ATTACH '", path, "' AS again"}),
+		"LOAD EXTENSION nowhere AT '127.0.0.1:1'",
+		"VACUUM INTO '_test_hostaccess_out.db'",
+	}
+	defer os.remove("_test_hostaccess_out.db")
+	for sql in refusals {
+		_, err := db.sql_execute(store, sql)
+		testing.expectf(t, err.kind == .Permission_Denied, "%s answered %v", sql, err.kind)
+		testing.expectf(
+			t,
+			strings.contains(err.message, "disabled for this database"),
+			"%s said %q",
+			sql,
+			err.message,
+		)
+	}
+	testing.expect_value(t, store.commit_seq, before)
+
+	// Reading, writing and DDL stay available: they are the database, not the host.
+	run(t, store, "INSERT INTO t (v) VALUES ('still here')")
+	run(t, store, "CREATE TABLE other (id INTEGER)")
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t").i, i64(1))
+
+	// Turning it back on restores the statement: the switch is a policy, not a
+	// schema change.
+	db.store_set_host_access(store, true)
+	if _, again := db.sql_execute(store, strings.concatenate({"ATTACH '", path, "' AS third"})); again.kind == .Permission_Denied {
+		testing.expect(t, false)
+	}
+}

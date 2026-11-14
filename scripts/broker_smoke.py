@@ -9,7 +9,8 @@ the two claims broker mode makes:
   themselves, and each request carries the commit sequence it saw;
 * the owner is the only writer: a second server on the same directory is refused
   with `locked` and the owner's pid;
-* a client that subscribes over WebSocket keeps the connection open without
+* a client cannot reach outside the database (a file path, a module, an export),
+  and a subscription keeps the connection open without
   stopping anyone else, and a write from another client arrives as a delta on
   that socket (the commit happens on the writer's thread and the frame is written
   to the subscriber's socket under that socket's lock).
@@ -79,8 +80,12 @@ def read_value(data: bytes, at: int):
 def decode(data: bytes):
     kind = struct.unpack_from("<I", data, 0)[0]
     if kind == WIRE_ERROR:
-        size = struct.unpack_from("<I", data, 4)[0]
-        raise RuntimeError(data[8 : 8 + size].decode())
+        # The error message is kind, then the string: the length sits after the
+        # kind, not in its place. Reading the kind as the length (which this did)
+        # cut the message at the wrong byte and matched nothing.
+        error_kind = struct.unpack_from("<I", data, 4)[0]
+        size = struct.unpack_from("<I", data, 8)[0]
+        raise RuntimeError(f"{data[12 : 12 + size].decode()} (kind {error_kind})")
     assert kind == WIRE_RESULT, f"unexpected message kind {kind}"
     at = 4
     commit_seq = struct.unpack_from("<Q", data, at)[0]
@@ -327,6 +332,20 @@ def main() -> int:
         check("a later read sees the later write", after["rows"] == [[3]], str(after["rows"]))
         check("the commit sequence moved", after["commit_seq"] > first["commit_seq"], str(after["commit_seq"]))
 
+        # A client cannot reach outside the database unless the server was started
+        # to allow it: the path or module name would be the client's, not the
+        # operator's.
+        for statement, name in (
+            ("ATTACH '_broker_tmp/db' AS other", "attach a file"),
+            ("LOAD EXTENSION nowhere AT '127.0.0.1:1'", "load an extension"),
+            ("VACUUM INTO '_broker_tmp/out.db'", "write a file"),
+        ):
+            try:
+                post(port, statement)
+                check(f"a remote client cannot {name}", False, "it was allowed")
+            except RuntimeError as exc:
+                check(f"a remote client cannot {name}", "disabled for this database" in str(exc), str(exc))
+
         # A subscription stays open while another client works: before the server
         # served one connection at a time, this request never came back.
         subscriber, pending = ws_open(port)
@@ -347,8 +366,16 @@ def main() -> int:
                 reader = pool.submit(post, port, "SELECT count(*) AS n FROM notes")
                 write = writer.result(timeout=20)
                 read = reader.result(timeout=20)
-            check("another client is served beside a subscriber", read["rows"] == [[4]], str(read["rows"]))
+            # The two requests race, so the read may land before or after the
+            # write. What matters is that it answered at all: the subscriber was
+            # holding a connection open at the time.
+            check(
+                "another client is served beside a subscriber",
+                read["rows"] in ([[3]], [[4]]),
+                str(read["rows"]),
+            )
             check("the write committed", write["commit_seq"] > 0, str(write))
+            check("the write is there afterwards", post(port, "SELECT count(*) AS n FROM notes")["rows"] == [[4]])
 
             frames, pending = ws_read_frames(subscriber, pending, 1)
             delta = decode_delta(frames[0][1])
