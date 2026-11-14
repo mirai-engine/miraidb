@@ -10314,6 +10314,81 @@ plan_estimate :: proc(t: ^testing.T, store: ^db.Store, sql: string, params: []db
 }
 
 @(test)
+test_plan_reads_a_range_written_as_two_comparisons :: proc(t: ^testing.T) {
+	// `v >= a AND v < b` is one band of the table, so it is priced and answered
+	// like `v BETWEEN a AND b`: one range scan, not two filters that each keep a
+	// third of the rows and lose to the scan.
+	store := fresh_db(t, "range_plan")
+	if store == nil do return
+	defer cleanup_db(store, "range_plan")
+
+	run(t, store, "CREATE TABLE r (id INTEGER PRIMARY KEY, n INTEGER)")
+	insert := strings.builder_make()
+	defer strings.builder_destroy(&insert)
+	strings.write_string(&insert, "INSERT INTO r (n) VALUES ")
+	for i in 0 ..< 400 {
+		if i > 0 do strings.write_string(&insert, ", ")
+		fmt.sbprintf(&insert, "(%d)", i + 1)
+	}
+	run(t, store, strings.to_string(insert))
+	run(t, store, "CREATE INDEX r_n ON r (n)")
+	run(t, store, "ANALYZE r")
+
+	range_plan := plan_line_of(t, store, "EXPLAIN SELECT * FROM r WHERE n >= 100 AND n < 150")
+	between_plan := plan_line_of(t, store, "EXPLAIN SELECT * FROM r WHERE n BETWEEN 100 AND 149")
+	testing.expectf(t, strings.contains(range_plan, "using index r_n"), "range plan: %s", range_plan)
+	testing.expectf(t, strings.contains(between_plan, "using index r_n"), "between plan: %s", between_plan)
+	// The two spellings of the same band price the same.
+	testing.expectf(t, range_plan == between_plan, "range priced as %q, between as %q", range_plan, between_plan)
+
+	// The bounds keep their own inclusivity, and nothing outside the band arrives.
+	counts := [3]i64{0, 0, 0}
+	for sql, i in ([3]string{
+		"SELECT count(*) FROM r WHERE n >= 100 AND n < 150",
+		"SELECT count(*) FROM r WHERE n >= 100 AND n <= 150",
+		"SELECT count(*) FROM r WHERE 150 > n AND 100 <= n",
+	}) {
+		result, err := db.sql_execute(store, sql)
+		if testing.expectf(t, db.error_ok(err), "%s: %s", sql, err.message) {
+			counts[i] = result.rows[0][0].i
+			db.sql_result_destroy(&result)
+		}
+	}
+	testing.expect_value(t, counts[0], i64(50))
+	testing.expect_value(t, counts[1], i64(51))
+	// The bounds written the other way round are the same band.
+	testing.expect_value(t, counts[2], i64(50))
+
+	// The scan reads the band, not the table.
+	db.store_reset_rows_scanned(store)
+	result, err := db.sql_execute(store, "SELECT count(*) FROM r WHERE n >= 100 AND n < 150")
+	if testing.expectf(t, db.error_ok(err), "count: %s", err.message) {
+		testing.expect_value(t, result.rows[0][0].i, i64(50))
+		db.sql_result_destroy(&result)
+	}
+	testing.expectf(t, db.store_rows_scanned(store) <= 60, "the range read %d rows", db.store_rows_scanned(store))
+
+	// One end alone is still a superset the filter has to finish, and two ranges on
+	// two columns keep the per-column product.
+	one_end, one_err := db.sql_execute(store, "SELECT count(*) FROM r WHERE n >= 400")
+	if testing.expectf(t, db.error_ok(one_err), "one end: %s", one_err.message) {
+		testing.expect_value(t, one_end.rows[0][0].i, i64(1))
+		db.sql_result_destroy(&one_end)
+	}
+}
+
+@(private)
+plan_line_of :: proc(t: ^testing.T, store: ^db.Store, sql: string) -> string {
+	result, err := db.sql_execute(store, sql)
+	if !testing.expectf(t, db.error_ok(err), "%s: %s", sql, err.message) do return ""
+	defer db.sql_result_destroy(&result)
+	for row in result.rows {
+		if strings.has_prefix(row[0].s, "scan ") do return strings.clone(row[0].s)
+	}
+	return ""
+}
+
+@(test)
 test_plan_reads_a_bound_value :: proc(t: ^testing.T) {
 	// A prepared statement is priced with the value it was given, so `n < ?` keeps
 	// the same estimate as `n < 5` instead of falling back to a third of the table.

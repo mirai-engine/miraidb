@@ -132,7 +132,7 @@ the gaps are named rather than left to be discovered.
   one schema, one set of rows and 55 queries through both engines, with the
   refusals and the intentional differences listed in the script.
 - `scripts/build.py` builds both binaries and runs the suite.
-- 228 integration tests covering CRUD, recovery, constraints, transactions,
+- 229 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
@@ -260,10 +260,14 @@ than 1000 bytes cannot be indexed and the insert says so.
   (6 of them), measured over a 200 000-row table; the three constants in
   `plan.odin` are those numbers, written down with the measurement beside them, and
   an index therefore wins while it keeps under about a fifth of the table.
+- **A range written as two comparisons is one range.** `v >= a AND v < b` is priced
+  and answered exactly like `v BETWEEN a AND b`: one band of the table, one range
+  scan, each bound keeping its own inclusivity, and the bounds written the other way
+  round (`b > v AND a <= v`) are the same band
+  (`test_plan_reads_a_range_written_as_two_comparisons`). One range per estimate is
+  combined; two ranges on two different columns still multiply.
 - **What the planner still does not do.** The subscription path lays out its walk in
-  the written order rather than the planned one, and `v >= a AND v < b` is priced as
-  two independent filters (a scan) where `v BETWEEN a AND b` is priced as one range
-  (an index probe). Staleness is no longer silent: `EXPLAIN` reprices with the
+  the written order rather than the planned one. Staleness is no longer silent: `EXPLAIN` reprices with the
   numbers it has and names their age.
 - **A join the grammar does not implement is refused, not approximated.**
   `NATURAL`, `RIGHT` and `FULL` joins used to parse as an alias for the table

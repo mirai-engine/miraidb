@@ -250,8 +250,13 @@ stats_estimate_rows :: proc(
 	defer delete(conjuncts)
 	split_and(predicate, &conjuncts)
 	estimate := f64(stats.rows)
+	// A range written as two comparisons is one range, not two independent
+	// filters: `v >= 5 AND v < 9` keeps a band of the table, not two thirds of it.
+	range_low, range_high, range_fraction, has_range := stats_range_of(stats, table, conjuncts[:], params)
+	if has_range do estimate *= range_fraction
 	for expr in conjuncts {
 		if estimate <= 1 do break
+		if has_range && (expr == range_low || expr == range_high) do continue
 		if binary, is_binary := expr^.(Binary_Expr); is_binary {
 			estimate *= stats_binary_fraction(stats, table, binary, params)
 			continue
@@ -263,6 +268,122 @@ stats_estimate_rows :: proc(
 	}
 	_ = estimate
 	return u64(max(estimate, 1.0))
+}
+
+// stats_range_of finds the one range a predicate writes as two comparisons on the
+// same column and answers it as a band: which conjuncts hold the bounds, and the
+// share of the table between them. One range per estimate is enough to price a
+// plan; two independent ranges on two columns keep the per-conjunct product.
+@(private)
+stats_range_of :: proc(
+	stats: Table_Stats,
+	table: ^Table,
+	conjuncts: []^Expr,
+	params: []Value,
+) -> (
+	low_expr: ^Expr,
+	high_expr: ^Expr,
+	fraction: f64,
+	ok: bool,
+) {
+	column := -1
+	low: f64
+	high: f64
+	low_value: f64
+	high_value: f64
+	have_low := false
+	have_high := false
+	high_inclusive := true
+	for expr in conjuncts {
+		binary, is_binary := expr^.(Binary_Expr)
+		if !is_binary do continue
+		bound_column, number, lower, inclusive, bound_ok := stats_range_bound(table, binary, params)
+		if !bound_ok do continue
+		if column < 0 {
+			column = bound_column
+		} else if bound_column != column {
+			continue
+		}
+		if lower {
+			if !have_low || number > low_value {
+				low = number
+				low_value = number
+				low_expr = expr
+				have_low = true
+			}
+		} else {
+			if !have_high || number < high_value {
+				high = number
+				high_value = number
+				high_expr = expr
+				high_inclusive = inclusive
+				have_high = true
+			}
+		}
+	}
+	if column < 0 || !have_low || !have_high do return nil, nil, 1, false
+	if high < low do return low_expr, high_expr, 1.0 / f64(stats.rows), true
+	return low_expr, high_expr, stats_range_fraction(stats, column, low, high, high_inclusive), true
+}
+
+// stats_range_bound reads one comparison as a bound on a column.
+@(private)
+stats_range_bound :: proc(
+	table: ^Table,
+	binary: Binary_Expr,
+	params: []Value,
+) -> (
+	column: int,
+	number: f64,
+	lower: bool,
+	inclusive: bool,
+	ok: bool,
+) {
+	column = -1
+	#partial switch binary.op {
+	case .Gt:
+		lower = true
+	case .Ge:
+		lower = true
+		inclusive = true
+	case .Lt:
+		lower = false
+	case .Le:
+		lower = false
+		inclusive = true
+	case:
+		return column, 0, false, false, false
+	}
+	qualifier, column_name, value_expr, reversed, sides_ok := comparison_sides(binary)
+	if !sides_ok do return column, 0, false, false, false
+	if len(qualifier) > 0 && !strings.equal_fold(qualifier, table.schema.name) {
+		return column, 0, false, false, false
+	}
+	column_index, found := schema_column_index(&table.schema, column_name)
+	if !found do return column, 0, false, false, false
+	value, constant := eval_constant(value_expr, params)
+	if !constant do return column, 0, false, false, false
+	numeric, is_number := value_as_f64(value)
+	if !is_number do return column, 0, false, false, false
+	if reversed do lower = !lower
+	return column_index, numeric, lower, inclusive, true
+}
+
+// stats_range_fraction is the share of a table's rows a band keeps: everything
+// below `high`, less what is below `low`.
+@(private)
+stats_range_fraction :: proc(
+	stats: Table_Stats,
+	column: int,
+	low: f64,
+	high: f64,
+	high_inclusive: bool,
+) -> f64 {
+	if stats.rows == 0 || column < 0 || column >= len(stats.columns) do return 1
+	below_high := stats_rows_below(stats, column, high, high_inclusive)
+	below_low := stats_rows_below(stats, column, low, false)
+	kept := below_high - min(below_high, below_low)
+	return f64(max(kept, 1)) / f64(stats.rows)
 }
 
 // stats_binary_fraction is the share of a table's rows one comparison keeps.
@@ -342,10 +463,7 @@ stats_between_fraction :: proc(
 	low, low_number := value_as_f64(low_value)
 	high, high_number := value_as_f64(high_value)
 	if !low_ok || !high_ok || !low_number || !high_number do return 0.25
-	below_high := stats_rows_below(stats, column_index, high, true)
-	below_low := stats_rows_below(stats, column_index, low, false)
-	kept := below_high - min(below_high, below_low)
-	return f64(max(kept, 1)) / f64(stats.rows)
+	return stats_range_fraction(stats, column_index, low, high, true)
 }
 
 // value_as_f64 reads a value as a number for histogram work. It is statistics

@@ -32,6 +32,9 @@
   `FLOAT` key, a paged table) falls back to the full evaluation.
 - A join subscription walks the tables it reads instead of copying every row of
   them into the transaction arena, which was 80 bytes a row per commit.
+- A range written as two comparisons is priced and answered as one: `v >= a AND
+  v < b` now costs what `v BETWEEN a AND b` costs, one range scan over the band,
+  instead of two independent filters that lost to a scan.
 - The planner's cost constants are measured instead of assumed: over a 200 000-row
   table a scan row costs 100.8 ns, a row fetched through an index 456.3 ns and one
   descent through the tree 600 ns, so `PLAN_SCAN_ROW` is 1, `PLAN_INDEX_ROW` 4.5 and

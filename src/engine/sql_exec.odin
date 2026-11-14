@@ -5216,10 +5216,103 @@ index_candidates :: proc(
 	// and hands back the cheapest one, or none when the scan wins.
 	plan := plan_access(tx.store, table, Table_Ref{name = table_name, alias = table_alias}, predicate, params)
 	if plan.kind != .Index do return nil, false
-	if candidates, ok := candidates_from_conjunct(plan.conjunct, table, table_alias, plan.index, params); ok {
+	// Both ends of a range travel together: `v >= 5 AND v < 9` is one scan over
+	// [5, 9), which is what the plan priced.
+	conjunct, companion := plan.conjunct, plan.conjunct2
+	if candidates, ok := candidates_from_range(conjunct, companion, table, table_alias, plan.index, params); ok {
 		return candidates, true
 	}
 	return nil, false
+}
+
+// candidates_from_range answers one comparison, or two that share a column, with
+// one index scan: the lower bound is where it starts and the upper bound where it
+// stops, each keeping the operator's own inclusivity. Anything else falls back to
+// the single-comparison path.
+@(private)
+candidates_from_range :: proc(
+	expr: ^Expr,
+	companion: ^Expr,
+	table: ^Table,
+	table_alias: string,
+	index_position: int,
+	params: []Value,
+) -> ([dynamic]Row_Id, bool) {
+	if companion == nil {
+		return candidates_from_conjunct(expr, table, table_alias, index_position, params)
+	}
+	first, first_ok := range_key(table, table_alias, expr, params)
+	second, second_ok := range_key(table, table_alias, companion, params)
+	if !first_ok || !second_ok {
+		if first_ok do delete(first.key)
+		if second_ok do delete(second.key)
+		return nil, false
+	}
+	defer delete(first.key)
+	defer delete(second.key)
+	if first.lower == second.lower do return nil, false
+	low := first
+	high := second
+	if !first.lower {
+		low = second
+		high = first
+	}
+	return table_index_scan(table, index_position, string(low.key), string(high.key), high.inclusive), true
+}
+
+// Range_Key is one end of a range as the index needs it: the encoded boundary, and
+// whether it holds the rows above or below it.
+@(private)
+Range_Key :: struct {
+	key:       []u8,
+	lower:     bool,
+	inclusive: bool,
+}
+
+@(private)
+range_key :: proc(
+	table: ^Table,
+	table_alias: string,
+	expr: ^Expr,
+	params: []Value,
+) -> (Range_Key, bool) {
+	binary, is_binary := expr^.(Binary_Expr)
+	if !is_binary do return {}, false
+	lower: bool
+	inclusive: bool
+	#partial switch binary.op {
+	case .Gt:
+		lower = true
+	case .Ge:
+		lower = true
+		inclusive = true
+	case .Lt:
+		lower = false
+	case .Le:
+		lower = false
+		inclusive = true
+	case:
+		return {}, false
+	}
+	qualifier, column_name, value_expr, reversed, sides_ok := comparison_sides(binary)
+	if !sides_ok do return {}, false
+	if len(qualifier) > 0 &&
+	   !strings.equal_fold(qualifier, table.schema.name) &&
+	   !(len(table_alias) > 0 && strings.equal_fold(qualifier, table_alias)) {
+		return {}, false
+	}
+	column_index, found := schema_column_index(&table.schema, column_name)
+	if !found do return {}, false
+	value, constant := eval_constant(value_expr, params)
+	if !constant do return {}, false
+	coerced, coerce_err := value_coerce(value, table.schema.columns[column_index].type)
+	if coerce_err.kind != .None do return {}, false
+	if len(table.schema.columns[column_index].collation) > 0 {
+		coerced = collate_ordered_value(coerced, table.schema.columns[column_index].collation)
+	}
+	// `5 < v` is the lower bound written the other way round.
+	if reversed do lower = !lower
+	return Range_Key{key = value_key_bytes(coerced), lower = lower, inclusive = inclusive}, true
 }
 
 // select_filters_rows reports whether the rows of a table can be dropped after the

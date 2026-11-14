@@ -41,8 +41,11 @@ Plan_Access :: struct {
 	kind:     Plan_Kind,
 	index:    int,     // position in table.indexes, -1 for a scan
 	conjunct: ^Expr,   // the predicate the index answers, nil for a scan
-	rows:     u64,     // rows the relation keeps
-	cost:     f64,
+	// conjunct2 is the other end of a range: `v >= 5 AND v < 9` is one scan over
+	// [5, 9) rather than two filters that each keep a third of the table.
+	conjunct2: ^Expr,
+	rows:      u64,    // rows the relation keeps
+	cost:      f64,
 }
 
 // plan_access picks between scanning a table and probing one of its indexes.
@@ -92,17 +95,143 @@ plan_access :: proc(
 		// What this index hands over, not what the whole predicate keeps: the
 		// filter that is left runs anyway.
 		kept := stats_estimate_rows(store, table, expr, params)
+		companion: ^Expr = nil
+		if !is_equality(expr) {
+			if other, found := plan_range_companion(table, ref, expr, conjuncts[:]); found {
+				companion = other
+				kept = plan_range_rows(store, table, ref, expr, other, params, kept)
+			}
+		}
 		cost := PLAN_PROBE + f64(kept) * PLAN_INDEX_ROW
 		if cost >= best.cost do continue
 		best = Plan_Access {
-			kind     = .Index,
-			index    = index_position,
-			conjunct = expr,
-			rows     = rows,
-			cost     = cost,
+			kind      = .Index,
+			index     = index_position,
+			conjunct  = expr,
+			conjunct2 = companion,
+			rows      = rows,
+			cost      = cost,
 		}
 	}
 	return best
+}
+
+// is_equality reports whether a conjunct is an equality, which no second end can
+// narrow.
+@(private)
+is_equality :: proc(expr: ^Expr) -> bool {
+	binary, is_binary := expr^.(Binary_Expr)
+	if !is_binary do return false
+	return binary.op == .Eq
+}
+
+// plan_range_companion finds the other end of a range among the conjuncts: the
+// same column, the opposite direction. `v >= 5 AND v < 9` becomes one range scan
+// instead of two filters that each keep a third of the table.
+@(private)
+plan_range_companion :: proc(
+	table: ^Table,
+	ref: Table_Ref,
+	expr: ^Expr,
+	conjuncts: []^Expr,
+) -> (^Expr, bool) {
+	bound, ok := plan_range_bound(table, ref, expr)
+	if !ok do return nil, false
+	for other in conjuncts {
+		if other == expr do continue
+		theirs, theirs_ok := plan_range_bound(table, ref, other)
+		if !theirs_ok || theirs.column != bound.column do continue
+		if theirs.lower == bound.lower do continue
+		return other, true
+	}
+	return nil, false
+}
+
+// Range_Bound is one comparison a plan can read: which column, and whether it
+// holds the rows below or above its value.
+@(private)
+Range_Bound :: struct {
+	column: int,
+	lower:  bool,
+}
+
+@(private)
+plan_range_bound :: proc(table: ^Table, ref: Table_Ref, expr: ^Expr) -> (Range_Bound, bool) {
+	binary, is_binary := expr^.(Binary_Expr)
+	if !is_binary do return {}, false
+	lower: bool
+	#partial switch binary.op {
+	case .Gt, .Ge:
+		lower = true
+	case .Lt, .Le:
+		lower = false
+	case:
+		return {}, false
+	}
+	qualifier, column_name, _, reversed, sides_ok := comparison_sides(binary)
+	if !sides_ok do return {}, false
+	if !plan_names_relation(qualifier, ref) do return {}, false
+	column_index, found := schema_column_index(&table.schema, column_name)
+	if !found do return {}, false
+	// `5 < v` is a lower bound written the other way round.
+	if reversed do lower = !lower
+	return Range_Bound{column = column_index, lower = lower}, true
+}
+
+// plan_range_rows estimates what both ends of a range keep, through the same
+// histogram the single comparison used.
+@(private)
+plan_range_rows :: proc(
+	store: ^Store,
+	table: ^Table,
+	ref: Table_Ref,
+	first: ^Expr,
+	second: ^Expr,
+	params: []Value,
+	fallback: u64,
+) -> u64 {
+	stats, has_stats := stats_get(store, table.schema.name)
+	if !has_stats || stats.rows == 0 do return fallback
+	low: f64
+	high: f64
+	high_inclusive := true
+	column := -1
+	have_low := false
+	have_high := false
+	for expr in ([]^Expr{first, second}) {
+		binary, is_binary := expr^.(Binary_Expr)
+		if !is_binary do continue
+		qualifier, column_name, value_expr, reversed, sides_ok := comparison_sides(binary)
+		if !sides_ok || !plan_names_relation(qualifier, ref) do continue
+		column_index, found := schema_column_index(&table.schema, column_name)
+		if !found || column_index >= len(stats.columns) do continue
+		if !stats.columns[column_index].numeric do return fallback
+		value, constant := eval_constant(value_expr, params)
+		number, is_number := value_as_f64(value)
+		if !constant || !is_number do return fallback
+		lower: bool
+		#partial switch binary.op {
+		case .Gt, .Ge:
+			lower = true
+		case .Lt, .Le:
+			lower = false
+		case:
+			return fallback
+		}
+		if reversed do lower = !lower
+		column = column_index
+		if lower {
+			low = number
+			have_low = true
+		} else {
+			high = number
+			have_high = true
+			high_inclusive = binary.op == .Le
+		}
+	}
+	if column < 0 || !have_low || !have_high do return fallback
+	fraction := stats_range_fraction(stats, column, low, high, high_inclusive)
+	return u64(max(fraction * f64(stats.rows), 1))
 }
 
 // plan_conjunct_column returns the column a conjunct filters on, when the
