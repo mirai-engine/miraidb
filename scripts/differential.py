@@ -9,8 +9,9 @@ unit suite cannot see because it asserts what its author expected.
 
 Three lists keep it honest:
 
-- `QUERIES` must answer identically (order matters when the query says
-  `ORDER BY`, otherwise the rows are compared as a multiset).
+- `QUERIES` must answer identically: values *and* types (order matters when the
+  statement's own top-level `ORDER BY` decides it, otherwise the rows are
+  compared as a multiset).
 - `REFUSED` must fail in this engine and succeed in SQLite, with the stated
   reason. A refusal that stops refusing fails the gate, so the list shrinks as
   the engine grows.
@@ -142,6 +143,35 @@ QUERIES = [
     "UPDATE kv SET v = 5 WHERE k = 'b' RETURNING k, v",
     "SELECT k, v FROM kv ORDER BY k",
     "SELECT k, old_v, new_v FROM audit ORDER BY id",
+    # Edge cases the second audit pass measured. A text is a number where truth
+    # is asked, a position is a character, and a real keeps its type.
+    "SELECT substr('abcdef', -3), substr('abcdef', 2, -2), substr('abcdef', 0, 3)",
+    "SELECT substr('abcdef', -99), substr('abcdef', 99), substr('abcdef', 3, 0)",
+    "SELECT length(char(233) || 'llo'), instr(char(233) || 'llo', 'llo'), substr(char(233) || 'llo', 2, 2)",
+    "SELECT 1 WHERE 'a'",
+    "SELECT 1 WHERE '1'",
+    "SELECT count(*) FROM nums WHERE t",
+    "SELECT typeof(1.0), typeof(1), typeof('1'), typeof(x'00')",
+    "SELECT 1.0, 1, 1.5, 0.1 + 0.2",
+    "SELECT -0.0, 0.0",
+    # A window's own ORDER BY does not order the result: these rows come back in
+    # an unspecified order and must compare as a multiset (AUDIT-10 P-B4).
+    "SELECT n, row_number() OVER (ORDER BY n) FROM nums",
+    "SELECT n, rank() OVER (ORDER BY n) FROM nums",
+    "SELECT n, lag(n) OVER (ORDER BY n) FROM nums",
+    "SELECT n, sum(n) OVER (PARTITION BY m ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM nums",
+    # Scalar edges around casting, rounding, rendering and formatting.
+    "SELECT CAST('12' AS INTEGER), CAST(2.9 AS INTEGER), CAST('2.9' AS REAL)",
+    "SELECT round(1.5), round(2.5), round(-2.5)",
+    "SELECT hex(x'00ff'), hex('abc'), quote(1.5), quote(NULL)",
+    "SELECT json_extract('{\"a\":{\"b\":2}}', '$.a.b'), json_type('[]'), json_type('1'), json_type('1.0')",
+    "SELECT date('2020-01-01', '+1 day'), strftime('%Y-%m', '2020-05-06')",
+    "SELECT printf('%05.2f', 3.14159), 3.0 = 3",
+    "SELECT printf('%05.2f|%-5s|%+.3d|%x|%.2e|%q', 3.14159, 'ab', 7, 255, 1234.5, 'it''s')",
+    "SELECT printf('%10.4f|%-10.4f|%08x|%g', 3.14159265, 3.14159265, 255, 1000000.0)",
+    # NULLs sort first in both engines, and a SUM of integers stays an integer.
+    "SELECT n, m FROM nums ORDER BY m",
+    "SELECT typeof(SUM(n)) FROM nums",
 ]
 
 # The engine refuses these and says why; SQLite answers them. A refusal that
@@ -154,11 +184,16 @@ REFUSED = {
     "SELECT * FROM (SELECT id FROM emp) AS sub": "a subquery in FROM is not supported",
     "SELECT id FROM emp WHERE EXISTS (SELECT 1 FROM dept WHERE dept.id = emp.dept)": "a correlated reference is not resolved (features.md E2)",
 
+    "SELECT sum(n) FILTER (WHERE n > 1) FROM nums": "an aggregate FILTER is not implemented; windows accept one",
+
 }
 
 # Both engines answer, differently, on purpose. These are the decisions listed
 # in docs/sqlite.md; if one converges, the entry is stale.
 DIFFERENT = {
+    "SELECT upper(char(233)), lower(char(201))": "SQLite folds ASCII only; this engine applies Unicode case mapping",
+    "SELECT CAST('12abc' AS INTEGER)": "a cast takes a whole number here, the numeric prefix in SQLite",
+    "SELECT printf('%.0f', 2.5)": "a tie at zero digits rounds away from zero in SQLite, to even in the formatter",
     "SELECT 1 / 0": "division by zero is an error here, NULL in SQLite",
     "SELECT CAST('abc' AS INTEGER)": "a cast that cannot hold its value is an error here, 0 in SQLite",
     "SELECT 9223372036854775807 + 1": "integer arithmetic wraps here, becomes a float in SQLite",
@@ -205,19 +240,26 @@ def sqlite_query(statement: str) -> tuple[list, str, int]:
 
 
 def same_cell(left, right) -> bool:
-    if left is None or right is None:
-        return left is None and right is None
+    """Compare a cell by value and by type.
+
+    SQLite's JSON keeps 1 and 1.0 apart and so does this runner: comparing them
+    as equal let a query that returned the wrong type pass, which is how a real
+    type bug stayed invisible (AUDIT-10 P-B5).
+    """
+    # SQLite has no boolean type: a true or a false is the number 1 or 0.
     if isinstance(left, bool):
         left = int(left)
     if isinstance(right, bool):
         right = int(right)
-    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
-        if isinstance(left, int) and isinstance(right, int):
-            return left == right
-        return math.isclose(float(left), float(right), rel_tol=1e-12, abs_tol=1e-12)
+    if left is None or right is None:
+        return left is None and right is None
+    if isinstance(left, int) and isinstance(right, int):
+        return left == right
+    if isinstance(left, float) and isinstance(right, float):
+        return math.isclose(left, right, rel_tol=1e-12, abs_tol=1e-12)
     if isinstance(left, str) and isinstance(right, str):
         return left == right
-    return left == right
+    return type(left) is type(right) and left == right
 
 
 def canon(row) -> str:
@@ -226,14 +268,89 @@ def canon(row) -> str:
 
 def canon_cell(cell):
     if isinstance(cell, bool):
-        return ["n", int(cell)]
-    if isinstance(cell, (int, float)):
-        return ["n", repr(float(cell)) if isinstance(cell, float) else cell]
-    return ["v", cell]
+        return ["i", int(cell)]
+    if isinstance(cell, int):
+        return ["i", cell]
+    if isinstance(cell, float):
+        return ["f", repr(cell)]
+    if cell is None:
+        return ["z"]
+    if isinstance(cell, str):
+        return ["s", cell]
+    return ["x", json.dumps(cell, sort_keys=True)]
+
+
+def top_level_words(statement: str) -> list[str]:
+    """The words of a statement that sit outside every parenthesis and literal."""
+    words: list[str] = []
+    word: list[str] = []
+    depth = 0
+    at, length = 0, len(statement)
+    while at < length:
+        c = statement[at]
+        if c in "'\"":
+            quote = c
+            at += 1
+            while at < length:
+                if statement[at] == quote:
+                    if at + 1 < length and statement[at + 1] == quote:
+                        at += 2
+                        continue
+                    at += 1
+                    break
+                at += 1
+            continue
+        if c == "[":
+            while at < length and statement[at] != "]":
+                at += 1
+            at += 1
+            continue
+        if c == "(":
+            if depth == 0 and word:
+                words.append("".join(word).lower())
+                word = []
+            depth += 1
+            at += 1
+            continue
+        if c == ")":
+            if depth == 0 and word:
+                words.append("".join(word).lower())
+                word = []
+            depth = max(depth - 1, 0)
+            at += 1
+            continue
+        if depth > 0:
+            at += 1
+            continue
+        if c.isalnum() or c == "_":
+            word.append(c)
+        else:
+            if word:
+                words.append("".join(word).lower())
+                word = []
+        at += 1
+    if word and depth == 0:
+        words.append("".join(word).lower())
+    return words
+
+
+def has_top_level_order_by(statement: str) -> bool:
+    """Whether the statement itself decides the row order.
+
+    "order by" as a substring is not the question: a window's
+    `OVER (… ORDER BY …)` or a subquery's own ORDER BY orders something else, so
+    treating it as the result's order compared an unordered result position by
+    position — three window queries were reported as differences in AUDIT-10
+    P-B4 while their multisets were identical.
+    """
+    words = top_level_words(statement)
+    return any(
+        words[i] == "order" and words[i + 1] == "by" for i in range(len(words) - 1)
+    )
 
 
 def compare(statement: str, mine: list, theirs: list) -> str:
-    ordered = "order by" in statement.lower()
+    ordered = has_top_level_order_by(statement)
     if not ordered:
         mine = sorted(mine, key=canon)
         theirs = sorted(theirs, key=canon)
