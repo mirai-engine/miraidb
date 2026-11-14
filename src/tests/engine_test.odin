@@ -854,6 +854,97 @@ join_set_matches_fresh :: proc(
 }
 
 @(test)
+test_join_subscription_walks_the_planned_order :: proc(t: ^testing.T) {
+	// A subscription over `big JOIN small` written big-first would walk every row of
+	// big and probe small once per row. The same query written small-first walks
+	// small and probes big, so the plan decides which one the subscription does --
+	// and because the tuple index is keyed by source position, that order is chosen
+	// once and kept.
+	store := fresh_db(t, "joinsub_order")
+	if store == nil do return
+	host := db.host_init(store)
+	defer db.host_destroy(host)
+	defer cleanup_db(store, "joinsub_order")
+
+	run(t, store, "CREATE TABLE author (id INTEGER PRIMARY KEY, name TEXT)")
+	run(t, store, "CREATE TABLE book (id INTEGER PRIMARY KEY, author_id INTEGER, title TEXT)")
+	run(t, store, "CREATE INDEX book_author ON book (author_id)")
+	authors := 5
+	books := 1000
+	insert_authors := strings.builder_make()
+	defer strings.builder_destroy(&insert_authors)
+	strings.write_string(&insert_authors, "INSERT INTO author (id, name) VALUES ")
+	for i in 0 ..< authors {
+		if i > 0 do strings.write_string(&insert_authors, ", ")
+		fmt.sbprintf(&insert_authors, "(%d, 'a%d')", i + 1, i + 1)
+	}
+	run(t, store, strings.to_string(insert_authors))
+	insert_books := strings.builder_make()
+	defer strings.builder_destroy(&insert_books)
+	strings.write_string(&insert_books, "INSERT INTO book (id, author_id, title) VALUES ")
+	for i in 0 ..< books {
+		if i > 0 do strings.write_string(&insert_books, ", ")
+		fmt.sbprintf(&insert_books, "(%d, %d, 'b%d')", i + 1, (i % authors) + 1, i + 1)
+	}
+	run(t, store, strings.to_string(insert_books))
+	run(t, store, "ANALYZE")
+
+	// Written big-first: the plan still starts with the five authors.
+	big_first := "SELECT author.name, book.title FROM book JOIN author ON author.id = book.author_id"
+	before := db.host_join_rows_walked(host)
+	id, snapshot, err := db.host_subscribe(host, big_first)
+	if !testing.expectf(t, db.error_ok(err), "subscribe: %s", err.message) do return
+	walked := db.host_join_rows_walked(host) - before
+	testing.expect_value(t, len(snapshot), books)
+	// The written order walks a thousand books and probes an author for each: exactly
+	// two thousand candidates. The planned order walks five authors and fetches the
+	// books of each, so anything close to a thousand is the plan deciding.
+	testing.expectf(t, walked < u64(books) + 100, "the subscription walked %d rows of %d", walked, books)
+	big_set := join_set_from_snapshot(snapshot)
+	for row in snapshot do db.free_values(row)
+	delete(snapshot)
+
+	// The other spelling answers the same set, so the order is a decision about work
+	// and not about the answer.
+	small_first := "SELECT author.name, book.title FROM author JOIN book ON author.id = book.author_id"
+	other_id, other_snapshot, other_err := db.host_subscribe(host, small_first)
+	if testing.expectf(t, db.error_ok(other_err), "subscribe: %s", other_err.message) {
+		small_set := join_set_from_snapshot(other_snapshot)
+		slice.sort(big_set[:])
+		slice.sort(small_set[:])
+		same := len(big_set) == len(small_set)
+		if same {
+			for key, i in big_set {
+				if strings.compare(key, small_set[i]) != 0 {
+					same = false
+					break
+				}
+			}
+		}
+		testing.expectf(t, same, "the two spellings answered %d and %d rows", len(big_set), len(small_set))
+		join_set_destroy(&small_set)
+		for row in other_snapshot do db.free_values(row)
+		delete(other_snapshot)
+	}
+	join_set_destroy(&big_set)
+
+	// A commit still publishes the right delta through the reordered walk.
+	deltas := new(Join_Deltas)
+	defer free(deltas)
+	host.on_update = join_delta_capture
+	host.on_update_ctx = deltas
+	run(t, store, "INSERT INTO book (author_id, title) VALUES (3, 'new')")
+	inserts, deletes := join_deltas_clear(deltas)
+	testing.expectf(t, inserts >= 1 && deletes == 0, "insert published %d/%d", inserts, deletes)
+	run(t, store, "UPDATE author SET name = 'renamed' WHERE id = 3")
+	inserts, deletes = join_deltas_clear(deltas)
+	testing.expectf(t, inserts >= 1 && inserts == deletes, "rename published %d/%d", inserts, deletes)
+
+	db.host_unsubscribe(host, id)
+	db.host_unsubscribe(host, other_id)
+}
+
+@(test)
 test_join_probes_the_inner_index :: proc(t: ^testing.T) {
 	// A nested loop reads the inner rows its ON clause names, not the whole
 	// relation once per outer row. The row counter is what proves it: with the

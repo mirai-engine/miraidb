@@ -69,6 +69,11 @@ Subscription_Query :: struct {
 	// join_index is that equality as a hash of the source's rows, so a commit
 	// probes the matches instead of walking the table. join_keys remembers the
 	// key of every indexed row, so an update or a delete can take it back out.
+	// join_order is the order the walk visits the sources, as positions in the
+	// written order, chosen once when the subscription is indexed. It is kept
+	// because the tuple index is keyed by source positions: a different order later
+	// would file the same tuple under a different key.
+	join_order:     []int,
 	join_probes:    []Join_Probe,
 	join_reverse:   []Join_Probe,
 	join_index:     []map[string][dynamic]Row_Id,
@@ -538,8 +543,10 @@ free_subscription_queries :: proc(queries: []Subscription_Query) {
 		delete(entry.rows)
 		if entry.join {
 			// The row keys and the tuple index are arena allocations: they go away
-			// together, and freeing them one by one would be a double free.
+			// together, and freeing them one by one would be a double free. The walk
+			// order is not, because it is chosen before the arena is reset.
 			virtual.arena_destroy(&entry.join_arena)
+			delete(entry.join_order)
 			delete(entry.join_tuples)
 			delete(entry.join_by_row)
 			delete(entry.join_counts)
@@ -722,8 +729,10 @@ host_join_plan_probes :: proc(
 		entry.join_probes[level] = Join_Probe{column = -1, other = -1}
 		entry.join_reverse[level] = Join_Probe{column = -1, other = -1}
 	}
-	for level in 1 ..< count {
-		host_join_plan_on(entry, stmt.joins[level - 1].on, tables, aliases, level)
+	// Every ON is read, not only the one written for a position: the sources may
+	// run in another order than the one they were written in.
+	for join in stmt.joins {
+		host_join_plan_on(entry, join.on, tables, aliases, 0)
 	}
 	for level in 0 ..< count {
 		if host_join_index_column(entry, level) < 0 do continue
@@ -1478,6 +1487,10 @@ host_join_prepare :: proc(host: ^Host, entry: ^Subscription_Query) -> bool {
 		for column in columns do delete(column, tx.alloc)
 		delete(columns)
 	}
+	// `SELECT *` keeps the column order it was written in; the walk may visit the
+	// sources in another order, because the tuple index only needs them visited.
+	host_join_planned_order(host, tx, entry, stmt, tables, aliases)
+	host_join_apply_order(entry, tables, aliases)
 	return host_join_rebuild(host, tx, entry, stmt, tables, aliases, expanded)
 }
 
@@ -1546,6 +1559,67 @@ host_query_is_incremental_join :: proc(entry: ^Subscription_Query) -> bool {
 		if item.expr != nil && expr_is_aggregate(item.expr) do return false
 	}
 	return true
+}
+
+// host_join_planned_order chooses the order the walk visits the sources and keeps
+// it on the entry. A nested loop start with the relation that matches the fewest
+// rows per outer row, which is what the planner already decides for the same query;
+// a subscription that walked the written order could start with the big table and
+// probe the small one fifty thousand times.
+@(private)
+host_join_planned_order :: proc(
+	host: ^Host,
+	tx: ^Tx,
+	entry: ^Subscription_Query,
+	stmt: Select_Stmt,
+	tables: []^Table,
+	aliases: []string,
+) {
+	// The order outlives the arena reset that a rebuild does, so it lives on the
+	// heap and is freed with the subscription.
+	if entry.join_order != nil do delete(entry.join_order)
+	entry.join_order = nil
+	if len(tables) < 2 do return
+	order := plan_join_order(host.store, tx, stmt, nil)
+	if !order.reordered do return
+	planned := make([]int, len(tables))
+	used := make([]bool, len(tables))
+	defer delete(used)
+	for step, position in order.steps {
+		name := len(step.alias) > 0 ? step.alias : step.name
+		found := -1
+		for alias, i in aliases {
+			if used[i] do continue
+			if strings.equal_fold(alias, name) {
+				found = i
+				break
+			}
+		}
+		if found < 0 do return
+		used[found] = true
+		planned[position] = found
+	}
+	entry.join_order = planned
+}
+
+// host_join_apply_order puts the sources in the order the entry was indexed with.
+@(private)
+host_join_apply_order :: proc(
+	entry: ^Subscription_Query,
+	tables: []^Table,
+	aliases: []string,
+) {
+	if len(entry.join_order) != len(tables) do return
+	planned_tables := make([]^Table, len(tables))
+	planned_aliases := make([]string, len(aliases))
+	defer delete(planned_tables)
+	defer delete(planned_aliases)
+	for source, position in entry.join_order {
+		planned_tables[position] = tables[source]
+		planned_aliases[position] = aliases[source]
+	}
+	copy(tables, planned_tables)
+	copy(aliases, planned_aliases)
 }
 
 // host_join_tables resolves the sources of a join query. It reports false when a
@@ -1617,6 +1691,7 @@ host_apply_incremental_join :: proc(
 		delete(columns)
 	}
 	if len(expanded) == 0 do return false
+	host_join_apply_order(entry, tables, aliases)
 
 	if !entry.join_ready do return false
 

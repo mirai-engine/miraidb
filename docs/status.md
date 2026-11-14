@@ -132,7 +132,7 @@ the gaps are named rather than left to be discovered.
   one schema, one set of rows and 55 queries through both engines, with the
   refusals and the intentional differences listed in the script.
 - `scripts/build.py` builds both binaries and runs the suite.
-- 229 integration tests covering CRUD, recovery, constraints, transactions,
+- 230 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
@@ -266,8 +266,14 @@ than 1000 bytes cannot be indexed and the insert says so.
   round (`b > v AND a <= v`) are the same band
   (`test_plan_reads_a_range_written_as_two_comparisons`). One range per estimate is
   combined; two ranges on two different columns still multiply.
-- **What the planner still does not do.** The subscription path lays out its walk in
-  the written order rather than the planned one. Staleness is no longer silent: `EXPLAIN` reprices with the
+- **A subscription walks the planned order.** A join subscription indexes its walk
+  with the same order the planner chooses for the same query, and keeps that order
+  for its life (the tuple index is keyed by source position): a subscription over
+  `big JOIN small` written big-first walks the small relation and probes the big
+  one, instead of walking the big one and probing the small one per row. `SELECT *`
+  still expands its columns in the written order.
+  `test_join_subscription_walks_the_planned_order` counts the candidates walked and
+  checks that the two spellings answer the same set. Staleness is no longer silent: `EXPLAIN` reprices with the
   numbers it has and names their age.
 - **A join the grammar does not implement is refused, not approximated.**
   `NATURAL`, `RIGHT` and `FULL` joins used to parse as an alias for the table

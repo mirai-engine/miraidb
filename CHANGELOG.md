@@ -32,6 +32,10 @@
   `FLOAT` key, a paged table) falls back to the full evaluation.
 - A join subscription walks the tables it reads instead of copying every row of
   them into the transaction arena, which was 80 bytes a row per commit.
+- A join subscription indexes its walk with the order the planner chooses for the
+  same query and keeps it, so `big JOIN small` written big-first walks the small
+  relation and probes the big one. `SELECT *` still expands its columns in the
+  written order.
 - A range written as two comparisons is priced and answered as one: `v >= a AND
   v < b` now costs what `v BETWEEN a AND b` costs, one range scan over the band,
   instead of two independent filters that lost to a scan.
