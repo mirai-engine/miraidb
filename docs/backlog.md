@@ -639,7 +639,7 @@ turns the row `done`; and a `CASE` in a policy or trigger works.
 ## D20 — A differential runner against SQLite: **done**
 
 **Done.** `scripts/differential.py` is the twenty-third gate: one schema, one set
-of rows and 55 queries go through this engine and the system `sqlite3`, and the
+of rows and 94 queries go through this engine and the system `sqlite3`, and the
 answers must match (as sequences when the query says `ORDER BY`, as multisets
 otherwise). Seven statements are refused here and answered there, each with the
 reason in the script, and the runner fails when a refusal stops refusing; four
@@ -1023,11 +1023,17 @@ them; `docs/sql.md` states the negative-index rule and the truth rule.
 - **Types as values.** `same_cell` compares `1` and `1.0` as equal, so a query that
   returns the wrong type passes.
 
-And the gate advertises more than it enforces: `docs/roadmap.md` says a 10% regression
-fails, while `scripts/bench.py` accepts 3x for every time metric and compares against a
-number recorded on another machine (it prints `machine` and never compares it). Two runs
-on this machine in one session produced 31 603 and 57 403 inserts/s, so the honest
-target is a *reference measured in the same run*, not a stored number.
+And the gate advertised more than it enforced: `docs/roadmap.md` said a 10% regression
+fails, while `scripts/bench.py` accepted 3x for every time metric and compared against a
+number recorded on another machine (it printed `machine` and never compared it). Runs on
+this machine in one session produced 31 603 and 57 403 inserts/s, 15.6/22.6/46.3 µs for a
+read transaction, and 5.3/73.6 ms for a commit with a reader open, with no code change:
+wall clock here is not gated at 10% by anything, and pretending otherwise was the lie.
+
+*Done*: `--check` fails on bytes per row (a property of the format, 10% against the
+baseline) and **reports** every time metric measured twice in the same run with its
+spread; `--strict-time` enforces 10% against the baseline for a quiet machine after
+`--record`. The roadmap says exactly that.
 
 **Next.**
 
