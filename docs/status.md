@@ -333,9 +333,12 @@ than 1000 bytes cannot be indexed and the insert says so.
   them back on for a deployment that trusts every client. Reading, writing and
   DDL stay available, and grants still decide who may do them (a database with no
   grants allows everyone, which is the default). `docs/security.md` states the
-  model. **What is still open:** nothing bounds a statement's work or lets the
-  server cancel it, and the transport is plain TCP (`AUDIT-9` B4, backlog D22
-  step 2, D23, D15).
+  model. `--statement-timeout-ms` cancels a statement that outlives it — the
+  watchdog sets the store's atomic cancel flag, the executor answers `cancelled`,
+  and the next statement runs — while `--budget` refuses a statement that
+  overspends (after the work, not during). **What is still open:** the transport
+  is plain TCP (D15), the row quota is unreachable from the server, and an
+  expression nested deeply enough still overflows the stack (D23).
 - **A mirrored `.sqlite` file is exact for rows and unproven for DDL.**
   `DROP TABLE` on a table that held rows leaves the file malformed for `sqlite3`,
   and an imported file's indexes are not read (`AUDIT-9` A3/B2, backlog D24).

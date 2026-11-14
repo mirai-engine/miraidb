@@ -2378,7 +2378,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		}
 		next := make([dynamic][]Source)
 		for partial in partials {
-			if tx.store.cancelled {
+			if store_cancelled(tx.store) {
 				delete(rows)
 				free_partials(&partials)
 				free_partials(&next)
@@ -2482,7 +2482,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 	// WHERE
 	filtered := make([dynamic][]Source)
 	for partial, index in partials {
-		if tx.store.cancelled {
+		if store_cancelled(tx.store) {
 			// The rows before this one were either kept (and freed through
 			// filtered) or freed in place, so only the pending ones are left.
 			for pending in partials[index:] do delete(pending)
@@ -4862,7 +4862,7 @@ sql_exec_update :: proc(tx: ^Tx, stmt: Update_Stmt, params: []Value) -> (Sql_Res
 	returned := make([dynamic][]Value, 0, len(rows))
 	result := Sql_Result{kind = .Affected}
 	for row in rows {
-		if tx.store.cancelled {
+		if store_cancelled(tx.store) {
 			return {}, errf(.Cancelled, "statement cancelled")
 		}
 		source: [2]Source
@@ -4986,7 +4986,7 @@ sql_exec_delete :: proc(tx: ^Tx, stmt: Delete_Stmt, params: []Value) -> (Sql_Res
 	returned := make([dynamic][]Value, 0, len(rows))
 	result := Sql_Result{kind = .Affected}
 	for row in rows {
-		if tx.store.cancelled {
+		if store_cancelled(tx.store) {
 			return {}, errf(.Cancelled, "statement cancelled")
 		}
 		source: [2]Source

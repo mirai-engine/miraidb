@@ -9,6 +9,7 @@ import "core:strconv"
 import "core:strings"
 import "core:sync"
 import "core:thread"
+import "core:time"
 
 import db "../engine"
 
@@ -16,11 +17,17 @@ USAGE :: `miraidb-server - HTTP front end for a miraidb database
 
 Usage:
   miraidb-server <database> [--port=8080] [--any] [--allow-host]
+                            [--statement-timeout-ms=N] [--budget=N]
 
 The three statements that reach outside the database are refused to clients
 unless --allow-host is given: ATTACH reads a file path, LOAD EXTENSION runs host
 code, and VACUUM INTO writes a file. A client can name any path or module, so the
 default is to believe none of them.
+
+A statement that runs longer than --statement-timeout-ms is cancelled and the
+client gets "cancelled"; --budget caps the work one statement may spend (a
+statement that overspends is refused instead of answered). Both are off by
+default.
 
 Each connection is served on its own thread, so a subscription that stays open
 does not stop another client from connecting. Statements are still run one at a
@@ -43,6 +50,8 @@ main :: proc() {
 	port := 8080
 	any_interface := false
 	allow_host := false
+	statement_timeout_ms := i64(0)
+	budget := u64(0)
 	for arg in os.args[1:] {
 		switch {
 		case strings.has_prefix(arg, "--port="):
@@ -56,6 +65,20 @@ main :: proc() {
 			any_interface = true
 		case arg == "--allow-host":
 			allow_host = true
+		case strings.has_prefix(arg, "--statement-timeout-ms="):
+			parsed, ok := strconv.parse_int(arg[len("--statement-timeout-ms="):])
+			if !ok || parsed < 0 {
+				fmt.eprintln("miraidb-server: --statement-timeout-ms needs a number of milliseconds")
+				os.exit(2)
+			}
+			statement_timeout_ms = i64(parsed)
+		case strings.has_prefix(arg, "--budget="):
+			parsed, ok := strconv.parse_int(arg[len("--budget="):])
+			if !ok || parsed < 0 {
+				fmt.eprintln("miraidb-server: --budget needs a number of work units")
+				os.exit(2)
+			}
+			budget = u64(parsed)
 		case strings.has_prefix(arg, "-"):
 			fmt.eprintfln("miraidb-server: unknown option %s", arg)
 			os.exit(2)
@@ -76,13 +99,19 @@ main :: proc() {
 	// The default refuses the statements that reach outside the database; a
 	// deployment that trusts every client it serves says so on the command line.
 	db.store_set_host_access(store, allow_host)
+	if budget > 0 do db.store_set_work_budget(store, budget)
 	host := db.host_init(store)
 	defer db.host_destroy(host)
 	server := Server{host = host}
+	server.timeout_us = statement_timeout_ms * 1000
 	server.connections = make(map[u64]^Connection)
 	defer delete(server.connections)
 	host.on_update = server_on_update
 	host.on_update_ctx = &server
+	// One watchdog for the whole server: it watches the statement in flight and
+	// cancels it when it has spent its time, which no other thread can do because
+	// the thread running the statement is inside it.
+	if server.timeout_us > 0 do _ = thread.create_and_start_with_data(&server, statement_watchdog, {})
 
 	address := any_interface ? net.IP4_Any : net.IP4_Loopback
 	endpoint := net.Endpoint{address = address, port = port}
@@ -113,6 +142,50 @@ Server :: struct {
 	host:        ^db.Host,
 	statements:  sync.Mutex,
 	connections: map[u64]^Connection,
+	// timeout_us is how long one statement may run before the watchdog cancels
+	// it; zero leaves it unbounded. The three fields below are the watchdog's
+	// view of the statement in flight.
+	timeout_us:            i64,
+	statement_running:     bool,
+	// statement_started_ns is a monotonic tick in nanoseconds, not a wall clock:
+	// a clock jump must not look like a statement running for an hour.
+	statement_started_ns:  i64,
+}
+
+// statement_begin takes the statement lock and tells the watchdog a statement
+// started. Every path that runs one goes through here and through
+// statement_end, so the watchdog can never see a stale "running".
+@(private)
+statement_begin :: proc(server: ^Server) {
+	sync.mutex_lock(&server.statements)
+	// A cancellation belongs to the statement that was running when it was asked
+	// for; the next one starts clean.
+	db.store_clear_cancel(server.host.store)
+	sync.atomic_store(&server.statement_started_ns, time.tick_now()._nsec)
+	sync.atomic_store(&server.statement_running, true)
+}
+
+@(private)
+statement_end :: proc(server: ^Server) {
+	sync.atomic_store(&server.statement_running, false)
+	sync.mutex_unlock(&server.statements)
+}
+
+// statement_watchdog cancels a statement that has spent its time. Cancellation
+// is cooperative: the executor checks the flag between rows and answers
+// `cancelled`, so the client gets an error instead of a dead server.
+@(private)
+statement_watchdog :: proc(data: rawptr) {
+	server := (^Server)(data)
+	for {
+		time.sleep(2 * time.Millisecond)
+		if !sync.atomic_load(&server.statement_running) do continue
+		elapsed_us := (time.tick_now()._nsec - sync.atomic_load(&server.statement_started_ns)) / 1000
+		if elapsed_us < server.timeout_us do continue
+		if sync.atomic_load(&server.statement_running) {
+			db.store_cancel(server.host.store)
+		}
+	}
 }
 
 // Connection is one accepted socket. send_mutex serialises writes: the thread
@@ -189,9 +262,9 @@ serve :: proc(connection: ^Connection) {
 	// Dropping the subscriptions touches the list a commit walks, so it waits for
 	// the statement in flight, exactly like a request does.
 	defer {
-		sync.mutex_lock(&connection.port.statements)
+		statement_begin(connection.port)
 		db.host_client_disconnect(host, owner)
-		sync.mutex_unlock(&connection.port.statements)
+		statement_end(connection.port)
 	}
 	buffer: [64 * 1024]u8
 	n, recv_err := net.recv(client, buffer[:])
@@ -212,11 +285,11 @@ serve :: proc(connection: ^Connection) {
 	// carries it while the statement executes: both happen inside the statement
 	// lock so two clients never see each other's identity.
 	if token, has_token := db.http_bearer_token(buffer[:n]); has_token {
-		sync.mutex_lock(&connection.port.statements)
+		statement_begin(connection.port)
 		if identity, valid := db.host_authenticate(host, token); valid {
 			db.store_set_identity(host.store, identity)
 		}
-		sync.mutex_unlock(&connection.port.statements)
+		statement_end(connection.port)
 	}
 	// A request may arrive in more than one segment. Reading once and parsing
 	// would reject a body that has not landed yet, so the loop keeps reading
@@ -247,9 +320,9 @@ serve :: proc(connection: ^Connection) {
 		n += read
 	}
 	_ = used
-	sync.mutex_lock(&connection.port.statements)
+	statement_begin(connection.port)
 	response := db.http_handle(host, request)
-	sync.mutex_unlock(&connection.port.statements)
+	statement_end(connection.port)
 	_ = send(connection, response)
 	delete(response)
 }
@@ -276,9 +349,9 @@ serve_postgres :: proc(connection: ^Connection) {
 	for {
 		n, recv_err := net.recv(client, buffer[:])
 		if recv_err != nil || n <= 0 do return
-		sync.mutex_lock(&connection.port.statements)
+		statement_begin(connection.port)
 		response, close := db.pg_handle_session_message(host, session, buffer[:n])
-		sync.mutex_unlock(&connection.port.statements)
+		statement_end(connection.port)
 		if len(response) > 0 {
 			_ = send(connection, response)
 			delete(response)
@@ -332,9 +405,9 @@ serve_frames :: proc(connection: ^Connection) {
 			return
 		}
 		if opcode == 1 || opcode == 2 {
-			sync.mutex_lock(&connection.port.statements)
+			statement_begin(connection.port)
 			response := db.wire_request_owned(host, payload, owner)
-			sync.mutex_unlock(&connection.port.statements)
+			statement_end(connection.port)
 			framed := db.ws_frame(response)
 			sent := policy_send(connection, framed)
 			delete(framed)

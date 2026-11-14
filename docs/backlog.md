@@ -705,7 +705,7 @@ old design (the kind of thing the audit found in `sql.md` and `README.md`) still
 needs a reader. The gate makes the cheap half impossible; the other half stays an
 editorial duty, listed in `CONTRIBUTING.md`.
 
-## D22 — The server, for real
+## D22 — The server, for real — **done**
 
 **Done: a thread per connection, and the delta path.** Each accepted socket gets
 its own thread (`src/server/main.odin`: `thread.create_and_start_with_data`), the
@@ -736,7 +736,22 @@ defended. The gate also turned up a bug in the gate itself: `decode` in
 `broker_smoke.py` read the error *kind* as the message length, so no error text
 had ever been matched.
 
-**Still open: what bounds one statement, and who a token-less client is.**
+**Done: what bounds one statement.** `--statement-timeout-ms=N` arms a watchdog
+thread. A statement announces itself to it (`statement_begin`, which also clears
+a stale cancellation), and the watchdog polls every 2 ms against a monotonic
+tick: when the statement has spent its time it sets `store.cancel` through
+`sync.atomic_store`, which every row loop in the executor checks and answers
+`cancelled`. A cancelled statement is an error, not a crash: the gate starts a
+second server with a 300 ms limit, asks for a four-way cross join, reads
+`cancelled`, then reads `SELECT 1` and the table it never wrote. `--budget=N`
+sets the engine's per-statement work budget, which refuses *after* the work.
+`store.cancel` and its read side are atomic now, so the flag is sound across the
+two threads that touch it.
+
+**Left for its own items.** Grants are opt-in (a database with no grant rows
+allows every statement), which is a policy decision rather than a bug: it is
+listed in the auth review. TLS, HTTP/2 and backpressure are D15; the row quota
+and a depth bound are D23.
 
 **Second half: who may ask.** A wire request runs under the connection's identity,
 and identity is whatever the bearer token said — or nothing. Grants are opt-in:

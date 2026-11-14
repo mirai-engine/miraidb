@@ -959,7 +959,7 @@ host_join_walk :: proc(walk: ^Join_Walk, level: int) -> bool {
 	// and costs no copy of its own.
 	for _, row in table.rows {
 		if row.deleted_seq != 0 do continue
-		if walk.tx.store.cancelled do return false
+		if store_cancelled(walk.tx.store) do return false
 		walk.sources[level] = Source{table = table, row = row, alias = alias}
 		if walk.walked != nil do walk.walked^ += 1
 		if !host_join_walk(walk, level + 1) do return false
@@ -1010,7 +1010,7 @@ host_join_walk_probe :: proc(walk: ^Join_Walk, level: int, probe: Join_Probe) ->
 	for id in bucket {
 		row, exists := table.rows[id]
 		if !exists || row.deleted_seq != 0 do continue
-		if walk.tx.store.cancelled do return false
+		if store_cancelled(walk.tx.store) do return false
 		walk.sources[level] = Source{table = table, row = row, alias = walk.aliases[level]}
 		if walk.walked != nil do walk.walked^ += 1
 		if !host_join_walk(walk, level + 1) do return false
@@ -2224,7 +2224,7 @@ host_tick :: proc(host: ^Host, now_us: i64) -> (ran: int, first_error: Error) {
 	defer sql_result_destroy(&due)
 
 	for row in due.rows {
-		if host.store.cancelled {
+		if store_cancelled(host.store) {
 			first_error = errf(.Cancelled, "scheduler cancelled")
 			break
 		}

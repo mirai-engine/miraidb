@@ -529,16 +529,19 @@ store_table_names :: proc(store: ^Store, alloc: mem.Allocator) -> []string {
 
 // --- Cancellation ----------------------------------------------------------
 
+// A cancellation is asked for by one thread (a watchdog, an embedder's signal
+// handler) and obeyed by the thread inside the statement, so the flag is atomic
+// and needs no lock the row loop would have to take.
 store_cancel :: proc(store: ^Store) {
-	store.cancelled = true
+	sync.atomic_store(&store.cancelled, true)
 }
 
 store_clear_cancel :: proc(store: ^Store) {
-	store.cancelled = false
+	sync.atomic_store(&store.cancelled, false)
 }
 
 store_cancelled :: proc(store: ^Store) -> bool {
-	return store.cancelled
+	return sync.atomic_load(&store.cancelled)
 }
 
 // --- Identity --------------------------------------------------------------

@@ -409,6 +409,49 @@ def main() -> int:
         connection.close()
         still = post(port, "SELECT count(*) AS n FROM notes")
         check("a dropped client does not disturb the owner", still["rows"] == [[4]], str(still["rows"]))
+        # A statement that outlives its budget is cancelled, and the server keeps
+        # serving: it is a second server (the first owns `_broker_tmp/db`) started
+        # with a 300 ms limit.
+        limited_db = "_broker_tmp/limited"
+        limited_port = free_port()
+        limited = subprocess.Popen(
+            [SERVER, limited_db, f"--port={limited_port}", "--statement-timeout-ms=300"],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            check("the limited server starts", wait_healthy(limited_port, limited))
+            post_limited = lambda sql: post(limited_port, sql)  # noqa: E731
+            post_limited("CREATE TABLE wide (id INTEGER PRIMARY KEY, v TEXT)")
+            rows = ",".join(f"({i}, 'x')" for i in range(1, 401))
+            post_limited(f"INSERT INTO wide (id, v) VALUES {rows}")
+            started = time.time()
+            try:
+                post_limited(
+                    "SELECT count(*) AS n FROM wide a, wide b, wide c, wide d"
+                )
+                check("a statement over the time limit is cancelled", False, "it answered")
+            except RuntimeError as exc:
+                elapsed = time.time() - started
+                check(
+                    "a statement over the time limit is cancelled",
+                    "cancelled" in str(exc).lower(),
+                    str(exc),
+                )
+                check("the cancel arrives near the limit", elapsed < 30, f"{elapsed:.1f}s")
+            # The process survived, the lock was released and the next statement
+            # runs: a cancelled statement is an error, not a crash.
+            check("the server still answers after a cancel", post_limited("SELECT 1 AS one")["rows"] == [[1]])
+            check("the cancelled statement left the table alone", post_limited("SELECT count(*) AS n FROM wide")["rows"] == [[400]])
+        finally:
+            if limited.poll() is None:
+                limited.terminate()
+                try:
+                    limited.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    limited.kill()
     finally:
         if server.poll() is None:
             server.terminate()

@@ -30,6 +30,7 @@ the database rather than the machine (`SELECT`, `INSERT`, DDL), is unaffected.
 ```text
 $ miraidb-server data/db --port=8080        # ATTACH / LOAD EXTENSION / VACUUM INTO refused
 $ miraidb-server data/db --port=8080 --allow-host   # every client is trusted
+$ miraidb-server data/db --port=8080 --statement-timeout-ms=2000 --budget=10000000
 ```
 
 ## Identity and grants
@@ -51,20 +52,21 @@ connection only; two clients never see each other's.
 - **Transport.** The socket is plain TCP: no TLS, no HTTP/2, no certificate
   pinning (backlog D15). Anything that must not be read in transit needs a
   tunnel in front of this server.
-- **Work per statement.** A statement runs until it finishes. There is no
-  statement timeout and no cancel from the client, and one statement at a time
-  is executed per database, so a slow query delays the others (backlog D23 and
-  D22 step 2). The row quota and the work budget exist in the engine and the
-  server does not set them.
+- **Work per statement.** `--statement-timeout-ms` cancels a statement that
+  outlives it (the client gets `cancelled` and the server keeps serving) and
+  `--budget` caps the work one statement may spend, refusing it *after* the work
+  is done rather than during. One statement at a time runs per database, so a
+  slow query delays the others. Neither flag is on by default, and the row quota
+  (`max_rows_per_query`) is still not reachable from the server (backlog D23).
+- **Depth.** An expression nested deeply enough overflows the stack and takes the
+  process with it (backlog D23). Until that lands, treat the server as one fault
+  away from a restart.
 - **One writer.** The server holds the directory lock; a second server on the
   same directory is refused with the owner's pid. Readers may open beside it with
   `--read-only`.
 - **The client registry.** `max_clients`, the outbox budget and the per-frame
   cap bound how much one client can make the server hold. Beyond those, a client
   that connects and says nothing holds one thread until it leaves.
-- **Memory of a bad statement.** An expression nested deeply enough overflows the
-  stack and takes the process with it (backlog D23). Until that item lands, treat
-  the server as one fault away from a restart.
 
 ## Connections
 
