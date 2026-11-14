@@ -146,7 +146,7 @@ the gaps are named rather than left to be discovered.
   `linux_arm64` and `darwin_arm64`. The POSIX lock is the reason it is checked:
   it carried a missing `core:sys/posix` import and two wrong integer types until
   this round, so the code that a Linux build would run had never been compiled.
-- 250 integration tests covering CRUD, recovery, constraints, transactions,
+- 251 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
@@ -374,12 +374,12 @@ than 1000 bytes cannot be indexed and the insert says so.
   text to a number first, `--json` keeps the `.0` on a real, and `INSERT OR
   REPLACE` is implemented instead of refused by accident (`AUDIT-10` P-B1/P-B2/
   P-B3/P-B7). `OR ROLLBACK`, `OR FAIL` and `OR IGNORE` are named refusals.
-- **A statement handle used after `finalize` kills the process.** `step` answers
-  `DONE` out of freed memory and `bind` is an access violation, where sqlite3
-  answers `SQLITE_MISUSE`; `bind` also accepts any index. In-memory opening is
-  fixed: `:memory:`, the empty path, `file::memory:` and
-  `file:<name>?mode=memory` all open through the engine, the C ABI and the facade
-  (`AUDIT-10` P-A2/P-A3, backlog D29).
+- **The embedding layers answer misuse instead of reading freed memory.** A
+  statement used after `finalize`, or through a connection already closed, gets
+  `MIRAIDB_MISUSE` (2) from the C ABI and `SQLITE_MISUSE` from the facade; a bind
+  past the statement's parameters gets `SQLITE_RANGE` (25) instead of growing the
+  list. Both were measured as an access violation and a silent acceptance in
+  `AUDIT-10` P-A3/P-B6.
 
 ## Not implemented: a second writer, and replication
 

@@ -587,6 +587,10 @@ Query :: struct {
 	alloc:     mem.Allocator,
 	statement: Statement,
 	source:    string,
+	// param_count is how many positional parameters ("?") the statement binds, in
+	// the order they appear. It is what the embedding layers check an index
+	// against, so a bind of 99 is a range error instead of a growth (D29).
+	param_count: int,
 }
 
 query_destroy :: proc(q: ^Query) {

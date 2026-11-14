@@ -20,6 +20,7 @@ import engine "../engine"
 SQLITE_OK :: c.int(0)
 SQLITE_ERROR :: c.int(1)
 SQLITE_MISUSE :: c.int(21)
+SQLITE_RANGE :: c.int(25)
 SQLITE_ROW :: c.int(100)
 SQLITE_DONE :: c.int(101)
 
@@ -34,6 +35,9 @@ Database :: struct {
 	last_changes: c.int,
 	last_error:   string, // owned, NUL-terminated
 	in_memory:    bool,
+	// statements is what this connection handed out and has not finalized, so a
+	// close can make them misuse rather than leave them dangling (D29).
+	statements: map[rawptr]^Statement,
 }
 
 Statement :: struct {
@@ -43,11 +47,13 @@ Statement :: struct {
 
 @(private)
 db_of :: proc(handle: rawptr) -> ^Database {
+	if !engine.handle_is_live(handle) do return nil
 	return cast(^Database)handle
 }
 
 @(private)
 stmt_of :: proc(handle: rawptr) -> ^Statement {
+	if !engine.handle_is_live(handle) do return nil
 	return cast(^Statement)handle
 }
 
@@ -110,6 +116,8 @@ sqlite3_open :: proc "c" (filename: cstring, ppDb: ^rawptr) -> c.int {
 	db := new(Database)
 	db.conn = conn
 	db.in_memory = in_memory
+	db.statements = make(map[rawptr]^Statement)
+	engine.handle_register(rawptr(db))
 	ppDb^ = rawptr(db)
 	return SQLITE_OK
 }
@@ -128,6 +136,20 @@ sqlite3_close :: proc "c" (handle: rawptr) -> c.int {
 	context = runtime.default_context()
 	db := db_of(handle)
 	if db == nil do return SQLITE_OK
+	// Statements this connection handed out are finalized here, so a later call
+	// through one of them answers misuse instead of touching freed memory.
+	keys := make([dynamic]rawptr, 0, len(db.statements))
+	for key, _ in db.statements do append(&keys, key)
+	for key in keys {
+		if stmt, found := db.statements[key]; found {
+			engine.embed_finalize(stmt.stmt)
+			engine.handle_forget(key)
+			free(stmt)
+		}
+	}
+	delete(db.statements)
+	delete(keys)
+	engine.handle_forget(rawptr(db))
 	engine.embed_close(db.conn)
 	delete(db.last_error)
 	free(db)
@@ -198,6 +220,8 @@ sqlite3_prepare_v2 :: proc "c" (handle: rawptr, sql: cstring, nByte: c.int, ppSt
 	stmt := new(Statement)
 	stmt.db = db
 	stmt.stmt = statement
+	db.statements[rawptr(stmt)] = stmt
+	engine.handle_register(rawptr(stmt))
 	ppStmt^ = rawptr(stmt)
 	return SQLITE_OK
 }
@@ -206,8 +230,10 @@ sqlite3_prepare_v2 :: proc "c" (handle: rawptr, sql: cstring, nByte: c.int, ppSt
 sqlite3_finalize :: proc "c" (handle: rawptr) -> c.int {
 	context = runtime.default_context()
 	stmt := stmt_of(handle)
-	if stmt == nil do return SQLITE_OK
+	if stmt == nil do return SQLITE_MISUSE
 	if stmt.db != nil do stmt.db.last_changes = c.int(engine.embed_changes(stmt.stmt))
+	if stmt.db != nil do delete_key(&stmt.db.statements, handle)
+	engine.handle_forget(handle)
 	engine.embed_finalize(stmt.stmt)
 	free(stmt)
 	return SQLITE_OK
@@ -217,7 +243,7 @@ sqlite3_finalize :: proc "c" (handle: rawptr) -> c.int {
 sqlite3_reset :: proc "c" (handle: rawptr) -> c.int {
 	context = runtime.default_context()
 	stmt := stmt_of(handle)
-	if stmt == nil do return SQLITE_OK
+	if stmt == nil do return SQLITE_MISUSE
 	engine.embed_reset(stmt.stmt)
 	return SQLITE_OK
 }
@@ -226,7 +252,7 @@ sqlite3_reset :: proc "c" (handle: rawptr) -> c.int {
 sqlite3_clear_bindings :: proc "c" (handle: rawptr) -> c.int {
 	context = runtime.default_context()
 	stmt := stmt_of(handle)
-	if stmt == nil do return SQLITE_OK
+	if stmt == nil do return SQLITE_MISUSE
 	engine.embed_clear_bindings(stmt.stmt)
 	return SQLITE_OK
 }
@@ -236,6 +262,7 @@ sqlite3_bind_null :: proc "c" (handle: rawptr, index: c.int) -> c.int {
 	context = runtime.default_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return SQLITE_MISUSE
+	if int(index) < 1 || int(index) > engine.Embed_Parameter_Count(stmt.stmt) do return SQLITE_RANGE
 	if engine.embed_bind_null(stmt.stmt, int(index) - 1).kind == .None do return SQLITE_OK
 	return SQLITE_ERROR
 }
@@ -251,6 +278,7 @@ sqlite3_bind_int64 :: proc "c" (handle: rawptr, index: c.int, value: c.longlong)
 	context = runtime.default_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return SQLITE_MISUSE
+	if int(index) < 1 || int(index) > engine.Embed_Parameter_Count(stmt.stmt) do return SQLITE_RANGE
 	if engine.embed_bind_int(stmt.stmt, int(index) - 1, i64(value)).kind == .None do return SQLITE_OK
 	return SQLITE_ERROR
 }
@@ -260,6 +288,7 @@ sqlite3_bind_double :: proc "c" (handle: rawptr, index: c.int, value: c.double) 
 	context = runtime.default_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return SQLITE_MISUSE
+	if int(index) < 1 || int(index) > engine.Embed_Parameter_Count(stmt.stmt) do return SQLITE_RANGE
 	if engine.embed_bind_float(stmt.stmt, int(index) - 1, f64(value)).kind == .None do return SQLITE_OK
 	return SQLITE_ERROR
 }
@@ -272,6 +301,7 @@ sqlite3_bind_text :: proc "c" (handle: rawptr, index: c.int, value: cstring, len
 	_ = destructor
 	stmt := stmt_of(handle)
 	if stmt == nil || value == nil do return SQLITE_MISUSE
+	if int(index) < 1 || int(index) > engine.Embed_Parameter_Count(stmt.stmt) do return SQLITE_RANGE
 	if engine.embed_bind_text(stmt.stmt, int(index) - 1, string(value)).kind == .None do return SQLITE_OK
 	return SQLITE_ERROR
 }
@@ -291,6 +321,7 @@ sqlite3_bind_blob :: proc "c" (handle: rawptr, index: c.int, data: rawptr, lengt
 	defer delete(bytes)
 	source := ([^]u8)(data)
 	for i in 0 ..< int(length) do bytes[i] = source[i]
+	if int(index) < 1 || int(index) > engine.Embed_Parameter_Count(stmt.stmt) do return SQLITE_RANGE
 	if engine.embed_bind_blob(stmt.stmt, int(index) - 1, bytes).kind == .None do return SQLITE_OK
 	return SQLITE_ERROR
 }

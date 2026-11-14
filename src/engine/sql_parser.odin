@@ -48,6 +48,7 @@ sql_parse :: proc(source: string) -> (Query, Error) {
 		}
 	}
 	q.statement = statement
+	q.param_count = p.param_count
 	return q, ERROR_NONE
 }
 

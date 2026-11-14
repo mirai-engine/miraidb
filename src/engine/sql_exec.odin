@@ -308,6 +308,9 @@ Stmt_Prepared :: struct {
 	query:       Query,
 	is_pragma:   bool,
 	pragma_body: string,
+	// param_count is how many positional parameters the statement binds, so a
+	// caller can refuse an index before it becomes a silent growth (D29).
+	param_count: int,
 }
 
 sql_prepare :: proc(store: ^Store, sql: string) -> (^Stmt_Prepared, Error) {
@@ -323,6 +326,7 @@ sql_prepare :: proc(store: ^Store, sql: string) -> (^Stmt_Prepared, Error) {
 		return nil, parse_err
 	}
 	prepared.query = query
+	prepared.param_count = query.param_count
 	return prepared, ERROR_NONE
 }
 

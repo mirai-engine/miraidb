@@ -153,9 +153,18 @@ embed_exec_params :: proc(conn: ^Embed_Conn, sql: string, params: []Value) -> Er
 
 embed_prepare :: proc(conn: ^Embed_Conn, sql: string) -> ^Embed_Statement {
 	if conn == nil do return nil
+	// Parse now rather than at the first step: it is the same work, it reports a
+	// syntax error where a caller expects one, and it is what makes the parameter
+	// count known before the first bind, so index 99 can be refused (D29).
+	prepared, prepare_err := sql_prepare(conn.store, sql)
+	if prepare_err.kind != .None {
+		embed_fail(conn, prepare_err)
+		return nil
+	}
 	stmt := new(Embed_Statement)
 	stmt.conn = conn
 	stmt.sql = strings.clone(sql)
+	stmt.prepared = prepared
 	return stmt
 }
 
@@ -173,10 +182,26 @@ embed_clear_bindings :: proc(stmt: ^Embed_Statement) {
 	clear(&stmt.params)
 }
 
-@(private)
+// Embed_Parameter_Count reports how many positional parameters the statement
+// binds, which is what an embedding layer checks an index against.
+Embed_Parameter_Count :: proc(stmt: ^Embed_Statement) -> int {
+	if stmt == nil || stmt.prepared == nil do return 0
+	return stmt.prepared.param_count
+}
+
 embed_bind :: proc(stmt: ^Embed_Statement, index: int, value: Value) -> Error {
 	if stmt == nil do return errf(.Invalid_Argument, "no statement")
 	if index < 0 do return errf(.Invalid_Argument, "parameter index cannot be negative")
+	// A bind outside the statement's parameters is a range error, not permission to
+	// grow the list: index 99 used to succeed and leave a parameter nobody reads.
+	if stmt.prepared != nil && index >= stmt.prepared.param_count {
+		return errf(
+			.Invalid_Argument,
+			"parameter index %d is out of range: the statement binds %d",
+			index + 1,
+			stmt.prepared.param_count,
+		)
+	}
 	for len(stmt.params) <= index do append(&stmt.params, value_null())
 	value_deep_free(stmt.params[index], context.allocator)
 	stmt.params[index] = value_clone(value, context.allocator)

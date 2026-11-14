@@ -13,6 +13,9 @@
  * database, and statements belong to their connection.
  *
  * Return codes: MIRAIDB_OK (0) on success, MIRAIDB_ERROR (1) on failure,
+ * MIRAIDB_MISUSE (2) when the handle is not live (a statement used after
+ * finalize, or anything used through a connection already closed: the call does
+ * nothing and the process keeps running),
  * MIRAIDB_ROW (100) when a step produced a row and MIRAIDB_DONE (101) when the
  * statement finished.
  *
@@ -33,10 +36,11 @@ typedef struct miraidb_statement miraidb_statement;
 typedef void *miraidb_conn;
 typedef void *miraidb_stmt;
 
-#define MIRAIDB_OK    0
-#define MIRAIDB_ERROR 1
-#define MIRAIDB_ROW   100
-#define MIRAIDB_DONE  101
+#define MIRAIDB_OK     0
+#define MIRAIDB_ERROR  1
+#define MIRAIDB_MISUSE 2
+#define MIRAIDB_ROW    100
+#define MIRAIDB_DONE   101
 
 #define MIRAIDB_NULL  0
 #define MIRAIDB_BOOL  1
@@ -62,7 +66,9 @@ int miraidb_backup(miraidb_conn db, const char *path);
 
 /* Prepared statements. `index` is zero-based. */
 miraidb_stmt miraidb_prepare(miraidb_conn db, const char *sql);
-/* Parameter indexes are zero-based: `index` 0 binds the first `?`. */
+/* Parameter indexes are zero-based: `index` 0 binds the first `?`. An index at
+ * or past the number of parameters the statement binds is refused with
+ * MIRAIDB_ERROR instead of growing the parameter list. */
 int  miraidb_bind_null(miraidb_stmt stmt, int index);
 int  miraidb_bind_int(miraidb_stmt stmt, int index, long long value);
 int  miraidb_bind_double(miraidb_stmt stmt, int index, double value);

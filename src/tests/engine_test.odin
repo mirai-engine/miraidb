@@ -7671,6 +7671,43 @@ test_text_positions_count_characters :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, `SELECT instr('日本語', '語')`).i, i64(3))
 }
 
+// A statement knows how many parameters it binds, a bind past them is refused,
+// and the handle registry tells a live pointer from a forgotten one without
+// touching what it points at (D29).
+@(test)
+test_bind_range_and_live_handles :: proc(t: ^testing.T) {
+	conn, open_err := db.embed_open(":memory:")
+	if !testing.expectf(t, db.error_ok(open_err), "open failed: %s", open_err.message) do return
+	defer db.embed_close(conn)
+
+	stmt := db.embed_prepare(conn, "INSERT INTO t (a, b) VALUES (?, ?)")
+	if !testing.expect(t, stmt != nil) do return
+	testing.expect_value(t, db.Embed_Parameter_Count(stmt), 2)
+	testing.expect(t, db.error_ok(db.embed_bind_int(stmt, 0, 1)))
+	testing.expect(t, db.error_ok(db.embed_bind_int(stmt, 1, 2)))
+	out_of_range := db.embed_bind_int(stmt, 2, 3)
+	testing.expect_value(t, out_of_range.kind, db.Error_Kind.Invalid_Argument)
+	testing.expect(t, strings.contains(out_of_range.message, "out of range"))
+	db.embed_finalize(stmt)
+
+	// Preparation parses, so a syntax error is reported where a caller expects
+	// one and no handle comes back.
+	broken := db.embed_prepare(conn, "SELECT ((")
+	testing.expect(t, broken == nil)
+	testing.expect(t, len(db.embed_error(conn)) > 0)
+
+	// The registry answers by value: a forgotten pointer is not dereferenced.
+	marker := new(int)
+	testing.expect(t, !db.handle_is_live(rawptr(marker)))
+	db.handle_register(rawptr(marker))
+	testing.expect(t, db.handle_is_live(rawptr(marker)))
+	testing.expect(t, db.handle_forget(rawptr(marker)))
+	testing.expect(t, !db.handle_is_live(rawptr(marker)))
+	testing.expect(t, !db.handle_forget(rawptr(marker)))
+	free(marker)
+	testing.expect(t, !db.handle_is_live(nil))
+}
+
 // SQLite spells an in-memory database in five ways and a program written against
 // its API starts with one of them (D28).
 @(test)

@@ -14,11 +14,16 @@ package capi
 import "base:runtime"
 import "core:c"
 import "core:strings"
+import "core:sync"
 
 import engine "../engine"
 
 MIRAIDB_OK :: c.int(0)
 MIRAIDB_ERROR :: c.int(1)
+// MIRAIDB_MISUSE is the answer to a handle that is not live: a statement used
+// after finalize, or anything used through a connection already closed. The call
+// does nothing and the process keeps running (D29).
+MIRAIDB_MISUSE :: c.int(2)
 MIRAIDB_ROW :: c.int(100)
 MIRAIDB_DONE :: c.int(101)
 
@@ -35,6 +40,9 @@ Capi_Connection :: struct {
 	embed:   ^engine.Embed_Conn,
 	last:    string, // owned, NUL-terminated
 	changes: c.int,
+	// statements is what this connection handed out and has not finalized, so a
+	// close can make every one of them misuse instead of leaving them dangling.
+	statements: map[rawptr]^Capi_Statement,
 }
 
 Capi_Statement :: struct {
@@ -47,6 +55,22 @@ Capi_Statement :: struct {
 // the only place in the API where a failed call has no handle to explain itself.
 @(private)
 last_open_error: string
+
+// last_misuse explains a dead handle. When the handle is dead its connection
+// cannot be found, so the reason is kept here and miraidb_errmsg falls back to it.
+@(private)
+last_misuse: string
+
+@(private)
+misuse_mutex: sync.Mutex
+
+@(private)
+set_misuse :: proc(message: string) {
+	sync.lock(&misuse_mutex)
+	defer sync.unlock(&misuse_mutex)
+	delete(last_misuse)
+	last_misuse = strings.clone(message)
+}
 
 @(export)
 miraidb_open :: proc "c" (path: cstring) -> rawptr {
@@ -63,11 +87,16 @@ miraidb_open :: proc "c" (path: cstring) -> rawptr {
 	last_open_error = ""
 	handle := new(Capi_Connection)
 	handle.embed = conn
+	handle.statements = make(map[rawptr]^Capi_Statement)
+	engine.handle_register(rawptr(handle))
 	return rawptr(handle)
 }
 
 @(private)
 capi_conn :: proc(handle: rawptr) -> ^Capi_Connection {
+	// The pointer is checked by value; casting it first and reading a field would
+	// be the access violation this guard exists to stop.
+	if !engine.handle_is_live(handle) do return nil
 	return cast(^Capi_Connection)handle
 }
 
@@ -75,7 +104,24 @@ capi_conn :: proc(handle: rawptr) -> ^Capi_Connection {
 miraidb_close :: proc "c" (handle: rawptr) {
 	context = runtime.default_context()
 	conn := capi_conn(handle)
-	if conn == nil do return
+	if conn == nil {
+		set_misuse("connection handle is closed")
+		return
+	}
+	// A statement this connection handed out is not left dangling: it is finalized
+	// here and its handle forgotten, so a later call answers misuse (D29).
+	keys := make([dynamic]rawptr, 0, len(conn.statements))
+	for key, _ in conn.statements do append(&keys, key)
+	for key in keys {
+		if stmt, found := conn.statements[key]; found {
+			engine.embed_finalize(stmt.embed)
+			engine.handle_forget(key)
+			free(stmt)
+		}
+	}
+	delete(conn.statements)
+	delete(keys)
+	engine.handle_forget(rawptr(conn))
 	engine.embed_close(conn.embed)
 	delete(conn.last)
 	free(conn)
@@ -86,20 +132,31 @@ miraidb_errmsg :: proc "c" (handle: rawptr) -> cstring {
 	context = runtime.default_context()
 	conn := capi_conn(handle)
 	if conn == nil {
+		sync.lock(&misuse_mutex)
+		reason := last_misuse
+		sync.unlock(&misuse_mutex)
+		if len(reason) > 0 do return cstring(raw_data(reason))
 		if len(last_open_error) == 0 do return ""
 		return cstring(raw_data(last_open_error))
 	}
 	delete(conn.last)
 	conn.last = strings.clone(engine.embed_error(conn.embed))
-	if len(conn.last) == 0 do return ""
-	return cstring(raw_data(conn.last))
+	if len(conn.last) > 0 do return cstring(raw_data(conn.last))
+	// A dead handle has no connection to explain itself, so the reason is the one
+	// the misuse path kept.
+	sync.lock(&misuse_mutex)
+	message := last_misuse
+	sync.unlock(&misuse_mutex)
+	if len(message) == 0 do return ""
+	return cstring(raw_data(message))
 }
 
 @(export)
 miraidb_exec :: proc "c" (handle: rawptr, sql: cstring) -> c.int {
 	context = runtime.default_context()
 	conn := capi_conn(handle)
-	if conn == nil || sql == nil do return MIRAIDB_ERROR
+	if conn == nil do return MIRAIDB_MISUSE
+	if sql == nil do return MIRAIDB_ERROR
 	err := engine.embed_exec(conn.embed, string(sql))
 	if err.kind != .None do return MIRAIDB_ERROR
 	return MIRAIDB_OK
@@ -109,7 +166,8 @@ miraidb_exec :: proc "c" (handle: rawptr, sql: cstring) -> c.int {
 miraidb_backup :: proc "c" (handle: rawptr, path: cstring) -> c.int {
 	context = runtime.default_context()
 	conn := capi_conn(handle)
-	if conn == nil || path == nil do return MIRAIDB_ERROR
+	if conn == nil do return MIRAIDB_MISUSE
+	if path == nil do return MIRAIDB_ERROR
 	err := engine.embed_backup(conn.embed, string(path))
 	if err.kind != .None do return MIRAIDB_ERROR
 	return MIRAIDB_OK
@@ -125,11 +183,14 @@ miraidb_prepare :: proc "c" (handle: rawptr, sql: cstring) -> rawptr {
 	stmt := new(Capi_Statement)
 	stmt.conn = conn
 	stmt.embed = statement
+	conn.statements[rawptr(stmt)] = stmt
+	engine.handle_register(rawptr(stmt))
 	return rawptr(stmt)
 }
 
 @(private)
 capi_stmt :: proc(handle: rawptr) -> ^Capi_Statement {
+	if !engine.handle_is_live(handle) do return nil
 	return cast(^Capi_Statement)handle
 }
 
@@ -137,7 +198,12 @@ capi_stmt :: proc(handle: rawptr) -> ^Capi_Statement {
 miraidb_finalize :: proc "c" (handle: rawptr) {
 	context = runtime.default_context()
 	stmt := capi_stmt(handle)
-	if stmt == nil do return
+	if stmt == nil {
+		set_misuse("statement handle is closed")
+		return
+	}
+	if stmt.conn != nil do delete_key(&stmt.conn.statements, handle)
+	engine.handle_forget(handle)
 	engine.embed_finalize(stmt.embed)
 	free(stmt)
 }
@@ -146,7 +212,10 @@ miraidb_finalize :: proc "c" (handle: rawptr) {
 miraidb_reset :: proc "c" (handle: rawptr) {
 	context = runtime.default_context()
 	stmt := capi_stmt(handle)
-	if stmt == nil do return
+	if stmt == nil {
+		set_misuse("statement handle is closed")
+		return
+	}
 	engine.embed_reset(stmt.embed)
 }
 
@@ -154,7 +223,7 @@ miraidb_reset :: proc "c" (handle: rawptr) {
 miraidb_bind_null :: proc "c" (handle: rawptr, index: c.int) -> c.int {
 	context = runtime.default_context()
 	stmt := capi_stmt(handle)
-	if stmt == nil do return MIRAIDB_ERROR
+	if stmt == nil do return MIRAIDB_MISUSE
 	if engine.embed_bind_null(stmt.embed, int(index)).kind != .None do return MIRAIDB_ERROR
 	return MIRAIDB_OK
 }
@@ -163,7 +232,7 @@ miraidb_bind_null :: proc "c" (handle: rawptr, index: c.int) -> c.int {
 miraidb_bind_int :: proc "c" (handle: rawptr, index: c.int, value: c.longlong) -> c.int {
 	context = runtime.default_context()
 	stmt := capi_stmt(handle)
-	if stmt == nil do return MIRAIDB_ERROR
+	if stmt == nil do return MIRAIDB_MISUSE
 	if engine.embed_bind_int(stmt.embed, int(index), i64(value)).kind != .None do return MIRAIDB_ERROR
 	return MIRAIDB_OK
 }
@@ -172,7 +241,7 @@ miraidb_bind_int :: proc "c" (handle: rawptr, index: c.int, value: c.longlong) -
 miraidb_bind_double :: proc "c" (handle: rawptr, index: c.int, value: c.double) -> c.int {
 	context = runtime.default_context()
 	stmt := capi_stmt(handle)
-	if stmt == nil do return MIRAIDB_ERROR
+	if stmt == nil do return MIRAIDB_MISUSE
 	if engine.embed_bind_float(stmt.embed, int(index), f64(value)).kind != .None do return MIRAIDB_ERROR
 	return MIRAIDB_OK
 }
@@ -181,7 +250,8 @@ miraidb_bind_double :: proc "c" (handle: rawptr, index: c.int, value: c.double) 
 miraidb_bind_text :: proc "c" (handle: rawptr, index: c.int, value: cstring) -> c.int {
 	context = runtime.default_context()
 	stmt := capi_stmt(handle)
-	if stmt == nil || value == nil do return MIRAIDB_ERROR
+	if stmt == nil do return MIRAIDB_MISUSE
+	if value == nil do return MIRAIDB_ERROR
 	if engine.embed_bind_text(stmt.embed, int(index), string(value)).kind != .None do return MIRAIDB_ERROR
 	return MIRAIDB_OK
 }
@@ -190,7 +260,8 @@ miraidb_bind_text :: proc "c" (handle: rawptr, index: c.int, value: cstring) -> 
 miraidb_bind_blob :: proc "c" (handle: rawptr, index: c.int, data: rawptr, length: c.int) -> c.int {
 	context = runtime.default_context()
 	stmt := capi_stmt(handle)
-	if stmt == nil || (data == nil && length > 0) do return MIRAIDB_ERROR
+	if stmt == nil do return MIRAIDB_MISUSE
+	if data == nil && length > 0 do return MIRAIDB_ERROR
 	bytes := make([]u8, int(length))
 	defer delete(bytes)
 	if length > 0 {
@@ -205,7 +276,7 @@ miraidb_bind_blob :: proc "c" (handle: rawptr, index: c.int, data: rawptr, lengt
 miraidb_step :: proc "c" (handle: rawptr) -> c.int {
 	context = runtime.default_context()
 	stmt := capi_stmt(handle)
-	if stmt == nil do return MIRAIDB_ERROR
+	if stmt == nil do return MIRAIDB_MISUSE
 	has_row, err := engine.embed_step(stmt.embed)
 	if err.kind != .None do return MIRAIDB_ERROR
 	return has_row ? MIRAIDB_ROW : MIRAIDB_DONE

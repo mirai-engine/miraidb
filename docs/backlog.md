@@ -1196,7 +1196,300 @@ and that no directory named `:memory:` appears; `scripts/capi_smoke.py` and
 `scripts/sqlite_abi_smoke.py` open each spelling through the DLL and read a row
 back. `./bin/miraidb.exe sql ":memory:" "SELECT 1"` answers `1`.
 
-## D29 — A C handle is never a dangling pointer
+## D29 — A C handle is never a dangling pointer — *done* (see `docs/roadmap.md`, closed)
+
+**Now.** `capi_stmt` was a cast of the caller's pointer (`src/capi/capi.odin`), so
+after `miraidb_finalize` the memory was free and the next call read it
+(`AUDIT-10` P-A3):
+
+```
+miraidb_step(stmt) after finalize   -> 101    (DONE, from freed memory)
+miraidb_bind_text(stmt, 1, "x")     -> access violation reading 0xFFFFFFFFFFFFFFF9
+```
+
+The second call ended the host process. `bind` also took any index:
+`miraidb_bind_int(stmt, 99, 1)` answered `OK` because `embed_bind` grew the
+parameter list to fit, so a typo became a NULL parameter instead of a range error.
+
+**Done.**
+
+1. `src/engine/handles.odin` keeps the set of live handles. Both embedding layers
+   register what they hand out and ask `handle_is_live` **by value** before they
+   dereference: a dead handle answers `MIRAIDB_MISUSE` (2) in the C ABI and
+   `SQLITE_MISUSE` (21) in the facade, and the process keeps running. A second
+   `finalize` does nothing.
+2. Closing a connection finalizes the statements it still owns and forgets their
+   handles, so a statement outliving its connection is misuse rather than a
+   dangling pointer.
+3. `embed_prepare` parses eagerly: a syntax error now fails at prepare, and
+   `Embed_Parameter_Count` is known before the first bind. A bind past it is
+   `SQLITE_RANGE` (25) in the facade and `MIRAIDB_ERROR` with "parameter index N is
+   out of range: the statement binds M" in the C ABI.
+4. Column accessors on a finished statement answer NULL/0 (they never dereference),
+   and `errmsg` explains the misuse even when the handle is dead.
+
+**Acceptance, met.** `test_bind_range_and_live_handles` covers the parameter count,
+the range error and the registry; `scripts/capi_smoke.py` and
+`scripts/sqlite_abi_smoke.py` run the hostile sequences through both DLLs — step,
+bind, reset, column and finalize after `finalize`, a double finalize, a bind past
+the parameters, and a statement used after its connection closed. Every call
+answers and the script finishes, which is the property the audit measured as
+missing.
+
+What is not promised: a pointer this layer never handed out, or a stale handle
+whose address the allocator reused for a new statement (that one then names the
+new statement, as in any C library). `docs/security.md` says so.
+
+## D25 — The C ABI, completely
+
+**Now.** 24 functions in the sqlite3 shape (`open`, `close`, `errmsg`, `exec`,
+`backup`, `prepare`, `finalize`, `reset`, six `bind`s, `step`, `changes`, nine
+column accessors, `version`) and none of the engine's levers: no open options, so
+an embedder cannot ask for read-only, in-memory or a durability other than the
+default; no `miraidb_interrupt` although `store_cancel` exists and is tested; no
+row quota or work budget; no identity or token, so roles and policies are
+unreachable from C; no statement about thread safety. `miraidb_open` also imports
+a `.sqlite` file into memory without saying so, which for a 250 000-row file is
+~15 s and the size of the file in RAM.
+
+**Next.**
+
+1. `miraidb_open_v2(path, flags)` with read-only, create, durability and
+   in-memory bits; keep `miraidb_open` as a thin wrapper so the ABI stays additive.
+2. `miraidb_interrupt`, `miraidb_set_row_quota`, `miraidb_set_work_budget`.
+3. `miraidb_set_identity`, `miraidb_authenticate(token)` so the C surface can use
+   what `roles.odin` already checks.
+4. A paragraph in `include/miraidb.h` on thread safety and pointer lifetimes, and
+   the same in `docs/`.
+
+**Acceptance.** `capi_smoke.py` exercises each new call; a cancelled statement
+returns `MIRAIDB_ERROR` with "cancelled" in `miraidb_errmsg`; a read-only open
+refuses `INSERT`; the header documents the model.
+
+**Cost.** M.
+
+## D26 — Docs whose claims are executed
+
+**Now.** `docs_check.py` verifies shape: counts, links, forbidden names, five-cell
+roadmap rows. It does not verify a sentence. Two rows of `docs/sqlite.md` still said
+`BEFORE` triggers and `RANGE`/`GROUPS` frames are refused, and both have worked
+since `0a59dbb` and `763bb3b` — this audit found them by reading, not by running
+anything.
+
+**Next.** Turn the compatibility matrix into data the gate executes: a table of
+`(statement, expectation)` where `expectation` is `works` or `refused`, run
+against both this engine and `sqlite3`, with the matrix rows generated from it or
+checked against it. Start with the rows that name a refusal, because those are the
+ones that go stale when a feature lands, then the `done` rows that are cheap to
+state as one statement.
+
+**Acceptance.** A row that says `refused` while the engine answers fails CI, and
+the reverse too; the SQLite matrix is generated or cross-checked from the same
+file.
+
+**Cost.** S.
+
+## D31 — The three wrong answers — *done* (see `docs/roadmap.md`, closed)
+
+**Now.** Three sentences that answered and were wrong, found by the second audit
+pass (`AUDIT-10`) by running 47 edge queries through both engines. All three are
+fixed and covered by tests now; the table is what the audit measured:
+
+| Query | SQLite | this engine |
+|---|---|---|
+| `SELECT substr('abcdef', -3)` | `def` | `abcdef` |
+| `SELECT 1 WHERE 'a'` | 0 rows | 1 row |
+| `SELECT 1.0` (`--json`) | `1.0` | `1` |
+
+The first is a missing feature that fails silently: a negative start counts from the
+end in SQLite, and the engine takes the absolute value path and returns the whole
+string. `substr` is tested, but only with a positive index
+(`test_functions` uses `substr(s, 3, 5)`), so nothing noticed.
+
+The second is a semantics choice with the wrong default. `WHERE` asks a value for its
+truth, and the engine's rule is "a non-empty text is true". SQLite converts the text
+to a number first, so `'a'` is `0` and the row is dropped; `'1'` is true. The
+difference is invisible until a predicate is written against a text column by mistake
+— which is exactly when it matters.
+
+The third is rendering, not data: `typeof(1.0)` answers `real`, and the JSON writer
+prints `1` for it because the format string drops a trailing `.0`. A JSON consumer
+gets an integer where the schema promised a real, and the differential runner cannot
+see it (it also treats `1` and `1.0` as equal; D30).
+
+`INSERT OR REPLACE` belongs here too: the parser refuses it with "expected into" and
+neither `REFUSED` in the differential nor `docs/sqlite.md` says so.
+
+**Next.** *(1 is done: `substr` follows SQLite and text positions count
+characters everywhere they are reported — `length`, `instr` and `substr` — tested
+in `test_text_positions_count_characters` over 21 cases and against SQLite over
+660.)*
+
+1. ~~`substr`/`substring`: a negative start counts from the end, a negative length
+   returns the characters before the start (SQLite's rule), and both are tested at
+   the boundary (start equal to length, start below the string, length 0).~~
+2. ~~`WHERE`: cast to a number the way SQLite does (`'12'` → 12, `'12a'` → 12, `'a'` →
+   0, `''` → 0, `x'…'` → 0), then test truth against that. Keep the current strictness
+   for comparisons (`1 = '1'` stays an error, listed in `DIFFERENT`): this is about
+   *truth*, not about comparison.~~ Done in `text_number_prefix`, tested over
+   seventeen literals in `test_text_truth_is_numeric`.
+3. ~~The JSON writer keeps the `.0` for a real, so a consumer can tell the types
+   apart.~~ Done for both writers: `Json_Value` carries an `is_integer` bit that
+   the parser and `json_from_value` set, and the CLI's `--json` path prints
+   `%d.0`. `json_type` and `json_extract` now agree on the type too.
+4. ~~`INSERT OR REPLACE`: implement it as `INSERT` + delete-on-conflict, or list it as
+   refused in `REFUSED` and in `docs/sqlite.md`. Refusing is acceptable; refusing
+   quietly is not.~~ Implemented: `unique_conflicts` collects the rows that collide on
+   any unique index, they are deleted through a staging delete that runs no trigger
+   program (SQLite fires delete triggers for a REPLACE only with recursive triggers
+   on), and the insert is retried. `OR ROLLBACK`/`FAIL`/`IGNORE` are named refusals.
+
+**Acceptance.** Each of the four has a test that fails today; the corpus in D30 holds
+them; `docs/sql.md` states the negative-index rule and the truth rule.
+
+**Cost.** S.
+
+## D30 — The differential cannot lie — *done* (see `docs/roadmap.md`, closed)
+
+**Now.** Two ways `scripts/differential.py` can look at a difference and not see it:
+
+- **Ordering by substring.** `compare()` decides the rows are ordered when
+  `"order by" in statement.lower()`. An `OVER (… ORDER BY …)` or a subquery with its
+  own `ORDER BY` therefore makes the *outer* result compared position by position,
+  while the outer query promises no order at all. Three window queries were reported
+  as differences whose multisets were identical in this pass; the same defect can hide
+  a real difference behind a lucky order.
+- **Types as values.** `same_cell` compares `1` and `1.0` as equal, so a query that
+  returns the wrong type passes.
+
+And the gate advertised more than it enforced: `docs/roadmap.md` said a 10% regression
+fails, while `scripts/bench.py` accepted 3x for every time metric and compared against a
+number recorded on another machine (it printed `machine` and never compared it). Runs on
+this machine in one session produced 31 603 and 57 403 inserts/s, 15.6/22.6/46.3 µs for a
+read transaction, and 5.3/73.6 ms for a commit with a reader open, with no code change:
+wall clock here is not gated at 10% by anything, and pretending otherwise was the lie.
+
+*Done*: `--check` fails on bytes per row (a property of the format, 10% against the
+baseline) and **reports** every time metric measured twice in the same run with its
+spread; `--strict-time` enforces 10% against the baseline for a quiet machine after
+`--record`. The roadmap says exactly that.
+
+**Next.**
+
+1. Decide "ordered" from the statement's own top level: the outermost `ORDER BY` after
+   the last closing parenthesis of the `FROM`/`WHERE`/`GROUP BY` region, or — simpler
+   and safer — compare as a multiset *and* as a sequence, and accept a query when
+   either matches, while a query that names a top-level `ORDER BY` must match the
+   sequence.
+2. Compare types: a cell carries its kind, so `int 1` and `real 1.0` differ.
+3. Adopt the 47 queries of `AUDIT-10` as the corpus, with the three D31 bugs listed in
+   `DIFFERENT` until they are fixed and moved to `QUERIES` after.
+4. The performance gate: measure a reference (a fixed, simple workload) in the same run
+   and compare against *that*, so a loaded machine and slower code are distinguishable;
+   keep the stored baseline as history. Then the roadmap can say 10% and mean it.
+
+**Acceptance.** A window query that returns the right multiset in any order passes; one
+that drops a row fails; a query returning `1` where SQLite returns `1.0` fails; the
+performance gate fails on a 15% regression of a same-run reference and passes on a
+loaded machine.
+
+**Cost.** S for the runner, M for the same-run reference.
+
+## D27 — The mirror keeps the schema it does not model
+
+**Now.** One `ALTER TABLE` through the engine rewrites the user's `.sqlite` file with
+the engine's own idea of the schema (`AUDIT-10` P-A1). Measured on a file that SQLite
+created:
+
+```sql
+-- before
+CREATE TABLE child (id INTEGER PRIMARY KEY,
+  pid INTEGER NOT NULL REFERENCES parent(id) ON DELETE CASCADE,
+  code TEXT UNIQUE CHECK (length(code) > 2),
+  note TEXT DEFAULT 'n' COLLATE NOCASE)
+
+-- after `ALTER TABLE parent ADD COLUMN extra INTEGER`
+CREATE TABLE "child" ("id" INTEGER NOT NULL, "pid" INTEGER NOT NULL,
+  "code" TEXT, "note" TEXT, PRIMARY KEY ("id"))
+```
+
+`PRAGMA foreign_key_list(child)` is empty afterwards. In the same experiment the file's
+view and trigger disappeared (three objects before, one after), and a
+`GENERATED ALWAYS AS (a*2)` column is imported as `NULL` and written back as a plain
+NULL column.
+
+The mechanism is two halves that each looked reasonable: `sqlite_import` recreates a
+table from `Sqlite_Column` (name, type, NOT NULL, PRIMARY KEY), and `sqlite_file_write`
+emits `CREATE TABLE` from the engine's `Table_Schema`. Any DDL forces the full rewrite,
+so everything the engine does not model is dropped — silently, on a file that is the
+user's database.
+
+D24 closed the *corruption* in that path (the empty `sqlite_master`) and the *indexes*
+on import. It did not close this, and the roadmap said DDL was safe, which was true of
+integrity and false of semantics.
+
+**Next.**
+
+1. Keep each imported object's original SQL: `Sqlite_Table.sql` already carries the
+   `CREATE TABLE` text and is currently unused by the writer. Extend it to views and
+   triggers (they are rows in `sqlite_master` with SQL), and keep them in the mirror as
+   opaque objects the engine does not evaluate but must not delete.
+2. On a rewrite, re-emit the original SQL for every object whose engine-side schema is
+   unchanged. For a table the engine *did* change (a column added), apply the change to
+   the original statement or fall back to the generated one — and in that second case,
+   say so: a `mirror_reason` the CLI's `--mirror-report` prints and the file's owner can
+   read.
+3. Refuse rather than degrade: a `ALTER`/`CREATE`/`DROP` that the engine cannot express
+   against a table whose SQL carries constraints it does not model answers
+   `mirror_unrepresentable` (or the existing `.Unsupported`) instead of writing a
+   weaker schema. Losing a user's foreign keys silently is worse than refusing the
+   statement.
+4. Import a `GENERATED` column as generated, or refuse the table with a reason. A NULL
+   column with the right name is the one outcome nobody can recover from.
+5. Gate it: a fixture with FK, UNIQUE, CHECK, DEFAULT, COLLATE, a view, a trigger and a
+   generated column goes through `INSERT`, `ALTER… ADD COLUMN`, `CREATE INDEX`,
+   `DROP INDEX` and `DROP TABLE`, and `sqlite_master` is compared (normalised) against
+   the expectation, plus `PRAGMA integrity_check` and a foreign-key check from a real
+   `sqlite3`.
+
+**Acceptance.** The fixture above keeps its constraints, view, trigger and generated
+column through every DDL the engine accepts; a DDL it cannot express is refused with a
+reason; `docs/sqlite.md` states which of the two happened.
+
+**Cost.** L. It is a design decision (preserve the text, or model the constraints and
+emit them) before it is code, and this item exists so the decision is written down.
+
+## D28 — Open the way SQLite opens — *done* (see `docs/roadmap.md`, closed)
+
+**Now.** The measure that started it (`AUDIT-10` P-A2):
+
+```
+$ ./bin/miraidb.exe sql ":memory:" "SELECT 1"
+miraidb: io: cannot create :memory:: INVALID_NAME
+
+sqlite3_open(':memory:')                   -> 1  (SQLITE_ERROR)
+sqlite3_open('')                           -> 1
+sqlite3_open('file::memory:?cache=shared') -> 1
+```
+
+`src/sqlite_compat` exists so a program written against `sqlite3_*` can link against
+this engine instead, and the first thing such a program does is open an in-memory
+database, so no such program could start.
+
+**Done.** `store_path_is_memory` recognises `:memory:`, the empty path,
+`file::memory:`, `file::memory:?cache=shared` and `file:<name>?mode=memory`, and
+`store_open` turns any of them into a non-persistent store with no path. That is
+the single door the CLI, the C ABI and the facade use, so there is one rule to
+keep right instead of three. In memory there is no log, no directory, no page
+files and nothing to compact, and every open is a fresh database.
+
+**Acceptance, met.** `test_open_in_memory_the_way_sqlite_does` opens all five
+spellings, writes, reads, proves a second open does not see the first one's table
+and that no directory named `:memory:` appears; `scripts/capi_smoke.py` and
+`scripts/sqlite_abi_smoke.py` open each spelling through the DLL and read a row
+back. `./bin/miraidb.exe sql ":memory:" "SELECT 1"` answers `1`.
+
+## D29 — A C handle is never a dangling pointer — *done* (see `docs/roadmap.md`, closed)
 
 **Now.** `capi_stmt` is a cast of the caller's pointer (`src/capi/capi.odin:132`), so
 after `miraidb_finalize` the memory is free and the next call reads it

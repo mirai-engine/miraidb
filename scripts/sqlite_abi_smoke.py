@@ -7,7 +7,7 @@ Run with a Python that can load the platform library:
 from __future__ import annotations
 import ctypes, os, shutil, sqlite3, sys
 
-OK, ERROR, ROW, DONE = 0, 1, 100, 101
+OK, ERROR, MISUSE, ROW, DONE, RANGE = 0, 1, 21, 100, 101, 25
 
 
 def load(path):
@@ -185,6 +185,36 @@ def main() -> int:
     empty_check.close()
     assert empty_integrity == "ok", empty_integrity
     assert remaining == 0, remaining
+
+    # A dead handle is misuse, not memory (D29): the sqlite3 face answers
+    # SQLITE_MISUSE to a statement used after finalize or through a closed
+    # connection, a bind outside the parameters answers SQLITE_RANGE, and none of
+    # it ends the process.
+    lib.sqlite3_finalize.restype = ctypes.c_int
+    lib.sqlite3_bind_text.restype = ctypes.c_int
+    lib.sqlite3_step.restype = ctypes.c_int
+
+    ghost = ctypes.c_void_p()
+    assert lib.sqlite3_open(b":memory:", ctypes.byref(ghost)) == OK
+    assert lib.sqlite3_exec(ghost, b"CREATE TABLE g (id INTEGER, s TEXT)", None, None, None) == OK
+    gone = ctypes.c_void_p()
+    assert lib.sqlite3_prepare_v2(ghost, b"INSERT INTO g (id, s) VALUES (?, ?)", -1, ctypes.byref(gone), None) == OK
+    assert lib.sqlite3_bind_int64(gone, 1, 1) == OK
+    assert lib.sqlite3_bind_text(gone, 2, b"a", -1, None) == OK
+    assert lib.sqlite3_bind_text(gone, 5, b"a", -1, None) == RANGE, "an index past the parameters is refused"
+    assert lib.sqlite3_finalize(gone) == OK
+    assert lib.sqlite3_step(gone) == MISUSE
+    assert lib.sqlite3_bind_text(gone, 1, b"b", -1, None) == MISUSE
+    assert lib.sqlite3_finalize(gone) == MISUSE
+
+    owner = ctypes.c_void_p()
+    assert lib.sqlite3_open(b":memory:", ctypes.byref(owner)) == OK
+    orphan = ctypes.c_void_p()
+    assert lib.sqlite3_prepare_v2(owner, b"SELECT 1", -1, ctypes.byref(orphan), None) == OK
+    assert lib.sqlite3_close(owner) == OK
+    assert lib.sqlite3_step(orphan) == MISUSE, "a statement of a closed connection is misuse"
+    lib.sqlite3_finalize(orphan)
+    lib.sqlite3_close(ghost)
 
     print("rows:", rows)
     print("error path:", message)

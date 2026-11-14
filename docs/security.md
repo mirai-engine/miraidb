@@ -80,3 +80,18 @@ that socket's lock, never by two threads at once.
 A frame may arrive in pieces and a read may carry several frames; the loop waits
 for the rest of a frame and drains what it has, rather than closing the
 connection.
+
+## Misuse of a handle
+
+A handle the embedding layer hands out is a pointer, and a host may keep one
+after it stopped being valid. Every entry point checks it against the layer's set
+of live handles before dereferencing, so a statement used after `finalize`, a
+statement whose connection was closed, and a second `finalize` all answer a
+misuse error (`MIRAIDB_MISUSE`, `SQLITE_MISUSE`) and do nothing. A bind index past
+the statement's parameters is `SQLITE_RANGE`, not a silent growth of the list.
+
+What this does not defend against: a pointer that was never handed out by this
+layer, or a host that keeps a stale handle long enough for the allocator to hand
+the same address to a new statement — the old handle then names the new one, as it
+would in any C library. The guarantee is that a handle this layer forgot answers
+an error instead of touching freed memory.

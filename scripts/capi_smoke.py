@@ -15,7 +15,7 @@ import ctypes
 import os
 import sys
 
-OK, ERROR, ROW, DONE = 0, 1, 100, 101
+OK, ERROR, MISUSE, ROW, DONE = 0, 1, 2, 100, 101
 
 
 def load(path: str):
@@ -129,6 +129,38 @@ def main() -> int:
     lib.miraidb_finalize(count)
     lib.miraidb_close(copy_db)
     shutil.rmtree(backup, ignore_errors=True)
+
+    # A handle is not permission to read freed memory (D29). Every call through a
+    # finalized statement answers MIRAIDB_MISUSE, a double finalize does nothing,
+    # a bind outside the statement's parameters is refused, and closing a
+    # connection with a statement open turns that statement into misuse. None of
+    # this may end the process, which is what the last of these used to do.
+    lib.miraidb_bind_int.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_longlong]
+    lib.miraidb_bind_int.restype = ctypes.c_int
+    lib.miraidb_reset.restype = None
+    lib.miraidb_finalize.restype = None
+    lib.miraidb_column_int.restype = ctypes.c_longlong
+
+    doomed = lib.miraidb_prepare(db, b"INSERT INTO t (id, name) VALUES (?, ?)")
+    assert doomed
+    assert lib.miraidb_bind_int(doomed, 0, 9) == OK
+    assert lib.miraidb_bind_text(doomed, 1, b"n") == OK
+    assert lib.miraidb_bind_int(doomed, 5, 1) == ERROR, "an index past the parameters is refused"
+    lib.miraidb_finalize(doomed)
+    assert lib.miraidb_step(doomed) == MISUSE
+    assert lib.miraidb_bind_text(doomed, 0, b"x") == MISUSE
+    lib.miraidb_reset(doomed)
+    assert lib.miraidb_column_int(doomed, 0) == 0
+    lib.miraidb_finalize(doomed)  # a second finalize must not crash
+    assert "closed" in lib.miraidb_errmsg(None).decode()
+
+    orphan_db = lib.miraidb_open(b":memory:")
+    assert orphan_db
+    orphan = lib.miraidb_prepare(orphan_db, b"SELECT 1")
+    assert orphan
+    lib.miraidb_close(orphan_db)
+    assert lib.miraidb_step(orphan) == MISUSE, "a statement of a closed connection is misuse"
+    lib.miraidb_finalize(orphan)
 
     # The error path reports a message instead of crashing.
     assert lib.miraidb_exec(db, b"SELECT * FROM missing") == ERROR
