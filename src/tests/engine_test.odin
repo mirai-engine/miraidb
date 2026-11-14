@@ -10942,6 +10942,64 @@ test_scalar_minmax_and_trim_sets :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_group_by_a_projection_alias :: proc(t: ^testing.T) {
+	// `SELECT dept AS d ... GROUP BY d` groups by what the projection names. A name
+	// that is a column of a source still means the column, which is what SQL says:
+	// aliasing `salary` to `dept` must not silently regroup the table.
+	store := fresh_db(t, "group_alias")
+	if store == nil do return
+	defer cleanup_db(store, "group_alias")
+
+	run(t, store, "CREATE TABLE emp (id INTEGER PRIMARY KEY, dept INTEGER, salary INTEGER)")
+	run(t, store, "INSERT INTO emp (dept, salary) VALUES (1, 10), (1, 20), (2, 30)")
+
+	Check :: struct {
+		sql:    string,
+		groups: int,
+		first:  [2]i64,
+		second: [2]i64,
+	}
+	checks := [3]Check{
+		// Grouped by the alias, ordered by it: two departments, two and one rows.
+		{"SELECT dept AS d, count(*) AS n FROM emp GROUP BY d ORDER BY d", 2, {1, 2}, {2, 1}},
+		// `dept` is a column here, so this groups by it and not by the alias.
+		{"SELECT salary AS dept, count(*) AS n FROM emp GROUP BY dept ORDER BY dept", 2, {10, 2}, {30, 1}},
+		// An expression can be named and grouped by that name.
+		{"SELECT dept * 10 AS tens, count(*) AS n FROM emp GROUP BY tens ORDER BY tens", 2, {10, 2}, {20, 1}},
+	}
+	for check in checks {
+		result, err := db.sql_execute(store, check.sql)
+		if !testing.expectf(t, db.error_ok(err), "%s: %s", check.sql, err.message) do continue
+		if testing.expectf(t, len(result.rows) == check.groups, "%s: %d groups", check.sql, len(result.rows)) {
+			testing.expect_value(t, result.rows[0][0].i, check.first[0])
+			testing.expect_value(t, result.rows[0][1].i, check.first[1])
+			testing.expect_value(t, result.rows[1][0].i, check.second[0])
+			testing.expect_value(t, result.rows[1][1].i, check.second[1])
+		}
+		db.sql_result_destroy(&result)
+	}
+
+	// The same alias in a join, where the name it stands for belongs to another
+	// table than the one the row comes from.
+	run(t, store, "CREATE TABLE dept (id INTEGER PRIMARY KEY, name TEXT)")
+	run(t, store, "INSERT INTO dept (id, name) VALUES (1, 'eng'), (2, 'ops')")
+	result, err := db.sql_execute(store, `
+		SELECT dept.name AS team, count(*) AS n
+		FROM emp JOIN dept ON dept.id = emp.dept
+		GROUP BY team ORDER BY team`)
+	if testing.expectf(t, db.error_ok(err), "join: %s", err.message) {
+		testing.expect_value(t, len(result.rows), 2)
+		if len(result.rows) == 2 {
+			testing.expect_value(t, result.rows[0][0].s, "eng")
+			testing.expect_value(t, result.rows[0][1].i, i64(2))
+			testing.expect_value(t, result.rows[1][0].s, "ops")
+			testing.expect_value(t, result.rows[1][1].i, i64(1))
+		}
+		db.sql_result_destroy(&result)
+	}
+}
+
+@(test)
 test_case_expressions :: proc(t: ^testing.T) {
 	// Both forms of CASE, wherever an expression is allowed. The branch is only
 	// evaluated when it is chosen, which is what makes the division guard safe.

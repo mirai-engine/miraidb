@@ -32,6 +32,9 @@
   `FLOAT` key, a paged table) falls back to the full evaluation.
 - A join subscription walks the tables it reads instead of copying every row of
   them into the transaction arena, which was 80 bytes a row per commit.
+- `GROUP BY` resolves a projection alias, so `SELECT dept AS d ... GROUP BY d`
+  groups by what the projection names; a name that is a column of a source still
+  means the column.
 - A join subscription indexes its walk with the order the planner chooses for the
   same query and keeps it, so `big JOIN small` written big-first walks the small
   relation and probes the big one. `SELECT *` still expands its columns in the

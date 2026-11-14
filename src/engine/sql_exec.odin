@@ -2317,6 +2317,9 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 	}
 	columns := make([dynamic]string, 0, len(stmt.projections))
 	expanded := expand_projections(star_sources[:], stmt.projections, &columns, tx.alloc)
+	// The GROUP BY list is resolved here, while the sources are still around: it
+	// may name a projection alias, and telling an alias from a column needs them.
+	group_exprs := group_by_expressions(stmt, star_sources[:], tx.alloc)
 	delete(star_sources)
 	if len(expanded) == 0 {
 		free_partials(&filtered)
@@ -2359,12 +2362,14 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		} else {
 			buckets := make(map[string][dynamic][]Source)
 			keys := make([dynamic]string)
+			// `SELECT dept AS d ... GROUP BY d` groups by what the projection
+			// names; a name that is a column of a source still means the column.
 			for partial in filtered {
 				ctx.sources = partial
 				w: Byte_Writer
 				bw_init(&w)
 				group_ok := true
-				for expr in stmt.group_by {
+				for expr in group_exprs {
 					value, eval_err := eval_expr(&ctx, expr)
 					if eval_err.kind != .None {
 						bw_destroy(&w)
@@ -2829,6 +2834,46 @@ encode_output_key_alloc :: proc(values: []Value, alloc: mem.Allocator) -> string
 	out := make([]u8, len(raw), alloc)
 	copy(out, raw)
 	return string(out)
+}
+
+// group_by_expressions resolves the GROUP BY list, replacing a name that is only a
+// projection alias with the expression it stands for. A name that is a column of a
+// source keeps meaning the column, which is what SQL says and what a reader
+// expects from `GROUP BY dept` once a projection happens to alias itself `dept`.
+@(private)
+group_by_expressions :: proc(
+	stmt: Select_Stmt,
+	sources: []Source,
+	alloc: mem.Allocator,
+) -> []^Expr {
+	out := make([]^Expr, len(stmt.group_by), alloc)
+	for expr, i in stmt.group_by {
+		out[i] = expr
+		reference, is_column := expr^.(Column_Expr)
+		if !is_column do continue
+		if len(reference.table) > 0 do continue
+		// A column of a source wins over an alias of the same name.
+		named_by_a_column := false
+		for source in sources {
+			if source.table == nil do continue
+			if _, found := schema_column_index(&source.table.schema, reference.name); found {
+				named_by_a_column = true
+				break
+			}
+		}
+		if named_by_a_column do continue
+		for projection in stmt.projections {
+			if len(projection.alias) > 0 {
+				if strings.equal_fold(projection.alias, reference.name) {
+					out[i] = projection.expr
+					break
+				}
+			}
+			// An unaliased projection names its column after the expression, so
+			// `SELECT dept ... GROUP BY dept` needs no substitution.
+		}
+	}
+	return out
 }
 
 // --- Expressions -----------------------------------------------------------

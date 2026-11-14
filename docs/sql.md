@@ -265,9 +265,11 @@ Scalar: `lower`, `upper`, `length`, `abs`, `coalesce`/`ifnull`, `now()`,
 - `ORDER BY` accepts a column, an alias, or a 1-based projection ordinal. The
   sort is stable and NULLs sort before values; rows that compare equal come back
   in row id order, so the same query always answers the same sequence.
-- `GROUP BY` groups by equality of the encoded group expressions. Without
-  `GROUP BY`, an aggregate query produces exactly one row, even when the table
-  is empty.
+- `GROUP BY` groups by equality of the encoded group expressions, and accepts a
+  projection alias: `SELECT dept AS d … GROUP BY d` groups by `dept`. A name that
+  is a column of a source still means the column, so aliasing `salary` to `dept`
+  does not regroup anything. Without `GROUP BY`, an aggregate query produces
+  exactly one row, even when the table is empty.
 - `LIMIT`/`OFFSET` take constant non-negative integers.
 - `DISTINCT` compares the whole projected row. Inside an aggregate it folds each
   value once: `count(DISTINCT x)`, `sum(DISTINCT x)` and `group_concat(DISTINCT

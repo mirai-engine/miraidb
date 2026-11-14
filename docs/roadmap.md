@@ -20,7 +20,7 @@ releases is worth shipping.
 | # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
 | 1 | **D6 — the join constants** | Done: the join delta (an equi-join is indexed by its key), the inner-side probe (`test_join_probes_the_inner_index`), `ORDER BY` from an index (`test_order_by_comes_from_the_index`), measured row costs, a bound value in the histogram, a view priced from its own FROM, a range written as two comparisons priced as one (`test_plan_reads_a_range_written_as_two_comparisons`), stale statistics announced in `EXPLAIN`, and a subscription that walks the planned order (`test_join_subscription_walks_the_planned_order`). What is left is the join side: `plan_join_matches` divides by the distinct count and is not calibrated against a measurement the way the row costs now are. | S | — |
-| 2 | **D9 — the rest of the grammar** | `RANGE`/`GROUPS` frames, windows beside `GROUP BY`, `BEFORE` triggers, `ALTER` type changes, more collations, user functions. | L | — |
+| 2 | **D9 — the rest of the grammar** | `RANGE`/`GROUPS` frames, windows beside `GROUP BY`, `BEFORE` triggers, `ALTER` type changes, more collations, user functions. `GROUP BY` on a projection alias is done (`test_group_by_a_projection_alias`). | L | — |
 | 3 | **ASAN pass** over the CLI, soak and conformance — *partly done* | Bounds and stack are covered today. Odin's heap allocator is not intercepted on Windows (a deliberate use-after-free is not reported), so the heap half runs with the POSIX toolchain in #14. | 1 round | 12 |
 | 4 | **D2 — spatial tree** | Node pages and a descent replace the scan over box columns. | M | — |
 | 5 | **D10 — precision and time** | Decimal arithmetic with scale, `TIMESTAMPTZ`, streaming blobs. | M | — |
