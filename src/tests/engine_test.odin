@@ -5974,10 +5974,12 @@ test_index_matches_full_scan :: proc(t: ^testing.T) {
 
 @(test)
 test_soak_update_delete_prune :: proc(t: ^testing.T) {
-	path := fmt.aprintf("_test_%s", "soak")
+	// Its own directory: the workload soak next door uses `_test_soak`, and a
+	// handle this test leaves behind must not refuse that one.
+	path := fmt.aprintf("_test_%s", "soak_prune")
 	defer delete(path)
 	defer os.remove_all(path)
-	store, host := fresh_host(t, "soak")
+	store, host := fresh_host(t, "soak_prune")
 	if store == nil do return
 
 	run(t, store, "CREATE TABLE soak (id INTEGER PRIMARY KEY, n INTEGER)")
