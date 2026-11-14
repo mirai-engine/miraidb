@@ -27,7 +27,7 @@ Rules for this file:
 | D3 | Snapshot cost — *done* | a read copies nothing (one reference per table); a commit copies the table it writes when a reader holds it, once per read generation: read after a commit 38 µs on the gate, commit against a reader 16.9 ms (`test_a_commit_copies_the_table_a_reader_holds`) | automatic version retention | M | P2 |
 | D4 | Page backend | `.sqlite` is rewritten whole per commit | pages in place, WAL frames, free list | XL | P1 |
 | D5 | Persistent indexes | **done**: index keys live in B+trees of pages, with a pool, a cursor over chained leaves and a memory gate | merging empty leaves; a trusted open without replay (D18b) | L | P0 |
-| D6 | Query planner — *done, the pricing half open* | `ANALYZE` measures row counts, per-column distinct/NULL counts, the numeric range and a sixteen-bucket histogram into `<db>/stats`; the plan prices scan against probe from those numbers, picks between index candidates, prints `est. N rows, cost C`, and orders joins by the rows each relation keeps per outer row with every ON travelling to the step that can answer it (`test_analyze_and_plan_estimates`, `test_plan_reorders_a_join`, `scripts/plan_check.py`) | probing an index for a joined table, `ORDER BY` from an index, calibrated cost constants | L | P1 |
+| D6 | Query planner — *done, the pricing half open* | `ANALYZE` measures row counts, per-column distinct/NULL counts, the numeric range and a sixteen-bucket histogram into `<db>/stats`; the plan prices scan against probe from those numbers, picks between index candidates, prints `est. N rows, cost C`, and orders joins by the rows each relation keeps per outer row with every ON travelling to the step that can answer it (`test_analyze_and_plan_estimates`, `test_plan_reorders_a_join`, `scripts/plan_check.py`) | the subscription using the planned order (`v >= a AND v < b` is priced as two filters, `BETWEEN` as one range) | S | P1 |
 | D7 | Scheduler durability | **durable** (due time is a logged column) | recovery test | S | — |
 | D8 | Crash injection | **done**: `Fault_Vfs` fails any operation at any call, and `test_fault_injection` walks the write offsets | same for the snapshot and the mirror writes | S | P1 |
 | D9 | SQL grammar | 32 statements, **`ROWS` frames, trigger `WHEN` and `RENAME COLUMN` done** (`test_window_frames`, `test_trigger_when`, `test_alter_rename_column`) | windows beside `GROUP BY`, `RANGE`/`GROUPS`, `BEFORE`, `ALTER` type changes, collations, user functions, `GROUP BY` on an alias | L | P2 |
@@ -352,10 +352,10 @@ nothing else can drop one. The same statement over 50 000 rows takes 137 ms agai
 `test_order_by_comes_from_the_index` compares the sequence with the sorted one, ties
 included, and counts the rows a LIMIT reads.
 
-**Not done.** The cost constants are
-chosen by hand —
-they encode "a row through an index costs four rows in place" and have not been
-calibrated against a measurement. The plan reads the values it is given: a prepared
+**Done: the constants are measured.** A scan row, a row fetched by id and one
+descent through the tree were timed over a 200 000-row table (100.8 ns, 456.3 ns and
+600 ns), and `plan.odin` holds those numbers with the measurement written beside
+them: an index row costs 4.5 scan rows and a probe 6. The plan reads the values it is given: a prepared
 `v < ?` bound to 50 keeps the estimate `v < 50` gets, so the histogram decides the
 access as well as the estimate (`test_plan_reads_a_bound_value`). A view is priced from the relation its own
 query reads, and `EXPLAIN` says so
@@ -596,7 +596,7 @@ stay listed so the order can be read as a whole.
    without `.exe` (`ci.py`, `page_rss.py`, `plan_check.py`, `bench.py`,
    `lock_smoke.py` and `broker_smoke.py` all hardcode a Windows binary).
 5. **D6 leftovers**: probe the inner side of a join, `ORDER BY` from an index,
-   calibrated constants, statistics that say they are stale, and the histogram
+   statistics that say they are stale, and the histogram
    for a bound parameter (a plan chosen at bind time, or a re-plan when a value
    lands).
 6. **Leak report** (above): make the diagnostics usable again.

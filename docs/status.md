@@ -255,9 +255,15 @@ than 1000 bytes cannot be indexed and the insert says so.
   follows a view over a view), and `EXPLAIN` says where the number came from
   instead of passing a guess off as a measurement
   (`test_plan_prices_a_view_from_its_own_from`).
-- **What the planner still does not do.** Its cost constants are hand-set rather
-  than calibrated against a measurement, and the subscription path lays out its
-  walk in the written order rather than the planned one. Staleness is no longer silent: `EXPLAIN` reprices with the
+- **The cost constants are measured.** A scan row costs 100.8 ns, a row fetched
+  through an index 456.3 ns (4.5 of them) and one descent through the tree 600 ns
+  (6 of them), measured over a 200 000-row table; the three constants in
+  `plan.odin` are those numbers, written down with the measurement beside them, and
+  an index therefore wins while it keeps under about a fifth of the table.
+- **What the planner still does not do.** The subscription path lays out its walk in
+  the written order rather than the planned one, and `v >= a AND v < b` is priced as
+  two independent filters (a scan) where `v BETWEEN a AND b` is priced as one range
+  (an index probe). Staleness is no longer silent: `EXPLAIN` reprices with the
   numbers it has and names their age.
 - **A join the grammar does not implement is refused, not approximated.**
   `NATURAL`, `RIGHT` and `FULL` joins used to parse as an alias for the table

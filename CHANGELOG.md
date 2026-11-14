@@ -32,6 +32,10 @@
   `FLOAT` key, a paged table) falls back to the full evaluation.
 - A join subscription walks the tables it reads instead of copying every row of
   them into the transaction arena, which was 80 bytes a row per commit.
+- The planner's cost constants are measured instead of assumed: over a 200 000-row
+  table a scan row costs 100.8 ns, a row fetched through an index 456.3 ns and one
+  descent through the tree 600 ns, so `PLAN_SCAN_ROW` is 1, `PLAN_INDEX_ROW` 4.5 and
+  `PLAN_PROBE` 6, with the measurement written beside them.
 - `ORDER BY` on a column set that is exactly an index key walks that index instead
   of sorting: 137 ms against 342 ms over 50 000 rows, and `ORDER BY id LIMIT 5`
   reads five rows in 4.6 ms where the sort took 115 ms. A filter keeps the full
