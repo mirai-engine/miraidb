@@ -137,7 +137,11 @@ the gaps are named rather than left to be discovered.
   audit pass measured both defects, `AUDIT-10` P-B4/P-B5). `--json` keeps the
   `.0` on a real, so the type survives even before the comparison sees it.
 - `scripts/build.py` builds both binaries and runs the suite.
-- 248 integration tests covering CRUD, recovery, constraints, transactions,
+- Every package passes `odin check` for `windows_amd64`, `linux_amd64`,
+  `linux_arm64` and `darwin_arm64`. The POSIX lock is the reason it is checked:
+  it carried a missing `core:sys/posix` import and two wrong integer types until
+  this round, so the code that a Linux build would run had never been compiled.
+- 249 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
