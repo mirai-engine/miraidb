@@ -2305,10 +2305,25 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 	delete(partials)
 
 	// The written order, not the execution order: `SELECT *` must emit columns in
-	// the order the query asked for, and a projection resolves names, not slots.
+	// the order the query asked for, and a projection resolves names, not slots. The
+	// first source is therefore resolved from the statement: `base` follows the
+	// plan, which may have started at a different relation.
 	star_sources := make([dynamic]Source)
 	if !empty_row {
-		append(&star_sources, Source{table = base, alias = stmt.from.alias})
+		from_table := base
+		if !system_name && !strings.equal_fold(stmt.from.name, exec.from.name) {
+			from_args, from_args_err := view_args(tx, stmt.from, params)
+			if from_args_err.kind == .None {
+				resolved, _, resolve_err := tx_source_table(
+					tx,
+					stmt.from.name,
+					from_args,
+					stmt.from.schema,
+				)
+				if resolve_err.kind == .None do from_table = resolved
+			}
+		}
+		append(&star_sources, Source{table = from_table, alias = stmt.from.alias})
 	}
 	for join in stmt.joins {
 		if table, ok := tx_table(tx, join.table.name); ok.kind == .None {

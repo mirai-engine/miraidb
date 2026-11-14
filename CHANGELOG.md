@@ -32,6 +32,10 @@
   `FLOAT` key, a paged table) falls back to the full evaluation.
 - A join subscription walks the tables it reads instead of copying every row of
   them into the transaction arena, which was 80 bytes a row per commit.
+- `SELECT *` lists the columns of a join in the order the query wrote them. It used
+  to expand them from the relation the plan started at, so a reordered join printed
+  the other table's columns — found through the `USING` work, where the fixture names
+  a column and a table the same.
 - The join order is searched by cost instead of grown greedily: the planner prices a
   step that probes an index as a probe (a row a join step produces costs eleven
   times a fetched row: 5.1 µs measured) and refuses to run a relation before the

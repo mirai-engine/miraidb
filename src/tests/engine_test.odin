@@ -10733,6 +10733,51 @@ plan_step_names :: proc(plan: db.Sql_Result) -> string {
 }
 
 @(test)
+test_star_lists_the_written_columns_after_a_reorder :: proc(t: ^testing.T) {
+	// The planner may run the relations of a join in another order, but `SELECT *`
+	// still lists them in the order the query wrote them. It used to expand the star
+	// from the relation the plan started at, so a reordered join printed the other
+	// table's columns — silently, and twice when both sources resolved to the same
+	// table.
+	store := fresh_db(t, "star_reorder")
+	if store == nil do return
+	defer cleanup_db(store, "star_reorder")
+	run(t, store, "CREATE TABLE small (id INTEGER PRIMARY KEY, label TEXT)")
+	run(t, store, "CREATE TABLE big (id INTEGER PRIMARY KEY, small_id INTEGER, note TEXT)")
+	run(t, store, "INSERT INTO small (id, label) VALUES (1, 'a'), (2, 'b')")
+	for start := 0; start < 200; start += 50 {
+		builder := strings.builder_make()
+		fmt.sbprintf(&builder, "INSERT INTO big (id, small_id, note) VALUES ")
+		for i in start ..< start + 50 {
+			if i > start do fmt.sbprintf(&builder, ",")
+			fmt.sbprintf(&builder, "(%d,%d,'n%d')", i, i % 2 + 1, i)
+		}
+		run(t, store, strings.to_string(builder))
+		strings.builder_destroy(&builder)
+	}
+	run(t, store, "ANALYZE")
+
+	// The small relation runs first, so the plan is reordered.
+	plan := run(t, store, "EXPLAIN SELECT * FROM big JOIN small ON small.id = big.small_id")
+	reordered := false
+	for row in plan.rows {
+		if strings_contains(row[0].s, "join order:") do reordered = true
+	}
+	testing.expect(t, reordered)
+	db.sql_result_destroy(&plan)
+
+	result, err := db.sql_execute(store, "SELECT * FROM big JOIN small ON small.id = big.small_id LIMIT 1")
+	if testing.expectf(t, db.error_ok(err), "%s", err.message) {
+		names := [5]string{"id", "small_id", "note", "id", "label"}
+		testing.expect_value(t, len(result.columns), 5)
+		for name, i in names {
+			if i < len(result.columns) do testing.expect_value(t, result.columns[i], name)
+		}
+	}
+	db.sql_result_destroy(&result)
+}
+
+@(test)
 test_plan_does_not_cross_join_before_it_can_filter :: proc(t: ^testing.T) {
 	// Only books joins the other two relations: authors and publishers share no
 	// condition. A plan that binds them first multiplies them (200 x 5) before
