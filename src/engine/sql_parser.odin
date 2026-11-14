@@ -1878,15 +1878,20 @@ parse_primary :: proc(p: ^Parser) -> ^Expr {
 					}
 					window_expr.order_by = items[:]
 				}
-				// An explicit frame over rows, or the default one when it is
-				// absent. RANGE and GROUPS need value arithmetic between rows and
-				// are refused instead of approximated.
-				if p_is_keyword(p, "range") || p_is_keyword(p, "groups") {
-					p_fail(p, .Sql_Unsupported, "RANGE and GROUPS frames are not supported; use ROWS")
-				}
+				// An explicit frame, or the default one when it is absent: from the
+				// partition start to the last peer of each row.
+				frame: Window_Frame
 				if p_match_keyword(p, "rows") {
-					frame: Window_Frame
 					frame.has = true
+					frame.unit = .Rows
+				} else if p_match_keyword(p, "range") {
+					frame.has = true
+					frame.unit = .Range
+				} else if p_match_keyword(p, "groups") {
+					frame.has = true
+					frame.unit = .Groups
+				}
+				if frame.has {
 					if p_match_keyword(p, "between") {
 						frame.start = parse_frame_bound(p)
 						p_expect_keyword(p, "and")

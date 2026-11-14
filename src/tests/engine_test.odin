@@ -9303,13 +9303,14 @@ test_window_frames :: proc(t: ^testing.T) {
 	}
 	delete(partitioned)
 
-	// RANGE needs value arithmetic between rows and is refused, not approximated.
-	range_err := run_error(
-		t,
+	// A RANGE frame is measured in the ordering value, not refused: the answers are
+	// checked against sqlite3 in test_window_range_and_groups_frames.
+	range_result, range_exec_err := db.sql_execute(
 		store,
 		"SELECT SUM(v) OVER (ORDER BY id RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
 	)
-	testing.expect_value(t, range_err.kind, db.Error_Kind.Sql_Unsupported)
+	testing.expect(t, db.error_ok(range_exec_err))
+	db.sql_result_destroy(&range_result)
 	// A start of UNBOUNDED FOLLOWING is not a frame.
 	bad_start := run_error(
 		t,
@@ -10775,6 +10776,93 @@ test_star_lists_the_written_columns_after_a_reorder :: proc(t: ^testing.T) {
 		}
 	}
 	db.sql_result_destroy(&result)
+}
+
+@(test)
+test_window_range_and_groups_frames :: proc(t: ^testing.T) {
+	// ROWS counts rows, GROUPS counts peer groups, and RANGE counts the ORDER BY
+	// value. Every expected number below is what sqlite3 answers for the same rows,
+	// including the descending frame.
+	store := fresh_db(t, "window_frames")
+	if store == nil do return
+	defer cleanup_db(store, "window_frames")
+	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT, n INTEGER, v REAL)")
+	run(t, store, `
+		INSERT INTO t (id, g, n, v) VALUES
+		 (1,'a',10,1.5),(2,'a',20,2.5),(3,'a',20,2.5),(4,'a',40,4.5),
+		 (5,'b',10,1.5),(6,'b',30,3.5),(7,'b',30,3.5),(8,'b',30,3.5)`)
+
+	Check :: struct {
+		sql:      string,
+		expected: [8]i64,
+	}
+	checks := [7]Check{
+		// RANGE without an offset runs to the last peer: 10 and 20 are separate
+		// values, the two 20s share their total, and 40 takes the whole partition.
+		{
+			"SELECT sum(n) OVER (ORDER BY n RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t ORDER BY id",
+			{20, 60, 60, 190, 20, 150, 150, 150},
+		},
+		// A RANGE offset is measured in the order value: 10..30 around each n.
+		{
+			"SELECT sum(n) OVER (ORDER BY n RANGE BETWEEN CURRENT ROW AND 10 FOLLOWING) FROM t ORDER BY id",
+			{60, 130, 130, 40, 60, 130, 130, 130},
+		},
+		// GROUPS 1 PRECEDING..1 FOLLOWING covers three peer groups.
+		{
+			"SELECT count(*) OVER (ORDER BY n GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t ORDER BY id",
+			{4, 7, 7, 4, 4, 6, 6, 6},
+		},
+		{
+			"SELECT count(*) OVER (ORDER BY n GROUPS BETWEEN 2 PRECEDING AND 2 FOLLOWING) FROM t ORDER BY id",
+			{7, 8, 8, 6, 7, 8, 8, 8},
+		},
+		// The same frame read in descending order walks the values the other way.
+		{
+			"SELECT sum(n) OVER (ORDER BY n RANGE BETWEEN 15 PRECEDING AND 15 FOLLOWING) FROM t ORDER BY id DESC",
+			{170, 170, 170, 60, 130, 150, 150, 60},
+		},
+		// A partition restarts the groups.
+		{
+			"SELECT sum(n) OVER (PARTITION BY g ORDER BY n GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY id",
+			{10, 50, 50, 80, 10, 100, 100, 100},
+		},
+		// RANGE 0 PRECEDING..0 FOLLOWING is exactly the peers of the row.
+		{
+			"SELECT sum(n) OVER (ORDER BY n RANGE BETWEEN 0 PRECEDING AND 0 FOLLOWING) FROM t ORDER BY id",
+			{20, 40, 40, 40, 20, 90, 90, 90},
+		},
+	}
+	for check in checks {
+		result, err := db.sql_execute(store, check.sql)
+		if !testing.expectf(t, db.error_ok(err), "%s: %s", check.sql, err.message) do continue
+		if testing.expectf(t, len(result.rows) == 8, "%s: %d rows", check.sql, len(result.rows)) {
+			for expected, i in check.expected {
+				testing.expectf(
+					t,
+					result.rows[i][0].i == expected,
+					"%s: row %d is %d, expected %d",
+					check.sql,
+					i,
+					result.rows[i][0].i,
+					expected,
+				)
+			}
+		}
+		db.sql_result_destroy(&result)
+	}
+
+	// A frame measured in the order value needs exactly one numeric term, and a
+	// text ordering has no arithmetic to do.
+	refused := [2]string{
+		"SELECT sum(n) OVER (ORDER BY n, id RANGE BETWEEN 10 PRECEDING AND CURRENT ROW) FROM t",
+		"SELECT sum(n) OVER (ORDER BY g RANGE BETWEEN 10 PRECEDING AND CURRENT ROW) FROM t",
+	}
+	for sql in refused {
+		result, err := db.sql_execute(store, sql)
+		testing.expectf(t, !db.error_ok(err), "%s should be refused", sql)
+		db.sql_result_destroy(&result)
+	}
 }
 
 @(test)

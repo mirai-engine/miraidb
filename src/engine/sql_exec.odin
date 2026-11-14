@@ -1174,6 +1174,34 @@ window_fill :: proc(
 ) -> Error {
 	running := len(window.order_by) > 0
 	name := window.name
+	// A RANGE frame with an offset runs from one ORDER BY *value* to another, so the
+	// values are read once for the partition. The slice lives until the function
+	// ends: a `defer` inside the block below would free it as soon as the block
+	// exits, which is before any frame reads it.
+	order_numbers: []f64
+	defer delete(order_numbers)
+	if window_frame_reads_values(window.frame) {
+		if len(window.order_by) != 1 {
+			return errf(.Sql_Unsupported, "a RANGE frame with an offset needs exactly one ORDER BY term")
+		}
+		order_numbers = make([]f64, len(indexes))
+		saved := ctx.sources
+		for index, j in indexes {
+			ctx.sources = sources[index]
+			value, eval_err := eval_expr(ctx, window.order_by[0].expr)
+			if eval_err.kind != .None {
+				ctx.sources = saved
+				return eval_err
+			}
+			number, is_number := value_as_f64(value)
+			if !is_number {
+				ctx.sources = saved
+				return errf(.Sql_Unsupported, "a RANGE frame with an offset needs a numeric ORDER BY term")
+			}
+			order_numbers[j] = number
+		}
+		ctx.sources = saved
+	}
 	assign :: proc(rows: []Output_Row, row: int, position: int, value: Value) {
 		rows[row].values[position] = value_clone(value, context.allocator)
 	}
@@ -1252,7 +1280,7 @@ window_fill :: proc(
 	   strings.equal_fold(name, "nth_value") {
 		if window.frame.has {
 			for index, j in indexes {
-				lo, hi, frame_err := window_frame_bounds(window.frame, j, len(indexes), ctx.params)
+				lo, hi, frame_err := window_frame_bounds(window.frame, j, len(indexes), ctx.params, order_keys, order_numbers)
 				if frame_err.kind != .None do return frame_err
 				target := lo
 				switch {
@@ -1298,7 +1326,7 @@ window_fill :: proc(
 	call := Call_Expr{name = window.name, args = window.args, star = window.star}
 	if window.frame.has {
 		for j in 0 ..< len(indexes) {
-			lo, hi, frame_err := window_frame_bounds(window.frame, j, len(indexes), ctx.params)
+			lo, hi, frame_err := window_frame_bounds(window.frame, j, len(indexes), ctx.params, order_keys, order_numbers)
 			if frame_err.kind != .None do return frame_err
 			value, agg_err := window_aggregate_over(ctx, call, sources, indexes, lo, hi)
 			if agg_err.kind != .None do return agg_err
@@ -1324,53 +1352,242 @@ window_fill :: proc(
 	return ERROR_NONE
 }
 
-// window_frame_bounds turns a ROWS frame into the inclusive range of partition
+// window_frame_reads_values reports whether a frame is measured in the ORDER BY
+// value rather than in rows or peer groups.
+@(private)
+window_frame_reads_values :: proc(frame: Window_Frame) -> bool {
+	if !frame.has || frame.unit != .Range do return false
+	return frame.start.offset != nil || frame.end.offset != nil
+}
+
+// window_peer_start and window_peer_end find the first and last position that sort
+// equally with `j`, which is what CURRENT ROW means in a RANGE or GROUPS frame.
+@(private)
+window_peer_start :: proc(order_keys: []string, j: int) -> int {
+	start := j
+	for start > 0 && order_keys[start - 1] == order_keys[j] do start -= 1
+	return start
+}
+
+@(private)
+window_peer_end :: proc(order_keys: []string, j: int) -> int {
+	end := j
+	for end + 1 < len(order_keys) && order_keys[end + 1] == order_keys[j] do end += 1
+	return end
+}
+
+// window_frame_bounds turns a frame into the inclusive range of partition
 // positions it covers for row `j`. An empty frame (lo > hi) is legal: the
 // aggregate over no rows still has a value (count 0, sum NULL).
+//
+// ROWS counts rows. GROUPS counts peer groups, so 1 PRECEDING is the group before
+// this one. RANGE without an offset means the peers of the row; with an offset it
+// runs from the ORDER BY value that far below to the value that far above, which
+// is why it needs one numeric ordering term.
 @(private)
 window_frame_bounds :: proc(
 	frame: Window_Frame,
 	j: int,
 	count: int,
 	params: []Value,
+	order_keys: []string,
+	order_numbers: []f64,
 ) -> (lo: int, hi: int, err: Error) {
-	bound_position :: proc(bound: Frame_Bound, j: int, is_start: bool, count: int, params: []Value) -> (int, Error) {
-		switch bound.kind {
-		case .Unbounded_Preceding:
-			if !is_start do return 0, errf(.Invalid_Argument, "UNBOUNDED PRECEDING cannot end a frame")
-			return 0, ERROR_NONE
-		case .Unbounded_Following:
-			if is_start do return 0, errf(.Invalid_Argument, "UNBOUNDED FOLLOWING cannot start a frame")
-			return count, ERROR_NONE
-		case .Current_Row:
-			return j, ERROR_NONE
-		case .Preceding, .Following:
-			offset := i64(1)
-			if bound.offset != nil {
-				value, constant := eval_constant(bound.offset, params)
-				if !constant {
-					return 0, errf(.Invalid_Argument, "a frame offset must be a constant")
-				}
-				parsed, ok := value_to_i64(value)
-				if !ok || parsed < 0 {
-					return 0, errf(.Invalid_Argument, "a frame offset must be a non-negative integer")
-				}
-				offset = parsed
+	rows_offset :: proc(bound: Frame_Bound, params: []Value) -> (int, Error) {
+		offset := i64(1)
+		if bound.offset != nil {
+			value, constant := eval_constant(bound.offset, params)
+			if !constant do return 0, errf(.Invalid_Argument, "a frame offset must be a constant")
+			parsed, ok := value_to_i64(value)
+			if !ok || parsed < 0 {
+				return 0, errf(.Invalid_Argument, "a frame offset must be a non-negative integer")
 			}
-			if bound.kind == .Preceding do return j - int(offset), ERROR_NONE
-			return j + int(offset), ERROR_NONE
+			offset = parsed
 		}
-		return 0, ERROR_NONE
+		return int(offset), ERROR_NONE
 	}
-	start, lo_err := bound_position(frame.start, j, true, count, params)
-	if lo_err.kind != .None do return 0, 0, lo_err
-	end, hi_err := bound_position(frame.end, j, false, count, params)
-	if hi_err.kind != .None do return 0, 0, hi_err
-	lo = start
-	hi = end
-	if lo < 0 do lo = 0
-	if hi > count - 1 do hi = count - 1
-	return lo, hi, ERROR_NONE
+	value_offset :: proc(bound: Frame_Bound, params: []Value) -> (f64, Error) {
+		if bound.offset == nil do return 1, ERROR_NONE
+		value, constant := eval_constant(bound.offset, params)
+		if !constant do return 0, errf(.Invalid_Argument, "a frame offset must be a constant")
+		number, ok := value_as_f64(value)
+		if !ok || number < 0 {
+			return 0, errf(.Invalid_Argument, "a frame offset must be a non-negative number")
+		}
+		return number, ERROR_NONE
+	}
+	if count == 0 do return 0, -1, ERROR_NONE
+	if !frame.has do return 0, count - 1, ERROR_NONE
+
+	switch frame.unit {
+	case .Rows:
+		bound_position :: proc(bound: Frame_Bound, j: int, is_start: bool, count: int, params: []Value) -> (int, Error) {
+			switch bound.kind {
+			case .Unbounded_Preceding:
+				if !is_start do return 0, errf(.Invalid_Argument, "UNBOUNDED PRECEDING cannot end a frame")
+				return 0, ERROR_NONE
+			case .Unbounded_Following:
+				if is_start do return 0, errf(.Invalid_Argument, "UNBOUNDED FOLLOWING cannot start a frame")
+				return count, ERROR_NONE
+			case .Current_Row:
+				return j, ERROR_NONE
+			case .Preceding, .Following:
+				offset, offset_err := rows_offset(bound, params)
+				if offset_err.kind != .None do return 0, offset_err
+				if bound.kind == .Preceding do return j - offset, ERROR_NONE
+				return j + offset, ERROR_NONE
+			}
+			return 0, ERROR_NONE
+		}
+		start, lo_err := bound_position(frame.start, j, true, count, params)
+		if lo_err.kind != .None do return 0, 0, lo_err
+		end, hi_err := bound_position(frame.end, j, false, count, params)
+		if hi_err.kind != .None do return 0, 0, hi_err
+		lo = start
+		hi = end
+		if lo < 0 do lo = 0
+		if hi > count - 1 do hi = count - 1
+		return lo, hi, ERROR_NONE
+
+	case .Groups:
+		// Where each peer group starts, so a bound can name a group instead of a row.
+		group_index := make([]int, count)
+		defer delete(group_index)
+		group_first := make([dynamic]int, 0, count)
+		defer delete(group_first)
+		for k in 0 ..< count {
+			if k == 0 || order_keys[k] != order_keys[k - 1] do append(&group_first, k)
+			group_index[k] = len(group_first) - 1
+		}
+		group_end :: proc(group_first: []int, group: int, count: int) -> int {
+			if group + 1 < len(group_first) do return group_first[group + 1] - 1
+			return count - 1
+		}
+		current := group_index[j]
+		switch frame.start.kind {
+		case .Unbounded_Preceding:
+			lo = 0
+		case .Current_Row:
+			lo = group_first[current]
+		case .Preceding:
+			offset, offset_err := rows_offset(frame.start, params)
+			if offset_err.kind != .None do return 0, 0, offset_err
+			lo = group_first[max(current - offset, 0)]
+		case .Following:
+			offset, offset_err := rows_offset(frame.start, params)
+			if offset_err.kind != .None do return 0, 0, offset_err
+			target := current + offset
+			lo = target < len(group_first) ? group_first[target] : count
+		case .Unbounded_Following:
+			return 0, 0, errf(.Invalid_Argument, "UNBOUNDED FOLLOWING cannot start a frame")
+		}
+		switch frame.end.kind {
+		case .Unbounded_Following:
+			hi = count - 1
+		case .Current_Row:
+			hi = group_end(group_first[:], current, count)
+		case .Preceding:
+			offset, offset_err := rows_offset(frame.end, params)
+			if offset_err.kind != .None do return 0, 0, offset_err
+			target := current - offset
+			hi = target >= 0 ? group_end(group_first[:], target, count) : -1
+		case .Following:
+			offset, offset_err := rows_offset(frame.end, params)
+			if offset_err.kind != .None do return 0, 0, offset_err
+			hi = group_end(group_first[:], min(current + offset, len(group_first) - 1), count)
+		case .Unbounded_Preceding:
+			return 0, 0, errf(.Invalid_Argument, "UNBOUNDED PRECEDING cannot end a frame")
+		}
+		if lo < 0 do lo = 0
+		if hi > count - 1 do hi = count - 1
+		return lo, hi, ERROR_NONE
+
+	case .Range:
+		if frame.start.offset == nil && frame.end.offset == nil {
+			// No offsets: the frame is made of peers.
+			switch frame.start.kind {
+			case .Unbounded_Preceding:
+				lo = 0
+			case .Current_Row:
+				lo = window_peer_start(order_keys, j)
+			case .Unbounded_Following:
+				return 0, 0, errf(.Invalid_Argument, "UNBOUNDED FOLLOWING cannot start a frame")
+			case .Preceding, .Following:
+				return 0, 0, errf(.Sql_Syntax, "a RANGE frame in this position needs an offset")
+			}
+			switch frame.end.kind {
+			case .Unbounded_Following:
+				hi = count - 1
+			case .Current_Row:
+				hi = window_peer_end(order_keys, j)
+			case .Unbounded_Preceding:
+				return 0, 0, errf(.Invalid_Argument, "UNBOUNDED PRECEDING cannot end a frame")
+			case .Preceding, .Following:
+				return 0, 0, errf(.Sql_Syntax, "a RANGE frame in this position needs an offset")
+			}
+			return lo, hi, ERROR_NONE
+		}
+		if len(order_numbers) != count {
+			return 0, 0, errf(.Sql_Unsupported, "a RANGE frame with an offset needs one numeric ORDER BY term")
+		}
+		ascending := count < 2 || order_numbers[count - 1] >= order_numbers[0]
+		// The first position whose value is on the wanted side of `target`, walking
+		// the partition in its own direction.
+		find_first :: proc(values: []f64, target: f64, ascending: bool, at_least: bool) -> int {
+			low, high := 0, len(values)
+			for low < high {
+				middle := (low + high) / 2
+				value := values[middle]
+				before := ascending ? value < target : value > target
+				after := ascending ? value > target : value < target
+				// before < target < after, in the partition's direction.
+				reached := at_least ? !before : after
+				if reached {
+					high = middle
+				} else {
+					low = middle + 1
+				}
+			}
+			return low
+		}
+		current := order_numbers[j]
+		switch frame.start.kind {
+		case .Unbounded_Preceding:
+			lo = 0
+		case .Current_Row:
+			lo = window_peer_start(order_keys, j)
+		case .Preceding:
+			offset, offset_err := value_offset(frame.start, params)
+			if offset_err.kind != .None do return 0, 0, offset_err
+			lo = find_first(order_numbers, ascending ? current - offset : current + offset, ascending, true)
+		case .Following:
+			offset, offset_err := value_offset(frame.start, params)
+			if offset_err.kind != .None do return 0, 0, offset_err
+			lo = find_first(order_numbers, ascending ? current + offset : current - offset, ascending, true)
+		case .Unbounded_Following:
+			return 0, 0, errf(.Invalid_Argument, "UNBOUNDED FOLLOWING cannot start a frame")
+		}
+		switch frame.end.kind {
+		case .Unbounded_Following:
+			hi = count - 1
+		case .Current_Row:
+			hi = window_peer_end(order_keys, j)
+		case .Preceding:
+			offset, offset_err := value_offset(frame.end, params)
+			if offset_err.kind != .None do return 0, 0, offset_err
+			hi = find_first(order_numbers, ascending ? current - offset : current + offset, ascending, false) - 1
+		case .Following:
+			offset, offset_err := value_offset(frame.end, params)
+			if offset_err.kind != .None do return 0, 0, offset_err
+			hi = find_first(order_numbers, ascending ? current + offset : current - offset, ascending, false) - 1
+		case .Unbounded_Preceding:
+			return 0, 0, errf(.Invalid_Argument, "UNBOUNDED PRECEDING cannot end a frame")
+		}
+		if lo < 0 do lo = 0
+		if hi > count - 1 do hi = count - 1
+		return lo, hi, ERROR_NONE
+	}
+	return 0, count - 1, ERROR_NONE
 }
 
 // window_aggregate_over evaluates an aggregate over positions [lo, hi] of the

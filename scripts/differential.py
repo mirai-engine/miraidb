@@ -77,6 +77,11 @@ QUERIES = [
     "SELECT count(*) FROM emp JOIN dept USING (id)",
     "SELECT dept.* FROM emp JOIN dept USING (id) ORDER BY emp.id",
     "SELECT emp.name, dept.name FROM emp LEFT JOIN dept USING (id) ORDER BY emp.id",
+    # Frames: a run of peer groups, and a band of the ordering value.
+    "SELECT id, sum(salary) OVER (ORDER BY id RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM emp ORDER BY id",
+    "SELECT id, count(*) OVER (ORDER BY dept GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM emp ORDER BY id",
+    "SELECT id, sum(salary) OVER (ORDER BY id RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM emp ORDER BY id",
+    "SELECT id, first_value(salary) OVER (ORDER BY id DESC RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM emp ORDER BY id",
     "SELECT dept, count(*), sum(salary) FROM emp GROUP BY dept ORDER BY dept",
     "SELECT dept, count(*) FROM emp GROUP BY dept HAVING count(*) > 1 ORDER BY dept",
     "SELECT DISTINCT n FROM nums ORDER BY n",

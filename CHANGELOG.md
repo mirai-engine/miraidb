@@ -32,6 +32,11 @@
   `FLOAT` key, a paged table) falls back to the full evaluation.
 - A join subscription walks the tables it reads instead of copying every row of
   them into the transaction arena, which was 80 bytes a row per commit.
+- `RANGE` and `GROUPS` window frames work, with offsets measured either in peer
+  groups or in the `ORDER BY` value (`OVER (ORDER BY n RANGE BETWEEN 10 PRECEDING
+  AND 10 FOLLOWING)`). A `RANGE` offset needs one numeric ordering term; a text one
+  is refused rather than given an interpretation. Answers are checked against
+  `sqlite3`, including a descending frame and a partitioned one.
 - `JOIN b USING (c, …)` is accepted: it is the equality the planner already knows,
   and `SELECT *` prints the merged column once, from the left relation, while `b.*`
   still lists every column. Four queries joined the differential runner and one of

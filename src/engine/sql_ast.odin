@@ -80,10 +80,20 @@ Frame_Bound :: struct {
 	offset: ^Expr,
 }
 
-// Window_Frame is an explicit frame over rows. Without one the engine keeps the
-// default: from the partition start to the last peer of the row.
+// Frame_Unit says what a frame counts: rows, peer groups, or a range of the
+// ORDER BY value.
+Frame_Unit :: enum u8 {
+	Rows,
+	Groups,
+	Range,
+}
+
+// Window_Frame is an explicit frame. Without one the engine keeps the default:
+// from the partition start to the last peer of the row, which is `RANGE UNBOUNDED
+// PRECEDING AND CURRENT ROW`.
 Window_Frame :: struct {
 	has:   bool,
+	unit:  Frame_Unit,
 	start: Frame_Bound,
 	end:   Frame_Bound,
 }

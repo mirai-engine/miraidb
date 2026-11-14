@@ -515,14 +515,24 @@ FROM s;
   `group_concat`) also works as a window; the frame is the partition up to the
   last peer of the current row, or the whole partition without `ORDER BY`.
 - `ORDER BY` may name a window projection by its alias.
-- A frame decides which rows the aggregate sees:
-  `OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)`. Bounds are
+- A frame decides which rows the aggregate sees. Bounds are
   `UNBOUNDED PRECEDING`, `<n> PRECEDING`, `CURRENT ROW`, `<n> FOLLOWING` and
-  `UNBOUNDED FOLLOWING`; `ROWS <bound>` is the shorthand ending at the current
+  `UNBOUNDED FOLLOWING`; `<unit> <bound>` is the shorthand ending at the current
   row. An explicit frame also moves `first_value`, `last_value` and `nth_value`,
   and an empty frame is an empty group (`count` 0, `sum` NULL).
-- `RANGE` and `GROUPS` frames (which need value arithmetic between rows) and
-  window functions beside `GROUP BY` are refused with `sql_unsupported` rather
+- The unit says what the bounds count:
+  - `ROWS` counts rows: `OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1
+    FOLLOWING)`.
+  - `GROUPS` counts peer groups, so `GROUPS 1 PRECEDING` reaches back one distinct
+    value of the ordering: `OVER (ORDER BY n GROUPS BETWEEN 1 PRECEDING AND 1
+    FOLLOWING)`.
+  - `RANGE` without an offset is the peers of the row; with an offset it runs
+    from the order *value* that far below to the value that far above —
+    `OVER (ORDER BY n RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING)` covers every
+    row whose `n` is within ten of this row's. That needs exactly one numeric
+    `ORDER BY` term, in either direction; a text ordering there is refused rather
+    than given an interpretation SQL reserves for its type order.
+- Window functions beside `GROUP BY` are refused with `sql_unsupported` rather
   than approximated.
 
 ## Triggers
