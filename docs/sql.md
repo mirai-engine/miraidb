@@ -280,8 +280,14 @@ Scalar: `lower`, `upper`, `length`, `abs`, `coalesce`/`ifnull`, `now()`,
   exactly one row, even when the table is empty.
 - `LIMIT`/`OFFSET` take constant non-negative integers (SQLite reads `LIMIT -1` as
   "no limit"; this engine refuses it).
-- `substr(s, start)` counts from the start. **A negative `start` is not implemented
-  yet**: it returns the whole string where SQLite counts from the end (backlog D31).
+- Text positions are characters, not bytes: `length('héllo')` is 5,
+  `instr('héllo', 'llo')` is 3 and `substr('héllo', 2, 2)` is `él`.
+  `octet_length` counts bytes.
+- `substr(s, start[, length])` follows SQLite: a negative `start` counts from the
+  end (`substr('abcdef', -3)` is `def`), a start of zero names the character
+  before the first one (`substr('abcdef', 0, 3)` is `ab`), a negative length
+  returns the characters *before* the start (`substr('abcdef', 2, -2)` is `a`),
+  and a `NULL` argument answers `NULL`.
 - `WHERE` asks a value for its truth. A number is true when it is not zero; a **text
   is true when it is not empty**, where SQLite converts it to a number first
   (`'a'` is false there and true here — backlog D31).

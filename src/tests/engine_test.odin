@@ -7627,6 +7627,50 @@ test_text_and_blob_functions :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT typeof(random())").s, "integer")
 }
 
+// SQLite positions text by character, not by byte, and substr counts a negative
+// start from the end and a negative length back from the start.
+@(test)
+test_text_positions_count_characters :: proc(t: ^testing.T) {
+	store := fresh_db(t, "chars")
+	if store == nil do return
+	defer cleanup_db(store, "chars")
+
+	checks := []struct {
+		sql:      string,
+		expected: string,
+	}{
+		{`SELECT substr('abcdef', 1, 3)`, "abc"},
+		{`SELECT substr('abcdef', 3)`, "cdef"},
+		{`SELECT substr('abcdef', -3)`, "def"},
+		{`SELECT substr('abcdef', -3, 2)`, "de"},
+		{`SELECT substr('abcdef', 2, -2)`, "a"},
+		{`SELECT substr('abcdef', 1, -1)`, ""},
+		{`SELECT substr('abcdef', 0, 3)`, "ab"},
+		{`SELECT substr('abcdef', 0)`, "abcdef"},
+		{`SELECT substr('abcdef', -99, 3)`, ""},
+		{`SELECT substr('abcdef', -99)`, "abcdef"},
+		{`SELECT substr('abcdef', 99)`, ""},
+		{`SELECT substr('abcdef', 3, 0)`, ""},
+		{`SELECT substr('abcdef', 2.9)`, "bcdef"},
+		{`SELECT substr('héllo', 2, 2)`, "él"},
+		{`SELECT substr('日本語', 2)`, "本語"},
+		{`SELECT length('héllo')`, "5"},
+		{`SELECT length('日本語')`, "3"},
+		{`SELECT length('')`, "0"},
+	}
+	for check in checks {
+		value := scalar(t, store, check.sql)
+		testing.expect_value(t, db.value_format(value, context.temp_allocator), check.expected)
+	}
+	// NULL propagates: a text function does not turn it into an error.
+	testing.expect(t, db.value_is_null(scalar(t, store, `SELECT substr(NULL, 1)`)))
+	testing.expect(t, db.value_is_null(scalar(t, store, `SELECT substr('abc', NULL)`)))
+	testing.expect(t, db.value_is_null(scalar(t, store, `SELECT substr('abc', 1, NULL)`)))
+	// Characters, not bytes: é is two bytes and 日 is three.
+	testing.expect_value(t, scalar(t, store, `SELECT instr('héllo', 'llo')`).i, i64(3))
+	testing.expect_value(t, scalar(t, store, `SELECT instr('日本語', '語')`).i, i64(3))
+}
+
 @(test)
 test_changes_and_last_insert_rowid :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "changes_rowid")

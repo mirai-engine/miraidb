@@ -137,7 +137,7 @@ the gaps are named rather than left to be discovered.
   `1.0` are the same (backlog D30). A JSON real that is integral also prints
   without its `.0` (backlog D31), which hides the type from both.
 - `scripts/build.py` builds both binaries and runs the suite.
-- 243 integration tests covering CRUD, recovery, constraints, transactions,
+- 244 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
@@ -360,12 +360,12 @@ than 1000 bytes cannot be indexed and the insert says so.
   view and a trigger are gone from the file afterwards — measured in `AUDIT-10`,
   and the reason D27 exists. The file keeps its rows and its integrity; it loses
   the rules.
-- **`substr` with a negative start, and a `WHERE` that is not a number.** The
-  engine returns the whole string for `substr('abcdef', -3)` where SQLite answers
-  `def`, and treats a non-empty text as true in `WHERE` where SQLite casts it to a
-  number first (`WHERE 'a'` returns rows here and none there). `--json` also
-  prints an integral real as `1`, so a consumer loses the type (`AUDIT-10` P-B1 to
-  P-B3, backlog D31).
+- **A `WHERE` that is not a number, and a real in `--json`.** The engine treats a
+  non-empty text as true in `WHERE` where SQLite casts it to a number first
+  (`WHERE 'a'` returns rows here and none there), and `--json` prints an integral
+  real as `1`, so a consumer loses the type (`AUDIT-10` P-B2/P-B3, backlog D31).
+  Text *positions* now match SQLite (characters, and `substr` counts a negative
+  start from the end); the truth of a text is the remaining piece.
 - **The C ABI cannot open an in-memory database.** `:memory:`, the empty path and
   `file:…?mode=memory` all fail; `sqlite3_open(":memory:")` through the facade
   answers `SQLITE_ERROR`. And a statement handle used after `finalize` is an

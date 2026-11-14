@@ -3954,7 +3954,7 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 	case "length", "char_length":
 		if len(args) != 1 do return {}, errf(.Invalid_Argument, "length() takes one argument")
 		if args[0].kind == .Null do return value_null(), ERROR_NONE
-		if args[0].kind == .String do return value_int(i64(len(args[0].s))), ERROR_NONE
+		if args[0].kind == .String do return value_int(i64(text_char_count(args[0].s))), ERROR_NONE
 		if args[0].kind == .Bytes do return value_int(i64(len(args[0].bytes))), ERROR_NONE
 		return {}, errf(.Invalid_Type, "length() expects text or bytes")
 	case "abs":
@@ -3970,21 +3970,62 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		if len(args) < 2 || len(args) > 3 {
 			return {}, errf(.Invalid_Argument, "substr() takes two or three arguments")
 		}
+		// NULL is not text and is not an error: SQLite answers NULL.
+		if args[0].kind == .Null || args[1].kind == .Null do return value_null(), ERROR_NONE
+		if len(args) == 3 && args[2].kind == .Null do return value_null(), ERROR_NONE
 		if args[0].kind != .String do return {}, errf(.Invalid_Type, "substr() expects text")
 		text := args[0].s
 		start_value, ok := value_to_i64(args[1])
 		if !ok do return {}, errf(.Invalid_Type, "substr() expects an integer start")
-		begin := int(start_value - 1)
-		if begin < 0 do begin = 0
-		if begin > len(text) do begin = len(text)
-		end := len(text)
-		if len(args) == 3 {
-			count, count_ok := value_to_i64(args[2])
-			if !count_ok do return {}, errf(.Invalid_Type, "substr() expects an integer length")
-			if count < 0 do count = 0
-			if begin + int(count) < end do end = begin + int(count)
+		chars := text_char_count(text)
+		begin := int(start_value)
+		if len(args) == 2 {
+			// No length asks for the rest of the text. A start at or before the
+			// first character (including zero) takes the whole string.
+			if begin > 0 {
+				begin -= 1
+			} else if begin < 0 {
+				begin += chars
+			}
+			if begin < 0 do begin = 0
+			if begin > chars do begin = chars
+			return value_string(text[text_byte_at(text, begin):]), ERROR_NONE
 		}
-		return value_string(text[begin:end]), ERROR_NONE
+		count_value, count_ok := value_to_i64(args[2])
+		if !count_ok do return {}, errf(.Invalid_Type, "substr() expects an integer length")
+		count := int(count_value)
+		from_end := false
+		if count < 0 {
+			// A negative length is the number of characters before the start.
+			count = -count
+			from_end = true
+		}
+		if begin < 0 {
+			begin += chars
+			if begin < 0 {
+				count += begin
+				if count < 0 do count = 0
+				begin = 0
+			}
+		} else if begin > 0 {
+			begin -= 1
+		} else if count > 0 {
+			// A start of zero names the character before the first one, so a
+			// positive length loses one character.
+			count -= 1
+		}
+		if from_end {
+			begin -= count
+			if begin < 0 {
+				count += begin
+				begin = 0
+			}
+		}
+		if begin > chars do begin = chars
+		if count > chars do count = chars
+		if begin + count > chars do count = chars - begin
+		if count < 0 do count = 0
+		return value_string(text[text_byte_at(text, begin):text_byte_at(text, begin + count)]), ERROR_NONE
 	case "trim", "ltrim", "rtrim":
 		if len(args) < 1 || len(args) > 2 {
 			return {}, errf(.Invalid_Argument, "%s() takes one or two arguments", call.name)
@@ -4136,8 +4177,11 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		if args[0].kind != .String || args[1].kind != .String {
 			return {}, errf(.Invalid_Type, "instr() expects text")
 		}
+		if args[0].kind == .Null || args[1].kind == .Null do return value_null(), ERROR_NONE
 		at := strings.index(args[0].s, args[1].s)
-		return value_int(at < 0 ? 0 : i64(at) + 1), ERROR_NONE
+		if at < 0 do return value_int(0), ERROR_NONE
+		// The answer is a character position, the offset found is a byte one.
+		return value_int(i64(text_char_count(args[0].s[:at])) + 1), ERROR_NONE
 	case "char":
 		builder := strings.builder_make()
 		defer strings.builder_destroy(&builder)
@@ -6148,6 +6192,52 @@ generated_plan_apply :: proc(
 		values[target] = coerced
 	}
 	return ERROR_NONE
+}
+
+// --- Text positions --------------------------------------------------------
+
+// text_char_count counts characters, not bytes: SQLite positions text by
+// character, so length('héllo') is five. A malformed byte counts as one.
+text_char_count :: proc(text: string) -> int {
+	for c in text {
+		if c >= 0x80 do return text_char_count_slow(text)
+	}
+	return len(text)
+}
+
+@(private)
+text_char_count_slow :: proc(text: string) -> int {
+	count, at := 0, 0
+	for at < len(text) {
+		_, size := utf8.decode_rune_in_string(text[at:])
+		if size <= 0 do size = 1
+		at += size
+		count += 1
+	}
+	return count
+}
+
+// text_byte_at turns a character index into a byte offset. An index at or past
+// the last character answers the length, so a slice end needs no special case.
+text_byte_at :: proc(text: string, index: int) -> int {
+	if index <= 0 do return 0
+	ascii := true
+	for c in text {
+		if c >= 0x80 {
+			ascii = false
+			break
+		}
+	}
+	if ascii do return min(index, len(text))
+	at, seen := 0, 0
+	for at < len(text) {
+		if seen == index do return at
+		_, size := utf8.decode_rune_in_string(text[at:])
+		if size <= 0 do size = 1
+		at += size
+		seen += 1
+	}
+	return at
 }
 
 // --- Collations ------------------------------------------------------------

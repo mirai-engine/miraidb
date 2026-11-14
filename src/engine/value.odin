@@ -764,6 +764,12 @@ value_to_i64 :: proc(v: Value) -> (i64, bool) {
 		if v.u > u64(max(i64)) do return 0, false
 		return i64(v.u), true
 	case .Float:
+		// Truncate toward zero, saturating instead of converting out of range:
+		// a caller asking for a start of 1e30 wants "past the end", not an
+		// undefined conversion.
+		if v.f != v.f do return 0, true
+		if v.f >= 9223372036854775808.0 do return max(i64), true
+		if v.f <= -9223372036854775808.0 do return min(i64), true
 		return i64(v.f), true
 	case .Int128:
 		value := i128(value_big(v))

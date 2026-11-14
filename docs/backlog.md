@@ -980,11 +980,14 @@ see it (it also treats `1` and `1.0` as equal; D30).
 `INSERT OR REPLACE` belongs here too: the parser refuses it with "expected into" and
 neither `REFUSED` in the differential nor `docs/sqlite.md` says so.
 
-**Next.**
+**Next.** *(1 is done: `substr` follows SQLite and text positions count
+characters everywhere they are reported — `length`, `instr` and `substr` — tested
+in `test_text_positions_count_characters` over 21 cases and against SQLite over
+660.)*
 
-1. `substr`/`substring`: a negative start counts from the end, a negative length
+1. ~~`substr`/`substring`: a negative start counts from the end, a negative length
    returns the characters before the start (SQLite's rule), and both are tested at
-   the boundary (start equal to length, start below the string, length 0).
+   the boundary (start equal to length, start below the string, length 0).~~
 2. `WHERE`: cast to a number the way SQLite does (`'12'` → 12, `'12a'` → 12, `'a'` →
    0, `''` → 0, `x'…'` → 0), then test truth against that. Keep the current strictness
    for comparisons (`1 = '1'` stays an error, listed in `DIFFERENT`): this is about
