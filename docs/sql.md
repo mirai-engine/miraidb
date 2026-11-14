@@ -288,9 +288,11 @@ Scalar: `lower`, `upper`, `length`, `abs`, `coalesce`/`ifnull`, `now()`,
   before the first one (`substr('abcdef', 0, 3)` is `ab`), a negative length
   returns the characters *before* the start (`substr('abcdef', 2, -2)` is `a`),
   and a `NULL` argument answers `NULL`.
-- `WHERE` asks a value for its truth. A number is true when it is not zero; a **text
-  is true when it is not empty**, where SQLite converts it to a number first
-  (`'a'` is false there and true here — backlog D31).
+- `WHERE` asks a value for its truth. A number is true when it is not zero, and a
+  text is converted to a number first, as SQLite does: its numeric prefix counts,
+  so `'12'` is true, `'12a'` is true, `'a'` is false, `''` is false and `'0'` is
+  false. The same rule governs `CASE WHEN`, `HAVING` and a policy's `USING`.
+  Comparison stays strict: `1 = '1'` is a type error, not a match.
 - `INSERT OR REPLACE` is refused with a syntax error and is not yet listed in the
   compatibility matrix (backlog D31).
 - `DISTINCT` compares the whole projected row. Inside an aggregate it folds each

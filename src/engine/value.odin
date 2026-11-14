@@ -853,9 +853,49 @@ value_is_truthy :: proc(v: Value) -> bool {
 	case .Float:
 		return v.f != 0
 	case .String:
-		return len(v.s) != 0
+		return text_number_prefix(v.s) != 0
+	case .Bytes:
+		return text_number_prefix(string(v.bytes)) != 0
 	}
 	return false
+}
+
+// text_number_prefix reads the numeric prefix of a text the way SQLite casts it
+// to a number: leading spaces, an optional sign, digits with an optional decimal
+// point and exponent, and no digits at all is zero. `WHERE 'a'` is false there
+// and `WHERE '1a'` is true, so truth cannot be "is the text empty".
+text_number_prefix :: proc(text: string) -> f64 {
+	at := 0
+	for at < len(text) {
+		c := text[at]
+		space := c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'
+		if !space do break
+		at += 1
+	}
+	begin := at
+	if at < len(text) && (text[at] == '+' || text[at] == '-') do at += 1
+	mantissa := at
+	for at < len(text) && text[at] >= '0' && text[at] <= '9' do at += 1
+	digits := at - mantissa
+	if at < len(text) && text[at] == '.' {
+		at += 1
+		fraction := at
+		for at < len(text) && text[at] >= '0' && text[at] <= '9' do at += 1
+		digits += at - fraction
+	}
+	// No digit means no number, whatever the sign and the point suggested.
+	if digits == 0 do return 0
+	if at < len(text) && (text[at] == 'e' || text[at] == 'E') {
+		scan := at + 1
+		if scan < len(text) && (text[scan] == '+' || text[scan] == '-') do scan += 1
+		exponent := scan
+		for scan < len(text) && text[scan] >= '0' && text[scan] <= '9' do scan += 1
+		// An exponent with no digits is not part of the number: '1e' is 1.
+		if scan > exponent do at = scan
+	}
+	number, ok := strconv.parse_f64(text[begin:at])
+	if !ok do return 0
+	return number
 }
 
 // value_parse_number turns a token into the narrowest numeric Value that holds

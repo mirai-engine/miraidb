@@ -7671,6 +7671,52 @@ test_text_positions_count_characters :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, `SELECT instr('日本語', '語')`).i, i64(3))
 }
 
+// WHERE asks a value for its truth, and SQLite converts a text to a number
+// first: 'a' is zero and false, '1a' is one and true. Fifty-three statements
+// through both engines found this one reporting a row SQLite drops.
+@(test)
+test_text_truth_is_numeric :: proc(t: ^testing.T) {
+	store := fresh_db(t, "truth")
+	if store == nil do return
+	defer cleanup_db(store, "truth")
+
+	cases := []struct {
+		literal: string,
+		truthy:  bool,
+	}{
+		{"'a'", false},
+		{"'1'", true},
+		{"'1a'", true},
+		{"'a1'", false},
+		{"''", false},
+		{"'0'", false},
+		{"'05'", true},
+		{"' 12 '", true},
+		{"'0x10'", false},
+		{"'-3'", true},
+		{"'  '", false},
+		{"x'00'", false},
+		{"x'31'", true},
+		{"'3e2'", true},
+		{"'.5'", true},
+		{"'-'", false},
+		{"'1_000'", true},
+	}
+	for c in cases {
+		result := run(t, store, fmt.tprintf("SELECT 1 WHERE %s", c.literal))
+		defer db.sql_result_destroy(&result)
+		testing.expect_value(t, len(result.rows), c.truthy ? 1 : 0)
+	}
+	// CASE WHEN asks the same question, and so does a stored column.
+	testing.expect_value(t, scalar(t, store, `SELECT CASE WHEN 'a' THEN 1 ELSE 0 END`).i, i64(0))
+	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)")
+	run(t, store, "INSERT INTO t (id, s) VALUES (1, '1'), (2, 'a'), (3, '0')")
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t WHERE s").i, i64(1))
+	// Comparison keeps its strictness: a text that looks like a number is not
+	// one, so the differential runner lists this as a deliberate difference.
+	testing.expect_value(t, run_error(t, store, `SELECT 1 WHERE 1 = '1'`).kind, db.Error_Kind.Invalid_Type)
+}
+
 @(test)
 test_changes_and_last_insert_rowid :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "changes_rowid")

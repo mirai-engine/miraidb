@@ -988,10 +988,11 @@ in `test_text_positions_count_characters` over 21 cases and against SQLite over
 1. ~~`substr`/`substring`: a negative start counts from the end, a negative length
    returns the characters before the start (SQLite's rule), and both are tested at
    the boundary (start equal to length, start below the string, length 0).~~
-2. `WHERE`: cast to a number the way SQLite does (`'12'` → 12, `'12a'` → 12, `'a'` →
+2. ~~`WHERE`: cast to a number the way SQLite does (`'12'` → 12, `'12a'` → 12, `'a'` →
    0, `''` → 0, `x'…'` → 0), then test truth against that. Keep the current strictness
    for comparisons (`1 = '1'` stays an error, listed in `DIFFERENT`): this is about
-   *truth*, not about comparison.
+   *truth*, not about comparison.~~ Done in `text_number_prefix`, tested over
+   seventeen literals in `test_text_truth_is_numeric`.
 3. The JSON writer keeps the `.0` for a real, so a consumer can tell the types apart.
 4. `INSERT OR REPLACE`: implement it as `INSERT` + delete-on-conflict, or list it as
    refused in `REFUSED` and in `docs/sqlite.md`. Refusing is acceptable; refusing
