@@ -52,7 +52,7 @@ python3 scripts/shell_smoke.py                             # 11/11
 python3 scripts/lock_smoke.py                              # two processes, one owner
 python3 scripts/bench.py --check                           # against benchmarks/baseline.json
 python3 scripts/page_rss.py --check                        # the pool bounds a read
-python3 scripts/plan_check.py                              # 6 plan checks
+python3 scripts/plan_check.py                              # 7 plan checks
 python3 scripts/mirror_cost.py --check --text 200          # a commit is a patch
 python3 scripts/roadmap.py --check                         # 100/100
 

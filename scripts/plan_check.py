@@ -6,8 +6,8 @@ an answer, so nothing in the test suite notices when it starts choosing badly.
 This gate builds a small database, runs ANALYZE, and checks the cheap properties
 that made the plans good: a point lookup probes the index, a predicate that keeps
 half the table scans it, a range estimate follows the histogram instead of the
-one-third rule, the join order puts the small relation first, and the row counter
-a run reports agrees with the plan it printed.
+one-third rule, the join probes the side it can index, and the row counter a run
+reports agrees with the plan it printed.
 
     python3 scripts/plan_check.py [--bin ./bin/miraidb.exe] [--keep]
 
@@ -139,6 +139,10 @@ def main() -> int:
             ranged or "no plan",
         )
 
+        # The join is judged by what it visits, not by which table it starts from:
+        # with an index to probe, starting from the filtered side can be cheaper
+        # than starting from the small one. What must not happen is a plan that
+        # reads the whole inner table once per outer row.
         join_plan = run_repl(
             args.bin,
             database,
@@ -147,12 +151,28 @@ def main() -> int:
                 "WHERE child.code = 3"
             ],
         )
-        order = plan_line(join_plan, "join order:")
+        probed = plan_line(join_plan, "join ")
         check(
             checks,
-            "the join runs the small relation first",
-            "parent" in order and order.index("parent") < order.index("child"),
-            order or plan_line(join_plan, "scan") or "no plan",
+            "the join probes the indexed side",
+            "using index parent_pkey" in probed,
+            probed or "no plan",
+        )
+        join_counters = run_repl(
+            args.bin,
+            database,
+            [
+                "SELECT count(*) FROM child JOIN parent ON parent.id = child.parent_id "
+                "WHERE child.code = 3",
+                "PRAGMA stats",
+            ],
+        )
+        join_scanned = metric(join_counters, "rows_scanned")
+        check(
+            checks,
+            "the join visits few rows",
+            0 < join_scanned < 3000,
+            f"rows_scanned = {join_scanned}",
         )
 
         # The executor has to follow the plan it printed: a point lookup must not
