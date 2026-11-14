@@ -1010,7 +1010,7 @@ them; `docs/sql.md` states the negative-index rule and the truth rule.
 
 **Cost.** S.
 
-## D30 — The differential cannot lie
+## D30 — The differential cannot lie — *done* (see `docs/roadmap.md`, closed)
 
 **Now.** Two ways `scripts/differential.py` can look at a difference and not see it:
 
