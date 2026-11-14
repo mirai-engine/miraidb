@@ -132,7 +132,7 @@ the gaps are named rather than left to be discovered.
   one schema, one set of rows and 55 queries through both engines, with the
   refusals and the intentional differences listed in the script.
 - `scripts/build.py` builds both binaries and runs the suite.
-- 241 integration tests covering CRUD, recovery, constraints, transactions,
+- 243 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
@@ -343,9 +343,13 @@ than 1000 bytes cannot be indexed and the insert says so.
   overspends (after the work, not during). **What is still open:** the transport
   is plain TCP (D15), the row quota is unreachable from the server, and an
   expression nested deeply enough still overflows the stack (D23).
-- **A mirrored `.sqlite` file is exact for rows and unproven for DDL.**
-  `DROP TABLE` on a table that held rows leaves the file malformed for `sqlite3`,
-  and an imported file's indexes are not read (`AUDIT-9` A3/B2, backlog D24).
+- **A mirrored `.sqlite` file survives DDL.** `DROP TABLE`, `ALTER TABLE`, `DROP
+  INDEX` and `CREATE INDEX` all leave a file `sqlite3` reads: the schema change
+  takes the full rewrite, and that rewrite used to leave a file whose
+  `sqlite_master` had no b-tree when the last table was dropped (an empty
+  database, and a dropped table that held rows). An imported file's indexes are
+  read and recreated now, so a plan walks one and `DROP INDEX` finds it
+  (`scripts/sqlite_abi_smoke.py` checks all of it against Python's `sqlite3`).
 
 ## Not implemented: a second writer, and replication
 

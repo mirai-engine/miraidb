@@ -39,6 +39,15 @@ Sqlite_Table :: struct {
 	pk_position:   int,
 }
 
+// Sqlite_Index is one sqlite_master row of type index whose SQL SQLite stored.
+// An automatic index (`sqlite_autoindex_*`) has no SQL and is skipped: it only
+// mirrors a UNIQUE constraint, and the recreated table does not carry one.
+Sqlite_Index :: struct {
+	name:  string,
+	table: string,
+	sql:   string,
+}
+
 // Sqlite_File is an open SQLite database image held in memory.
 Sqlite_File :: struct {
 	data:      []u8,
@@ -46,6 +55,10 @@ Sqlite_File :: struct {
 	usable:    u32,
 	encoding:  u32,
 	tables:    []Sqlite_Table,
+	// indexes are the secondary indexes the file declares. An import recreates
+	// them, so a plan can use one and DROP INDEX finds it; before this they were
+	// silently dropped, and the imported database scanned.
+	indexes:   []Sqlite_Index,
 	// wal_pages holds the images a write-ahead log carries; the reader consults
 	// them before the database file. wal_committed is the database size at the
 	// last commit frame (0 when the log has no commit).
@@ -384,8 +397,9 @@ sqlite_walk :: proc(
 
 @(private)
 Sqlite_Master_Ctx :: struct {
-	file:   ^Sqlite_File,
-	tables: [dynamic]Sqlite_Table,
+	file:    ^Sqlite_File,
+	tables:  [dynamic]Sqlite_Table,
+	indexes: [dynamic]Sqlite_Index,
 }
 
 @(private)
@@ -396,6 +410,22 @@ sqlite_master_visit :: proc(user: rawptr, rowid: i64, payload: []u8) -> bool {
 	kind := values[0]
 	name := values[1]
 	sql := values[4]
+	if kind.kind == .String && strings.equal_fold(kind.s, "index") {
+		// sql is the CREATE INDEX statement SQLite kept; the table name is the
+		// fourth column. An automatic index has no SQL and is left out.
+		if name.kind == .String && sql.kind == .String && len(sql.s) > 0 &&
+		   !strings.has_prefix(name.s, "sqlite_") {
+			append(
+				&ctx.indexes,
+				Sqlite_Index {
+					name = strings.clone(name.s, ctx.file.alloc),
+					table = values[2].kind == .String ? strings.clone(values[2].s, ctx.file.alloc) : "",
+					sql = strings.clone(sql.s, ctx.file.alloc),
+				},
+			)
+		}
+		return true
+	}
 	if kind.kind != .String || !strings.equal_fold(kind.s, "table") do return true
 	if name.kind != .String do return true
 	if strings.has_prefix(name.s, "sqlite_") do return true
@@ -589,6 +619,7 @@ sqlite_file_open :: proc(
 		return {}, errf(.Corrupt_Log, "%s has a malformed sqlite_master", path)
 	}
 	file.tables = ctx.tables[:]
+	file.indexes = ctx.indexes[:]
 	return file, ERROR_NONE
 }
 
@@ -604,6 +635,12 @@ sqlite_file_destroy :: proc(file: ^Sqlite_File) {
 		}
 		delete(table.columns, file.alloc)
 	}
+	for &index in file.indexes {
+		delete(index.name, file.alloc)
+		delete(index.table, file.alloc)
+		delete(index.sql, file.alloc)
+	}
+	delete(file.indexes, file.alloc)
 	delete(file.tables, file.alloc)
 	delete(file.data, file.alloc)
 	file^ = {}
@@ -663,7 +700,11 @@ sqlite_value_text :: proc(value: Value, alloc: mem.Allocator) -> string {
 // sqlite_import materialises the file into a store: one table per non-system
 // table, with the schema inferred from the declared types and the rows inserted
 // through the normal statement path so constraints apply.
-sqlite_import :: proc(file: ^Sqlite_File, store: ^Store, alloc := context.allocator) -> (tables: int, rows: int, err: Error) {
+sqlite_import :: proc(
+	file: ^Sqlite_File,
+	store: ^Store,
+	alloc := context.allocator,
+) -> (tables: int, rows: int, err: Error) {
 	// One write transaction: import is all-or-nothing and pays a single commit.
 	tx := tx_begin_write(store)
 	for &table in file.tables {
@@ -715,10 +756,34 @@ sqlite_import :: proc(file: ^Sqlite_File, store: ^Store, alloc := context.alloca
 			rows += 1
 		}
 	}
+	// Secondary indexes, in the order the file lists them. SQLite's own CREATE
+	// INDEX statement is run as it stands, so a unique or multi-column index keeps
+	// its shape. An index this engine cannot express (a partial index, an
+	// expression index) is retried without the WHERE clause, and if that also
+	// fails it is left out rather than failing the import: the data is the point,
+	// the access path is an optimisation.
+	for index in file.indexes {
+		if len(index.sql) == 0 do continue
+		if _, create_err := sql_execute_in_tx(tx, index.sql); create_err.kind == .None do continue
+		if plain, ok := sqlite_index_without_where(index.sql, context.temp_allocator); ok {
+			_, _ = sql_execute_in_tx(tx, plain)
+		}
+	}
 	if commit_err := tx_commit(tx); commit_err.kind != .None {
 		return tables, rows, commit_err
 	}
 	return tables, rows, ERROR_NONE
+}
+
+// sqlite_index_without_where drops a trailing WHERE clause, which is what makes
+// a partial index partial. Everything up to it is a CREATE INDEX this engine
+// understands.
+@(private)
+sqlite_index_without_where :: proc(sql: string, alloc: mem.Allocator) -> (string, bool) {
+	upper := strings.to_upper(sql, context.temp_allocator)
+	at := strings.index(upper, " WHERE ")
+	if at < 0 do return "", false
+	return strings.trim_space(sql[:at]), true
 }
 
 @(private)

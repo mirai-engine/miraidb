@@ -5,7 +5,7 @@ Run with a Python that can load the platform library:
     python scripts/sqlite_abi_smoke.py
 """
 from __future__ import annotations
-import ctypes, os, shutil, sys
+import ctypes, os, shutil, sqlite3, sys
 
 OK, ERROR, ROW, DONE = 0, 1, 100, 101
 
@@ -104,9 +104,77 @@ def main() -> int:
     message = lib.sqlite3_errmsg(db).decode()
     assert "missing" in message, message
     assert lib.sqlite3_close(db) == OK
+
+    # The mirror survives DDL. The facade opens a real SQLite file, imports it,
+    # and every commit patches the file back; a schema change takes the full
+    # rewrite, which is the path that used to leave the file malformed for
+    # SQLite when the dropped table held rows. The file is created and verified
+    # by Python's sqlite3, so the check is against a second implementation.
+    mirror_path = os.path.join("bin", "sqlite_abi_mirror.sqlite")
+    for stale in (mirror_path, mirror_path + "-journal"):
+        if os.path.exists(stale):
+            os.remove(stale)
+    seed = sqlite3.connect(mirror_path)
+    seed.executescript(
+        "CREATE TABLE keep (id INTEGER PRIMARY KEY, v TEXT);"
+        "CREATE INDEX keep_v ON keep (v);"
+        "CREATE TABLE gone (id INTEGER PRIMARY KEY, w TEXT);"
+        "INSERT INTO keep (id, v) VALUES (1, 'a'), (2, 'b');"
+        "INSERT INTO gone (id, w) VALUES (1, 'x'), (2, 'y'), (3, 'z');"
+    )
+    seed.commit()
+    seed.close()
+
+    mirrored = ctypes.c_void_p()
+    assert lib.sqlite3_open(mirror_path.encode(), ctypes.byref(mirrored)) == OK, "open mirror"
+    ddl = [
+        b"DROP TABLE gone",
+        b"ALTER TABLE keep ADD COLUMN extra INTEGER",
+        b"INSERT INTO keep (id, v, extra) VALUES (3, 'c', 7)",
+        b"DROP INDEX keep_v",
+        b"CREATE INDEX keep_extra ON keep (extra)",
+    ]
+    for statement in ddl:
+        code = lib.sqlite3_exec(mirrored, statement, None, None, None)
+        assert code == OK, (statement, lib.sqlite3_errmsg(mirrored))
+    assert lib.sqlite3_close(mirrored) == OK
+
+    check_file = sqlite3.connect(mirror_path)
+    integrity = check_file.execute("PRAGMA integrity_check").fetchone()[0]
+    assert integrity == "ok", integrity
+    rows_after = check_file.execute("SELECT id, v, extra FROM keep ORDER BY id").fetchall()
+    assert rows_after == [(1, "a", None), (2, "b", None), (3, "c", 7)], rows_after
+    objects = dict(check_file.execute("SELECT name, type FROM sqlite_master WHERE type IN ('table','index')"))
+    assert "gone" not in objects, objects
+    assert objects.get("keep_extra") == "index", objects
+    assert "keep_v" not in objects, objects
+    check_file.close()
+
+    # The same rewrite with nothing left: dropping the last table leaves a valid,
+    # empty database rather than a file whose sqlite_master has no b-tree.
+    empty_path = os.path.join("bin", "sqlite_abi_empty.sqlite")
+    if os.path.exists(empty_path):
+        os.remove(empty_path)
+    seed = sqlite3.connect(empty_path)
+    seed.executescript("CREATE TABLE only_one (id INTEGER PRIMARY KEY); INSERT INTO only_one VALUES (1), (2);")
+    seed.commit()
+    seed.close()
+    emptied = ctypes.c_void_p()
+    assert lib.sqlite3_open(empty_path.encode(), ctypes.byref(emptied)) == OK
+    assert lib.sqlite3_exec(emptied, b"DROP TABLE only_one", None, None, None) == OK, lib.sqlite3_errmsg(emptied)
+    assert lib.sqlite3_close(emptied) == OK
+    empty_check = sqlite3.connect(empty_path)
+    empty_integrity = empty_check.execute("PRAGMA integrity_check").fetchone()[0]
+    remaining = empty_check.execute("SELECT count(*) FROM sqlite_master").fetchone()[0]
+    empty_check.close()
+    assert empty_integrity == "ok", empty_integrity
+    assert remaining == 0, remaining
+
     print("rows:", rows)
     print("error path:", message)
     print("blob io:", blobs_ok)
+    print("mirror after DDL:", integrity, rows_after)
+    print("mirror emptied:", empty_integrity, remaining)
     print("sqlite3_* smoke: ok")
     return 0
 

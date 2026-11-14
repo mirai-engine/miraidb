@@ -20,7 +20,7 @@ script lists.
 | Feature | Status | Notes |
 |---|---|---|
 | Header, page size, encoding | done | 512..65536 pages, reserved bytes, UTF-8 |
-| sqlite_master and schema SQL | done | tables and their CREATE statements; **an imported file's indexes are not read**, so a plan scans and `DROP INDEX` fails (backlog D24) |
+| sqlite_master and schema SQL | done | tables and their CREATE statements, and their indexes: an imported index is recreated, so a plan walks it and `DROP INDEX` finds it (an index this engine cannot express is retried without its `WHERE`) |
 | Table b-trees, leaf and interior | done | rowid tables, multi-level trees |
 | WITHOUT ROWID (index b-trees) | done | read path |
 | Varints and serial types | done | all widths, 0/1 shortcuts, floats, text, blob |
@@ -175,11 +175,13 @@ free list and the rollback journal that makes a torn commit harmless. The commit
 log is still the truth. A table with a secondary index, a file with a
 write-ahead log, a tree deeper than three levels **or any schema change**
 re-encode the whole file instead (`scripts/mirror_cost.py --check` measures it).
-That full rewrite is the path a `DROP TABLE` takes, and it is where the audit
-found a file left malformed for `sqlite3` when the dropped table held rows
-(backlog D24): treat the mirror as exact for rows and *unproven* for DDL until
-that item says otherwise. A failed mirror write is reported through `last_error`
-and never fails the commit.
+That full rewrite is the path a `DROP TABLE` takes. It used to leave the file
+malformed for `sqlite3` when the last table was dropped — the empty tree the
+`sqlite_master` root is built from ignored the room the 100-byte file header
+needs — and `scripts/sqlite_abi_smoke.py` now runs `DROP TABLE`, `ALTER TABLE`,
+`DROP INDEX` and `CREATE INDEX` through the facade and verifies the result with
+Python's `sqlite3`. A failed mirror write is reported through `last_error` and
+never fails the commit.
 
 ## Export determinism
 

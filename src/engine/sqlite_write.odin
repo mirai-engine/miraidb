@@ -270,12 +270,18 @@ sqlite_build_tree :: proc(
 	reserve := 0,
 ) -> int {
 	if len(cells) == 0 {
-		// An empty table is a single empty leaf page.
+		// An empty table is a single empty leaf page whose content starts at the
+		// end of the usable area. `reserve` has to be honoured here too: the
+		// sqlite_master tree reserves the 100-byte file header so its root can
+		// move to page 1, and a page whose content starts at `usable` has no room
+		// for that shift — the move then left page 1 without a b-tree header and
+		// SQLite called the file malformed.
+		content := w.usable - reserve
 		page_no := sqlite_writer_new_page(w)
 		page := sqlite_writer_page(w, page_no)
 		page[0] = 13
-		page[5] = u8(w.usable >> 8)
-		page[6] = u8(w.usable)
+		page[5] = u8(content >> 8)
+		page[6] = u8(content)
 		return page_no
 	}
 	leaves := make([dynamic]Sqlite_Leaf, 0, 8)

@@ -834,7 +834,39 @@ and a message for both.
 
 **Cost.** M. The counting is small; finding every recursive path is the work.
 
-## D24 — The `.sqlite` mirror, completely
+## D24 — The `.sqlite` mirror, completely — *partly done*
+
+**Done.** Both defects the audit found are fixed and gated.
+
+*The empty `sqlite_master`.* `sqlite_build_tree` with no cells returned an empty
+leaf whose content offset was `usable`, ignoring the `reserve` its caller passed.
+The `sqlite_master` tree reserves the 100-byte file header so its root can move
+to page 1, and with the offset at `usable` the move had no room and returned
+early — leaving page 1 with no b-tree header at all. `sqlite3` reads that as
+`database disk image is malformed`, which is what a `DROP TABLE` produced. The
+empty branch honours `reserve` now, so an empty database and a dropped last table
+both write a file that opens (`test_empty_export_is_a_readable_file`, and the
+gate checks `PRAGMA integrity_check` from Python's `sqlite3`).
+
+*Indexes on import.* `sqlite_master_visit` skipped every row of type `index`.
+`Sqlite_File.indexes` collects them (name, table, the SQL SQLite stored), and
+`sqlite_import` runs each `CREATE INDEX` as it stands inside the import
+transaction; a partial index that this engine cannot express is retried without
+its `WHERE`, and if that fails too it is left out rather than failing the import.
+`test_imported_indexes_are_planned_and_droppable` proves the plan names the index
+and `DROP INDEX` answers `index_not_found` only for an index that is really gone.
+
+*The gate.* `scripts/sqlite_abi_smoke.py` now opens a real `.sqlite` file through
+the facade, runs `DROP TABLE`, `ALTER TABLE`, `INSERT`, `DROP INDEX` and
+`CREATE INDEX`, closes, and verifies with Python's `sqlite3`: integrity, rows,
+and which objects remain in `sqlite_master`. A second fixture drops the last
+table and expects a valid empty database. Before the fix, the mirrored file was
+`malformed` after that drop (reproduced with the CLI and `sqlite3` 3.53).
+
+**What is left.** A schema change still re-encodes the whole file (the mirror's
+cost, measured by `mirror_cost.py`); a partial or expression index that fails
+both attempts disappears silently, which should become a counted and reported
+skip; and the mirror has no fuzz pass of its own.
 
 **Now.** Two defects in the compatibility path, both reproduced against files that
 `sqlite3` opened and closed cleanly:
@@ -856,13 +888,12 @@ CI.
 
 **Next.**
 
-1. Fix the full-rewrite path for a table that loses its pages: write the new file,
-   then prove it with `PRAGMA integrity_check` from a real `sqlite3` in the gate.
-2. Read the indexes of an imported file (name, columns, uniqueness) and plan from
-   them; where an index cannot be represented, refuse the file's `DROP INDEX` with
-   a reason instead of `index_not_found`.
-3. Extend the ABI gate to DDL, and give the mirror its own fuzz pass (random DDL
-   and DML, integrity after each chunk).
+1. ~~Fix the full-rewrite path and prove it with `PRAGMA integrity_check`.~~ Done.
+2. ~~Read the indexes of an imported file.~~ Done, including the retry without
+   `WHERE`.
+3. ~~Extend the ABI gate to DDL.~~ Done. Left: a fuzz pass (random DDL and DML,
+   integrity after each chunk) and a counted skip for an index that cannot be
+   expressed.
 
 **Acceptance.** The four DDL statements survive a round trip through the engine and
 are valid for `sqlite3`; an imported index shows in `EXPLAIN` and can be dropped;

@@ -11857,3 +11857,103 @@ test_row_quota_refuses_while_producing :: proc(t: ^testing.T) {
 		db.sql_result_destroy(&all)
 	}
 }
+
+// An imported file's indexes are read, imported and then usable: a plan can walk
+// one and DROP INDEX finds it. Before this the reader skipped every row of type
+// `index`, so a 250 000-row import scanned and `DROP INDEX` answered
+// index_not_found.
+@(test)
+test_imported_indexes_are_planned_and_droppable :: proc(t: ^testing.T) {
+	path := "_test_indexes_imported.db"
+	os.remove(path)
+	defer os.remove(path)
+
+	// Build the file with the exporter, which writes sqlite_master rows of type
+	// `index` exactly as SQLite does.
+	source := fresh_db(t, "indexes_source")
+	if source == nil do return
+	run(t, source, "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)")
+	run(t, source, "CREATE UNIQUE INDEX people_name ON people (name)")
+	run(t, source, "CREATE INDEX people_age ON people (age)")
+	run(t, source, "INSERT INTO people (id, name, age) VALUES (1, 'ana', 30), (2, 'bo', 40)")
+	_, _, export_err := db.sqlite_file_write(source, path)
+	testing.expectf(t, db.error_ok(export_err), "export: %s", export_err.message)
+	db.store_close(source)
+	os.remove_all("_test_indexes_source")
+
+	file, open_err := db.sqlite_file_open(path)
+	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
+	testing.expect_value(t, len(file.indexes), 2)
+
+	// Import it into a store and the index is there to be used.
+	store, store_err := db.store_open("", {persistent = false})
+	if !testing.expectf(t, db.error_ok(store_err), "store: %s", store_err.message) do return
+	defer db.store_close(store)
+	_, _, import_err := db.sqlite_import(&file, store)
+	testing.expectf(t, db.error_ok(import_err), "import: %s", import_err.message)
+	db.sqlite_file_destroy(&file)
+
+	plan := run(t, store, "EXPLAIN SELECT * FROM people WHERE name = 'ana'")
+	defer db.sql_result_destroy(&plan)
+	text := strings.builder_make()
+	defer strings.builder_destroy(&text)
+	for row in plan.rows do for value in row do strings.write_string(&text, value.s)
+	testing.expectf(t, strings.contains(strings.to_string(text), "people_name"), "%s", strings.to_string(text))
+
+	list := run(t, store, "PRAGMA index_list(people)")
+	defer db.sql_result_destroy(&list)
+	listed := strings.builder_make()
+	defer strings.builder_destroy(&listed)
+	for row in list.rows do strings.write_string(&listed, row[1].s)
+	testing.expect(t, strings.contains(strings.to_string(listed), "people_name"))
+	testing.expect(t, strings.contains(strings.to_string(listed), "people_age"))
+
+	drop, drop_err := db.sql_execute(store, "DROP INDEX people_age")
+	if !testing.expectf(t, db.error_ok(drop_err), "drop: %s", drop_err.message) do return
+	db.sql_result_destroy(&drop)
+	missing := run_error(t, store, "DROP INDEX people_age")
+	testing.expect_value(t, missing.kind, db.Error_Kind.Index_Not_Found)
+
+	after := run(t, store, "PRAGMA index_list(people)")
+	defer db.sql_result_destroy(&after)
+	remaining := strings.builder_make()
+	defer strings.builder_destroy(&remaining)
+	for row in after.rows do strings.write_string(&remaining, row[1].s)
+	testing.expect(t, strings.contains(strings.to_string(remaining), "people_name"))
+	testing.expect(t, !strings.contains(strings.to_string(remaining), "people_age"))
+}
+
+// A database with no tables still writes a file SQLite can open: page 1 needs a
+// b-tree header at offset 100, and the empty b-tree the master is built from has
+// to reserve the room for it. Dropping the last table of a mirrored file takes
+// exactly this path, so before the fix the file was left malformed.
+@(test)
+test_empty_export_is_a_readable_file :: proc(t: ^testing.T) {
+	path := "_test_empty_export.db"
+	os.remove(path)
+	defer os.remove(path)
+
+	store := fresh_db(t, "empty_export")
+	if store == nil do return
+	run(t, store, "CREATE TABLE only_one (id INTEGER PRIMARY KEY, v TEXT)")
+	run(t, store, "INSERT INTO only_one (id, v) VALUES (1, 'x')")
+	run(t, store, "DROP TABLE only_one")
+	_, _, export_err := db.sqlite_file_write(store, path)
+	testing.expectf(t, db.error_ok(export_err), "export: %s", export_err.message)
+	db.store_close(store)
+	os.remove_all("_test_empty_export")
+
+	file, open_err := db.sqlite_file_open(path)
+	if !testing.expectf(t, db.error_ok(open_err), "the empty file is not readable: %s", open_err.message) do return
+	defer db.sqlite_file_destroy(&file)
+	testing.expect_value(t, len(file.tables), 0)
+	testing.expect_value(t, len(file.indexes), 0)
+
+	// Page 1 must hold a leaf b-tree header after the 100-byte file header.
+	data, read_err := os.read_entire_file(path, context.allocator)
+	if !testing.expect(t, read_err == nil) do return
+	defer delete(data)
+	testing.expect_value(t, data[100], u8(13))
+	testing.expect_value(t, data[100 + 3], u8(0))
+	testing.expect_value(t, data[100 + 4], u8(0))
+}
