@@ -206,66 +206,101 @@ Store_Op :: struct {
 	values: []Value,
 }
 
+// store_path_is_memory reports whether a path names a database that lives in this
+// process, the way SQLite spells one: ":memory:", the empty name, and the "file:"
+// URIs that ask for memory ("file::memory:?cache=shared",
+// "file:memdb1?mode=memory&cache=shared"). A program written against the sqlite3
+// API starts with one of these, so refusing them meant such a program could not
+// start at all (D28).
+store_path_is_memory :: proc(path: string) -> bool {
+	if len(path) == 0 do return true
+	if strings.equal_fold(path, ":memory:") do return true
+	if strings.has_prefix(path, "file:") {
+		rest := path[len("file:"):]
+		if at := strings.index_byte(rest, '?'); at >= 0 {
+			query := rest[at:]
+			rest = rest[:at]
+			if strings.contains(query, "mode=memory") do return true
+		}
+		if strings.equal_fold(rest, ":memory:") do return true
+	}
+	return false
+}
+
 store_open :: proc(path: string, options: Store_Options) -> (^Store, Error) {
+	settings := options
+	open_path := path
+	// An in-memory spelling is not a directory to create. In memory there is no
+	// log to be durable about, no directory to page and nothing to compact.
+	if store_path_is_memory(open_path) {
+		settings.persistent = false
+		settings.create = !settings.read_only
+		settings.durable = false
+		settings.durability = .None
+		settings.vfs = nil
+		settings.paged_tables = false
+		settings.compact_after_bytes = 0
+		open_path = ""
+	}
 	store := new(Store)
 	store.alloc = context.allocator
 	store.tables = make(map[string]^Table)
 	store.attached = make(map[string]^Store)
 	store.variables = make(map[string]Value)
-	store.persistent = options.persistent
-	store.vfs = options.vfs
-	store.path = path
-	store.paged_tables = options.paged_tables
-	store.read_only = options.read_only
+	store.persistent = settings.persistent
+	store.vfs = settings.vfs
+	store.path = open_path
+	store.paged_tables = settings.paged_tables
+	store.read_only = settings.read_only
 	store.host_access = true
 	if store.read_only {
-		if options.create {
+		if settings.create {
 			free(store)
 			return nil, errf(.Invalid_Argument, "a read-only open cannot create the database")
 		}
 		// The page files belong to the writer: a reader replays into memory.
 		store.paged_tables = false
 	}
-	store.page_frames = options.page_frames
+	store.page_frames = settings.page_frames
 	if store.page_frames <= 0 do store.page_frames = STORE_DEFAULT_PAGE_FRAMES
-	if options.in_memory_log {
+	if settings.in_memory_log {
 		store.log = log_open_memory()
 		return store, ERROR_NONE
 	}
-	if !options.persistent {
+	if !settings.persistent {
 		return store, ERROR_NONE
 	}
-	if len(path) == 0 {
+	if len(open_path) == 0 {
 		free(store)
 		return nil, errf(.Invalid_Argument, "a persistent database needs a path")
 	}
 	// A virtual file system has no directories: the log path names the file.
-	if options.vfs == nil && !os.exists(path) {
-		if !options.create {
+	if settings.vfs == nil && !os.exists(open_path) {
+		if !settings.create {
 			free(store)
-			return nil, errf(.Io, "database %s does not exist", path)
+			return nil, errf(.Io, "database %s does not exist", open_path)
 		}
-		if mkdir_err := os.make_directory_all(path); mkdir_err != nil {
+		if mkdir_err := os.make_directory_all(open_path); mkdir_err != nil {
 			free(store)
-			return nil, errf(.Io, "cannot create %s: %v", path, mkdir_err)
+			return nil, errf(.Io, "cannot create %s: %v", open_path, mkdir_err)
 		}
 	}
 	// The directory is owned from here on. A second process that finds it held is
 	// refused with the owner's pid instead of appending to a log it does not own.
-	if options.vfs == nil {
+	if settings.vfs == nil {
 		role := store.read_only ? Db_Lock_Role.Reader : Db_Lock_Role.Writer
-		lock, lock_err := db_lock_acquire(path, role)
+		lock, lock_err := db_lock_acquire(open_path, role)
 		if lock_err.kind != .None {
 			free(store)
 			return nil, lock_err
 		}
 		store.lock = lock
 	}
-	durability := options.durability
-	if !options.durable do durability = .None
-	checksum := options.checksum
+	durability := settings.durability
+	if !settings.durable do durability = .None
+	checksum := settings.checksum
 	if checksum == .Default do checksum = .CRC32C
-	log, log_err := log_open(path, options.create, durability, checksum, options.vfs)
+	log, log_err := log_open(open_path, settings.create, durability, checksum, settings.vfs)
 	if log_err.kind != .None {
 		db_lock_release(&store.lock)
 		free(store)
@@ -315,11 +350,11 @@ store_open :: proc(path: string, options: Store_Options) -> (^Store, Error) {
 	if attach_err := store_attach_restore(store); attach_err.kind != .None {
 		store.last_error = attach_err
 	}
-	if options.compact_after_bytes > 0 {
+	if settings.compact_after_bytes > 0 {
 		// A database opened with the option always gets the worker; if the
 		// thread cannot start, compaction stays available through the explicit
 		// call and the failure is reported, not hidden.
-		if !store_start_background_compaction(store, options.compact_after_bytes) {
+		if !store_start_background_compaction(store, settings.compact_after_bytes) {
 			store.last_error = errf(.Internal, "cannot start the background compactor")
 		}
 	}

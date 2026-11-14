@@ -54,6 +54,22 @@ def main() -> int:
     elif os.path.exists(db_path):
         os.remove(db_path)
 
+    # A SQLite program starts with an in-memory database more often than not, and
+    # every spelling has to open or the program cannot start (D28).
+    for spelling in (b":memory:", b"", b"file::memory:", b"file::memory:?cache=shared",
+                     b"file:memdb1?mode=memory&cache=shared"):
+        memory = ctypes.c_void_p()
+        assert lib.sqlite3_open(spelling, ctypes.byref(memory)) == OK, f"open {spelling!r}"
+        assert lib.sqlite3_exec(memory, b"CREATE TABLE m (id INTEGER)", None, None, None) == OK
+        assert lib.sqlite3_exec(memory, b"INSERT INTO m (id) VALUES (7)", None, None, None) == OK
+        check = ctypes.c_void_p()
+        assert lib.sqlite3_prepare_v2(memory, b"SELECT id FROM m", -1, ctypes.byref(check), None) == OK
+        assert lib.sqlite3_step(check) == ROW
+        assert lib.sqlite3_column_int64(check, 0) == 7
+        lib.sqlite3_finalize(check)
+        assert lib.sqlite3_close(memory) == OK
+    assert not os.path.exists(":memory:"), "the :memory: spelling made a directory"
+
     db = ctypes.c_void_p()
     assert lib.sqlite3_open(db_path.encode(), ctypes.byref(db)) == OK, "open"
     assert lib.sqlite3_exec(db, b"CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)", None, None, None) == OK

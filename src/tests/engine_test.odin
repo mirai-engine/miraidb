@@ -7671,6 +7671,42 @@ test_text_positions_count_characters :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, `SELECT instr('日本語', '語')`).i, i64(3))
 }
 
+// SQLite spells an in-memory database in five ways and a program written against
+// its API starts with one of them (D28).
+@(test)
+test_open_in_memory_the_way_sqlite_does :: proc(t: ^testing.T) {
+	spellings := []string{":memory:", "", "file::memory:", "file::memory:?cache=shared", "file:memdb1?mode=memory&cache=shared"}
+	for spelling in spellings {
+		store, err := db.store_open(spelling, {persistent = true, create = true, durable = true})
+		if !testing.expectf(t, db.error_ok(err), "%q did not open: %s", spelling, err.message) {
+			continue
+		}
+		testing.expect_value(t, store.persistent, false)
+		run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+		run(t, store, "INSERT INTO t (id, v) VALUES (1, 'a')")
+		testing.expect_value(t, scalar(t, store, "SELECT v FROM t WHERE id = 1").s, "a")
+		db.store_close(store)
+		// Nothing was written where a directory could have been made.
+		if len(spelling) > 0 && !strings.has_prefix(spelling, "file:") {
+			testing.expect(t, !os.exists(spelling))
+		}
+	}
+	// A database opened as memory is a fresh one each time.
+	first, _ := db.store_open(":memory:", {persistent = true, create = true})
+	run(t, first, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+	db.store_close(first)
+	second, _ := db.store_open(":memory:", {persistent = true, create = true})
+	defer db.store_close(second)
+	missing := run_error(t, second, "SELECT * FROM t")
+	testing.expectf(t, missing.kind != .None, "a fresh :memory: database still has the table")
+	// The spellings are recognised without opening anything.
+	testing.expect(t, db.store_path_is_memory(":memory:"))
+	testing.expect(t, db.store_path_is_memory(""))
+	testing.expect(t, db.store_path_is_memory("file:x?mode=memory"))
+	testing.expect(t, !db.store_path_is_memory("_test_something"))
+	testing.expect(t, !db.store_path_is_memory("file:data.db"))
+}
+
 // A text value is bytes, and hex() shows the bytes; a byte that is not part of
 // a UTF-8 sequence is escaped when a value is written as JSON, so a document is
 // always parseable (D32).

@@ -72,6 +72,20 @@ def main() -> int:
         elif os.path.exists(candidate):
             os.remove(candidate)
 
+    # An in-memory database through the C ABI, in the spellings SQLite accepts
+    # (D28): the connection answers and writes without a directory.
+    for spelling in (b":memory:", b"", b"file::memory:?cache=shared"):
+        memory = lib.miraidb_open(spelling)
+        assert memory, f"open {spelling!r}"
+        assert lib.miraidb_exec(memory, b"CREATE TABLE m (id INTEGER)") == OK
+        assert lib.miraidb_exec(memory, b"INSERT INTO m (id) VALUES (5)") == OK
+        probe = lib.miraidb_prepare(memory, b"SELECT id FROM m")
+        assert lib.miraidb_step(probe) == ROW, "an in-memory row is readable"
+        assert lib.miraidb_column_int(probe, 0) == 5
+        lib.miraidb_finalize(probe)
+        lib.miraidb_close(memory)
+    assert not os.path.exists(":memory:"), "the :memory: spelling made a directory"
+
     db = lib.miraidb_open(database.encode())
     if not db:
         print("open failed", file=sys.stderr)

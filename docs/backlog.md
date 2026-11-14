@@ -1166,9 +1166,9 @@ reason; `docs/sqlite.md` states which of the two happened.
 **Cost.** L. It is a design decision (preserve the text, or model the constraints and
 emit them) before it is code, and this item exists so the decision is written down.
 
-## D28 — Open the way SQLite opens
+## D28 — Open the way SQLite opens — *done* (see `docs/roadmap.md`, closed)
 
-**Now.** `:memory:` is not a database here (`AUDIT-10` P-A2):
+**Now.** The measure that started it (`AUDIT-10` P-A2):
 
 ```
 $ ./bin/miraidb.exe sql ":memory:" "SELECT 1"
@@ -1181,25 +1181,20 @@ sqlite3_open('file::memory:?cache=shared') -> 1
 
 `src/sqlite_compat` exists so a program written against `sqlite3_*` can link against
 this engine instead, and the first thing such a program does is open an in-memory
-database. Nothing documents the gap; the error names a filesystem problem, which is
-misleading.
+database, so no such program could start.
 
-**Next.**
+**Done.** `store_path_is_memory` recognises `:memory:`, the empty path,
+`file::memory:`, `file::memory:?cache=shared` and `file:<name>?mode=memory`, and
+`store_open` turns any of them into a non-persistent store with no path. That is
+the single door the CLI, the C ABI and the facade use, so there is one rule to
+keep right instead of three. In memory there is no log, no directory, no page
+files and nothing to compact, and every open is a fresh database.
 
-1. An in-memory open in the engine: `:memory:` (and the empty path) mean
-   `store_open("", {persistent = false})`, which already exists — the work is the
-   spelling and the ABI flag.
-2. `file:…?mode=memory` and `?cache=shared` in the facade: recognise the URI form and
-   either honour the memory mode or refuse with a reason.
-3. A `MIRAIDB_IN_MEMORY` bit on the C open options (which lands with D25) so an
-   embedder does not have to spell a name.
-4. `docs/sqlite.md` and the header state which forms open in memory.
-
-**Acceptance.** `sqlite3_open(":memory:")` through the DLL answers `SQLITE_OK` and a
-statement round-trips; the CLI opens `:memory:`; `docs` list the accepted spellings.
-
-**Cost.** S. This is the cheapest item in the table and it unblocks every sqlite3 test
-suite.
+**Acceptance, met.** `test_open_in_memory_the_way_sqlite_does` opens all five
+spellings, writes, reads, proves a second open does not see the first one's table
+and that no directory named `:memory:` appears; `scripts/capi_smoke.py` and
+`scripts/sqlite_abi_smoke.py` open each spelling through the DLL and read a row
+back. `./bin/miraidb.exe sql ":memory:" "SELECT 1"` answers `1`.
 
 ## D29 — A C handle is never a dangling pointer
 

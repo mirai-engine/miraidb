@@ -50,7 +50,7 @@ script lists.
 | VACUUM / ANALYZE / REINDEX | partial | `compact` is the engine's VACUUM, `VACUUM INTO` writes a copy, `ANALYZE` measures statistics; `REINDEX` does not exist |
 | PRAGMA | partial | four classes below: 25 answer, 18 are accepted as no-ops, 11 are refused |
 | EXPLAIN / EXPLAIN QUERY PLAN | partial | `EXPLAIN` prints the chosen access path, the estimate and the join order; there is no `EXPLAIN QUERY PLAN` row format |
-| Opening in memory | refused | `:memory:`, the empty path and `file:…?mode=memory` are not a database here: an open needs a path. A program written against sqlite3 starts with one of those, so this is the first thing to add (backlog D28) |
+| Opening in memory | done | `:memory:`, the empty path, `file::memory:` (with or without `?cache=shared`) and `file:<name>?mode=memory` open a private database in the process: the tables live in memory, no directory is made, and every open is a fresh one (`test_open_in_memory_the_way_sqlite_does`; `scripts/capi_smoke.py` and `scripts/sqlite_abi_smoke.py` open each spelling through the DLL) |
 | CREATE TRIGGER | done | `BEFORE` and `AFTER` triggers with `WHEN`, `NEW` and `OLD`; a `BEFORE` body that fails stops the write. Column-specific (`OF`) triggers are refused |
 | CREATE VIRTUAL TABLE (FTS5, R-Tree) | done | FTS5 with BM25, `snippet` and `highlight`; spatial tables store their boxes as columns |
 | GENERATED / STRICT / WITHOUT ROWID DDL | partial | `GENERATED … STORED` and `STRICT` work; `WITHOUT ROWID` is refused for writing and supported for reading |

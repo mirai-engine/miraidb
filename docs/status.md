@@ -146,7 +146,7 @@ the gaps are named rather than left to be discovered.
   `linux_arm64` and `darwin_arm64`. The POSIX lock is the reason it is checked:
   it carried a missing `core:sys/posix` import and two wrong integer types until
   this round, so the code that a Linux build would run had never been compiled.
-- 249 integration tests covering CRUD, recovery, constraints, transactions,
+- 250 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
@@ -374,11 +374,12 @@ than 1000 bytes cannot be indexed and the insert says so.
   text to a number first, `--json` keeps the `.0` on a real, and `INSERT OR
   REPLACE` is implemented instead of refused by accident (`AUDIT-10` P-B1/P-B2/
   P-B3/P-B7). `OR ROLLBACK`, `OR FAIL` and `OR IGNORE` are named refusals.
-- **The C ABI cannot open an in-memory database.** `:memory:`, the empty path and
-  `file:…?mode=memory` all fail; `sqlite3_open(":memory:")` through the facade
-  answers `SQLITE_ERROR`. And a statement handle used after `finalize` is an
-  access violation rather than a misuse error, which ends the host process
-  (`AUDIT-10` P-A2/P-A3, backlog D28 and D29).
+- **A statement handle used after `finalize` kills the process.** `step` answers
+  `DONE` out of freed memory and `bind` is an access violation, where sqlite3
+  answers `SQLITE_MISUSE`; `bind` also accepts any index. In-memory opening is
+  fixed: `:memory:`, the empty path, `file::memory:` and
+  `file:<name>?mode=memory` all open through the engine, the C ABI and the facade
+  (`AUDIT-10` P-A2/P-A3, backlog D29).
 
 ## Not implemented: a second writer, and replication
 
