@@ -285,7 +285,9 @@ Scalar: `lower`, `upper`, `length`, `abs`, `coalesce`/`ifnull`, `now()`,
   "no limit"; this engine refuses it).
 - Text positions are characters, not bytes: `length('héllo')` is 5,
   `instr('héllo', 'llo')` is 3 and `substr('héllo', 2, 2)` is `él`.
-  `octet_length` counts bytes.
+  A text value is still a byte string, so `octet_length('héllo')` is 6 and
+  `hex('é')` is `C3A9` — the bytes, as SQLite answers them. The two rules are
+  different questions: a *position* is a character, a *byte* is a byte.
 - `substr(s, start[, length])` follows SQLite: a negative `start` counts from the
   end (`substr('abcdef', -3)` is `def`), a start of zero names the character
   before the first one (`substr('abcdef', 0, 3)` is `ab`), a negative length

@@ -7,6 +7,7 @@ import "core:os"
 import "core:strconv"
 import "core:strings"
 import "core:time"
+import "core:unicode/utf8"
 
 import db "../engine"
 import sdk "../client"
@@ -63,7 +64,7 @@ In the REPL:
 BEGIN/COMMIT/ROLLBACK keep one transaction open across statements.`
 
 main :: proc() {
-	args := os.args
+	args := cli_args(context.temp_allocator)
 	if len(args) < 2 {
 		fmt.println(USAGE)
 		os.exit(2)
@@ -758,26 +759,41 @@ json_value :: proc(builder: ^strings.Builder, value: db.Value) {
 @(private)
 json_string :: proc(builder: ^strings.Builder, text: string) {
 	strings.write_byte(builder, '"')
-	for i := 0; i < len(text); i += 1 {
-		byte := text[i]
-		switch byte {
-		case '"':
-			strings.write_string(builder, `\"`)
-		case '\\':
-			strings.write_string(builder, `\\`)
-		case '\n':
-			strings.write_string(builder, `\n`)
-		case '\r':
-			strings.write_string(builder, `\r`)
-		case '\t':
-			strings.write_string(builder, `\t`)
-		case:
-			if byte < 0x20 {
-				fmt.sbprintf(builder, `\u%04x`, byte)
-			} else {
-				strings.write_byte(builder, byte)
+	at := 0
+	for at < len(text) {
+		byte := text[at]
+		if byte < 0x80 {
+			switch byte {
+			case '"':
+				strings.write_string(builder, `\"`)
+			case '\\':
+				strings.write_string(builder, `\\`)
+			case '\n':
+				strings.write_string(builder, `\n`)
+			case '\r':
+				strings.write_string(builder, `\r`)
+			case '\t':
+				strings.write_string(builder, `\t`)
+			case:
+				if byte < 0x20 {
+					fmt.sbprintf(builder, `\u%04x`, byte)
+				} else {
+					strings.write_byte(builder, byte)
+				}
 			}
+			at += 1
+			continue
 		}
+		// A valid multi-byte character goes out as it came; a byte that is not
+		// part of one is escaped, so the document stays valid JSON (D32).
+		_, size := utf8.decode_rune_in_string(text[at:])
+		if size <= 1 {
+			fmt.sbprintf(builder, `\u%04x`, rune(byte))
+			at += 1
+			continue
+		}
+		strings.write_string(builder, text[at:at + size])
+		at += size
 	}
 	strings.write_byte(builder, '"')
 }

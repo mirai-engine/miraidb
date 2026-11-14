@@ -783,7 +783,7 @@ refused.
 
 **Cost.** L. It is the difference between a demo of the wire protocol and a server.
 
-## D32 — A byte is not a character, on the way in or out
+## D32 — A byte is not a character, on the way in or out — *done* (see `docs/roadmap.md`, closed)
 
 **Now.** Three symptoms of one confusion, measured while growing the differential
 corpus in D30:
@@ -812,9 +812,20 @@ edges — argument decoding, the JSON writer, and `hex`.
 4. A test in `scripts/shell_smoke.py` that pipes `SELECT 'é'` through `--json` and
    through `hex` and compares both against SQLite.
 
+**Done.** All four: `src/cli/args_windows.odin` re-reads the wide command line
+(`CommandLineToArgvW` + `wstring_to_utf8`), so an argument the user typed as `é`
+arrives as `C3 A9` instead of `0xE9`; `sq_hex` iterates the bytes of a text
+(`for c in text` yields runes, which is what produced `E9`); and both JSON writers
+escape a byte that does not form a UTF-8 sequence as its Latin-1 reading
+(`\u00e9`), so the document always parses. `length`/`instr`/`substr` already
+count characters from the D31 round, so `hex` (bytes) and a position (characters)
+now answer their own question instead of disagreeing.
+
 **Acceptance.** `--json` output parses with any JSON library for a database that
 holds non-ASCII text; `hex('é')` is `C3A9`; `length('é')` is 1; the argument path
-and the file path agree.
+and the file path agree. — `test_text_is_bytes_and_json_stays_valid` checks the
+engine side and `scripts/shell_smoke.py` sends the statement through argv and
+parses the answer.
 
 **Cost.** S.
 

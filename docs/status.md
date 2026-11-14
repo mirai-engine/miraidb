@@ -127,6 +127,11 @@ the gaps are named rather than left to be discovered.
 - `miraidb` has 17 commands: `create`, `sql`, `sqlite`, `import-sqlite`,
   `export-sqlite`, `repl`, `inspect`, `describe`, `bench`, `bench-read`,
   `codegen`, `export`, `call`, `subscribe`, `check`, `compact`, `snapshot`.
+- The command line is decoded as UTF-8 (from the wide command line on Windows,
+  where the usual argument path is the ANSI code page), and `--json` escapes a
+  byte that does not form UTF-8 as `\u00XX`, so a document it prints always
+  parses (`scripts/shell_smoke.py` sends `SELECT hex('é'), length('é'), char(233)`
+  and checks both).
 - `miraidb sql --json <db> <statement>` prints a result as one JSON array of
   rows, which is how `scripts/differential.py` compares answers against SQLite:
   one schema, one set of rows and 94 queries through both engines, with 6

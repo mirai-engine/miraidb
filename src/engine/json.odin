@@ -401,26 +401,41 @@ json_write_to :: proc(b: ^strings.Builder, value: Json_Value) {
 
 json_write_string :: proc(b: ^strings.Builder, text: string) {
 	strings.write_byte(b, '"')
-	for i in 0 ..< len(text) {
-		c := text[i]
-		switch c {
-		case '"':
-			strings.write_string(b, "\\\"")
-		case '\\':
-			strings.write_string(b, "\\\\")
-		case '\n':
-			strings.write_string(b, "\\n")
-		case '\r':
-			strings.write_string(b, "\\r")
-		case '\t':
-			strings.write_string(b, "\\t")
-		case:
-			if c < 0x20 {
-				fmt.sbprintf(b, "\\u%04x", c)
-			} else {
-				strings.write_byte(b, c)
+	at := 0
+	for at < len(text) {
+		c := text[at]
+		if c < 0x80 {
+			switch c {
+			case '"':
+				strings.write_string(b, "\\\"")
+			case '\\':
+				strings.write_string(b, "\\\\")
+			case '\n':
+				strings.write_string(b, "\\n")
+			case '\r':
+				strings.write_string(b, "\\r")
+			case '\t':
+				strings.write_string(b, "\\t")
+			case:
+				if c < 0x20 {
+					fmt.sbprintf(b, "\\u%04x", c)
+				} else {
+					strings.write_byte(b, c)
+				}
 			}
+			at += 1
+			continue
 		}
+		// A valid multi-byte character goes out as it came; a byte that is not
+		// part of one is escaped, so a document is always valid JSON (D32).
+		_, size := utf8.decode_rune_in_string(text[at:])
+		if size <= 1 {
+			fmt.sbprintf(b, "\\u%04x", rune(c))
+			at += 1
+			continue
+		}
+		strings.write_string(b, text[at:at + size])
+		at += size
 	}
 	strings.write_byte(b, '"')
 }

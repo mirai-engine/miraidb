@@ -3,6 +3,7 @@
 .output and .timer. It drives the binary through stdin and checks the output,
 so the behaviour is covered without a unit test for the CLI."""
 
+import json
 import os
 import shutil
 import subprocess
@@ -93,9 +94,23 @@ def main() -> int:
             timeout=120,
         )
 
+        # A non-ASCII statement reaches the engine as UTF-8 even when it comes
+        # through the command line, and --json stays parseable: the argument is
+        # decoded from the wide command line, not the ANSI code page (D32).
+        utf8 = subprocess.run(
+            [BINARY, "sql", "--json", windows_path(database), "SELECT hex('é'), length('é'), char(233)"],
+            capture_output=True,
+            timeout=120,
+        )
+        try:
+            utf8_rows = json.loads(utf8.stdout.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            utf8_rows = None
+
         checks = {
             "last line without newline": "tail-without-newline" in tail.stdout,
             "json keeps the real": real.stdout.strip() == "[[1.0,1,1.5]]",
+            "argv is utf-8": utf8_rows == [["C3A9", 1, "\u00e9"]],
             "list mode": "id = 1\nname = a\n\nid = 2\nname = b c" in out,
             "csv quoting": '1,a,"x, y"' in out and "2,b c,NULL" in out,
             "tab separator": "id\tname\n1\ta\n2\tb c" in out,

@@ -3763,7 +3763,9 @@ sq_hex :: proc(value: Value) -> string {
 	case .Bytes:
 		for byte in value.bytes do fmt.sbprintf(&builder, "%02X", byte)
 	case .String:
-		for byte in value.s do fmt.sbprintf(&builder, "%02X", byte)
+		// Iterate the bytes: `for c in text` would yield runes, so hex('é')
+		// answered the code point E9 instead of the UTF-8 bytes C3A9 (D32).
+		for i in 0 ..< len(value.s) do fmt.sbprintf(&builder, "%02X", value.s[i])
 	}
 	return strings.clone(strings.to_string(builder))
 }

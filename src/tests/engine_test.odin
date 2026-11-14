@@ -7671,6 +7671,34 @@ test_text_positions_count_characters :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, `SELECT instr('日本語', '語')`).i, i64(3))
 }
 
+// A text value is bytes, and hex() shows the bytes; a byte that is not part of
+// a UTF-8 sequence is escaped when a value is written as JSON, so a document is
+// always parseable (D32).
+@(test)
+test_text_is_bytes_and_json_stays_valid :: proc(t: ^testing.T) {
+	store := fresh_db(t, "bytes")
+	if store == nil do return
+	defer cleanup_db(store, "bytes")
+
+	// hex answers the UTF-8 bytes, not the code point: é is C3 A9.
+	testing.expect_value(t, db.value_format(scalar(t, store, `SELECT hex(char(233))`), context.temp_allocator), "C3A9")
+	testing.expect_value(t, db.value_format(scalar(t, store, `SELECT hex('abc')`), context.temp_allocator), "616263")
+	testing.expect_value(t, db.value_format(scalar(t, store, `SELECT hex(unhex('00ff'))`), context.temp_allocator), "00FF")
+	testing.expect_value(t, scalar(t, store, `SELECT octet_length(char(233))`).i, i64(2))
+	testing.expect_value(t, scalar(t, store, `SELECT length(char(233))`).i, i64(1))
+
+	// Valid text is written as it came.
+	valid := scalar(t, store, `SELECT json_object('a', char(233))`)
+	testing.expect_value(t, db.value_format(valid, context.temp_allocator), `{"a":"é"}`)
+
+	// A byte that is not part of a UTF-8 sequence is escaped as its Latin-1
+	// reading, so the output is a JSON document a parser accepts.
+	raw_bytes := []u8{'a', 0xE9, 'b'}
+	raw := string(raw_bytes)
+	written := db.json_write(db.json_from_value(db.value_string(raw), context.temp_allocator), context.temp_allocator)
+	testing.expect_value(t, written, `"a\u00e9b"`)
+}
+
 // WHERE asks a value for its truth, and SQLite converts a text to a number
 // first: 'a' is zero and false, '1a' is one and true. Fifty-three statements
 // through both engines found this one reporting a row SQLite drops.
