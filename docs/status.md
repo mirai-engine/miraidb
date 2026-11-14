@@ -134,10 +134,10 @@ the gaps are named rather than left to be discovered.
   the second audit pass measured: a statement is taken as ordered when its text
   contains "order by", so a window's `OVER (… ORDER BY …)` makes an unordered
   result compared position by position, and a cell compares by value, so `1` and
-  `1.0` are the same (backlog D30). A JSON real that is integral also prints
-  without its `.0` (backlog D31), which hides the type from both.
+  `1.0` are the same (backlog D30). `--json` now keeps the `.0` on a real, so a
+  consumer reads the type the query produced.
 - `scripts/build.py` builds both binaries and runs the suite.
-- 245 integration tests covering CRUD, recovery, constraints, transactions,
+- 246 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
@@ -360,11 +360,12 @@ than 1000 bytes cannot be indexed and the insert says so.
   view and a trigger are gone from the file afterwards — measured in `AUDIT-10`,
   and the reason D27 exists. The file keeps its rows and its integrity; it loses
   the rules.
-- **A real in `--json`.** `--json` prints an integral real as `1`, so a consumer
-  loses the type the schema promised (`AUDIT-10` P-B3, backlog D31). Text
-  positions and the truth of a text now match SQLite: characters count as
-  positions, `substr` counts a negative start from the end, and `WHERE` converts
-  a text to a number first, so `WHERE 'a'` keeps no row.
+- **`INSERT OR REPLACE` is refused without being documented.** The parser answers
+  "expected into" and neither the compatibility matrix nor the differential's
+  refusal list mentions it (`AUDIT-10` P-B7, backlog D31). The three wrong
+  answers the audit measured are fixed: text positions are characters, `substr`
+  counts a negative start from the end, and `WHERE` converts a text to a number
+  first.
 - **The C ABI cannot open an in-memory database.** `:memory:`, the empty path and
   `file:…?mode=memory` all fail; `sqlite3_open(":memory:")` through the facade
   answers `SQLITE_ERROR`. And a statement handle used after `finalize` is an

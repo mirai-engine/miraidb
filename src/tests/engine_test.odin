@@ -7717,6 +7717,32 @@ test_text_truth_is_numeric :: proc(t: ^testing.T) {
 	testing.expect_value(t, run_error(t, store, `SELECT 1 WHERE 1 = '1'`).kind, db.Error_Kind.Invalid_Type)
 }
 
+// A JSON number is written back with the type it had: 1.0 is not 1, and reading
+// the value back gives a real. The number alone cannot tell the two apart, so
+// Json_Value carries the bit set by the parser or by json_from_value.
+@(test)
+test_json_keeps_real_type :: proc(t: ^testing.T) {
+	store := fresh_db(t, "jsonreal")
+	if store == nil do return
+	defer cleanup_db(store, "jsonreal")
+
+	checks := []struct {
+		sql:      string,
+		expected: string,
+	}{
+		{`SELECT json_object('a', 1, 'b', 1.0)`, `{"a":1,"b":1.0}`},
+		{`SELECT json_array(1.0, 2, 1.5)`, `[1.0,2,1.5]`},
+		{`SELECT json('{"a":1,"b":1.0}')`, `{"a":1,"b":1.0}`},
+	}
+	for check in checks {
+		testing.expect_value(t, db.value_format(scalar(t, store, check.sql), context.temp_allocator), check.expected)
+	}
+	testing.expect_value(t, scalar(t, store, `SELECT json_type('1.0')`).s, "real")
+	testing.expect_value(t, scalar(t, store, `SELECT json_type('1')`).s, "integer")
+	testing.expect_value(t, scalar(t, store, `SELECT typeof(json_extract('{"a":1.0}', '$.a'))`).s, "real")
+	testing.expect_value(t, scalar(t, store, `SELECT typeof(json_extract('{"a":1}', '$.a'))`).s, "integer")
+}
+
 @(test)
 test_changes_and_last_insert_rowid :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "changes_rowid")

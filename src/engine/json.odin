@@ -25,6 +25,9 @@ Json_Value :: struct {
 	kind:    Json_Kind,
 	boolean: bool,
 	number:  f64,
+	// is_integer separates 1 from 1.0: the number alone cannot, and a caller
+	// asking for the type of a JSON value has to get it back unchanged.
+	is_integer: bool,
 	text:    string,
 	items:   []Json_Value,
 	keys:    []string,
@@ -96,12 +99,23 @@ json_parse_value :: proc(p: ^Json_Parser, depth: int) -> Json_Value {
 			return Json_Value{kind = .Null}
 		}
 	}
+	literal_start := p.at
 	number, ok := json_parse_number(p)
 	if !ok {
 		p.failed = true
 		return {}
 	}
-	return Json_Value{kind = .Number, number = number}
+	// The text says which of the two numbers this is; a point or an exponent
+	// makes it a real even when the value happens to be integral.
+	literal := p.text[literal_start:p.at]
+	integral := true
+	for c in literal {
+		if c == '.' || c == 'e' || c == 'E' {
+			integral = false
+			break
+		}
+	}
+	return Json_Value{kind = .Number, number = number, is_integer = integral}
 }
 
 JSON_MAX_DEPTH :: 64
@@ -355,8 +369,12 @@ json_write_to :: proc(b: ^strings.Builder, value: Json_Value) {
 	case .Bool:
 		strings.write_string(b, value.boolean ? "true" : "false")
 	case .Number:
-		if value.number == math.floor(value.number) && math.abs(value.number) < 1e15 {
+		if value.is_integer && math.abs(value.number) < 9.2e18 {
 			fmt.sbprintf(b, "%d", i64(value.number))
+		} else if value.number == math.floor(value.number) && math.abs(value.number) < 1e15 {
+			// A real that happens to be integral keeps its point, so a consumer
+			// reads the same type the query produced.
+			fmt.sbprintf(b, "%d.0", i64(value.number))
 		} else {
 			fmt.sbprintf(b, "%v", value.number)
 		}
@@ -416,9 +434,9 @@ json_from_value :: proc(value: Value, alloc: mem.Allocator) -> Json_Value {
 	case .Bool:
 		return Json_Value{kind = .Bool, boolean = value.b}
 	case .Int:
-		return Json_Value{kind = .Number, number = f64(value.i)}
+		return Json_Value{kind = .Number, number = f64(value.i), is_integer = true}
 	case .Uint:
-		return Json_Value{kind = .Number, number = f64(value.u)}
+		return Json_Value{kind = .Number, number = f64(value.u), is_integer = true}
 	case .Float:
 		return Json_Value{kind = .Number, number = value.f}
 	case .String:
@@ -435,7 +453,7 @@ json_to_value :: proc(value: Json_Value, alloc: mem.Allocator) -> Value {
 	case .Bool:
 		return value_bool(value.boolean)
 	case .Number:
-		if value.number == math.floor(value.number) && math.abs(value.number) < 9.2e18 {
+		if value.is_integer {
 			return value_int(i64(value.number))
 		}
 		return value_float(value.number)
@@ -497,7 +515,7 @@ json_path_find :: proc(root: Json_Value, path: string) -> (Json_Value, bool) {
 				at += 1
 				if at < len(trimmed) && trimmed[at] == ']' do at += 1
 				if current.kind != .Array do return {}, false
-				return Json_Value{kind = .Number, number = f64(len(current.items))}, true
+				return Json_Value{kind = .Number, number = f64(len(current.items)), is_integer = true}, true
 			}
 			start := at
 			for at < len(trimmed) && trimmed[at] != ']' do at += 1
@@ -525,8 +543,7 @@ json_type_name :: proc(value: Json_Value) -> string {
 	case .Bool:
 		return value.boolean ? "true" : "false"
 	case .Number:
-		if value.number == math.floor(value.number) do return "integer"
-		return "real"
+		return value.is_integer ? "integer" : "real"
 	case .String:
 		return "text"
 	case .Array:

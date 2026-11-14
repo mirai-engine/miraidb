@@ -952,8 +952,9 @@ file.
 
 ## D31 — The three wrong answers
 
-**Now.** Three sentences that answer and are wrong, found by the second audit pass
-(`AUDIT-10`) by running 47 edge queries through both engines:
+**Now.** Three sentences that answered and were wrong, found by the second audit
+pass (`AUDIT-10`) by running 47 edge queries through both engines. All three are
+fixed and covered by tests now; the table is what the audit measured:
 
 | Query | SQLite | this engine |
 |---|---|---|
@@ -993,7 +994,10 @@ in `test_text_positions_count_characters` over 21 cases and against SQLite over
    for comparisons (`1 = '1'` stays an error, listed in `DIFFERENT`): this is about
    *truth*, not about comparison.~~ Done in `text_number_prefix`, tested over
    seventeen literals in `test_text_truth_is_numeric`.
-3. The JSON writer keeps the `.0` for a real, so a consumer can tell the types apart.
+3. ~~The JSON writer keeps the `.0` for a real, so a consumer can tell the types
+   apart.~~ Done for both writers: `Json_Value` carries an `is_integer` bit that
+   the parser and `json_from_value` set, and the CLI's `--json` path prints
+   `%d.0`. `json_type` and `json_extract` now agree on the type too.
 4. `INSERT OR REPLACE`: implement it as `INSERT` + delete-on-conflict, or list it as
    refused in `REFUSED` and in `docs/sqlite.md`. Refusing is acceptable; refusing
    quietly is not.

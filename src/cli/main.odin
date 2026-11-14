@@ -2,6 +2,7 @@
 package main
 
 import "core:fmt"
+import "core:math"
 import "core:os"
 import "core:strconv"
 import "core:strings"
@@ -738,7 +739,13 @@ json_value :: proc(builder: ^strings.Builder, value: db.Value) {
 			fmt.sbprintf(builder, "%q", db.value_format(value, context.temp_allocator))
 			return
 		}
-		fmt.sbprintf(builder, "%.17g", value.f)
+		if value.f == math.floor(value.f) && math.abs(value.f) < 1e15 {
+			// A real that happens to be integral keeps its point: a consumer that
+			// reads the schema expects a number it can tell from an integer.
+			fmt.sbprintf(builder, "%d.0", i64(value.f))
+		} else {
+			fmt.sbprintf(builder, "%.17g", value.f)
+		}
 	case .Bytes:
 		strings.write_string(builder, `{"$blob":"`)
 		for byte in value.bytes do fmt.sbprintf(builder, "%02x", byte)

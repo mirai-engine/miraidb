@@ -84,8 +84,18 @@ def main() -> int:
             timeout=120,
         )
 
+        # --json prints a result a tool can parse, and a real that happens to be
+        # integral keeps its point: [[1.0,1,1.5]] is not [[1,1,1.5]].
+        real = subprocess.run(
+            [BINARY, "sql", "--json", windows_path(database), "SELECT 1.0, 1, 1.5"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
         checks = {
             "last line without newline": "tail-without-newline" in tail.stdout,
+            "json keeps the real": real.stdout.strip() == "[[1.0,1,1.5]]",
             "list mode": "id = 1\nname = a\n\nid = 2\nname = b c" in out,
             "csv quoting": '1,a,"x, y"' in out and "2,b c,NULL" in out,
             "tab separator": "id\tname\n1\ta\n2\tb c" in out,
