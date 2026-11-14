@@ -252,6 +252,14 @@ Scalar: `lower`, `upper`, `length`, `abs`, `coalesce`/`ifnull`, `now()`,
   and table functions keep the written order, and `EXPLAIN` prints
   `join order: …`. An `ON` clause is optional; without it the join is a cross
   product.
+- `JOIN b USING (c, …)` is the equality `a.c = b.c` for every column named, where
+  `a` is the relation written before the join, and it is planned like any other
+  condition. It carries one extra rule: `SELECT *` prints a merged column once,
+  from the left relation, and lists the right one without it — `a JOIN b USING
+  (id)` yields `a.id, a.…, b.…`, while `b.*` still lists every column of `b`. A
+  column that is not in the left relation is an error, not a cross join.
+- `SELECT *` lists the columns of the relations **as written**, even when the plan
+  runs them in another order.
 - `LEFT JOIN` extends a partial row with NULLs when no right row matches.
 - Unqualified column names must be unique across the joined tables; qualify
   with the table name or its alias otherwise.

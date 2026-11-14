@@ -425,6 +425,10 @@ parse_select :: proc(p: ^Parser) -> Statement {
 			join.table = parse_table_ref(p)
 			if p_match_keyword(p, "on") {
 				join.on = parse_expression(p)
+			} else if p_is_keyword(p, "using") {
+				p_advance(p)
+				join.using_columns = parse_using_columns(p)
+				join.on = parse_using_condition(p, select.from, joins[:], join.table, join.using_columns)
 			}
 			append(&joins, join)
 		}
@@ -525,7 +529,69 @@ p_sequence_number :: proc(p: ^Parser) -> (i64, bool) {
 	return negative ? -number : number, true
 }
 
+// parse_using_columns reads `(a, b, ...)` after `USING`.
 @(private)
+parse_using_columns :: proc(p: ^Parser) -> []string {
+	columns := make([dynamic]string, 0, 2, p.alloc)
+	if !p_expect_punct(p, "(") do return columns[:]
+	if !p_is_punct(p, ")") {
+		for {
+			append(&columns, p_ident(p))
+			if !p_match_punct(p, ",") do break
+		}
+	}
+	p_expect_punct(p, ")")
+	if len(columns) == 0 {
+		p_fail(p, .Sql_Syntax, "USING needs at least one column")
+	}
+	return columns[:]
+}
+
+// parse_using_condition turns `JOIN b USING (x, y)` into the condition the rest of
+// the engine already understands, `left.x = b.x AND left.y = b.y`. The left side is
+// the relation written before the join: SQL resolves a USING column in the earlier
+// joined tables, and the one immediately before is the only one that can hold it
+// without being ambiguous.
+@(private)
+parse_using_condition :: proc(
+	p: ^Parser,
+	from: Table_Ref,
+	previous: []Join_Clause,
+	right: Table_Ref,
+	columns: []string,
+) -> ^Expr {
+	left := from
+	if len(previous) > 0 do left = previous[len(previous) - 1].table
+	left_name := left.name
+	if len(left.alias) > 0 do left_name = left.alias
+	right_name := right.name
+	if len(right.alias) > 0 do right_name = right.alias
+	condition: ^Expr
+	for column in columns {
+		equality := new(Expr, p.alloc)
+		equality^ = Binary_Expr {
+			op    = .Eq,
+			left  = column_expr(p, left_name, column),
+			right = column_expr(p, right_name, column),
+		}
+		if condition == nil {
+			condition = equality
+			continue
+		}
+		both := new(Expr, p.alloc)
+		both^ = Binary_Expr{op = .And, left = condition, right = equality}
+		condition = both
+	}
+	return condition
+}
+
+@(private)
+column_expr :: proc(p: ^Parser, table: string, column: string) -> ^Expr {
+	expr := new(Expr, p.alloc)
+	expr^ = Column_Expr{table = strings.clone(table, p.alloc), name = strings.clone(column, p.alloc)}
+	return expr
+}
+
 parse_table_ref :: proc(p: ^Parser) -> Table_Ref {
 	ref: Table_Ref
 	ref.name = p_ident(p)

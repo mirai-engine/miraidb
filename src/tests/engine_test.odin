@@ -10778,6 +10778,111 @@ test_star_lists_the_written_columns_after_a_reorder :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_join_using :: proc(t: ^testing.T) {
+	// `JOIN b USING (c)` is `ON a.c = b.c` with one extra rule: `SELECT *` prints the
+	// merged column once, from the left relation. The condition is desugared where
+	// it is parsed, so the planner probes it like any other equality.
+	store := fresh_db(t, "join_using")
+	if store == nil do return
+	defer cleanup_db(store, "join_using")
+
+	run(t, store, "CREATE TABLE dept (id INTEGER PRIMARY KEY, name TEXT)")
+	run(t, store, "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept INTEGER, salary INTEGER)")
+	// The employee table is the big one, so the planner starts at the departments
+	// and `SELECT *` has to keep writing the columns in the order the query did.
+	for i in 0 ..< 300 {
+		run(t, store, fmt.tprintf("INSERT INTO emp (id, name, dept, salary) VALUES (%d, 'e%d', %d, %d)", i, i, i % 3 + 1, i * 10))
+	}
+	// One employee in a department that does not exist, for the outer row.
+	run(t, store, "INSERT INTO emp (id, name, dept, salary) VALUES (300, 'gone', 9, 5)")
+	run(t, store, "INSERT INTO dept (id, name) VALUES (0, 'eng'), (1, 'ops'), (2, 'hr'), (3, 'new')")
+	run(t, store, "ANALYZE")
+
+	result, err := db.sql_execute(store, "SELECT * FROM emp JOIN dept USING (id) WHERE emp.id < 3 ORDER BY emp.id")
+	if testing.expectf(t, db.error_ok(err), "%s", err.message) {
+		// The merged column appears once, from the left relation, and the right one
+		// is listed without it.
+		names := [5]string{"id", "name", "dept", "salary", "name"}
+		testing.expectf(t, len(result.columns) == 5, "%d columns: %v", len(result.columns), result.columns)
+		for name, i in names {
+			if i < len(result.columns) do testing.expect_value(t, result.columns[i], name)
+		}
+		testing.expect_value(t, len(result.rows), 3)
+		if len(result.rows) == 2 {
+			testing.expect_value(t, result.rows[0][0].i, i64(0))
+			testing.expect_value(t, result.rows[0][1].s, "e0")
+			testing.expect_value(t, result.rows[0][3].i, i64(0))
+			testing.expect_value(t, result.rows[0][4].s, "eng")
+		}
+	}
+	db.sql_result_destroy(&result)
+
+	// The same join written with ON lists the join column twice.
+	on_result, on_err := db.sql_execute(
+		store,
+		"SELECT * FROM emp JOIN dept ON dept.id = emp.id WHERE emp.id < 3 ORDER BY emp.id",
+	)
+	if testing.expectf(t, db.error_ok(on_err), "%s", on_err.message) {
+		testing.expect_value(t, len(on_result.columns), 6)
+		testing.expect_value(t, on_result.columns[4], "id")
+	}
+	db.sql_result_destroy(&on_result)
+
+	// A qualified star still lists every column of the relation, merged or not.
+	qualified, qualified_err := db.sql_execute(
+		store,
+		"SELECT dept.* FROM emp JOIN dept USING (id) WHERE emp.id < 3 ORDER BY emp.id",
+	)
+	if testing.expectf(t, db.error_ok(qualified_err), "%s", qualified_err.message) {
+		testing.expect_value(t, len(qualified.columns), 2)
+		testing.expect_value(t, qualified.columns[0], "id")
+	}
+	db.sql_result_destroy(&qualified)
+
+	// Two merged columns leave both out of the right side.
+	both, both_err := db.sql_execute(
+		store,
+		"SELECT * FROM emp JOIN dept USING (id, name) WHERE emp.id < 3",
+	)
+	if testing.expectf(t, db.error_ok(both_err), "%s", both_err.message) {
+		testing.expect_value(t, len(both.columns), 4)
+	}
+	db.sql_result_destroy(&both)
+
+	// A LEFT join keeps the rows that match nothing, with the right side empty.
+	left, left_err := db.sql_execute(
+		store,
+		"SELECT * FROM emp LEFT JOIN dept USING (id) WHERE emp.id >= 300 ORDER BY emp.id",
+	)
+	if testing.expectf(t, db.error_ok(left_err), "%s", left_err.message) {
+		testing.expect_value(t, len(left.rows), 1)
+		if len(left.rows) == 1 {
+			testing.expect_value(t, left.rows[0][0].i, i64(300))
+			testing.expect(t, left.rows[0][4].kind == .Null)
+		}
+	}
+	db.sql_result_destroy(&left)
+
+	// USING reaches the planner as an equality, so the join probes the index.
+	// The desugared equality reaches the planner, so the second relation is
+	// reached through its primary key instead of being scanned per outer row.
+	plan := run(t, store, "EXPLAIN SELECT count(*) FROM emp JOIN dept USING (id) WHERE emp.id < 3")
+	probed := false
+	for row in plan.rows {
+		if strings.has_prefix(row[0].s, "join ") && strings_contains(row[0].s, "using index") {
+			probed = true
+		}
+	}
+	testing.expect(t, probed)
+	db.sql_result_destroy(&plan)
+
+	// A column that is not in both relations is an error, not a silent cross join.
+	missing, missing_err := db.sql_execute(store, "SELECT * FROM emp JOIN dept USING (nope)")
+	testing.expect(t, !db.error_ok(missing_err))
+	db.sql_result_destroy(&missing)
+}
+
+@(test)
 test_plan_does_not_cross_join_before_it_can_filter :: proc(t: ^testing.T) {
 	// Only books joins the other two relations: authors and publishers share no
 	// condition. A plan that binds them first multiplies them (200 x 5) before

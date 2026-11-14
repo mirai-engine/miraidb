@@ -440,7 +440,7 @@ pg_describe_plan :: proc(host: ^Host, sql: string) -> (columns: []string, ok: bo
 		}
 	}
 	names := make([dynamic]string, 0, len(stmt.projections))
-	_ = expand_projections(sources[:], stmt.projections, &names, context.allocator)
+	_ = expand_projections(sources[:], stmt.joins, stmt.projections, &names, context.allocator)
 	sync.shared_unlock(&host.store.mutex)
 	return names[:], true
 }

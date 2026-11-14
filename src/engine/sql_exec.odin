@@ -1793,7 +1793,7 @@ sql_exec_stream_select :: proc(
 	probe := make([]Source, 1, tx.alloc)
 	probe[0] = Source{table = base, alias = stmt.from.alias}
 	columns := make([dynamic]string, 0, len(stmt.projections), tx.alloc)
-	expanded := expand_projections(probe, stmt.projections, &columns, tx.alloc)
+	expanded := expand_projections(probe, stmt.joins, stmt.projections, &columns, tx.alloc)
 	if len(expanded) == 0 do return {}, false, ERROR_NONE
 	aggregate := false
 	for expr in expanded {
@@ -2331,7 +2331,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		}
 	}
 	columns := make([dynamic]string, 0, len(stmt.projections))
-	expanded := expand_projections(star_sources[:], stmt.projections, &columns, tx.alloc)
+	expanded := expand_projections(star_sources[:], stmt.joins, stmt.projections, &columns, tx.alloc)
 	// The GROUP BY list is resolved here, while the sources are still around: it
 	// may name a projection alias, and telling an alias from a column needs them.
 	group_exprs := group_by_expressions(stmt, star_sources[:], tx.alloc)
@@ -2655,6 +2655,7 @@ sort_key_bytes :: proc(key: []u8) -> []u8 {
 
 expand_projections :: proc(
 	sources: []Source,
+	joins: []Join_Clause,
 	projections: []Select_Item,
 	columns: ^[dynamic]string,
 	alloc: mem.Allocator,
@@ -2670,14 +2671,21 @@ expand_projections :: proc(
 			}
 		}
 		if is_star {
-			for source in sources {
+			for source, index in sources {
 				qualifier := len(source.alias) > 0 ? source.alias : source.table.schema.name
 				if len(star_qualifier) > 0 {
 					matches := strings.equal_fold(star_qualifier, source.table.schema.name) ||
 						(len(source.alias) > 0 && strings.equal_fold(star_qualifier, source.alias))
 					if !matches do continue
 				}
+				// A `JOIN ... USING (c)` merges c: the right side does not repeat
+				// it in `SELECT *`. A qualified `b.*` still lists every column of b.
+				merged: []string
+				if len(star_qualifier) == 0 && index > 0 && index - 1 < len(joins) {
+					merged = joins[index - 1].using_columns
+				}
 				for column in source.table.schema.columns {
+					if column_in_names(column.name, merged) do continue
 					expr := new(Expr, alloc)
 					expr^ = Column_Expr{table = qualifier, name = column.name}
 					append(&expanded, expr)
@@ -2690,6 +2698,16 @@ expand_projections :: proc(
 		append(columns, projection_name(item))
 	}
 	return expanded[:]
+}
+
+// column_in_names reports whether a column appears in a list of names, the way
+// SQL compares them: without case.
+@(private)
+column_in_names :: proc(name: string, names: []string) -> bool {
+	for candidate in names {
+		if strings.equal_fold(candidate, name) do return true
+	}
+	return false
 }
 
 @(private)

@@ -221,6 +221,11 @@ Join_Clause :: struct {
 	table: Table_Ref,
 	left:  bool,
 	on:    ^Expr,
+	// using_columns holds the columns of `JOIN ... USING (a, b)`. They are also
+	// turned into the equality in `on`, so the rest of the engine sees one
+	// condition; the list stays because `SELECT *` prints a merged column once, as
+	// SQL says.
+	using_columns: []string,
 }
 
 Select_Stmt :: struct {

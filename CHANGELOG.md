@@ -32,6 +32,10 @@
   `FLOAT` key, a paged table) falls back to the full evaluation.
 - A join subscription walks the tables it reads instead of copying every row of
   them into the transaction arena, which was 80 bytes a row per commit.
+- `JOIN b USING (c, …)` is accepted: it is the equality the planner already knows,
+  and `SELECT *` prints the merged column once, from the left relation, while `b.*`
+  still lists every column. Four queries joined the differential runner and one of
+  its documented refusals is gone.
 - `SELECT *` lists the columns of a join in the order the query wrote them. It used
   to expand them from the relation the plan started at, so a reordered join printed
   the other table's columns — found through the `USING` work, where the fixture names

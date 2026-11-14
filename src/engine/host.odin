@@ -1247,7 +1247,7 @@ host_agg_prepare :: proc(host: ^Host, entry: ^Subscription_Query) -> bool {
 	defer delete(star, tx.alloc)
 	star[0] = Source{table = base, alias = stmt.from.alias}
 	columns := make([dynamic]string, 0, len(stmt.projections), tx.alloc)
-	expanded := expand_projections(star, stmt.projections, &columns, tx.alloc)
+	expanded := expand_projections(star, stmt.joins, stmt.projections, &columns, tx.alloc)
 	defer {
 		for column in columns do delete(column, tx.alloc)
 		delete(columns)
@@ -1358,7 +1358,7 @@ host_apply_incremental_aggregate :: proc(
 	defer delete(star, tx.alloc)
 	star[0] = Source{table = base, alias = stmt.from.alias}
 	columns := make([dynamic]string, 0, len(stmt.projections), tx.alloc)
-	expanded := expand_projections(star, stmt.projections, &columns, tx.alloc)
+	expanded := expand_projections(star, stmt.joins, stmt.projections, &columns, tx.alloc)
 	defer {
 		for column in columns do delete(column, tx.alloc)
 		delete(columns)
@@ -1482,7 +1482,7 @@ host_join_prepare :: proc(host: ^Host, entry: ^Subscription_Query) -> bool {
 	defer delete(star, tx.alloc)
 	for table, i in tables do star[i] = Source{table = table, alias = aliases[i]}
 	columns := make([dynamic]string, 0, len(stmt.projections), tx.alloc)
-	expanded := expand_projections(star[:], stmt.projections, &columns, tx.alloc)
+	expanded := expand_projections(star[:], stmt.joins, stmt.projections, &columns, tx.alloc)
 	defer {
 		for column in columns do delete(column, tx.alloc)
 		delete(columns)
@@ -1685,7 +1685,7 @@ host_apply_incremental_join :: proc(
 	defer delete(star, tx.alloc)
 	for table, i in tables do star[i] = Source{table = table, alias = aliases[i]}
 	columns := make([dynamic]string, 0, len(stmt.projections), tx.alloc)
-	expanded := expand_projections(star[:], stmt.projections, &columns, tx.alloc)
+	expanded := expand_projections(star[:], stmt.joins, stmt.projections, &columns, tx.alloc)
 	defer {
 		for column in columns do delete(column, tx.alloc)
 		delete(columns)
@@ -1834,7 +1834,7 @@ host_project_row :: proc(
 		if !value_is_truthy(value) do return nil, false, ERROR_NONE
 	}
 	columns := make([dynamic]string, 0, len(stmt.projections), tx.alloc)
-	expanded := expand_projections([]Source{source}, stmt.projections, &columns, tx.alloc)
+	expanded := expand_projections([]Source{source}, stmt.joins, stmt.projections, &columns, tx.alloc)
 	for column in columns do delete(column, tx.alloc)
 	delete(columns)
 	out := make([]Value, len(expanded))

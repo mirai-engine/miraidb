@@ -71,6 +71,12 @@ QUERIES = [
     "SELECT count(*), count(salary), sum(salary), avg(salary), min(salary), max(salary) FROM emp",
     "SELECT count(DISTINCT dept), sum(DISTINCT dept), avg(DISTINCT dept) FROM emp",
     "SELECT dept AS d, count(*) FROM emp GROUP BY d ORDER BY d",
+    # A join written with USING: the merged column appears once in `SELECT *`,
+    # the left relation supplies it, and a qualified star still lists them all.
+    "SELECT * FROM emp JOIN dept USING (id) ORDER BY emp.id",
+    "SELECT count(*) FROM emp JOIN dept USING (id)",
+    "SELECT dept.* FROM emp JOIN dept USING (id) ORDER BY emp.id",
+    "SELECT emp.name, dept.name FROM emp LEFT JOIN dept USING (id) ORDER BY emp.id",
     "SELECT dept, count(*), sum(salary) FROM emp GROUP BY dept ORDER BY dept",
     "SELECT dept, count(*) FROM emp GROUP BY dept HAVING count(*) > 1 ORDER BY dept",
     "SELECT DISTINCT n FROM nums ORDER BY n",
@@ -139,7 +145,7 @@ REFUSED = {
     "SELECT emp.id FROM emp RIGHT JOIN dept ON emp.dept = dept.id": "RIGHT joins are refused, not approximated",
     "SELECT emp.id FROM emp FULL JOIN dept ON emp.dept = dept.id": "FULL joins are refused, not approximated",
     "SELECT emp.id FROM emp NATURAL JOIN dept": "NATURAL joins are refused, not approximated",
-    "SELECT emp.id FROM emp JOIN dept USING (id)": "JOIN ... USING is refused, not approximated",
+
     "SELECT * FROM (SELECT id FROM emp) AS sub": "a subquery in FROM is not supported",
     "SELECT id FROM emp WHERE EXISTS (SELECT 1 FROM dept WHERE dept.id = emp.dept)": "a correlated reference is not resolved (features.md E2)",
 
