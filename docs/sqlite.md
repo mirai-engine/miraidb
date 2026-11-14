@@ -50,6 +50,7 @@ script lists.
 | VACUUM / ANALYZE / REINDEX | partial | `compact` is the engine's VACUUM, `VACUUM INTO` writes a copy, `ANALYZE` measures statistics; `REINDEX` does not exist |
 | PRAGMA | partial | four classes below: 25 answer, 18 are accepted as no-ops, 11 are refused |
 | EXPLAIN / EXPLAIN QUERY PLAN | partial | `EXPLAIN` prints the chosen access path, the estimate and the join order; there is no `EXPLAIN QUERY PLAN` row format |
+| Opening in memory | refused | `:memory:`, the empty path and `file:…?mode=memory` are not a database here: an open needs a path. A program written against sqlite3 starts with one of those, so this is the first thing to add (backlog D28) |
 | CREATE TRIGGER | done | `BEFORE` and `AFTER` triggers with `WHEN`, `NEW` and `OLD`; a `BEFORE` body that fails stops the write. Column-specific (`OF`) triggers are refused |
 | CREATE VIRTUAL TABLE (FTS5, R-Tree) | done | FTS5 with BM25, `snippet` and `highlight`; spatial tables store their boxes as columns |
 | GENERATED / STRICT / WITHOUT ROWID DDL | partial | `GENERATED … STORED` and `STRICT` work; `WITHOUT ROWID` is refused for writing and supported for reading |
@@ -180,7 +181,15 @@ malformed for `sqlite3` when the last table was dropped — the empty tree the
 `sqlite_master` root is built from ignored the room the 100-byte file header
 needs — and `scripts/sqlite_abi_smoke.py` now runs `DROP TABLE`, `ALTER TABLE`,
 `DROP INDEX` and `CREATE INDEX` through the facade and verifies the result with
-Python's `sqlite3`. A failed mirror write is reported through `last_error` and
+Python's `sqlite3`.
+
+**The rewrite re-emits the schema from the engine's model, and that model is
+smaller than SQLite's.** A `REFERENCES … ON DELETE CASCADE`, a `UNIQUE`, a
+`CHECK`, a `DEFAULT`, a `COLLATE`, a `GENERATED … AS` column, and every view and
+trigger are dropped from the file by the first schema change (measured; backlog
+D27). Rows, indexes the engine knows, and file integrity survive; the rules do
+not. Until D27 lands, treat a schema change on someone else's `.sqlite` file as a
+one-way simplification and keep the original. A failed mirror write is reported through `last_error` and
 never fails the commit.
 
 ## Export determinism

@@ -278,7 +278,15 @@ Scalar: `lower`, `upper`, `length`, `abs`, `coalesce`/`ifnull`, `now()`,
   is a column of a source still means the column, so aliasing `salary` to `dept`
   does not regroup anything. Without `GROUP BY`, an aggregate query produces
   exactly one row, even when the table is empty.
-- `LIMIT`/`OFFSET` take constant non-negative integers.
+- `LIMIT`/`OFFSET` take constant non-negative integers (SQLite reads `LIMIT -1` as
+  "no limit"; this engine refuses it).
+- `substr(s, start)` counts from the start. **A negative `start` is not implemented
+  yet**: it returns the whole string where SQLite counts from the end (backlog D31).
+- `WHERE` asks a value for its truth. A number is true when it is not zero; a **text
+  is true when it is not empty**, where SQLite converts it to a number first
+  (`'a'` is false there and true here — backlog D31).
+- `INSERT OR REPLACE` is refused with a syntax error and is not yet listed in the
+  compatibility matrix (backlog D31).
 - `DISTINCT` compares the whole projected row. Inside an aggregate it folds each
   value once: `count(DISTINCT x)`, `sum(DISTINCT x)` and `group_concat(DISTINCT
   x)` count, add or join the distinct values only, and `NULL` is not a value.

@@ -130,7 +130,12 @@ the gaps are named rather than left to be discovered.
 - `miraidb sql --json <db> <statement>` prints a result as one JSON array of
   rows, which is how `scripts/differential.py` compares answers against SQLite:
   one schema, one set of rows and 55 queries through both engines, with the
-  refusals and the intentional differences listed in the script.
+  refusals and the intentional differences listed in the script. Two blind spots
+  the second audit pass measured: a statement is taken as ordered when its text
+  contains "order by", so a window's `OVER (… ORDER BY …)` makes an unordered
+  result compared position by position, and a cell compares by value, so `1` and
+  `1.0` are the same (backlog D30). A JSON real that is integral also prints
+  without its `.0` (backlog D31), which hides the type from both.
 - `scripts/build.py` builds both binaries and runs the suite.
 - 243 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
@@ -343,13 +348,29 @@ than 1000 bytes cannot be indexed and the insert says so.
   overspends (after the work, not during). **What is still open:** the transport
   is plain TCP (D15), the row quota is unreachable from the server, and an
   expression nested deeply enough still overflows the stack (D23).
-- **A mirrored `.sqlite` file survives DDL.** `DROP TABLE`, `ALTER TABLE`, `DROP
-  INDEX` and `CREATE INDEX` all leave a file `sqlite3` reads: the schema change
-  takes the full rewrite, and that rewrite used to leave a file whose
+- **A mirrored `.sqlite` file stays readable through DDL, and loses what the
+  engine does not model.** `DROP TABLE`, `ALTER TABLE`, `DROP INDEX` and `CREATE
+  INDEX` all leave a file `sqlite3` opens: the rewrite used to leave a file whose
   `sqlite_master` had no b-tree when the last table was dropped (an empty
-  database, and a dropped table that held rows). An imported file's indexes are
-  read and recreated now, so a plan walks one and `DROP INDEX` finds it
+  database, and a dropped table that held rows), and an imported index is read and
+  recreated now, so a plan walks one and `DROP INDEX` finds it
   (`scripts/sqlite_abi_smoke.py` checks all of it against Python's `sqlite3`).
+  **But a schema change re-emits the schema from the engine's own model**, so
+  `REFERENCES`, `UNIQUE`, `CHECK`, `DEFAULT`, `COLLATE`, a `GENERATED` column, a
+  view and a trigger are gone from the file afterwards — measured in `AUDIT-10`,
+  and the reason D27 exists. The file keeps its rows and its integrity; it loses
+  the rules.
+- **`substr` with a negative start, and a `WHERE` that is not a number.** The
+  engine returns the whole string for `substr('abcdef', -3)` where SQLite answers
+  `def`, and treats a non-empty text as true in `WHERE` where SQLite casts it to a
+  number first (`WHERE 'a'` returns rows here and none there). `--json` also
+  prints an integral real as `1`, so a consumer loses the type (`AUDIT-10` P-B1 to
+  P-B3, backlog D31).
+- **The C ABI cannot open an in-memory database.** `:memory:`, the empty path and
+  `file:…?mode=memory` all fail; `sqlite3_open(":memory:")` through the facade
+  answers `SQLITE_ERROR`. And a statement handle used after `finalize` is an
+  access violation rather than a misuse error, which ends the host process
+  (`AUDIT-10` P-A2/P-A3, backlog D28 and D29).
 
 ## Not implemented: a second writer, and replication
 
