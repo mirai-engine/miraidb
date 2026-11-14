@@ -2,6 +2,7 @@ package engine
 
 import "core:fmt"
 import "core:strings"
+import "core:sync"
 
 // The HTTP layer is the transport half of the server. It stays free of sockets
 // so the protocol logic is testable: a socket loop reads bytes,
@@ -159,6 +160,8 @@ http_bearer_token :: proc(request: []u8) -> (string, bool) {
 @(private)
 client_drops :: proc(host: ^Host) -> u64 {
 	total: u64
+	sync.mutex_lock(&host.clients_mutex)
+	defer sync.mutex_unlock(&host.clients_mutex)
 	for _, client in host.clients do total += client.dropped
 	return total
 }
@@ -235,7 +238,7 @@ http_dispatch :: proc(host: ^Host, request: Http_Request) -> []u8 {
 			host.metric_errors,
 			host.store.commit_seq,
 			len(host.subscriptions),
-			len(host.clients),
+			host_client_count(host),
 			client_drops(host),
 		)
 		defer delete(body)

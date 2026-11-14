@@ -242,21 +242,15 @@ wire_request_owned :: proc(host: ^Host, data: []u8, owner: u64) -> []u8 {
 	// identity inside the request is kept for the next one. An embedded caller
 	// (owner 0) keeps using the store identity directly.
 	if owner != 0 {
-		if client, exists := host.clients[owner]; exists {
+		if client, exists := host_client_get(host, owner); exists {
 			store_set_identity(host.store, client.identity)
 		}
 	}
 	response := wire_dispatch_owned(host, data, owner)
 	if owner != 0 {
-		if client, exists := host.clients[owner]; exists {
-			client.identity = store_identity(host.store)
-			host.clients[owner] = client
-		}
+		host_client_set_identity(host, owner, store_identity(host.store))
 	}
-	if client, exists := host.clients[owner]; exists {
-		client.bytes_out += u64(len(response))
-		host.clients[owner] = client
-	}
+	host_client_add_bytes(host, owner, u64(len(response)))
 	if len(response) >= 4 {
 		kind := u32(response[0]) | u32(response[1]) << 8 | u32(response[2]) << 16 | u32(response[3]) << 24
 		if kind == WIRE_ERROR do host.metric_errors += 1

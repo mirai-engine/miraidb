@@ -171,25 +171,25 @@ ws_read_frame_within :: proc(
 	data: []u8,
 	max_bytes: int,
 ) -> (payload: []u8, consumed: int, opcode: u8, err: Error) {
-	if len(data) < 2 do return nil, 0, 0, errf(.Invalid_Argument, "short WebSocket frame")
+	if len(data) < 2 do return nil, 0, 0, errf(.Incomplete, "short WebSocket frame")
 	opcode = data[0] & 0x0f
 	masked := data[1] & 0x80 != 0
 	length := int(data[1] & 0x7f)
 	offset := 2
 	switch length {
 	case 126:
-		if len(data) < 4 do return nil, 0, opcode, errf(.Invalid_Argument, "short frame length")
+		if len(data) < 4 do return nil, 0, opcode, errf(.Incomplete, "short frame length")
 		length = int(data[2]) << 8 | int(data[3])
 		offset = 4
 	case 127:
-		if len(data) < 10 do return nil, 0, opcode, errf(.Invalid_Argument, "short frame length")
+		if len(data) < 10 do return nil, 0, opcode, errf(.Incomplete, "short frame length")
 		length = 0
 		for i in 0 ..< 8 do length = length << 8 | int(data[2 + i])
 		offset = 10
 	}
 	mask: [4]u8
 	if masked {
-		if len(data) < offset + 4 do return nil, 0, opcode, errf(.Invalid_Argument, "short frame mask")
+		if len(data) < offset + 4 do return nil, 0, opcode, errf(.Incomplete, "short frame mask")
 		copy(mask[:], data[offset:offset + 4])
 		offset += 4
 	}
@@ -201,7 +201,7 @@ ws_read_frame_within :: proc(
 			max_bytes,
 		)
 	}
-	if len(data) < offset + length do return nil, 0, opcode, errf(.Invalid_Argument, "incomplete frame")
+	if len(data) < offset + length do return nil, 0, opcode, errf(.Incomplete, "incomplete frame")
 	payload = make([]u8, length)
 	copy(payload, data[offset:offset + length])
 	if masked {

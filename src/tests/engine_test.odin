@@ -11629,3 +11629,68 @@ test_a_commit_copies_the_table_a_reader_holds :: proc(t: ^testing.T) {
 		testing.expect_value(t, again, committed)
 	}
 }
+
+// A frame that has not fully arrived is not a protocol error: the transport
+// reads again. Before this, a frame split across two reads closed the socket,
+// which is what a client that writes a large subscribe sees on a slow link.
+@(test)
+test_partial_frame_waits_for_the_rest :: proc(t: ^testing.T) {
+	message := []u8{'a', 'b', 'c', 'd', 'e', 'f'}
+	frame := db.ws_frame(message)
+	defer delete(frame)
+
+	// One byte, then a header half, then a missing tail: all incomplete.
+	cuts := []int{1, 3, 5, len(frame) - 1}
+	for cut in cuts {
+		_, _, _, err := db.ws_read_frame_within(frame[:cut], 0)
+		testing.expectf(t, err.kind == .Incomplete, "cut %d answered %v", cut, err.kind)
+	}
+
+	payload, consumed, opcode, err := db.ws_read_frame_within(frame, 0)
+	defer delete(payload)
+	testing.expect(t, db.error_ok(err))
+	testing.expect_value(t, consumed, len(frame))
+	testing.expect_value(t, opcode, u8(2))
+	testing.expect_value(t, len(payload), len(message))
+
+	// A frame that claims more than the cap is refused, not awaited.
+	_, _, _, over := db.ws_read_frame_within(frame, len(message) - 1)
+	testing.expect_value(t, over.kind, db.Error_Kind.Quota_Exceeded)
+}
+
+// A delta is routed by the subscription that produced it: the transport asks
+// which connection created it instead of guessing from the table.
+@(test)
+test_subscription_knows_its_connection :: proc(t: ^testing.T) {
+	store := fresh_db(t, "subowner")
+	if store == nil do return
+	defer cleanup_db(store, "subowner")
+	host := db.host_init(store)
+	defer db.host_destroy(host)
+
+	run(t, store, "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
+	run(t, store, "INSERT INTO items (name) VALUES ('one')")
+
+	first, snapshot, err := db.host_subscribe_many_owned(host, []string{"SELECT id, name FROM items"}, 7)
+	testing.expectf(t, db.error_ok(err), "subscribe failed: %s", err.message)
+	defer {
+		for query_rows in snapshot do for row in query_rows do db.free_values(row)
+		delete(snapshot)
+	}
+	testing.expect_value(t, db.host_subscription_owner(host, first), u64(7))
+
+	second, snapshot_two, second_err := db.host_subscribe_many_owned(
+		host,
+		[]string{"SELECT count(*) AS n FROM items"},
+		9,
+	)
+	testing.expectf(t, db.error_ok(second_err), "second subscribe failed: %s", second_err.message)
+	defer {
+		for query_rows in snapshot_two do for row in query_rows do db.free_values(row)
+		delete(snapshot_two)
+	}
+	testing.expect_value(t, db.host_subscription_owner(host, second), u64(9))
+
+	// An id nobody created belongs to no connection, so nothing is written.
+	testing.expect_value(t, db.host_subscription_owner(host, first + second + 100), u64(0))
+}

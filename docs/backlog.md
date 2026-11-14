@@ -707,14 +707,24 @@ editorial duty, listed in `CONTRIBUTING.md`.
 
 ## D22 — The server, for real
 
-**Now.** `miraidb-server` accepts a connection, serves it to completion, and then
-accepts the next one (`src/server/main.odin`: `for { accept; serve }`). A WebSocket
-subscription never returns, so while one subscriber is connected **no other client
-can connect at all** — measured: a second client's `/query` times out behind an
-open subscription. The same shape means one expensive statement stalls everyone,
-and nothing bounds it: `store_set_work_budget` and `store_cancel` exist and are
-tested, but the server sets neither and has no route, header or timer that reaches
-them.
+**Done: a thread per connection, and the delta path.** Each accepted socket gets
+its own thread (`src/server/main.odin`: `thread.create_and_start_with_data`), the
+registry behind it is locked (`Host.clients_mutex`, so a connection's counters can
+be bumped by a statement thread while another thread registers), writes to a
+socket happen under that socket's lock, and `host.on_update` is finally wired to
+the transport: a commit finds the connection that owns the subscription
+(`host_subscription_owner`) and writes one delta frame into it.
+`scripts/broker_smoke.py` runs a subscriber and a second client at the same time,
+reads the delta the write produced, and checks that two frames in one read both
+answer. The frame loop also waits for the rest of a frame that has not arrived
+instead of closing the socket, which the old one did.
+
+Statements still run **one at a time**, under `Server.statements`: the store
+carries the caller's identity while a statement executes (`store_set_identity`),
+so two statements at once would see each other's. A slow query therefore queues
+the others rather than running beside them, which is what step 2 is for.
+
+**Still open: who may ask, and what bounds one statement.**
 
 **Second half: who may ask.** A wire request runs under the connection's identity,
 and identity is whatever the bearer token said — or nothing. Grants are opt-in:
@@ -727,9 +737,8 @@ server: `CREATE TABLE`, `INSERT`, `SELECT`, `DROP TABLE` all answered 200, and
 
 **Next.**
 
-1. Serve connections concurrently (a thread per connection; `Host` already guards
-   its maps and counters with a mutex) and prove it: one subscriber, one query, the
-   query answered while the subscription stays open.
+1. ~~Serve connections concurrently and prove it.~~ Done; `broker_smoke.py` holds
+   a subscription open while another client writes and reads the delta.
 2. Wire a per-statement work budget and a cancel route (`store_set_work_budget`,
    `store_cancel`) so a stuck statement ends with `.Cancelled` instead of ending
    the process, and a client that leaves stops its work.

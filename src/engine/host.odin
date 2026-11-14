@@ -192,8 +192,12 @@ Host :: struct {
 	// Counters for the metrics endpoint.
 	metric_requests:      u64,
 	metric_errors:        u64,
-	// Live connection registry (F9).
+	// Live connection registry (F9). The registry is read and written by the
+	// transport's threads, so every access takes clients_mutex: a connection is
+	// registered by the thread that accepted it and its counters are bumped by
+	// the thread that runs a statement for it.
 	clients:              map[u64]Client,
+	clients_mutex:        sync.Mutex,
 	max_clients:          int,
 	// module_memory_limit and module_row_limit bound one module call.
 	module_memory_limit:  int,
@@ -2540,6 +2544,8 @@ decode_values :: proc(payload: []u8, alloc: mem.Allocator) -> []Value {
 // host_client_connect registers a connection. It returns false when the
 // registry is full, which the transport reports as a rejection.
 host_client_connect :: proc(host: ^Host, owner: u64) -> bool {
+	sync.mutex_lock(&host.clients_mutex)
+	defer sync.mutex_unlock(&host.clients_mutex)
 	if _, exists := host.clients[owner]; exists do return true
 	if host.max_clients > 0 && len(host.clients) >= host.max_clients do return false
 	host.clients[owner] = Client{owner = owner, connected_us = host.now_us}
@@ -2547,20 +2553,70 @@ host_client_connect :: proc(host: ^Host, owner: u64) -> bool {
 }
 
 // host_client_disconnect forgets the connection and drops its subscriptions.
+//
+// The subscription list belongs to the host, not to the registry, and a commit
+// walks it. A caller with more than one thread (the server) therefore calls this
+// while no statement is running: it holds its own statement lock, so the drop
+// cannot race the walk. The registry itself is always locked here.
 host_client_disconnect :: proc(host: ^Host, owner: u64) {
+	sync.mutex_lock(&host.clients_mutex)
 	delete_key(&host.clients, owner)
+	sync.mutex_unlock(&host.clients_mutex)
 	host_drop_owned(host, owner)
+}
+
+// host_client_get copies one registry entry under the lock, so a caller outside
+// the transport (a wire request) reads a consistent identity and counters.
+host_client_get :: proc(host: ^Host, owner: u64) -> (Client, bool) {
+	sync.mutex_lock(&host.clients_mutex)
+	defer sync.mutex_unlock(&host.clients_mutex)
+	client, exists := host.clients[owner]
+	return client, exists
+}
+
+// host_client_set_identity records the identity a request left behind, so the
+// next request from the same connection runs under it.
+host_client_set_identity :: proc(host: ^Host, owner: u64, identity: Identity) {
+	sync.mutex_lock(&host.clients_mutex)
+	defer sync.mutex_unlock(&host.clients_mutex)
+	client, exists := host.clients[owner]
+	if !exists do return
+	client.identity = identity
+	host.clients[owner] = client
+}
+
+// host_client_add_bytes counts a response against the connection's outbox.
+host_client_add_bytes :: proc(host: ^Host, owner: u64, bytes: u64) {
+	sync.mutex_lock(&host.clients_mutex)
+	defer sync.mutex_unlock(&host.clients_mutex)
+	client, exists := host.clients[owner]
+	if !exists do return
+	client.bytes_out += bytes
+	host.clients[owner] = client
+}
+
+// host_subscription_owner reports which connection created a subscription, or 0
+// when the id is unknown. The transport routes a delta with it.
+host_subscription_owner :: proc(host: ^Host, id: u64) -> u64 {
+	for subscription in host.subscriptions {
+		if subscription.id == id do return subscription.owner
+	}
+	return 0
 }
 
 // host_client_over_budget reports whether a connection has been sent more
 // than `limit` bytes. The transport uses it to drop slow consumers instead of
 // letting one of them hold the writer.
 host_client_over_budget :: proc(host: ^Host, owner: u64, limit: u64) -> bool {
+	sync.mutex_lock(&host.clients_mutex)
+	defer sync.mutex_unlock(&host.clients_mutex)
 	client, exists := host.clients[owner]
 	return exists && client.bytes_out > limit
 }
 
 host_client_bytes :: proc(host: ^Host, owner: u64) -> u64 {
+	sync.mutex_lock(&host.clients_mutex)
+	defer sync.mutex_unlock(&host.clients_mutex)
 	client, exists := host.clients[owner]
 	if !exists do return 0
 	return client.bytes_out
@@ -2593,6 +2649,8 @@ host_client_queue_budget :: proc(host: ^Host) -> u64 {
 // message does not fit: the policy counts the drop and asks for the connection
 // to be closed on the next write.
 host_client_enqueue :: proc(host: ^Host, owner: u64, bytes: u64) -> bool {
+	sync.mutex_lock(&host.clients_mutex)
+	defer sync.mutex_unlock(&host.clients_mutex)
 	client, exists := host.clients[owner]
 	if !exists do return false
 	if budget := host.client_queue_budget; budget > 0 && client.queue + bytes > budget {
@@ -2609,6 +2667,8 @@ host_client_enqueue :: proc(host: ^Host, owner: u64, bytes: u64) -> bool {
 
 // host_client_dequeue releases bytes once the transport wrote them.
 host_client_dequeue :: proc(host: ^Host, owner: u64, bytes: u64) {
+	sync.mutex_lock(&host.clients_mutex)
+	defer sync.mutex_unlock(&host.clients_mutex)
 	client, exists := host.clients[owner]
 	if !exists do return
 	client.queue = client.queue >= bytes ? client.queue - bytes : 0
@@ -2616,12 +2676,16 @@ host_client_dequeue :: proc(host: ^Host, owner: u64, bytes: u64) {
 }
 
 host_client_queue :: proc(host: ^Host, owner: u64) -> u64 {
+	sync.mutex_lock(&host.clients_mutex)
+	defer sync.mutex_unlock(&host.clients_mutex)
 	client, exists := host.clients[owner]
 	if !exists do return 0
 	return client.queue
 }
 
 host_client_dropped :: proc(host: ^Host, owner: u64) -> u64 {
+	sync.mutex_lock(&host.clients_mutex)
+	defer sync.mutex_unlock(&host.clients_mutex)
 	client, exists := host.clients[owner]
 	if !exists do return 0
 	return client.dropped
@@ -2629,6 +2693,8 @@ host_client_dropped :: proc(host: ^Host, owner: u64) -> u64 {
 
 // host_client_should_drop tells the transport to close the connection.
 host_client_should_drop :: proc(host: ^Host, owner: u64) -> bool {
+	sync.mutex_lock(&host.clients_mutex)
+	defer sync.mutex_unlock(&host.clients_mutex)
 	client, exists := host.clients[owner]
 	return exists && client.drop
 }
@@ -2645,10 +2711,14 @@ host_join_rows_walked :: proc(host: ^Host) -> u64 {
 }
 
 host_client_count :: proc(host: ^Host) -> int {
+	sync.mutex_lock(&host.clients_mutex)
+	defer sync.mutex_unlock(&host.clients_mutex)
 	return len(host.clients)
 }
 
 host_client_connected :: proc(host: ^Host, owner: u64) -> bool {
+	sync.mutex_lock(&host.clients_mutex)
+	defer sync.mutex_unlock(&host.clients_mutex)
 	_, exists := host.clients[owner]
 	return exists
 }

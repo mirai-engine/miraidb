@@ -132,7 +132,7 @@ the gaps are named rather than left to be discovered.
   one schema, one set of rows and 55 queries through both engines, with the
   refusals and the intentional differences listed in the script.
 - `scripts/build.py` builds both binaries and runs the suite.
-- 236 integration tests covering CRUD, recovery, constraints, transactions,
+- 238 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
@@ -319,11 +319,19 @@ than 1000 bytes cannot be indexed and the insert says so.
   ends the process rather than a parse error, and `max_rows_per_query` is read
   after the rows exist, so it cannot prevent the memory it exists to cap
   (`AUDIT-9` A4/A5, backlog D23).
-- **The server serves one client at a time.** `serve` never returns while a
-  WebSocket subscription is open, so a subscriber blocks every other client; and
-  a wire request runs under whatever identity its token named, including none,
-  which leaves DDL, `ATTACH` and `LOAD EXTENSION` open to any client unless grants
-  were created (`AUDIT-9` A1/A2, backlog D22).
+- **The server serves many clients, one statement at a time.** Each accepted
+  socket gets its own thread, so a subscriber no longer blocks anyone: a
+  subscription stays open while another client writes and the write's delta is
+  written to the subscriber's socket under that socket's lock
+  (`scripts/broker_smoke.py` runs both at once and reads the delta).
+  `host_on_commit` was never wired to the transport before this, so a live
+  subscription delivered its snapshot and then nothing. Statements still run one
+  at a time — the store carries the caller's identity while it executes — so a
+  slow query queues the others instead of running beside them.
+  **What is still open:** a wire request runs under whatever identity its token
+  named, including none, which leaves DDL, `ATTACH` and `LOAD EXTENSION` open to
+  any client unless grants were created, and nothing bounds a statement's work or
+  lets the server cancel it (`AUDIT-9` A2/B4, backlog D22 steps 2-4).
 - **A mirrored `.sqlite` file is exact for rows and unproven for DDL.**
   `DROP TABLE` on a table that held rows leaves the file malformed for `sqlite3`,
   and an imported file's indexes are not read (`AUDIT-9` A3/B2, backlog D24).
