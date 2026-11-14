@@ -894,10 +894,32 @@ tx_insert :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error) {
 		return 0, err
 	}
 
+	// A BEFORE trigger sees the row that is about to be written, while nothing has
+	// been staged: if its body fails, there is nothing to roll back and the insert
+	// stops here.
+	if trigger_err := trigger_fire(
+		tx,
+		name,
+		.Insert,
+		.Before,
+		Row{},
+		Row{id = id, values = row_values},
+		table.schema,
+	); trigger_err.kind != .None {
+		return 0, trigger_err
+	}
 	writes.inserts[id] = Row{id = id, values = row_values}
 	writes.next_row_id = u64(id) + 1
 	tx_register_unique(tx, name, table, row_values, id)
-	if trigger_err := trigger_fire(tx, name, .Insert, Row{}, Row{id = id, values = row_values}, table.schema); trigger_err.kind != .None {
+	if trigger_err := trigger_fire(
+		tx,
+		name,
+		.Insert,
+		.After,
+		Row{},
+		Row{id = id, values = row_values},
+		table.schema,
+	); trigger_err.kind != .None {
 		return 0, trigger_err
 	}
 	return id, ERROR_NONE
@@ -971,6 +993,17 @@ tx_update :: proc(tx: ^Tx, name: string, id: Row_Id, values: []Value) -> Error {
 		tx_register_unique(tx, name, table, previous.values, id)
 		return err
 	}
+	if trigger_err := trigger_fire(
+		tx,
+		name,
+		.Update,
+		.Before,
+		previous,
+		Row{id = id, values = row_values},
+		table.schema,
+	); trigger_err.kind != .None {
+		return trigger_err
+	}
 	if _, staged := writes.inserts[id]; staged {
 		writes.inserts[id] = Row{id = id, values = row_values}
 	} else {
@@ -981,7 +1014,15 @@ tx_update :: proc(tx: ^Tx, name: string, id: Row_Id, values: []Value) -> Error {
 	if fk_err := fk_parent_update(tx, name, previous.values, row_values); fk_err.kind != .None {
 		return fk_err
 	}
-	if trigger_err := trigger_fire(tx, name, .Update, previous, Row{id = id, values = row_values}, table.schema); trigger_err.kind != .None {
+	if trigger_err := trigger_fire(
+		tx,
+		name,
+		.Update,
+		.After,
+		previous,
+		Row{id = id, values = row_values},
+		table.schema,
+	); trigger_err.kind != .None {
 		return trigger_err
 	}
 	return ERROR_NONE
@@ -1002,6 +1043,9 @@ tx_delete :: proc(tx: ^Tx, name: string, id: Row_Id) -> Error {
 	if fk_err := fk_parent_delete(tx, name, previous.values); fk_err.kind != .None {
 		return fk_err
 	}
+	if trigger_err := trigger_fire(tx, name, .Delete, .Before, previous, Row{}, table.schema); trigger_err.kind != .None {
+		return trigger_err
+	}
 	writes := tx_writes(tx, name, table)
 	tx_unregister_unique(tx, name, table, previous.values, id)
 	if _, staged := writes.inserts[id]; staged {
@@ -1012,7 +1056,7 @@ tx_delete :: proc(tx: ^Tx, name: string, id: Row_Id) -> Error {
 		}
 		writes.deletes[id] = true
 	}
-	if trigger_err := trigger_fire(tx, name, .Delete, previous, Row{}, table.schema); trigger_err.kind != .None {
+	if trigger_err := trigger_fire(tx, name, .Delete, .After, previous, Row{}, table.schema); trigger_err.kind != .None {
 		return trigger_err
 	}
 	return ERROR_NONE

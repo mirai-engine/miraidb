@@ -17,6 +17,14 @@ Trigger_Fire_Event :: enum {
 	Delete,
 }
 
+// Trigger_Timing is when the body runs. A BEFORE trigger runs while the row is
+// still only proposed, so a failing statement in it stops the write; an AFTER
+// trigger runs once the row is staged, and its failure rolls the statement back.
+Trigger_Timing :: enum {
+	Before,
+	After,
+}
+
 // trigger_ensure creates the catalog on first use.
 trigger_ensure :: proc(tx: ^Tx) -> Error {
 	if table, table_err := tx_table(tx, TRIGGER_TABLE); table_err.kind == .None {
@@ -37,9 +45,6 @@ trigger_ensure :: proc(tx: ^Tx) -> Error {
 
 // trigger_create records a trigger, replacing one with the same name.
 trigger_create :: proc(tx: ^Tx, stmt: Create_Trigger_Stmt) -> Error {
-	if stmt.before {
-		return errf(.Sql_Unsupported, "only AFTER triggers are supported")
-	}
 	if stmt.event != "insert" && stmt.event != "update" && stmt.event != "delete" {
 		return errf(.Sql_Syntax, "unknown trigger event %q", stmt.event)
 	}
@@ -64,7 +69,7 @@ trigger_create :: proc(tx: ^Tx, stmt: Create_Trigger_Stmt) -> Error {
 		value_string(stmt.name),
 		value_string(stmt.table),
 		value_string(stmt.event),
-		value_string("after"),
+		value_string(stmt.before ? "before" : "after"),
 		value_string(stmt.body),
 		value_string(stmt.when_text),
 	}
@@ -154,6 +159,7 @@ trigger_fire :: proc(
 	tx: ^Tx,
 	table_name: string,
 	event: Trigger_Fire_Event,
+	timing: Trigger_Timing,
 	old_row: Row,
 	new_row: Row,
 	schema: Table_Schema,
@@ -175,8 +181,12 @@ trigger_fire :: proc(
 	}
 	result, query_err := sql_execute_in_tx_params(
 		tx,
-		"SELECT body, when_text FROM _triggers WHERE table_name = ? AND event = ? AND timing = 'after' ORDER BY name",
-		[]Value{value_string(table_name), value_string(event_name)},
+		"SELECT body, when_text FROM _triggers WHERE table_name = ? AND event = ? AND timing = ? ORDER BY name",
+		[]Value {
+			value_string(table_name),
+			value_string(event_name),
+			value_string(timing == .Before ? "before" : "after"),
+		},
 	)
 	if query_err.kind != .None do return query_err
 	defer sql_result_destroy(&result)

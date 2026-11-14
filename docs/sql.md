@@ -546,9 +546,11 @@ END;
 DROP TRIGGER audit_insert;
 ```
 
-- `AFTER INSERT`, `AFTER UPDATE` and `AFTER DELETE`, one per row, with `NEW`
-  bound to the row being written and `OLD` to the stored one (the missing side
-  of an event reads NULL).
+- `BEFORE` and `AFTER`, for `INSERT`, `UPDATE` and `DELETE`, one row at a time,
+  with `NEW` bound to the row being written and `OLD` to the stored one (the
+  missing side of an event reads NULL). An `AFTER` trigger runs once the row is
+  staged; a `BEFORE` trigger runs while the row is still only proposed, so a body
+  that fails stops the write and takes its own effects with it.
 - The body may hold several statements separated by `;`; they run in the same
   transaction as the write, so a failing trigger rolls the row back.
 - The definition is a row in the internal `_triggers` table, which means it is
@@ -558,9 +560,9 @@ DROP TRIGGER audit_insert;
   and `OLD` in scope: a false or NULL condition skips it without failing the
   write. The condition is checked when `CREATE TRIGGER` parses it, so a typo is
   reported there rather than on the first write.
-- `BEFORE` and column-specific (`OF`) triggers are refused with
-  `sql_unsupported` instead of being approximated. A trigger that fires itself
-  stops at a depth of 8 and fails the statement.
+- Column-specific (`OF`) triggers are refused with `sql_unsupported` instead of
+  being approximated. A trigger that fires itself stops at a depth of 8 and fails
+  the statement.
 
 ## Roles and permissions
 

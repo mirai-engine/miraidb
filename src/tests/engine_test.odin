@@ -8246,9 +8246,11 @@ test_triggers :: proc(t: ^testing.T) {
 	testing.expect_value(t, missing.kind, db.Error_Kind.Table_Not_Found)
 	run(t, store, "DROP TRIGGER IF EXISTS t_ins")
 
-	// Only AFTER triggers are modelled, and a BEFORE one is refused with a reason.
+	// BEFORE triggers are modelled too (their order is covered by test_before_triggers);
+	// this one is created and dropped before it can fire, so the counts below stay.
 	before := run_error(t, store, "CREATE TRIGGER b BEFORE INSERT ON t BEGIN INSERT INTO audit (note) VALUES ('no'); END")
-	testing.expect_value(t, before.kind, db.Error_Kind.Sql_Unsupported)
+	testing.expect(t, db.error_ok(before))
+	run(t, store, "DROP TRIGGER b")
 	// WHEN is accepted (the condition itself is covered by test_trigger_when).
 	run(t, store, "CREATE TRIGGER w AFTER INSERT ON t WHEN NEW.a = 'x' BEGIN INSERT INTO audit (note) VALUES ('when'); END")
 	run(t, store, "DROP TRIGGER w")
@@ -9318,6 +9320,60 @@ test_window_frames :: proc(t: ^testing.T) {
 		"SELECT SUM(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED FOLLOWING AND CURRENT ROW) FROM t",
 	)
 	testing.expect_value(t, bad_start.kind, db.Error_Kind.Invalid_Argument)
+}
+
+@(test)
+test_before_triggers :: proc(t: ^testing.T) {
+	// A BEFORE trigger runs while the row is still only proposed: its body sees NEW,
+	// the row is not written yet, and a body that fails stops the write. The same
+	// statements through sqlite3 give the same order and the same log.
+	store := fresh_db(t, "trigger_before")
+	if store == nil do return
+	defer cleanup_db(store, "trigger_before")
+	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
+	run(t, store, "CREATE TABLE log (id INTEGER PRIMARY KEY AUTOINCREMENT, note TEXT NOT NULL)")
+	run(t, store, `
+		CREATE TRIGGER t_before BEFORE INSERT ON t
+		BEGIN INSERT INTO log (note) VALUES ('before ' || NEW.v); END`)
+	run(t, store, `
+		CREATE TRIGGER t_after AFTER INSERT ON t
+		BEGIN INSERT INTO log (note) VALUES ('after ' || NEW.v); END`)
+	run(t, store, "INSERT INTO t (id, v) VALUES (1, 10)")
+
+	run(t, store, `
+		CREATE TRIGGER t_update BEFORE UPDATE ON t
+		BEGIN INSERT INTO log (note) VALUES ('upd ' || OLD.v || '->' || NEW.v); END`)
+	run(t, store, "UPDATE t SET v = 11 WHERE id = 1")
+	run(t, store, `
+		CREATE TRIGGER t_delete BEFORE DELETE ON t
+		BEGIN INSERT INTO log (note) VALUES ('del ' || OLD.v); END`)
+	run(t, store, "DELETE FROM t WHERE id = 1")
+
+	expected := [4]string{"before 10", "after 10", "upd 10->11", "del 11"}
+	log_result, log_err := db.sql_execute(store, "SELECT note FROM log ORDER BY id")
+	if testing.expectf(t, db.error_ok(log_err), "%s", log_err.message) {
+		testing.expect_value(t, len(log_result.rows), 4)
+		for want, i in expected {
+			if i < len(log_result.rows) do testing.expect_value(t, log_result.rows[i][0].s, want)
+		}
+	}
+	db.sql_result_destroy(&log_result)
+
+	// A BEFORE trigger whose body fails stops the insert, and the rows its body
+	// wrote are gone with the statement.
+	run(t, store, "CREATE TABLE guard (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
+	run(t, store, `
+		CREATE TRIGGER guard_stop BEFORE INSERT ON guard WHEN NEW.v > 0
+		BEGIN INSERT INTO log (note) VALUES ('refused'); INSERT INTO nope (x) VALUES (1); END`)
+	refused := run_error(t, store, "INSERT INTO guard (id, v) VALUES (1, 1)")
+	testing.expect(t, refused.kind != .None)
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM guard").i, i64(0))
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM log WHERE note = 'refused'").i, i64(0))
+
+	// The WHEN condition skips the trigger without an error.
+	allowed := run_error(t, store, "INSERT INTO guard (id, v) VALUES (2, 0)")
+	testing.expect(t, db.error_ok(allowed))
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM guard").i, i64(1))
 }
 
 @(test)

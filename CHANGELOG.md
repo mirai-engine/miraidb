@@ -32,6 +32,10 @@
   `FLOAT` key, a paged table) falls back to the full evaluation.
 - A join subscription walks the tables it reads instead of copying every row of
   them into the transaction arena, which was 80 bytes a row per commit.
+- `BEFORE` triggers work: the body runs while the row is still only proposed, so a
+  statement in it that fails stops the write and takes its own effects with it, and
+  `WHEN` still decides whether it fires. The log a `BEFORE`/`AFTER` pair writes is
+  the one `sqlite3` writes, in the same order.
 - `RANGE` and `GROUPS` window frames work, with offsets measured either in peer
   groups or in the `ORDER BY` value (`OVER (ORDER BY n RANGE BETWEEN 10 PRECEDING
   AND 10 FOLLOWING)`). A `RANGE` offset needs one numeric ordering term; a text one
