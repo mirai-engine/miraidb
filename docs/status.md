@@ -314,6 +314,11 @@ than 1000 bytes cannot be indexed and the insert says so.
   connection authenticated as is kept **per connection** (`test_connection_identity`):
   two clients never share the identity policies see, and `SET identity` inside a
   request persists for that client only.
+- **Two soak tests shared a directory.** `test_soak_workload` and
+  `test_soak_update_delete_prune` both opened `_test_soak`, so when the second found
+  the first's handle still alive it refused with "already open by pid N". The prune
+  soak has its own directory now, and the refusal it produced was a name collision
+  rather than a lock that outlives its owner.
 - **A reader can open beside the writer (D18b).** The lock file has two bytes: the
   writer byte is taken exclusively, the reader byte shared by readers and writers
   alike. `store_open(..., read_only = true)` (CLI `--read-only`) therefore opens
