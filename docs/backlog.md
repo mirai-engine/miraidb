@@ -783,6 +783,41 @@ refused.
 
 **Cost.** L. It is the difference between a demo of the wire protocol and a server.
 
+## D32 — A byte is not a character, on the way in or out
+
+**Now.** Three symptoms of one confusion, measured while growing the differential
+corpus in D30:
+
+| Symptom | Command | Today | SQLite / expected |
+|---|---|---|---|
+| The CLI receives its arguments in the ANSI code page | `miraidb sql --json db "SELECT 'é'"` | `[[<0xE9>]]`, not valid JSON | `[["é"]]`, and `hex` of it is `C3A9` |
+| `--json` prints a byte that is not UTF-8 | same command | a raw `0xE9` in the JSON text | a JSON document a parser accepts |
+| `hex()` of text answers code points | `SELECT hex('é')` (from a UTF-8 file, where the bytes are right) | `E9` | `C3A9` |
+| An invalid byte becomes a replacement character | `SELECT hex('é')` through argv | `FFFD` | the bytes it holds, or an error |
+
+The file path is correct: a statement read from a UTF-8 file (`.read`, a piped
+`repl`) stores `C3 A9`, so the engine's storage is fine and the defect is at the
+edges — argument decoding, the JSON writer, and `hex`.
+
+**Next.**
+
+1. Decode the process arguments as UTF-8, not the ANSI code page, on Windows (the
+   `os.args` conversion; check Linux while there).
+2. Make the JSON writer produce valid JSON for any text: escape a byte that does
+   not form UTF-8 as a `\uFFFD` (and document it) or print the value as
+   `{"$bytes":"<hex>"}` — but never emit an invalid document.
+3. Decide what a text *is*: `hex`, `octet_length`, `length` and `substr` cannot
+   disagree. SQLite treats text as UTF-8 bytes, and positions by character; the
+   engine should do the same, with `hex` on the bytes.
+4. A test in `scripts/shell_smoke.py` that pipes `SELECT 'é'` through `--json` and
+   through `hex` and compares both against SQLite.
+
+**Acceptance.** `--json` output parses with any JSON library for a database that
+holds non-ASCII text; `hex('é')` is `C3A9`; `length('é')` is 1; the argument path
+and the file path agree.
+
+**Cost.** S.
+
 ## D23 — Resource limits — *partly done*
 
 **Done.** The depth bound. `MAX_EXPRESSION_DEPTH :: 100` counts the outermost
