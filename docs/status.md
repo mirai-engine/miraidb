@@ -129,15 +129,15 @@ the gaps are named rather than left to be discovered.
   `codegen`, `export`, `call`, `subscribe`, `check`, `compact`, `snapshot`.
 - `miraidb sql --json <db> <statement>` prints a result as one JSON array of
   rows, which is how `scripts/differential.py` compares answers against SQLite:
-  one schema, one set of rows and 55 queries through both engines, with the
-  refusals and the intentional differences listed in the script. Two blind spots
-  the second audit pass measured: a statement is taken as ordered when its text
-  contains "order by", so a window's `OVER (… ORDER BY …)` makes an unordered
-  result compared position by position, and a cell compares by value, so `1` and
-  `1.0` are the same (backlog D30). `--json` now keeps the `.0` on a real, so a
-  consumer reads the type the query produced.
+  one schema, one set of rows and 94 queries through both engines, with 6
+  refusals and 7 intentional differences listed in the script. A row is compared
+  position by position only when the statement's own top-level `ORDER BY` decides
+  the order, and a cell is compared by type as well as by value, so a query that
+  returns a real where SQLite returns an integer is a difference (the second
+  audit pass measured both defects, `AUDIT-10` P-B4/P-B5). `--json` keeps the
+  `.0` on a real, so the type survives even before the comparison sees it.
 - `scripts/build.py` builds both binaries and runs the suite.
-- 247 integration tests covering CRUD, recovery, constraints, transactions,
+- 248 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.

@@ -220,6 +220,9 @@ rejects `ALICE` beside `Alice` and `WHERE name = 'ALICE'` still uses the index.
   `NULL`, and only the chosen branch is evaluated.
 - Column references (`name`, `table.name`).
 - Arithmetic `+ - * / %`, string concatenation `||`, unary `-`/`+`.
+- `printf`/`format` with SQLite's own conversions: `%d %i %u %o %x %X %f %e %g
+  %s %c %q %%`, the flags `- 0 + space`, a width and a `.precision`; an unknown
+  conversion is written back as it came.
 - Scalar functions: `lower`, `upper`, `length`, `substr`/`substring`, `trim`,
   `ltrim`, `rtrim` (the second argument is the set of characters to remove; the
   default is the space), `replace`, `concat`, `abs`, `sign`, `round`, `floor`,

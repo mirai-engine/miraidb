@@ -3768,46 +3768,173 @@ sq_hex :: proc(value: Value) -> string {
 	return strings.clone(strings.to_string(builder))
 }
 
-// sq_format implements the printf subset SQLite's format() exposes.
+// sq_format implements SQLite's printf/format:
+//
+//	%[flags][width][.precision]conversion
+//
+// over d i u o x X f F e E g G s c q and %%. A conversion this does not know is
+// written back as it came, so a pattern is never silently mangled: the earlier
+// version dropped the "%" of "%05.2f" and answered "05.2f" (found by the
+// differential corpus in D30).
 @(private)
 sq_format :: proc(pattern: string, args: []Value) -> string {
 	builder := strings.builder_make()
 	defer strings.builder_destroy(&builder)
 	next := 0
-	for i := 0; i < len(pattern); i += 1 {
-		if pattern[i] != '%' || i + 1 >= len(pattern) {
-			strings.write_byte(&builder, pattern[i])
+	at := 0
+	for at < len(pattern) {
+		if pattern[at] != '%' {
+			strings.write_byte(&builder, pattern[at])
+			at += 1
 			continue
 		}
-		i += 1
-		switch pattern[i] {
-		case '%':
+		start := at
+		if at + 1 < len(pattern) && pattern[at + 1] == '%' {
 			strings.write_byte(&builder, '%')
-		case 'd', 'i':
-			if next < len(args) {
-				strings.write_string(&builder, fmt.aprintf("%d", sq_int(args[next]), allocator = context.temp_allocator))
-				next += 1
+			at += 2
+			continue
+		}
+		scan := at + 1
+		left, zero, plus, space := false, false, false, false
+		flags: for scan < len(pattern) {
+			switch pattern[scan] {
+			case '-':
+				left = true
+			case '0':
+				zero = true
+			case '+':
+				plus = true
+			case ' ':
+				space = true
+			case:
+				break flags
 			}
+			scan += 1
+		}
+		width := 0
+		for scan < len(pattern) && pattern[scan] >= '0' && pattern[scan] <= '9' {
+			width = width * 10 + int(pattern[scan] - '0')
+			scan += 1
+		}
+		precision := -1
+		if scan < len(pattern) && pattern[scan] == '.' {
+			scan += 1
+			precision = 0
+			for scan < len(pattern) && pattern[scan] >= '0' && pattern[scan] <= '9' {
+				precision = precision * 10 + int(pattern[scan] - '0')
+				scan += 1
+			}
+		}
+		if scan >= len(pattern) {
+			// A trailing "%" is not a conversion: write it as it came.
+			strings.write_string(&builder, pattern[start:scan])
+			at = scan
+			continue
+		}
+		conversion := pattern[scan]
+		at = scan + 1
+		arg := next < len(args) ? args[next] : value_null()
+		if next < len(args) do next += 1
+		core := ""
+		sign := ""
+		signed := false
+		switch conversion {
+		case 'd', 'i', 'u', 'o', 'x', 'X':
+			number := sq_int(arg)
+			square := number
+			if conversion == 'u' || conversion == 'o' || conversion == 'x' || conversion == 'X' {
+				square = i64(u64(number))
+			}
+			magnitude := number
+			if (conversion == 'd' || conversion == 'i') && number < 0 do magnitude = -number
+			switch conversion {
+			case 'd', 'i':
+				core = fmt.aprintf("%d", magnitude, allocator = context.temp_allocator)
+			case 'u':
+				core = fmt.aprintf("%d", u64(number), allocator = context.temp_allocator)
+			case 'o':
+				core = fmt.aprintf("%o", u64(square), allocator = context.temp_allocator)
+			case 'x':
+				core = fmt.aprintf("%x", u64(square), allocator = context.temp_allocator)
+			case 'X':
+				core = fmt.aprintf("%X", u64(square), allocator = context.temp_allocator)
+			}
+			// A precision is the fewest digits, not a rounding.
+			for precision > len(core) {
+				core = fmt.aprintf("0%s", core, allocator = context.temp_allocator)
+			}
+			if conversion == 'd' || conversion == 'i' {
+				signed = true
+				if number < 0 {
+					sign = "-"
+				} else if plus {
+					sign = "+"
+				} else if space {
+					sign = " "
+				}
+			}
+		case 'f', 'F', 'e', 'E', 'g', 'G':
+			specification := sq_float_spec(conversion, precision)
+			core = fmt.aprintf(specification, sq_float(arg), allocator = context.temp_allocator)
+			signed = true
 		case 's':
-			if next < len(args) {
-				strings.write_string(&builder, value_format(args[next], context.temp_allocator))
-				next += 1
-			}
-		case 'f':
-			if next < len(args) {
-				strings.write_string(&builder, fmt.aprintf("%f", sq_float(args[next]), allocator = context.temp_allocator))
-				next += 1
+			if arg.kind != .Null do core = value_format(arg, context.temp_allocator)
+			if precision >= 0 && precision < len(core) do core = core[:precision]
+		case 'c':
+			// SQLite takes the first character of the text, not the code point.
+			if arg.kind != .Null {
+				text := value_format(arg, context.temp_allocator)
+				if len(text) > 0 do core = text[:1]
 			}
 		case 'q':
-			if next < len(args) {
-				strings.write_string(&builder, sq_literal(args[next]))
-				next += 1
+			// "%q doubles a single quote and adds no quoting of its own.
+			if arg.kind != .Null {
+				text := value_format(arg, context.temp_allocator)
+				core, _ = strings.replace_all(text, "'", "''", context.temp_allocator)
 			}
 		case:
-			strings.write_byte(&builder, pattern[i])
+			strings.write_string(&builder, pattern[start:at])
+			continue
+		}
+		// A sign belongs in front of the padding when zeros were asked for.
+		if signed && len(core) > 0 && (core[0] == '-' || core[0] == '+') {
+			if len(sign) == 0 {
+				sign = core[:1]
+				core = core[1:]
+			}
+		} else if signed && len(sign) == 0 && len(core) > 0 {
+			if plus {
+				sign = "+"
+			} else if space {
+				sign = " "
+			}
+		}
+		total := len(sign) + len(core)
+		pad := width > total ? width - total : 0
+		if !left && !zero {
+			for _ in 0 ..< pad do strings.write_byte(&builder, ' ')
+		}
+		strings.write_string(&builder, sign)
+		if !left && zero {
+			for _ in 0 ..< pad do strings.write_byte(&builder, '0')
+		}
+		strings.write_string(&builder, core)
+		if left {
+			for _ in 0 ..< pad do strings.write_byte(&builder, ' ')
 		}
 	}
 	return strings.clone(strings.to_string(builder))
+}
+
+// sq_float_spec builds the Odin format string for a float conversion, with the
+// precision the pattern asked for (six digits when it asked for none).
+@(private)
+sq_float_spec :: proc(conversion: byte, precision: int) -> string {
+	letter := conversion
+	if letter == 'F' do letter = 'f'
+	if letter == 'G' do letter = 'g'
+	if precision < 0 do return fmt.aprintf("%%%c", letter, allocator = context.temp_allocator)
+	return fmt.aprintf("%%.%d%c", precision, letter, allocator = context.temp_allocator)
 }
 
 @(private)

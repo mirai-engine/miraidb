@@ -7806,6 +7806,46 @@ test_insert_or_replace :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t").i, i64(3))
 }
 
+// format()/printf() follow SQLite's printf: flags, width and precision apply,
+// and a conversion the engine does not know is written back unchanged instead
+// of being dropped. The differential corpus found this (D30).
+@(test)
+test_format_flags_and_precision :: proc(t: ^testing.T) {
+	store := fresh_db(t, "format")
+	if store == nil do return
+	defer cleanup_db(store, "format")
+
+	checks := []struct {
+		sql:      string,
+		expected: string,
+	}{
+		{`SELECT printf('%05.2f', 3.14159)`, "03.14"},
+		{`SELECT printf('%5.1f', 2.5)`, "  2.5"},
+		{`SELECT printf('%-6s|', 'ab')`, "ab    |"},
+		{`SELECT printf('%+.3d', 7)`, "+007"},
+		{`SELECT printf('%.3d', -7)`, "-007"},
+		{`SELECT printf('%08x', 255)`, "000000ff"},
+		{`SELECT printf('%08.3f', 3.14159)`, "0003.142"},
+		{`SELECT printf('%.3s', 'abcdef')`, "abc"},
+		{`SELECT printf('%q', 'it''s')`, "it''s"},
+		{`SELECT printf('%u', -1)`, "18446744073709551615"},
+		{`SELECT printf('%d-%s', 1, 'a')`, "1-a"},
+		{`SELECT printf('100%%')`, "100%"},
+		{`SELECT printf('%s', NULL)`, ""},
+		{`SELECT printf('%e', 1234.5)`, "1.234500e+03"},
+		{`SELECT printf('%g', 1000000.0)`, "1e+06"},
+		{`SELECT printf('%c', 'Hello')`, "H"},
+		{`SELECT printf('%10.4f|', 3.14159265)`, "    3.1416|"},
+		// An unknown conversion is written as it came, not dropped.
+		{`SELECT printf('%z', 1)`, "%z"},
+		{`SELECT format('%d/%d', 3, 4)`, "3/4"},
+	}
+	for check in checks {
+		value := scalar(t, store, check.sql)
+		testing.expect_value(t, db.value_format(value, context.temp_allocator), check.expected)
+	}
+}
+
 @(test)
 test_changes_and_last_insert_rowid :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "changes_rowid")
