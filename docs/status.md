@@ -132,7 +132,7 @@ the gaps are named rather than left to be discovered.
   one schema, one set of rows and 55 queries through both engines, with the
   refusals and the intentional differences listed in the script.
 - `scripts/build.py` builds both binaries and runs the suite.
-- 239 integration tests covering CRUD, recovery, constraints, transactions,
+- 241 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
@@ -315,10 +315,14 @@ than 1000 bytes cannot be indexed and the insert says so.
   is tested, but nothing outside the tests calls it: the CLI, the server and the C
   ABI have no cancel handle or statement timeout, and `store_set_work_budget` is
   in the same state. A long query holds the read lock until it finishes.
-- **Limits.** An expression nested about two hundred deep is a stack overflow that
-  ends the process rather than a parse error, and `max_rows_per_query` is read
-  after the rows exist, so it cannot prevent the memory it exists to cap
-  (`AUDIT-9` A4/A5, backlog D23).
+- **Limits.** An expression may nest 100 levels and no more
+  (`MAX_EXPRESSION_DEPTH`, enforced by the parser and by the evaluator, which used
+  to die by stack overflow at 155-178 levels of nesting with no message). A
+  statement without `LIMIT`/`OFFSET` stops producing rows as soon as it passes
+  `max_rows_per_query` instead of refusing after the result exists. What is left:
+  a join still builds its intermediate before the projection sees it, `LIMIT` is
+  not pushed into the scan, and an allocation that fails is still a crash rather
+  than an error (`AUDIT-9` A5, backlog D23).
 - **The server serves many clients, one statement at a time.** Each accepted
   socket gets its own thread, so a subscriber no longer blocks anyone: a
   subscription stays open while another client writes and the write's delta is

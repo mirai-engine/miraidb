@@ -783,7 +783,21 @@ refused.
 
 **Cost.** L. It is the difference between a demo of the wire protocol and a server.
 
-## D23 — Resource limits
+## D23 — Resource limits — *partly done*
+
+**Done.** The depth bound. `MAX_EXPRESSION_DEPTH :: 100` counts the outermost
+expression as level one, and both halves enforce it: `parse_expression` refuses a
+tree that nests deeper (so 99 levels of parentheses parse and 100 do not) and
+`eval_expr` refuses while it descends, which is the half a `+` chain of 2 000
+terms needs, since it parses iteratively as a left-deep tree. Before this the
+process died at 166 nested parentheses, 178 terms in one chain and 155 nested
+`CASE`s, by stack overflow, with no message and no exit code. The boundary is
+measured on a release build and stated in `test_expression_depth_is_bounded`,
+which also proves the test process survives all three shapes.
+
+The quota is read where rows appear: `sql_exec_select` stops as soon as the
+projection passes `max_rows_per_query`, except when the statement carries
+`LIMIT`/`OFFSET`, which bound their own rows (the post-check applies there).
 
 **Now.** Three ways to lose the process, all measured on the shipped CLI:
 
@@ -803,14 +817,15 @@ the server or the C ABI.
 
 **Next.**
 
-1. A depth counter in `parse_expression` and in `eval_expr` (and the paths that
-   mirror them: `eval_order_value`, `value_compile`, policy and trigger bodies),
-   with one named limit and `Sql_Syntax`/`Sql_Unsupported` on the way out. SQLite's
-   limit is 1 000; ours can be lower as long as it is documented and tested at the
-   boundary.
-2. Check the row quota and the work budget while rows accumulate, not after.
+1. ~~A depth counter in the parser and the evaluator.~~ Done at 100 levels.
+2. ~~Check the row quota while rows accumulate.~~ Done for the projection. Left:
+   the join's *intermediate* is built before the projection sees a row, so a
+   `LIMIT 1` over a huge join still builds the join; and `LIMIT` is not pushed
+   into the scan. This is where the memory spike actually happens.
 3. Treat a failed allocation as an error (`.Out_Of_Memory` or the existing
-   `.Quota_Exceeded`) everywhere the executor allocates per row.
+   `.Quota_Exceeded`) everywhere the executor allocates per row. Not started: the
+   audit saw it as `Index 1 is out of range 0..<0` and that path still needs a
+   reproduction before it can be fixed honestly.
 
 **Acceptance.** A test that nests exactly the limit (answers) and the limit plus
 one (refuses, process alive); a test with a small quota over a cross join that

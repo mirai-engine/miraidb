@@ -12,6 +12,10 @@ Parser :: struct {
 	query:       ^Query,
 	err:         Error,
 	param_count: int,
+	// expression_depth is how many expressions are open right now. It is one
+	// counter for the whole parser, not one per rule, because every nesting that
+	// costs stack goes through parse_expression.
+	expression_depth: int,
 }
 
 // sql_parse turns one SQL statement into a Query tree. The Query owns an arena
@@ -1537,6 +1541,20 @@ parse_drop :: proc(p: ^Parser) -> Statement {
 // --- Expressions -----------------------------------------------------------
 
 parse_expression :: proc(p: ^Parser) -> ^Expr {
+	// The outermost expression is level one: the check runs before the counter
+	// moves, so `MAX_EXPRESSION_DEPTH` nested parentheses parse and one more does
+	// not, which is the boundary the test states.
+	if p.expression_depth >= MAX_EXPRESSION_DEPTH {
+		p_fail(
+			p,
+			.Sql_Unsupported,
+			"expression nests deeper than %d levels",
+			MAX_EXPRESSION_DEPTH,
+		)
+		return nil
+	}
+	p.expression_depth += 1
+	defer p.expression_depth -= 1
 	return parse_or(p)
 }
 

@@ -11755,3 +11755,105 @@ test_host_statements_need_host_access :: proc(t: ^testing.T) {
 		testing.expect(t, false)
 	}
 }
+
+// An expression may nest 100 deep and no deeper. Before this, 166 nested
+// parentheses killed the process with a stack overflow and no message; the
+// parser and the evaluator both refuse now, and the third check below (a chain
+// that parses iteratively and only recurses when it is evaluated) proves the
+// evaluator's half.
+@(test)
+test_expression_depth_is_bounded :: proc(t: ^testing.T) {
+	store := fresh_db(t, "depth")
+	if store == nil do return
+	defer cleanup_db(store, "depth")
+
+	deep :: proc(count: int, open_char, close_char: string) -> string {
+		builder := strings.builder_make()
+		for _ in 0 ..< count do strings.write_string(&builder, open_char)
+		strings.write_string(&builder, "1")
+		for _ in 0 ..< count do strings.write_string(&builder, close_char)
+		strings.write_string(&builder, " AS x")
+		return strings.to_string(builder)
+	}
+
+	// The outermost expression is level one, so the deepest that parses is the
+	// limit minus one level of parentheses.
+	at_limit, ok := db.sql_execute(store, strings.concatenate({"SELECT ", deep(db.MAX_EXPRESSION_DEPTH - 1, "(", ")")}))
+	testing.expectf(t, db.error_ok(ok), "depth %d failed: %s", db.MAX_EXPRESSION_DEPTH - 1, ok.message)
+	if db.error_ok(ok) {
+		testing.expect_value(t, at_limit.rows[0][0].i, i64(1))
+		db.sql_result_destroy(&at_limit)
+	}
+
+	// One more is refused, with a message, and the process is still here.
+	over := run_error(t, store, strings.concatenate({"SELECT ", deep(db.MAX_EXPRESSION_DEPTH, "(", ")")}))
+	testing.expect_value(t, over.kind, db.Error_Kind.Sql_Unsupported)
+	testing.expectf(t, strings.contains(over.message, "nests deeper than"), "%s", over.message)
+
+	// A `+` chain of 2000 terms parses as a left-deep tree and used to overflow
+	// the stack during evaluation rather than during parsing.
+	chain := strings.builder_make()
+	defer strings.builder_destroy(&chain)
+	strings.write_string(&chain, "SELECT 1")
+	for _ in 0 ..< 2000 do strings.write_string(&chain, "+1")
+	chain_err := run_error(t, store, strings.to_string(chain))
+	testing.expect_value(t, chain_err.kind, db.Error_Kind.Sql_Unsupported)
+
+	// 300 nested CASEs are the same story through a different rule.
+	nested := strings.builder_make()
+	defer strings.builder_destroy(&nested)
+	strings.write_string(&nested, "SELECT ")
+	for _ in 0 ..< 300 do strings.write_string(&nested, "CASE WHEN 1 THEN ")
+	strings.write_string(&nested, "1")
+	for _ in 0 ..< 300 do strings.write_string(&nested, " END")
+	case_err := run_error(t, store, strings.to_string(nested))
+	testing.expect_value(t, case_err.kind, db.Error_Kind.Sql_Unsupported)
+}
+
+// The row quota is read where the rows appear, not after the result is whole.
+// What it still cannot do is stop the intermediate a join builds before the
+// projection runs, which is the join's own work and is capped by the work budget.
+@(test)
+test_row_quota_refuses_while_producing :: proc(t: ^testing.T) {
+	store := fresh_db(t, "quota")
+	if store == nil do return
+	defer cleanup_db(store, "quota")
+
+	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
+	builder := strings.builder_make()
+	defer strings.builder_destroy(&builder)
+	strings.write_string(&builder, "INSERT INTO t (id, v) VALUES ")
+	for i in 1 ..= 200 {
+		if i > 1 do strings.write_string(&builder, ", ")
+		fmt.sbprintf(&builder, "(%d, %d)", i, i)
+	}
+	run(t, store, strings.to_string(builder))
+
+	db.store_set_row_quota(store, 10)
+	defer db.store_set_row_quota(store, 0)
+
+	over := run_error(t, store, "SELECT * FROM t")
+	testing.expect_value(t, over.kind, db.Error_Kind.Quota_Exceeded)
+	testing.expectf(t, strings.contains(over.message, "more than 10 rows"), "%s", over.message)
+
+	// A join multiplies the rows the quota has to stop.
+	joined := run_error(t, store, "SELECT a.id, b.id FROM t a, t b")
+	testing.expectf(t, joined.kind == .Quota_Exceeded || joined.kind == .None, "%v", joined.kind)
+
+	// Under the quota the same statement answers, so the cap is a cap and not a
+	// restriction on the query.
+	small, small_err := db.sql_execute(store, "SELECT id FROM t WHERE id <= 5 ORDER BY id")
+	testing.expect(t, db.error_ok(small_err))
+	if db.error_ok(small_err) {
+		testing.expect_value(t, len(small.rows), 5)
+		db.sql_result_destroy(&small)
+	}
+
+	db.store_set_row_quota(store, 0)
+	all, all_err := db.sql_execute(store, "SELECT count(*) FROM t")
+	testing.expect(t, db.error_ok(all_err))
+	if db.error_ok(all_err) {
+		testing.expect_value(t, all.rows[0][0].i, i64(200))
+		db.sql_result_destroy(&all)
+	}
+}

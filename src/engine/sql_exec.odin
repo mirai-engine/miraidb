@@ -811,6 +811,16 @@ Source :: struct {
 	hidden_unqualified: bool,
 }
 
+// quota_reached reports whether `produced` rows are already past the store's row
+// quota. It is checked where rows are produced, not when the result is finished,
+// because a quota read after the fact cannot prevent the spike it exists to cap.
+@(private)
+quota_reached :: proc(tx: ^Tx, produced: int) -> bool {
+	if tx == nil do return false
+	quota := tx.store.max_rows_per_query
+	return quota > 0 && u64(produced) > quota
+}
+
 Eval_Ctx :: struct {
 	tx:      ^Tx,
 	sources: []Source,
@@ -822,6 +832,11 @@ Eval_Ctx :: struct {
 	// an aggregate then answers from its running accumulator instead of walking
 	// a materialized group.
 	stream: ^Agg_Stream,
+	// depth is how deep the evaluation is. The parser refuses a tree deeper than
+	// MAX_EXPRESSION_DEPTH, so this only fires for a tree that arrived another way
+	// (a stored view, a generated column, a policy); it is here so the failure is
+	// an error instead of an overflow.
+	depth:  int,
 }
 
 @(private)
@@ -2749,6 +2764,28 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 				delete(partial)
 			}
 			append(&output, Output_Row{values = values, sort_key = sort_key, row_id = row_id})
+			// A statement with LIMIT or OFFSET bounds its own rows, and it asks
+			// for fewer than it produces, so the quota cannot judge it here: the
+			// post-check after the projection is the one that applies. Without
+			// either, the rows being produced are the answer.
+			if stmt.limit == nil && stmt.offset == nil && quota_reached(tx, len(output)) {
+				// Stop where the rows appear: the rest of the scan is work the
+				// caller has already said it does not want.
+				free_values(values)
+				delete(partial)
+				for row in output do free_values(row.values)
+				for pending_cells in window_cells do delete(pending_cells)
+				for pending_sources in window_sources do delete(pending_sources)
+				delete(window_cells)
+				delete(window_sources)
+				delete(output)
+				delete(filtered)
+				return {}, errf(
+					.Quota_Exceeded,
+					"query returns more than %d rows",
+					tx.store.max_rows_per_query,
+				)
+			}
 		}
 	}
 	delete(filtered)
@@ -3137,6 +3174,15 @@ group_by_expressions :: proc(
 
 eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 	if expr == nil do return value_null(), ERROR_NONE
+	ctx.depth += 1
+	defer ctx.depth -= 1
+	if ctx.depth > MAX_EXPRESSION_DEPTH {
+		return value_null(), errf(
+			.Sql_Unsupported,
+			"expression nests deeper than %d levels",
+			MAX_EXPRESSION_DEPTH,
+		)
+	}
 	switch e in expr^ {
 	case Literal_Expr:
 		return e.value, ERROR_NONE

@@ -28,6 +28,15 @@ Unary_Op :: enum u8 {
 	Not,
 }
 
+// MAX_EXPRESSION_DEPTH bounds how deeply an expression may nest. Parsing and
+// evaluating are both recursive, so depth is stack: measured on a release build,
+// this engine dies at 166 nested parentheses, 178 terms in one `+` chain and 155
+// nested `CASE`s, and it dies by overflow (the process disappears) rather than
+// answering an error. 100 leaves the margin and is the number both the parser and
+// the evaluator enforce, so a tree built by a path that skipped the parser (a
+// stored view, a generated column) is refused rather than trusted.
+MAX_EXPRESSION_DEPTH :: 100
+
 Expr :: union {
 	Literal_Expr,
 	Column_Expr,
