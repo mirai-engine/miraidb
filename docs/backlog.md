@@ -704,3 +704,166 @@ had written — and nothing failed when the engine moved on.
 old design (the kind of thing the audit found in `sql.md` and `README.md`) still
 needs a reader. The gate makes the cheap half impossible; the other half stays an
 editorial duty, listed in `CONTRIBUTING.md`.
+
+## D22 — The server, for real
+
+**Now.** `miraidb-server` accepts a connection, serves it to completion, and then
+accepts the next one (`src/server/main.odin`: `for { accept; serve }`). A WebSocket
+subscription never returns, so while one subscriber is connected **no other client
+can connect at all** — measured: a second client's `/query` times out behind an
+open subscription. The same shape means one expensive statement stalls everyone,
+and nothing bounds it: `store_set_work_budget` and `store_cancel` exist and are
+tested, but the server sets neither and has no route, header or timer that reaches
+them.
+
+**Second half: who may ask.** A wire request runs under the connection's identity,
+and identity is whatever the bearer token said — or nothing. Grants are opt-in:
+`permission_allows` answers `true` when `_grant` has no rows, which is the state of
+every database that never created one. So an unauthenticated client can create,
+read, write and drop tables, and can also run `LOAD EXTENSION` (native code in the
+host process) and `ATTACH` (a file path in the host). Verified against a running
+server: `CREATE TABLE`, `INSERT`, `SELECT`, `DROP TABLE` all answered 200, and
+`LOAD EXTENSION` / `ATTACH` reached their loaders.
+
+**Next.**
+
+1. Serve connections concurrently (a thread per connection; `Host` already guards
+   its maps and counters with a mutex) and prove it: one subscriber, one query, the
+   query answered while the subscription stays open.
+2. Wire a per-statement work budget and a cancel route (`store_set_work_budget`,
+   `store_cancel`) so a stuck statement ends with `.Cancelled` instead of ending
+   the process, and a client that leaves stops its work.
+3. Refuse the host-touching statements (`ATTACH`, `LOAD EXTENSION`, `VACUUM INTO`,
+   DDL) to a remote client unless the server was started with a flag that allows
+   them; keep them allowed on the local embed path.
+4. Write the threat model down in `docs/`: what a server without a token is
+   trusted to do, and what `--any` changes.
+
+**Acceptance.** Two clients at once, one of them subscribed (`broker_smoke.py`
+grows a second concurrent client); a statement that spends more than the budget
+returns `.Cancelled`; a remote client's `LOAD EXTENSION` is refused and the same
+statement through the embed API still works; the document exists and says what is
+refused.
+
+**Cost.** L. It is the difference between a demo of the wire protocol and a server.
+
+## D23 — Resource limits
+
+**Now.** Three ways to lose the process, all measured on the shipped CLI:
+
+| Input | Result |
+|---|---|
+| `SELECT ((((…1…))))` 170 deep | exit 253 (`0xC00000FD`, stack overflow), no message |
+| `SELECT 1+1+…` 2 000 terms | exit 253 |
+| `SELECT CASE WHEN 1 THEN …` 300 deep | exit 253 |
+| a three-way join with a 2·10⁹-row intermediate | `sql_exec.odin: Index 1 is out of range 0..<0` |
+
+The first three are a recursive descent and a recursive evaluator with no depth
+bound; the fourth is `make` returning `nil` under memory pressure and the code
+indexing it anyway. Separately, `max_rows_per_query` is compared with the row count
+**after** the result is built, so the cap that exists to prevent the spike cannot
+prevent it, and neither the quota nor the work budget is reachable from the CLI,
+the server or the C ABI.
+
+**Next.**
+
+1. A depth counter in `parse_expression` and in `eval_expr` (and the paths that
+   mirror them: `eval_order_value`, `value_compile`, policy and trigger bodies),
+   with one named limit and `Sql_Syntax`/`Sql_Unsupported` on the way out. SQLite's
+   limit is 1 000; ours can be lower as long as it is documented and tested at the
+   boundary.
+2. Check the row quota and the work budget while rows accumulate, not after.
+3. Treat a failed allocation as an error (`.Out_Of_Memory` or the existing
+   `.Quota_Exceeded`) everywhere the executor allocates per row.
+
+**Acceptance.** A test that nests exactly the limit (answers) and the limit plus
+one (refuses, process alive); a test with a small quota over a cross join that
+fails fast instead of materializing; a test that the CLI exits with an error code
+and a message for both.
+
+**Cost.** M. The counting is small; finding every recursive path is the work.
+
+## D24 — The `.sqlite` mirror, completely
+
+**Now.** Two defects in the compatibility path, both reproduced against files that
+`sqlite3` opened and closed cleanly:
+
+- `DROP TABLE` on a table that **held rows** leaves the file malformed —
+  `PRAGMA integrity_check` answers `database disk image is malformed` and
+  `sqlite_master` cannot be read. Dropping an empty table, truncating, adding a
+  column, creating an index and updating rows are all fine, so the defect is in
+  the full rewrite that DDL falls back to (`sqlite_mirror.odin`: `needs_full`)
+  when it has to release the pages of a non-empty table.
+- An imported file's **indexes are ignored**: the plan is a full scan and
+  `DROP INDEX` answers `index_not_found`, while `sqlite3` sees the index in
+  `sqlite_master`. Correct answers, missing access path, and one statement SQLite
+  accepts that this engine refuses.
+
+The ABI gate (`sqlite_abi_smoke.py`) creates a table, inserts, prepares and reads
+blobs — no `DROP`, no `ALTER`, no `DROP INDEX` — which is why neither defect fails
+CI.
+
+**Next.**
+
+1. Fix the full-rewrite path for a table that loses its pages: write the new file,
+   then prove it with `PRAGMA integrity_check` from a real `sqlite3` in the gate.
+2. Read the indexes of an imported file (name, columns, uniqueness) and plan from
+   them; where an index cannot be represented, refuse the file's `DROP INDEX` with
+   a reason instead of `index_not_found`.
+3. Extend the ABI gate to DDL, and give the mirror its own fuzz pass (random DDL
+   and DML, integrity after each chunk).
+
+**Acceptance.** The four DDL statements survive a round trip through the engine and
+are valid for `sqlite3`; an imported index shows in `EXPLAIN` and can be dropped;
+the gate fails if either regresses.
+
+**Cost.** M.
+
+## D25 — The C ABI, completely
+
+**Now.** 24 functions in the sqlite3 shape (`open`, `close`, `errmsg`, `exec`,
+`backup`, `prepare`, `finalize`, `reset`, six `bind`s, `step`, `changes`, nine
+column accessors, `version`) and none of the engine's levers: no open options, so
+an embedder cannot ask for read-only, in-memory or a durability other than the
+default; no `miraidb_interrupt` although `store_cancel` exists and is tested; no
+row quota or work budget; no identity or token, so roles and policies are
+unreachable from C; no statement about thread safety. `miraidb_open` also imports
+a `.sqlite` file into memory without saying so, which for a 250 000-row file is
+~15 s and the size of the file in RAM.
+
+**Next.**
+
+1. `miraidb_open_v2(path, flags)` with read-only, create, durability and
+   in-memory bits; keep `miraidb_open` as a thin wrapper so the ABI stays additive.
+2. `miraidb_interrupt`, `miraidb_set_row_quota`, `miraidb_set_work_budget`.
+3. `miraidb_set_identity`, `miraidb_authenticate(token)` so the C surface can use
+   what `roles.odin` already checks.
+4. A paragraph in `include/miraidb.h` on thread safety and pointer lifetimes, and
+   the same in `docs/`.
+
+**Acceptance.** `capi_smoke.py` exercises each new call; a cancelled statement
+returns `MIRAIDB_ERROR` with "cancelled" in `miraidb_errmsg`; a read-only open
+refuses `INSERT`; the header documents the model.
+
+**Cost.** M.
+
+## D26 — Docs whose claims are executed
+
+**Now.** `docs_check.py` verifies shape: counts, links, forbidden names, five-cell
+roadmap rows. It does not verify a sentence. Two rows of `docs/sqlite.md` still said
+`BEFORE` triggers and `RANGE`/`GROUPS` frames are refused, and both have worked
+since `0a59dbb` and `763bb3b` — this audit found them by reading, not by running
+anything.
+
+**Next.** Turn the compatibility matrix into data the gate executes: a table of
+`(statement, expectation)` where `expectation` is `works` or `refused`, run
+against both this engine and `sqlite3`, with the matrix rows generated from it or
+checked against it. Start with the rows that name a refusal, because those are the
+ones that go stale when a feature lands, then the `done` rows that are cheap to
+state as one statement.
+
+**Acceptance.** A row that says `refused` while the engine answers fails CI, and
+the reverse too; the SQLite matrix is generated or cross-checked from the same
+file.
+
+**Cost.** S.
