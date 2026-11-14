@@ -950,7 +950,7 @@ file.
 
 **Cost.** S.
 
-## D31 — The three wrong answers
+## D31 — The three wrong answers — *done* (see `docs/roadmap.md`, closed)
 
 **Now.** Three sentences that answered and were wrong, found by the second audit
 pass (`AUDIT-10`) by running 47 edge queries through both engines. All three are
@@ -998,9 +998,12 @@ in `test_text_positions_count_characters` over 21 cases and against SQLite over
    apart.~~ Done for both writers: `Json_Value` carries an `is_integer` bit that
    the parser and `json_from_value` set, and the CLI's `--json` path prints
    `%d.0`. `json_type` and `json_extract` now agree on the type too.
-4. `INSERT OR REPLACE`: implement it as `INSERT` + delete-on-conflict, or list it as
+4. ~~`INSERT OR REPLACE`: implement it as `INSERT` + delete-on-conflict, or list it as
    refused in `REFUSED` and in `docs/sqlite.md`. Refusing is acceptable; refusing
-   quietly is not.
+   quietly is not.~~ Implemented: `unique_conflicts` collects the rows that collide on
+   any unique index, they are deleted through a staging delete that runs no trigger
+   program (SQLite fires delete triggers for a REPLACE only with recursive triggers
+   on), and the insert is retried. `OR ROLLBACK`/`FAIL`/`IGNORE` are named refusals.
 
 **Acceptance.** Each of the four has a test that fails today; the corpus in D30 holds
 them; `docs/sql.md` states the negative-index rule and the truth rule.

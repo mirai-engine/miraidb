@@ -657,6 +657,24 @@ parse_frame_bound :: proc(p: ^Parser) -> Frame_Bound {
 parse_insert :: proc(p: ^Parser) -> Statement {
 	insert: Insert_Stmt
 	p_expect_keyword(p, "insert")
+	// INSERT OR <action> INTO. REPLACE deletes the rows the new one collides
+	// with; ABORT is what the engine already does; the other three are named
+	// refusals instead of a misleading "expected into".
+	if p_match_keyword(p, "or") {
+		switch {
+		case p_match_keyword(p, "replace"):
+			insert.conflict_replace = true
+		case p_match_keyword(p, "abort"):
+			// The default resolution: the statement fails, the transaction survives.
+		case p_is_keyword(p, "rollback"), p_is_keyword(p, "fail"), p_is_keyword(p, "ignore"):
+			action := p_ident(p)
+			p_fail(p, .Sql_Unsupported, "INSERT OR %s is not implemented: use OR REPLACE or a plain INSERT, which aborts", action)
+			return insert
+		case:
+			p_fail(p, .Sql_Syntax, "expected replace, abort, rollback, fail or ignore after OR")
+			return insert
+		}
+	}
 	p_expect_keyword(p, "into")
 	insert.table = p_ident(p)
 	if p_is_punct(p, ".") {

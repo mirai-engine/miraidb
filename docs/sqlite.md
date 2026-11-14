@@ -35,7 +35,7 @@ script lists.
 | Feature | Status | Notes |
 |---|---|---|
 | SELECT with joins, subqueries, aggregates | done | engine syntax; `INNER`/`LEFT`/`CROSS`, no `NATURAL`/`RIGHT`/`FULL` (refused with a reason) |
-| INSERT / UPDATE / DELETE | done | `RETURNING` with `*` or a column list |
+| INSERT / UPDATE / DELETE | done | `RETURNING` with `*` or a column list; `INSERT OR REPLACE` deletes on any unique conflict, `OR ABORT` (the default), `OR ROLLBACK`/`FAIL`/`IGNORE` refused with a reason |
 | CREATE/DROP TABLE, ALTER | done | `ALTER` adds, drops and renames columns and renames the table; type changes are refused |
 | CREATE/DROP INDEX, UNIQUE | done | btree, hash, direct |
 | CREATE/DROP VIEW | done | `OR REPLACE`, parameters, materialization |

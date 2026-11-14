@@ -7743,6 +7743,69 @@ test_json_keeps_real_type :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, `SELECT typeof(json_extract('{"a":1}', '$.a'))`).s, "integer")
 }
 
+// INSERT OR REPLACE deletes every row the new one collides with, on any unique
+// index, and counts one affected row.
+@(test)
+test_insert_or_replace :: proc(t: ^testing.T) {
+	store := fresh_db(t, "replace")
+	if store == nil do return
+	defer cleanup_db(store, "replace")
+
+	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, u TEXT UNIQUE, v TEXT)")
+	run(t, store, "INSERT INTO t VALUES (1, 'a', 'x'), (2, 'b', 'y')")
+
+	// A collision on the primary key replaces that row.
+	result := run(t, store, "INSERT OR REPLACE INTO t VALUES (1, 'c', 'z')")
+	testing.expect_value(t, result.affected, 1)
+	db.sql_result_destroy(&result)
+	testing.expect_value(t, scalar(t, store, "SELECT v FROM t WHERE id = 1").s, "z")
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t").i, i64(2))
+	// changes() reports the inserted row, not the deleted one.
+	testing.expect_value(t, scalar(t, store, "SELECT changes()").i, i64(1))
+
+	// A collision on a unique index deletes the row that held the value.
+	run(t, store, "INSERT OR REPLACE INTO t VALUES (3, 'b', 'w')")
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t").i, i64(2))
+	testing.expect_value(t, scalar(t, store, "SELECT id FROM t WHERE u = 'b'").i, i64(3))
+
+	// A row can collide under two indexes at once: both rows go, one arrives.
+	run(t, store, "CREATE TABLE two (id INTEGER PRIMARY KEY, u TEXT UNIQUE, v TEXT)")
+	run(t, store, "INSERT INTO two VALUES (1, 'a', 'x'), (2, 'b', 'y')")
+	run(t, store, "INSERT OR REPLACE INTO two VALUES (1, 'b', 'z')")
+	rows := run(t, store, "SELECT id, u, v FROM two")
+	testing.expect_value(t, len(rows.rows), 1)
+	testing.expect_value(t, rows.rows[0][0].i, i64(1))
+	testing.expect_value(t, rows.rows[0][1].s, "b")
+	testing.expect_value(t, rows.rows[0][2].s, "z")
+	db.sql_result_destroy(&rows)
+
+	// No conflict inserts like a plain INSERT, and RETURNING reports the row.
+	returned := run(t, store, "INSERT OR REPLACE INTO t VALUES (4, 'd', 'q') RETURNING v")
+	testing.expect_value(t, len(returned.rows), 1)
+	testing.expect_value(t, returned.rows[0][0].s, "q")
+	db.sql_result_destroy(&returned)
+
+	// A delete trigger does not fire for the rows REPLACE removes, which is
+	// SQLite's behaviour with recursive triggers off.
+	run(t, store, "CREATE TABLE audited (id INTEGER PRIMARY KEY, v TEXT)")
+	run(t, store, "CREATE TABLE audit (note TEXT)")
+	run(t, store, `
+		CREATE TRIGGER audited_del BEFORE DELETE ON audited
+		BEGIN INSERT INTO audit (note) VALUES ('deleted'); END`)
+	run(t, store, "INSERT INTO audited VALUES (1, 'old')")
+	run(t, store, "INSERT OR REPLACE INTO audited VALUES (1, 'new')")
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM audit").i, i64(0))
+	testing.expect_value(t, scalar(t, store, "SELECT v FROM audited WHERE id = 1").s, "new")
+
+	// The actions that are not implemented say so, instead of "expected into".
+	unsupported := run_error(t, store, "INSERT OR ROLLBACK INTO t VALUES (9, 'q', 'r')")
+	testing.expect_value(t, unsupported.kind, db.Error_Kind.Sql_Unsupported)
+	testing.expect(t, strings.contains(unsupported.message, "OR ROLLBACK"))
+	testing.expect_value(t, run_error(t, store, "INSERT OR IGNORE INTO t VALUES (9, 'q', 'r')").kind, db.Error_Kind.Sql_Unsupported)
+	// ABORT is what a plain INSERT already does.
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t").i, i64(3))
+}
+
 @(test)
 test_changes_and_last_insert_rowid :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "changes_rowid")

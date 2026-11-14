@@ -137,7 +137,7 @@ the gaps are named rather than left to be discovered.
   `1.0` are the same (backlog D30). `--json` now keeps the `.0` on a real, so a
   consumer reads the type the query produced.
 - `scripts/build.py` builds both binaries and runs the suite.
-- 246 integration tests covering CRUD, recovery, constraints, transactions,
+- 247 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
@@ -360,12 +360,11 @@ than 1000 bytes cannot be indexed and the insert says so.
   view and a trigger are gone from the file afterwards — measured in `AUDIT-10`,
   and the reason D27 exists. The file keeps its rows and its integrity; it loses
   the rules.
-- **`INSERT OR REPLACE` is refused without being documented.** The parser answers
-  "expected into" and neither the compatibility matrix nor the differential's
-  refusal list mentions it (`AUDIT-10` P-B7, backlog D31). The three wrong
-  answers the audit measured are fixed: text positions are characters, `substr`
-  counts a negative start from the end, and `WHERE` converts a text to a number
-  first.
+- **Three wrong answers the second audit found are fixed.** Text positions are
+  characters, `substr` counts a negative start from the end, `WHERE` converts a
+  text to a number first, `--json` keeps the `.0` on a real, and `INSERT OR
+  REPLACE` is implemented instead of refused by accident (`AUDIT-10` P-B1/P-B2/
+  P-B3/P-B7). `OR ROLLBACK`, `OR FAIL` and `OR IGNORE` are named refusals.
 - **The C ABI cannot open an in-memory database.** `:memory:`, the empty path and
   `file:…?mode=memory` all fail; `sqlite3_open(":memory:")` through the facade
   answers `SQLITE_ERROR`. And a statement handle used after `finalize` is an

@@ -293,8 +293,12 @@ Scalar: `lower`, `upper`, `length`, `abs`, `coalesce`/`ifnull`, `now()`,
   so `'12'` is true, `'12a'` is true, `'a'` is false, `''` is false and `'0'` is
   false. The same rule governs `CASE WHEN`, `HAVING` and a policy's `USING`.
   Comparison stays strict: `1 = '1'` is a type error, not a match.
-- `INSERT OR REPLACE` is refused with a syntax error and is not yet listed in the
-  compatibility matrix (backlog D31).
+- `INSERT OR REPLACE` deletes every row the new one collides with, on the primary
+  key or on any unique index, and then inserts: two rows that collide under two
+  different indexes both go and one arrives, `affected` counts the inserted row,
+  and delete triggers do not fire (SQLite's behaviour with recursive triggers
+  off). `INSERT OR ABORT` is what a plain `INSERT` already does; `OR ROLLBACK`,
+  `OR FAIL` and `OR IGNORE` are refused with a message that says so.
 - `DISTINCT` compares the whole projected row. Inside an aggregate it folds each
   value once: `count(DISTINCT x)`, `sum(DISTINCT x)` and `group_concat(DISTINCT
   x)` count, add or join the distinct values only, and `NULL` is not a value.

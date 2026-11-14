@@ -4698,6 +4698,30 @@ find_conflict_row :: proc(tx: ^Tx, table: ^Table, values: []Value) -> (Row, bool
 }
 
 
+// unique_conflicts collects the rows an INSERT OR REPLACE deletes: every row
+// that shares a key with the proposed values in a unique index. One row can
+// collide under two indexes, so it is listed once.
+@(private)
+unique_conflicts :: proc(tx: ^Tx, table: ^Table, values: []Value) -> [dynamic]Row_Id {
+	ids := make([dynamic]Row_Id, 0, 2, tx.alloc)
+	for idx, i in table.indexes {
+		if !idx.unique do continue
+		found := table_index_lookup(table, i, values)
+		for id in found {
+			seen := false
+			for existing in ids {
+				if existing == id {
+					seen = true
+					break
+				}
+			}
+			if !seen do append(&ids, id)
+		}
+		delete(found)
+	}
+	return ids
+}
+
 @(private)
 returning_append :: proc(
 	result: ^Sql_Result,
@@ -4832,6 +4856,30 @@ sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Res
 		if insert_err.kind == .None {
 			if fts_err := fts_index_if_virtual(tx, stmt.table, row_id, values, true); fts_err.kind != .None {
 				return {}, fts_err
+			}
+		}
+		if insert_err.kind != .None && stmt.conflict_replace {
+			// INSERT OR REPLACE: delete what the new row collides with, on any
+			// unique index, and insert again. SQLite counts one affected row and
+			// fires no delete trigger, which is what happens here: the deletes go
+			// through the staging layer, not through the DELETE statement.
+			conflicts := unique_conflicts(tx, table, values)
+			defer delete(conflicts)
+			for id in conflicts {
+				if fts_err := fts_delete_if_virtual(tx, stmt.table, id); fts_err.kind != .None {
+					return {}, fts_err
+				}
+				if delete_err := tx_delete_without_triggers(tx, stmt.table, id); delete_err.kind != .None {
+					return {}, delete_err
+				}
+			}
+			if len(conflicts) > 0 {
+				row_id, insert_err = tx_insert(tx, stmt.table, values)
+				if insert_err.kind == .None {
+					if fts_err := fts_index_if_virtual(tx, stmt.table, row_id, values, true); fts_err.kind != .None {
+						return {}, fts_err
+					}
+				}
 			}
 		}
 		if insert_err.kind != .None {

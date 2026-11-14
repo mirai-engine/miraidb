@@ -1029,6 +1029,18 @@ tx_update :: proc(tx: ^Tx, name: string, id: Row_Id, values: []Value) -> Error {
 }
 
 tx_delete :: proc(tx: ^Tx, name: string, id: Row_Id) -> Error {
+	return tx_delete_impl(tx, name, id, true)
+}
+
+// tx_delete_without_triggers stages a delete and runs no trigger program. INSERT
+// OR REPLACE uses it: SQLite fires delete triggers for the rows a REPLACE
+// removes only when recursive triggers are enabled, and they are off by default.
+tx_delete_without_triggers :: proc(tx: ^Tx, name: string, id: Row_Id) -> Error {
+	return tx_delete_impl(tx, name, id, false)
+}
+
+@(private)
+tx_delete_impl :: proc(tx: ^Tx, name: string, id: Row_Id, fire_triggers: bool) -> Error {
 	if tx.read_only do return errf(.Transaction_Read_Only, "cannot delete in a read transaction")
 	table, table_err := tx_table(tx, name)
 	if table_err.kind != .None do return table_err
@@ -1043,8 +1055,10 @@ tx_delete :: proc(tx: ^Tx, name: string, id: Row_Id) -> Error {
 	if fk_err := fk_parent_delete(tx, name, previous.values); fk_err.kind != .None {
 		return fk_err
 	}
-	if trigger_err := trigger_fire(tx, name, .Delete, .Before, previous, Row{}, table.schema); trigger_err.kind != .None {
-		return trigger_err
+	if fire_triggers {
+		if trigger_err := trigger_fire(tx, name, .Delete, .Before, previous, Row{}, table.schema); trigger_err.kind != .None {
+			return trigger_err
+		}
 	}
 	writes := tx_writes(tx, name, table)
 	tx_unregister_unique(tx, name, table, previous.values, id)
@@ -1056,8 +1070,10 @@ tx_delete :: proc(tx: ^Tx, name: string, id: Row_Id) -> Error {
 		}
 		writes.deletes[id] = true
 	}
-	if trigger_err := trigger_fire(tx, name, .Delete, .After, previous, Row{}, table.schema); trigger_err.kind != .None {
-		return trigger_err
+	if fire_triggers {
+		if trigger_err := trigger_fire(tx, name, .Delete, .After, previous, Row{}, table.schema); trigger_err.kind != .None {
+			return trigger_err
+		}
 	}
 	return ERROR_NONE
 }

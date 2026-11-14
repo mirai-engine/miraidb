@@ -279,6 +279,8 @@ Insert_Stmt :: struct {
 	// UPSERT: DO NOTHING, or DO UPDATE SET over the conflicting row.
 	conflict_do_nothing: bool,
 	conflict_assignments: []Assignment,
+	// INSERT OR REPLACE: the rows the new one collides with are deleted first.
+	conflict_replace: bool,
 }
 
 // Returning lists the rows a mutation reports back: every column with `*`, or
