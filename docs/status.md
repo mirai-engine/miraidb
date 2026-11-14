@@ -132,7 +132,7 @@ the gaps are named rather than left to be discovered.
   one schema, one set of rows and 55 queries through both engines, with the
   refusals and the intentional differences listed in the script.
 - `scripts/build.py` builds both binaries and runs the suite.
-- 231 integration tests covering CRUD, recovery, constraints, transactions,
+- 232 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
@@ -235,7 +235,9 @@ than 1000 bytes cannot be indexed and the insert says so.
   outer row matches instead of the whole relation, so the same join over 200
   authors and 1 000 books reads about 1 200 rows where the scan read 200 200
   (`test_join_probes_the_inner_index`). `EXPLAIN` prints `join <name> using index
-  <index> …`, `join order: …` when it changed, and `scripts/plan_check.py` is a CI
+  <index> …`, `join order: …` when it changed (the order is searched by cost, so the
+  step that can filter is preferred over the one that only looks small), and
+  `scripts/plan_check.py` is a CI
   gate over the plans a measured fixture must produce.
 - **An index can serve the order.** When the ORDER BY names the whole key of one
   in-memory index, in the index's own order and all in one direction, the executor

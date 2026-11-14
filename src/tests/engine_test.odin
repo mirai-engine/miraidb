@@ -10707,6 +10707,152 @@ test_plan_prices_a_view_from_its_own_from :: proc(t: ^testing.T) {
 	}
 }
 
+@(private)
+plan_step_names :: proc(plan: db.Sql_Result) -> string {
+	// The steps of a plan in run order, without the "join order:" summary, which
+	// only appears when the order differs from the written one.
+	names := make([dynamic]string)
+	defer delete(names)
+	defer for name in names do delete(name)
+	for row in plan.rows {
+		line := row[0].s
+		prefix := ""
+		if strings.has_prefix(line, "scan ") {
+			prefix = "scan "
+		} else if strings.has_prefix(line, "join ") && !strings_contains(line, "join order:") {
+			prefix = "join "
+		} else {
+			continue
+		}
+		rest := line[len(prefix):]
+		end := 0
+		for end < len(rest) && rest[end] != ' ' && rest[end] != '(' do end += 1
+		append(&names, strings.clone(rest[:end]))
+	}
+	return strings.join(names[:], " > ")
+}
+
+@(test)
+test_plan_does_not_cross_join_before_it_can_filter :: proc(t: ^testing.T) {
+	// Only books joins the other two relations: authors and publishers share no
+	// condition. A plan that binds them first multiplies them (200 x 5) before
+	// books can filter anything, and the old greedy did exactly that, because it
+	// compared the rows one outer row matches — which for the first relation in
+	// the list is its own row count, not a per-outer figure.
+	store := fresh_db(t, "plan_cross")
+	if store == nil do return
+	defer cleanup_db(store, "plan_cross")
+	run(t, store, "CREATE TABLE authors (id INTEGER PRIMARY KEY)")
+	run(t, store, "CREATE TABLE publishers (id INTEGER PRIMARY KEY)")
+	run(t, store, "CREATE TABLE books (id INTEGER PRIMARY KEY, author_id INTEGER, publisher_id INTEGER)")
+	run(t, store, "CREATE INDEX books_author ON books (author_id)")
+	run(t, store, "CREATE INDEX books_publisher ON books (publisher_id)")
+	for i in 0 ..< 5 {
+		run(t, store, fmt.tprintf("INSERT INTO publishers (id) VALUES (%d)", i))
+	}
+	for start := 0; start < 200; start += 50 {
+		builder := strings.builder_make()
+		fmt.sbprintf(&builder, "INSERT INTO authors (id) VALUES ")
+		for i in start ..< start + 50 {
+			if i > start do fmt.sbprintf(&builder, ",")
+			fmt.sbprintf(&builder, "(%d)", i)
+		}
+		run(t, store, strings.to_string(builder))
+		strings.builder_destroy(&builder)
+	}
+	for start := 0; start < 2000; start += 200 {
+		builder := strings.builder_make()
+		fmt.sbprintf(&builder, "INSERT INTO books (id, author_id, publisher_id) VALUES ")
+		for i in start ..< start + 200 {
+			if i > start do fmt.sbprintf(&builder, ",")
+			fmt.sbprintf(&builder, "(%d,%d,%d)", i, i % 200, i % 5)
+		}
+		run(t, store, strings.to_string(builder))
+		strings.builder_destroy(&builder)
+	}
+	run(t, store, "ANALYZE")
+
+	plan := run(
+		t,
+		store,
+		`EXPLAIN SELECT count(*)
+		 FROM publishers
+		 JOIN books ON books.publisher_id = publishers.id
+		 JOIN authors ON books.author_id = authors.id`,
+	)
+	joined_lines := make([dynamic]string, 0, 4)
+	defer delete(joined_lines)
+	for row in plan.rows {
+		if strings.has_prefix(row[0].s, "join ") && !strings_contains(row[0].s, "join order:") {
+			append(&joined_lines, row[0].s)
+		}
+	}
+	testing.expect_value(t, len(joined_lines), 2)
+	if len(joined_lines) == 2 {
+		// Books runs second, through the index it has on the publisher, and the
+		// authors are reached through the primary key after that.
+		testing.expectf(
+			t,
+			strings_contains(joined_lines[0], "join books using index books_publisher"),
+			"books should be probed second, plan: %s / %s",
+			joined_lines[0],
+			joined_lines[1],
+		)
+		testing.expect(t, strings_contains(joined_lines[1], "join authors"))
+	}
+	first_steps := plan_step_names(plan)
+	defer delete(first_steps)
+	db.sql_result_destroy(&plan)
+
+	db.store_reset_rows_scanned(store)
+	count := scalar(
+		t,
+		store,
+		`SELECT count(*)
+		 FROM publishers
+		 JOIN books ON books.publisher_id = publishers.id
+		 JOIN authors ON books.author_id = authors.id`,
+	)
+	testing.expect_value(t, count.i, i64(2000))
+	// Two thousand books, and one probe each for the publisher and the author: a
+	// plan that crossed the two unjoined relations first would visit 200 x 5
+	// partials times a thousand books.
+	scanned := db.store_rows_scanned(store)
+	testing.expectf(t, scanned < 10_000, "the join visited %d rows", scanned)
+
+	// The same join spelled the other way round is planned to the same size: the
+	// cost is a property of the schema, not of the FROM the user wrote. The two
+	// plans need not be identical — two orders can cost almost the same — but
+	// neither may cross the two unjoined relations before books filters them.
+	other_plan := run(
+		t,
+		store,
+		`EXPLAIN SELECT count(*) FROM authors
+		 JOIN books ON books.author_id = authors.id
+		 JOIN publishers ON books.publisher_id = publishers.id`,
+	)
+	other_steps := plan_step_names(other_plan)
+	defer delete(other_steps)
+	db.sql_result_destroy(&other_plan)
+	db.store_reset_rows_scanned(store)
+	other_count := scalar(
+		t,
+		store,
+		`SELECT count(*) FROM authors
+		 JOIN books ON books.author_id = authors.id
+		 JOIN publishers ON books.publisher_id = publishers.id`,
+	)
+	testing.expect_value(t, other_count.i, i64(2000))
+	other_scanned := db.store_rows_scanned(store)
+	testing.expectf(
+		t,
+		other_scanned < 20_000,
+		"the join spelled the other way visited %d rows (%s)",
+		other_scanned,
+		other_steps,
+	)
+}
+
 @(test)
 test_plan_reorders_a_join :: proc(t: ^testing.T) {
 	// A nested loop reads the whole inner relation per outer row, so the order of

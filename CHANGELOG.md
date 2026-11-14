@@ -32,6 +32,11 @@
   `FLOAT` key, a paged table) falls back to the full evaluation.
 - A join subscription walks the tables it reads instead of copying every row of
   them into the transaction arena, which was 80 bytes a row per commit.
+- The join order is searched by cost instead of grown greedily: the planner prices a
+  step that probes an index as a probe (a row a join step produces costs eleven
+  times a fetched row: 5.1 µs measured) and refuses to run a relation before the
+  `ON` that filters it can be answered, which is what made `FROM a JOIN b JOIN c`
+  bind the two unjoined relations first and multiply them.
 - `GROUP BY` resolves a projection alias, so `SELECT dept AS d ... GROUP BY d`
   groups by what the projection names; a name that is a column of a source still
   means the column.
