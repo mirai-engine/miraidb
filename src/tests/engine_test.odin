@@ -7117,6 +7117,95 @@ test_import_keeps_the_keys_sqlite_declared :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_limit_stops_the_scan :: proc(t: ^testing.T) {
+	// LIMIT on a statement that neither filters nor shrinks stops the scan once it
+	// has the rows it needs, instead of collecting the table and slicing (D23).
+	store := fresh_db(t, "limit_scan")
+	if store == nil do return
+	defer cleanup_db(store, "limit_scan")
+	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+	{
+		tx := db.tx_begin_write(store)
+		builder := strings.builder_make()
+		defer strings.builder_destroy(&builder)
+		strings.write_string(&builder, "INSERT INTO t (id, v) VALUES ")
+		for i in 1 ..= 1000 {
+			if i > 1 do strings.write_string(&builder, ", ")
+			fmt.sbprintf(&builder, "(%d, 'v%d')", i, i)
+		}
+		_, insert_err := db.sql_execute_in_tx(tx, strings.to_string(builder))
+		testing.expect(t, db.error_ok(insert_err))
+		testing.expect(t, db.error_ok(db.tx_commit(tx)))
+	}
+
+	db.store_reset_rows_scanned(store)
+	ten, ten_err := db.sql_execute(store, "SELECT id FROM t LIMIT 10")
+	if testing.expectf(t, db.error_ok(ten_err), "limit: %s", ten_err.message) {
+		testing.expect_value(t, len(ten.rows), 10)
+		testing.expect_value(t, ten.rows[0][0].i, i64(1))
+		testing.expect_value(t, ten.rows[9][0].i, i64(10))
+	}
+	db.sql_result_destroy(&ten)
+	scanned := db.store_rows_scanned(store)
+	testing.expectf(t, scanned == 10, "the scan read %d rows for LIMIT 10", scanned)
+
+	// OFFSET is kept: five rows are read to answer LIMIT 3 OFFSET 2.
+	db.store_reset_rows_scanned(store)
+	offset, offset_err := db.sql_execute(store, "SELECT id FROM t LIMIT 3 OFFSET 2")
+	if testing.expectf(t, db.error_ok(offset_err), "limit offset: %s", offset_err.message) {
+		testing.expect_value(t, len(offset.rows), 3)
+		testing.expect_value(t, offset.rows[0][0].i, i64(3))
+		testing.expect_value(t, offset.rows[2][0].i, i64(5))
+	}
+	db.sql_result_destroy(&offset)
+	testing.expect_value(t, db.store_rows_scanned(store), u64(5))
+
+	// A parameter decides it just as well.
+	param, param_err := db.sql_execute_params(store, "SELECT id FROM t LIMIT ?", []db.Value{db.value_int(4)})
+	if testing.expectf(t, db.error_ok(param_err), "limit param: %s", param_err.message) do testing.expect_value(t, len(param.rows), 4)
+	db.sql_result_destroy(&param)
+
+	// ORDER BY cannot stop early - it has to see the whole table - but the answer
+	// is still the last three rows.
+	descending, desc_err := db.sql_execute(store, "SELECT id FROM t ORDER BY id DESC LIMIT 3")
+	if testing.expectf(t, db.error_ok(desc_err), "limit desc: %s", desc_err.message) {
+		testing.expect_value(t, len(descending.rows), 3)
+		testing.expect_value(t, descending.rows[0][0].i, i64(1000))
+		testing.expect_value(t, descending.rows[2][0].i, i64(998))
+	}
+	db.sql_result_destroy(&descending)
+
+	// A WHERE clause may discard rows, so the scan runs on.
+	filtered, filtered_err := db.sql_execute(store, "SELECT id FROM t WHERE id > 990 LIMIT 2")
+	if testing.expectf(t, db.error_ok(filtered_err), "limit where: %s", filtered_err.message) {
+		testing.expect_value(t, len(filtered.rows), 2)
+		testing.expect_value(t, filtered.rows[0][0].i, i64(991))
+	}
+	db.sql_result_destroy(&filtered)
+
+	// And the join stops once it has its rows rather than building the product.
+	run(t, store, "CREATE TABLE u (id INTEGER PRIMARY KEY)")
+	{
+		tx := db.tx_begin_write(store)
+		for i in 1 ..= 200 {
+			_, insert_err := db.sql_execute_in_tx(tx, fmt.aprintf("INSERT INTO u (id) VALUES (%d)", i))
+			testing.expect(t, db.error_ok(insert_err))
+		}
+		testing.expect(t, db.error_ok(db.tx_commit(tx)))
+	}
+	db.store_reset_rows_scanned(store)
+	pair, pair_err := db.sql_execute(store, "SELECT u.id, t.id FROM u, t LIMIT 5")
+	if testing.expectf(t, db.error_ok(pair_err), "limit join: %s", pair_err.message) {
+		testing.expect_value(t, len(pair.rows), 5)
+		testing.expect_value(t, pair.rows[0][0].i, i64(1))
+		testing.expect_value(t, pair.rows[0][1].i, i64(1))
+	}
+	db.sql_result_destroy(&pair)
+	joined_scanned := db.store_rows_scanned(store)
+	testing.expectf(t, joined_scanned < 300, "the join read %d rows for LIMIT 5", joined_scanned)
+}
+
+@(test)
 test_row_quota_stops_a_cross_join :: proc(t: ^testing.T) {
 	// A cross join used to build every combination before the projection could
 	// count one row, so a quota could not stop the spike it exists for (D23).

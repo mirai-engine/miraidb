@@ -2226,6 +2226,33 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		return stream_result, stream_err
 	}
 
+	// Row-level policies load once per statement. A denied row never reaches the
+	// projection, an aggregate or the join output. They load before the join
+	// because they also decide whether LIMIT can stop the scan (D23).
+	policies := make([dynamic]Policy_Set)
+	defer policy_sets_destroy(&policies)
+	policy_tables := make([dynamic]string)
+	defer delete(policy_tables)
+	append(&policy_tables, stmt.from.name)
+	for join in stmt.joins do append(&policy_tables, join.table.name)
+	has_policies := false
+	for name in policy_tables {
+		if len(name) == 0 || is_system_table(name) do continue
+		set, policy_err := policy_load(tx, name)
+		if policy_err.kind != .None do return {}, policy_err
+		if len(set.using_exprs) > 0 do has_policies = true
+		append(&policies, set)
+	}
+
+	// LIMIT n, on a statement that neither filters nor shrinks, means the scan can
+	// stop as soon as it has n rows: nothing later in the scan can appear in the
+	// answer. Zero means no pushdown (D23).
+	limit_rows := 0
+	if stmt.where_clause == nil && !has_policies && len(stmt.order_by) == 0 &&
+	   !select_output_may_shrink(stmt) {
+		limit_rows = select_row_limit(stmt, params)
+	}
+
 	// Base rows. A usable index narrows the scan; the WHERE clause is still
 	// re-checked below.
 	partials := make([dynamic][]Source)
@@ -2348,6 +2375,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			one := make([]Source, 1)
 			one[0] = Source{table = base, row = row, alias = exec.from.alias}
 			append(&partials, one)
+			if limit_rows > 0 && len(partials) >= limit_rows do break
 		}
 		delete(rows)
 	}
@@ -2361,7 +2389,10 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 	// step carries the ON conditions that become answerable when it runs (which is
 	// what lets the planner move a relation ahead of the join it was written in).
 	join_counts_quota := !select_output_may_shrink(stmt)
-	for step in order.steps[1:] {
+	for step, step_index in order.steps[1:] {
+		// Only the last step can stop early: the rows it drops are rows later
+		// steps would have joined.
+		stop_at_limit := limit_rows > 0 && step_index == len(order.steps) - 2
 		if step.ref.as_of != nil {
 			free_partials(&partials)
 			return {}, errf(.Sql_Unsupported, "AS OF is only supported on the first table of a join")
@@ -2481,6 +2512,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 				}
 				append(&next, candidate)
 				matched = true
+				if stop_at_limit && len(next) >= limit_rows do break
 				if join_counts_quota && quota_reached(tx, len(next)) {
 					// A cross join materialises its intermediate before the
 					// projection can count anything, so the quota has to fire
@@ -2506,28 +2538,11 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			}
 			if lateral do delete(lateral_rows)
 			if using_probe do delete(probe_rows)
+			if stop_at_limit && len(next) >= limit_rows do break
 		}
 		delete(rows)
 		free_partials(&partials)
 		partials = next
-	}
-
-	// Row-level policies load once per statement. A denied row never reaches
-	// the projection, an aggregate or the join output.
-	policies := make([dynamic]Policy_Set)
-	defer policy_sets_destroy(&policies)
-	policy_tables := make([dynamic]string)
-	defer delete(policy_tables)
-	append(&policy_tables, stmt.from.name)
-	for join in stmt.joins do append(&policy_tables, join.table.name)
-	for name in policy_tables {
-		if len(name) == 0 || is_system_table(name) do continue
-		set, policy_err := policy_load(tx, name)
-		if policy_err.kind != .None {
-			free_partials(&partials)
-			return {}, policy_err
-		}
-		append(&policies, set)
 	}
 
 	// WHERE

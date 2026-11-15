@@ -945,8 +945,15 @@ the server or the C ABI.
    combinations with a quota of 100 refuses after fewer than 1 000 rows, where it
    used to build all 40 000). A statement whose output can shrink — `DISTINCT`,
    `GROUP BY`/`HAVING`, an aggregate, a window — is still judged by what it emits,
-   so `SELECT count(*) FROM a, b` answers. Left: `LIMIT` is not pushed into the
-   scan or the join, so `SELECT * FROM t LIMIT 10` still collects the table.
+   so `SELECT count(*) FROM a, b` answers.
+   ~~`LIMIT` is not pushed into the scan.~~ Done: a statement with `LIMIT`, no
+   `WHERE`, no `ORDER BY`, no `DISTINCT`, no aggregate, no window and no policy
+   stops its scan once it has `LIMIT + OFFSET` rows, and a join stops at its last
+   step the same way. `SELECT id FROM t LIMIT 10` reads 10 rows of a 1 000-row
+   table, `LIMIT 3 OFFSET 2` reads five, and `SELECT u.id, t.id FROM u, t LIMIT 5`
+   reads fewer than 300 rows of the 200 × 1 000 it used to build
+   (`test_limit_stops_the_scan`). Left: an allocation that fails is still a
+   crash.
 3. Treat a failed allocation as an error (`.Out_Of_Memory` or the existing
    `.Quota_Exceeded`) everywhere the executor allocates per row. Not started: the
    audit saw it as `Index 1 is out of range 0..<0` and that path still needs a
