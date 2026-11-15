@@ -15,7 +15,7 @@ import ctypes
 import os
 import sys
 
-OK, ERROR, MISUSE, ROW, DONE = 0, 1, 2, 100, 101
+OK, ERROR, MISUSE, DENIED, ROW, DONE = 0, 1, 2, 3, 100, 101
 
 
 def load(path: str):
@@ -62,7 +62,27 @@ def load(path: str):
     lib.miraidb_work_used.restype = ctypes.c_ulonglong
     lib.miraidb_interrupt.argtypes = [ctypes.c_void_p]
     lib.miraidb_interrupt.restype = ctypes.c_int
+    lib.miraidb_set_identity.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    lib.miraidb_set_identity.restype = ctypes.c_int
+    lib.miraidb_identity.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    lib.miraidb_identity.restype = ctypes.c_int
+    lib.miraidb_issue_token.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_longlong, ctypes.c_char_p, ctypes.c_ulonglong,
+    ]
+    lib.miraidb_issue_token.restype = ctypes.c_int
+    lib.miraidb_authenticate.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    lib.miraidb_authenticate.restype = ctypes.c_int
     return lib
+
+
+def scalar(lib, db, sql: bytes) -> int:
+    """The first integer of a one-row, one-column query, through the C ABI."""
+    stmt = lib.miraidb_prepare(db, sql)
+    assert stmt, lib.miraidb_errmsg(db)
+    assert lib.miraidb_step(stmt) == ROW, lib.miraidb_errmsg(db)
+    value = lib.miraidb_column_int(stmt, 0)
+    lib.miraidb_finalize(stmt)
+    return value
 
 
 def main() -> int:
@@ -216,6 +236,67 @@ def main() -> int:
     # dead handle answers MIRAIDB_MISUSE instead of touching freed memory.
     assert lib.miraidb_interrupt(db) == OK
     assert lib.miraidb_exec(db, b"SELECT count(*) FROM t") == OK
+
+    # Identity and credentials (D25). A policy filters by the identity the
+    # connection carries; a token names that identity to a connection that has not
+    # set one yet; and an expired token is refused without changing who the caller
+    # was. The identity is 32 bytes, not text: two different callers must not see
+    # each other's rows.
+    import shutil
+    ana = bytes(range(32))
+    luis = bytes(range(32, 64))
+    identity_db = os.path.join("bin", "capi_identity")
+    shutil.rmtree(identity_db, ignore_errors=True)
+    auth = ctypes.c_void_p(lib.miraidb_open(identity_db.encode()))
+    assert auth
+    assert lib.miraidb_exec(auth, b"CREATE TABLE doc (id INTEGER PRIMARY KEY, owner IDENTITY NOT NULL, body TEXT)") == OK
+    assert lib.miraidb_exec(auth, b"CREATE POLICY own ON doc USING (owner = current_identity())") == OK
+    for who, value in ((ana, b"a"), (luis, b"b")):
+        assert lib.miraidb_set_identity(auth, who) == OK
+        stmt = lib.miraidb_prepare(auth, b"INSERT INTO doc (id, owner, body) VALUES (?, current_identity(), ?)")
+        assert stmt, lib.miraidb_errmsg(auth)
+        assert lib.miraidb_bind_int(stmt, 0, 1 if who == ana else 2) == OK
+        assert lib.miraidb_bind_text(stmt, 1, value) == OK
+        assert lib.miraidb_step(stmt) == DONE, lib.miraidb_errmsg(auth)
+        lib.miraidb_finalize(stmt)
+    seen = ctypes.create_string_buffer(32)
+    assert lib.miraidb_identity(auth, seen) == 32
+    assert seen.raw == luis, "identity reads back the bytes that were set"
+    assert scalar(lib, auth, b"SELECT count(*) FROM doc") == 1
+    assert lib.miraidb_set_identity(auth, ana) == OK
+    assert scalar(lib, auth, b"SELECT count(*) FROM doc") == 1
+    body = lib.miraidb_prepare(auth, b"SELECT body FROM doc")
+    assert lib.miraidb_step(body) == ROW
+    assert lib.miraidb_column_text(body, 0) == b"a", "a caller sees its own row"
+    lib.miraidb_finalize(body)
+
+    token = ctypes.create_string_buffer(128)
+    issued = lib.miraidb_issue_token(auth, ana, 0, token, len(token))
+    assert issued == 67, issued
+    assert token.value.startswith(b"mt_")
+    assert lib.miraidb_issue_token(auth, ana, 0, token, 10) == -1, "a short buffer is refused"
+    ana_token = token.value
+    expired = ctypes.create_string_buffer(128)
+    assert lib.miraidb_issue_token(auth, luis, -1, expired, len(expired)) == 67
+    lib.miraidb_close(auth)
+
+    # A connection that has not authenticated carries the all-zero identity, so a
+    # policy that compares against current_identity() matches nothing: the embedded
+    # path is the server's path, not a privileged one.
+    again = ctypes.c_void_p(lib.miraidb_open(identity_db.encode()))
+    assert again, lib.miraidb_errmsg(None)
+    assert scalar(lib, again, b"SELECT count(*) FROM doc") == 0, "no identity, no rows"
+    assert lib.miraidb_authenticate(again, expired.value) == DENIED
+    assert "expired" in lib.miraidb_errmsg(again).decode()
+    assert scalar(lib, again, b"SELECT count(*) FROM doc") == 0, "a refused token changes nobody"
+    assert lib.miraidb_authenticate(again, ana_token) == OK, lib.miraidb_errmsg(again)
+    seen = ctypes.create_string_buffer(32)
+    assert lib.miraidb_identity(again, seen) == 32
+    assert seen.raw == ana, "the token names the identity it was issued for"
+    assert scalar(lib, again, b"SELECT count(*) FROM doc") == 1
+    assert lib.miraidb_authenticate(again, b"mt_00") == DENIED
+    lib.miraidb_close(again)
+    shutil.rmtree(identity_db, ignore_errors=True)
 
     # The error path reports a message instead of crashing.
     assert lib.miraidb_exec(db, b"SELECT * FROM missing") == ERROR

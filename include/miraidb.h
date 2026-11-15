@@ -15,13 +15,22 @@
  * Return codes: MIRAIDB_OK (0) on success, MIRAIDB_ERROR (1) on failure,
  * MIRAIDB_MISUSE (2) when the handle is not live (a statement used after
  * finalize, or anything used through a connection already closed: the call does
- * nothing and the process keeps running),
+ * nothing and the process keeps running), MIRAIDB_DENIED (3) for a token that is
+ * unknown or expired,
  * MIRAIDB_ROW (100) when a step produced a row and MIRAIDB_DONE (101) when the
  * statement finished.
  *
  * Strings are UTF-8 and NUL-terminated. Text and blob pointers returned by the
  * column accessors are borrowed: they stay valid until the next step, reset or
  * finalize of that statement.
+ *
+ * Threads: a connection, and every statement made from it, belongs to one thread
+ * at a time. Two threads may use two connections on the same file - the engine
+ * takes a reader/writer lock on the file - and miraidb_interrupt is the one call
+ * that may run on another thread while a statement is executing. Nothing else is
+ * synchronised: opening the same path twice in one process, sharing a statement,
+ * or closing a connection while another thread uses it is a data race, not a
+ * refused call.
  */
 
 #include <stddef.h>
@@ -47,6 +56,7 @@ typedef void *miraidb_stmt;
 #define MIRAIDB_OK     0
 #define MIRAIDB_ERROR  1
 #define MIRAIDB_MISUSE 2
+#define MIRAIDB_DENIED 3
 #define MIRAIDB_ROW    100
 #define MIRAIDB_DONE   101
 
@@ -112,6 +122,30 @@ unsigned long long miraidb_work_used(miraidb_conn db);
  * connection starts with a clean flag, so an interrupted call leaves the
  * connection usable. A dead handle answers MIRAIDB_MISUSE and does nothing. */
 int miraidb_interrupt(miraidb_conn db);
+
+/* Identity and credentials. Row policies filter by the identity the connection
+ * carries. A connection that never set one carries the all-zero identity, so a
+ * policy that compares against current_identity() matches no row until an
+ * identity or a token is set: an embedded caller that wants to be the host has
+ * to say which identity that is. An identity is the 32 bytes of an IDENTITY
+ * value, the same shape a token names - not text, and not a UUID string.
+ *
+ *   unsigned char id[32]; unsigned char out[32]; char token[128];
+ *   miraidb_identity(db, out);              // who the policies see now
+ *   miraidb_issue_token(db, id, 0, token, sizeof token);  // 0: never expires
+ *   miraidb_authenticate(other, token);     // MIRAIDB_DENIED if unknown/expired
+ *
+ * miraidb_issue_token writes at most out_len bytes including the NUL and returns
+ * the token's length, or -1 when the buffer is too small (a token is 67
+ * characters, so 68 bytes always fit). ttl_us is microseconds, zero meaning no
+ * expiry. A token is stored as an HMAC digest, so the database file does not hold
+ * a usable credential. miraidb_authenticate leaves the identity unchanged when it
+ * answers MIRAIDB_DENIED, and explains the reason through miraidb_errmsg. */
+int  miraidb_set_identity(miraidb_conn db, const void *identity32);
+int  miraidb_identity(miraidb_conn db, void *out32);
+int  miraidb_issue_token(miraidb_conn db, const void *identity32,
+                         long long ttl_us, char *out, unsigned long long out_len);
+int  miraidb_authenticate(miraidb_conn db, const char *token);
 
 const char *miraidb_version(void);
 

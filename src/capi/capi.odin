@@ -31,6 +31,10 @@ MIRAIDB_ERROR :: c.int(1)
 // after finalize, or anything used through a connection already closed. The call
 // does nothing and the process keeps running (D29).
 MIRAIDB_MISUSE :: c.int(2)
+// MIRAIDB_DENIED is the answer to a token that is unknown or expired. The
+// identity of the connection is left unchanged, so a caller that ignores the code
+// still cannot become somebody else by accident.
+MIRAIDB_DENIED :: c.int(3)
 MIRAIDB_ROW :: c.int(100)
 MIRAIDB_DONE :: c.int(101)
 
@@ -446,6 +450,74 @@ miraidb_interrupt :: proc "c" (handle: rawptr) -> c.int {
 	if conn == nil do return MIRAIDB_MISUSE
 	engine.store_cancel(conn.embed.store)
 	return MIRAIDB_OK
+}
+
+// miraidb_set_identity makes `identity` the caller row policies see. The bytes are
+// the 32 of an IDENTITY column value, the same shape a token names; a NULL pointer
+// is an error. A connection that never calls this carries the all-zero identity,
+// so a policy comparing against current_identity() matches nothing: that is what
+// the server does before a client authenticates, and the embedded path is the same
+// path, not a privileged one.
+@(export)
+miraidb_set_identity :: proc "c" (handle: rawptr, identity: rawptr) -> c.int {
+	context = runtime.default_context()
+	conn := capi_conn(handle)
+	if conn == nil do return MIRAIDB_MISUSE
+	if identity == nil do return MIRAIDB_ERROR
+	bytes := cast(^[32]u8)identity
+	engine.embed_set_identity(conn.embed, engine.Identity(bytes^))
+	return MIRAIDB_OK
+}
+
+// miraidb_identity copies the identity the policies see into `out` (32 bytes) and
+// returns the number of bytes written, or MIRAIDB_MISUSE for a dead handle.
+@(export)
+miraidb_identity :: proc "c" (handle: rawptr, out: rawptr) -> c.int {
+	context = runtime.default_context()
+	conn := capi_conn(handle)
+	if conn == nil do return MIRAIDB_MISUSE
+	if out == nil do return MIRAIDB_ERROR
+	identity := engine.embed_identity(conn.embed)
+	bytes := cast(^[32]u8)out
+	bytes^ = cast([32]u8)identity
+	return 32
+}
+
+// miraidb_authenticate resolves a token and, when it is live, makes its identity
+// the caller's. It answers MIRAIDB_OK, MIRAIDB_DENIED for an unknown or expired
+// token (miraidb_errmsg says which), or MIRAIDB_MISUSE for a dead handle.
+@(export)
+miraidb_authenticate :: proc "c" (handle: rawptr, token: cstring) -> c.int {
+	context = runtime.default_context()
+	conn := capi_conn(handle)
+	if conn == nil do return MIRAIDB_MISUSE
+	if token == nil do return MIRAIDB_ERROR
+	err := engine.embed_authenticate(conn.embed, string(token))
+	if err.kind == .Permission_Denied do return MIRAIDB_DENIED
+	if err.kind != .None do return MIRAIDB_ERROR
+	return MIRAIDB_OK
+}
+
+// miraidb_issue_token writes a credential for `identity` into `out` as text, never
+// more than `out_len` bytes including the NUL, and returns its length or -1 when
+// the buffer is too small. A token is 67 characters; a caller that passes 68 or
+// more always succeeds. TTL is in microseconds and zero means it never expires.
+@(export)
+miraidb_issue_token :: proc "c" (handle: rawptr, identity: rawptr, ttl_us: c.longlong, out: cstring, out_len: c.ulonglong) -> c.int {
+	context = runtime.default_context()
+	conn := capi_conn(handle)
+	if conn == nil do return MIRAIDB_MISUSE
+	if identity == nil || out == nil do return MIRAIDB_ERROR
+	bytes := cast(^[32]u8)identity
+	token, err := engine.embed_issue_token(conn.embed, engine.Identity(bytes^), i64(ttl_us))
+	defer delete(token)
+	if err.kind != .None do return MIRAIDB_ERROR
+	needed := u64(len(token)) + 1
+	if out_len < needed do return -1
+	buffer := cast([^]u8)out
+	for i in 0 ..< len(token) do buffer[i] = token[i]
+	buffer[len(token)] = 0
+	return c.int(len(token))
 }
 
 @(export)

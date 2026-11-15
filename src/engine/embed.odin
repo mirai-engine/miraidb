@@ -23,6 +23,7 @@ package engine
 // in-memory store, so statements answer against the file without converting it.
 
 import "core:strings"
+import "core:time"
 
 EMBED_OK :: Error_Kind.None
 
@@ -142,6 +143,53 @@ embed_backup :: proc(conn: ^Embed_Conn, path: string) -> Error {
 	}
 	embed_succeed(conn)
 	return ERROR_NONE
+}
+
+// --- Identity and tokens ---------------------------------------------------
+//
+// An embedded caller is sometimes the host and sometimes a guest of one: a
+// program that embeds the engine still has row policies, and they filter by the
+// identity the store carries, which starts as the all-zero identity - the same
+// state a server connection is in before it authenticates. These four calls are
+// what a C caller needs to make that choice, and they work without a Host because
+// a token is a row in the database, not a piece of the reducer catalog.
+
+// embed_set_identity makes `identity` the caller the policies see.
+embed_set_identity :: proc(conn: ^Embed_Conn, identity: Identity) -> Error {
+	if conn == nil do return errf(.Invalid_Argument, "no connection")
+	store_set_identity(conn.store, identity)
+	embed_succeed(conn)
+	return ERROR_NONE
+}
+
+// embed_identity reports the identity the policies see.
+embed_identity :: proc(conn: ^Embed_Conn) -> Identity {
+	if conn == nil do return {}
+	return store_identity(conn.store)
+}
+
+// embed_authenticate resolves a token and, if it is live, installs the identity it
+// names. The identity is left alone when the token is unknown or expired, so a
+// caller that ignores the error cannot become somebody else by accident.
+embed_authenticate :: proc(conn: ^Embed_Conn, token: string) -> Error {
+	if conn == nil do return errf(.Invalid_Argument, "no connection")
+	identity, valid := store_authenticate(conn.store, token, time.now()._nsec / 1000)
+	if !valid {
+		return embed_fail(conn, errf(.Permission_Denied, "invalid or expired token"))
+	}
+	store_set_identity(conn.store, identity)
+	embed_succeed(conn)
+	return ERROR_NONE
+}
+
+// embed_issue_token creates a credential for `identity`. Zero `ttl_us` means it
+// never expires. The returned string is owned by the caller.
+embed_issue_token :: proc(conn: ^Embed_Conn, identity: Identity, ttl_us: i64) -> (string, Error) {
+	if conn == nil do return "", errf(.Invalid_Argument, "no connection")
+	token, issue_err := store_issue_token(conn.store, identity, ttl_us, time.now()._nsec / 1000)
+	if issue_err.kind != .None do return "", embed_fail(conn, issue_err)
+	embed_succeed(conn)
+	return token, ERROR_NONE
 }
 
 // embed_exec_params runs one statement with positional parameters.
