@@ -7103,15 +7103,69 @@ test_import_keeps_the_keys_sqlite_declared :: proc(t: ^testing.T) {
 		}
 		strings.write_byte(&summary, ' ')
 	}
-	// A primary key comes back as text (its index is the automatic one); a UNIQUE
-	// or composite key comes back as a named index row, which is what carries it
-	// into a second write without asking for a second index.
-	testing.expect_value(t, strings.to_string(summary), "cp:2/0 cu:0/0 k:0/0pk t3:0/0 u:0/0 ")
-	names := make([dynamic]string, 0, 3)
-	defer delete(names)
-	for index in written.indexes do append(&names, index.name)
-	slice.sort_by(names[:], proc(a, b: string) -> bool { return a < b })
-	testing.expect_value(t, strings.join(names[:], ","), "cu_key_a_b,t3_key_a_b_c,u_key_code")
+	// The table text comes back exactly as the fixture spelled it, and since every
+	// key it declares is carried by an automatic index, no named index row is
+	// written at all: the declaration and its number are enough.
+	testing.expect_value(t, strings.to_string(summary), "cp:2/0 cu:0/1 k:0/1pk t3:0/1 u:0/1 ")
+	testing.expect_value(t, len(written.indexes), 0)
+	for table in written.tables {
+		for original in file.tables {
+			if original.name != table.name do continue
+			testing.expect_value(t, table.sql, original.sql)
+		}
+	}
+}
+
+@(test)
+test_rewrite_keeps_a_keyed_table_as_it_was :: proc(t: ^testing.T) {
+	// The rest of D27: a table whose declaration SQLite backs with an automatic
+	// index used to be rebuilt, because the rewrite could not number those
+	// indexes. It can now, so a schema change elsewhere leaves the declaration -
+	// and the numbers SQLite gives it - exactly as the file had them.
+	source := "src/tests/fixtures/keys.sqlite"
+	path := "_test_keys_mirror.db"
+	os.remove(path)
+	data, read_err := os.read_entire_file(source, context.allocator)
+	if !testing.expect(t, read_err == nil) do return
+	defer delete(data)
+	if !testing.expect(t, os.write_entire_file(path, data) == nil) do return
+
+	before, before_err := db.sqlite_file_open(path)
+	if !testing.expect(t, db.error_ok(before_err)) do return
+	originals := make(map[string]string)
+	defer {
+		for _, sql in originals do delete(sql)
+		delete(originals)
+	}
+	for table in before.tables do originals[table.name] = strings.clone(table.sql)
+	group_counts := make(map[string]int)
+	for table in before.tables do group_counts[table.name] = len(table.key_order)
+	db.sqlite_file_destroy(&before)
+
+	conn, open_err := db.embed_open(path, {persistent = true, create = false, durable = false})
+	if !testing.expectf(t, db.error_ok(open_err), "embed_open: %s", open_err.message) do return
+	// A schema change takes the whole-file rewrite, which is the path that used to
+	// rebuild every table from the engine's model.
+	created, create_err := db.sql_execute(conn.store, "CREATE TABLE newcomer (id INTEGER PRIMARY KEY)")
+	testing.expect(t, db.error_ok(create_err))
+	db.sql_result_destroy(&created)
+	db.embed_close(conn)
+
+	after, after_err := db.sqlite_file_open(path)
+	if !testing.expect(t, db.error_ok(after_err)) do return
+	defer {
+		db.sqlite_file_destroy(&after)
+		os.remove(path)
+	}
+	seen := 0
+	for table in after.tables {
+		original, found := originals[table.name]
+		if !found do continue
+		testing.expect_value(t, table.sql, original)
+		testing.expect_value(t, len(table.key_order), group_counts[table.name])
+		seen += 1
+	}
+	testing.expect_value(t, seen, 5)
 }
 
 @(test)

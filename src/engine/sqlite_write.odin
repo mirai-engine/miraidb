@@ -571,6 +571,22 @@ sqlite_write_index_tree :: proc(
 	return nodes[0].page
 }
 
+@(private)
+sqlite_index_by_name :: proc(schema: ^Table_Schema, name: string) -> (Index_Schema, bool) {
+	for index in schema.indexes {
+		if index.name == name do return index, true
+	}
+	return {}, false
+}
+
+@(private)
+sqlite_name_in :: proc(names: []string, name: string) -> bool {
+	for other in names {
+		if other == name do return true
+	}
+	return false
+}
+
 // sqlite_index_sql renders the CREATE INDEX statement stored in sqlite_master.
 @(private)
 sqlite_index_sql :: proc(table: ^Table, index: Index_Schema) -> string {
@@ -762,6 +778,27 @@ sqlite_file_write :: proc(store: ^Store, path: string, alloc := context.allocato
 		}
 		append(&master_rows, Sqlite_Export_Row{rowid = i64(len(master_rows) + 1), values = master})
 		tables += 1
+		// A kept text keeps its own key declarations, so the automatic indexes
+		// they imply are written first, with the number the declaration gives
+		// them: SQLite numbers automatic indexes in the order it creates them,
+		// which is the order the constraints appear (D27).
+		if keep_text {
+			for index_name, order in original.key_indexes {
+				index, found := sqlite_index_by_name(&table.schema, index_name)
+				if !found do continue
+				index_root := sqlite_write_index_tree(&w, table, index, exported[:], alloc)
+				if index_root == 0 do continue
+				row := make([]Value, 5)
+				row[0] = value_string("index")
+				row[1] = value_string(
+					fmt.aprintf("sqlite_autoindex_%s_%d", table.schema.name, order + 1),
+				)
+				row[2] = value_string(table.schema.name)
+				row[3] = value_int(i64(index_root))
+				row[4] = value_null()
+				append(&master_rows, Sqlite_Export_Row{rowid = i64(len(master_rows) + 1), values = row})
+			}
+		}
 		// Secondary indexes. The rowid alias needs none; the key does, and it is
 		// named the way SQLite names the index a table constraint implies, with a
 		// NULL SQL: the declaration in the table's own text is what says what it
@@ -770,6 +807,7 @@ sqlite_file_write :: proc(store: ^Store, path: string, alloc := context.allocato
 		alias := sqlite_rowid_alias(table)
 		for &index in table.schema.indexes {
 			if index.implicit && len(index.columns) == 1 && index.columns[0] == alias do continue
+			if keep_text && sqlite_name_in(original.key_indexes, index.name) do continue
 			index_root := sqlite_write_index_tree(&w, table, index, exported[:], alloc)
 			if index_root == 0 do continue
 			implied := !keep_text && index.unique && len(table.schema.primary_key) > 0 &&
@@ -786,7 +824,9 @@ sqlite_file_write :: proc(store: ^Store, path: string, alloc := context.allocato
 			index_row[2] = value_string(table.schema.name)
 			index_row[3] = value_int(i64(index_root))
 			if implied {
-				index_row[4] = value_string("")
+				// SQLite stores NULL in the sql column of an automatic index: there
+				// is no statement to re-run, the declaration that made it is enough.
+				index_row[4] = value_null()
 			} else {
 				index_row[4] = value_string(sqlite_index_sql(table, index))
 			}

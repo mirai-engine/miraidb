@@ -428,6 +428,10 @@ Mirror_Kept :: struct {
 	// a statement would declare a shape the pages do not have, which SQLite
 	// rejects as a malformed schema.
 	can_keep:  bool,
+	// key_indexes names, in the order SQLite numbers them, the engine index that
+	// carries each automatic index the kept text implies. Empty when the text
+	// declares no key beyond the rowid.
+	key_indexes: []string,
 }
 
 // store_mirror_keep records the file's catalog, so a later rewrite can put back
@@ -437,6 +441,13 @@ store_mirror_keep :: proc(store: ^Store, file: ^Sqlite_File) {
 	for &table in file.tables {
 		schema, found := store.tables[table.name]
 		if !found do continue
+		keys, keys_ok := mirror_key_indexes(&table, &schema.schema)
+		can_keep := mirror_text_keepable(&table) && keys_ok
+		if !can_keep {
+			for name in keys do delete(name)
+			delete(keys)
+			keys = nil
+		}
 		append(
 			&store.mirror_kept,
 			Mirror_Kept {
@@ -447,8 +458,9 @@ store_mirror_keep :: proc(store: ^Store, file: ^Sqlite_File) {
 				// import read, and a borrowed slice would be freed with it.
 				sql = strings.clone(table.sql),
 				signature = schema_signature(&schema.schema),
-				can_keep = mirror_text_keepable(&table, &schema.schema),
+				can_keep = can_keep,
 				has_rules = mirror_text_has_rules(table.sql),
+				key_indexes = keys,
 			},
 		)
 	}
@@ -481,6 +493,8 @@ store_mirror_kept_destroy :: proc(store: ^Store) {
 		if len(kept.table) > 0 do delete(kept.table)
 		if len(kept.sql) > 0 do delete(kept.sql)
 		if len(kept.signature) > 0 do delete(kept.signature)
+		for name in kept.key_indexes do delete(name)
+		delete(kept.key_indexes)
 	}
 	delete(store.mirror_kept)
 	// The array is gone: leaving its length behind would let the next append write
@@ -500,27 +514,47 @@ mirror_text_has_rules :: proc(sql: string) -> bool {
 // mirror_text_keepable reports whether the file's declaration and the engine's
 // storage describe the same record, so the statement can be re-emitted verbatim.
 //
-// Three declarations cannot be kept yet, and rebuilding the table from the
-// engine's model is what happens instead (and is reported):
+// Two declarations cannot be kept, and rebuilding the table from the engine's
+// model is what happens instead (and is reported):
 //
 //   - a generated column: SQLite computes it and does not store it, so the kept
 //     text would declare more columns than the pages hold;
-//   - a WITHOUT ROWID table: its rows have no rowid to patch;
-//   - UNIQUE, and a PRIMARY KEY that is not an INTEGER rowid alias: SQLite backs
-//     them with an automatic index, and the engine's import does not build one
-//     from a column constraint, so the kept text would declare an index the file
-//     does not have. SQLite rejects that as "wrong # of entries in index".
-mirror_text_keepable :: proc(table: ^Sqlite_Table, schema: ^Table_Schema) -> bool {
+//   - a WITHOUT ROWID table: its rows have no rowid to patch.
+//
+// A key is a third question, answered by mirror_key_indexes: the text may declare
+// it as long as every automatic index it implies can be written with the number
+// the declaration gives it.
+mirror_text_keepable :: proc(table: ^Sqlite_Table) -> bool {
 	if table.without_rowid do return false
 	if sqlite_contains_word(table.sql, "GENERATED") do return false
-	if sqlite_contains_word(table.sql, "UNIQUE") do return false
-	// An INTEGER PRIMARY KEY in a rowid table is the rowid, not an index.
-	if len(schema.primary_key) == 1 {
-		if schema.columns[schema.primary_key[0]].type.kind != .Int do return false
-	} else if len(schema.primary_key) > 1 {
-		return false
-	}
 	return true
+}
+
+// mirror_key_indexes maps each automatic index the file's text implies, in the
+// order SQLite numbers them, to the engine index that carries it. A group with no
+// unique index of its own means the text cannot be kept: writing it would declare
+// an automatic index the file does not have, and SQLite calls that malformed.
+mirror_key_indexes :: proc(table: ^Sqlite_Table, schema: ^Table_Schema) -> ([]string, bool) {
+	names := make([dynamic]string, 0, len(table.key_order))
+	used := make([]bool, len(schema.indexes))
+	defer delete(used)
+	for group in table.key_order {
+		matched := false
+		for index, i in schema.indexes {
+			if used[i] || !index.unique do continue
+			if !schema_index_matches(&schema.indexes[i], group) do continue
+			used[i] = true
+			append(&names, strings.clone(index.name))
+			matched = true
+			break
+		}
+		if !matched {
+			for name in names do delete(name)
+			delete(names)
+			return nil, false
+		}
+	}
+	return names[:], true
 }
 
 // schema_signature is a stable text form of what the engine models about a table.

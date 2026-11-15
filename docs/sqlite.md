@@ -190,18 +190,20 @@ so `ALTER TABLE parent …` leaves `child`'s `REFERENCES … ON DELETE CASCADE`,
 `CHECK`, `DEFAULT` and `COLLATE` alone and keeps the views and triggers
 (`scripts/sqlite_abi_smoke.py` compares `sqlite_master` before and after).
 
-What is still rebuilt from the engine's model, and now reported by
-`--mirror-report` as `mirror-lost:`:
+A table whose declaration spells a key is kept too, and that is where the
+numbering matters: SQLite creates an automatic index for each key in the order
+the constraints appear, so the rewrite writes `sqlite_autoindex_<table>_1`,
+`_2` … in that same order, each with the b-tree of the engine index that carries
+it. `CREATE TABLE m2 (a TEXT PRIMARY KEY, b TEXT UNIQUE)` keeps both, and so does
+a table whose `UNIQUE` is declared after the primary key.
+
+What is still rebuilt from the engine's model, and reported by `--mirror-report`
+as `mirror-lost:`:
 
 - the table the DDL itself changed, which loses `REFERENCES`, `CHECK`, `DEFAULT`,
   `COLLATE` and a generated column;
-- any table whose declaration SQLite backs with an automatic index — a `UNIQUE`
-  column, a non-`INTEGER` `PRIMARY KEY`, a composite key — or a `WITHOUT ROWID`
-  table, or one with a `GENERATED` column. Re-emitting that text would declare an
-  index whose number SQLite takes from the order the constraints appear in, and
-  the engine's model does not keep that order; the rebuild writes the keys as
-  index rows instead, so the constraint survives even though the text does not.
-  D33 built the export side of this; what is left is D27.
+- a table with a `GENERATED` column (SQLite computes it and does not store it) or
+  one declared `WITHOUT ROWID` (its rows have no rowid to patch).
 
 Rows, indexes the engine knows, and file integrity survive in every case; a table
 rebuilt this way loses its rules and says so. A failed mirror write is reported through `last_error` and

@@ -1177,7 +1177,16 @@ loaded machine.
 
 **Cost.** S for the runner, M for the same-run reference.
 
-## D27 — The mirror keeps the schema it does not model — *half done*
+## D27 — The mirror keeps the schema it does not model — **done** (see `docs/roadmap.md`, closed)
+
+Closed by numbering the automatic indexes: the writer walks the constraints of
+the kept text in declaration order and writes `sqlite_autoindex_<table>_<n>` for
+each, matched to the engine index that carries it. A table whose text spells a
+`UNIQUE` column, a text key or a composite key therefore keeps its text through a
+rewrite. `GENERATED` and `WITHOUT ROWID` stay rebuilt and are stated as limits.
+Covered by
+`test_rewrite_keeps_a_keyed_table_as_it_was` and the `sqlite_master` comparison
+in `scripts/sqlite_abi_smoke.py`.
 
 **Now.** One `ALTER TABLE` through the engine rewrites the user's `.sqlite` file with
 the engine's own idea of the schema (`AUDIT-10` P-A1). Measured on a file that SQLite

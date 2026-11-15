@@ -183,11 +183,26 @@ def main() -> int:
         " flag INTEGER CHECK (flag IN (0, 1)));"
         "INSERT INTO parent (id, name) VALUES (1, 'a');"
         "INSERT INTO child (id, pid, flag) VALUES (1, 1, 1);"
+        "CREATE TABLE keyed (code TEXT PRIMARY KEY, v INTEGER);"
+        "CREATE TABLE tagged (id INTEGER PRIMARY KEY, tag TEXT UNIQUE, n INTEGER);"
+        "CREATE TABLE paired (a TEXT, b TEXT, UNIQUE (a, b));"
+        "INSERT INTO keyed (code, v) VALUES ('a', 1);"
+        "INSERT INTO tagged (id, tag, n) VALUES (1, 'x', 2);"
+        "INSERT INTO paired (a, b) VALUES ('p', 'q');"
         "CREATE VIEW child_view AS SELECT id FROM child;"
         "CREATE TRIGGER child_touch AFTER INSERT ON child BEGIN SELECT 1; END;"
     )
     seed.commit()
     child_sql = seed.execute("SELECT sql FROM sqlite_master WHERE name = 'child'").fetchone()[0]
+    # The tables whose declaration SQLite backs with an automatic index: the text
+    # must come back exactly as it was, with the indexes numbered as it numbers
+    # them (D27).
+    keyed_before = list(
+        seed.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master"
+            " WHERE tbl_name IN ('keyed', 'tagged', 'paired') ORDER BY name"
+        )
+    )
     seed.close()
 
     keeper = ctypes.c_void_p()
@@ -206,6 +221,23 @@ def main() -> int:
     assert kept.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'").fetchall() == [("child_touch",)]
     columns = [row[1] for row in kept.execute("PRAGMA table_info(parent)").fetchall()]
     assert columns == ["id", "name", "extra"], columns
+    keyed_after = list(
+        kept.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master"
+            " WHERE tbl_name IN ('keyed', 'tagged', 'paired') ORDER BY name"
+        )
+    )
+    assert keyed_after == keyed_before, (keyed_before, keyed_after)
+    for statement, message in (
+        ("INSERT INTO keyed (code, v) VALUES ('a', 9)", "keyed.code"),
+        ("INSERT INTO tagged (id, tag, n) VALUES (2, 'x', 0)", "tagged.tag"),
+        ("INSERT INTO paired (a, b) VALUES ('p', 'q')", "paired"),
+    ):
+        try:
+            kept.execute(statement)
+        except sqlite3.IntegrityError:
+            continue
+        raise AssertionError("%s was accepted by SQLite after the DDL" % message)
     kept.close()
 
     # The same rewrite with nothing left: dropping the last table leaves a valid,

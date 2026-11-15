@@ -146,7 +146,7 @@ the gaps are named rather than left to be discovered.
   `linux_arm64` and `darwin_arm64`. The POSIX lock is the reason it is checked:
   it carried a missing `core:sys/posix` import and two wrong integer types until
   this round, so the code that a Linux build would run had never been compiled.
-- 253 integration tests covering CRUD, recovery, constraints, transactions,
+- 254 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
@@ -367,11 +367,13 @@ than 1000 bytes cannot be indexed and the insert says so.
   **A schema change now keeps every object it was not asked to change**: a
   rewrite re-emits the file's own text for tables whose schema the engine did not
   touch, and for every view and trigger, so `ALTER TABLE parent …` no longer
-  strips `child`. The table the DDL touched is still rebuilt from the engine's
-  model — as is a table whose `UNIQUE`, non-integer `PRIMARY KEY` or `WITHOUT
-  ROWID` shape SQLite backs with an automatic index — and `--mirror-report`
-  prints a `mirror-lost:` line naming it. The file keeps its rows and its
-  integrity; a rebuilt table loses the rules it had, loudly.
+  strips `child`. A table whose declaration SQLite backs with an automatic index
+  — a `UNIQUE` column, a text or composite `PRIMARY KEY` — keeps its text too:
+  the rewrite writes those indexes with the number the declaration gives them,
+  which is what a rebuild could not do. Only the table the DDL itself changed, a
+  `GENERATED` column and a `WITHOUT ROWID` table are rebuilt, and
+  `--mirror-report` prints a `mirror-lost:` line naming each. The file keeps its
+  rows and its integrity; a rebuilt table loses the rules it had, loudly.
 - **A written file carries the keys the model holds.** A primary key is declared
   in the table text — text, composite or the `INTEGER` rowid alias — and its
   index is written the way SQLite writes the index a declaration implies, as a

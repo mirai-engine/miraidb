@@ -43,6 +43,10 @@ Sqlite_Table :: struct {
 	// the engine cannot recreate is a constraint the import silently drops (D33).
 	primary_group: []int,
 	unique_groups: [dynamic][]int,
+	// key_order holds every key group in the order SQLite creates its automatic
+	// indexes from the declaration, rowid alias excluded. A rewrite that keeps the
+	// text has to spell those indexes with these numbers (D27).
+	key_order:     [dynamic][]int,
 }
 
 // Sqlite_Index is one sqlite_master row of type index whose SQL SQLite stored.
@@ -569,14 +573,22 @@ sqlite_constraints_from_sql :: proc(sql: string, table: ^Sqlite_Table, alloc: me
 	position := 0
 	for item in items {
 		upper := strings.to_upper(item, context.temp_allocator)
-		if _, is_column := sqlite_parse_column(item, context.temp_allocator); is_column {
+		if column, is_column := sqlite_parse_column(item, context.temp_allocator); is_column {
 			if position < len(table.columns) && sqlite_has_word(upper, "UNIQUE") &&
-			   !table.columns[position].primary_key {
+			   !column.primary_key {
 				// A column-level UNIQUE names just that column: there is no list
 				// to read, and an empty group would be written as UNIQUE ().
 				group := make([]int, 1, alloc)
 				group[0] = position
 				append(&table.unique_groups, group)
+				append(&table.key_order, group)
+			} else if column.primary_key && !sqlite_declared_integer(column.declared) {
+				// Owned by unique_groups so the destroy loop frees it once; the
+				// import skips a group that repeats the column's key.
+				group := make([]int, 1, alloc)
+				group[0] = position
+				append(&table.unique_groups, group)
+				append(&table.key_order, group)
 			}
 			position += 1
 			continue
@@ -585,6 +597,11 @@ sqlite_constraints_from_sql :: proc(sql: string, table: ^Sqlite_Table, alloc: me
 		if !primary && !sqlite_has_word(upper, "UNIQUE") do continue
 		positions := sqlite_group_key(upper, item, table.columns, alloc)
 		if len(positions) == 0 do continue
+		// An INTEGER PRIMARY KEY in a rowid table is the rowid, and SQLite makes
+		// no index for it, so it takes no automatic number.
+		rowid_alias := primary && len(positions) == 1 &&
+			sqlite_declared_integer(table.columns[positions[0]].declared)
+		if !rowid_alias do append(&table.key_order, positions)
 		if primary {
 			if len(positions) == 1 {
 				table.columns[positions[0]].primary_key = true
@@ -658,6 +675,11 @@ sqlite_unquote_ident :: proc(text: string) -> string {
 
 // sqlite_has_word looks for a keyword outside quoted text, so a DEFAULT holding
 // the word does not count as the constraint.
+@(private)
+sqlite_declared_integer :: proc(declared: string) -> bool {
+	return strings.equal_fold(strings.trim_space(declared), "INTEGER")
+}
+
 @(private)
 sqlite_has_word :: proc(upper: string, word: string) -> bool {
 	from := 0
@@ -807,6 +829,9 @@ sqlite_file_destroy :: proc(file: ^Sqlite_File) {
 		delete(table.primary_group, file.alloc)
 		for group in table.unique_groups do delete(group, file.alloc)
 		delete(table.unique_groups)
+		// Every group in key_order is owned by unique_groups or primary_group, so
+		// this frees the array and not the groups.
+		delete(table.key_order)
 	}
 	for &index in file.indexes {
 		delete(index.name, file.alloc)
