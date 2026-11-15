@@ -88,7 +88,12 @@ def main() -> int:
             os.makedirs("bin", exist_ok=True)
             build(args.odin, tool)
             print("tracked allocations per statement:")
-            if run_tool(tool, 200) != 0:
+            status = run_tool(tool, 200)
+            # The tool cannot close its store (see the note in its main.odin), so the
+            # directory it leaves is removed here.
+            import shutil
+            shutil.rmtree("_leakcheck_db", ignore_errors=True)
+            if status != 0:
                 print("leaks: a shape left more allocations than its budget", file=sys.stderr)
                 return 1
 
