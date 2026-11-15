@@ -1071,6 +1071,24 @@ a `.sqlite` file into memory without saying so, which for a 250 000-row file is
 returns `MIRAIDB_ERROR` with "cancelled" in `miraidb_errmsg`; a read-only open
 refuses `INSERT`; the header documents the model.
 
+**Done so far.** The two caps reach C: `miraidb_set_row_quota`,
+`miraidb_set_work_budget`, `miraidb_work_used`, and `miraidb_interrupt` /
+`sqlite3_interrupt` stop a running statement; the next statement starts with a
+clean flag. The `sqlite3_*` face answers SQLite's primary result codes —
+`SQLITE_CONSTRAINT` (19), `SQLITE_MISMATCH` (20), `SQLITE_INTERRUPT` (9),
+`SQLITE_BUSY` (5), `SQLITE_READONLY` (8), `SQLITE_AUTH` (23), `SQLITE_TOOBIG`
+(13), `SQLITE_NOTADB` (26) and the rest — and `sqlite3_errcode` reports the code
+the failing call returned. `include/miraidb.h` documents the caps, the interrupt
+and the misuse contract. `scripts/capi_smoke.py` and
+`scripts/sqlite_abi_smoke.py` exercise all of it.
+
+**What is left.** Open options (read-only, durability, in-memory) on
+`miraidb_open`, an identity/token so roles and policies are reachable from C, and
+a written thread-safety statement (one connection, one thread, as today). Also:
+`miraidb_open` imports a `.sqlite` file into memory without saying so, and the
+extended result codes are not implemented (`sqlite3_extended_result_codes` is
+accepted and ignored).
+
 **Cost.** M.
 
 ## D26 — Docs whose claims are executed — **done** (see `docs/roadmap.md`, closed)

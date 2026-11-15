@@ -191,6 +191,8 @@ and `upper` folds the whole of Unicode where SQLite folds ASCII only.
 | Extension loading | done | `LOAD EXTENSION <name> AT 'host:port'` runs it out of process; the ABI is v1/v2 |
 | VFS layer | done | OS, memory and quota backends; the commit log, the page files and the statistics file go through it |
 | Backup API | done | `miraidb_backup` in the C ABI, `VACUUM INTO` in SQL |
+| Result codes | done | the `sqlite3_*` face answers SQLite's primary codes: `SQLITE_CONSTRAINT` (19) for a duplicate key or a null in a key column, `SQLITE_MISMATCH` (20) for a type the comparison cannot reconcile, `SQLITE_INTERRUPT` (9) when a cancellation landed, `SQLITE_RANGE` (25) for a bind past the parameters, and `SQLITE_ERROR` (1) for a syntax error or a missing table, which is what SQLite does too. `sqlite3_errcode` reports the same code the failing call returned |
+| Caps and interrupt | done | `miraidb_set_row_quota` and `miraidb_set_work_budget` cap one statement and `miraidb_work_used` reports the spend; `miraidb_interrupt` and `sqlite3_interrupt` ask a running statement to stop. A cap belongs to the connection's session and reaches nothing in the log, and the next statement starts with a clean cancel flag, so an interrupted connection stays usable |
 
 ## The course harness
 

@@ -7,7 +7,7 @@ Run with a Python that can load the platform library:
 from __future__ import annotations
 import ctypes, os, shutil, sqlite3, sys
 
-OK, ERROR, MISUSE, ROW, DONE, RANGE = 0, 1, 21, 100, 101, 25
+OK, ERROR, CONSTRAINT, MISUSE, ROW, DONE, RANGE = 0, 1, 19, 21, 100, 101, 25
 
 
 def load(path):
@@ -259,6 +259,28 @@ def main() -> int:
     empty_check.close()
     assert empty_integrity == "ok", empty_integrity
     assert remaining == 0, remaining
+
+    # A failure carries the result code SQLite uses for it (D25): a duplicate is
+    # SQLITE_CONSTRAINT (19), a syntax error is SQLITE_ERROR (1), errcode agrees
+    # with what step returned, and an interrupt ends the running statement
+    # without poisoning the connection.
+    coded = ctypes.c_void_p()
+    assert lib.sqlite3_open(b":memory:", ctypes.byref(coded)) == OK
+    lib.sqlite3_exec.restype = ctypes.c_int
+    lib.sqlite3_errcode.restype = ctypes.c_int
+    lib.sqlite3_errcode.argtypes = [ctypes.c_void_p]
+    assert lib.sqlite3_exec(coded, b"CREATE TABLE c (id INTEGER PRIMARY KEY, s TEXT UNIQUE)", None, None, None) == OK
+    assert lib.sqlite3_exec(coded, b"INSERT INTO c VALUES (1, 'a')", None, None, None) == OK
+    assert lib.sqlite3_exec(coded, b"INSERT INTO c VALUES (2, 'a')", None, None, None) == CONSTRAINT, "a duplicate key is a constraint"
+    assert lib.sqlite3_errcode(coded) == CONSTRAINT, "errcode names the same condition"
+    assert lib.sqlite3_exec(coded, b"INSERT INTO c VALUES (3, 'b')", None, None, None) == OK
+    assert lib.sqlite3_errcode(coded) == OK
+    assert lib.sqlite3_exec(coded, b"SELECT (((", None, None, None) == ERROR, "a syntax error is a plain error"
+    assert lib.sqlite3_errcode(coded) == ERROR
+    lib.sqlite3_interrupt.argtypes = [ctypes.c_void_p]
+    lib.sqlite3_interrupt(coded)
+    assert lib.sqlite3_exec(coded, b"SELECT count(*) FROM c", None, None, None) == OK, "an interrupted connection still works"
+    assert lib.sqlite3_close(coded) == OK
 
     # A dead handle is misuse, not memory (D29): the sqlite3 face answers
     # SQLITE_MISUSE to a statement used after finalize or through a closed

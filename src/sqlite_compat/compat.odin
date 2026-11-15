@@ -19,8 +19,23 @@ import engine "../engine"
 
 SQLITE_OK :: c.int(0)
 SQLITE_ERROR :: c.int(1)
+// The primary result codes a caller switches on. They are SQLite's numbers, so a
+// program written against the classic API reads the same reason it always did
+// (D25): a duplicate key is SQLITE_CONSTRAINT, an interrupted statement is
+// SQLITE_INTERRUPT, and so on.
+SQLITE_BUSY :: c.int(5)
+SQLITE_NOMEM :: c.int(7)
+SQLITE_READONLY :: c.int(8)
+SQLITE_INTERRUPT :: c.int(9)
+SQLITE_IOERR :: c.int(10)
+SQLITE_CORRUPT :: c.int(11)
+SQLITE_TOOBIG :: c.int(13)
+SQLITE_CONSTRAINT :: c.int(19)
+SQLITE_MISMATCH :: c.int(20)
 SQLITE_MISUSE :: c.int(21)
+SQLITE_AUTH :: c.int(23)
 SQLITE_RANGE :: c.int(25)
+SQLITE_NOTADB :: c.int(26)
 SQLITE_ROW :: c.int(100)
 SQLITE_DONE :: c.int(101)
 
@@ -33,6 +48,7 @@ SQLITE_NULL :: c.int(5)
 Database :: struct {
 	conn:         ^engine.Embed_Conn,
 	last_changes: c.int,
+	last_code:    c.int,  // what sqlite3_errcode answers
 	last_error:   string, // owned, NUL-terminated
 	in_memory:    bool,
 	// statements is what this connection handed out and has not finalized, so a
@@ -95,6 +111,57 @@ set_error :: proc(db: ^Database, text: string) {
 	if db == nil do return
 	delete(db.last_error)
 	db.last_error = strings.clone(text)
+}
+
+// sqlite_code names an engine error with the result code SQLite reports for the
+// same condition. The names are the contract: a caller that tests for
+// SQLITE_CONSTRAINT after an INSERT keeps working (D25).
+@(private)
+sqlite_code :: proc(err: engine.Error) -> c.int {
+	switch err.kind {
+	case .None:
+		return SQLITE_OK
+	case .Duplicate_Primary_Key, .Duplicate_Unique, .Not_Null_Violation:
+		return SQLITE_CONSTRAINT
+	case .Invalid_Type:
+		return SQLITE_MISMATCH
+	case .Out_Of_Memory:
+		return SQLITE_NOMEM
+	case .Quota_Exceeded:
+		return SQLITE_TOOBIG
+	case .Cancelled:
+		return SQLITE_INTERRUPT
+	case .Locked:
+		return SQLITE_BUSY
+	case .Transaction_Read_Only:
+		return SQLITE_READONLY
+	case .Permission_Denied:
+		return SQLITE_AUTH
+	case .Io:
+		return SQLITE_IOERR
+	case .Corrupt_Log:
+		return SQLITE_CORRUPT
+	case .Format_Too_New:
+		return SQLITE_NOTADB
+	case .Invalid_Argument, .Table_Not_Found, .Table_Exists, .Column_Not_Found,
+	     .Index_Exists, .Index_Not_Found, .No_Primary_Key, .Auto_Increment_Requires_Integer,
+	     .Sql_Syntax, .Sql_Unsupported, .Sql_Not_A_Query, .Transaction_Closed,
+	     .Internal, .Incomplete:
+		// SQLite reports these as a plain error with the message saying which, and
+		// so do we: inventing a code would be a difference nobody asked for.
+		return SQLITE_ERROR
+	}
+	return SQLITE_ERROR
+}
+
+// fail records the message and the code together, so sqlite3_errcode answers
+// what the last step or exec returned.
+@(private)
+fail :: proc(db: ^Database, err: engine.Error) -> c.int {
+	set_error(db, err.message)
+	code := sqlite_code(err)
+	if db != nil do db.last_code = code
+	return code
 }
 
 @(export)
@@ -173,7 +240,20 @@ sqlite3_errcode :: proc "c" (handle: rawptr) -> c.int {
 	context = runtime.default_context()
 	db := db_of(handle)
 	if db == nil do return SQLITE_ERROR
-	return len(engine.embed_error(db.conn)) > 0 ? SQLITE_ERROR : SQLITE_OK
+	// The code the last exec or step answered, so a caller can tell a duplicate
+	// key (19) from a syntax error (1) without parsing the message (D25).
+	return db.last_code
+}
+
+// sqlite3_interrupt asks the statement that is running, on any thread, to stop.
+// The next statement starts with a clean flag, so interrupting a connection does
+// not poison it, which is what SQLite documents (D25).
+@(export)
+sqlite3_interrupt :: proc "c" (handle: rawptr) {
+	context = runtime.default_context()
+	db := db_of(handle)
+	if db == nil do return
+	engine.store_cancel(db.conn.store)
 }
 
 @(export)
@@ -200,9 +280,9 @@ sqlite3_exec :: proc "c" (handle: rawptr, sql: cstring, callback: rawptr, arg: r
 	db := db_of(handle)
 	if db == nil || sql == nil do return SQLITE_MISUSE
 	if err := engine.embed_exec(db.conn, string(sql)); err.kind != .None {
-		set_error(db, err.message)
-		return SQLITE_ERROR
+		return fail(db, err)
 	}
+	db.last_code = SQLITE_OK
 	return SQLITE_OK
 }
 
@@ -333,8 +413,7 @@ sqlite3_step :: proc "c" (handle: rawptr) -> c.int {
 	if stmt == nil do return SQLITE_MISUSE
 	has_row, err := engine.embed_step(stmt.stmt)
 	if err.kind != .None {
-		set_error(stmt.db, err.message)
-		return SQLITE_ERROR
+		return fail(stmt.db, err)
 	}
 	if has_row do return SQLITE_ROW
 	if stmt.db != nil do stmt.db.last_changes = c.int(engine.embed_changes(stmt.stmt))
@@ -475,8 +554,6 @@ sqlite3_extended_result_codes :: proc "c" (handle: rawptr, onoff: c.int) -> c.in
 
 
 // --- Incremental BLOB I/O --------------------------------------------------
-
-SQLITE_READONLY :: c.int(8)
 
 @(export)
 sqlite3_blob_open :: proc "c" (

@@ -123,6 +123,9 @@ embed_succeed :: proc(conn: ^Embed_Conn) {
 // embed_exec runs one statement without parameters.
 embed_exec :: proc(conn: ^Embed_Conn, sql: string) -> Error {
 	if conn == nil do return errf(.Invalid_Argument, "no connection")
+	// A cancellation belongs to the statement it interrupted: the next one starts
+	// with a clean flag, so an interrupted connection is still usable (D25).
+	store_clear_cancel(conn.store)
 	result, exec_err := sql_execute(conn.store, sql)
 	if exec_err.kind != .None do return embed_fail(conn, exec_err)
 	sql_result_destroy(&result)
@@ -144,6 +147,7 @@ embed_backup :: proc(conn: ^Embed_Conn, path: string) -> Error {
 // embed_exec_params runs one statement with positional parameters.
 embed_exec_params :: proc(conn: ^Embed_Conn, sql: string, params: []Value) -> Error {
 	if conn == nil do return errf(.Invalid_Argument, "no connection")
+	store_clear_cancel(conn.store)
 	result, exec_err := sql_execute_params(conn.store, sql, params)
 	if exec_err.kind != .None do return embed_fail(conn, exec_err)
 	sql_result_destroy(&result)
@@ -274,6 +278,7 @@ embed_start :: proc(stmt: ^Embed_Statement) -> Error {
 		}
 		stmt.prepared = prepared
 	}
+	store_clear_cancel(stmt.conn.store)
 	result, exec_err := prepared_execute(stmt.conn.store, stmt.prepared, stmt.params[:])
 	if exec_err.kind != .None {
 		stmt.done = true

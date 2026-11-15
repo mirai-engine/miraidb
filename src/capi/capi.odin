@@ -378,6 +378,51 @@ miraidb_column_is_null :: proc "c" (handle: rawptr, index: c.int) -> c.int {
 	return engine.embed_column_is_null(stmt.embed, int(index)) ? 1 : 0
 }
 
+// miraidb_set_row_quota caps how many rows one statement may produce (zero
+// removes the cap). It is a property of the connection's session, like SQLite's
+// limit API, and nothing about it reaches the log (D23).
+@(export)
+miraidb_set_row_quota :: proc "c" (handle: rawptr, rows: c.ulonglong) -> c.int {
+	context = runtime.default_context()
+	conn := capi_conn(handle)
+	if conn == nil do return MIRAIDB_MISUSE
+	engine.store_set_row_quota(conn.embed.store, u64(rows))
+	return MIRAIDB_OK
+}
+
+// miraidb_set_work_budget caps the work one statement may spend, in the same
+// units miraidb_work_used reports (zero removes the cap).
+@(export)
+miraidb_set_work_budget :: proc "c" (handle: rawptr, units: c.ulonglong) -> c.int {
+	context = runtime.default_context()
+	conn := capi_conn(handle)
+	if conn == nil do return MIRAIDB_MISUSE
+	engine.store_set_work_budget(conn.embed.store, u64(units))
+	return MIRAIDB_OK
+}
+
+// miraidb_work_used is what the statements on this connection have spent so far.
+@(export)
+miraidb_work_used :: proc "c" (handle: rawptr) -> c.ulonglong {
+	context = runtime.default_context()
+	conn := capi_conn(handle)
+	if conn == nil do return 0
+	return c.ulonglong(engine.store_work_used(conn.embed.store))
+}
+
+// miraidb_interrupt asks the statement that is running - on any thread - to stop.
+// The next statement starts with a clean flag, the way SQLite's interrupt works,
+// so a cancelled statement does not poison the connection (SQLITE_INTERRUPT in
+// the sqlite3 face). A call with a dead handle is misuse and does nothing.
+@(export)
+miraidb_interrupt :: proc "c" (handle: rawptr) -> c.int {
+	context = runtime.default_context()
+	conn := capi_conn(handle)
+	if conn == nil do return MIRAIDB_MISUSE
+	engine.store_cancel(conn.embed.store)
+	return MIRAIDB_OK
+}
+
 @(export)
 miraidb_version :: proc "c" () -> cstring {
 	context = runtime.default_context()

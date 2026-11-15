@@ -91,6 +91,19 @@ const char *miraidb_column_text(miraidb_stmt stmt, int index);
 const void *miraidb_column_bytes(miraidb_stmt stmt, int index, int *length);
 int         miraidb_column_is_null(miraidb_stmt stmt, int index);
 
+/* Caps for one statement. Both belong to the connection's session, are not part
+ * of the database, and survive a commit; zero removes the cap. A statement that
+ * overruns either is refused with MIRAIDB_ERROR and miraidb_errmsg names which
+ * cap it hit. miraidb_work_used reports what this connection has spent so far. */
+int          miraidb_set_row_quota(miraidb_conn db, unsigned long long rows);
+int          miraidb_set_work_budget(miraidb_conn db, unsigned long long units);
+unsigned long long miraidb_work_used(miraidb_conn db);
+
+/* Asks the statement running on any thread to stop; the next statement on this
+ * connection starts with a clean flag, so an interrupted call leaves the
+ * connection usable. A dead handle answers MIRAIDB_MISUSE and does nothing. */
+int miraidb_interrupt(miraidb_conn db);
+
 const char *miraidb_version(void);
 
 #ifdef __cplusplus

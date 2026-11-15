@@ -52,6 +52,14 @@ def load(path: str):
     lib.miraidb_column_is_null.argtypes = [ctypes.c_void_p, ctypes.c_int]
     lib.miraidb_column_is_null.restype = ctypes.c_int
     lib.miraidb_version.restype = ctypes.c_char_p
+    for name in ("miraidb_set_row_quota", "miraidb_set_work_budget"):
+        function = getattr(lib, name)
+        function.argtypes = [ctypes.c_void_p, ctypes.c_ulonglong]
+        function.restype = ctypes.c_int
+    lib.miraidb_work_used.argtypes = [ctypes.c_void_p]
+    lib.miraidb_work_used.restype = ctypes.c_ulonglong
+    lib.miraidb_interrupt.argtypes = [ctypes.c_void_p]
+    lib.miraidb_interrupt.restype = ctypes.c_int
     return lib
 
 
@@ -162,11 +170,34 @@ def main() -> int:
     assert lib.miraidb_step(orphan) == MISUSE, "a statement of a closed connection is misuse"
     lib.miraidb_finalize(orphan)
 
+    # The two caps D23 built are reachable from C, and the message names which one
+    # was hit. A cap is a session property: setting it back to zero restores the
+    # statement, and work_used reports what this connection has spent.
+    assert lib.miraidb_set_row_quota(db, 1) == OK
+    assert lib.miraidb_exec(db, b"SELECT * FROM t") == ERROR
+    assert "more than 1 rows" in lib.miraidb_errmsg(db).decode()
+    assert lib.miraidb_set_row_quota(db, 0) == OK
+    assert lib.miraidb_exec(db, b"SELECT * FROM t") == OK
+
+    assert lib.miraidb_set_work_budget(db, 1) == OK
+    assert lib.miraidb_exec(db, b"SELECT * FROM t") == ERROR
+    assert "budget is 1" in lib.miraidb_errmsg(db).decode()
+    assert lib.miraidb_work_used(db) > 0
+    assert lib.miraidb_set_work_budget(db, 0) == OK
+
+    # Interrupt asks a running statement to stop. The flag belongs to that
+    # statement: the next one starts clean, so the connection stays usable, and a
+    # dead handle answers MIRAIDB_MISUSE instead of touching freed memory.
+    assert lib.miraidb_interrupt(db) == OK
+    assert lib.miraidb_exec(db, b"SELECT count(*) FROM t") == OK
+
     # The error path reports a message instead of crashing.
     assert lib.miraidb_exec(db, b"SELECT * FROM missing") == ERROR
     message = lib.miraidb_errmsg(db).decode()
     assert "missing" in message, message
     lib.miraidb_close(db)
+    assert lib.miraidb_set_row_quota(db, 5) == MISUSE, "a dead handle is misuse"
+    assert lib.miraidb_interrupt(db) == MISUSE
     print("rows:", rows)
     print("error path:", message)
     print("capi smoke: ok")
