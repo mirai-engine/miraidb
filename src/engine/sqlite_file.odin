@@ -37,11 +37,18 @@ Sqlite_Table :: struct {
 	// pk_position is the column index of INTEGER PRIMARY KEY, which SQLite
 	// stores as the rowid and leaves null inside the record.
 	pk_position:   int,
+	// primary_group and unique_groups are the column positions of a table-level
+	// PRIMARY KEY or UNIQUE clause. A single-column key travels as
+	// `column.primary_key`; these hold what a column cannot say, because a key
+	// the engine cannot recreate is a constraint the import silently drops (D33).
+	primary_group: []int,
+	unique_groups: [dynamic][]int,
 }
 
 // Sqlite_Index is one sqlite_master row of type index whose SQL SQLite stored.
-// An automatic index (`sqlite_autoindex_*`) has no SQL and is skipped: it only
-// mirrors a UNIQUE constraint, and the recreated table does not carry one.
+// An automatic index (`sqlite_autoindex_*`) has no SQL, so the constraint it
+// mirrors is read from the table text instead and recreated as a table-level key
+// (sqlite_constraints_from_sql).
 // Sqlite_Object is a catalog entry the engine does not model: a view or a
 // trigger. Its SQL is kept verbatim, because a rewrite that dropped it would
 // delete part of the user's database (D27).
@@ -467,6 +474,7 @@ sqlite_master_visit :: proc(user: rawptr, rowid: i64, payload: []u8) -> bool {
 		columns   = sqlite_columns_from_sql(sql.kind == .String ? sql.s : "", ctx.file.alloc),
 	}
 	table.without_rowid = sqlite_contains_word(table.sql, "WITHOUT ROWID")
+	sqlite_constraints_from_sql(table.sql, &table, ctx.file.alloc)
 	for column, i in table.columns {
 		if column.primary_key && strings.equal_fold(column.declared, "INTEGER") {
 			table.pk_position = i
@@ -483,14 +491,14 @@ sqlite_contains_word :: proc(haystack, word: string) -> bool {
 	return strings.contains(upper, word)
 }
 
-// sqlite_columns_from_sql extracts the column list of a CREATE TABLE statement.
-// It is a small scanner, not a full parser: it splits the top-level parenthesised
-// list on commas, then reads each item's name, declared type and the NOT NULL /
-// PRIMARY KEY flags.
-sqlite_columns_from_sql :: proc(sql: string, alloc: mem.Allocator) -> []Sqlite_Column {
-	columns := make([dynamic]Sqlite_Column, 0, 8, alloc)
+// sqlite_table_items splits the top-level parenthesised list of a CREATE TABLE
+// statement on the commas that separate its items. It is the one scanner the
+// column reader and the constraint reader share.
+@(private)
+sqlite_table_items :: proc(sql: string, alloc: mem.Allocator) -> []string {
+	items := make([dynamic]string, 0, 8, alloc)
 	open := strings.index_rune(sql, '(')
-	if open < 0 do return columns[:]
+	if open < 0 do return items[:]
 	depth := 0
 	start := open + 1
 	end := -1
@@ -507,7 +515,7 @@ sqlite_columns_from_sql :: proc(sql: string, alloc: mem.Allocator) -> []Sqlite_C
 		}
 		if end >= 0 do break
 	}
-	if end < 0 do return columns[:]
+	if end < 0 do return items[:]
 	body := sql[start:end]
 	item_start := 0
 	depth = 0
@@ -532,12 +540,142 @@ sqlite_columns_from_sql :: proc(sql: string, alloc: mem.Allocator) -> []Sqlite_C
 			continue
 		}
 		if c == ',' && depth == 0 {
-			item := strings.trim_space(body[item_start:i])
+			append(&items, strings.trim_space(body[item_start:i]))
 			item_start = i + 1
-			if column, ok := sqlite_parse_column(item, alloc); ok do append(&columns, column)
 		}
 	}
+	return items[:]
+}
+
+// sqlite_columns_from_sql extracts the column list of a CREATE TABLE statement.
+// It is a small scanner, not a full parser: it reads each item's name, declared
+// type and the NOT NULL / PRIMARY KEY flags.
+sqlite_columns_from_sql :: proc(sql: string, alloc: mem.Allocator) -> []Sqlite_Column {
+	columns := make([dynamic]Sqlite_Column, 0, 8, alloc)
+	items := sqlite_table_items(sql, context.temp_allocator)
+	for item in items {
+		if column, ok := sqlite_parse_column(item, alloc); ok do append(&columns, column)
+	}
 	return columns[:]
+}
+
+// sqlite_constraints_from_sql reads the key clauses of a CREATE TABLE statement
+// into the table it describes. A single-column table-level key becomes the
+// column's own flag; anything wider stays a group, so an import can recreate it
+// and the imported table refuses a duplicate (D33).
+@(private)
+sqlite_constraints_from_sql :: proc(sql: string, table: ^Sqlite_Table, alloc: mem.Allocator) {
+	items := sqlite_table_items(sql, context.temp_allocator)
+	position := 0
+	for item in items {
+		upper := strings.to_upper(item, context.temp_allocator)
+		if _, is_column := sqlite_parse_column(item, context.temp_allocator); is_column {
+			if position < len(table.columns) && sqlite_has_word(upper, "UNIQUE") &&
+			   !table.columns[position].primary_key {
+				// A column-level UNIQUE names just that column: there is no list
+				// to read, and an empty group would be written as UNIQUE ().
+				group := make([]int, 1, alloc)
+				group[0] = position
+				append(&table.unique_groups, group)
+			}
+			position += 1
+			continue
+		}
+		primary := sqlite_has_word(upper, "PRIMARY")
+		if !primary && !sqlite_has_word(upper, "UNIQUE") do continue
+		positions := sqlite_group_key(upper, item, table.columns, alloc)
+		if len(positions) == 0 do continue
+		if primary {
+			if len(positions) == 1 {
+				table.columns[positions[0]].primary_key = true
+				table.columns[positions[0]].not_null = true
+			} else {
+				table.primary_group = positions
+			}
+			continue
+		}
+		append(&table.unique_groups, positions)
+	}
+}
+
+// sqlite_group_key maps the parenthesised column list that follows a key word to
+// column positions.
+@(private)
+sqlite_group_key :: proc(upper, item: string, columns: []Sqlite_Column, alloc: mem.Allocator) -> []int {
+	positions := make([dynamic]int, 0, 2, alloc)
+	open := strings.index_rune(item, '(')
+	if open < 0 do return positions[:]
+	close := -1
+	depth := 0
+	in_quote: u8 = 0
+	for i in open ..< len(item) {
+		c := item[i]
+		if in_quote != 0 {
+			if c == in_quote do in_quote = 0
+			continue
+		}
+		if c == '"' || c == '\'' || c == '`' || c == '[' {
+			in_quote = c == '[' ? u8(']') : c
+			continue
+		}
+		if c == '(' {
+			depth += 1
+			continue
+		}
+		if c == ')' {
+			depth -= 1
+			if depth == 0 {
+				close = i
+				break
+			}
+		}
+	}
+	if close < 0 do return positions[:]
+	for part in strings.split(item[open + 1:close], ",") {
+		name := sqlite_unquote_ident(strings.trim_space(part))
+		for column, i in columns {
+			if strings.equal_fold(column.name, name) {
+				append(&positions, i)
+				break
+			}
+		}
+	}
+	return positions[:]
+}
+
+@(private)
+sqlite_unquote_ident :: proc(text: string) -> string {
+	if len(text) >= 2 {
+		switch text[0] {
+		case '"', '\'', '`':
+			if text[len(text) - 1] == text[0] do return text[1:len(text) - 1]
+		case '[':
+			if text[len(text) - 1] == ']' do return text[1:len(text) - 1]
+		}
+	}
+	return text
+}
+
+// sqlite_has_word looks for a keyword outside quoted text, so a DEFAULT holding
+// the word does not count as the constraint.
+@(private)
+sqlite_has_word :: proc(upper: string, word: string) -> bool {
+	from := 0
+	for {
+		at := strings.index(upper[from:], word)
+		if at < 0 do return false
+		at += from
+		before_ok := at == 0 || !sqlite_word_byte(upper[at - 1])
+		after := at + len(word)
+		after_ok := after >= len(upper) || !sqlite_word_byte(upper[after])
+		if before_ok && after_ok do return true
+		from = at + 1
+	}
+}
+
+@(private)
+sqlite_word_byte :: proc(c: u8) -> bool {
+	return c == '_' || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
 }
 
 @(private)
@@ -666,6 +804,9 @@ sqlite_file_destroy :: proc(file: ^Sqlite_File) {
 			delete(column.declared, file.alloc)
 		}
 		delete(table.columns, file.alloc)
+		delete(table.primary_group, file.alloc)
+		for group in table.unique_groups do delete(group, file.alloc)
+		delete(table.unique_groups)
 	}
 	for &index in file.indexes {
 		delete(index.name, file.alloc)
@@ -755,7 +896,22 @@ sqlite_import :: proc(
 			strings.write_byte(&create, ' ')
 			strings.write_string(&create, column_type_name(Column_Type{kind = column.inferred}))
 			if column.not_null do strings.write_string(&create, " NOT NULL")
-			if i == table.pk_position do strings.write_string(&create, " PRIMARY KEY")
+			// A text key is declared inline here even though the engine keeps it as
+			// an index: the import only has to hand the engine a schema it accepts,
+			// and an export writes the key as an index row (D33).
+			if column.primary_key do strings.write_string(&create, " PRIMARY KEY")
+		}
+		// A key wider than one column, or a text key, is declared as a table
+		// constraint: the engine keeps it as an index and enforces it, and an
+		// export then carries it as an index row (D33).
+		if len(table.primary_group) > 0 {
+			strings.write_string(&create, ", PRIMARY KEY (")
+			sqlite_write_group(&create, &table, table.primary_group)
+		}
+		for group in table.unique_groups {
+			if len(group) == 1 && table.columns[group[0]].primary_key do continue
+			strings.write_string(&create, ", UNIQUE (")
+			sqlite_write_group(&create, &table, group)
 		}
 		strings.write_string(&create, ")")
 		if _, create_err := sql_execute_in_tx(tx, strings.to_string(create)); create_err.kind != .None {
@@ -808,6 +964,17 @@ sqlite_import :: proc(
 	// store: a rewrite re-emits it for every object it does not change (D27).
 	store_mirror_keep(store, file)
 	return tables, rows, ERROR_NONE
+}
+
+@(private)
+sqlite_write_group :: proc(builder: ^strings.Builder, table: ^Sqlite_Table, group: []int) {
+	for position, i in group {
+		if i > 0 do strings.write_string(builder, ", ")
+		if position >= 0 && position < len(table.columns) {
+			sqlite_write_ident(builder, table.columns[position].name)
+		}
+	}
+	strings.write_byte(builder, ')')
 }
 
 // sqlite_index_without_where drops a trailing WHERE clause, which is what makes

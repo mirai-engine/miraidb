@@ -6986,6 +6986,135 @@ test_sqlite_live_mirror :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_keys_cross_a_sqlite_file_both_ways :: proc(t: ^testing.T) {
+	// A written file carries every key the model holds (D33). The primary key of
+	// a text column and a UNIQUE column travel as index rows, because an inline
+	// constraint would ask SQLite for an automatic index (sqlite_autoindex_*)
+	// that the writer does not produce, and SQLite calls such a file malformed.
+	path := "_test_keys_round_trip.db"
+	os.remove(path)
+	source := fresh_db(t, "keys_source")
+	if source == nil do return
+	run(t, source, "CREATE TABLE k (code TEXT PRIMARY KEY, v INTEGER)")
+	run(t, source, "INSERT INTO k (code, v) VALUES ('a', 1)")
+	run(t, source, "CREATE TABLE u (id INTEGER PRIMARY KEY, code TEXT UNIQUE)")
+	run(t, source, "INSERT INTO u (id, code) VALUES (1, 'x')")
+	run(t, source, "CREATE TABLE cp (a INTEGER, b INTEGER, PRIMARY KEY (a, b))")
+	run(t, source, "INSERT INTO cp (a, b) VALUES (1, 2)")
+	_, _, export_err := db.sqlite_file_write(source, path)
+	testing.expect(t, db.error_ok(export_err))
+	db.store_close(source)
+	os.remove_all("_test_keys_source")
+
+	file, file_err := db.sqlite_file_open(path)
+	if !testing.expectf(t, db.error_ok(file_err), "sqlite_file_open: %s", file_err.message) do return
+	defer db.sqlite_file_destroy(&file)
+	testing.expect_value(t, len(file.tables), 3)
+	// Each key is declared in the table text the way SQLite declares it, and the
+	// reader has to see it, or an import drops the constraint.
+	for table in file.tables {
+		switch table.name {
+		case "k":
+			testing.expect_value(t, table.columns[0].primary_key, true)
+			testing.expect_value(t, table.columns[0].not_null, true)
+		case "cp":
+			testing.expect_value(t, len(table.primary_group), 2)
+		case "u":
+			// The UNIQUE column is a named index row, so the text does not repeat
+			// it: a declaration here would ask for a second, automatic index.
+			testing.expect_value(t, len(table.unique_groups), 0)
+		}
+	}
+	// The key indexes are automatic ones: no SQL, because the declaration in the
+	// table text is what says what they are. The UNIQUE column is the only named
+	// index, and the integer key is the rowid, which needs none.
+	testing.expect_value(t, len(file.indexes), 1)
+	testing.expect_value(t, file.indexes[0].name, "u_code_key")
+
+	// The way back: the import recreates the keys, so the engine refuses what the
+	// engine refused before the trip.
+	store := fresh_db(t, "keys_import")
+	if store == nil do return
+	defer cleanup_db(store, "keys_import")
+	tables, rows, import_err := db.sqlite_import(&file, store)
+	testing.expect(t, db.error_ok(import_err))
+	testing.expect_value(t, tables, 3)
+	testing.expect_value(t, rows, 3)
+	duplicate_text := run_error(t, store, "INSERT INTO k (code, v) VALUES ('a', 9)")
+	testing.expect_value(t, duplicate_text.kind, db.Error_Kind.Duplicate_Primary_Key)
+	duplicate_unique := run_error(t, store, "INSERT INTO u (id, code) VALUES (9, 'x')")
+	testing.expect_value(t, duplicate_unique.kind, db.Error_Kind.Duplicate_Unique)
+	duplicate_composite := run_error(t, store, "INSERT INTO cp (a, b) VALUES (1, 2)")
+	testing.expect_value(t, duplicate_composite.kind, db.Error_Kind.Duplicate_Primary_Key)
+	null_key := run_error(t, store, "INSERT INTO k (code, v) VALUES (NULL, 1)")
+	testing.expect_value(t, null_key.kind, db.Error_Kind.Not_Null_Violation)
+	os.remove(path)
+}
+
+@(test)
+test_import_keeps_the_keys_sqlite_declared :: proc(t: ^testing.T) {
+	// SQLite spells a UNIQUE column and a composite key as table constraints and
+	// backs each with an automatic index that carries no SQL. The constraint has
+	// to be read from the table text, or the imported table accepts the duplicate
+	// the source file refused (D33).
+	file, open_err := db.sqlite_file_open("src/tests/fixtures/keys.sqlite")
+	if !testing.expectf(t, db.error_ok(open_err), "sqlite_file_open: %s", open_err.message) do return
+	defer db.sqlite_file_destroy(&file)
+	store := fresh_db(t, "keys_fixture")
+	if store == nil do return
+	defer cleanup_db(store, "keys_fixture")
+	tables, rows, import_err := db.sqlite_import(&file, store)
+	testing.expect(t, db.error_ok(import_err))
+	testing.expect_value(t, tables, 5)
+	testing.expect_value(t, rows, 9)
+	duplicates := []string{
+		"INSERT INTO k (code, v) VALUES ('a', 9)",
+		"INSERT INTO u (id, code, n) VALUES (9, 'x', 0)",
+		"INSERT INTO cu (a, b) VALUES (1, 2)",
+		"INSERT INTO cp (a, b) VALUES (1, 2)",
+		"INSERT INTO t3 (a, b, c) VALUES ('p', 'q', 'r')",
+	}
+	for statement in duplicates {
+		refusal := run_error(t, store, statement)
+		testing.expectf(t, refusal.kind != db.Error_Kind.None, "%s was accepted", statement)
+	}
+	// And the keys survive the way back out: the written text declares them and
+	// the automatic indexes follow it.
+	path := "_test_keys_fixture.db"
+	os.remove(path)
+	_, _, export_err := db.sqlite_file_write(store, path)
+	testing.expect(t, db.error_ok(export_err))
+	written, written_err := db.sqlite_file_open(path)
+	if !testing.expect(t, db.error_ok(written_err)) do return
+	defer {
+		db.sqlite_file_destroy(&written)
+		os.remove(path)
+	}
+	summary := strings.builder_make()
+	defer strings.builder_destroy(&summary)
+	for table in written.tables {
+		strings.write_string(&summary, table.name)
+		strings.write_byte(&summary, ':')
+		strings.write_int(&summary, len(table.primary_group))
+		strings.write_byte(&summary, '/')
+		strings.write_int(&summary, len(table.unique_groups))
+		if table.name == "k" && len(table.columns) > 0 && table.columns[0].primary_key {
+			strings.write_string(&summary, "pk")
+		}
+		strings.write_byte(&summary, ' ')
+	}
+	// A primary key comes back as text (its index is the automatic one); a UNIQUE
+	// or composite key comes back as a named index row, which is what carries it
+	// into a second write without asking for a second index.
+	testing.expect_value(t, strings.to_string(summary), "cp:2/0 cu:0/0 k:0/0pk t3:0/0 u:0/0 ")
+	names := make([dynamic]string, 0, 3)
+	defer delete(names)
+	for index in written.indexes do append(&names, index.name)
+	slice.sort_by(names[:], proc(a, b: string) -> bool { return a < b })
+	testing.expect_value(t, strings.join(names[:], ","), "cu_key_a_b,t3_key_a_b_c,u_key_code")
+}
+
+@(test)
 test_mirror_patches_only_the_pages_it_touched :: proc(t: ^testing.T) {
 	path := "_test_mirror_patch.db"
 	journal := "_test_mirror_patch.db-journal"

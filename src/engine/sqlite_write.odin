@@ -592,6 +592,26 @@ sqlite_index_sql :: proc(table: ^Table, index: Index_Schema) -> string {
 
 // --- Database --------------------------------------------------------------
 
+// sqlite_rowid_alias is the column SQLite stores as the table's rowid, and only
+// that one: a single INTEGER primary key. SQLite needs no index for it, because
+// the row's own key is the index.
+@(private)
+sqlite_rowid_alias :: proc(table: ^Table) -> int {
+	if len(table.schema.primary_key) != 1 do return -1
+	position := table.schema.primary_key[0]
+	if position < 0 || position >= len(table.schema.columns) do return -1
+	if table.schema.columns[position].type.kind != .Int do return -1
+	return position
+}
+
+@(private)
+sqlite_column_is_key :: proc(schema: ^Table_Schema, position: int) -> bool {
+	for key in schema.primary_key {
+		if key == position do return true
+	}
+	return false
+}
+
 @(private)
 sqlite_master_sql :: proc(table: ^Table) -> string {
 	builder := strings.builder_make()
@@ -603,12 +623,24 @@ sqlite_master_sql :: proc(table: ^Table) -> string {
 		sqlite_write_ident(&builder, column.name)
 		strings.write_byte(&builder, ' ')
 		strings.write_string(&builder, sqlite_type_name(column.type))
-		if column.not_null do strings.write_string(&builder, " NOT NULL")
+		// A key column is never NULL in this engine, and the exported table has
+		// to keep saying so: the PRIMARY KEY clause is written only for the rowid
+		// alias, and SQLite would let a NULL into a text key.
+		if column.not_null || sqlite_column_is_key(&table.schema, i) {
+			strings.write_string(&builder, " NOT NULL")
+		}
 	}
-	if len(table.schema.primary_key) == 1 {
-		position := table.schema.primary_key[0]
+	// The key is declared inline, as SQLite declares it, and its index is written
+	// as the automatic index a declaration implies (see the index loop). A text
+	// or composite key needs that index; without it SQLite reports the file as
+	// malformed (D33). A `UNIQUE` column is not declared here, because it would
+	// ask for an automatic index of its own; it travels as a named index instead.
+	if len(table.schema.primary_key) > 0 {
 		strings.write_string(&builder, ", PRIMARY KEY (")
-		sqlite_write_ident(&builder, table.schema.columns[position].name)
+		for position, i in table.schema.primary_key {
+			if i > 0 do strings.write_string(&builder, ", ")
+			sqlite_write_ident(&builder, table.schema.columns[position].name)
+		}
 		strings.write_byte(&builder, ')')
 	}
 	strings.write_string(&builder, ")")
@@ -678,13 +710,7 @@ sqlite_file_write :: proc(store: ^Store, path: string, alloc := context.allocato
 		defer table_collect_release(table, &collected)
 		exported := make([dynamic]Sqlite_Export_Row, 0, len(collected))
 		defer delete(exported)
-		rowid_column := -1
-		if len(table.schema.primary_key) == 1 {
-			position := table.schema.primary_key[0]
-			if table.schema.columns[position].type.kind == .Int {
-				rowid_column = position
-			}
-		}
+		rowid_column := sqlite_rowid_alias(table)
 		next_rowid := i64(1)
 		for row in collected {
 			if len(row.values) == 0 do continue
@@ -736,17 +762,34 @@ sqlite_file_write :: proc(store: ^Store, path: string, alloc := context.allocato
 		}
 		append(&master_rows, Sqlite_Export_Row{rowid = i64(len(master_rows) + 1), values = master})
 		tables += 1
-		// Secondary indexes: implicit ones (the rowid key) are not needed.
-		for index in table.schema.indexes {
-			if index.implicit do continue
+		// Secondary indexes. The rowid alias needs none; the key does, and it is
+		// named the way SQLite names the index a table constraint implies, with a
+		// NULL SQL: the declaration in the table's own text is what says what it
+		// is. A table whose original text was kept has no such row, because
+		// `mirror_text_keepable` refuses a text that declares a key (D33).
+		alias := sqlite_rowid_alias(table)
+		for &index in table.schema.indexes {
+			if index.implicit && len(index.columns) == 1 && index.columns[0] == alias do continue
 			index_root := sqlite_write_index_tree(&w, table, index, exported[:], alloc)
 			if index_root == 0 do continue
+			implied := !keep_text && index.unique && len(table.schema.primary_key) > 0 &&
+				schema_index_matches(&index, table.schema.primary_key)
 			index_row := make([]Value, 5)
 			index_row[0] = value_string("index")
-			index_row[1] = value_string(index.name)
+			if implied {
+				index_row[1] = value_string(
+					fmt.aprintf("sqlite_autoindex_%s_1", table.schema.name),
+				)
+			} else {
+				index_row[1] = value_string(index.name)
+			}
 			index_row[2] = value_string(table.schema.name)
 			index_row[3] = value_int(i64(index_root))
-			index_row[4] = value_string(sqlite_index_sql(table, index))
+			if implied {
+				index_row[4] = value_string("")
+			} else {
+				index_row[4] = value_string(sqlite_index_sql(table, index))
+			}
 			append(&master_rows, Sqlite_Export_Row{rowid = i64(len(master_rows) + 1), values = index_row})
 		}
 	}

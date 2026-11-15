@@ -197,13 +197,34 @@ What is still rebuilt from the engine's model, and now reported by
   `COLLATE` and a generated column;
 - any table whose declaration SQLite backs with an automatic index — a `UNIQUE`
   column, a non-`INTEGER` `PRIMARY KEY`, a composite key — or a `WITHOUT ROWID`
-  table, or one with a `GENERATED` column. The engine's model does not describe
-  those shapes, and re-emitting the text would declare an index the file does not
-  have (backlog D33 for the export side of it).
+  table, or one with a `GENERATED` column. Re-emitting that text would declare an
+  index whose number SQLite takes from the order the constraints appear in, and
+  the engine's model does not keep that order; the rebuild writes the keys as
+  index rows instead, so the constraint survives even though the text does not.
+  D33 built the export side of this; what is left is D27.
 
 Rows, indexes the engine knows, and file integrity survive in every case; a table
 rebuilt this way loses its rules and says so. A failed mirror write is reported through `last_error` and
 never fails the commit.
+
+## Keys in a written file
+
+The exported text declares the primary key the way SQLite declares it, including
+a text one and a composite one, and the index the declaration implies is written
+as SQLite writes it: a master row named `sqlite_autoindex_<table>_1` with no SQL,
+holding the key's b-tree. A file without that row is one SQLite refuses to read
+("wrong # of entries in index sqlite_autoindex_k_1"), which is what a text key
+used to produce. A `UNIQUE` column is the other way round: it travels as a named
+`CREATE UNIQUE INDEX` row and does not appear in the text, because a declaration
+would ask for a second, automatic index. The integer key that is the rowid gets
+neither, since the row's own key is the index.
+
+An import reads all of it back out of the table text — a column `UNIQUE`, a
+table-level `UNIQUE (a, b)`, a table-level `PRIMARY KEY (a, b)` — because the
+automatic index rows carry no SQL to read. `src/tests/fixtures/keys.sqlite` is
+that shape written by real `sqlite3`, and
+`test_import_keeps_the_keys_sqlite_declared` proves the constraint is enforced
+after the import and again after the export.
 
 ## Export determinism
 

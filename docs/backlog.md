@@ -829,7 +829,18 @@ parses the answer.
 
 **Cost.** S.
 
-## D33 — The export writes a schema it cannot back
+## D33 — The export writes a schema it cannot back — **done** (see `docs/roadmap.md`, closed)
+
+Closed by writing the key the way SQLite writes it: the table text declares the
+primary key (text, composite or rowid alias), its index is the automatic index the
+declaration implies (`sqlite_autoindex_<table>_1`, no SQL), and a `UNIQUE` column
+travels as a named index row. The import reads the key clauses back out of the
+table text. Measured both ways with real `sqlite3` and covered by
+`test_keys_cross_a_sqlite_file_both_ways` and
+`test_import_keeps_the_keys_sqlite_declared`. The plan below is the one that was
+followed, except that step 2 started as "emit the engine's own index name" and
+was changed to the automatic index once the model text was the only text the
+writer controls, which makes the number always 1.
 
 **Now.** Found while doing D27, with Python's `sqlite3` as the judge:
 

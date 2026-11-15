@@ -146,7 +146,7 @@ the gaps are named rather than left to be discovered.
   `linux_arm64` and `darwin_arm64`. The POSIX lock is the reason it is checked:
   it carried a missing `core:sys/posix` import and two wrong integer types until
   this round, so the code that a Linux build would run had never been compiled.
-- 251 integration tests covering CRUD, recovery, constraints, transactions,
+- 253 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
@@ -372,6 +372,18 @@ than 1000 bytes cannot be indexed and the insert says so.
   ROWID` shape SQLite backs with an automatic index — and `--mirror-report`
   prints a `mirror-lost:` line naming it. The file keeps its rows and its
   integrity; a rebuilt table loses the rules it had, loudly.
+- **A written file carries the keys the model holds.** A primary key is declared
+  in the table text — text, composite or the `INTEGER` rowid alias — and its
+  index is written the way SQLite writes the index a declaration implies, as a
+  `sqlite_autoindex_<table>_1` row with no SQL. A `UNIQUE` column travels as a
+  named index row instead, because a declaration would ask for a second,
+  automatic index. Before this, a text key or a `UNIQUE` column produced a file
+  SQLite called malformed, or accepted duplicates in. Going the other way, an
+  import reads `UNIQUE`, `PRIMARY KEY` and composite keys out of the table text
+  and recreates them, so a duplicate the source refused is refused after the
+  import too (`test_keys_cross_a_sqlite_file_both_ways`,
+  `test_import_keeps_the_keys_sqlite_declared`, and the `keys.sqlite` fixture
+  whose automatic indexes carry no SQL).
 - **Three wrong answers the second audit found are fixed.** Text positions are
   characters, `substr` counts a negative start from the end, `WHERE` converts a
   text to a number first, `--json` keeps the `.0` on a real, and `INSERT OR
