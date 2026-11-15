@@ -147,6 +147,9 @@ main :: proc() {
 			fmt.printfln("mirror-bytes: %d", store.mirror_bytes_written)
 			fmt.printfln("mirror-rewrites: %d", store.mirror_full_writes)
 			if len(store.mirror_reason) > 0 do fmt.printfln("mirror-reason: %s", store.mirror_reason)
+			// An object the rewrite had to rebuild from the engine's model loses
+			// whatever that model cannot express, and the report says which.
+			for loss in store.mirror_losses do fmt.printfln("mirror-lost: %s", loss)
 		}
 		if memory_report {
 			// The peak covers the whole process, and opening a database already

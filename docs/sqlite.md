@@ -183,13 +183,26 @@ needs — and `scripts/sqlite_abi_smoke.py` now runs `DROP TABLE`, `ALTER TABLE`
 `DROP INDEX` and `CREATE INDEX` through the facade and verifies the result with
 Python's `sqlite3`.
 
-**The rewrite re-emits the schema from the engine's model, and that model is
-smaller than SQLite's.** A `REFERENCES … ON DELETE CASCADE`, a `UNIQUE`, a
-`CHECK`, a `DEFAULT`, a `COLLATE`, a `GENERATED … AS` column, and every view and
-trigger are dropped from the file by the first schema change (measured; backlog
-D27). Rows, indexes the engine knows, and file integrity survive; the rules do
-not. Until D27 lands, treat a schema change on someone else's `.sqlite` file as a
-one-way simplification and keep the original. A failed mirror write is reported through `last_error` and
+**The rewrite now keeps every object it was not asked to change.** Each catalog
+entry is remembered as the file spelled it, and a rewrite re-emits that text for
+a table whose schema the engine did not touch, and for every view and trigger —
+so `ALTER TABLE parent …` leaves `child`'s `REFERENCES … ON DELETE CASCADE`,
+`CHECK`, `DEFAULT` and `COLLATE` alone and keeps the views and triggers
+(`scripts/sqlite_abi_smoke.py` compares `sqlite_master` before and after).
+
+What is still rebuilt from the engine's model, and now reported by
+`--mirror-report` as `mirror-lost:`:
+
+- the table the DDL itself changed, which loses `REFERENCES`, `CHECK`, `DEFAULT`,
+  `COLLATE` and a generated column;
+- any table whose declaration SQLite backs with an automatic index — a `UNIQUE`
+  column, a non-`INTEGER` `PRIMARY KEY`, a composite key — or a `WITHOUT ROWID`
+  table, or one with a `GENERATED` column. The engine's model does not describe
+  those shapes, and re-emitting the text would declare an index the file does not
+  have (backlog D33 for the export side of it).
+
+Rows, indexes the engine knows, and file integrity survive in every case; a table
+rebuilt this way loses its rules and says so. A failed mirror write is reported through `last_error` and
 never fails the commit.
 
 ## Export determinism

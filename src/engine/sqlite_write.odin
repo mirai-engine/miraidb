@@ -11,6 +11,7 @@ package engine
 // The writer is intentionally simple: it emits a freshly packed database (no
 // freelist, no journal, no WAL) using the default 4096-byte page size.
 
+import "core:fmt"
 import "core:mem"
 import "core:os"
 import "core:slice"
@@ -660,6 +661,10 @@ sqlite_file_write :: proc(store: ^Store, path: string, alloc := context.allocato
 	}
 	slice.sort_by(names[:], proc(a, b: string) -> bool { return a < b })
 
+	// What the last rewrite had to rebuild is reported, not hidden: a caller can
+	// ask a Store what its file lost (D27).
+	for loss in store.mirror_losses do delete(loss)
+	clear(&store.mirror_losses)
 	root_pages := make([dynamic]int, 0, len(names))
 	defer delete(root_pages)
 	master_rows := make([dynamic]Sqlite_Export_Row, 0, len(names))
@@ -712,7 +717,23 @@ sqlite_file_write :: proc(store: ^Store, path: string, alloc := context.allocato
 		master[1] = value_string(table.schema.name)
 		master[2] = value_string(table.schema.name)
 		master[3] = value_int(i64(root))
-		master[4] = value_string(sqlite_master_sql(table))
+		// An object the engine did not change keeps the text the file had, so a
+		// rewrite no longer drops the rules the model cannot hold (D27).
+		original, imported := store_mirror_kept_lookup(store, table.schema.name)
+		keep_text := imported && original.kind == "table" && original.can_keep &&
+			original.signature == schema_signature(&table.schema)
+		if keep_text {
+			master[4] = value_string(original.sql)
+		} else {
+			master[4] = value_string(sqlite_master_sql(table))
+			if imported && original.has_rules {
+				loss := fmt.aprintf(
+					"%s was rebuilt from the engine's model, which does not hold REFERENCES, UNIQUE, CHECK, DEFAULT, COLLATE or a generated column",
+					table.schema.name,
+				)
+				append(&store.mirror_losses, loss)
+			}
+		}
 		append(&master_rows, Sqlite_Export_Row{rowid = i64(len(master_rows) + 1), values = master})
 		tables += 1
 		// Secondary indexes: implicit ones (the rowid key) are not needed.
@@ -728,6 +749,24 @@ sqlite_file_write :: proc(store: ^Store, path: string, alloc := context.allocato
 			index_row[4] = value_string(sqlite_index_sql(table, index))
 			append(&master_rows, Sqlite_Export_Row{rowid = i64(len(master_rows) + 1), values = index_row})
 		}
+	}
+
+	// Views and triggers are not modelled, so their text is re-emitted as it came:
+	// a rewrite used to delete them from the user's file (D27).
+	opaque := make([dynamic]Mirror_Kept, 0, len(store.mirror_kept))
+	defer delete(opaque)
+	for kept in store.mirror_kept {
+		if kept.kind == "view" || kept.kind == "trigger" do append(&opaque, kept)
+	}
+	slice.sort_by(opaque[:], proc(a, b: Mirror_Kept) -> bool { return a.name < b.name })
+	for kept in opaque {
+		row := make([]Value, 5, alloc)
+		row[0] = value_string(kept.kind)
+		row[1] = value_string(kept.name)
+		row[2] = value_string(kept.table)
+		row[3] = value_int(0)
+		row[4] = value_string(kept.sql)
+		append(&master_rows, Sqlite_Export_Row{rowid = i64(len(master_rows) + 1), values = row})
 	}
 
 	// sqlite_sequence tracks AUTOINCREMENT counters; SQLite creates it only when a

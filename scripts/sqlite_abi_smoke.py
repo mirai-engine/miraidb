@@ -21,6 +21,7 @@ def load(path):
     lib.sqlite3_prepare_v2.restype = ctypes.c_int
     lib.sqlite3_step.argtypes = [ctypes.c_void_p]
     lib.sqlite3_step.restype = ctypes.c_int
+    lib.sqlite3_exec.restype = ctypes.c_int
     lib.sqlite3_finalize.argtypes = [ctypes.c_void_p]
     lib.sqlite3_column_count.argtypes = [ctypes.c_void_p]
     lib.sqlite3_column_count.restype = ctypes.c_int
@@ -166,6 +167,47 @@ def main() -> int:
     assert "keep_v" not in objects, objects
     check_file.close()
 
+    # D27: a rewrite keeps what it was not asked to change. A DDL on one table
+    # used to re-emit every table from the engine's model, so REFERENCES,
+    # UNIQUE, CHECK, DEFAULT, COLLATE, views and triggers disappeared from the
+    # user's file. Now only the table the DDL touched is rebuilt.
+    keep_path = os.path.join("bin", "sqlite_abi_keep.sqlite")
+    if os.path.exists(keep_path):
+        os.remove(keep_path)
+    seed = sqlite3.connect(keep_path)
+    seed.executescript(
+        "CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT);"
+        "CREATE TABLE child (id INTEGER PRIMARY KEY,"
+        " pid INTEGER NOT NULL REFERENCES parent(id) ON DELETE CASCADE,"
+        " note TEXT DEFAULT 'n' COLLATE NOCASE,"
+        " flag INTEGER CHECK (flag IN (0, 1)));"
+        "INSERT INTO parent (id, name) VALUES (1, 'a');"
+        "INSERT INTO child (id, pid, flag) VALUES (1, 1, 1);"
+        "CREATE VIEW child_view AS SELECT id FROM child;"
+        "CREATE TRIGGER child_touch AFTER INSERT ON child BEGIN SELECT 1; END;"
+    )
+    seed.commit()
+    child_sql = seed.execute("SELECT sql FROM sqlite_master WHERE name = 'child'").fetchone()[0]
+    seed.close()
+
+    keeper = ctypes.c_void_p()
+    assert lib.sqlite3_open(keep_path.encode(), ctypes.byref(keeper)) == OK, "open keeper"
+    assert lib.sqlite3_exec(keeper, b"ALTER TABLE parent ADD COLUMN extra INTEGER", None, None, None) == OK
+    assert lib.sqlite3_close(keeper) == OK
+
+    kept = sqlite3.connect(keep_path)
+    assert kept.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    assert kept.execute("SELECT sql FROM sqlite_master WHERE name = 'child'").fetchone()[0] == child_sql, (
+        "the table the DDL did not touch kept its text"
+    )
+    rules = kept.execute("PRAGMA foreign_key_list(child)").fetchall()
+    assert len(rules) == 1 and rules[0][2] == "parent", rules
+    assert kept.execute("SELECT name FROM sqlite_master WHERE type = 'view'").fetchall() == [("child_view",)]
+    assert kept.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'").fetchall() == [("child_touch",)]
+    columns = [row[1] for row in kept.execute("PRAGMA table_info(parent)").fetchall()]
+    assert columns == ["id", "name", "extra"], columns
+    kept.close()
+
     # The same rewrite with nothing left: dropping the last table leaves a valid,
     # empty database rather than a file whose sqlite_master has no b-tree.
     empty_path = os.path.join("bin", "sqlite_abi_empty.sqlite")
@@ -193,6 +235,7 @@ def main() -> int:
     lib.sqlite3_finalize.restype = ctypes.c_int
     lib.sqlite3_bind_text.restype = ctypes.c_int
     lib.sqlite3_step.restype = ctypes.c_int
+    lib.sqlite3_exec.restype = ctypes.c_int
 
     ghost = ctypes.c_void_p()
     assert lib.sqlite3_open(b":memory:", ctypes.byref(ghost)) == OK

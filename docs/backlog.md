@@ -829,6 +829,44 @@ parses the answer.
 
 **Cost.** S.
 
+## D33 — The export writes a schema it cannot back
+
+**Now.** Found while doing D27, with Python's `sqlite3` as the judge:
+
+```
+$ ./bin/miraidb.exe sql db "CREATE TABLE k (code TEXT PRIMARY KEY, v INTEGER)"   # engine DDL
+$ ./bin/miraidb.exe export-sqlite db k.sqlite
+$ sqlite3 k.sqlite "PRAGMA integrity_check"
+wrong # of entries in index sqlite_autoindex_k_1
+Error in 2nd command line argument: database disk image is malformed
+```
+
+The writer emits `CREATE TABLE "k" ("code" TEXT, "v" INTEGER, PRIMARY KEY
+("code"))` and no `sqlite_autoindex_k_1` row. SQLite creates the automatic index
+from the declaration, finds no b-tree for it, and rejects the file. A
+`WITHOUT ROWID` table takes the same path. The same file also loses an inline
+`UNIQUE`: re-importing `CREATE TABLE child (code TEXT UNIQUE)` and exporting it
+gives `PRAGMA index_list(child)` = only `child_pkey`, so duplicates are accepted
+after the round trip.
+
+**Next.**
+
+1. `sqlite_file_write`: for every unique index in the model whose SQL SQLite would
+   store as an automatic index (a primary key that is not an `INTEGER` rowid
+   alias, an inline `UNIQUE`), write a `sqlite_master` row of type `index`, name
+   `sqlite_autoindex_<table>_<n>`, `sql` NULL, and the index b-tree as its root.
+2. `sqlite_import`: carry `column.unique` into the engine's index list, so a
+   recreated table enforces the constraint.
+3. A gate: export a table with a text primary key, a composite key and a
+   `WITHOUT ROWID` shape; `PRAGMA integrity_check` is `ok` and `index_list` shows
+   the automatic index. Import a `UNIQUE` column and prove a duplicate is refused.
+
+**Acceptance.** The three shapes export to files SQLite opens and indexes; an
+imported `UNIQUE` still refuses a duplicate.
+
+**Cost.** M. It shares its mechanism with D27's remainder, and doing it there
+finishes both.
+
 ## D23 — Resource limits — *partly done*
 
 **Done.** The depth bound. `MAX_EXPRESSION_DEPTH :: 100` counts the outermost
@@ -1102,7 +1140,7 @@ loaded machine.
 
 **Cost.** S for the runner, M for the same-run reference.
 
-## D27 — The mirror keeps the schema it does not model
+## D27 — The mirror keeps the schema it does not model — *half done*
 
 **Now.** One `ALTER TABLE` through the engine rewrites the user's `.sqlite` file with
 the engine's own idea of the schema (`AUDIT-10` P-A1). Measured on a file that SQLite
@@ -1135,10 +1173,22 @@ D24 closed the *corruption* in that path (the empty `sqlite_master`) and the *in
 on import. It did not close this, and the roadmap said DDL was safe, which was true of
 integrity and false of semantics.
 
+**Progress.** Step 1 and half of step 2 are in: `store_mirror_keep` remembers every
+catalog entry as the file spelled it, with a signature of the model the engine built
+from it, and a rewrite re-emits that text for a table whose signature still matches and
+for every view and trigger. `--mirror-report` prints a `mirror-lost:` line for each
+table it had to rebuild. `scripts/sqlite_abi_smoke.py` compares `sqlite_master` before
+and after an ALTER and proves `child` keeps `REFERENCES … ON DELETE CASCADE`, `CHECK`,
+`DEFAULT` and `COLLATE`, and that the view and the trigger survive.
+
 **Next.**
 
-1. Keep each imported object's original SQL: `Sqlite_Table.sql` already carries the
-   `CREATE TABLE` text and is currently unused by the writer. Extend it to views and
+1. ~~Keep each imported object's original SQL: `Sqlite_Table.sql` already carries the
+   `CREATE TABLE` text and is currently unused by the writer.~~ Done above. What
+   remains: a table whose `UNIQUE`, non-integer `PRIMARY KEY` or `WITHOUT ROWID` shape
+   SQLite backs with an automatic index still has to be rebuilt, because the writer
+   emits no `sqlite_autoindex_*` row — D33 holds that work, and it lets the text be
+   kept for those tables too. Extend it to views and
    triggers (they are rows in `sqlite_master` with SQL), and keep them in the mirror as
    opaque objects the engine does not evaluate but must not delete.
 2. On a rewrite, re-emit the original SQL for every object whose engine-side schema is
@@ -1394,70 +1444,6 @@ performance gate fails on a 15% regression of a same-run reference and passes on
 loaded machine.
 
 **Cost.** S for the runner, M for the same-run reference.
-
-## D27 — The mirror keeps the schema it does not model
-
-**Now.** One `ALTER TABLE` through the engine rewrites the user's `.sqlite` file with
-the engine's own idea of the schema (`AUDIT-10` P-A1). Measured on a file that SQLite
-created:
-
-```sql
--- before
-CREATE TABLE child (id INTEGER PRIMARY KEY,
-  pid INTEGER NOT NULL REFERENCES parent(id) ON DELETE CASCADE,
-  code TEXT UNIQUE CHECK (length(code) > 2),
-  note TEXT DEFAULT 'n' COLLATE NOCASE)
-
--- after `ALTER TABLE parent ADD COLUMN extra INTEGER`
-CREATE TABLE "child" ("id" INTEGER NOT NULL, "pid" INTEGER NOT NULL,
-  "code" TEXT, "note" TEXT, PRIMARY KEY ("id"))
-```
-
-`PRAGMA foreign_key_list(child)` is empty afterwards. In the same experiment the file's
-view and trigger disappeared (three objects before, one after), and a
-`GENERATED ALWAYS AS (a*2)` column is imported as `NULL` and written back as a plain
-NULL column.
-
-The mechanism is two halves that each looked reasonable: `sqlite_import` recreates a
-table from `Sqlite_Column` (name, type, NOT NULL, PRIMARY KEY), and `sqlite_file_write`
-emits `CREATE TABLE` from the engine's `Table_Schema`. Any DDL forces the full rewrite,
-so everything the engine does not model is dropped — silently, on a file that is the
-user's database.
-
-D24 closed the *corruption* in that path (the empty `sqlite_master`) and the *indexes*
-on import. It did not close this, and the roadmap said DDL was safe, which was true of
-integrity and false of semantics.
-
-**Next.**
-
-1. Keep each imported object's original SQL: `Sqlite_Table.sql` already carries the
-   `CREATE TABLE` text and is currently unused by the writer. Extend it to views and
-   triggers (they are rows in `sqlite_master` with SQL), and keep them in the mirror as
-   opaque objects the engine does not evaluate but must not delete.
-2. On a rewrite, re-emit the original SQL for every object whose engine-side schema is
-   unchanged. For a table the engine *did* change (a column added), apply the change to
-   the original statement or fall back to the generated one — and in that second case,
-   say so: a `mirror_reason` the CLI's `--mirror-report` prints and the file's owner can
-   read.
-3. Refuse rather than degrade: a `ALTER`/`CREATE`/`DROP` that the engine cannot express
-   against a table whose SQL carries constraints it does not model answers
-   `mirror_unrepresentable` (or the existing `.Unsupported`) instead of writing a
-   weaker schema. Losing a user's foreign keys silently is worse than refusing the
-   statement.
-4. Import a `GENERATED` column as generated, or refuse the table with a reason. A NULL
-   column with the right name is the one outcome nobody can recover from.
-5. Gate it: a fixture with FK, UNIQUE, CHECK, DEFAULT, COLLATE, a view, a trigger and a
-   generated column goes through `INSERT`, `ALTER… ADD COLUMN`, `CREATE INDEX`,
-   `DROP INDEX` and `DROP TABLE`, and `sqlite_master` is compared (normalised) against
-   the expectation, plus `PRAGMA integrity_check` and a foreign-key check from a real
-   `sqlite3`.
-
-**Acceptance.** The fixture above keeps its constraints, view, trigger and generated
-column through every DDL the engine accepts; a DDL it cannot express is refused with a
-reason; `docs/sqlite.md` states which of the two happened.
-
-**Cost.** L. It is a design decision (preserve the text, or model the constraints and
-emit them) before it is code, and this item exists so the decision is written down.
 
 ## D28 — Open the way SQLite opens — *done* (see `docs/roadmap.md`, closed)
 

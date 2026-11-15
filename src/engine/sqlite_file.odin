@@ -42,6 +42,16 @@ Sqlite_Table :: struct {
 // Sqlite_Index is one sqlite_master row of type index whose SQL SQLite stored.
 // An automatic index (`sqlite_autoindex_*`) has no SQL and is skipped: it only
 // mirrors a UNIQUE constraint, and the recreated table does not carry one.
+// Sqlite_Object is a catalog entry the engine does not model: a view or a
+// trigger. Its SQL is kept verbatim, because a rewrite that dropped it would
+// delete part of the user's database (D27).
+Sqlite_Object :: struct {
+	kind:  string, // "view" or "trigger"
+	name:  string,
+	table: string,
+	sql:   string,
+}
+
 Sqlite_Index :: struct {
 	name:  string,
 	table: string,
@@ -59,6 +69,9 @@ Sqlite_File :: struct {
 	// them, so a plan can use one and DROP INDEX finds it; before this they were
 	// silently dropped, and the imported database scanned.
 	indexes:   []Sqlite_Index,
+	// others are the views and triggers, kept as text because the engine has no
+	// model for them. A rewrite re-emits them unchanged (D27).
+	others:    []Sqlite_Object,
 	// wal_pages holds the images a write-ahead log carries; the reader consults
 	// them before the database file. wal_committed is the database size at the
 	// last commit frame (0 when the log has no commit).
@@ -400,6 +413,7 @@ Sqlite_Master_Ctx :: struct {
 	file:    ^Sqlite_File,
 	tables:  [dynamic]Sqlite_Table,
 	indexes: [dynamic]Sqlite_Index,
+	others:  [dynamic]Sqlite_Object,
 }
 
 @(private)
@@ -418,6 +432,23 @@ sqlite_master_visit :: proc(user: rawptr, rowid: i64, payload: []u8) -> bool {
 			append(
 				&ctx.indexes,
 				Sqlite_Index {
+					name = strings.clone(name.s, ctx.file.alloc),
+					table = values[2].kind == .String ? strings.clone(values[2].s, ctx.file.alloc) : "",
+					sql = strings.clone(sql.s, ctx.file.alloc),
+				},
+			)
+		}
+		return true
+	}
+	if kind.kind == .String &&
+	   (strings.equal_fold(kind.s, "view") || strings.equal_fold(kind.s, "trigger")) {
+		// A view or a trigger is part of the database even though the engine has
+		// no model for it: keep its text so a rewrite can put it back (D27).
+		if name.kind == .String && sql.kind == .String && len(sql.s) > 0 {
+			append(
+				&ctx.others,
+				Sqlite_Object {
+					kind = strings.clone(kind.s, ctx.file.alloc),
 					name = strings.clone(name.s, ctx.file.alloc),
 					table = values[2].kind == .String ? strings.clone(values[2].s, ctx.file.alloc) : "",
 					sql = strings.clone(sql.s, ctx.file.alloc),
@@ -620,6 +651,7 @@ sqlite_file_open :: proc(
 	}
 	file.tables = ctx.tables[:]
 	file.indexes = ctx.indexes[:]
+	file.others = ctx.others[:]
 	return file, ERROR_NONE
 }
 
@@ -772,6 +804,9 @@ sqlite_import :: proc(
 	if commit_err := tx_commit(tx); commit_err.kind != .None {
 		return tables, rows, commit_err
 	}
+	// Remember the catalog the file spelled, now that the tables exist in the
+	// store: a rewrite re-emits it for every object it does not change (D27).
+	store_mirror_keep(store, file)
 	return tables, rows, ERROR_NONE
 }
 

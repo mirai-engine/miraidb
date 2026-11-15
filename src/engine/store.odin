@@ -138,6 +138,14 @@ Store :: struct {
 	mirror_full_writes:   int,
 	// mirror_reason says why the last commit re-encoded the mirrored file.
 	mirror_reason:        string,
+	// mirror_kept holds the catalog text the imported file had (a table's
+	// CREATE statement, a view, a trigger), so a rewrite can re-emit an object it
+	// did not have to change instead of rebuilding it from a model that does not
+	// hold its rules (D27).
+	mirror_kept:          [dynamic]Mirror_Kept,
+	// mirror_losses names the objects the last rewrite had to rebuild from the
+	// engine's model, which drops whatever that model cannot express.
+	mirror_losses:        [dynamic]string,
 	log:           Commit_Log,
 	vfs:           ^Vfs,
 	persistent:    bool,
@@ -384,6 +392,10 @@ store_close :: proc(store: ^Store) {
 	for _, attached in store.attached do store_close(attached)
 	delete(store.attached)
 	mirror_destroy(store.mirror)
+	store_mirror_kept_destroy(store)
+	for loss in store.mirror_losses do delete(loss)
+	delete(store.mirror_losses)
+	clear(&store.mirror_losses)
 	delete(store.mirror_reason)
 	delete(store.sqlite_mirror)
 	for name, value in store.variables {
@@ -395,6 +407,141 @@ store_close :: proc(store: ^Store) {
 	log_close(&store.log)
 	db_lock_release(&store.lock)
 	free(store)
+}
+
+// Mirror_Kept is one catalog entry as the imported file spelled it. `signature`
+// is the model the engine built from it; while that signature still matches, the
+// original text is what a rewrite emits.
+Mirror_Kept :: struct {
+	kind:      string,
+	name:      string,
+	table:     string,
+	sql:       string,
+	signature: string,
+	// has_rules is true when the file's declaration carried something the engine's
+	// model cannot express, so a rebuild is worth reporting and a plain table's is
+	// not.
+	has_rules: bool,
+	// can_keep is false when the file's declaration and the engine's storage do
+	// not describe the same record: a generated column is computed by SQLite and
+	// is not stored, and a WITHOUT ROWID table has no rowid to patch. Keeping such
+	// a statement would declare a shape the pages do not have, which SQLite
+	// rejects as a malformed schema.
+	can_keep:  bool,
+}
+
+// store_mirror_keep records the file's catalog, so a later rewrite can put back
+// what the engine does not model.
+store_mirror_keep :: proc(store: ^Store, file: ^Sqlite_File) {
+	store_mirror_kept_destroy(store)
+	for &table in file.tables {
+		schema, found := store.tables[table.name]
+		if !found do continue
+		append(
+			&store.mirror_kept,
+			Mirror_Kept {
+				kind = strings.clone("table"),
+				name = strings.clone(table.name),
+				table = strings.clone(table.name),
+				// The text is owned here: the caller destroys the Sqlite_File the
+				// import read, and a borrowed slice would be freed with it.
+				sql = strings.clone(table.sql),
+				signature = schema_signature(&schema.schema),
+				can_keep = mirror_text_keepable(&table, &schema.schema),
+				has_rules = mirror_text_has_rules(table.sql),
+			},
+		)
+	}
+	for &object in file.others {
+		append(
+			&store.mirror_kept,
+			Mirror_Kept {
+				kind = strings.clone(object.kind),
+				name = strings.clone(object.name),
+				table = strings.clone(object.table),
+				sql = strings.clone(object.sql),
+			},
+		)
+	}
+}
+
+store_mirror_kept_lookup :: proc(store: ^Store, name: string) -> (Mirror_Kept, bool) {
+	for kept in store.mirror_kept {
+		if kept.name == name do return kept, true
+	}
+	return {}, false
+}
+
+store_mirror_kept_destroy :: proc(store: ^Store) {
+	for kept in store.mirror_kept {
+		// A view or a trigger has no signature, and freeing a string that was
+		// never cloned would free the empty literal.
+		if len(kept.kind) > 0 do delete(kept.kind)
+		if len(kept.name) > 0 do delete(kept.name)
+		if len(kept.table) > 0 do delete(kept.table)
+		if len(kept.sql) > 0 do delete(kept.sql)
+		if len(kept.signature) > 0 do delete(kept.signature)
+	}
+	delete(store.mirror_kept)
+	// The array is gone: leaving its length behind would let the next append write
+	// into freed memory.
+	store.mirror_kept = nil
+}
+
+// mirror_text_has_rules reports whether a CREATE TABLE statement says something
+// the engine's schema model does not hold, so that a rebuild of it is reported.
+mirror_text_has_rules :: proc(sql: string) -> bool {
+	for word in ([]string{"REFERENCES", "UNIQUE", "CHECK", "DEFAULT", "COLLATE", "GENERATED"}) {
+		if sqlite_contains_word(sql, word) do return true
+	}
+	return false
+}
+
+// mirror_text_keepable reports whether the file's declaration and the engine's
+// storage describe the same record, so the statement can be re-emitted verbatim.
+//
+// Three declarations cannot be kept yet, and rebuilding the table from the
+// engine's model is what happens instead (and is reported):
+//
+//   - a generated column: SQLite computes it and does not store it, so the kept
+//     text would declare more columns than the pages hold;
+//   - a WITHOUT ROWID table: its rows have no rowid to patch;
+//   - UNIQUE, and a PRIMARY KEY that is not an INTEGER rowid alias: SQLite backs
+//     them with an automatic index, and the engine's import does not build one
+//     from a column constraint, so the kept text would declare an index the file
+//     does not have. SQLite rejects that as "wrong # of entries in index".
+mirror_text_keepable :: proc(table: ^Sqlite_Table, schema: ^Table_Schema) -> bool {
+	if table.without_rowid do return false
+	if sqlite_contains_word(table.sql, "GENERATED") do return false
+	if sqlite_contains_word(table.sql, "UNIQUE") do return false
+	// An INTEGER PRIMARY KEY in a rowid table is the rowid, not an index.
+	if len(schema.primary_key) == 1 {
+		if schema.columns[schema.primary_key[0]].type.kind != .Int do return false
+	} else if len(schema.primary_key) > 1 {
+		return false
+	}
+	return true
+}
+
+// schema_signature is a stable text form of what the engine models about a table.
+// Two schemas with the same signature produce the same engine table, so a rewrite
+// may keep the file's original CREATE statement; any difference means the engine
+// changed the table and the statement has to be rebuilt.
+schema_signature :: proc(schema: ^Table_Schema) -> string {
+	builder := strings.builder_make()
+	defer strings.builder_destroy(&builder)
+	if schema.ephemeral do strings.write_string(&builder, "temporary ")
+	for column in schema.columns {
+		not_null := column.not_null ? "notnull" : "nullable"
+		fmt.sbprintf(&builder, "%s:%v:%s;", column.name, column.type.kind, not_null)
+	}
+	for position in schema.primary_key do fmt.sbprintf(&builder, "pk:%d;", position)
+	for index in schema.indexes {
+		if index.implicit do continue
+		fmt.sbprintf(&builder, "index:%s:%v:", index.name, index.unique)
+		for position in index.columns do fmt.sbprintf(&builder, "%d,", position)
+	}
+	return strings.clone(strings.to_string(builder))
 }
 
 // store_set_sqlite_mirror makes every later commit write the state back to
@@ -469,6 +616,14 @@ store_sqlite_mirror_rewrite :: proc(store: ^Store) -> Error {
 	if build_err.kind != .None do return build_err
 	store.mirror = built
 	store.mirror_bytes_written += u64(store.mirror.page_count * store.mirror.page_size)
+	// The file now says what the rewrite wrote, so the catalog it is compared
+	// against next time is this one: a table rebuilt from the model is the model
+	// from here on, and a table kept verbatim keeps its text (D27).
+	refreshed, refreshed_err := sqlite_file_open(store.sqlite_mirror)
+	if refreshed_err.kind == .None {
+		store_mirror_keep(store, &refreshed)
+		sqlite_file_destroy(&refreshed)
+	}
 	return ERROR_NONE
 }
 

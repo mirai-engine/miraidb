@@ -364,11 +364,14 @@ than 1000 bytes cannot be indexed and the insert says so.
   database, and a dropped table that held rows), and an imported index is read and
   recreated now, so a plan walks one and `DROP INDEX` finds it
   (`scripts/sqlite_abi_smoke.py` checks all of it against Python's `sqlite3`).
-  **But a schema change re-emits the schema from the engine's own model**, so
-  `REFERENCES`, `UNIQUE`, `CHECK`, `DEFAULT`, `COLLATE`, a `GENERATED` column, a
-  view and a trigger are gone from the file afterwards — measured in `AUDIT-10`,
-  and the reason D27 exists. The file keeps its rows and its integrity; it loses
-  the rules.
+  **A schema change now keeps every object it was not asked to change**: a
+  rewrite re-emits the file's own text for tables whose schema the engine did not
+  touch, and for every view and trigger, so `ALTER TABLE parent …` no longer
+  strips `child`. The table the DDL touched is still rebuilt from the engine's
+  model — as is a table whose `UNIQUE`, non-integer `PRIMARY KEY` or `WITHOUT
+  ROWID` shape SQLite backs with an automatic index — and `--mirror-report`
+  prints a `mirror-lost:` line naming it. The file keeps its rows and its
+  integrity; a rebuilt table loses the rules it had, loudly.
 - **Three wrong answers the second audit found are fixed.** Text positions are
   characters, `substr` counts a negative start from the end, `WHERE` converts a
   text to a number first, `--json` keeps the `.0` on a real, and `INSERT OR
