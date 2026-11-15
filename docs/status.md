@@ -146,7 +146,7 @@ the gaps are named rather than left to be discovered.
   `linux_arm64` and `darwin_arm64`. The POSIX lock is the reason it is checked:
   it carried a missing `core:sys/posix` import and two wrong integer types until
   this round, so the code that a Linux build would run had never been compiled.
-- 262 integration tests covering CRUD, recovery, constraints, transactions,
+- 263 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
@@ -391,17 +391,28 @@ than 1000 bytes cannot be indexed and the insert says so.
   text to a number first, `--json` keeps the `.0` on a real, and `INSERT OR
   REPLACE` is implemented instead of refused by accident (`AUDIT-10` P-B1/P-B2/
   P-B3/P-B7). `OR ROLLBACK`, `OR FAIL` and `OR IGNORE` are named refusals.
-- **The leak report was real, and most of it is fixed.** A tracking allocator
-  around the store showed five live allocations per statement where the suite
-  printed nine `+++ leak` lines: the lexer built a quoted token's text with the
-  process allocator, the read set and the plan's steps were never freed, the
-  projection names were cloned without freeing the original, and every
-  `strings.to_lower` used for a comparison leaked its copy. Reads are down to two
-  allocations per statement (`tools/leakcheck`, gate "leak budgets") and the
-  working set of `SELECT 1` from 1.1 KiB to about 0.2 KiB per statement. What is
-  left: two builders the tracker names `builder.odin:173` without a caller, and
-  about 0.8 KiB per UPDATE allocated outside the tracked allocator (the
-  transaction arena), which `scripts/leaks.py` reports.
+- **The leak report was real, and now a statement leaves nothing.** A tracking
+  allocator around the store (`tools/leakcheck`) showed five live allocations per
+  read where the suite printed nine lines per statement, and it now shows **zero**
+  for every read shape, including `EXPLAIN` and a subquery. Three of the defects
+  were error messages nobody kept: a statement asked whether `_view`, `_policy`,
+  `_triggers`, `_grant`, `_attach` and `_virtual` were tables, and every answer
+  built a formatted message to say "no" (`tx_table_probe` asks the same question
+  without building anything). The rest were the lexer's quoted text, the read set,
+  the plan's steps, the projection names, a `to_lower` copy per comparison, the
+  `EXPLAIN` fragments, `PRAGMA`'s lowered name and its rows array, and the slices
+  an `INSERT`/`UPDATE`/`DELETE` builds for a `RETURNING` it never uses. A write now
+  keeps exactly the row it wrote (two to four blocks) and does not grow per
+  statement, and `INSERT OR REPLACE` repeated 2 000 times went from 1.25 KiB to
+  about 250 bytes per statement (the commit log's own growth).
+- **An error message belongs to whoever receives the error.** `errf` allocates it,
+  and `error_free` gives it back; a caller that inspects the kind and drops the
+  error frees it there. That was the largest single source of the remaining leak
+  lines: a `REPLACE` that collided built one message per statement to explain the
+  first attempt and threw it away.
+- **A tombstone owns nothing.** `table_prune_versions` dropped a deleted row from
+  the map without freeing its values or the array that held its versions, so every
+  `INSERT OR REPLACE` left the replaced row behind.
 - **Row history is the caller's decision.** A commit used to keep the version of
   every row it replaced for the life of the process, because a read may be pinned
   to an older sequence at any time. `store_prune_history` drops it when no read is

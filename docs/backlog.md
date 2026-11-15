@@ -630,47 +630,46 @@ image (`/usr/bin/sqlite3`), so the runner belongs with the POSIX CI work; the
 corpus can be generated from the grammar (`docs/sql.md`) plus the shapes that bit
 us: aliases, keyword lookalikes, `AS OF`, `TRUNCATE`, `RETURNING`.
 
-## Diagnostics — the leak report is readable now
+## Diagnostics — what the leak report still says
 
-**Settled.** The `+++ leak` lines were real, not allocations a bulk free releases
-out of the tracker's sight. `tools/leakcheck` wraps the allocator the engine
-allocates from in a tracking allocator, runs one statement two hundred times and
-counts what is still live after the last result is destroyed: it found five live
-allocations per `SELECT` where the suite printed nine lines per statement.
+**Settled.** The `+++ leak` lines were real: a tracking allocator around the store
+(`tools/leakcheck`) found five live allocations per read where the suite printed
+nine lines per statement, most of them error messages a caller had asked for and
+dropped. Reads are at zero, writes are flat, and the suite's own line count fell
+from 289 878 to 116 741.
 
-**Fixed.** The lexer built a quoted token's text with the process allocator and
-nothing freed it (it belongs to the query arena now); `tx.read_tables` and the
-plan's `steps` were never freed; the projection names were cloned into the result
-without freeing the original; and every `strings.to_lower` used only for a
-comparison leaked its copy, in `eval_call`, `eval_aggregate`,
-`eval_aggregate_values` and the aggregate stream. Reads went from five live
-allocations per statement to two, and `SELECT 1` repeated in one process from
-1.1 KiB to about 0.2 KiB per statement.
-
-**Gate.** `scripts/leaks.py` builds the tool and enforces the budget each shape
-declares (`tools/leakcheck/main.odin`), and reports the working set the CLI
-measures with `--repeat` before and after a few thousand statements. CI runs it as
-the "leak budgets" gate.
+**The tool is the report.** It prints, per shape, how many blocks are still live,
+their total size, and the file and line that allocated them, plus the first bytes
+of a block whose contents are text, which is how the six "table X is not visible"
+messages were identified. `scripts/leaks.py` builds it, applies the budgets and
+measures the CLI's working set with `--repeat`; CI runs it as the "leak budgets"
+gate.
 
 **What is left, in order.**
 
-1. Two allocations per `SELECT` that the tracker attributes to `builder.odin:173`
-   but cannot attribute to a caller (the location is inside `core:strings`, not at
-   the `builder_make` site). 83 to 166 bytes per statement, in the gate at that
-   number.
-2. About 0.8 KiB per `UPDATE` and 1.2 KiB per `INSERT OR REPLACE` measured on the
-   working set, which is allocated outside the tracked allocator (a transaction
-   arena) and so invisible to the tool. `INSERT OR REPLACE` fell from 1.6 KiB when
-   the history pruning landed; `UPDATE` did not move, so it is something else.
-3. `log_index_append` opens the index sidecar, seeks and writes 16 bytes on **every
-   commit**; that is a file-open per commit, not a leak, and it is the first thing
-   to look at when commit latency matters.
-4. A store is not safe to close under a different allocator than the one it was
-   opened with: rows are allocated and freed with whichever `context.allocator` is
-   current at each moment (`clone_values`/`free_values` in `table.odin`), so
-   swapping the allocator mid-process makes the tracker report bad frees at close.
-   That is why the tool swaps the allocator before opening and never closes, and it
-   is worth deciding whether a table should own its allocator.
+1. **The 116 741 lines the suite still prints are test-side.** A test that asserts
+   a statement fails drops the error, and a store closed by `cleanup_db` frees
+   memory the tracker saw allocated; neither is an engine leak, and the gate is
+   what says so. Making the suite quiet would mean every test freeing every error
+   it expected, which is worth doing only if the noise starts hiding something.
+2. **A map node freed through the wrong allocator.** Odin frees a map's nodes with
+   whichever allocator is current, and the engine builds several maps in the
+   transaction arena: removing a node from one frees arena memory through the
+   process allocator. It is harmless while the arena outlives the map (it always
+   does here) and the tool counts these instead of failing, but a map that outlived
+   its arena would be a real crash. The candidates are `Tx_Snapshot`'s maps.
+3. **About 250 bytes per commit on the CLI's working set** for `INSERT OR REPLACE`
+   and 120 for `UPDATE` over 2 000 statements: the commit log's in-memory index
+   grows with the log, which is data rather than a leak, and it is the number to
+   watch if a long-lived process needs a bound (`VACUUM` compacts the log).
+4. **Error ownership across the API.** `error_free` exists and the engine frees the
+   messages it swallows, but a host that receives an error and drops it still leaks
+   that message: the C ABI, the server handlers and the tests do this today. The
+   next step is one sweep, not one fix per site: any entry point that returns
+   `Error` should say in its comment that the message is the caller's.
+5. **`log_index_append` opens the index sidecar, seeks and writes 16 bytes on every
+   commit**: a file-open per commit, not a leak, and the first thing to look at
+   when commit latency matters.
 
 ## Ordering, if this becomes the roadmap again
 

@@ -6,16 +6,19 @@
 // tracking allocator, runs one statement N times, and reports how many allocations
 // are still live once the last result is destroyed.
 //
-// Only read shapes are measured here: a write allocates through the transaction's
-// arena, which the tracking allocator does not own, and the free that closes it is
-// reported as a bad free by the tracker rather than by the engine. The write path
-// is measured end to end by scripts/leaks.py, which asks the CLI for the working
-// set before and after a few thousand statements.
+// A read has to leave nothing behind, and a write keeps the row it wrote: the
+// budgets say which is which. A write also allocates through the transaction's
+// arena, and Odin frees a map's nodes with whichever allocator is current rather
+// than the one that allocated them, so the tracker reports a few frees of memory it
+// does not own and the tool counts them instead of stopping (see leakcheck_bad_free).
+// After every statement the tool prunes row history, exactly as the CLI does, so a
+// version a write shadows is not counted as a leak.
 //
 // Run it through scripts/leaks.py, which builds it and applies the budgets.
 package leakcheck
 
 import "core:fmt"
+import "base:runtime"
 import "core:mem"
 import "core:os"
 import "core:strconv"
@@ -24,16 +27,24 @@ import db "../../src/engine"
 
 Shape :: struct {
 	statement: string,
-	// budget is the live allocations per statement the shape may leave. A number
-	// above zero is a known, documented leftover; the gate holds the line at what
-	// it is today, so a new one fails instead of hiding in the noise. Two is what a
-	// SELECT still leaves: two builders the tracker names builder.odin:173 but
-	// cannot attribute to a caller, and one for a statement that reads a table.
+	// budget is the live allocations per statement the shape may leave. Zero is what
+	// a read must leave; a write keeps the row it wrote, and its budget is what one
+	// row costs. The gate holds the line at those numbers, so a leak of one block per
+	// statement - two hundred over a run - fails instead of hiding in the noise.
 	budget:    int,
+}
+
+bad_frees: int
+
+@(private)
+leakcheck_bad_free :: proc(t: ^mem.Tracking_Allocator, memory: rawptr, location: runtime.Source_Code_Location) {
+	bad_frees += 1
 }
 
 main :: proc() {
 	repeat := 200
+	verbose := false
+	if len(os.args) > 2 && os.args[2] == "verbose" do verbose = true
 	if len(os.args) > 1 {
 		if parsed, ok := strconv.parse_int(os.args[1]); ok && parsed > 0 do repeat = parsed
 	}
@@ -43,16 +54,31 @@ main :: proc() {
 	defer os.remove_all(path)
 
 	entries := []Shape {
-		{"SELECT 1", 2},
-		{"SELECT count(*) FROM t", 2},
-		{"SELECT * FROM t", 2},
-		{"SELECT 'abc'", 2},
-		{"SELECT v FROM t WHERE v > 0 ORDER BY v", 2},
-		{"PRAGMA integrity_check", 2},
+		{"SELECT 1", 0},
+		{"SELECT count(*) FROM t", 0},
+		{"SELECT * FROM t", 0},
+		{"SELECT 'abc'", 0},
+		{"SELECT v FROM t WHERE v > 0 ORDER BY v", 0},
+		{"PRAGMA integrity_check", 0},
+		// A statement whose FROM is a subquery, and a plan: both walk the same "is
+		// that a table?" questions the plain shapes do.
+		{"SELECT * FROM t WHERE v = (SELECT 1)", 0},
+		{"EXPLAIN SELECT * FROM t", 0},
+		// A write keeps the row it wrote: its values, the array that holds its
+		// history, and a map node.
+		{"INSERT OR REPLACE INTO t (id, v) VALUES (3, 3)", 4},
+		{"UPDATE t SET v = v + 1 WHERE id = 1", 4},
+		{"DELETE FROM t WHERE id = 99", 4},
 	}
 
 	track: mem.Tracking_Allocator
 	mem.tracking_allocator_init(&track, context.allocator)
+	// A map's nodes are freed through the allocator that is current when the node is
+	// removed, and the engine builds several maps in the transaction arena: removing a
+	// node from one of those frees arena memory through this allocator, which the
+	// tracker reports as a bad free. That is a property of Odin's maps, not a defect
+	// the engine can fix here, so the tool counts them instead of stopping.
+	track.bad_free_callback = leakcheck_bad_free
 	context.allocator = mem.tracking_allocator(&track)
 	// Closing the store frees memory the store allocated through its own arena, and
 	// a tracking allocator reports a pointer it does not know as a bad free, so the
@@ -88,6 +114,11 @@ main :: proc() {
 				os.exit(2)
 			}
 			db.sql_result_destroy(&result)
+			// A write commits a row: the version it replaced is the caller's to drop,
+			// and a process that runs statements keeps no history. Without this the
+			// measurement counts the values each REPLACE shadows, which is data the
+			// caller asked for, not a leak.
+			db.store_prune_history(store)
 		}
 		live := len(track.allocation_map)
 		bytes := 0
@@ -109,6 +140,40 @@ main :: proc() {
 			f64(bytes) / f64(repeat),
 			shape.statement,
 		)
+		// Where a live allocation came from, so a reader can act on the line instead
+		// of hunting for it: the location is the one the allocating call reports, and
+		// a shape that leaves nothing behind prints nothing here.
+		if live > 0 {
+			sites := make(map[string]int, context.temp_allocator)
+			site_bytes := make(map[string]int, context.temp_allocator)
+			for _, entry in track.allocation_map {
+				site := fmt.tprintf("%s:%d", entry.location.file_path, entry.location.line)
+				sites[site] += 1
+				site_bytes[site] += entry.size
+			}
+			for site, count in sites {
+				fmt.printfln("         %-6d %-8d %s", count, site_bytes[site], site)
+			}
+			if verbose {
+				for _, entry in track.allocation_map {
+					// The bytes a leftover block holds name it better than its size
+					// does: a leaked error message says which table was missing.
+					bytes := ([^]u8)(entry.memory)[:min(entry.size, 96)]
+					printable := true
+					for b in bytes do if b < 32 && b != 0 do printable = false
+					if printable do fmt.printfln("         text=%q", string(bytes))
+					fmt.printfln(
+						"         entry size=%d align=%d mem=%p %s:%d",
+						entry.size,
+						entry.alignment,
+						entry.memory,
+						entry.location.file_path,
+						entry.location.line,
+					)
+				}
+			}
+			free_all(context.temp_allocator)
+		}
 	}
 	// The store is not closed here. A row is allocated and freed with whichever
 	// allocator `context.allocator` is when each happens, not with the store's, so a
@@ -119,6 +184,12 @@ main :: proc() {
 	if failed > 0 {
 		fmt.eprintfln("leakcheck: %d shape(s) over budget", failed)
 		os.exit(1)
+	}
+	if bad_frees > 0 {
+		fmt.printfln(
+			"leakcheck: %d free(s) of memory this allocator did not allocate (arena maps)",
+			bad_frees,
+		)
 	}
 	fmt.printfln("leakcheck: every shape within budget over %d statements", repeat)
 }

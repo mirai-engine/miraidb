@@ -544,10 +544,10 @@ is clean, and check that before dismissing a report.
 
 This roadmap is closed: **100 / 100**, every row `done` with a test. It is not
 the whole plan. `docs/roadmap.md` is the authoritative order for what is left,
-and its list still carries nine open items (POSIX CI, spatial tree, decimal and
-time zones, replication, the module sandbox, TLS and HTTP/2, generated clients,
-licences) plus the rows of the efficiency contract recorded as not met. The open
-defects are in the section above; they come first.
+and its table is the count to trust (POSIX CI, spatial tree, decimal and time
+zones, replication, the module sandbox, TLS and HTTP/2, generated clients,
+licences, and the rest of the page store and the grammar). The open defects are
+in the section above; they come first.
 
 Rationale, unchanged: correctness and memory first, then the features a user can
 see, then the cheap independent gaps.
