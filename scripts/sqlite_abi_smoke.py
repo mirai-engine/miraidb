@@ -280,6 +280,28 @@ def main() -> int:
     lib.sqlite3_interrupt.argtypes = [ctypes.c_void_p]
     lib.sqlite3_interrupt(coded)
     assert lib.sqlite3_exec(coded, b"SELECT count(*) FROM c", None, None, None) == OK, "an interrupted connection still works"
+
+    # Extended result codes (D25): with the mode on, the same failure answers the
+    # narrow code, so a caller learns which constraint failed without parsing the
+    # message, and extended_errcode answers it either way. SQLite's numbers:
+    # unique 2067, primary key 1555, not null 1299.
+    lib.sqlite3_extended_result_codes.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    lib.sqlite3_extended_result_codes.restype = ctypes.c_int
+    lib.sqlite3_extended_errcode.argtypes = [ctypes.c_void_p]
+    lib.sqlite3_extended_errcode.restype = ctypes.c_int
+    UNIQUE, PRIMARYKEY, NOTNULL = 2067, 1555, 1299
+    assert lib.sqlite3_extended_result_codes(coded, 1) == OK
+    assert lib.sqlite3_exec(coded, b"INSERT INTO c VALUES (2, 'a')", None, None, None) == UNIQUE
+    assert lib.sqlite3_errcode(coded) == UNIQUE, "in extended mode errcode is narrow"
+    assert lib.sqlite3_extended_errcode(coded) == UNIQUE
+    assert lib.sqlite3_exec(coded, b"INSERT INTO c VALUES (1, 'z')", None, None, None) == PRIMARYKEY
+    assert lib.sqlite3_exec(coded, b"CREATE TABLE n (id INTEGER PRIMARY KEY, v TEXT NOT NULL)", None, None, None) == OK
+    assert lib.sqlite3_exec(coded, b"INSERT INTO n (id, v) VALUES (1, NULL)", None, None, None) == NOTNULL
+    assert lib.sqlite3_exec(coded, b"SELECT (((", None, None, None) == ERROR, "a syntax error has no narrow code"
+    assert lib.sqlite3_extended_result_codes(coded, 0) == OK
+    assert lib.sqlite3_exec(coded, b"INSERT INTO c VALUES (2, 'a')", None, None, None) == CONSTRAINT
+    assert lib.sqlite3_errcode(coded) == CONSTRAINT, "off again is the primary code"
+    assert lib.sqlite3_extended_errcode(coded) == UNIQUE, "extended_errcode still answers which one"
     assert lib.sqlite3_close(coded) == OK
 
     # A dead handle is misuse, not memory (D29): the sqlite3 face answers

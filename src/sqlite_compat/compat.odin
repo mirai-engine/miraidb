@@ -31,6 +31,14 @@ SQLITE_IOERR :: c.int(10)
 SQLITE_CORRUPT :: c.int(11)
 SQLITE_TOOBIG :: c.int(13)
 SQLITE_CONSTRAINT :: c.int(19)
+// The extended constraint codes, which SQLite reports only when a caller turns
+// sqlite3_extended_result_codes on. Each is SQLITE_CONSTRAINT plus a small
+// ordinal, as in SQLite, so a program that masks the low byte still sees 19.
+SQLITE_CONSTRAINT_CHECK :: c.int(19 | 1 << 8)
+SQLITE_CONSTRAINT_FOREIGNKEY :: c.int(19 | 3 << 8)
+SQLITE_CONSTRAINT_NOTNULL :: c.int(19 | 5 << 8)
+SQLITE_CONSTRAINT_PRIMARYKEY :: c.int(19 | 6 << 8)
+SQLITE_CONSTRAINT_UNIQUE :: c.int(19 | 8 << 8)
 SQLITE_MISMATCH :: c.int(20)
 SQLITE_MISUSE :: c.int(21)
 SQLITE_AUTH :: c.int(23)
@@ -49,6 +57,10 @@ Database :: struct {
 	conn:         ^engine.Embed_Conn,
 	last_changes: c.int,
 	last_code:    c.int,  // what sqlite3_errcode answers
+	last_extended: c.int, // what sqlite3_extended_errcode answers
+	// extended is set by sqlite3_extended_result_codes: with it, sqlite3_errcode
+	// answers the extended code too, the way SQLite does.
+	extended:     bool,
 	last_error:   string, // owned, NUL-terminated
 	in_memory:    bool,
 	// statements is what this connection handed out and has not finalized, so a
@@ -154,13 +166,36 @@ sqlite_code :: proc(err: engine.Error) -> c.int {
 	return SQLITE_ERROR
 }
 
+// sqlite_extended_code is sqlite_code with the constraint narrowed to which
+// constraint failed, which is what a caller that turned extended codes on reads.
+@(private)
+sqlite_extended_code :: proc(err: engine.Error) -> c.int {
+	// The narrow code only exists to say which constraint failed; everything else
+	// keeps the primary code sqlite_code names.
+	#partial switch err.kind {
+	case .Duplicate_Primary_Key:
+		return SQLITE_CONSTRAINT_PRIMARYKEY
+	case .Duplicate_Unique:
+		return SQLITE_CONSTRAINT_UNIQUE
+	case .Not_Null_Violation:
+		return SQLITE_CONSTRAINT_NOTNULL
+	}
+	return sqlite_code(err)
+}
+
 // fail records the message and the code together, so sqlite3_errcode answers
 // what the last step or exec returned.
 @(private)
 fail :: proc(db: ^Database, err: engine.Error) -> c.int {
 	set_error(db, err.message)
 	code := sqlite_code(err)
-	if db != nil do db.last_code = code
+	if db != nil {
+		db.last_code = code
+		db.last_extended = sqlite_extended_code(err)
+	}
+	// A caller in extended mode reads the narrow code from the return value as
+	// well, so the check it wrote next to sqlite3_step keeps working.
+	if db != nil && db.extended && db.last_extended != code do return db.last_extended
 	return code
 }
 
@@ -241,8 +276,21 @@ sqlite3_errcode :: proc "c" (handle: rawptr) -> c.int {
 	db := db_of(handle)
 	if db == nil do return SQLITE_ERROR
 	// The code the last exec or step answered, so a caller can tell a duplicate
-	// key (19) from a syntax error (1) without parsing the message (D25).
+	// key (19) from a syntax error (1) without parsing the message (D25). In
+	// extended mode the narrow code is the answer, as in SQLite.
+	if db.extended do return db.last_extended
 	return db.last_code
+}
+
+// sqlite3_extended_errcode answers the narrow code regardless of the mode, the way
+// SQLite's own does: a caller can ask "which constraint" without changing what
+// every other call returns.
+@(export)
+sqlite3_extended_errcode :: proc "c" (handle: rawptr) -> c.int {
+	context = runtime.default_context()
+	db := db_of(handle)
+	if db == nil do return SQLITE_ERROR
+	return db.last_extended
 }
 
 // sqlite3_interrupt asks the statement that is running, on any thread, to stop.
@@ -547,8 +595,12 @@ sqlite3_busy_timeout :: proc "c" (handle: rawptr, milliseconds: c.int) -> c.int 
 @(export)
 sqlite3_extended_result_codes :: proc "c" (handle: rawptr, onoff: c.int) -> c.int {
 	context = runtime.default_context()
-	_ = handle
-	_ = onoff
+	db := db_of(handle)
+	if db == nil do return SQLITE_MISUSE
+	db.extended = onoff != 0
+	// The mode is a preference of the caller, not a state of the database, so
+	// turning it off falls back to the primary code the last call answered.
+	if !db.extended && db.last_extended != 0 do db.last_extended = db.last_code
 	return SQLITE_OK
 }
 
