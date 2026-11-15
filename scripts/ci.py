@@ -78,6 +78,14 @@ def build_gates(args: argparse.Namespace) -> list[Gate]:
     gates.append(
         Gate("differential vs sqlite3", [sys.executable, "scripts/differential.py", "--bin", "./bin/miraidb.exe"])
     )
+    # The compatibility matrix is a table this runs: a claim in docs/sqlite.md that
+    # stops being true fails here, which is what keeps the document honest (D26).
+    gates.append(
+        Gate(
+            "documented compatibility",
+            [sys.executable, "scripts/compat_check.py", "--bin", "./bin/miraidb.exe"],
+        )
+    )
     gates.append(
         Gate(
             "mirror cost",

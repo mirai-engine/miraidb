@@ -145,6 +145,41 @@ behaviour here will see different results:
 | `WHERE int_col = '1'` | compares through affinity | error `cannot compare int with string` |
 | `HAVING c > 1` where `c` aliases `count(*)` | works | error `column c does not exist` |
 
+## The claims in this file are executed
+
+Every row below is run by `scripts/compat_check.py`, which is a gate: the
+statement goes through this engine (its `--json` output) and through SQLite's
+Python module, each on its own in-memory database. `matches` means both answer
+the same thing, `ours` means this engine answers what is written while SQLite
+answers something else — a difference the sections above state on purpose — and
+`refused` means the statement has to fail with a message that contains the word.
+A claim that stops being true fails the gate, which is the point: a compatibility
+document that nobody runs is a document that drifts.
+
+```compat
+# claim | statement | answer, one list per row
+matches | SELECT length('héllo')                          | [[5]]
+matches | SELECT octet_length('héllo')                    | [[6]]
+matches | SELECT instr('héllo', 'l')                      | [[3]]
+matches | SELECT substr('héllo', -3, 2)                   | [["ll"]]
+matches | SELECT hex('é')                                 | [["C3A9"]]
+matches | SELECT printf('%05.2f', 3.14159)                | [["03.14"]]
+matches | SELECT json_type('1.0')                         | [["real"]]
+matches | SELECT typeof(1), typeof(1.0), typeof('1')      | [["integer", "real", "text"]]
+matches | SELECT round(2.5), round(-2.5)                  | [[3.0, -3.0]]
+matches | SELECT 'abc' LIKE 'A%'                          | [[1]]
+ours    | SELECT printf('%.0f', 2.5)                      | [["2"]]
+ours    | SELECT upper(char(233))                         | [["É"]]
+refused | SELECT 1 = '1'                                 | invalid_type
+refused | SELECT CAST('12abc' AS INTEGER)                | invalid_type
+refused | SELECT 1/0                                     | division by zero
+refused | CREATE TABLE z (a INT) WITHOUT ROWID           | WITHOUT ROWID
+```
+
+Two of those rows correct this document: `printf('%.0f', 2.5)` answers `2` here
+and `3` in SQLite (this engine rounds half to even, SQLite rounds away from zero),
+and `upper` folds the whole of Unicode where SQLite folds ASCII only.
+
 ## Embedding and tooling
 
 | Feature | Status | Notes |

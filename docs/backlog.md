@@ -1063,7 +1063,13 @@ refuses `INSERT`; the header documents the model.
 
 **Cost.** M.
 
-## D26 — Docs whose claims are executed
+## D26 — Docs whose claims are executed — **done** (see `docs/roadmap.md`, closed)
+
+The matrix is executable: `docs/sqlite.md` carries a ```compat block and
+`scripts/compat_check.py` runs every claim in it through the CLI's `--json` and
+through SQLite's Python module, each on its own in-memory database, as gate 24.
+Writing it corrected one statement: `printf('%.0f', 2.5)` answers 2 here and 3 in
+SQLite, which is now a row rather than prose.
 
 **Now.** `docs_check.py` verifies shape: counts, links, forbidden names, five-cell
 roadmap rows. It does not verify a sentence. Two rows of `docs/sqlite.md` still said
