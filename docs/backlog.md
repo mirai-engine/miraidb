@@ -413,10 +413,23 @@ walk that exists now.
 ## D9 — The rest of the grammar
 
 **Now.** 32 statement kinds. Refused with `sql_unsupported`: windows beside
-`GROUP BY`, `BEFORE` triggers, `RANGE`/`GROUPS` frames, `ALTER TABLE` beyond
-rename/drop/add column, collations beyond `BINARY`/`NOCASE`/`RTRIM`,
-user-defined functions. `GROUP BY` does not resolve a projection alias
-(`GROUP BY d` where `d` is `dept AS d`), although `ORDER BY` does.
+`GROUP BY`, collations beyond `BINARY`/`NOCASE`/`RTRIM`, user-defined functions.
+`GROUP BY` does not resolve a projection alias (`GROUP BY d` where `d` is
+`dept AS d`), although `ORDER BY` does.
+
+**Done: `ALTER TABLE … ALTER COLUMN c TYPE t`.** The declaration changes and
+every stored row is rewritten through `value_cast`, the function `CAST` uses, so
+`INTEGER` to `TEXT` gives the digits and `TEXT` to `INTEGER` parses the number.
+A value the cast refuses (`'thirty'` to an integer) refuses the whole statement
+and leaves every row as it was; a conversion that merges two unique keys is
+caught by the rebuilt table's uniqueness check. The rewrite goes through the same
+`alter_row_values` the log replay uses, which now returns the conversion error
+instead of a silent copy — so a reopened database holds the new type, which the
+test checks. `SET DATA TYPE` is accepted beside `TYPE`; a generated column is
+refused, because its value is computed rather than stored; a paged table keeps
+the existing refusal. `test_alter_column_type` covers both spellings, the
+surviving index, both refusals, the generated column, the unchanged type as a
+no-op and the reopen.
 
 **Done: `ALTER TABLE RENAME COLUMN`.** A rename keeps the rows and the indexes:
 indexes refer to columns by position and a rename keeps the count, so the stored

@@ -134,12 +134,23 @@ ALTER TABLE t ADD COLUMN note TEXT NOT NULL DEFAULT '';
 ALTER TABLE t DROP COLUMN note;
 ALTER TABLE t RENAME COLUMN label TO name;
 ALTER TABLE t RENAME label TO name;     -- COLUMN is optional
+ALTER TABLE t ALTER COLUMN qty TYPE REAL;
+ALTER TABLE t ALTER qty SET DATA TYPE REAL;  -- the standard's spelling
 ```
 
 - A rename keeps the rows and the indexes: indexes refer to columns by
   position, so nothing has to be rebuilt. Adding or dropping a column matches
   the surviving columns by name; a rename matches by position, which is what
   keeps the data.
+- A type change rewrites the table: every stored value is converted with the
+  rules of `CAST` (`INTEGER` to `TEXT` gives the digits, `TEXT` to `INTEGER`
+  parses the number), the declaration becomes the new type, and the indexes are
+  rebuilt over the converted keys. A value the conversion refuses — `'thirty'` to
+  `INTEGER` — refuses the whole statement and leaves every row as it was; a
+  conversion that makes two unique keys equal is refused the same way. SQLite
+  spells this as a table rebuild; here it is one statement, and the replay of its
+  log record converts too, so a reopened database agrees with the one that ran it.
+  A generated column is refused, because its value is computed rather than stored.
 - Text that names a column — a generated expression, a trigger body, a policy
   condition, a view — is stored as written and is **not** rewritten by a rename.
 - A virtual table (full-text or spatial) keeps the column names its index was

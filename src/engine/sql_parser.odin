@@ -325,6 +325,26 @@ parse_alter_table :: proc(p: ^Parser) -> Statement {
 		stmt.drop_column = p_ident(p)
 		return stmt
 	}
+	// ALTER [COLUMN] name [SET DATA] TYPE type. SQLite has no such statement (it
+	// asks for a table rebuild), Standard SQL spells it `SET DATA TYPE` and
+	// PostgreSQL spells it `TYPE`; both are accepted rather than one of them.
+	if p_match_keyword(p, "alter") {
+		p_match_keyword(p, "column")
+		stmt.alter_column = p_ident(p)
+		if !p_match_keyword(p, "type") {
+			p_match_keyword(p, "set")
+			p_match_keyword(p, "data")
+			p_expect_keyword(p, "type")
+		}
+		type_name := p_ident_or_keyword(p)
+		kind, width, type_ok := type_kind_from_name(type_name)
+		if !type_ok {
+			p_fail(p, .Sql_Syntax, "unknown column type %q", type_name)
+			return stmt
+		}
+		stmt.alter_type = Column_Type{kind = kind, width = width}
+		return stmt
+	}
 	if p_expect_keyword(p, "add") == false do return stmt
 	p_match_keyword(p, "column")
 	stmt.column.name = p_ident(p)

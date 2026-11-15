@@ -12652,3 +12652,65 @@ test_credential_without_a_host :: proc(t: ^testing.T) {
 	delete(token)
 	delete(short)
 }
+
+// ALTER COLUMN ... TYPE is a rewrite: every stored value is converted with CAST's
+// rules, the declaration changes, and a value the conversion refuses refuses the
+// whole statement. The replay of the log record runs the same conversion, so a
+// reopened database agrees with the one that made the change (D9).
+@(test)
+test_alter_column_type :: proc(t: ^testing.T) {
+	store := fresh_db(t, "alter_type")
+	if store == nil do return
+	path := fmt.aprintf("_test_%s", "alter_type")
+	defer delete(path)
+	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+	run(t, store, "INSERT INTO t (id, v) VALUES (1, 10), (2, 20)")
+	run(t, store, "CREATE INDEX t_v ON t (v)")
+
+	run(t, store, "ALTER TABLE t ALTER COLUMN v TYPE REAL")
+	testing.expect_value(t, scalar(t, store, "SELECT typeof(v) FROM t WHERE id = 1").s, "real")
+	testing.expect_value(t, scalar(t, store, "SELECT v FROM t WHERE id = 2").f, 20.0)
+	// The index survived the rewrite and still answers through the new type.
+	testing.expect_value(t, scalar(t, store, "SELECT id FROM t WHERE v = 20.0").i, 2)
+
+	// Real to Text, then a text that is not a number: the downgrade is refused as
+	// a whole and every row keeps the type it had.
+	run(t, store, "INSERT INTO t (id, v) VALUES (3, 30)")
+	run(t, store, "ALTER TABLE t ALTER COLUMN v TYPE TEXT")
+	testing.expect_value(t, scalar(t, store, "SELECT typeof(v) FROM t WHERE id = 1").s, "text")
+	testing.expect_value(t, scalar(t, store, "SELECT v FROM t WHERE id = 2").s, "20")
+	run(t, store, "UPDATE t SET v = 'thirty' WHERE id = 3")
+	_, bad := db.sql_execute(store, "ALTER TABLE t ALTER COLUMN v TYPE INTEGER")
+	testing.expect(t, !db.error_ok(bad), "a text that is not a number cannot become an integer")
+	if !db.error_ok(bad) {
+		testing.expect_value(t, bad.kind, db.Error_Kind.Invalid_Type)
+		testing.expect(t, strings_contains(bad.message, "cannot become BIGINT"))
+	}
+	testing.expect_value(t, scalar(t, store, "SELECT typeof(v) FROM t WHERE id = 1").s, "text")
+
+	// Two values that collide under the new type are refused by the rebuilt table.
+	run(t, store, "CREATE TABLE u (id INTEGER PRIMARY KEY, k TEXT UNIQUE)")
+	run(t, store, "INSERT INTO u (id, k) VALUES (1, '1'), (2, '01')")
+	_, collide := db.sql_execute(store, "ALTER TABLE u ALTER COLUMN k TYPE INTEGER")
+	testing.expect(t, !db.error_ok(collide), "a type change cannot merge unique keys")
+	testing.expect_value(t, scalar(t, store, "SELECT typeof(k) FROM u WHERE id = 2").s, "text")
+
+	// The standard's other spelling, and an unchanged type as a no-op.
+	run(t, store, "ALTER TABLE u ALTER k SET DATA TYPE TEXT")
+	run(t, store, "ALTER TABLE u ALTER COLUMN k TYPE TEXT")
+
+	// A generated column is refused, because SQLite recomputes it from its
+	// expression and a type would not survive a trip through the mirror.
+	run(t, store, "CREATE TABLE g (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2))")
+	_, generated := db.sql_execute(store, "ALTER TABLE g ALTER COLUMN b TYPE REAL")
+	testing.expect(t, !db.error_ok(generated))
+	testing.expect_value(t, generated.kind, db.Error_Kind.Sql_Unsupported)
+
+	// Reopening replays the change through the same conversion.
+	db.store_close(store)
+	reopened, open_err := db.store_open(path, {persistent = true, create = true, durable = false})
+	if !testing.expectf(t, db.error_ok(open_err), "reopen failed: %s", open_err.message) do return
+	defer cleanup_db(reopened, "alter_type")
+	testing.expect_value(t, scalar(t, reopened, "SELECT typeof(v) FROM t WHERE id = 1").s, "text")
+	testing.expect_value(t, scalar(t, reopened, "SELECT v FROM t WHERE id = 2").s, "20")
+}

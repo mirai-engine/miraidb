@@ -359,6 +359,11 @@ Alter_Table_Stmt :: struct {
 	// column instead of the table.
 	rename_column: string,
 	drop_column:   string,
+	// alter_column names the column whose declared type changes, and alter_type is
+	// the type it will have. The change is a rewrite: every stored value is
+	// converted with the same rules as CAST.
+	alter_column: string,
+	alter_type:   Column_Type,
 	table:  string,
 	column: Column,
 }

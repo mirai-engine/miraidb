@@ -1276,17 +1276,24 @@ table_collect_release :: proc(t: ^Table, rows: ^[dynamic]Row) {
 	delete(rows^)
 }
 
-// alter_row_values lays one stored row out for the schema an ALTER produced.
-// When the column count is unchanged the statement is a rename, and only
-// positions identify the columns: matching by name would find nothing and turn
-// every value into its default. An added or dropped column changes the count, so
-// names decide there, which is what makes the surviving columns keep their data.
+// alter_row_values lays one stored row out for the schema an ALTER produced, and
+// converts a value whose column changed type. The conversion is CAST's: a row that
+// a CAST would refuse refuses the whole ALTER instead of being stored as the old
+// type under the new declaration. Both the statement and the replay of its log
+// record go through here, so a database reopened after an ALTER holds converted
+// values; the statement path is what proves the conversion is possible before the
+// record is written, so the replay cannot meet a value it cannot convert.
+//
+// When the column count is unchanged the statement is a rename, and only positions
+// identify the columns: matching by name would find nothing and turn every value
+// into its default. An added or dropped column changes the count, so names decide
+// there, which is what makes the surviving columns keep their data.
 alter_row_values :: proc(
 	old: ^Table_Schema,
 	next: Table_Schema,
 	values: []Value,
 	alloc: mem.Allocator,
-) -> []Value {
+) -> ([]Value, Error) {
 	out := make([]Value, len(next.columns), alloc)
 	same_width := len(old.columns) == len(next.columns)
 	for column, i in next.columns {
@@ -1297,12 +1304,27 @@ alter_row_values :: proc(
 			if at, found := schema_column_index(old, column.name); found do old_index = at
 		}
 		if old_index >= 0 && old_index < len(values) {
-			out[i] = values[old_index]
+			stored := values[old_index]
+			if stored.kind != .Null && !type_equal(old.columns[old_index].type, column.type) {
+				converted, cast_err := value_cast(stored, column.type)
+				if cast_err.kind != .None {
+					return nil, errf(
+						.Invalid_Type,
+						"column %s cannot become %s: %s",
+						column.name,
+						column_type_name(column.type),
+						cast_err.message,
+					)
+				}
+				out[i] = converted
+			} else {
+				out[i] = stored
+			}
 		} else {
 			out[i] = column.has_default ? column.default_value : value_null()
 		}
 	}
-	return out
+	return out, ERROR_NONE
 }
 
 // --- Index maintenance for DDL ---------------------------------------------

@@ -47,6 +47,20 @@ Column_Type :: struct {
 	components: []Column_Type,
 }
 
+// type_equal asks whether two declarations name the same type. Column_Type holds
+// a slice (PRODUCT's components), so `==` does not compile; the flat fields plus a
+// component-by-component walk is the only honest comparison.
+type_equal :: proc(a, b: Column_Type) -> bool {
+	if a.kind != b.kind || a.width != b.width do return false
+	if a.inner_kind != b.inner_kind || a.inner_width != b.inner_width do return false
+	if a.right_kind != b.right_kind || a.right_width != b.right_width do return false
+	if len(a.components) != len(b.components) do return false
+	for component, i in a.components {
+		if !type_equal(component, b.components[i]) do return false
+	}
+	return true
+}
+
 // type_inner is the payload type of OPTION(T).
 type_inner :: proc(t: Column_Type) -> Column_Type {
 	return Column_Type{kind = t.inner_kind, width = t.inner_width}

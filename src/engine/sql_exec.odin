@@ -5452,6 +5452,12 @@ sql_exec_create_type :: proc(tx: ^Tx, stmt: Create_Type_Stmt) -> (Sql_Result, Er
 }
 
 sql_exec_alter_table :: proc(tx: ^Tx, stmt: Alter_Table_Stmt) -> (Sql_Result, Error) {
+	if len(stmt.alter_column) > 0 {
+		if type_err := tx_alter_column_type(tx, stmt.table, stmt.alter_column, stmt.alter_type); type_err.kind != .None {
+			return {}, type_err
+		}
+		return Sql_Result{kind = .Ack, commit_seq = tx.store.commit_seq}, ERROR_NONE
+	}
 	if len(stmt.drop_column) > 0 {
 		if drop_err := tx_drop_column(tx, stmt.table, stmt.drop_column); drop_err.kind != .None {
 			return {}, drop_err

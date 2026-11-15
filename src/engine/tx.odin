@@ -439,7 +439,8 @@ tx_alter_table :: proc(tx: ^Tx, name: string, next_schema: Table_Schema) -> Erro
 	replacement, create_err := table_create(&schema)
 	if create_err.kind != .None do return create_err
 	for id, row in current.rows {
-		values := alter_row_values(&current.schema, next_schema, row.values, tx.alloc)
+		values, convert_err := alter_row_values(&current.schema, next_schema, row.values, tx.alloc)
+		if convert_err.kind != .None do return convert_err
 		if insert_err := table_insert(replacement, id, values); insert_err.kind != .None {
 			return insert_err
 		}
@@ -448,6 +449,44 @@ tx_alter_table :: proc(tx: ^Tx, name: string, next_schema: Table_Schema) -> Erro
 	replacement.next_sequence = current.next_sequence
 	tx.state.altered[strings.clone(name, tx.alloc)] = replacement
 	return ERROR_NONE
+}
+
+// tx_alter_column_type changes the declared type of one column and converts every
+// stored value to it, with CAST's rules. A value the conversion refuses refuses the
+// statement, so the table is either wholly the new type or untouched; duplicates a
+// conversion creates (two texts that become the same integer) are caught by the
+// uniqueness check of the rebuilt table.
+tx_alter_column_type :: proc(tx: ^Tx, name, column_name: string, next_type: Column_Type) -> Error {
+	if tx.read_only do return errf(.Transaction_Read_Only, "cannot alter a table in a read transaction")
+	if guard_err := tx_paged_alter_guard(tx, name); guard_err.kind != .None do return guard_err
+	if _, created := tx.state.created[name]; created {
+		return errf(.Sql_Unsupported, "alter a table outside the transaction that created it")
+	}
+	current, current_err := tx_table(tx, name)
+	if current_err.kind != .None do return current_err
+	index, found := schema_column_index(&current.schema, column_name)
+	if !found do return errf(.Column_Not_Found, "column %s does not exist in %s", column_name, name)
+	if current.schema.columns[index].generated {
+		return errf(.Sql_Unsupported, "cannot change the type of the generated column %s", column_name)
+	}
+	columns := make([]Column, len(current.schema.columns), tx.alloc)
+	copy(columns, current.schema.columns)
+	unchanged := type_equal(columns[index].type, next_type)
+	if !unchanged {
+		columns[index].type = next_type
+		// The name of a CREATE TYPE declaration described the old type; the column
+		// now carries the type this statement named.
+		columns[index].named_type = ""
+	}
+	next_schema := current.schema
+	next_schema.columns = columns
+	if validate_err := schema_validate(&next_schema); validate_err.kind != .None {
+		return validate_err
+	}
+	// An unchanged type is a no-op that still validates, so a caller can run a
+	// migration twice without copying the table the second time.
+	if unchanged do return ERROR_NONE
+	return tx_alter_table(tx, name, next_schema)
 }
 
 // tx_drop_column removes a column from a table and every row, including the
