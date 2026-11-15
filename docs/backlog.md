@@ -849,17 +849,43 @@ from the declaration, finds no b-tree for it, and rejects the file. A
 gives `PRAGMA index_list(child)` = only `child_pkey`, so duplicates are accepted
 after the round trip.
 
+**Where the defect lives** (checked in the tree, so the next session does not have
+to rediscover it):
+
+- `schema_normalize` (`src/engine/table.odin:284`) already appends a unique index
+  for the primary key and for every `UNIQUE` column, named `<table>_pkey` and
+  `<table>_<col>_key`, with `implicit = true`.
+- `sqlite_file_write` **skips exactly those**: `if index.implicit do continue`
+  (`src/engine/sqlite_write.odin:741`), which is why the constraint leaves no
+  index in the file.
+- `sqlite_master_sql` (`:595`) writes `PRIMARY KEY (col)` inline whenever the key
+  is one column, including a text one; SQLite then wants an automatic index that
+  the file does not carry.
+- `Sqlite_Column` (`src/engine/sqlite_file.odin:22`) has no `unique` field, so an
+  import cannot carry the constraint into the engine.
+
 **Next.**
 
-1. `sqlite_file_write`: for every unique index in the model whose SQL SQLite would
-   store as an automatic index (a primary key that is not an `INTEGER` rowid
-   alias, an inline `UNIQUE`), write a `sqlite_master` row of type `index`, name
-   `sqlite_autoindex_<table>_<n>`, `sql` NULL, and the index b-tree as its root.
-2. `sqlite_import`: carry `column.unique` into the engine's index list, so a
-   recreated table enforces the constraint.
-3. A gate: export a table with a text primary key, a composite key and a
-   `WITHOUT ROWID` shape; `PRAGMA integrity_check` is `ok` and `index_list` shows
-   the automatic index. Import a `UNIQUE` column and prove a duplicate is refused.
+1. `sqlite_master_sql`: write `PRIMARY KEY (col)` inline **only** when the key is
+   the rowid alias (one column, type `.Int`). A text or composite key is carried
+   by an index row instead.
+2. The index loop: instead of skipping every implicit index, skip only that rowid
+   alias and emit the rest through `sqlite_index_sql` under the engine's own name
+   (`k_pkey`, `u_code_key`). Emitting `sqlite_autoindex_<table>_<n>` rows instead
+   was considered and rejected: SQLite numbers those by declaration order while
+   the engine orders the primary key first, so the name can bind a constraint to
+   the wrong b-tree.
+3. `sqlite_file.odin`: add `unique: bool` to `Sqlite_Column`, parse it in
+   `sqlite_columns_from_sql` (a column constraint, and a table-level
+   `UNIQUE (col)` with one column), and have `sqlite_import` put `UNIQUE` in the
+   recreated `CREATE TABLE`, so the engine enforces it and exports it.
+4. A gate: export a text primary key, a composite key, a `UNIQUE` column and a
+   table imported from a `WITHOUT ROWID` file; `PRAGMA integrity_check` is `ok`,
+   `PRAGMA index_list` shows the unique index, and an `INSERT` duplicate is
+   refused after importing a `UNIQUE` column.
+5. After that, `mirror_text_keepable` can allow `UNIQUE` and a text primary key
+   (their indexes will exist in the file), which is the rest of D27: only
+   `GENERATED` and `WITHOUT ROWID` would remain, as documented limits.
 
 **Acceptance.** The three shapes export to files SQLite opens and indexes; an
 imported `UNIQUE` still refuses a duplicate.
@@ -1187,8 +1213,10 @@ and after an ALTER and proves `child` keeps `REFERENCES … ON DELETE CASCADE`, 
    `CREATE TABLE` text and is currently unused by the writer.~~ Done above. What
    remains: a table whose `UNIQUE`, non-integer `PRIMARY KEY` or `WITHOUT ROWID` shape
    SQLite backs with an automatic index still has to be rebuilt, because the writer
-   emits no `sqlite_autoindex_*` row — D33 holds that work, and it lets the text be
-   kept for those tables too. Extend it to views and
+   emits no index row for an implicit one (`if index.implicit do continue`,
+   `src/engine/sqlite_write.odin:741`) — D33 holds that work, and it lets the text be
+   kept for those tables too, since `mirror_text_keepable` only refuses them for
+   that reason. Extend it to views and
    triggers (they are rows in `sqlite_master` with SQL), and keep them in the mirror as
    opaque objects the engine does not evaluate but must not delete.
 2. On a rewrite, re-emit the original SQL for every object whose engine-side schema is
