@@ -4095,6 +4095,13 @@ test_row_quota :: proc(t: ^testing.T) {
 	small := run(t, store, "SELECT id FROM t LIMIT 1")
 	testing.expect_value(t, len(small.rows), 1)
 
+	// A window query reaches the same refusal with its sources handed to
+	// window_sources instead of the row loop. Both shapes used to free a row a
+	// second time, which a release build reports as exit 116 with no message; the
+	// gate that catches it is `scripts/shell_smoke.py` ("row quota refuses").
+	_, window := db.sql_execute(store, "SELECT row_number() OVER () FROM t")
+	testing.expect_value(t, window.kind, db.Error_Kind.Quota_Exceeded)
+
 	db.store_set_row_quota(store, 0)
 	full := run(t, store, "SELECT id FROM t")
 	testing.expect_value(t, len(full.rows), 3)
@@ -4871,6 +4878,9 @@ test_statement_work_budget :: proc(t: ^testing.T) {
 	testing.expect_value(t, db.store_work_budget(store), u64(1))
 	_, over := db.sql_execute(store, "SELECT id, label FROM e")
 	testing.expect_value(t, over.kind, db.Error_Kind.Quota_Exceeded)
+	// The message names the work the statement actually spent: it used to say 0,
+	// because the count was read after the result had been destroyed.
+	testing.expectf(t, strings.contains(over.message, "spends 3 work"), "message: %s", over.message)
 
 	// Mutations pay for the rows they affect.
 	db.store_set_work_budget(store, 0)

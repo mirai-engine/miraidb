@@ -71,8 +71,12 @@ sql_execute_params :: proc(store: ^Store, sql: string, params: []Value) -> (Sql_
 	budget := store.max_work_per_call
 	sync.unlock(&store.mutex)
 	if budget > 0 && result.work > budget {
+		// Read the spend before the destroy zeroes the result, or the message
+		// reports 0 work for a statement that spent 3 (the CLI's --budget showed
+		// it as soon as the cap was reachable).
+		spent := result.work
 		sql_result_destroy(&result)
-		return {}, errf(.Quota_Exceeded, "statement spends %d work, budget is %d", result.work, budget)
+		return {}, errf(.Quota_Exceeded, "statement spends %d work, budget is %d", spent, budget)
 	}
 	return result, ERROR_NONE
 }
@@ -165,8 +169,12 @@ sql_execute_in_tx_params :: proc(tx: ^Tx, sql: string, params: []Value) -> (Sql_
 	if tx != nil do tx.work_units += result.work
 	budget := tx.store.max_work_per_call
 	if budget > 0 && result.work > budget {
+		// Read the spend before the destroy zeroes the result, or the message
+		// reports 0 work for a statement that spent 3 (the CLI's --budget showed
+		// it as soon as the cap was reachable).
+		spent := result.work
 		sql_result_destroy(&result)
-		return {}, errf(.Quota_Exceeded, "statement spends %d work, budget is %d", result.work, budget)
+		return {}, errf(.Quota_Exceeded, "statement spends %d work, budget is %d", spent, budget)
 	}
 	return result, ERROR_NONE
 }
@@ -2821,9 +2829,12 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			// either, the rows being produced are the answer.
 			if stmt.limit == nil && stmt.offset == nil && quota_reached(tx, len(output)) {
 				// Stop where the rows appear: the rest of the scan is work the
-				// caller has already said it does not want.
-				free_values(values)
-				delete(partial)
+				// caller has already said it does not want. Neither `values` nor
+				// `partial` is freed here: the row was already appended to `output`
+				// and the loop below frees what output holds, and the sources went
+				// either to the row loop (freed) or to window_sources (freed below).
+				// Freeing either a second time corrupts the heap, which a release
+				// build reports as exit 116 with no message at all.
 				for row in output do free_values(row.values)
 				for pending_cells in window_cells do delete(pending_cells)
 				for pending_sources in window_sources do delete(pending_sources)

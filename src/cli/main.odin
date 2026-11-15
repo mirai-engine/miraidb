@@ -48,6 +48,10 @@ Options:
                                             statement finishes
   --json                                    print a query result as one JSON
                                             array of rows, for a tool to compare
+  --row-quota=N                             refuse a statement that produces
+                                            more than N rows
+  --budget=N                                refuse a statement that spends more
+                                            than N work units
 
 The database is a directory holding a commit log. SQL covers CREATE, DROP and
 ALTER TABLE, INSERT, UPDATE, DELETE, UPSERT, SELECT with joins, common table
@@ -62,6 +66,19 @@ In the REPL:
   .quit              leave
 
 BEGIN/COMMIT/ROLLBACK keep one transaction open across statements.`
+
+// The caps the command line asked for. They belong to this session, not to the
+// database, so they are set on the store the command opens and nothing about them
+// reaches the log (D23).
+cli_row_quota: u64
+cli_work_budget: u64
+
+apply_limits :: proc(store: ^db.Store) -> ^db.Store {
+	if store == nil do return store
+	if cli_row_quota > 0 do db.store_set_row_quota(store, cli_row_quota)
+	if cli_work_budget > 0 do db.store_set_work_budget(store, cli_work_budget)
+	return store
+}
 
 main :: proc() {
 	args := cli_args(context.temp_allocator)
@@ -109,6 +126,18 @@ main :: proc() {
 				parsed, ok := strconv.parse_int(arg[len("--page-frames="):])
 				if !ok || parsed <= 0 do usage_error("--page-frames needs a positive integer")
 				page_frames = int(parsed)
+				continue
+			}
+			if strings.has_prefix(arg, "--row-quota=") {
+				parsed, ok := strconv.parse_int(arg[len("--row-quota="):])
+				if !ok || parsed <= 0 do usage_error("--row-quota needs a positive integer")
+				cli_row_quota = u64(parsed)
+				continue
+			}
+			if strings.has_prefix(arg, "--budget=") {
+				parsed, ok := strconv.parse_int(arg[len("--budget="):])
+				if !ok || parsed <= 0 do usage_error("--budget needs a positive integer")
+				cli_work_budget = u64(parsed)
 				continue
 			}
 			append(&filtered, arg)
@@ -426,9 +455,9 @@ open_database :: proc(
 		}
 		// The file stays the user's database: every commit patches it back.
 		db.store_set_sqlite_mirror(store, path)
-		return store, db.ERROR_NONE
+		return apply_limits(store), db.ERROR_NONE
 	}
-	return db.store_open(
+	store, store_err := db.store_open(
 		path,
 		{
 			persistent = persistent,
@@ -441,6 +470,7 @@ open_database :: proc(
 			read_only = read_only,
 		},
 	)
+	return apply_limits(store), store_err
 }
 
 // connect builds a client for the authority in `url`.

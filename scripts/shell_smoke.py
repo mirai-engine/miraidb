@@ -107,10 +107,32 @@ def main() -> int:
         except (UnicodeDecodeError, json.JSONDecodeError):
             utf8_rows = None
 
+        # A caller can cap what one statement may produce or spend (D23). Making
+        # the cap reachable from the command line exposed a double free in the
+        # quota path: a release build died with exit 116 and no message where it
+        # now answers the refusal, and the budget message reported 0 work because
+        # it read the count after the result was destroyed.
+        quota = subprocess.run(
+            [BINARY, "sql", windows_path(database), "SELECT * FROM t", "--row-quota=1"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        budget = subprocess.run(
+            [BINARY, "sql", windows_path(database), "SELECT * FROM t", "--budget=1"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
         checks = {
             "last line without newline": "tail-without-newline" in tail.stdout,
             "json keeps the real": real.stdout.strip() == "[[1.0,1,1.5]]",
             "argv is utf-8": utf8_rows == [["C3A9", 1, "\u00e9"]],
+            "row quota refuses": quota.returncode == 1
+            and "more than 1 rows" in (quota.stderr + quota.stdout),
+            "budget refuses": budget.returncode == 1
+            and "spends 2 work, budget is 1" in (budget.stderr + budget.stdout),
             "list mode": "id = 1\nname = a\n\nid = 2\nname = b c" in out,
             "csv quoting": '1,a,"x, y"' in out and "2,b c,NULL" in out,
             "tab separator": "id\tname\n1\ta\n2\tb c" in out,

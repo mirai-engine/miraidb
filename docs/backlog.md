@@ -966,6 +966,16 @@ counts the rows the join built: fewer than 1 000 of the 40 000 that exist, and a
 aggregate over the same join still answers 40 000). Left: a CLI flag that sets the
 quota, and `LIMIT` pushed into the scan.
 
+**Reachable from the command line.** `miraidb sql db "SELECT …" --row-quota=N
+--budget=N` sets both caps on the store the command opens; both are session
+properties and nothing about them reaches the log. Reaching them exposed two
+defects, both fixed: the quota path in `sql_exec_select` freed the row a second
+time — once through the row loop or `window_sources` and once in the refusal —
+which a release build reports as exit 116 with no message, and the work-budget
+message said `0 work` because it read `result.work` after `sql_result_destroy`.
+The gate for the crash is `scripts/shell_smoke.py` ("row quota refuses"), because
+the memory tracker only prints `+++ bad free` and lets the suite pass.
+
 **Cost.** M. The counting is small; finding every recursive path is the work.
 
 ## D24 — The `.sqlite` mirror, completely — *partly done*
