@@ -125,6 +125,12 @@ identity_from_hex :: proc(text: string) -> (Identity, bool) {
 // jwt_identity validates a HS256 JWT and returns its subject.
 @(private)
 jwt_identity :: proc(host: ^Host, token: string) -> (Identity, bool) {
+	return jwt_identity_store(host.store, token, host_now(host))
+}
+
+// jwt_identity_store verifies a signed token against a database, for a caller
+// that has no host to read the key or the clock from.
+jwt_identity_store :: proc(store: ^Store, token: string, now_us: i64) -> (Identity, bool) {
 	first := strings.index(token, ".")
 	if first < 0 do return Identity{}, false
 	after_first := token[first + 1:]
@@ -136,7 +142,7 @@ jwt_identity :: proc(host: ^Host, token: string) -> (Identity, bool) {
 
 	signing_input := token[:second]
 	expected := make([]u8, 32, context.temp_allocator)
-	hmac.sum(.SHA256, expected, transmute([]u8)signing_input, host_token_key(host))
+	hmac.sum(.SHA256, expected, transmute([]u8)signing_input, store_token_key(store))
 	expected_text := b64url_encode(expected)
 	if crypto.compare_constant_time(transmute([]u8)expected_text, transmute([]u8)signature) != 1 {
 		return Identity{}, false
@@ -148,7 +154,7 @@ jwt_identity :: proc(host: ^Host, token: string) -> (Identity, bool) {
 	subject := jwt_string_claim(claims, "sub")
 	if len(subject) == 0 do return Identity{}, false
 	if expiry, has_expiry := jwt_number_claim(claims, "exp"); has_expiry {
-		if expiry < host_now(host) / 1_000_000 do return Identity{}, false
+		if expiry < now_us / 1_000_000 do return Identity{}, false
 	}
 	return identity_from_hex(subject)
 }

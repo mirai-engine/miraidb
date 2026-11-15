@@ -12603,3 +12603,52 @@ test_empty_export_is_a_readable_file :: proc(t: ^testing.T) {
 	testing.expect_value(t, data[100 + 3], u8(0))
 	testing.expect_value(t, data[100 + 4], u8(0))
 }
+
+// A token is a row in the database, so a connection that never built a Host can
+// still issue one and a later connection can check it. The key that digests are
+// built with has to be the database's, or every connection would invent its own
+// and no credential would survive a reopen (D25).
+@(test)
+test_credential_without_a_host :: proc(t: ^testing.T) {
+	store := fresh_db(t, "credential")
+	if store == nil do return
+	path := fmt.aprintf("_test_%s", "credential")
+	defer delete(path)
+
+	identity: db.Identity
+	identity[0] = 3
+	identity[31] = 4
+	token, issue_err := db.store_issue_token(store, identity, 0, 1_000_000)
+	testing.expect(t, db.error_ok(issue_err))
+	testing.expect_value(t, len(token), 67)
+	// No host exists, so the metadata table that holds the key was created by
+	// issuing, not by host_init.
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM _meta").i, 1)
+
+	resolved, valid := db.store_authenticate(store, token, 1_000_000)
+	testing.expect(t, valid, "a token issued here is accepted here")
+	testing.expect_value(t, resolved[0], u8(3))
+	testing.expect_value(t, resolved[31], u8(4))
+
+	// The clock is a parameter, so expiry is testable without waiting.
+	_, early := db.store_authenticate(store, token, 999_999)
+	testing.expect(t, early)
+	short, short_err := db.store_issue_token(store, identity, -1, 1_000_000)
+	testing.expect(t, db.error_ok(short_err))
+	_, live := db.store_authenticate(store, short, 1_000_000)
+	testing.expect(t, !live, "an expired token names nobody")
+
+	// Reopening keeps the key, so the credential survives the process: this is the
+	// defect the C ABI smoke caught, where every connection made a new key.
+	db.store_close(store)
+	reopened, open_err := db.store_open(path, {persistent = true, create = true, durable = false})
+	if !testing.expectf(t, db.error_ok(open_err), "reopen failed: %s", open_err.message) do return
+	defer cleanup_db(reopened, "credential")
+	again, survives := db.store_authenticate(reopened, token, 1_000_000)
+	testing.expect(t, survives, "a token issued before the reopen is still accepted")
+	testing.expect_value(t, again[31], u8(4))
+	_, unknown := db.store_authenticate(reopened, "mt_00", 1_000_000)
+	testing.expect(t, !unknown)
+	delete(token)
+	delete(short)
+}

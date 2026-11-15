@@ -35,10 +35,10 @@ host_ensure_meta :: proc(host: ^Host) -> Error {
 	return insert_err
 }
 
-// host_meta reads one metadata value.
-host_meta :: proc(host: ^Host, key: string) -> (string, bool) {
+// store_meta reads one metadata value from a database, with or without a host.
+store_meta :: proc(store: ^Store, key: string) -> (string, bool) {
 	result, query_err := sql_execute_params(
-		host.store,
+		store,
 		"SELECT value FROM _meta WHERE key = ?",
 		[]Value{value_string(key)},
 	)
@@ -46,6 +46,11 @@ host_meta :: proc(host: ^Host, key: string) -> (string, bool) {
 	defer sql_result_destroy(&result)
 	if len(result.rows) == 0 do return "", false
 	return result.rows[0][0].s, true
+}
+
+// host_meta reads one metadata value.
+host_meta :: proc(host: ^Host, key: string) -> (string, bool) {
+	return store_meta(host.store, key)
 }
 
 // host_schema_text renders the user schema as plain text: one block per table

@@ -100,6 +100,11 @@ Store :: struct {
 	// identity is the caller the policies see. A server would set it per
 	// connection; the embedded API sets it per store.
 	identity:      Identity,
+	// token_key is the HMAC key credential digests are built with, loaded on
+	// first use. It lives here rather than on the Host because a token is a
+	// property of the database: an embedded connection that never built a Host
+	// still has to authenticate a credential.
+	token_key:     []u8,
 	// host_access allows the statements that reach outside the database: ATTACH
 	// reads a file path, LOAD EXTENSION runs host code, VACUUM INTO writes one.
 	// An embedded caller is the host and starts with it enabled; a server turns it
@@ -393,6 +398,7 @@ store_close :: proc(store: ^Store) {
 	delete(store.attached)
 	mirror_destroy(store.mirror)
 	store_mirror_kept_destroy(store)
+	delete(store.token_key)
 	for loss in store.mirror_losses do delete(loss)
 	delete(store.mirror_losses)
 	clear(&store.mirror_losses)

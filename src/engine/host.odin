@@ -185,8 +185,6 @@ Host :: struct {
 	now_us:               i64,
 	// token_counter keeps issued tokens distinct within one process.
 	token_counter:        u64,
-	// token_key is the HMAC key for credential hashing, loaded lazily.
-	token_key:            []u8,
 	// procedure_logs holds the messages of the last procedure call.
 	procedure_logs:       []string,
 	// Counters for the metrics endpoint.
