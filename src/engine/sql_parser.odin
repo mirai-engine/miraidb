@@ -28,7 +28,7 @@ sql_parse :: proc(source: string) -> (Query, Error) {
 	q.alloc = virtual.arena_allocator(&q.arena)
 	q.source = strings.clone(source, q.alloc)
 	p := Parser {
-		lexer   = lexer_init(source),
+		lexer   = lexer_init(source, q.alloc),
 		alloc   = q.alloc,
 		query   = &q,
 	}

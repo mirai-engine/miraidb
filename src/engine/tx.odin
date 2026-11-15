@@ -25,6 +25,11 @@ Tx :: struct {
 	// read_seq is the commit sequence the transaction started from and
 	// read_tables is the set of tables it touched.
 	read_seq:    u64,
+	// pinned records a read started with tx_begin_read_at: it reads the live tables
+	// filtered by version stamps, so the versions it can see must be kept until it
+	// ends.
+	pinned:      bool,
+	pinned_seq:  u64,
 	read_tables: map[string]bool,
 	// A read transaction shares every table instead of copying it: it holds one
 	// reference per table and does not hold the store lock; `locked` records
@@ -309,9 +314,14 @@ tx_begin_read_at :: proc(store: ^Store, seq: u64) -> ^Tx {
 	tx.frozen = nil
 	tx.frozen_list = nil
 	tx.use_frozen = false
+	tx.pinned = true
+	tx.pinned_seq = seq
+	if seq < tx.read_seq do tx.read_seq = seq
+	// Announce the pin before taking the read lock: the write side prunes history
+	// while it holds the store's lock, and a pin nobody can see is history gone.
+	store_pin_read(store, seq)
 	sync.shared_lock(&store.mutex)
 	tx.locked = true
-	if seq < tx.read_seq do tx.read_seq = seq
 	return tx
 }
 
@@ -358,6 +368,7 @@ tx_discard :: proc(tx: ^Tx) {
 	for _, documents in tx.fts_new_docs do delete(documents)
 	delete(tx.fts_new_docs)
 	delete(tx.cte_tables)
+	delete(tx.read_tables)
 	delete(tx.state.index_ops)
 	delete(tx.state.writes)
 	delete(tx.state.created)
@@ -366,14 +377,22 @@ tx_discard :: proc(tx: ^Tx) {
 	delete(tx.frozen_list)
 	delete(tx.frozen)
 	virtual.arena_destroy(&tx.arena)
+	pinned := tx.pinned
+	pinned_seq := tx.pinned_seq
+	// Row history is kept by default: a caller may pin a read to an older sequence
+	// at any time, and a pin nobody announced yet would find the history gone. A
+	// caller that knows it keeps no history - the CLI, the ABI - calls
+	// store_prune_history itself.
+	store := tx.store
 	if tx.locked {
 		if tx.read_only {
-			sync.shared_unlock(&tx.store.mutex)
+			sync.shared_unlock(&store.mutex)
 		} else {
-			sync.unlock(&tx.store.mutex)
+			sync.unlock(&store.mutex)
 		}
 	}
 	free(tx)
+	if pinned do store_unpin_read(store, pinned_seq)
 }
 
 // --- Lookup ----------------------------------------------------------------

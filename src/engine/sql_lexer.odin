@@ -1,5 +1,6 @@
 package engine
 
+import "core:mem"
 import "core:strings"
 
 // Token_Kind is the lexical class of a SQL token. Punctuation and operators
@@ -26,10 +27,14 @@ Lexer :: struct {
 	pos:    int,
 	line:   int,
 	column: int,
+	// alloc owns the text of a quoted token: a quoted identifier or a string
+	// literal is not a slice of the source, and the statement's arena is what
+	// frees it when the statement is done.
+	alloc:  mem.Allocator,
 }
 
-lexer_init :: proc(src: string) -> Lexer {
-	return Lexer{src = src, pos = 0, line = 1, column = 1}
+lexer_init :: proc(src: string, alloc := context.allocator) -> Lexer {
+	return Lexer{src = src, pos = 0, line = 1, column = 1, alloc = alloc}
 }
 
 @(private)
@@ -117,7 +122,7 @@ lexer_next :: proc(l: ^Lexer) -> Token {
 	case '\'', '"', '`':
 		quote := c
 		lexer_advance(l)
-		builder := strings.builder_make()
+		builder := strings.builder_make(l.alloc)
 		for {
 			if l.pos >= len(l.src) {
 				strings.builder_destroy(&builder)

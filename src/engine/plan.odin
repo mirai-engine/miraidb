@@ -342,7 +342,10 @@ plan_join_order :: proc(
 			return plan_ordered_join(tx, stmt, relations[:], dependencies, tx.alloc)
 		}
 	}
-	steps := make([]Plan_Step, len(relations))
+	// The steps are the plan: they go back to the caller, so they live in the
+	// statement's allocator (a transaction arena) and are freed with it. Freeing them
+	// here is a use-after-free the first EXPLAIN after the change walked into.
+	steps := make([]Plan_Step, len(relations), tx.alloc)
 	bound_names := make(map[string]bool)
 	defer delete(bound_names)
 	partials: f64 = 1

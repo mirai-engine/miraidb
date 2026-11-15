@@ -1685,6 +1685,7 @@ window_aggregate_over :: proc(
 @(private)
 eval_aggregate_values :: proc(ctx: ^Eval_Ctx, call: Call_Expr, values: []Value) -> (Value, Error) {
 	name := strings.to_lower(call.name)
+	defer delete(name)
 	if name == "count" {
 		if call.star || len(call.args) == 0 do return value_int(i64(len(values))), ERROR_NONE
 		count := 0
@@ -3331,6 +3332,12 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		delete(window_sources)
 		for kept in group_keep do delete(kept)
 		delete(group_keep)
+	} else {
+		// No window was filled, so none of these took an element: their headers are
+		// the only thing left, and they were allocated with the statement.
+		delete(window_cells)
+		delete(window_sources)
+		delete(group_keep)
 	}
 
 	if len(stmt.order_by) > 0 {
@@ -3382,8 +3389,15 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 	result := Sql_Result{kind = .Rows}
 	// The projection names live in the transaction arena, and the result
 	// outlives the transaction: clone them or the caller prints freed bytes.
+	// The names in `columns` are owned by the statement - projection_name clones a
+	// name or hands back an allocation - and the result keeps its own copy of each,
+	// so both the strings and the array are freed here.
 	result.columns = make([]string, len(columns))
-	for column, i in columns do result.columns[i] = strings.clone(column)
+	for column, i in columns {
+		result.columns[i] = strings.clone(column)
+		delete(column)
+	}
+	delete(columns)
 	rows_out := make([dynamic][]Value, 0, len(output))
 	ids_out := make([dynamic]Row_Id, 0, len(output))
 	for row, i in output {
@@ -4583,7 +4597,9 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		value, _ := db_time_call(call.name, args[:])
 		return value, ERROR_NONE
 	}
-	switch strings.to_lower(call.name) {
+	lowered := strings.to_lower(call.name)
+	defer delete(lowered)
+	switch lowered {
 	case "snippet", "highlight":
 		if len(args) != 2 {
 			return {}, errf(.Invalid_Argument, "%s() takes text and a pattern", call.name)
@@ -4695,6 +4711,7 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		begin := 0
 		end := len(text)
 		lower := strings.to_lower(call.name)
+		defer delete(lower)
 		if lower != "rtrim" {
 			for begin < end && strings.index_byte(set, text[begin]) >= 0 do begin += 1
 		}
@@ -4855,7 +4872,9 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		if args[0].kind == .Null do return value_null(), ERROR_NONE
 		number, ok := value_to_f64(args[0])
 		if !ok do return {}, errf(.Invalid_Type, "%s() expects a number", call.name)
-		switch strings.to_lower(call.name) {
+		inner_lower := strings.to_lower(call.name)
+		defer delete(inner_lower)
+		switch inner_lower {
 		case "log", "log10":
 			if number <= 0 do return value_null(), ERROR_NONE
 			return value_float(math.log10(number)), ERROR_NONE
@@ -5035,6 +5054,7 @@ eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		return agg_stream_value(acc)
 	}
 	name := strings.to_lower(call.name)
+	defer delete(name)
 	rows := ctx.group
 	single_rows: [1][]Source
 	if !ctx.grouped {
