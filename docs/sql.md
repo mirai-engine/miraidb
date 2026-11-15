@@ -588,8 +588,15 @@ FROM s;
   projection or the aggregate. A `RANGE` frame with an offset is refused beside
   `GROUP BY`: it re-reads its `ORDER BY` value per row, and that value may be an
   aggregate whose group is already gone.
-- A window nested inside a larger expression (`sum(n) OVER () + 1`) is refused with
-  `sql_unsupported`; the projection has to be the window call itself.
+- A projection that contains a window turns the `LIMIT` pushdown off, wherever the
+  window sits: the frame is the whole table, so the scan may not stop early.
+- A window can sit inside a larger expression: `sum(n) OVER () + 1`, `abs(sum(n)
+  OVER () - 20)`, `CASE WHEN max(n) OVER () > 10 THEN … END`. The executor fills the
+  window into a hidden slot of the row and then evaluates the projection over it, so
+  the arithmetic runs per row over an answer that already covers the frame. Several
+  windows in one expression work, and `ORDER BY` may name the alias.
+- A window in `WHERE`, `GROUP BY` or `HAVING` is still refused: those run before the
+  rows exist, and so is a window nested in a window.
 
 ## Host functions
 

@@ -413,10 +413,28 @@ walk that exists now.
 ## D9 — The rest of the grammar
 
 **Now.** 32 statement kinds. Refused with `sql_unsupported`: collations beyond
-`BINARY`/`NOCASE`/`RTRIM`, and a window nested inside a larger expression
-(`sum(n) OVER () + 1`), because the executor fills a window column rather than
-evaluating the window where it appears. `GROUP BY` does not resolve a projection
-alias (`GROUP BY d` where `d` is `dept AS d`), although `ORDER BY` does.
+`BINARY`/`NOCASE`/`RTRIM`, a window in `WHERE`/`GROUP BY`/`HAVING` (those run before
+the rows exist) and a window inside a window. `GROUP BY` does not resolve a
+projection alias (`GROUP BY d` where `d` is `dept AS d`), although `ORDER BY` does.
+
+**Done: a window inside a larger expression.** `sum(n) OVER () + 1`, and the
+percentage idiom `count(*) * 100.0 / sum(count(*)) OVER ()`, which used to be
+refused with "cannot be evaluated here". `expr_walk` (a visitor with a per-node
+stop) is the walker the tree was missing: `expr_collect_windows` numbers every
+window inside a projection, the row keeps those answers in hidden slots behind the
+visible columns, and after `apply_windows` the projection is evaluated once more
+with a node-to-slot map in `Eval_Ctx`, so the arithmetic reads a filled answer
+instead of the window. Nested and top-level windows mix, `ORDER BY` may name the
+alias, and a call or a `CASE` around the window is walked the same way. A window
+inside a window and a window in `WHERE` are still refused.
+
+The work found a wrong answer of its own: `select_output_may_shrink` asked whether
+a **top-level** projection was a window, so a nested one was invisible to the
+`LIMIT` pushdown and `SELECT sum(v) OVER () + 1 FROM t LIMIT 1` read one row and
+answered 2 instead of 16. It now uses `expr_has_window`; a projection without a
+window still pushes the limit down. `test_windows_inside_expressions` covers the
+arithmetic, the call and `CASE` shapes, the grouped percentage, both `LIMIT`
+directions and the refusals.
 
 **Done: host functions.** A program registers a scalar function on the store
 (`store_register_function`, `src/engine/functions.odin`) and SQL calls it. The

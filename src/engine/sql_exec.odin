@@ -843,7 +843,10 @@ select_output_may_shrink :: proc(stmt: Select_Stmt) -> bool {
 	for item in stmt.projections {
 		if item.star || item.expr == nil do continue
 		if expr_is_aggregate(item.expr) do return true
-		if _, is_window := item.expr^.(Window_Expr); is_window do return true
+		// Anywhere, not only at the top: `sum(v) OVER () + 1` needs every row just
+		// as `sum(v) OVER ()` does, and a pushed-down LIMIT would stop the scan and
+		// let the window answer from the rows it was allowed to read.
+		if expr_has_window(item.expr) do return true
 	}
 	return false
 }
@@ -859,6 +862,12 @@ Eval_Ctx :: struct {
 	// an aggregate then answers from its running accumulator instead of walking
 	// a materialized group.
 	stream: ^Agg_Stream,
+	// window_values and window_slots are set while a projection that contains a
+	// window is evaluated after the windows were filled: the node maps to the slot
+	// that holds its answer, so `sum(n) OVER () + 1` reads the answer instead of
+	// refusing. Both are nil everywhere else.
+	window_values: []Value,
+	window_slots:  map[^Expr]int,
 	// depth is how deep the evaluation is. The parser refuses a tree deeper than
 	// MAX_EXPRESSION_DEPTH, so this only fires for a tree that arrived another way
 	// (a stored view, a generated column, a policy); it is here so the failure is
@@ -1858,14 +1867,15 @@ window_sort :: proc(indexes: []int, order_keys: []string) {
 // apply_windows fills every window projection once all output rows exist.
 apply_windows :: proc(
 	ctx: ^Eval_Ctx,
-	expanded: []^Expr,
-	positions: []int,
+	nodes: []^Expr,
+	slots: []int,
 	cells: [][dynamic]Window_Cell,
 	rows: []Output_Row,
 	sources: [][]Source,
 ) -> Error {
-	for position, cell_index in positions {
-		window := expanded[position]^.(Window_Expr)
+	for node, cell_index in nodes {
+		position := slots[cell_index]
+		window := node^.(Window_Expr)
 		if !window_is_known(window.name) {
 			return errf(.Sql_Unsupported, "unknown window function %s()", window.name)
 		}
@@ -1925,14 +1935,13 @@ apply_windows :: proc(
 // projection is what puts the result in its slot.
 window_row_cells :: proc(
 	ctx: ^Eval_Ctx,
-	expanded: []^Expr,
-	positions: []int,
+	nodes: []^Expr,
 	has_windows: bool,
 ) -> ([dynamic]Window_Cell, Error) {
-	cells := make([dynamic]Window_Cell, 0, len(positions))
+	cells := make([dynamic]Window_Cell, 0, len(nodes))
 	if !has_windows do return cells, ERROR_NONE
-	for position in positions {
-		window := expanded[position]^.(Window_Expr)
+	for node in nodes {
+		window := node^.(Window_Expr)
 		partition_key, partition_err := window_partition_key(ctx, window)
 		if partition_err.kind != .None do return cells, partition_err
 		order_key, order_err := window_order_key(ctx, window)
@@ -1977,6 +1986,87 @@ window_cells_destroy :: proc(cells: [dynamic]Window_Cell) {
 window_cell_rows_destroy :: proc(rows: ^[dynamic][dynamic]Window_Cell) {
 	for cells in rows do window_cells_destroy(cells)
 	delete(rows^)
+}
+
+// Expr_Visit returns whether the walk should descend into the node it was given.
+Expr_Visit :: #type proc(expr: ^Expr, user: rawptr) -> bool
+
+// expr_walk visits every expression of a tree, parents before children, and is the
+// one place that knows the shape of every node: a new expression type must be added
+// here, or everything built on the walk silently misses its subtree. A window's
+// arguments are not descended into - SQL does not put a window inside a window -
+// and a subquery's windows belong to the SELECT of the subquery.
+expr_walk :: proc(expr: ^Expr, visit: Expr_Visit, user: rawptr) {
+	if expr == nil do return
+	if !visit(expr, user) do return
+	#partial switch e in expr^ {
+	case Binary_Expr:
+		expr_walk(e.left, visit, user)
+		expr_walk(e.right, visit, user)
+	case Unary_Expr:
+		expr_walk(e.operand, visit, user)
+	case Is_Null_Expr:
+		expr_walk(e.operand, visit, user)
+	case Between_Expr:
+		expr_walk(e.operand, visit, user)
+		expr_walk(e.low, visit, user)
+		expr_walk(e.high, visit, user)
+	case In_Expr:
+		expr_walk(e.operand, visit, user)
+		for item in e.items do expr_walk(item, visit, user)
+	case Like_Expr:
+		expr_walk(e.operand, visit, user)
+		expr_walk(e.pattern, visit, user)
+	case Match_Expr:
+		expr_walk(e.operand, visit, user)
+		expr_walk(e.pattern, visit, user)
+	case Cast_Expr:
+		expr_walk(e.operand, visit, user)
+	case Collate_Expr:
+		expr_walk(e.operand, visit, user)
+	case Call_Expr:
+		for arg in e.args do expr_walk(arg, visit, user)
+	case Case_Expr:
+		expr_walk(e.operand, visit, user)
+		for branch in e.branches {
+			expr_walk(branch.condition, visit, user)
+			expr_walk(branch.result, visit, user)
+		}
+		expr_walk(e.fallback, visit, user)
+	}
+}
+
+@(private)
+collect_window_visit :: proc(expr: ^Expr, user: rawptr) -> bool {
+	if _, is_window := expr^.(Window_Expr); is_window {
+		append(cast(^[dynamic]^Expr)user, expr)
+		return false
+	}
+	return true
+}
+
+// expr_collect_windows appends every window expression inside `expr`, outermost
+// first. It is what gives a window nested in a larger projection a slot of its own.
+expr_collect_windows :: proc(expr: ^Expr, out: ^[dynamic]^Expr) {
+	expr_walk(expr, collect_window_visit, rawptr(out))
+}
+
+@(private)
+has_window_visit :: proc(expr: ^Expr, user: rawptr) -> bool {
+	if _, is_window := expr^.(Window_Expr); is_window {
+		found := cast(^bool)user
+		found^ = true
+		return false
+	}
+	return true
+}
+
+// expr_has_window reports whether a projection needs the whole scan, which a window
+// anywhere in it does: its frame is the table.
+expr_has_window :: proc(expr: ^Expr) -> bool {
+	found := false
+	expr_walk(expr, has_window_visit, rawptr(&found))
+	return found
 }
 
 // window_positions lists the projection indexes that hold a window expression.
@@ -2886,15 +2976,64 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 	}
 	window_positions := window_positions_of(expanded)
 	defer delete(window_positions)
-	has_windows := len(window_positions) > 0
+	// A window can also sit inside a larger projection, `sum(n) OVER () + 1`: its
+	// answer then needs a slot of its own, behind the visible columns, and the
+	// projection is evaluated after the windows are filled.
+	nested_windows := make([dynamic]^Expr)
+	for expr in expanded {
+		if _, top := expr^.(Window_Expr); top do continue
+		expr_collect_windows(expr, &nested_windows)
+	}
+	defer delete(nested_windows)
+	has_windows := len(window_positions) > 0 || len(nested_windows) > 0
+	// window_nodes is every window that needs filling, in cell order: the top-level
+	// ones first (their slot is the projection index), then the nested ones (their
+	// slot is behind the visible columns).
+	window_nodes := make([dynamic]^Expr, 0, len(window_positions) + len(nested_windows))
+	window_slot_list := make([dynamic]int, 0, len(window_positions) + len(nested_windows))
+	window_slots := make(map[^Expr]int)
+	defer {
+		delete(window_nodes)
+		delete(window_slot_list)
+		delete(window_slots)
+	}
+	// needs_outer marks a projection that has to be evaluated once its windows are
+	// filled, because evaluating it earlier would reach an unfilled window.
+	needs_outer := make([]bool, len(expanded))
+	defer delete(needs_outer)
+	// Two passes, so a slot does not depend on the order the projections are walked:
+	// every nested window is numbered behind the visible columns first, then the
+	// list is built top-level windows first, nested ones after.
+	for expr, position in expanded {
+		if _, top := expr^.(Window_Expr); top {
+			append(&window_nodes, expr)
+			append(&window_slot_list, position)
+			window_slots[expr] = position
+			continue
+		}
+		inner := make([dynamic]^Expr)
+		expr_collect_windows(expr, &inner)
+		if len(inner) == 0 {
+			delete(inner)
+			continue
+		}
+		needs_outer[position] = true
+		for node in inner {
+			slot := len(expanded) + len(nested_windows)
+			append(&nested_windows, node)
+			append(&window_nodes, node)
+			append(&window_slot_list, slot)
+			window_slots[node] = slot
+		}
+		delete(inner)
+	}
 	if has_windows && aggregate {
 		// A window reads its ORDER BY value once per partition to place a RANGE
 		// frame, and beside GROUP BY that value may be an aggregate, which needs the
 		// group rather than a row: the group is gone by the time a window is filled.
 		// Every other frame shape reads keys that were captured per group.
-		for position in window_positions {
-			expr := expanded[position]
-			window := expr^.(Window_Expr)
+		for node in window_nodes {
+			window := node^.(Window_Expr)
 			if window_frame_reads_values(window.frame) {
 				free_partials(&filtered)
 				return {}, errf(
@@ -2969,7 +3108,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			} else {
 				ctx.sources = nil
 			}
-			cells, cells_err := window_row_cells(&ctx, expanded, window_positions, has_windows)
+			cells, cells_err := window_row_cells(&ctx, window_nodes[:], has_windows)
 			if cells_err.kind != .None {
 				free_values_over_rows(&output)
 				window_cell_rows_destroy(&window_cells)
@@ -2978,9 +3117,11 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 				free_partials(&filtered)
 				return {}, cells_err
 			}
-			values := make([]Value, len(expanded))
+			values := make([]Value, len(expanded) + len(nested_windows))
 			for expr, i in expanded {
-				if has_windows && window_cell_for(window_positions, i) >= 0 {
+				// A top-level window, or a projection whose windows are still
+				// unfilled, is a null here and is written after apply_windows.
+				if needs_outer[i] || (has_windows && window_cell_for(window_positions, i) >= 0) {
 					values[i] = value_null()
 					continue
 				}
@@ -3045,15 +3186,17 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 	} else {
 		for partial, index in filtered {
 			ctx.sources = partial
-			values := make([]Value, len(expanded))
-			cells, cells_err := window_row_cells(&ctx, expanded, window_positions, has_windows)
+			values := make([]Value, len(expanded) + len(nested_windows))
+			cells, cells_err := window_row_cells(&ctx, window_nodes[:], has_windows)
 			if cells_err.kind != .None {
 				free_values(values)
 				free_partials(&filtered)
 				return {}, cells_err
 			}
 			for expr, i in expanded {
-				if has_windows && window_cell_for(window_positions, i) >= 0 {
+				// A top-level window, or a projection whose windows are still
+				// unfilled, is a null here and is written after apply_windows.
+				if needs_outer[i] || (has_windows && window_cell_for(window_positions, i) >= 0) {
 					values[i] = value_null()
 					continue
 				}
@@ -3114,7 +3257,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 	delete(filtered)
 
 	if has_windows {
-		if window_err := apply_windows(&ctx, expanded, window_positions, window_cells[:], output[:], window_sources[:]); window_err.kind != .None {
+		if window_err := apply_windows(&ctx, window_nodes[:], window_slot_list[:], window_cells[:], output[:], window_sources[:]); window_err.kind != .None {
 			free_values_over_rows(&output)
 			window_cell_rows_destroy(&window_cells)
 			for sources in window_sources do delete(sources)
@@ -3123,6 +3266,48 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			delete(group_keep)
 			delete(output)
 			return {}, window_err
+		}
+		// A projection that carried a window inside it is evaluated now, with the
+		// answers in place: `sum(n) OVER () + 1` reads the slot instead of refusing.
+		has_outer := false
+		for needed in needs_outer do if needed do has_outer = true
+		if has_outer {
+			for &row, i in output {
+				if aggregate {
+					ctx.group = group_keep[i][:]
+					ctx.grouped = true
+					ctx.sources = len(group_keep[i]) > 0 ? group_keep[i][0] : nil
+				} else {
+					ctx.sources = window_sources[i]
+				}
+				ctx.window_slots = window_slots
+				ctx.window_values = row.values
+				for expr, position in expanded {
+					if !needs_outer[position] do continue
+					value, eval_err := eval_expr(&ctx, expr)
+					if eval_err.kind != .None {
+						ctx.window_values = nil
+						ctx.window_slots = nil
+						ctx.group = nil
+						ctx.grouped = false
+						ctx.sources = nil
+						free_values_over_rows(&output)
+						window_cell_rows_destroy(&window_cells)
+						for sources in window_sources do delete(sources)
+						delete(window_sources)
+						for kept in group_keep do delete(kept)
+						delete(group_keep)
+						delete(output)
+						return {}, eval_err
+					}
+					row.values[position] = value_clone(value, context.allocator)
+				}
+				ctx.window_values = nil
+				ctx.window_slots = nil
+			}
+			ctx.group = nil
+			ctx.grouped = false
+			ctx.sources = nil
 		}
 		// ORDER BY runs on the completed rows, so an alias that names a window
 		// projection sorts on its value. A grouped row has no source behind it: its
@@ -3512,6 +3697,13 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 			"expression nests deeper than %d levels",
 			MAX_EXPRESSION_DEPTH,
 		)
+	}
+	if _, is_window := expr^.(Window_Expr); is_window && ctx.window_slots != nil {
+		if slot, found := ctx.window_slots[expr]; found {
+			if slot >= 0 && slot < len(ctx.window_values) {
+				return ctx.window_values[slot], ERROR_NONE
+			}
+		}
 	}
 	switch e in expr^ {
 	case Literal_Expr:

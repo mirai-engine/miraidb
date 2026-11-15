@@ -146,7 +146,7 @@ the gaps are named rather than left to be discovered.
   `linux_arm64` and `darwin_arm64`. The POSIX lock is the reason it is checked:
   it carried a missing `core:sys/posix` import and two wrong integer types until
   this round, so the code that a Linux build would run had never been compiled.
-- 260 integration tests covering CRUD, recovery, constraints, transactions,
+- 261 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
@@ -391,6 +391,12 @@ than 1000 bytes cannot be indexed and the insert says so.
   text to a number first, `--json` keeps the `.0` on a real, and `INSERT OR
   REPLACE` is implemented instead of refused by accident (`AUDIT-10` P-B1/P-B2/
   P-B3/P-B7). `OR ROLLBACK`, `OR FAIL` and `OR IGNORE` are named refusals.
+- **A window can sit inside a larger expression.** The executor fills the window
+  into a hidden slot of the row and evaluates the projection afterwards, so
+  `count(*) * 100.0 / sum(count(*)) OVER ()` answers, with or without `GROUP BY`.
+  Writing it found that the `LIMIT` pushdown only looked for a window at the top of
+  a projection: a nested one let the scan stop early and the window answered from
+  the rows it was allowed to read (`test_windows_inside_expressions`).
 - **A program can make its own code callable from SQL.** A scalar function
   registered on the store is looked up only where a name would otherwise be
   unknown, so the builtins keep their names; the arity is checked before the

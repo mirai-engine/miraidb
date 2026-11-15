@@ -12875,3 +12875,54 @@ test_host_functions :: proc(t: ^testing.T) {
 	testing.expect_value(t, unknown.kind, db.Error_Kind.Sql_Unsupported)
 	testing.expect(t, !db.error_ok(db.store_register_function(store, "", 0, twice)))
 }
+
+// A window can also sit inside a larger projection: its answer gets a hidden slot,
+// the projection is evaluated once the windows are filled, and the node reads that
+// slot. Anywhere in the tree, and nowhere that is read before the rows exist.
+@(test)
+test_windows_inside_expressions :: proc(t: ^testing.T) {
+	store := fresh_db(t, "window_nested")
+	if store == nil do return
+	defer cleanup_db(store, "window_nested")
+	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT, v INTEGER)")
+	run(t, store, "INSERT INTO t (id, k, v) VALUES (1, 'a', 1), (2, 'a', 2), (3, 'b', 3), (4, 'b', 4), (5, 'c', 5)")
+
+	// The list is 15 and its maximum 5.
+	testing.expect_value(t, scalar(t, store, "SELECT sum(v) OVER () + 1 FROM t LIMIT 1").i, 16)
+	testing.expect_value(t, scalar(t, store, "SELECT 1 + sum(v) OVER () FROM t LIMIT 1").i, 16)
+	testing.expect_value(t, scalar(t, store, "SELECT sum(v) OVER () * 2 FROM t LIMIT 1").i, 30)
+	testing.expect_value(t, scalar(t, store, "SELECT sum(v) OVER () + max(v) OVER () FROM t LIMIT 1").i, 20)
+	// A call and a CASE are walked like a binary expression.
+	testing.expect_value(t, scalar(t, store, "SELECT abs(sum(v) OVER () - 20) FROM t LIMIT 1").i, 5)
+	testing.expect_value(
+		t,
+		scalar(t, store, "SELECT CASE WHEN sum(v) OVER () > 10 THEN 1 ELSE 0 END FROM t LIMIT 1").i,
+		1,
+	)
+	// The value is per row, and ORDER BY may name it.
+	rows := run(t, store, "SELECT id, sum(v) OVER () + v AS adj FROM t ORDER BY adj DESC, id DESC LIMIT 2")
+	testing.expect_value(t, len(rows.rows), 2)
+	testing.expect_value(t, rows.rows[0][0].i, 5)
+	testing.expect_value(t, rows.rows[1][1].i, 19)
+	db.sql_result_destroy(&rows)
+
+	// The percentage-of-total idiom, which needs a nested window beside GROUP BY.
+	pct := run(t, store, "SELECT k, count(*) * 100.0 / sum(count(*)) OVER () AS pct FROM t GROUP BY k ORDER BY k")
+	testing.expect_value(t, len(pct.rows), 3)
+	testing.expect_value(t, pct.rows[0][1].f, 40.0)
+	testing.expect_value(t, pct.rows[2][1].f, 20.0)
+	db.sql_result_destroy(&pct)
+
+	// A window anywhere in a projection needs the whole scan: a LIMIT may not stop
+	// it, or the window answers from the rows the scan was allowed to read. The
+	// pushdown itself still applies to a projection without one.
+	testing.expect_value(t, scalar(t, store, "SELECT sum(v) OVER () FROM t LIMIT 1").i, 15)
+	testing.expect_value(t, scalar(t, store, "SELECT max(v) OVER () FROM t LIMIT 1").i, 5)
+	limited := run(t, store, "SELECT id FROM t LIMIT 2")
+	testing.expect_value(t, len(limited.rows), 2)
+	db.sql_result_destroy(&limited)
+
+	// WHERE is evaluated before any row exists, so a window there stays refused.
+	where_err := run_error(t, store, "SELECT id FROM t WHERE sum(v) OVER () > 0")
+	testing.expect_value(t, where_err.kind, db.Error_Kind.Sql_Unsupported)
+}
