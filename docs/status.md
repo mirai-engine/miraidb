@@ -391,6 +391,24 @@ than 1000 bytes cannot be indexed and the insert says so.
   text to a number first, `--json` keeps the `.0` on a real, and `INSERT OR
   REPLACE` is implemented instead of refused by accident (`AUDIT-10` P-B1/P-B2/
   P-B3/P-B7). `OR ROLLBACK`, `OR FAIL` and `OR IGNORE` are named refusals.
+- **The C ABI reaches every lever the engine has.** 33 `miraidb_*` exports and 43
+  `sqlite3_*` exports: open with flags (read-only, in-memory, no-sync, paged),
+  interrupt, the row quota and work budget with `miraidb_work_used`, an identity
+  and a token (`miraidb_set_identity`, `miraidb_identity`, `miraidb_issue_token`,
+  `miraidb_authenticate`, which answers `MIRAIDB_DENIED` for an unknown or expired
+  token and changes nobody), SQLite's primary result codes and, when asked, the
+  narrow constraint ones. The threading contract is written in
+  `include/miraidb.h`: one connection and its statements to one thread at a time,
+  two threads may use two connections on the same file, `miraidb_interrupt` is the
+  one call that may run against a busy connection.
+- **A token is a property of the database, not of a host.** The lookups moved from
+  `Host` to `Store` (`store_token_key`, `store_token_digest`, `store_issue_token`,
+  `store_authenticate`) with the clock passed in, so an embedded connection can
+  authenticate without building a reducer catalog. The key cache moved with them —
+  which also stopped `host_destroy` from leaking it — and `_meta` is created on
+  first use, because without that every connection invented its own key and no
+  token survived a reopen (`test_credential_without_a_host`,
+  `scripts/capi_smoke.py`).
 - **The embedding layers answer misuse instead of reading freed memory.** A
   statement used after `finalize`, or through a connection already closed, gets
   `MIRAIDB_MISUSE` (2) from the C ABI and `SQLITE_MISUSE` from the facade; a bind

@@ -1045,56 +1045,58 @@ the gate fails if either regresses.
 
 **Cost.** M.
 
-## D25 — The C ABI, completely
+## D25 — The C ABI, completely: **done**
 
-**Now.** 24 functions in the sqlite3 shape (`open`, `close`, `errmsg`, `exec`,
-`backup`, `prepare`, `finalize`, `reset`, six `bind`s, `step`, `changes`, nine
-column accessors, `version`) and none of the engine's levers: no open options, so
-an embedder cannot ask for read-only, in-memory or a durability other than the
-default; no `miraidb_interrupt` although `store_cancel` exists and is tested; no
-row quota or work budget; no identity or token, so roles and policies are
-unreachable from C; no statement about thread safety. `miraidb_open` also imports
-a `.sqlite` file into memory without saying so, which for a 250 000-row file is
-~15 s and the size of the file in RAM.
+**Now.** 33 `miraidb_*` exports and 43 `sqlite3_*` exports, and the engine's
+levers are all on the C side:
 
-**Next.**
+- **Opening**: `miraidb_open_ex(path, flags)` with read-only, in-memory, no-sync
+  and paged bits; `miraidb_open` is that call with no flags. The header states the
+  surprising part — a path that is already a SQLite file is imported into memory
+  and mirrored back on every commit — because a caller that does not know it will
+  wonder why opening a 250 000-row file takes seconds.
+- **Stopping work**: `miraidb_interrupt` and `sqlite3_interrupt` cancel the
+  running statement from any thread; the cancellation belongs to that statement, so
+  `embed_exec`, `embed_exec_params` and `embed_start` clear the flag before their
+  own work and an interrupted connection keeps serving.
+- **Capping work**: `miraidb_set_row_quota`, `miraidb_set_work_budget`,
+  `miraidb_work_used`. Caps are session properties, never schema.
+- **Saying who you are**: `miraidb_set_identity`, `miraidb_identity`,
+  `miraidb_issue_token`, `miraidb_authenticate`. An identity is the 32 bytes of an
+  `IDENTITY` value; a token is 67 characters and is stored as an HMAC digest, so a
+  copied database file holds no usable credential. `miraidb_authenticate` answers
+  the new `MIRAIDB_DENIED` (3) for an unknown or expired token and leaves the
+  identity alone.
+- **Result codes**: `sqlite3_errcode` answers SQLite's primary codes —
+  `SQLITE_CONSTRAINT` (19), `SQLITE_MISMATCH` (20), `SQLITE_INTERRUPT` (9),
+  `SQLITE_BUSY` (5), `SQLITE_READONLY` (8), `SQLITE_AUTH` (23), `SQLITE_TOOBIG`
+  (13), `SQLITE_NOTADB` (26) — and, with
+  `sqlite3_extended_result_codes(db, 1)`, the narrow constraint code
+  (`_PRIMARYKEY` 1555, `_UNIQUE` 2067, `_NOTNULL` 1299).
+  `sqlite3_extended_errcode` answers the narrow code in either mode.
+- **Misuse**: a dead handle answers `MIRAIDB_MISUSE`/`SQLITE_MISUSE` and does
+  nothing; a bind past the statement's parameters is `SQLITE_RANGE` (25).
+- **Threads**: stated in `include/miraidb.h` — one connection and its statements
+  belong to one thread at a time, two threads may use two connections on the same
+  file, `miraidb_interrupt` is the one call that may run against a busy
+  connection, and nothing else is synchronised.
 
-1. `miraidb_open_v2(path, flags)` with read-only, create, durability and
-   in-memory bits; keep `miraidb_open` as a thin wrapper so the ABI stays additive.
-2. `miraidb_interrupt`, `miraidb_set_row_quota`, `miraidb_set_work_budget`.
-3. `miraidb_set_identity`, `miraidb_authenticate(token)` so the C surface can use
-   what `roles.odin` already checks.
-4. A paragraph in `include/miraidb.h` on thread safety and pointer lifetimes, and
-   the same in `docs/`.
+**What it took.** A token is a row in the database and its digest is built from a
+key in `_meta`, but every lookup went through a `Host`, so a C connection could
+not authenticate anything. `store_token_key`, `store_token_digest`,
+`store_issue_token` and `store_authenticate` do the same work for a store, with
+the clock passed in; the key cache moved from `Host` to `Store`, which also
+stopped `host_destroy` from leaking it. The key is created in `_meta` by
+`store_token_key`, because an embedded database has no `host_init` to create that
+table — without it every connection invented a key of its own and no token
+survived a reopen, which the smoke caught as "invalid or expired token".
 
-**Acceptance.** `capi_smoke.py` exercises each new call; a cancelled statement
-returns `MIRAIDB_ERROR` with "cancelled" in `miraidb_errmsg`; a read-only open
-refuses `INSERT`; the header documents the model.
-
-**Done so far.** The two caps reach C: `miraidb_set_row_quota`,
-`miraidb_set_work_budget`, `miraidb_work_used`, and `miraidb_interrupt` /
-`sqlite3_interrupt` stop a running statement; the next statement starts with a
-clean flag. The `sqlite3_*` face answers SQLite's primary result codes —
-`SQLITE_CONSTRAINT` (19), `SQLITE_MISMATCH` (20), `SQLITE_INTERRUPT` (9),
-`SQLITE_BUSY` (5), `SQLITE_READONLY` (8), `SQLITE_AUTH` (23), `SQLITE_TOOBIG`
-(13), `SQLITE_NOTADB` (26) and the rest — and `sqlite3_errcode` reports the code
-the failing call returned. `include/miraidb.h` documents the caps, the interrupt
-and the misuse contract. `scripts/capi_smoke.py` and
-`scripts/sqlite_abi_smoke.py` exercise all of it.
-
-`miraidb_open_ex(path, flags)` adds the open options — read-only, in-memory, no
-sync, paged — and the plain `miraidb_open` is that call with no flags; a reader
-refuses writes with `cannot insert in a read transaction`, an in-memory database
-writes nothing to disk, and the header states that a path that is already a
-SQLite file is imported into memory and mirrored back.
-
-**What is left.** An identity/token so roles and policies are reachable from C, a
-written thread-safety statement (one connection, one thread, as today), and the
-extended result codes (`sqlite3_extended_result_codes` is accepted and ignored).
-A caller that needs a cap on a reader connection can set one: the caps are
-session properties, not schema.
-
-**Cost.** M.
+**Acceptance.** `scripts/capi_smoke.py` exercises every new call, including the
+round trip across a close and a reopen, a policy that hides another caller's rows,
+an expired token that changes nobody, and a connection that never authenticated
+(which matches no policy row, exactly as a server connection does before
+`AUTH`). `scripts/sqlite_abi_smoke.py` proves each result code in both modes.
+`include/miraidb.h` documents the model.
 
 ## D26 — Docs whose claims are executed — **done** (see `docs/roadmap.md`, closed)
 
