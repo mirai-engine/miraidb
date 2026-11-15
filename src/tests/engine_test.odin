@@ -12967,3 +12967,37 @@ test_prune_history_respects_a_pin :: proc(t: ^testing.T) {
 		for _, row in table.rows do testing.expect_value(t, len(row.versions), 0)
 	}
 }
+
+// An error message is the receiver's to free, and error_free is how. A statement
+// that fails answers with one, and a process that answers failures all day has to
+// give them back: before error_free existed, every refused statement left its
+// message behind (tools/leakcheck measured one per REPLACE that collided).
+@(test)
+test_error_free_releases_the_message :: proc(t: ^testing.T) {
+	store := fresh_db(t, "error_free")
+	if store == nil do return
+	defer cleanup_db(store, "error_free")
+	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+
+	_, missing := db.sql_execute(store, "SELECT * FROM nope")
+	testing.expect(t, !db.error_ok(missing))
+	testing.expectf(t, len(missing.message) > 0, "a refusal carries a message")
+	db.error_free(&missing)
+	testing.expect_value(t, missing.kind, db.Error_Kind.None)
+	testing.expect_value(t, len(missing.message), 0)
+
+	// The same for an error that a statement answers with and the caller drops: a
+	// REPLACE that collides is not a failure, and its first attempt's message is
+	// freed where it is swallowed.
+	run(t, store, "INSERT INTO t (id, v) VALUES (1, 1)")
+	run(t, store, "INSERT OR REPLACE INTO t (id, v) VALUES (1, 2)")
+	replaced, replaced_err := db.sql_execute(store, "SELECT v FROM t WHERE id = 1")
+	testing.expect(t, db.error_ok(replaced_err))
+	testing.expect_value(t, replaced.rows[0][0].i, 2)
+	db.sql_result_destroy(&replaced)
+
+	// A nil error frees nothing, so a caller does not have to guard the call.
+	nothing: db.Error
+	db.error_free(&nothing)
+	db.error_free(nil)
+}

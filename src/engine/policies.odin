@@ -126,6 +126,9 @@ policy_parse :: proc(tx: ^Tx, table, sql: string, set: ^Policy_Set) -> (^Expr, E
 policy_load :: proc(tx: ^Tx, table: string) -> (Policy_Set, Error) {
 	set: Policy_Set
 	if strings.has_prefix(table, "_") do return set, ERROR_NONE
+	// An absent `_policy` table is the normal case for a database without policies,
+	// and `tx_collect` would build an error message to say so on every statement.
+	if tx_table_probe(tx, POLICY_TABLE) == nil do return set, ERROR_NONE
 	rows := make([dynamic]Row)
 	defer delete(rows)
 	if collect_err := tx_collect(tx, POLICY_TABLE, &rows); collect_err.kind != .None {

@@ -710,8 +710,8 @@ plan_probe_ready :: proc(
 	bound_names: map[string]bool,
 ) -> bool {
 	if on == nil do return false
-	table, table_err := tx_table(tx, relation.ref.name)
-	if table_err.kind != .None || table == nil || table.paged != nil do return false
+	table := tx_table_probe(tx, relation.ref.name)
+	if table == nil || table.paged != nil do return false
 	conjuncts := make([dynamic]^Expr)
 	defer delete(conjuncts)
 	split_and(on, &conjuncts)
@@ -877,8 +877,8 @@ plan_relation :: proc(
 	on: ^Expr,
 	params: []Value,
 ) -> Plan_Relation {
-	table, table_err := tx_table(tx, ref.name)
-	if table_err.kind != .None {
+	table := tx_table_probe(tx, ref.name)
+	if table == nil {
 		// A view has no rows of its own until the statement runs. Its own FROM is
 		// the one number that exists before that, so the plan borrows it.
 		if estimated, priced := plan_view_relation(store, tx, ref, on, params, 0); priced {

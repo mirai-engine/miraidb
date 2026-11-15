@@ -27,7 +27,7 @@ Trigger_Timing :: enum {
 
 // trigger_ensure creates the catalog on first use.
 trigger_ensure :: proc(tx: ^Tx) -> Error {
-	if table, table_err := tx_table(tx, TRIGGER_TABLE); table_err.kind == .None {
+	if table := tx_table_probe(tx, TRIGGER_TABLE); table != nil {
 		// A catalog written before WHEN existed gets the column on first use, so
 		// an older database keeps its triggers instead of failing to open them.
 		if _, found := schema_column_index(&table.schema, "when_text"); !found {
@@ -113,7 +113,7 @@ trigger_lookup :: proc(tx: ^Tx, name: string) -> (row: []Value, found: bool) {
 }
 
 trigger_drop :: proc(tx: ^Tx, name: string, if_exists: bool) -> Error {
-	if _, table_err := tx_table(tx, TRIGGER_TABLE); table_err.kind != .None {
+	if tx_table_probe(tx, TRIGGER_TABLE) == nil {
 		if if_exists do return ERROR_NONE
 		return errf(.Table_Not_Found, "trigger %s does not exist", name)
 	}
@@ -167,7 +167,9 @@ trigger_fire :: proc(
 	// Internal tables have no triggers, and a transaction that never created one
 	// never pays for the catalog lookup.
 	if len(table_name) > 0 && table_name[0] == '_' do return ERROR_NONE
-	if _, table_err := tx_table(tx, TRIGGER_TABLE); table_err.kind != .None do return ERROR_NONE
+	// Most databases have no triggers, and that is the answer to almost every call
+	// here: a probe asks it without an error message to throw away.
+	if tx_table_probe(tx, TRIGGER_TABLE) == nil do return ERROR_NONE
 	if tx.trigger_depth >= TRIGGER_MAX_DEPTH {
 		return errf(.Sql_Unsupported, "triggers nest more than %d deep", TRIGGER_MAX_DEPTH)
 	}

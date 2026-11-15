@@ -91,8 +91,8 @@ extension_unload :: proc(tx: ^Tx, name: string, if_exists: bool) -> Error {
 
 @(private)
 extension_find :: proc(tx: ^Tx, name: string) -> (bool, Error) {
-	table, err := tx_table(tx, EXTENSION_TABLE)
-	if err.kind != .None do return false, err
+	table := tx_table_probe(tx, EXTENSION_TABLE)
+	if table == nil do return false, ERROR_NONE
 	rows := make([dynamic]Row, 0, 4)
 	defer delete(rows)
 	table_collect(table, &rows)

@@ -604,9 +604,15 @@ sql_exec_explain :: proc(tx: ^Tx, stmt: Explain_Stmt, params: []Value) -> (Sql_R
 	case Select_Stmt:
 		order := plan_join_order(store, tx, inner, params)
 		first := order.steps[0]
-		base_table, table_err := tx_table(tx, order.from.name)
-		if table_err.kind == .None {
-			append(&lines, fmt.aprintf("scan %s%s", first.name, explain_access(store, base_table, order.from, inner.where_clause, params)))
+		// Asking whether the FROM names a table is a bool question: the probe answers
+		// it without building the error message that says it does not.
+		base_table := tx_table_probe(tx, order.from.name)
+		if base_table != nil {
+			// explain_access builds a fragment and the line copies it, so the fragment
+			// is freed here: EXPLAIN used to leave one behind per statement.
+			suffix := explain_access(store, base_table, order.from, inner.where_clause, params)
+			append(&lines, fmt.aprintf("scan %s%s", first.name, suffix))
+			delete(suffix)
 		} else if _, is_view := view_sql(tx, order.from.name); is_view {
 			// The number is the view's own FROM: it has no rows to measure yet.
 			append(&lines, fmt.aprintf(
@@ -643,7 +649,7 @@ sql_exec_explain :: proc(tx: ^Tx, stmt: Explain_Stmt, params: []Value) -> (Sql_R
 		if inner.having != nil do append(&lines, result_own("having"))
 		if len(inner.order_by) > 0 {
 			ordered := false
-			if ordered_table, ordered_err := tx_table(tx, order.from.name); ordered_err.kind == .None {
+			if ordered_table := tx_table_probe(tx, order.from.name); ordered_table != nil {
 				if index, _, ordered_ok := index_order_for(tx, ordered_table, order.from, inner); ordered_ok {
 					append(&lines, fmt.aprintf(
 						"order by (index %s)",
@@ -656,9 +662,15 @@ sql_exec_explain :: proc(tx: ^Tx, stmt: Explain_Stmt, params: []Value) -> (Sql_R
 		}
 		if inner.limit != nil || inner.offset != nil do append(&lines, result_own("limit/offset"))
 	case Update_Stmt:
-		append(&lines, strings.concatenate({"update ", inner.table, explain_index_suffix(store, Table_Ref{name = inner.table}, inner.where_clause, params)}))
+		suffix := explain_index_suffix(store, Table_Ref{name = inner.table}, inner.where_clause, params)
+		append(&lines, strings.concatenate({"update ", inner.table, suffix}))
+		// The suffix is a built fragment, and the line it went into copied it: free it
+		// here (an absent table answers the empty literal, which nothing owns).
+		if len(suffix) > 0 do delete(suffix)
 	case Delete_Stmt:
-		append(&lines, strings.concatenate({"delete ", inner.table, explain_index_suffix(store, Table_Ref{name = inner.table}, inner.where_clause, params)}))
+		suffix := explain_index_suffix(store, Table_Ref{name = inner.table}, inner.where_clause, params)
+		append(&lines, strings.concatenate({"delete ", inner.table, suffix}))
+		if len(suffix) > 0 do delete(suffix)
 	case Insert_Stmt:
 		append(&lines, strings.concatenate({"insert into ", inner.table}))
 	case Create_Table_Stmt:
@@ -790,8 +802,8 @@ explain_access :: proc(
 
 @(private)
 explain_index_suffix :: proc(store: ^Store, ref: Table_Ref, predicate: ^Expr, params: []Value) -> string {
-	table, table_err := store_table(store, ref.name)
-	if table_err.kind != .None do return ""
+	table, found := store.tables[ref.name]
+	if !found do return ""
 	return explain_access(store, table, ref, predicate, params)
 }
 
@@ -5516,6 +5528,9 @@ sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Res
 	}
 	result := Sql_Result{kind = .Affected}
 	returned := make([dynamic][]Value, 0, len(insert_rows))
+	// A statement without RETURNING builds this and never fills it: the array is the
+	// statement's, not the result's, unless the result takes it at the end.
+	if stmt.returning == nil do defer delete(returned)
 	for values_expr in insert_rows {
 		if len(values_expr) != len(positions) {
 			return {}, errf(
@@ -5550,6 +5565,10 @@ sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Res
 			// unique index, and insert again. SQLite counts one affected row and
 			// fires no delete trigger, which is what happens here: the deletes go
 			// through the staging layer, not through the DELETE statement.
+			//
+			// The duplicate-key answer explained the first attempt, and this branch
+			// answers the statement instead: its message is freed here.
+			error_free(&insert_err)
 			conflicts := unique_conflicts(tx, table, values)
 			defer delete(conflicts)
 			for id in conflicts {
@@ -5574,6 +5593,7 @@ sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Res
 			conflict, found := find_conflict_row(tx, table, values)
 			if !found do return {}, insert_err
 			if stmt.conflict_do_nothing {
+				error_free(&insert_err)
 				continue
 			}
 			if len(stmt.conflict_assignments) == 0 do return {}, insert_err
@@ -5685,6 +5705,7 @@ sql_exec_update :: proc(tx: ^Tx, stmt: Update_Stmt, params: []Value) -> (Sql_Res
 	defer policy_set_destroy(&policies)
 	affected := 0
 	returned := make([dynamic][]Value, 0, len(rows))
+	if stmt.returning == nil do defer delete(returned)
 	result := Sql_Result{kind = .Affected}
 	for row in rows {
 		if store_cancelled(tx.store) {
@@ -5809,6 +5830,7 @@ sql_exec_delete :: proc(tx: ^Tx, stmt: Delete_Stmt, params: []Value) -> (Sql_Res
 	defer policy_set_destroy(&policies)
 	affected := 0
 	returned := make([dynamic][]Value, 0, len(rows))
+	if stmt.returning == nil do defer delete(returned)
 	result := Sql_Result{kind = .Affected}
 	for row in rows {
 		if store_cancelled(tx.store) {

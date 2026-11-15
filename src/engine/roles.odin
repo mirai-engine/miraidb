@@ -134,7 +134,7 @@ sql_exec_grant :: proc(tx: ^Tx, stmt: Grant_Stmt) -> (Sql_Result, Error) {
 // through the '*' grant).
 has_role :: proc(tx: ^Tx, role: string) -> (bool, Error) {
 	if tx == nil do return false, ERROR_NONE
-	if _, table_err := tx_table(tx, ROLE_TABLE); table_err.kind != .None do return false, ERROR_NONE
+	if tx_table_probe(tx, ROLE_TABLE) == nil do return false, ERROR_NONE
 	identity := identity_text(tx.store.identity)
 	defer delete(identity)
 	return roles_row_exists(
@@ -150,7 +150,7 @@ has_role :: proc(tx: ^Tx, role: string) -> (bool, Error) {
 permission_allows :: proc(tx: ^Tx, table_name, action: string) -> (bool, Error) {
 	if tx == nil do return true, ERROR_NONE
 	if len(table_name) == 0 || table_name[0] == '_' do return true, ERROR_NONE
-	if _, table_err := tx_table(tx, GRANT_TABLE); table_err.kind != .None do return true, ERROR_NONE
+	if tx_table_probe(tx, GRANT_TABLE) == nil do return true, ERROR_NONE
 	if !tx.store.grants_checked {
 		tx.store.grants_checked = true
 		tx.store.grants_active = false

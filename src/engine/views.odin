@@ -90,6 +90,10 @@ view_names :: proc(tx: ^Tx, alloc: mem.Allocator) -> ([]string, Error) {
 
 @(private)
 view_sql :: proc(tx: ^Tx, name: string) -> (string, bool) {
+	// Every statement asks this, and a database without views has no `_view` table,
+	// so the miss is the normal answer: probe it rather than read a table that is
+	// not there (which builds an error message nobody keeps).
+	if tx_table_probe(tx, VIEW_TABLE) == nil do return "", false
 	rows := make([dynamic]Row)
 	defer delete(rows)
 	if collect_err := tx_collect(tx, VIEW_TABLE, &rows); collect_err.kind != .None do return "", false

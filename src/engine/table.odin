@@ -278,7 +278,17 @@ table_prune_versions :: proc(t: ^Table, before_seq: u64) {
 		t.rows[id] = row
 		if row.deleted_seq != 0 && row.deleted_seq <= before_seq do append(&dead, id)
 	}
-	for id in dead do map_erase(&t.rows, id)
+	for id in dead {
+		// A tombstone nobody can read any more owns nothing: its values and the array
+		// that held their history are freed with it. Forgetting them is what made
+		// INSERT OR REPLACE leave the replaced row behind for the life of the process
+		// (tools/leakcheck counted 48 bytes per statement).
+		if row, ok := t.rows[id]; ok {
+			free_values(row.values)
+			delete(row.versions)
+		}
+		map_erase(&t.rows, id)
+	}
 }
 
 // schema_normalize adds the implicit unique indexes for the primary key and for

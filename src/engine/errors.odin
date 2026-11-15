@@ -49,13 +49,25 @@ error_ok :: proc(err: Error) -> bool {
 	return err.kind == .None
 }
 
-// errf builds an Error with a formatted message. The message is owned by the
-// heap and lives as long as the caller keeps it.
+// errf builds an Error with a formatted message. The message is allocated on the
+// heap and belongs to whoever receives the error: a caller that keeps it passes it
+// on, and a caller that answers the question without it frees it with error_free.
+// Before error_free existed every discarded error was a leak - a REPLACE that
+// collided once per statement left its "duplicate key" message behind for ever.
 errf :: proc(kind: Error_Kind, format: string, args: ..any) -> Error {
 	return Error {
 		kind = kind,
 		message = fmt.aprintf(format, ..args),
 	}
+}
+
+// error_free releases the message an error carries. An error that is returned to a
+// caller is the caller's to free; one that is inspected and dropped here is freed
+// where it is dropped.
+error_free :: proc(err: ^Error) {
+	if err == nil do return
+	if len(err.message) > 0 do delete(err.message)
+	err^ = {}
 }
 
 // error_kind_name is the stable, machine friendly name of a kind. It is used by

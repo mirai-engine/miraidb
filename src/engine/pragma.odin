@@ -94,6 +94,9 @@ pragma_result :: proc(columns: []string, rows: [][]Value, commit_seq: u64) -> Sq
 	for column, i in columns do result.columns[i] = strings.clone(column)
 	result.rows = make([][]Value, len(rows))
 	for row, i in rows do result.rows[i] = row
+	// Every caller builds `rows` for this call and never looks at it again: the row
+	// slices belong to the result now, the array that held them does not.
+	if rows != nil do delete(rows)
 	return result
 }
 
@@ -124,7 +127,13 @@ sql_exec_pragma :: proc(store: ^Store, body: string, locked: bool) -> (Sql_Resul
 		name = strings.trim_space(body[:assign])
 		has_argument = true
 	}
-	name = strings.to_lower(strings.trim_space(name))
+	trimmed_name := strings.trim_space(name)
+	lowered_name := strings.to_lower(trimmed_name)
+	// `to_lower` answers its own argument when the text is already lowercase, so only
+	// a copy of its own may be freed (trap 53): the statement text outlives this call.
+	lowered_owned := raw_data(lowered_name) != raw_data(trimmed_name)
+	defer if lowered_owned do delete(lowered_name)
+	name = lowered_name
 	argument = strings.trim(argument, " \t\r\n\"'")
 	if !locked {
 		sync.shared_lock(&store.mutex)

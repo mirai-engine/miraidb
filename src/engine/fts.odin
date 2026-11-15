@@ -65,8 +65,11 @@ fts_run :: proc(tx: ^Tx, sql: string, params: []Value = nil) -> Error {
 
 @(private)
 fts_virtual_lookup :: proc(tx: ^Tx, name: string) -> (Fts_Table, bool) {
-	table, err := tx_table(tx, VIRTUAL_TABLE)
-	if err.kind != .None do return {}, false
+	// A database without a full-text table has no `_virtual` table, and that miss is
+	// the answer to most of these questions: probe it instead of reading a table that
+	// is not there and building an error message nobody keeps.
+	table := tx_table_probe(tx, VIRTUAL_TABLE)
+	if table == nil do return {}, false
 	rows := make([dynamic]Row, 0, 8)
 	defer delete(rows)
 	table_collect(table, &rows)

@@ -350,10 +350,16 @@ tx_discard :: proc(tx: ^Tx) {
 		table_destroy(table)
 	}
 	for _, writes in tx.state.writes {
+		// The staged values may live in the transaction arena (a statement that
+		// validates against a typed column builds them there), so this frees the maps
+		// and the struct, and the arena reclaims the values with the transaction.
 		delete(writes.inserts)
 		delete(writes.updates)
 		delete(writes.deletes)
 		delete(writes.unique_keys)
+		// tx_writes allocates the struct with `new`, not from the arena: a statement
+		// that wrote one table left 152 bytes behind for every commit.
+		free(writes)
 	}
 	for i in 0 ..< len(tx.savepoints) do tx_snapshot_destroy(tx, &tx.savepoints[i].snapshot)
 	delete(tx.savepoints)
@@ -372,6 +378,7 @@ tx_discard :: proc(tx: ^Tx) {
 	delete(tx.state.index_ops)
 	delete(tx.state.writes)
 	delete(tx.state.created)
+	delete(tx.state.altered)
 	delete(tx.state.dropped)
 	for table in tx.frozen_list do table_release(table)
 	delete(tx.frozen_list)
@@ -417,6 +424,24 @@ tx_table :: proc(tx: ^Tx, name: string) -> (^Table, Error) {
 		return nil, errf(.Table_Not_Found, "table %s is not visible to this transaction", name)
 	}
 	return store_table(tx.store, name)
+}
+
+// tx_table_probe answers "can this transaction see that table?" and returns nil
+// when it cannot. `tx_table` builds an error message to explain the miss, and a
+// caller that only checks the kind and drops the error leaks that message: a
+// SELECT asked whether `_view` exists and whether its (empty) FROM named a table on
+// every statement, which `tools/leakcheck` counted as two live allocations per
+// statement. Ask with this when the answer is a bool.
+tx_table_probe :: proc(tx: ^Tx, name: string) -> ^Table {
+	// The key must outlive the statement's query arena.
+	tx.read_tables[strings.clone(name, tx.alloc)] = true
+	if table, ok := tx.cte_tables[name]; ok do return table
+	if table, ok := tx.state.altered[name]; ok do return table
+	if table, ok := tx.state.created[name]; ok do return table
+	if tx.state.dropped[name] do return nil
+	if tx.use_frozen do return tx.frozen[name]
+	table, ok := tx.store.tables[name]
+	return table if ok else nil
 }
 
 // tx_read_seq is the commit the transaction reads from.
@@ -705,8 +730,8 @@ tx_get :: proc(tx: ^Tx, name: string, id: Row_Id) -> (Row, bool) {
 		if writes.deletes[id] do return {}, false
 		if writes.truncated do return {}, false
 	}
-	table, table_err := tx_table(tx, name)
-	if table_err.kind != .None do return {}, false
+	table := tx_table_probe(tx, name)
+	if table == nil do return {}, false
 	return table_get_row(table, id, tx.alloc)
 }
 

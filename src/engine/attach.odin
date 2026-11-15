@@ -14,7 +14,7 @@ ATTACH_TABLE :: "_attach"
 
 // attach_ensure creates the catalog on first use.
 attach_ensure :: proc(tx: ^Tx) -> Error {
-	if _, table_err := tx_table(tx, ATTACH_TABLE); table_err.kind == .None do return ERROR_NONE
+	if tx_table_probe(tx, ATTACH_TABLE) != nil do return ERROR_NONE
 	_, create_err := sql_execute_in_tx(
 		tx,
 		"CREATE TABLE _attach (name TEXT PRIMARY KEY NOT NULL, path TEXT NOT NULL)",
@@ -24,7 +24,7 @@ attach_ensure :: proc(tx: ^Tx) -> Error {
 
 // attach_recorded reports whether the catalog already holds `name`.
 attach_recorded :: proc(tx: ^Tx, name: string) -> bool {
-	if _, table_err := tx_table(tx, ATTACH_TABLE); table_err.kind != .None do return false
+	if tx_table_probe(tx, ATTACH_TABLE) == nil do return false
 	result, err := sql_execute_in_tx_params(
 		tx,
 		"SELECT name FROM _attach WHERE name = ?",
