@@ -12926,3 +12926,44 @@ test_windows_inside_expressions :: proc(t: ^testing.T) {
 	where_err := run_error(t, store, "SELECT id FROM t WHERE sum(v) OVER () > 0")
 	testing.expect_value(t, where_err.kind, db.Error_Kind.Sql_Unsupported)
 }
+
+// Row history is kept by default, and pruning it is the caller's decision: a
+// process that runs statements and exits (the CLI) drops it after every statement,
+// and a pinned read keeps what it needs until it ends.
+@(test)
+test_prune_history_respects_a_pin :: proc(t: ^testing.T) {
+	store := fresh_db(t, "prune_history")
+	if store == nil do return
+	defer cleanup_db(store, "prune_history")
+	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)")
+	run(t, store, "INSERT INTO t (id, label) VALUES (1, 'one')")
+	first := store.commit_seq
+	run(t, store, "UPDATE t SET label = 'two' WHERE id = 1")
+	testing.expect_value(t, len(store.pinned_reads), 0)
+
+	// With a pinned read at the first commit the history it needs survives a prune,
+	// which cannot even take the store's lock while the pin is alive.
+	pinned := db.tx_begin_read_at(store, first)
+	testing.expect_value(t, len(store.pinned_reads), 1)
+	db.store_prune_history(store)
+	old, old_err := db.sql_execute_in_tx(pinned, "SELECT label FROM t")
+	if testing.expectf(t, db.error_ok(old_err), "pinned read failed: %s", old_err.message) {
+		testing.expect_value(t, old.rows[0][0].s, "one")
+		db.sql_result_destroy(&old)
+	}
+	db.tx_end(pinned)
+	testing.expect_value(t, len(store.pinned_reads), 0)
+
+	// With no pin the same call drops the replaced value, and the current view is
+	// what a later read asks for.
+	db.store_prune_history(store)
+	view, view_err := db.sql_execute(store, "SELECT label FROM t")
+	testing.expect(t, db.error_ok(view_err))
+	testing.expect_value(t, view.rows[0][0].s, "two")
+	db.sql_result_destroy(&view)
+	table, found := store.tables["t"]
+	testing.expect(t, found)
+	if found {
+		for _, row in table.rows do testing.expect_value(t, len(row.versions), 0)
+	}
+}

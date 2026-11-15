@@ -124,6 +124,12 @@ def build_gates(args: argparse.Namespace) -> list[Gate]:
         gates.append(
             Gate(f"vet {package}", [args.odin, "check", package, "-no-entry-point", "-vet"])
         )
+    gates.append(
+        Gate(
+            "leak budgets",
+            [sys.executable, "scripts/leaks.py", "--odin", args.odin, "--repeat", "1000"],
+        )
+    )
     gates.append(Gate("documentation consistency", [sys.executable, "scripts/docs_check.py"]))
     gates.append(Gate("roadmap is consistent", [sys.executable, "scripts/roadmap.py", "--check"]))
     return gates

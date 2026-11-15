@@ -630,20 +630,47 @@ image (`/usr/bin/sqlite3`), so the runner belongs with the POSIX CI work; the
 corpus can be generated from the grammar (`docs/sql.md`) plus the shapes that bit
 us: aliases, keyword lookalikes, `AS OF`, `TRUNCATE`, `RETURNING`.
 
-## Diagnostics — the leak report is unreadable
+## Diagnostics — the leak report is readable now
 
-The debug allocator prints `+++ leak` for every block it still knows at exit:
-**~320k lines per suite run**, about nine per statement, dominated by
-`builder.odin:173`, `sql_exec_insert`, `sql_exec_select`, `projection_name`,
-`br_read_len_bytes`, `lexer_next` and `plan_join_order`. The count has been flat
-across rounds (312k before D6), so it is not a regression, and nobody has
-established whether they are real leaks or allocations a bulk free releases out of
-the tracker's sight. Two things would settle it and both are cheap: run 20k
-statements in one process and compare the working set from `--memory-report` with
-20k more (a real leak grows ~400 B per statement), and make `scripts/soak.py`
-assert the working set stays flat instead of only checking the log and the reopen.
-Until then the leak report cannot be used to judge a change, and a real leak
-would hide inside it.
+**Settled.** The `+++ leak` lines were real, not allocations a bulk free releases
+out of the tracker's sight. `tools/leakcheck` wraps the allocator the engine
+allocates from in a tracking allocator, runs one statement two hundred times and
+counts what is still live after the last result is destroyed: it found five live
+allocations per `SELECT` where the suite printed nine lines per statement.
+
+**Fixed.** The lexer built a quoted token's text with the process allocator and
+nothing freed it (it belongs to the query arena now); `tx.read_tables` and the
+plan's `steps` were never freed; the projection names were cloned into the result
+without freeing the original; and every `strings.to_lower` used only for a
+comparison leaked its copy, in `eval_call`, `eval_aggregate`,
+`eval_aggregate_values` and the aggregate stream. Reads went from five live
+allocations per statement to two, and `SELECT 1` repeated in one process from
+1.1 KiB to about 0.2 KiB per statement.
+
+**Gate.** `scripts/leaks.py` builds the tool and enforces the budget each shape
+declares (`tools/leakcheck/main.odin`), and reports the working set the CLI
+measures with `--repeat` before and after a few thousand statements. CI runs it as
+the "leak budgets" gate.
+
+**What is left, in order.**
+
+1. Two allocations per `SELECT` that the tracker attributes to `builder.odin:173`
+   but cannot attribute to a caller (the location is inside `core:strings`, not at
+   the `builder_make` site). 83 to 166 bytes per statement, in the gate at that
+   number.
+2. About 0.8 KiB per `UPDATE` and 1.2 KiB per `INSERT OR REPLACE` measured on the
+   working set, which is allocated outside the tracked allocator (a transaction
+   arena) and so invisible to the tool. `INSERT OR REPLACE` fell from 1.6 KiB when
+   the history pruning landed; `UPDATE` did not move, so it is something else.
+3. `log_index_append` opens the index sidecar, seeks and writes 16 bytes on **every
+   commit**; that is a file-open per commit, not a leak, and it is the first thing
+   to look at when commit latency matters.
+4. A store is not safe to close under a different allocator than the one it was
+   opened with: rows are allocated and freed with whichever `context.allocator` is
+   current at each moment (`clone_values`/`free_values` in `table.odin`), so
+   swapping the allocator mid-process makes the tracker report bad frees at close.
+   That is why the tool swaps the allocator before opening and never closes, and it
+   is worth deciding whether a table should own its allocator.
 
 ## Ordering, if this becomes the roadmap again
 

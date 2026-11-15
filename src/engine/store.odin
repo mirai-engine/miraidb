@@ -108,6 +108,12 @@ Store :: struct {
 	// property of the database: an embedded connection that never built a Host
 	// still has to authenticate a credential.
 	token_key:     []u8,
+	// pinned_reads holds the sequences pinned read transactions are reading at. A
+	// row version is only needed by a reader at an older sequence, so a read that is
+	// pinned keeps the history it can still see, and with none pinned the caller may
+	// drop all of it. Before this, a commit kept every version it replaced for the
+	// life of the process: an UPDATE cost ~900 bytes per statement.
+	pinned_reads:  [dynamic]u64,
 	// host_access allows the statements that reach outside the database: ATTACH
 	// reads a file path, LOAD EXTENSION runs host code, VACUUM INTO writes one.
 	// An embedded caller is the host and starts with it enabled; a server turns it
@@ -264,6 +270,7 @@ store_open :: proc(path: string, options: Store_Options) -> (^Store, Error) {
 	store.attached = make(map[string]^Store)
 	store.variables = make(map[string]Value)
 	store.functions = make(map[string]Scalar_Function_Def)
+	store.pinned_reads = make([dynamic]u64)
 	store.persistent = settings.persistent
 	store.vfs = settings.vfs
 	store.path = open_path
@@ -415,6 +422,7 @@ store_close :: proc(store: ^Store) {
 	delete(store.variables)
 	for name, _ in store.functions do delete(name)
 	delete(store.functions)
+	delete(store.pinned_reads)
 	stats_destroy(store)
 	log_close(&store.log)
 	db_lock_release(&store.lock)
@@ -1532,6 +1540,40 @@ store_prune_versions :: proc(store: ^Store, before_seq: u64) {
 	for _, table in store.tables {
 		table_prune_versions(table, before_seq)
 	}
+}
+
+// store_pin_read records a read pinned to `seq`; store_unpin_read drops it. The
+// history a pinned read needs is kept until the pin is gone.
+store_pin_read :: proc(store: ^Store, seq: u64) {
+	if store == nil do return
+	sync.lock(&store.mutex)
+	append(&store.pinned_reads, seq)
+	sync.unlock(&store.mutex)
+}
+
+store_unpin_read :: proc(store: ^Store, seq: u64) {
+	if store == nil do return
+	sync.lock(&store.mutex)
+	for pinned, i in store.pinned_reads {
+		if pinned == seq {
+			unordered_remove(&store.pinned_reads, i)
+			break
+		}
+	}
+	sync.unlock(&store.mutex)
+}
+
+// store_prune_history drops the row versions and tombstones nothing can ask for any
+// more. A pinned read holds the store's shared lock for its whole life and may need
+// any version it can still see, so a prune while one is alive does nothing: taking
+// the exclusive lock here would wait for the pin to end, and the caller asked to
+// keep that read's history, not to wait for it.
+store_prune_history :: proc(store: ^Store) {
+	if store == nil do return
+	if len(store.pinned_reads) > 0 do return
+	sync.lock(&store.mutex)
+	for _, table in store.tables do table_prune_versions(table, store.commit_seq)
+	sync.unlock(&store.mutex)
 }
 
 // store_rows_scanned is how many rows scans visited since the last reset.

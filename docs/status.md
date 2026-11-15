@@ -146,7 +146,7 @@ the gaps are named rather than left to be discovered.
   `linux_arm64` and `darwin_arm64`. The POSIX lock is the reason it is checked:
   it carried a missing `core:sys/posix` import and two wrong integer types until
   this round, so the code that a Linux build would run had never been compiled.
-- 261 integration tests covering CRUD, recovery, constraints, transactions,
+- 262 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
@@ -391,6 +391,24 @@ than 1000 bytes cannot be indexed and the insert says so.
   text to a number first, `--json` keeps the `.0` on a real, and `INSERT OR
   REPLACE` is implemented instead of refused by accident (`AUDIT-10` P-B1/P-B2/
   P-B3/P-B7). `OR ROLLBACK`, `OR FAIL` and `OR IGNORE` are named refusals.
+- **The leak report was real, and most of it is fixed.** A tracking allocator
+  around the store showed five live allocations per statement where the suite
+  printed nine `+++ leak` lines: the lexer built a quoted token's text with the
+  process allocator, the read set and the plan's steps were never freed, the
+  projection names were cloned without freeing the original, and every
+  `strings.to_lower` used for a comparison leaked its copy. Reads are down to two
+  allocations per statement (`tools/leakcheck`, gate "leak budgets") and the
+  working set of `SELECT 1` from 1.1 KiB to about 0.2 KiB per statement. What is
+  left: two builders the tracker names `builder.odin:173` without a caller, and
+  about 0.8 KiB per UPDATE allocated outside the tracked allocator (the
+  transaction arena), which `scripts/leaks.py` reports.
+- **Row history is the caller's decision.** A commit used to keep the version of
+  every row it replaced for the life of the process, because a read may be pinned
+  to an older sequence at any time. `store_prune_history` drops it when no read is
+  pinned, `store_pin_read`/`store_unpin_read` track the pins so a pinned read keeps
+  what it needs, and the CLI prunes after every statement because it keeps no
+  history: `INSERT OR REPLACE` repeated 2 000 times went from 1.6 KiB to 1.2 KiB
+  per statement (`test_prune_history_respects_a_pin`).
 - **A window can sit inside a larger expression.** The executor fills the window
   into a hidden slot of the row and evaluates the projection afterwards, so
   `count(*) * 100.0 / sum(count(*)) OVER ()` answers, with or without `GROUP BY`.

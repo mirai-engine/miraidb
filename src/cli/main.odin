@@ -46,6 +46,8 @@ Options:
                                             current cost, when a sql statement commits
   --memory-report                           print this process memory when a sql
                                             statement finishes
+  --repeat=N                                run that sql statement N times in one
+                                            process, and report the working set
   --json                                    print a query result as one JSON
                                             array of rows, for a tool to compare
   --row-quota=N                             refuse a statement that produces
@@ -72,6 +74,10 @@ BEGIN/COMMIT/ROLLBACK keep one transaction open across statements.`
 // reaches the log (D23).
 cli_row_quota: u64
 cli_work_budget: u64
+
+// cli_repeat runs one statement N times in one process, which is how a caller asks
+// whether the working set stays flat (scripts/leaks.py). One is the normal case.
+cli_repeat: int
 
 apply_limits :: proc(store: ^db.Store) -> ^db.Store {
 	if store == nil do return store
@@ -134,6 +140,12 @@ main :: proc() {
 				cli_row_quota = u64(parsed)
 				continue
 			}
+			if strings.has_prefix(arg, "--repeat=") {
+				parsed, ok := strconv.parse_int(arg[len("--repeat="):])
+				if !ok || parsed <= 0 do usage_error("--repeat needs a positive integer")
+				cli_repeat = int(parsed)
+				continue
+			}
 			if strings.has_prefix(arg, "--budget=") {
 				parsed, ok := strconv.parse_int(arg[len("--budget="):])
 				if !ok || parsed <= 0 do usage_error("--budget needs a positive integer")
@@ -165,10 +177,34 @@ main :: proc() {
 		if !db.error_ok(err) do fail(err)
 		baseline := memory_report ? cli_current_rss_bytes() : 0
 		statement := strings.join(arguments[1:], " ")
+		if cli_repeat > 1 {
+			// A repeated statement is how a caller asks whether the working set stays
+			// flat: the leak report the debug allocator prints cannot answer that,
+			// because it mixes the statement's leftovers with the process's own.
+			for run in 0 ..< cli_repeat {
+				repeated, repeat_err := db.sql_execute(store, statement)
+				if !db.error_ok(repeat_err) do fail(repeat_err)
+				db.sql_result_destroy(&repeated)
+				// A process that holds a statement open for a while keeps no history:
+				// the values an UPDATE replaced would otherwise stay for ever.
+				db.store_prune_history(store)
+				if memory_report && run == 0 {
+					fmt.printfln("rss-after-first-bytes: %d", cli_current_rss_bytes())
+				}
+			}
+			if memory_report {
+				fmt.printfln("repeat-runs: %d", cli_repeat)
+				fmt.printfln("rss-before-bytes: %d", baseline)
+				fmt.printfln("rss-after-last-bytes: %d", cli_current_rss_bytes())
+			}
+			db.store_close(store)
+			return
+		}
 		result, exec_err := db.sql_execute(store, statement)
 		if !db.error_ok(exec_err) do fail(exec_err)
 		print_result(result)
 		db.sql_result_destroy(&result)
+		db.store_prune_history(store)
 		if mirror_report {
 			// A database opened from a .sqlite file patches that file after every
 			// commit; these are the pages it had to write.
