@@ -1082,12 +1082,17 @@ the failing call returned. `include/miraidb.h` documents the caps, the interrupt
 and the misuse contract. `scripts/capi_smoke.py` and
 `scripts/sqlite_abi_smoke.py` exercise all of it.
 
-**What is left.** Open options (read-only, durability, in-memory) on
-`miraidb_open`, an identity/token so roles and policies are reachable from C, and
-a written thread-safety statement (one connection, one thread, as today). Also:
-`miraidb_open` imports a `.sqlite` file into memory without saying so, and the
-extended result codes are not implemented (`sqlite3_extended_result_codes` is
-accepted and ignored).
+`miraidb_open_ex(path, flags)` adds the open options — read-only, in-memory, no
+sync, paged — and the plain `miraidb_open` is that call with no flags; a reader
+refuses writes with `cannot insert in a read transaction`, an in-memory database
+writes nothing to disk, and the header states that a path that is already a
+SQLite file is imported into memory and mirrored back.
+
+**What is left.** An identity/token so roles and policies are reachable from C, a
+written thread-safety statement (one connection, one thread, as today), and the
+extended result codes (`sqlite3_extended_result_codes` is accepted and ignored).
+A caller that needs a cap on a reader connection can set one: the caps are
+session properties, not schema.
 
 **Cost.** M.
 

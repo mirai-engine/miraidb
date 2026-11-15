@@ -25,6 +25,8 @@ def load(path: str):
         lib = ctypes.CDLL(path)
     lib.miraidb_open.argtypes = [ctypes.c_char_p]
     lib.miraidb_open.restype = ctypes.c_void_p
+    lib.miraidb_open_ex.argtypes = [ctypes.c_char_p, ctypes.c_int]
+    lib.miraidb_open_ex.restype = ctypes.c_void_p
     lib.miraidb_close.argtypes = [ctypes.c_void_p]
     lib.miraidb_errmsg.argtypes = [ctypes.c_void_p]
     lib.miraidb_errmsg.restype = ctypes.c_char_p
@@ -137,6 +139,30 @@ def main() -> int:
     lib.miraidb_finalize(count)
     lib.miraidb_close(copy_db)
     shutil.rmtree(backup, ignore_errors=True)
+
+    # Open flags (D25): a reader refuses every write and says why, an in-memory
+    # database leaves nothing behind, and miraidb_open is this call with no flags.
+    import shutil
+    flags_path = os.path.join("bin", "capi_smoke_flags")
+    shutil.rmtree(flags_path, ignore_errors=True)
+    writer = ctypes.c_void_p(lib.miraidb_open(flags_path.encode()))
+    assert writer
+    assert lib.miraidb_exec(writer, b"CREATE TABLE f (id INTEGER PRIMARY KEY)") == OK
+    assert lib.miraidb_exec(writer, b"INSERT INTO f VALUES (1)") == OK
+    lib.miraidb_close(writer)
+    assert os.path.exists(os.path.join(flags_path, "lock")), "a writer leaves a database behind"
+    reader = ctypes.c_void_p(lib.miraidb_open_ex(flags_path.encode(), 1))
+    assert reader, lib.miraidb_errmsg(None)
+    assert lib.miraidb_exec(reader, b"SELECT count(*) FROM f") == OK
+    assert lib.miraidb_exec(reader, b"INSERT INTO f VALUES (2)") == ERROR
+    assert "read transaction" in lib.miraidb_errmsg(reader).decode()
+    lib.miraidb_close(reader)
+    memory = ctypes.c_void_p(lib.miraidb_open_ex(b"", 2))
+    assert memory
+    assert lib.miraidb_exec(memory, b"CREATE TABLE m (id INTEGER PRIMARY KEY)") == OK
+    assert lib.miraidb_exec(memory, b"INSERT INTO m VALUES (1)") == OK
+    lib.miraidb_close(memory)
+    shutil.rmtree(flags_path, ignore_errors=True)
 
     # A handle is not permission to read freed memory (D29). Every call through a
     # finalized statement answers MIRAIDB_MISUSE, a double finalize does nothing,

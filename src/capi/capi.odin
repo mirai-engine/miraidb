@@ -18,6 +18,13 @@ import "core:sync"
 
 import engine "../engine"
 
+// Open flags for miraidb_open_ex. They are bits so a caller can ask for more than
+// one, and the plain miraidb_open is miraidb_open_ex(path, 0).
+MIRAIDB_OPEN_READ_ONLY :: c.int(1 << 0)
+MIRAIDB_OPEN_IN_MEMORY :: c.int(1 << 1)
+MIRAIDB_OPEN_NO_SYNC :: c.int(1 << 2)
+MIRAIDB_OPEN_PAGED :: c.int(1 << 3)
+
 MIRAIDB_OK :: c.int(0)
 MIRAIDB_ERROR :: c.int(1)
 // MIRAIDB_MISUSE is the answer to a handle that is not live: a statement used
@@ -75,8 +82,26 @@ set_misuse :: proc(message: string) {
 @(export)
 miraidb_open :: proc "c" (path: cstring) -> rawptr {
 	context = runtime.default_context()
+	return miraidb_open_ex(path, 0)
+}
+
+// miraidb_open_ex opens with flags: a reader instead of a writer, an in-memory
+// database that leaves nothing behind, a log that never fsyncs, or page files for
+// new tables. A path that is already a SQLite file is imported into memory and
+// mirrored back on every commit, whatever the flags say; that is stated in
+// include/miraidb.h because it is the one surprising part of opening.
+@(export)
+miraidb_open_ex :: proc "c" (path: cstring, flags: c.int) -> rawptr {
+	context = runtime.default_context()
 	if path == nil do return nil
-	conn, err := engine.embed_open(string(path))
+	options := engine.Store_Options {
+		persistent = flags & MIRAIDB_OPEN_IN_MEMORY == 0,
+		create     = flags & MIRAIDB_OPEN_READ_ONLY == 0,
+		durable    = flags & MIRAIDB_OPEN_NO_SYNC == 0,
+		read_only  = flags & MIRAIDB_OPEN_READ_ONLY != 0,
+		paged_tables = flags & MIRAIDB_OPEN_PAGED != 0,
+	}
+	conn, err := engine.embed_open(string(path), options)
 	if err.kind != .None {
 		if conn != nil do engine.embed_close(conn)
 		delete(last_open_error)

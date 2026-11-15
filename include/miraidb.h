@@ -34,6 +34,14 @@ typedef struct miraidb_connection miraidb_connection;
 typedef struct miraidb_statement miraidb_statement;
 
 typedef void *miraidb_conn;
+
+/* Flags for miraidb_open_ex; several may be combined. miraidb_open(path) is
+ * miraidb_open_ex(path, 0). A path that is already a SQLite file is imported
+ * into memory and mirrored back after every commit, whatever the flags say. */
+#define MIRAIDB_OPEN_READ_ONLY 1  /* take the reader's lock; every write refused */
+#define MIRAIDB_OPEN_IN_MEMORY 2  /* nothing on disk, gone on close */
+#define MIRAIDB_OPEN_NO_SYNC   4  /* never fsync the log (faster, less safe) */
+#define MIRAIDB_OPEN_PAGED     8  /* keep new tables in page files, not in RAM */
 typedef void *miraidb_stmt;
 
 #define MIRAIDB_OK     0
@@ -52,6 +60,7 @@ typedef void *miraidb_stmt;
 
 /* Opens the engine format, or imports a .sqlite/.db file into memory. */
 miraidb_conn miraidb_open(const char *path);
+miraidb_conn miraidb_open_ex(const char *path, int flags);
 void         miraidb_close(miraidb_conn db);
 
 /* Last error for the connection, or an empty string. When db is NULL, the
