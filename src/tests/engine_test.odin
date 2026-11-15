@@ -8855,9 +8855,13 @@ test_window_functions :: proc(t: ^testing.T) {
 	)
 	testing.expect_value(t, len(framed_rank.rows), 5)
 	db.sql_result_destroy(&framed_rank)
-	// A window beside GROUP BY is still refused rather than approximated.
-	group_err := run_error(t, store, "SELECT g, count(*), row_number() OVER (ORDER BY g) FROM s GROUP BY g")
-	testing.expect_value(t, group_err.kind, db.Error_Kind.Sql_Unsupported)
+	// A window beside GROUP BY reads the groups rather than approximating a row:
+	// every group is one row of the window's input, so row_number numbers them.
+	grouped_numbers := run(t, store, "SELECT g, count(*), row_number() OVER (ORDER BY g) FROM s GROUP BY g ORDER BY g")
+	testing.expect_value(t, len(grouped_numbers.rows), 2)
+	testing.expect_value(t, grouped_numbers.rows[0][2].i, 1)
+	testing.expect_value(t, grouped_numbers.rows[1][2].i, 2)
+	db.sql_result_destroy(&grouped_numbers)
 	cleanup_db(store, "windows")
 }
 
@@ -12713,4 +12717,94 @@ test_alter_column_type :: proc(t: ^testing.T) {
 	defer cleanup_db(reopened, "alter_type")
 	testing.expect_value(t, scalar(t, reopened, "SELECT typeof(v) FROM t WHERE id = 1").s, "text")
 	testing.expect_value(t, scalar(t, reopened, "SELECT v FROM t WHERE id = 2").s, "20")
+}
+
+// A window beside GROUP BY reads the groups: the argument of an aggregate window is
+// an aggregate that was already evaluated for the group, so `sum(count(*)) OVER ()`
+// is the total of the per-group counts, which a subquery of the same groups answers
+// too. The ranking windows read the captured keys, and ORDER BY may name either.
+@(test)
+test_windows_beside_group_by :: proc(t: ^testing.T) {
+	store := fresh_db(t, "window_group")
+	if store == nil do return
+	defer cleanup_db(store, "window_group")
+	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT, v INTEGER)")
+	run(t, store, "INSERT INTO t (id, k, v) VALUES (1, 'a', 1), (2, 'a', 2), (3, 'b', 3), (4, 'b', 4), (5, 'c', 5)")
+
+	// The percentage-of-total shape: the window total is 5, the same number the
+	// same groups answer through a subquery.
+	run(t, store, "SELECT k, count(*) AS n, sum(count(*)) OVER () AS total FROM t GROUP BY k")
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t").i, 5)
+	result := run(t, store, "SELECT k, count(*) AS n, sum(count(*)) OVER () AS total FROM t GROUP BY k ORDER BY k")
+	testing.expect_value(t, len(result.rows), 3)
+	testing.expect_value(t, result.rows[0][1].i, 2)
+	testing.expect_value(t, result.rows[0][2].i, 5)
+	testing.expect_value(t, result.rows[2][1].i, 1)
+	testing.expect_value(t, result.rows[2][2].i, 5)
+	db.sql_result_destroy(&result)
+	testing.expect_value(
+		t,
+		scalar(t, store, "WITH g AS (SELECT count(*) AS n FROM t GROUP BY k) SELECT sum(n) FROM g").i,
+		5,
+	)
+	// avg and max over the same values.
+	testing.expect_value(
+		t,
+		scalar(t, store, "SELECT avg(count(*)) OVER () FROM t GROUP BY k LIMIT 1").f,
+		5.0 / 3.0,
+	)
+	testing.expect_value(t, scalar(t, store, "SELECT max(count(*)) OVER () FROM t GROUP BY k LIMIT 1").i, 2)
+
+	// A running window is cumulative from the partition start, one row per group.
+	running := run(t, store, "SELECT k, sum(count(*)) OVER (ORDER BY k) AS s FROM t GROUP BY k ORDER BY k")
+	testing.expect_value(t, len(running.rows), 3)
+	testing.expect_value(t, running.rows[0][1].i, 2)
+	testing.expect_value(t, running.rows[1][1].i, 4)
+	testing.expect_value(t, running.rows[2][1].i, 5)
+	db.sql_result_destroy(&running)
+
+	// Rank and row_number read the order key of the groups; the tie between a and b
+	// is what makes them peers, so both get rank 1 and the next rank is 3.
+	ranked := run(t, store, "SELECT k, rank() OVER (ORDER BY count(*) DESC) AS r FROM t GROUP BY k ORDER BY k")
+	testing.expect_value(t, ranked.rows[0][1].i, 1)
+	testing.expect_value(t, ranked.rows[1][1].i, 1)
+	testing.expect_value(t, ranked.rows[2][1].i, 3)
+	db.sql_result_destroy(&ranked)
+	testing.expect_value(
+		t,
+		scalar(t, store, "SELECT row_number() OVER (PARTITION BY k ORDER BY k) FROM t GROUP BY k ORDER BY k LIMIT 1").i,
+		1,
+	)
+	// first_value over the groups takes the first group's value.
+	testing.expect_value(
+		t,
+		scalar(t, store, "SELECT first_value(count(*)) OVER (ORDER BY k) FROM t GROUP BY k ORDER BY k LIMIT 1").i,
+		2,
+	)
+
+	// ORDER BY can name the window projection, and the row still answers its group.
+	ordered := run(t, store, "SELECT k, count(*) AS n, sum(count(*)) OVER () AS total FROM t GROUP BY k ORDER BY total DESC, n ASC, k")
+	testing.expect_value(t, ordered.rows[0][0].s, "c")
+	db.sql_result_destroy(&ordered)
+
+	// An empty group set is an empty answer, not a crash.
+	empty := run(t, store, "SELECT k, count(*) AS n, sum(count(*)) OVER () FROM t WHERE id > 99 GROUP BY k")
+	testing.expect_value(t, len(empty.rows), 0)
+	db.sql_result_destroy(&empty)
+
+	// A RANGE frame with an offset reads the ORDER BY value per row, and beside
+	// GROUP BY that value may be an aggregate the frame can no longer reach.
+	_, range_err := db.sql_execute(
+		store,
+		"SELECT k, sum(count(*)) OVER (ORDER BY k RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t GROUP BY k",
+	)
+	testing.expect(t, !db.error_ok(range_err))
+	testing.expect_value(t, range_err.kind, db.Error_Kind.Sql_Unsupported)
+
+	// DISTINCT inside a window used to be parsed and dropped, so the window counted
+	// every row: 2, 2 and 1 became three values instead of two.
+	testing.expect_value(t, scalar(t, store, "SELECT count(DISTINCT count(*)) OVER () FROM t GROUP BY k LIMIT 1").i, 2)
+	run(t, store, "CREATE TABLE d (id INTEGER PRIMARY KEY, v INTEGER)")
+	run(t, store, "INSERT INTO d (id, v) VALUES (1, 1), (2, 1), (3, 2)")
+	testing.expect_value(t, scalar(t, store, "SELECT count(DISTINCT v) OVER () FROM d LIMIT 1").i, 2)
 }

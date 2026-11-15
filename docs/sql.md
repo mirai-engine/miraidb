@@ -573,8 +573,23 @@ FROM s;
     row whose `n` is within ten of this row's. That needs exactly one numeric
     `ORDER BY` term, in either direction; a text ordering there is refused rather
     than given an interpretation SQL reserves for its type order.
-- Window functions beside `GROUP BY` are refused with `sql_unsupported` rather
-  than approximated.
+- `DISTINCT` inside a window (`count(DISTINCT v) OVER (…)`) counts the distinct
+  argument values of the frame, the same way the aggregate does.
+- Beside `GROUP BY` the window's input rows are the **groups**, so the argument of
+  an aggregate window may itself be an aggregate: `sum(count(*)) OVER ()` is the
+  total of the per-group counts, which is the percentage-of-total shape:
+
+  ```sql
+  SELECT k, count(*) AS n, sum(count(*)) OVER () AS total FROM t GROUP BY k;
+  ```
+
+  The ranking windows read the keys the group captured (`rank() OVER (ORDER BY
+  count(*) DESC)` numbers the groups), and `ORDER BY` may name either the window
+  projection or the aggregate. A `RANGE` frame with an offset is refused beside
+  `GROUP BY`: it re-reads its `ORDER BY` value per row, and that value may be an
+  aggregate whose group is already gone.
+- A window nested inside a larger expression (`sum(n) OVER () + 1`) is refused with
+  `sql_unsupported`; the projection has to be the window call itself.
 
 ## Triggers
 

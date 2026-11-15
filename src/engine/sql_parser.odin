@@ -1909,6 +1909,7 @@ parse_primary :: proc(p: ^Parser) -> ^Expr {
 				window_expr.name = call_expr.name
 				window_expr.args = call_expr.args
 				window_expr.star = call_expr.star
+				window_expr.is_distinct = call_expr.is_distinct
 				p_expect_punct(p, "(")
 				if p_match_keyword(p, "partition") {
 					p_expect_keyword(p, "by")

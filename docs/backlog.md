@@ -412,10 +412,29 @@ walk that exists now.
 
 ## D9 — The rest of the grammar
 
-**Now.** 32 statement kinds. Refused with `sql_unsupported`: windows beside
-`GROUP BY`, collations beyond `BINARY`/`NOCASE`/`RTRIM`, user-defined functions.
-`GROUP BY` does not resolve a projection alias (`GROUP BY d` where `d` is
-`dept AS d`), although `ORDER BY` does.
+**Now.** 32 statement kinds. Refused with `sql_unsupported`: collations beyond
+`BINARY`/`NOCASE`/`RTRIM`, user-defined functions, and a window nested inside a
+larger expression (`sum(n) OVER () + 1`), because the executor fills a window
+column rather than evaluating the window where it appears. `GROUP BY` does not
+resolve a projection alias (`GROUP BY d` where `d` is `dept AS d`), although
+`ORDER BY` does.
+
+**Done: a window beside `GROUP BY`.** The window's input rows are the groups: the
+aggregate branch captures each group's partition key, order key and arguments
+while `ctx.grouped` is set, so the argument of an aggregate window may be an
+aggregate and `sum(count(*)) OVER ()` answers the total of the per-group counts
+(the test compares it with `sum(n)` over a CTE of the same groups). Filling runs
+after the grouping, in a tail both branches share; a grouped row rebuilds its
+`ORDER BY` key from the group it came from, which is what lets `ORDER BY` name
+either the window projection or the aggregate. A frame whose rows have no source
+is aggregated over the captured argument values (`eval_aggregate_values`, with
+the same comparison and accumulation rules as `eval_aggregate`), and a `RANGE`
+frame with an offset is refused beside `GROUP BY` with a message that says why.
+`DISTINCT` inside a window is fixed on the way: the parser built the call and
+dropped the flag, so `count(DISTINCT v) OVER (…)` counted every row.
+`test_windows_beside_group_by` covers the totals, `avg`/`max`, a running window,
+the rank tie, `row_number` over partitions, `first_value`, an empty group set, a
+`RANGE` refusal and both `DISTINCT` shapes.
 
 **Done: `ALTER TABLE … ALTER COLUMN c TYPE t`.** The declaration changes and
 every stored row is rewritten through `value_cast`, the function `CAST` uses, so

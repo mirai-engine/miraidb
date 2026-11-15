@@ -111,6 +111,10 @@ Window_Expr :: struct {
 	name:      string,
 	args:      []^Expr,
 	star:      bool,
+	// is_distinct records `count(DISTINCT x) OVER (…)`. It was parsed and dropped,
+	// so the window counted every row while the same call without OVER counted the
+	// distinct ones.
+	is_distinct: bool,
 	partition: []^Expr,
 	order_by:  []Order_Item,
 	frame:     Window_Frame,

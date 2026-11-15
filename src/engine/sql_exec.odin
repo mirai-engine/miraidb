@@ -1372,12 +1372,17 @@ window_fill :: proc(
 		return ERROR_NONE
 	}
 	// Aggregate windows reuse the group aggregate: the frame is a group.
-	call := Call_Expr{name = window.name, args = window.args, star = window.star}
+	call := Call_Expr {
+		name        = window.name,
+		args        = window.args,
+		star        = window.star,
+		is_distinct = window.is_distinct,
+	}
 	if window.frame.has {
 		for j in 0 ..< len(indexes) {
 			lo, hi, frame_err := window_frame_bounds(window.frame, j, len(indexes), ctx.params, order_keys, order_numbers)
 			if frame_err.kind != .None do return frame_err
-			value, agg_err := window_aggregate_over(ctx, call, sources, indexes, lo, hi)
+			value, agg_err := window_aggregate_frame(ctx, window, call, cells, indexes, lo, hi, cell_index, sources)
 			if agg_err.kind != .None do return agg_err
 			assign(rows, indexes[j], position, value)
 		}
@@ -1386,14 +1391,9 @@ window_fill :: proc(
 	j := 0
 	for j < len(indexes) {
 		end := running ? peer_end(order_keys, j) : len(indexes) - 1
-		frame := make([][]Source, end + 1)
-		for f in 0 ..= end do frame[f] = sources[indexes[f]]
-		ctx.group = frame
-		ctx.grouped = true
-		value, agg_err := eval_aggregate(ctx, call)
-		ctx.group = nil
-		ctx.grouped = false
-		delete(frame)
+		// The frame of a running window is the partition up to the last peer of this
+		// row, not the row alone: `sum(n) OVER (ORDER BY k)` is cumulative.
+		value, agg_err := window_aggregate_frame(ctx, window, call, cells, indexes, 0, end, cell_index, sources)
 		if agg_err.kind != .None do return agg_err
 		for f in j ..= end do assign(rows, indexes[f], position, value)
 		j = end + 1
@@ -1667,6 +1667,177 @@ window_aggregate_over :: proc(
 	return value, agg_err
 }
 
+// eval_aggregate_values is eval_aggregate over values instead of sources. A
+// grouped row has no row behind it - its window argument is an aggregate that was
+// already evaluated for the group - so the frame is the captured values, and the
+// rules are the ones eval_aggregate applies (same comparisons, same integer versus
+// float accumulation, same DISTINCT keys) so `sum(count(*)) OVER ()` answers what
+// `sum(n)` over a subquery of the same groups answers.
+@(private)
+eval_aggregate_values :: proc(ctx: ^Eval_Ctx, call: Call_Expr, values: []Value) -> (Value, Error) {
+	name := strings.to_lower(call.name)
+	if name == "count" {
+		if call.star || len(call.args) == 0 do return value_int(i64(len(values))), ERROR_NONE
+		count := 0
+		keys: map[string]bool
+		if call.is_distinct do keys = make(map[string]bool)
+		defer agg_distinct_destroy(&keys)
+		for value in values {
+			if value.kind == .Null do continue
+			if call.is_distinct {
+				key := agg_distinct_key(value)
+				_, repeated := keys[key]
+				if repeated {
+					delete(key)
+				} else {
+					keys[key] = true
+				}
+				if repeated do continue
+			}
+			count += 1
+		}
+		return value_int(i64(count)), ERROR_NONE
+	}
+	if name == "group_concat" || name == "string_agg" {
+		separator := ","
+		separator_text: string
+		if len(call.args) == 2 {
+			value, eval_err := eval_expr(ctx, call.args[1])
+			if eval_err.kind != .None do return {}, eval_err
+			if value.kind != .Null {
+				separator_text = value_format(value, context.allocator)
+				separator = separator_text
+			}
+		}
+		defer if len(separator_text) > 0 do delete(separator_text)
+		builder := strings.builder_make()
+		defer strings.builder_destroy(&builder)
+		seen := 0
+		for value in values {
+			if value.kind == .Null do continue
+			if seen > 0 do strings.write_string(&builder, separator)
+			strings.write_string(&builder, value_format(value, context.allocator))
+			seen += 1
+		}
+		if seen == 0 do return value_null(), ERROR_NONE
+		return value_string(strings.clone(strings.to_string(builder), context.allocator)), ERROR_NONE
+	}
+	if name != "min" && name != "max" && name != "sum" && name != "total" && name != "avg" {
+		return {}, errf(.Internal, "unknown aggregate %s", name)
+	}
+	accumulator := value_null()
+	seen := 0
+	sum_int: i64
+	sum_float: f64
+	sum_128: i128
+	uses_float: bool
+	uses_128: bool
+	keys: map[string]bool
+	if call.is_distinct do keys = make(map[string]bool)
+	defer agg_distinct_destroy(&keys)
+	for value in values {
+		if value.kind == .Null do continue
+		if call.is_distinct {
+			key := agg_distinct_key(value)
+			_, repeated := keys[key]
+			if repeated {
+				delete(key)
+			} else {
+				keys[key] = true
+			}
+			if repeated do continue
+		}
+		seen += 1
+		switch name {
+		case "min":
+			if accumulator.kind == .Null {
+				accumulator = value
+			} else {
+				order, ok := value_compare(value, accumulator)
+				if !ok do return {}, errf(.Invalid_Type, "min() mixes incompatible types")
+				if order == .Less do accumulator = value
+			}
+		case "max":
+			if accumulator.kind == .Null {
+				accumulator = value
+			} else {
+				order, ok := value_compare(value, accumulator)
+				if !ok do return {}, errf(.Invalid_Type, "max() mixes incompatible types")
+				if order == .Greater do accumulator = value
+			}
+		case "sum", "total", "avg":
+			if !value_is_numeric(value) {
+				return {}, errf(.Invalid_Type, "%s() expects numbers", name)
+			}
+			if value.kind == .Float {
+				uses_float = true
+				number, _ := value_to_f64(value)
+				sum_float += number
+			} else if value.kind == .Int128 || value.kind == .Uint128 {
+				if !uses_128 {
+					uses_128 = true
+					sum_128 = i128(sum_int)
+				}
+				sum_128 += value_as_i128(value)
+			} else if uses_float {
+				number, _ := value_to_f64(value)
+				sum_float += number
+			} else if uses_128 {
+				number, _ := value_to_i64(value)
+				sum_128 += i128(number)
+			} else {
+				number, _ := value_to_i64(value)
+				sum_int += number
+			}
+		}
+	}
+	switch name {
+	case "min", "max":
+		return value_clone(accumulator, context.allocator), ERROR_NONE
+	case "sum", "total":
+		if seen == 0 do return value_null(), ERROR_NONE
+		if uses_float do return value_float(sum_float), ERROR_NONE
+		if uses_128 do return value_int128(sum_128), ERROR_NONE
+		return value_int(sum_int), ERROR_NONE
+	case "avg":
+		if seen == 0 do return value_null(), ERROR_NONE
+		total := uses_float ? sum_float : (uses_128 ? f64(sum_128) : f64(sum_int))
+		return value_float(total / f64(seen)), ERROR_NONE
+	}
+	return {}, errf(.Internal, "unknown aggregate %s", name)
+}
+
+// window_aggregate_frame aggregates rows [lo, hi] of one window. When the row has
+// a source the aggregate is evaluated over it exactly as before; when it has none
+// (a grouped row) the frame is the argument values the group captured.
+@(private)
+window_aggregate_frame :: proc(
+	ctx: ^Eval_Ctx,
+	window: Window_Expr,
+	call: Call_Expr,
+	cells: [][dynamic]Window_Cell,
+	indexes: []int,
+	lo, hi, cell_index: int,
+	sources: [][]Source,
+) -> (Value, Error) {
+	if len(sources) != 0 {
+		return window_aggregate_over(ctx, call, sources, indexes, lo, hi)
+	}
+	if lo > hi do return value_null(), ERROR_NONE
+	values := make([]Value, hi - lo + 1)
+	defer delete(values)
+	for f in lo ..= hi {
+		cell := cells[indexes[f]][cell_index]
+		if window.star || len(cell.args) == 0 {
+			// count(*) over the frame: one non-null stand-in per row.
+			values[f - lo] = value_int(1)
+			continue
+		}
+		values[f - lo] = cell.args[0]
+	}
+	return eval_aggregate_values(ctx, call, values)
+}
+
 // window_sort orders the row indexes of a partition by their ORDER BY keys.
 // Insertion sort keeps equal keys in row order, which the peer logic relies on.
 window_sort :: proc(indexes: []int, order_keys: []string) {
@@ -1745,6 +1916,67 @@ apply_windows :: proc(
 		delete(buckets)
 	}
 	return ERROR_NONE
+}
+
+// window_row_cells evaluates one row's window cells: the partition key, the order
+// key and the arguments, each with the context the row is being read under, so a
+// grouped row answers an aggregate and an ungrouped one answers a column. The
+// statement's windows are metadata, so this runs before the projection: the
+// projection is what puts the result in its slot.
+window_row_cells :: proc(
+	ctx: ^Eval_Ctx,
+	expanded: []^Expr,
+	positions: []int,
+	has_windows: bool,
+) -> ([dynamic]Window_Cell, Error) {
+	cells := make([dynamic]Window_Cell, 0, len(positions))
+	if !has_windows do return cells, ERROR_NONE
+	for position in positions {
+		window := expanded[position]^.(Window_Expr)
+		partition_key, partition_err := window_partition_key(ctx, window)
+		if partition_err.kind != .None do return cells, partition_err
+		order_key, order_err := window_order_key(ctx, window)
+		if order_err.kind != .None {
+			delete(partition_key)
+			return cells, order_err
+		}
+		args := make([]Value, len(window.args))
+		for arg, a in window.args {
+			arg_value, arg_err := eval_expr(ctx, arg)
+			if arg_err.kind != .None {
+				delete(partition_key)
+				delete(order_key)
+				free_values(args)
+				return cells, arg_err
+			}
+			args[a] = value_clone(arg_value, context.allocator)
+		}
+		append(&cells, Window_Cell{partition = partition_key, order = order_key, args = args})
+	}
+	return cells, ERROR_NONE
+}
+
+@(private)
+free_values_over_rows :: proc(rows: ^[dynamic]Output_Row) {
+	for row in rows do free_values(row.values)
+}
+
+// window_cells_destroy frees one cell list: the keys it holds and the list itself.
+@(private)
+window_cells_destroy :: proc(cells: [dynamic]Window_Cell) {
+	for cell in cells {
+		delete(cell.partition)
+		delete(cell.order)
+		free_values(cell.args)
+	}
+	delete(cells)
+}
+
+// window_cell_rows_destroy frees the cell list of every output row.
+@(private)
+window_cell_rows_destroy :: proc(rows: ^[dynamic][dynamic]Window_Cell) {
+	for cells in rows do window_cells_destroy(cells)
+	delete(rows^)
 }
 
 // window_positions lists the projection indexes that hold a window expression.
@@ -2654,16 +2886,30 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 	}
 	window_positions := window_positions_of(expanded)
 	defer delete(window_positions)
-	if len(window_positions) > 0 && aggregate {
-		free_partials(&filtered)
-		return {}, errf(
-			.Sql_Unsupported,
-			"window functions next to GROUP BY are not supported",
-		)
-	}
 	has_windows := len(window_positions) > 0
+	if has_windows && aggregate {
+		// A window reads its ORDER BY value once per partition to place a RANGE
+		// frame, and beside GROUP BY that value may be an aggregate, which needs the
+		// group rather than a row: the group is gone by the time a window is filled.
+		// Every other frame shape reads keys that were captured per group.
+		for position in window_positions {
+			expr := expanded[position]
+			window := expr^.(Window_Expr)
+			if window_frame_reads_values(window.frame) {
+				free_partials(&filtered)
+				return {}, errf(
+					.Sql_Unsupported,
+					"a RANGE frame with an offset beside GROUP BY is not supported",
+				)
+			}
+		}
+	}
 	window_cells := make([dynamic][dynamic]Window_Cell, 0, len(filtered))
 	window_sources := make([dynamic][]Source, 0, len(filtered))
+	// group_keep holds the groups whose windows are still pending: a grouped row
+	// has no source behind it, and rebuilding its ORDER BY key after the windows
+	// need the group the row came from.
+	group_keep := make([dynamic][dynamic][]Source, 0, len(filtered))
 
 	output := make([dynamic]Output_Row, 0, len(filtered))
 	if aggregate {
@@ -2723,11 +2969,29 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			} else {
 				ctx.sources = nil
 			}
+			cells, cells_err := window_row_cells(&ctx, expanded, window_positions, has_windows)
+			if cells_err.kind != .None {
+				free_values_over_rows(&output)
+				window_cell_rows_destroy(&window_cells)
+				for kept in group_keep do delete(kept)
+				delete(group_keep)
+				free_partials(&filtered)
+				return {}, cells_err
+			}
 			values := make([]Value, len(expanded))
 			for expr, i in expanded {
+				if has_windows && window_cell_for(window_positions, i) >= 0 {
+					values[i] = value_null()
+					continue
+				}
 				value, eval_err := eval_expr(&ctx, expr)
 				if eval_err.kind != .None {
 					free_values(values)
+					window_cells_destroy(cells)
+					free_values_over_rows(&output)
+					window_cell_rows_destroy(&window_cells)
+					for kept in group_keep do delete(kept)
+					delete(group_keep)
 					free_partials(&filtered)
 					return {}, eval_err
 				}
@@ -2737,65 +3001,61 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 				having, having_err := eval_expr(&ctx, stmt.having)
 				if having_err.kind != .None {
 					free_values(values)
+					window_cells_destroy(cells)
+					free_values_over_rows(&output)
+					window_cell_rows_destroy(&window_cells)
+					for kept in group_keep do delete(kept)
+					delete(group_keep)
 					free_partials(&filtered)
 					return {}, having_err
 				}
 				if !value_is_truthy(having) {
 					free_values(values)
+					window_cells_destroy(cells)
+					delete(group)
 					continue
 				}
 			}
 			// A group has no row behind it: every group key answers the same
 			// tiebreak, which is what "unspecified order among equal groups" means.
-			sort_key := build_order_key(&ctx, stmt.order_by, expanded, values, columns[:], NO_ROW_ID)
+			// With a window in the projection the keys are rebuilt once the window
+			// values exist, which is why the group is kept.
+			sort_key: []u8
+			if !has_windows {
+				sort_key = build_order_key(&ctx, stmt.order_by, expanded, values, columns[:], NO_ROW_ID)
+			}
 			append(
 				&output,
 				Output_Row{values = values, sort_key = sort_key, row_id = NO_ROW_ID},
 			)
-			ctx.grouped = false
-			delete(group)
+			if has_windows {
+				append(&window_cells, cells)
+				append(&group_keep, group)
+			} else {
+				ctx.grouped = false
+				delete(group)
+			}
 		}
 		delete(groups)
 		ctx.group = nil
-		for partial in filtered do delete(partial)
+		// A pending window owns its partials: they are freed with the group below.
+		if !has_windows {
+			for partial in filtered do delete(partial)
+		}
 	} else {
 		for partial, index in filtered {
 			ctx.sources = partial
 			values := make([]Value, len(expanded))
-			cells := make([dynamic]Window_Cell, 0, len(window_positions))
+			cells, cells_err := window_row_cells(&ctx, expanded, window_positions, has_windows)
+			if cells_err.kind != .None {
+				free_values(values)
+				free_partials(&filtered)
+				return {}, cells_err
+			}
 			for expr, i in expanded {
-				if has_windows {
-					if cell_index := window_cell_for(window_positions, i); cell_index >= 0 {
-						window := expr^.(Window_Expr)
-						partition_key, partition_err := window_partition_key(&ctx, window)
-						if partition_err.kind != .None {
-							free_values(values)
-							free_partials(&filtered)
-							return {}, partition_err
-						}
-						order_key, order_err := window_order_key(&ctx, window)
-						if order_err.kind != .None {
-							delete(partition_key)
-							free_values(values)
-							free_partials(&filtered)
-							return {}, order_err
-						}
-						args := make([]Value, len(window.args))
-						for arg, a in window.args {
-							arg_value, arg_err := eval_expr(&ctx, arg)
-							if arg_err.kind != .None {
-								delete(partition_key)
-								delete(order_key)
-								free_values(values)
-								free_partials(&filtered)
-								return {}, arg_err
-							}
-							args[a] = value_clone(arg_value, context.allocator)
-						}
-						append(&cells, Window_Cell{partition = partition_key, order = order_key, args = args})
-						values[i] = value_null()
-						continue
-					}
+				if has_windows && window_cell_for(window_positions, i) >= 0 {
+					values[i] = value_null()
+					continue
 				}
 				value, eval_err := eval_expr(&ctx, expr)
 				if eval_err.kind != .None {
@@ -2835,11 +3095,12 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 				// either to the row loop (freed) or to window_sources (freed below).
 				// Freeing either a second time corrupts the heap, which a release
 				// build reports as exit 116 with no message at all.
-				for row in output do free_values(row.values)
-				for pending_cells in window_cells do delete(pending_cells)
+				free_values_over_rows(&output)
+				window_cell_rows_destroy(&window_cells)
 				for pending_sources in window_sources do delete(pending_sources)
-				delete(window_cells)
 				delete(window_sources)
+				for kept in group_keep do delete(kept)
+				delete(group_keep)
 				delete(output)
 				delete(filtered)
 				return {}, errf(
@@ -2854,30 +3115,37 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 
 	if has_windows {
 		if window_err := apply_windows(&ctx, expanded, window_positions, window_cells[:], output[:], window_sources[:]); window_err.kind != .None {
-			for row in output do free_values(row.values)
-			for cells in window_cells do delete(cells)
+			free_values_over_rows(&output)
+			window_cell_rows_destroy(&window_cells)
 			for sources in window_sources do delete(sources)
+			delete(window_sources)
+			for kept in group_keep do delete(kept)
+			delete(group_keep)
 			delete(output)
 			return {}, window_err
 		}
 		// ORDER BY runs on the completed rows, so an alias that names a window
-		// projection sorts on its value.
+		// projection sorts on its value. A grouped row has no source behind it: its
+		// group answers, which is what lets `ORDER BY count(*)` beside a window read
+		// the aggregate rather than one row of the group.
 		for &row, i in output {
-			ctx.sources = window_sources[i]
+			if aggregate {
+				ctx.group = group_keep[i][:]
+				ctx.grouped = true
+				ctx.sources = len(group_keep[i]) > 0 ? group_keep[i][0] : nil
+			} else {
+				ctx.sources = window_sources[i]
+			}
 			row.sort_key = build_order_key(&ctx, stmt.order_by, expanded, row.values, columns[:], row.row_id)
 		}
+		ctx.group = nil
+		ctx.grouped = false
 		ctx.sources = nil
-		for cells in window_cells {
-			for cell in cells {
-				delete(cell.partition)
-				delete(cell.order)
-				free_values(cell.args)
-			}
-			delete(cells)
-		}
-		delete(window_cells)
+		window_cell_rows_destroy(&window_cells)
 		for sources in window_sources do delete(sources)
 		delete(window_sources)
+		for kept in group_keep do delete(kept)
+		delete(group_keep)
 	}
 
 	if len(stmt.order_by) > 0 {
