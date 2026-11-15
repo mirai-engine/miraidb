@@ -825,6 +825,21 @@ quota_reached :: proc(tx: ^Tx, produced: int) -> bool {
 	return quota > 0 && u64(produced) > quota
 }
 
+// select_output_may_shrink reports whether the projection can emit fewer rows
+// than the rows it reads: DISTINCT, GROUP BY/HAVING, an aggregate and a window
+// all decide rows after the join. When none of them is present every kept row is
+// an output row, so the row quota may fire while the join is still building,
+// which is where the memory spike is (D23).
+select_output_may_shrink :: proc(stmt: Select_Stmt) -> bool {
+	if stmt.is_distinct || len(stmt.group_by) > 0 || stmt.having != nil do return true
+	for item in stmt.projections {
+		if item.star || item.expr == nil do continue
+		if expr_is_aggregate(item.expr) do return true
+		if _, is_window := item.expr^.(Window_Expr); is_window do return true
+	}
+	return false
+}
+
 Eval_Ctx :: struct {
 	tx:      ^Tx,
 	sources: []Source,
@@ -2345,6 +2360,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 	// Nested-loop joins. Each partial is one bound combination of rows, and each
 	// step carries the ON conditions that become answerable when it runs (which is
 	// what lets the planner move a relation ahead of the join it was written in).
+	join_counts_quota := !select_output_may_shrink(stmt)
 	for step in order.steps[1:] {
 		if step.ref.as_of != nil {
 			free_partials(&partials)
@@ -2465,6 +2481,22 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 				}
 				append(&next, candidate)
 				matched = true
+				if join_counts_quota && quota_reached(tx, len(next)) {
+					// A cross join materialises its intermediate before the
+					// projection can count anything, so the quota has to fire
+					// here: the rows being produced are the rows the query asked
+					// for (D23).
+					if lateral do delete(lateral_rows)
+					if using_probe do delete(probe_rows)
+					delete(rows)
+					free_partials(&partials)
+					free_partials(&next)
+					return {}, errf(
+						.Quota_Exceeded,
+						"query builds more than %d rows",
+						tx.store.max_rows_per_query,
+					)
+				}
 			}
 			if step.left && !matched {
 				candidate := make([]Source, len(partial) + 1)

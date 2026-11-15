@@ -939,10 +939,14 @@ the server or the C ABI.
 **Next.**
 
 1. ~~A depth counter in the parser and the evaluator.~~ Done at 100 levels.
-2. ~~Check the row quota while rows accumulate.~~ Done for the projection. Left:
-   the join's *intermediate* is built before the projection sees a row, so a
-   `LIMIT 1` over a huge join still builds the join; and `LIMIT` is not pushed
-   into the scan. This is where the memory spike actually happens.
+2. ~~Check the row quota while rows accumulate.~~ Done for the projection, and
+   now for the join: a step refuses as soon as it has produced `quota + 1`
+   candidates, which is the spike the audit measured (a cross join of 40 000
+   combinations with a quota of 100 refuses after fewer than 1 000 rows, where it
+   used to build all 40 000). A statement whose output can shrink — `DISTINCT`,
+   `GROUP BY`/`HAVING`, an aggregate, a window — is still judged by what it emits,
+   so `SELECT count(*) FROM a, b` answers. Left: `LIMIT` is not pushed into the
+   scan or the join, so `SELECT * FROM t LIMIT 10` still collects the table.
 3. Treat a failed allocation as an error (`.Out_Of_Memory` or the existing
    `.Quota_Exceeded`) everywhere the executor allocates per row. Not started: the
    audit saw it as `Index 1 is out of range 0..<0` and that path still needs a
@@ -950,8 +954,10 @@ the server or the C ABI.
 
 **Acceptance.** A test that nests exactly the limit (answers) and the limit plus
 one (refuses, process alive); a test with a small quota over a cross join that
-fails fast instead of materializing; a test that the CLI exits with an error code
-and a message for both.
+fails fast instead of materializing (`test_row_quota_stops_a_cross_join`, which
+counts the rows the join built: fewer than 1 000 of the 40 000 that exist, and an
+aggregate over the same join still answers 40 000). Left: a CLI flag that sets the
+quota, and `LIMIT` pushed into the scan.
 
 **Cost.** M. The counting is small; finding every recursive path is the work.
 

@@ -7117,6 +7117,50 @@ test_import_keeps_the_keys_sqlite_declared :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_row_quota_stops_a_cross_join :: proc(t: ^testing.T) {
+	// A cross join used to build every combination before the projection could
+	// count one row, so a quota could not stop the spike it exists for (D23).
+	store := fresh_db(t, "quota_join")
+	if store == nil do return
+	defer cleanup_db(store, "quota_join")
+	run(t, store, "CREATE TABLE a (id INTEGER PRIMARY KEY)")
+	run(t, store, "CREATE TABLE b (id INTEGER PRIMARY KEY)")
+	{
+		tx := db.tx_begin_write(store)
+		for i in 1 ..= 200 {
+			_, insert_a := db.sql_execute_in_tx(tx, fmt.aprintf("INSERT INTO a (id) VALUES (%d)", i))
+			testing.expect(t, db.error_ok(insert_a))
+			_, insert_b := db.sql_execute_in_tx(tx, fmt.aprintf("INSERT INTO b (id) VALUES (%d)", i))
+			testing.expect(t, db.error_ok(insert_b))
+		}
+		testing.expect(t, db.error_ok(db.tx_commit(tx)))
+	}
+	db.store_set_row_quota(store, 100)
+	defer db.store_set_row_quota(store, 0)
+	db.store_reset_rows_scanned(store)
+	cross, cross_err := db.sql_execute(store, "SELECT a.id, b.id FROM a, b")
+	testing.expect_value(t, cross_err.kind, db.Error_Kind.Quota_Exceeded)
+	db.sql_result_destroy(&cross)
+	// 40 000 combinations exist; the refusal has to arrive while the join builds,
+	// not after the whole product is in memory.
+	scanned := db.store_rows_scanned(store)
+	testing.expectf(t, scanned < 1000, "the join built %d rows before refusing", scanned)
+
+	// A statement that can shrink its output is judged by what it emits: an
+	// aggregate over the same cross join answers with one row.
+	counted, counted_err := db.sql_execute(store, "SELECT count(*) FROM a, b")
+	if testing.expectf(t, db.error_ok(counted_err), "count over a join: %s", counted_err.message) {
+		testing.expect_value(t, counted.rows[0][0].i, i64(40000))
+	}
+	db.sql_result_destroy(&counted)
+
+	// And the plain quota still refuses a single-table scan that is too wide.
+	wide, wide_err := db.sql_execute(store, "SELECT * FROM a")
+	testing.expect_value(t, wide_err.kind, db.Error_Kind.Quota_Exceeded)
+	db.sql_result_destroy(&wide)
+}
+
+@(test)
 test_rewrite_keeps_a_keyed_table_as_it_was :: proc(t: ^testing.T) {
 	// The rest of D27: a table whose declaration SQLite backs with an automatic
 	// index used to be rebuilt, because the rewrite could not number those
