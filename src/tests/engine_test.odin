@@ -12808,3 +12808,70 @@ test_windows_beside_group_by :: proc(t: ^testing.T) {
 	run(t, store, "INSERT INTO d (id, v) VALUES (1, 1), (2, 1), (3, 2)")
 	testing.expect_value(t, scalar(t, store, "SELECT count(DISTINCT v) OVER () FROM d LIMIT 1").i, 2)
 }
+
+// A host function is SQL calling code the caller linked. The registry is consulted
+// last, so a builtin keeps its name; the arity is checked before the handler runs;
+// a handler reads through the group context like any other call, so it works as the
+// argument of an aggregate.
+@(test)
+test_host_functions :: proc(t: ^testing.T) {
+	store := fresh_db(t, "host_functions")
+	if store == nil do return
+	defer cleanup_db(store, "host_functions")
+	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT, v INTEGER)")
+	run(t, store, "INSERT INTO t (id, k, v) VALUES (1, 'a', 1), (2, 'a', 2), (3, 'b', 3)")
+
+	prefix := "id:"
+	twice :: proc(args: []db.Value, user: rawptr) -> (db.Value, db.Error) {
+		if args[0].kind == .Null do return db.value_null(), db.ERROR_NONE
+		number, ok := db.value_to_i64(args[0])
+		if !ok {
+			return {}, db.errf(db.Error_Kind.Invalid_Type, "twice() expects an integer")
+		}
+		return db.value_int(number * 2), db.ERROR_NONE
+	}
+	labelled :: proc(args: []db.Value, user: rawptr) -> (db.Value, db.Error) {
+		tag := cast(^string)user
+		text := args[0].kind == .String ? args[0].s : ""
+		return db.value_string(fmt.aprintf("%s%s", tag^, text)), db.ERROR_NONE
+	}
+	refuse :: proc(args: []db.Value, user: rawptr) -> (db.Value, db.Error) {
+		return {}, db.errf(db.Error_Kind.Invalid_Argument, "refuse() was called with %d", len(args))
+	}
+	testing.expect(t, db.error_ok(db.store_register_function(store, "twice", 1, twice)))
+	testing.expect(t, db.error_ok(db.store_register_function(store, "labelled", 1, labelled, rawptr(&prefix))))
+	testing.expect(t, db.error_ok(db.store_register_function(store, "refuse", -1, refuse)))
+
+	testing.expect_value(t, scalar(t, store, "SELECT twice(21)").i, 42)
+	testing.expect_value(t, scalar(t, store, "SELECT TWICE(4)").i, 8)
+	testing.expect_value(t, scalar(t, store, "SELECT twice(1 + 1)").i, 4)
+	testing.expect_value(t, scalar(t, store, "SELECT twice(NULL)").kind, db.Value_Kind.Null)
+	testing.expect_value(t, scalar(t, store, "SELECT labelled('x')").s, "id:x")
+	// The function runs per row, in WHERE, and as the argument of an aggregate.
+	testing.expect_value(t, scalar(t, store, "SELECT twice(v) FROM t WHERE id = 2").i, 4)
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t WHERE twice(v) > 2").i, 2)
+	testing.expect_value(t, scalar(t, store, "SELECT sum(twice(v)) FROM t").i, 12)
+	testing.expect_value(t, scalar(t, store, "SELECT twice(count(*)) FROM t GROUP BY k ORDER BY k LIMIT 1").i, 4)
+
+	// The arity is the statement's error, and the handler's own error travels.
+	bad_arity := run_error(t, store, "SELECT twice(1, 2)")
+	testing.expect_value(t, bad_arity.kind, db.Error_Kind.Invalid_Argument)
+	testing.expect(t, strings_contains(bad_arity.message, "twice() takes 1"))
+	handled := run_error(t, store, "SELECT refuse(1, 2, 3)")
+	testing.expect_value(t, handled.kind, db.Error_Kind.Invalid_Argument)
+	testing.expect(t, strings_contains(handled.message, "refuse() was called with 3"))
+	type_err := run_error(t, store, "SELECT twice('x')")
+	testing.expect_value(t, type_err.kind, db.Error_Kind.Invalid_Type)
+
+	// A builtin keeps its name: the host is asked only where the name is unknown.
+	testing.expect(t, db.error_ok(db.store_register_function(store, "upper", 1, twice)))
+	testing.expect_value(t, scalar(t, store, "SELECT upper('a')").s, "A")
+
+	// Unregistering restores "unknown function", and registering nothing is a
+	// refusable call rather than a crash.
+	testing.expect(t, db.store_unregister_function(store, "twice"))
+	testing.expect(t, !db.store_unregister_function(store, "twice"))
+	unknown := run_error(t, store, "SELECT twice(1)")
+	testing.expect_value(t, unknown.kind, db.Error_Kind.Sql_Unsupported)
+	testing.expect(t, !db.error_ok(db.store_register_function(store, "", 0, twice)))
+}

@@ -90,6 +90,9 @@ Store :: struct {
 	// with the same allocator the store's memory came from.
 	alloc:         mem.Allocator,
 	variables:     map[string]Value,
+	// functions are the host's scalar functions, keyed by their lowercased name.
+	// They live in this process, not in the log: a reopen starts without them.
+	functions:     map[string]Scalar_Function_Def,
 	// cancelled asks the next row loop to stop. It is cooperative: a running
 	// statement checks it between rows, so the caller still owns the outcome.
 	cancelled:     bool,
@@ -260,6 +263,7 @@ store_open :: proc(path: string, options: Store_Options) -> (^Store, Error) {
 	store.tables = make(map[string]^Table)
 	store.attached = make(map[string]^Store)
 	store.variables = make(map[string]Value)
+	store.functions = make(map[string]Scalar_Function_Def)
 	store.persistent = settings.persistent
 	store.vfs = settings.vfs
 	store.path = open_path
@@ -409,6 +413,8 @@ store_close :: proc(store: ^Store) {
 		value_deep_free(value, context.allocator)
 	}
 	delete(store.variables)
+	for name, _ in store.functions do delete(name)
+	delete(store.functions)
 	stats_destroy(store)
 	log_close(&store.log)
 	db_lock_release(&store.lock)

@@ -591,6 +591,37 @@ FROM s;
 - A window nested inside a larger expression (`sum(n) OVER () + 1`) is refused with
   `sql_unsupported`; the projection has to be the window call itself.
 
+## Host functions
+
+A program that embeds the engine can register a scalar function, and SQL can then
+call it like any other:
+
+```c
+static int twice(void *user, const miraidb_value *args, int argc, miraidb_value *result) {
+    result->type = MIRAIDB_INT;
+    result->i = args[0].i * 2;
+    return MIRAIDB_OK;
+}
+miraidb_create_function(db, "twice", 1, twice, NULL);
+```
+
+```sql
+SELECT twice(v) FROM t WHERE twice(v) > 10;
+SELECT twice(count(*)) FROM t GROUP BY k;
+```
+
+- The registry is consulted **last**: a builtin keeps its name, so a registration
+  cannot quietly replace `upper()`.
+- `arity` is exact, or `-1` for any number; the count is checked before the handler
+  runs, and a mismatch is the statement's error.
+- The arguments are evaluated before the call, so a host function works per row, in
+  `WHERE`, and as the argument of an aggregate (where it sees the group).
+- A handler receives values as `miraidb_value`: a tag, an integer, a real and a
+  borrowed buffer. Text it returns is copied when it returns, so a temporary buffer
+  is allowed; text it receives is borrowed for the duration of the call.
+- Registrations belong to the process, not to the database: they are not logged,
+  they do not survive a reopen, and `miraidb_close` drops them.
+
 ## Triggers
 
 ```sql

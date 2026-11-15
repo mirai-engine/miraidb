@@ -413,11 +413,27 @@ walk that exists now.
 ## D9 — The rest of the grammar
 
 **Now.** 32 statement kinds. Refused with `sql_unsupported`: collations beyond
-`BINARY`/`NOCASE`/`RTRIM`, user-defined functions, and a window nested inside a
-larger expression (`sum(n) OVER () + 1`), because the executor fills a window
-column rather than evaluating the window where it appears. `GROUP BY` does not
-resolve a projection alias (`GROUP BY d` where `d` is `dept AS d`), although
-`ORDER BY` does.
+`BINARY`/`NOCASE`/`RTRIM`, and a window nested inside a larger expression
+(`sum(n) OVER () + 1`), because the executor fills a window column rather than
+evaluating the window where it appears. `GROUP BY` does not resolve a projection
+alias (`GROUP BY d` where `d` is `dept AS d`), although `ORDER BY` does.
+
+**Done: host functions.** A program registers a scalar function on the store
+(`store_register_function`, `src/engine/functions.odin`) and SQL calls it. The
+registry is consulted where a name would otherwise be "unknown function", so the
+builtins keep their names and a registration cannot shadow `upper()`; the arity is
+exact or -1 and is checked before the handler runs; the arguments are evaluated by
+the engine, so a host function runs per row, in `WHERE`, and as the argument of an
+aggregate, where it sees the group. `Scalar_Function` takes `(args, user)` and
+returns `(Value, Error)`, and an error kind travels as the statement's error. The
+registry is per process and never logged, and `store_close` frees it with the keys
+it cloned. `miraidb_create_function(db, name, arity, callback, user)` is the C side:
+`miraidb_value` carries a tag, an integer, a real and a borrowed buffer, text a
+callback returns is copied before the callback's buffer goes away, and the C entry
+lives in the connection so `miraidb_close` frees it. `test_host_functions` covers
+the calls, the arity and handler errors, the group argument, a builtin keeping its
+name and unregistering; `scripts/capi_smoke.py` does the same through ctypes with a
+real callback, both directions of text included.
 
 **Done: a window beside `GROUP BY`.** The window's input rows are the groups: the
 aggregate branch captures each group's partition key, order key and arguments

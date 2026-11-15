@@ -4785,6 +4785,22 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		if args[0].kind != .String do return {}, errf(.Invalid_Type, "format() expects a text pattern")
 		return value_string(sq_format(args[0].s, args[1:])), ERROR_NONE
 	}
+	// A host function answers last, so the builtins keep their names. The count is
+	// checked here rather than in the handler: a wrong number of arguments is the
+	// caller's mistake, and every handler would have to write the same check.
+	if ctx.tx != nil && ctx.tx.store != nil {
+		if def, found := store_function(ctx.tx.store, call.name); found {
+			if def.arity >= 0 && len(args) != def.arity {
+				return {}, errf(
+					.Invalid_Argument,
+					"%s() takes %d arguments",
+					call.name,
+					def.arity,
+				)
+			}
+			return def.handler(args[:], def.user)
+		}
+	}
 	return {}, errf(.Sql_Unsupported, "unknown function %s", call.name)
 }
 

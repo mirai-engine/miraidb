@@ -123,6 +123,41 @@ unsigned long long miraidb_work_used(miraidb_conn db);
  * connection usable. A dead handle answers MIRAIDB_MISUSE and does nothing. */
 int miraidb_interrupt(miraidb_conn db);
 
+/* Host functions. A program that embeds the engine can make its own code callable
+ * from SQL. The engine's own functions answer first, so `upper()` keeps its name;
+ * a registered name is consulted only where a statement would otherwise fail with
+ * "unknown function".
+ *
+ *   static int twice(void *user, const miraidb_value *args, int argc,
+ *                    miraidb_value *result) {
+ *       result->type = MIRAIDB_INT;
+ *       result->i = args[0].i * 2;
+ *       return MIRAIDB_OK;                    // anything else is a statement error
+ *   }
+ *   miraidb_create_function(db, "twice", 1, twice, NULL);
+ *
+ * miraidb_value carries one value: `type` is one of the MIRAIDB_* type constants,
+ * `i` holds an integer or a boolean, `f` a real, and `bytes`/`nbytes` a text or a
+ * blob that the callback borrows. Text a callback returns is copied when the
+ * callback returns, so the buffer it points at may be temporary. `arity` is the
+ * exact number of arguments, or -1 for any number; a mismatch is the statement's
+ * error, reported before the callback runs. The user pointer travels back with
+ * every call. Registrations belong to the process, not to the database: they are
+ * not logged, and reopening the file starts with none. */
+typedef struct miraidb_value {
+    int type;
+    long long i;
+    double f;
+    const void *bytes;
+    int nbytes;
+} miraidb_value;
+
+typedef int (*miraidb_function)(void *user, const miraidb_value *args, int argc,
+                                miraidb_value *result);
+
+int miraidb_create_function(miraidb_conn db, const char *name, int arity,
+                            miraidb_function callback, void *user);
+
 /* Identity and credentials. Row policies filter by the identity the connection
  * carries. A connection that never set one carries the all-zero identity, so a
  * policy that compares against current_identity() matches no row until an

@@ -72,6 +72,7 @@ def load(path: str):
     lib.miraidb_issue_token.restype = ctypes.c_int
     lib.miraidb_authenticate.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
     lib.miraidb_authenticate.restype = ctypes.c_int
+    lib.miraidb_create_function.restype = ctypes.c_int
     return lib
 
 
@@ -297,6 +298,73 @@ def main() -> int:
     assert lib.miraidb_authenticate(again, b"mt_00") == DENIED
     lib.miraidb_close(again)
     shutil.rmtree(identity_db, ignore_errors=True)
+
+    # Host functions (D9): the program's own code becomes callable from SQL, the
+    # arity is checked before the callback runs, text crosses both ways, and the
+    # builtins keep their names because they are asked first.
+    class Value(ctypes.Structure):
+        _fields_ = [
+            ("type", ctypes.c_int),
+            ("i", ctypes.c_longlong),
+            ("f", ctypes.c_double),
+            ("bytes", ctypes.c_void_p),
+            ("nbytes", ctypes.c_int),
+        ]
+
+    NULL, BOOL, INT, FLOAT, TEXT, BLOB, OTHER = 0, 1, 2, 3, 4, 5, 6
+    CALLBACK = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(Value), ctypes.c_int, ctypes.POINTER(Value))
+    calls = []
+
+    @CALLBACK
+    def twice(user, args, argc, result):
+        calls.append("twice")
+        if args[0].type == NULL:
+            result[0].type = NULL
+            return OK
+        if args[0].type != INT:
+            return ERROR
+        result[0].type = INT
+        result[0].i = args[0].i * 2
+        return OK
+
+    @CALLBACK
+    def shout(user, args, argc, result):
+        # Text arrives borrowed; text returned is copied by the engine when the
+        # callback returns, so a temporary buffer is allowed.
+        word = ctypes.string_at(args[0].bytes, args[0].nbytes).decode().upper()
+        buffer = ctypes.create_string_buffer(word.encode() + b"!")
+        result[0].type = TEXT
+        result[0].bytes = ctypes.cast(buffer, ctypes.c_void_p)
+        result[0].nbytes = len(word) + 1
+        calls.append(("shout", args[0].nbytes))
+        return OK
+
+    lib.miraidb_create_function.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, CALLBACK, ctypes.c_void_p,
+    ]
+    assert lib.miraidb_create_function(db, b"twice", 1, twice, None) == OK
+    assert lib.miraidb_create_function(db, b"shout", 1, shout, None) == OK
+    assert lib.miraidb_create_function(db, b"twice", 1, CALLBACK(), None) == ERROR, "a function needs a callback"
+    assert lib.miraidb_create_function(db, None, 1, twice, None) == ERROR
+    assert scalar(lib, db, b"SELECT twice(21)") == 42
+    assert scalar(lib, db, b"SELECT TWICE(2)") == 4
+    stmt = lib.miraidb_prepare(db, b"SELECT shout('ada')")
+    assert stmt, lib.miraidb_errmsg(db)
+    assert lib.miraidb_step(stmt) == ROW, lib.miraidb_errmsg(db)
+    assert lib.miraidb_column_text(stmt, 0) == b"ADA!", "text returned by C is copied"
+    lib.miraidb_finalize(stmt)
+    assert calls.count("twice") == 2 and calls[-1] == ("shout", 3), calls
+    # The builtins answer first, and a wrong argument count is the statement's error.
+    assert lib.miraidb_create_function(db, b"upper", 1, twice, None) == OK
+    stmt = lib.miraidb_prepare(db, b"SELECT upper('a')")
+    assert lib.miraidb_step(stmt) == ROW
+    assert lib.miraidb_column_text(stmt, 0) == b"A"
+    lib.miraidb_finalize(stmt)
+    assert lib.miraidb_exec(db, b"SELECT twice(1, 2)") == ERROR, "the arity is checked before the callback"
+    assert "takes 1" in lib.miraidb_errmsg(db).decode()
+    # Re-registering the same name with a different arity replaces it.
+    assert lib.miraidb_create_function(db, b"twice", -1, twice, None) == OK
+    assert lib.miraidb_exec(db, b"SELECT twice(1, 2)") == OK, lib.miraidb_errmsg(db)
 
     # The error path reports a message instead of crashing.
     assert lib.miraidb_exec(db, b"SELECT * FROM missing") == ERROR

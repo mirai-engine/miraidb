@@ -146,7 +146,7 @@ the gaps are named rather than left to be discovered.
   `linux_arm64` and `darwin_arm64`. The POSIX lock is the reason it is checked:
   it carried a missing `core:sys/posix` import and two wrong integer types until
   this round, so the code that a Linux build would run had never been compiled.
-- 259 integration tests covering CRUD, recovery, constraints, transactions,
+- 260 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
@@ -391,6 +391,13 @@ than 1000 bytes cannot be indexed and the insert says so.
   text to a number first, `--json` keeps the `.0` on a real, and `INSERT OR
   REPLACE` is implemented instead of refused by accident (`AUDIT-10` P-B1/P-B2/
   P-B3/P-B7). `OR ROLLBACK`, `OR FAIL` and `OR IGNORE` are named refusals.
+- **A program can make its own code callable from SQL.** A scalar function
+  registered on the store is looked up only where a name would otherwise be
+  unknown, so the builtins keep their names; the arity is checked before the
+  handler runs; the arguments are the engine's, so the function works per row, in
+  `WHERE` and as the argument of an aggregate. `miraidb_create_function` carries
+  the same thing across the C boundary, with text copied in both directions
+  (`test_host_functions`, `scripts/capi_smoke.py`).
 - **The C ABI reaches every lever the engine has.** 33 `miraidb_*` exports and 43
   `sqlite3_*` exports: open with flags (read-only, in-memory, no-sync, paged),
   interrupt, the row quota and work budget with `miraidb_work_used`, an identity

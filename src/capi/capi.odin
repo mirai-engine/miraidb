@@ -47,6 +47,29 @@ CAPI_TEXT :: c.int(4)
 CAPI_BLOB :: c.int(5)
 CAPI_OTHER :: c.int(6)
 
+// Capi_Value is one value crossing the C boundary: a tag, an integer, a real and a
+// borrowed buffer. It matches `miraidb_value` in include/miraidb.h field by field.
+Capi_Value :: struct {
+	type:   c.int,
+	i:      c.longlong,
+	f:      c.double,
+	bytes:  rawptr,
+	nbytes: c.int,
+}
+
+Capi_Function_Callback :: #type proc "c" (
+	user:   rawptr,
+	args:   [^]Capi_Value,
+	argc:   c.int,
+	result: ^Capi_Value,
+) -> c.int
+
+@(private)
+Capi_Function :: struct {
+	callback: Capi_Function_Callback,
+	user:     rawptr,
+}
+
 Capi_Connection :: struct {
 	embed:   ^engine.Embed_Conn,
 	last:    string, // owned, NUL-terminated
@@ -54,6 +77,9 @@ Capi_Connection :: struct {
 	// statements is what this connection handed out and has not finalized, so a
 	// close can make every one of them misuse instead of leaving them dangling.
 	statements: map[rawptr]^Capi_Statement,
+	// functions are the per-registration trampolines, freed with the connection:
+	// the store holds the user pointer they carry, not their lifetime.
+	functions: [dynamic]^Capi_Function,
 }
 
 Capi_Statement :: struct {
@@ -117,6 +143,7 @@ miraidb_open_ex :: proc "c" (path: cstring, flags: c.int) -> rawptr {
 	handle := new(Capi_Connection)
 	handle.embed = conn
 	handle.statements = make(map[rawptr]^Capi_Statement)
+	handle.functions = make([dynamic]^Capi_Function)
 	engine.handle_register(rawptr(handle))
 	return rawptr(handle)
 }
@@ -150,6 +177,8 @@ miraidb_close :: proc "c" (handle: rawptr) {
 	}
 	delete(conn.statements)
 	delete(keys)
+	for function in conn.functions do free(function)
+	delete(conn.functions)
 	engine.handle_forget(rawptr(conn))
 	engine.embed_close(conn.embed)
 	delete(conn.last)
@@ -449,6 +478,116 @@ miraidb_interrupt :: proc "c" (handle: rawptr) -> c.int {
 	conn := capi_conn(handle)
 	if conn == nil do return MIRAIDB_MISUSE
 	engine.store_cancel(conn.embed.store)
+	return MIRAIDB_OK
+}
+
+// capi_value_of lays an engine value out for a callback. Text and blobs are
+// borrowed: they live until the statement moves on, which is after the callback.
+@(private)
+capi_value_of :: proc(value: engine.Value) -> Capi_Value {
+	out := Capi_Value{}
+	#partial switch value.kind {
+	case .Null:
+		out.type = CAPI_NULL
+	case .Bool:
+		out.type = CAPI_BOOL
+		out.i = value.b ? 1 : 0
+	case .Int, .Uint, .Timestamp, .Duration, .Connection:
+		out.type = CAPI_INT
+		if number, ok := engine.value_to_i64(value); ok do out.i = c.longlong(number)
+	case .Float:
+		out.type = CAPI_FLOAT
+		out.f = c.double(value.f)
+	case .String:
+		out.type = CAPI_TEXT
+		out.bytes = rawptr(raw_data(value.s))
+		out.nbytes = c.int(len(value.s))
+	case .Bytes:
+		out.type = CAPI_BLOB
+		out.bytes = rawptr(raw_data(value.bytes))
+		out.nbytes = c.int(len(value.bytes))
+	case:
+		// An IDENTITY, a UUID or a product has no C shape here; the callback sees
+		// MIRAIDB_OTHER and can refuse or ignore it.
+		out.type = CAPI_OTHER
+	}
+	return out
+}
+
+// engine_value_of is the other direction: what a callback returned, copied so the
+// value outlives the callback's own buffer.
+@(private)
+engine_value_of :: proc(value: Capi_Value) -> (engine.Value, engine.Error) {
+	switch value.type {
+	case CAPI_NULL:
+		return engine.value_null(), engine.ERROR_NONE
+	case CAPI_BOOL:
+		return engine.value_bool(value.i != 0), engine.ERROR_NONE
+	case CAPI_INT:
+		return engine.value_int(i64(value.i)), engine.ERROR_NONE
+	case CAPI_FLOAT:
+		return engine.value_float(f64(value.f)), engine.ERROR_NONE
+	case CAPI_TEXT:
+		if value.bytes == nil || value.nbytes <= 0 do return engine.value_string(""), engine.ERROR_NONE
+		text := make([]u8, int(value.nbytes))
+		copy(text, (cast([^]u8)value.bytes)[:int(value.nbytes)])
+		return engine.value_string(string(text)), engine.ERROR_NONE
+	case CAPI_BLOB:
+		if value.bytes == nil || value.nbytes <= 0 do return engine.value_bytes(nil), engine.ERROR_NONE
+		data := make([]u8, int(value.nbytes))
+		copy(data, (cast([^]u8)value.bytes)[:int(value.nbytes)])
+		return engine.value_bytes(data), engine.ERROR_NONE
+	}
+	return {}, engine.errf(engine.Error_Kind.Invalid_Type, "a host function cannot return MIRAIDB_OTHER")
+}
+
+@(private)
+capi_function_call :: proc(args: []engine.Value, user: rawptr) -> (engine.Value, engine.Error) {
+	entry := cast(^Capi_Function)user
+	if entry == nil do return {}, engine.errf(engine.Error_Kind.Internal, "host function has no entry")
+	cvalues := make([]Capi_Value, len(args))
+	defer delete(cvalues)
+	for value, i in args do cvalues[i] = capi_value_of(value)
+	result := Capi_Value{type = CAPI_NULL}
+	status := entry.callback(entry.user, raw_data(cvalues), c.int(len(cvalues)), &result)
+	if status != MIRAIDB_OK {
+		return {}, engine.errf(engine.Error_Kind.Invalid_Argument, "host function returned %d", status)
+	}
+	return engine_value_of(result)
+}
+
+// miraidb_create_function makes a C callback callable from SQL. The name is
+// registered case-insensitively and cannot replace a builtin, because the builtins
+// answer first. Registrations last until the connection closes and are not part of
+// the database.
+@(export)
+miraidb_create_function :: proc "c" (
+	handle: rawptr,
+	name: cstring,
+	arity: c.int,
+	callback: Capi_Function_Callback,
+	user: rawptr,
+) -> c.int {
+	context = runtime.default_context()
+	conn := capi_conn(handle)
+	if conn == nil do return MIRAIDB_MISUSE
+	if name == nil || callback == nil do return MIRAIDB_ERROR
+	if arity < -1 do return MIRAIDB_ERROR
+	entry := new(Capi_Function)
+	entry.callback = callback
+	entry.user = user
+	err := engine.store_register_function(
+		conn.embed.store,
+		string(name),
+		int(arity),
+		capi_function_call,
+		rawptr(entry),
+	)
+	if err.kind != .None {
+		free(entry)
+		return MIRAIDB_ERROR
+	}
+	append(&conn.functions, entry)
 	return MIRAIDB_OK
 }
 
