@@ -54,7 +54,7 @@ Rules for this file:
 | D18 | a read-only open replays | a reader that trusts the pages of a quiescent writer | M |
 | D23 | depth, row quota and budget are bounded | an allocation failure is a crash, not an error | M |
 | D24 | an index the engine cannot express is dropped on import | a counted skip, and a mirror fuzz pass | S |
-| D34 | the Linux suite crashes under the threaded runner; the heap half of ASAN waits on it | find the corruption, then run ASAN on POSIX | M |
+| D34 | the Linux suite crashes under the threaded runner; the sanitizer covers the Windows CLI, not the suite | find the corruption, run the suite sanitized on every platform | M |
 | D35 | diagnostics: test-side leak lines, map nodes freed through the wrong allocator, error ownership | one sweep | M |
 
 ---
@@ -394,12 +394,16 @@ darwin_arm64, and the CLI runs on Linux. `odin test src/tests` under the default
 two-thread runner dies in `test_aggregates_and_order` with a map panic and a
 segmentation fault, while the test alone passes: memory corruption, most likely
 a map built in a transaction arena whose nodes are freed through another
-allocator (`Tx_Snapshot`'s maps). On Windows the suite runs under
-`-sanitize:address` for bounds and stack, but Odin's heap allocator is not
-intercepted there.
+allocator (`Tx_Snapshot`'s maps). On Windows the heap half works after all:
+Odin's allocator calls `HeapAlloc`, which AddressSanitizer intercepts only with
+`ASAN_OPTIONS=windows_hook_rtl_allocators=true`. With it, the CLI runs under the
+`heap sanitizer` gate (`scripts/asan_smoke.py`) and the suite runs clean except
+`test_expression_depth_is_bounded`, whose 100 levels overflow the larger frames
+a sanitized build uses.
 
 **Done when.** The threaded suite is green on Linux, a CI job runs it on Linux and
-macOS with `-sanitize:address` (the heap half), and the scripts that hardcode a
+macOS with `-sanitize:address`, the Windows suite runs under the sanitizer as a
+gate (it is the CLI only today), and the scripts that hardcode a
 `.exe` (`ci.py`, `page_rss.py`, `plan_check.py`, `bench.py`, `lock_smoke.py`,
 `broker_smoke.py`) find the binary on every platform.
 

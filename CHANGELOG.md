@@ -2,6 +2,14 @@
 
 ## 0.15
 
+- A commit read its own freed transaction: `tx_commit` cleared
+  `apply_validated` in a `defer` through `tx.store`, after `tx_discard` had freed
+  `tx`. When the heap reused the block, the process died with no message, about
+  once in ten commits (the differential gate's setup hit it intermittently).
+  Introduced by the write-path round above, found with AddressSanitizer once
+  `windows_hook_rtl_allocators=true` let it see Odin's heap on Windows, and
+  guarded by a new gate, `scripts/asan_smoke.py`, which builds the CLI sanitized
+  and replays the differential corpus (27 gates).
 - The planning documents are one list again. `docs/roadmap.md` holds every open
   item, split by goal: speed against the reference model (R1–R4, measured by its
   own benchmark suite), SQLite's surface (S1–S7) and hardening (the D items).
@@ -12,7 +20,7 @@
 - `scripts/sqlite_gaps.py` runs every SQLite function and pragma and 63 grammar
   shapes through the CLI: 73 of 121 functions, 54 of 63 pragmas and 30 of 63
   shapes run today. A CI gate fails when `docs/sqlite-roadmap.md` states other
-  counts, so the document cannot drift again (26 gates).
+  counts, so the document cannot drift again (27 gates).
 - `docs/security.md` no longer says a deep expression takes the server down: the
   depth bound closed that; an allocation failure still can (D23).
 

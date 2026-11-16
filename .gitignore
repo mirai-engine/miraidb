@@ -40,3 +40,6 @@ __pycache__/
 # page_rss.py workspace
 /_page_rss/
 .index/
+
+# asan_smoke.py workspace
+/_asan_smoke/

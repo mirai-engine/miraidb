@@ -54,7 +54,7 @@ that way.
 | # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
 | 17 | **D23 — allocation failure** | A failed allocation is a crash, not `.Out_Of_Memory`; start with an allocator that fails the nth call. | M | — |
-| 18 | **D34 — Linux suite and heap sanitizer** | The threaded suite crashes on Linux; then CI on Linux and macOS with `-sanitize:address`, and scripts that find a binary without `.exe`. | M | — |
+| 18 | **D34 — Linux suite and heap sanitizer** | The threaded suite crashes on Linux; then CI on Linux and macOS with `-sanitize:address`, the suite sanitized as a gate (the CLI already is, on Windows), and scripts that find a binary without `.exe`. | M | — |
 | 19 | **D8 — fault injection beyond the log** | Snapshot, rotation, the mirror, a kill during a page flush. | S | — |
 | 20 | **D3 — version retention** | Automatic retention tied to the oldest reader; `AS OF` on a join. | M | — |
 | 21 | **D5 — the rest of the page store** | Leaf merge, versions on paged tables, a read without the shared lock for its whole life; with D18, a reader that trusts the pages. | L | — |
@@ -112,4 +112,4 @@ the CI gate checks; they are not a comparison with the reference.
 Every row of this table is met today and gated by `scripts/bench.py`, the read
 and commit numbers by `bench-read`, and the subscription row by
 `test_join_subscription_probes_the_join_key`. The engineering gates are listed in
-`docs/status.md` and run by `scripts/ci.py` (26 gates).
+`docs/status.md` and run by `scripts/ci.py` (27 gates).

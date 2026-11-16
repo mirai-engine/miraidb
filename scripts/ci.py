@@ -91,6 +91,9 @@ def build_gates(args: argparse.Namespace) -> list[Gate]:
     gates.append(
         Gate("SQLite surface", [sys.executable, "scripts/sqlite_gaps.py", "--check", "--bin", "./bin/miraidb.exe"])
     )
+    # The CLI under AddressSanitizer with the Windows heap hooked: a use-after-free
+    # of heap memory is invisible to it otherwise, and one shipped that way.
+    gates.append(Gate("heap sanitizer", [sys.executable, "scripts/asan_smoke.py", "--odin", args.odin]))
     gates.append(
         Gate(
             "mirror cost",

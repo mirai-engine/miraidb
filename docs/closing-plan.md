@@ -564,7 +564,7 @@ is clean, and check that before dismissing a report.
 These were items of the roadmap after the plan closed; each entry names the code
 and the test or gate that proves it, and the git history of `docs/backlog.md`
 holds each one's full write-up. The engineering gates that watch them today are
-listed in `docs/status.md` and run by `scripts/ci.py` (26 gates).
+listed in `docs/status.md` and run by `scripts/ci.py` (27 gates).
 
 | Item | Evidence |
 |---|---|

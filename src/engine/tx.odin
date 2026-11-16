@@ -1546,8 +1546,12 @@ tx_commit :: proc(tx: ^Tx) -> Error {
 	// own keys when it was staged, and the write lock has been held since, so
 	// applying it does not probe the unique indexes again. Updates are still
 	// checked: two rows that swap keys collide halfway through the apply.
-	tx.store.apply_validated = true
-	defer tx.store.apply_validated = false
+	// The flag is cleared through the store, not through `tx`: tx_discard frees
+	// the transaction before this procedure returns, and a deferred `tx.store`
+	// read the freed block (a heap corruption in roughly one commit in ten).
+	validating_store := tx.store
+	validating_store.apply_validated = true
+	defer validating_store.apply_validated = false
 	for op in ops {
 		if apply_err := store_apply(tx.store, op); apply_err.kind != .None {
 			// Applying a validated transaction must not fail. If it does, undo
