@@ -17,7 +17,7 @@ def load(path):
     lib.sqlite3_close.argtypes = [ctypes.c_void_p]
     lib.sqlite3_exec.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
     lib.sqlite3_exec.restype = ctypes.c_int
-    lib.sqlite3_prepare_v2.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
+    lib.sqlite3_prepare_v2.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_char_p)]
     lib.sqlite3_prepare_v2.restype = ctypes.c_int
     lib.sqlite3_step.argtypes = [ctypes.c_void_p]
     lib.sqlite3_step.restype = ctypes.c_int
@@ -432,6 +432,48 @@ def main() -> int:
     assert lib.sqlite3_column_type(render_stmt, 0) == 1 and lib.sqlite3_column_type(render_stmt, 3) == 5
     lib.sqlite3_finalize(render_stmt)
     assert lib.sqlite3_close(render_db) == OK
+
+    # F5: prepare_v2 reports where the first statement ends, honours nByte, and
+    # answers "no statement" instead of an error for text that holds none. A
+    # caller looping over a script used to lose everything after the first
+    # semicolon because the tail was always NULL.
+    tail_db = ctypes.c_void_p()
+    assert lib.sqlite3_open(b":memory:", ctypes.byref(tail_db)) == OK
+    script = b"SELECT 1; SELECT 2"
+    first = ctypes.c_void_p()
+    tail = ctypes.c_char_p()
+    assert lib.sqlite3_prepare_v2(tail_db, script, -1, ctypes.byref(first), ctypes.byref(tail)) == OK
+    assert lib.sqlite3_step(first) == ROW and lib.sqlite3_column_int64(first, 0) == 1
+    assert tail.value == b" SELECT 2", tail.value
+    second = ctypes.c_void_p()
+    assert lib.sqlite3_prepare_v2(tail_db, tail, -1, ctypes.byref(second), None) == OK
+    assert lib.sqlite3_step(second) == ROW and lib.sqlite3_column_int64(second, 0) == 2
+    lib.sqlite3_finalize(second)
+    lib.sqlite3_finalize(first)
+
+    # A semicolon inside a literal does not end the statement.
+    quoted = ctypes.c_void_p()
+    quoted_tail = ctypes.c_char_p()
+    assert lib.sqlite3_prepare_v2(tail_db, b"SELECT ';' AS a; SELECT 3", -1,
+                                  ctypes.byref(quoted), ctypes.byref(quoted_tail)) == OK
+    assert lib.sqlite3_step(quoted) == ROW and lib.sqlite3_column_text(quoted, 0) == b";"
+    assert quoted_tail.value == b" SELECT 3", quoted_tail.value
+    lib.sqlite3_finalize(quoted)
+
+    # nByte decides how much of the buffer is the statement.
+    exact = ctypes.c_void_p()
+    exact_tail = ctypes.c_char_p()
+    assert lib.sqlite3_prepare_v2(tail_db, b"SELECT 4; SELECT 5", 8, ctypes.byref(exact),
+                                  ctypes.byref(exact_tail)) == OK
+    assert lib.sqlite3_step(exact) == ROW and lib.sqlite3_column_int64(exact, 0) == 4
+    assert exact_tail.value == b"; SELECT 5", exact_tail.value
+    lib.sqlite3_finalize(exact)
+
+    # Nothing to prepare is not an error, and ppStmt stays NULL.
+    empty = ctypes.c_void_p(1234)
+    assert lib.sqlite3_prepare_v2(tail_db, b"  -- only a comment\n", -1, ctypes.byref(empty), None) == OK
+    assert not empty.value, "a comment-only text prepares no statement"
+    assert lib.sqlite3_close(tail_db) == OK
 
     print("rows:", rows)
     print("error path:", message)

@@ -89,6 +89,104 @@ stmt_of :: proc(handle: rawptr) -> ^Statement {
 	return cast(^Statement)handle
 }
 
+// statement_end returns the index just past the first statement: its terminating
+// semicolon, or the end of the text. Quotes, comments and blob literals are
+// walked, so a semicolon inside one does not end a statement. SQLite exposes the
+// same boundary through pzTail (F5).
+@(private)
+statement_end :: proc(sql: string) -> int {
+	i := 0
+	for i < len(sql) {
+		ch := sql[i]
+		if ch == '\'' || ch == '"' || ch == '`' {
+			quote := ch
+			i += 1
+			for i < len(sql) {
+				if sql[i] == quote {
+					if i + 1 < len(sql) && sql[i + 1] == quote {
+						i += 2
+						continue
+					}
+					i += 1
+					break
+				}
+				i += 1
+			}
+			continue
+		}
+		if ch == '[' {
+			i += 1
+			for i < len(sql) && sql[i] != ']' do i += 1
+			if i < len(sql) do i += 1
+			continue
+		}
+		if ch == '-' && i + 1 < len(sql) && sql[i + 1] == '-' {
+			i += 2
+			for i < len(sql) && sql[i] != '\n' do i += 1
+			continue
+		}
+		if ch == '/' && i + 1 < len(sql) && sql[i + 1] == '*' {
+			i += 2
+			for i + 1 < len(sql) && !(sql[i] == '*' && sql[i + 1] == '/') do i += 1
+			if i + 1 < len(sql) do i += 2
+			else do i = len(sql)
+			continue
+		}
+		if ch == ';' do return i + 1
+		i += 1
+	}
+	return len(sql)
+}
+
+// only_space_or_comments reports text that holds no statement: whitespace,
+// semicolons and comments only. SQLite prepares nothing from it and answers OK.
+@(private)
+only_space_or_comments :: proc(text: string) -> bool {
+	i := 0
+	for i < len(text) {
+		ch := text[i]
+		if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == ';' {
+			i += 1
+			continue
+		}
+		if ch == '-' && i + 1 < len(text) && text[i + 1] == '-' {
+			i += 2
+			for i < len(text) && text[i] != '\n' do i += 1
+			continue
+		}
+		if ch == '/' && i + 1 < len(text) && text[i + 1] == '*' {
+			i += 2
+			for i + 1 < len(text) && !(text[i] == '*' && text[i + 1] == '/') do i += 1
+			if i + 1 < len(text) do i += 2
+			else do i = len(text)
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// c_text is the text a caller handed us, honouring nByte: a non-negative count
+// is the byte count, a negative one means "up to the terminator".
+@(private)
+c_text :: proc(sql: cstring, nByte: c.int) -> string {
+	if nByte < 0 do return string(sql)
+	if nByte == 0 do return ""
+	bytes := ([^]u8)(rawptr(sql))
+	return string(bytes[:int(nByte)])
+}
+
+// fail_connection reports the connection's last error with the message it holds,
+// for the paths that call the engine without an Error value of their own.
+@(private)
+fail_connection :: proc(db: ^Database) -> c.int {
+	if db == nil do return SQLITE_ERROR
+	set_error(db, engine.embed_error(db.conn))
+	db.last_code = SQLITE_ERROR
+	db.last_extended = SQLITE_ERROR
+	return SQLITE_ERROR
+}
+
 @(private)
 stmt_clear_text_cache :: proc(stmt: ^Statement) {
 	if stmt == nil do return
@@ -367,14 +465,24 @@ sqlite3_exec :: proc "c" (handle: rawptr, sql: cstring, callback: rawptr, arg: r
 @(export)
 sqlite3_prepare_v2 :: proc "c" (handle: rawptr, sql: cstring, nByte: c.int, ppStmt: ^rawptr, pzTail: ^cstring) -> c.int {
 	context = runtime.default_context()
-	context = runtime.default_context()
-	_ = nByte
 	if pzTail != nil do pzTail^ = nil
 	if ppStmt != nil do ppStmt^ = nil
 	db := db_of(handle)
 	if db == nil || sql == nil || ppStmt == nil do return SQLITE_MISUSE
-	statement := engine.embed_prepare(db.conn, string(sql))
-	if statement == nil do return SQLITE_ERROR
+	text := c_text(sql, nByte)
+	// One statement per call, and the tail says where the next one starts, which
+	// is the contract a caller that loops over a script depends on.
+	end := statement_end(text)
+	if pzTail != nil {
+		base := uintptr(rawptr(sql))
+		pzTail^ = transmute(cstring)(base + uintptr(end))
+	}
+	head := strings.trim_space(text[:end])
+	// Whitespace, semicolons or a comment and nothing else is not an error in
+	// SQLite: there is no statement to prepare, and *ppStmt stays NULL.
+	if only_space_or_comments(text[:end]) do return SQLITE_OK
+	statement := engine.embed_prepare(db.conn, head)
+	if statement == nil do return fail_connection(db)
 	stmt := new(Statement)
 	stmt.db = db
 	stmt.stmt = statement
