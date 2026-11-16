@@ -113,7 +113,7 @@ trigger_lookup :: proc(tx: ^Tx, name: string) -> (row: []Value, found: bool) {
 }
 
 trigger_drop :: proc(tx: ^Tx, name: string, if_exists: bool) -> Error {
-	if tx_table_probe(tx, TRIGGER_TABLE) == nil {
+	if !tx_system_table_exists(tx, TRIGGER_TABLE, &tx.trigger_probe) {
 		if if_exists do return ERROR_NONE
 		return errf(.Table_Not_Found, "trigger %s does not exist", name)
 	}
@@ -169,7 +169,7 @@ trigger_fire :: proc(
 	if len(table_name) > 0 && table_name[0] == '_' do return ERROR_NONE
 	// Most databases have no triggers, and that is the answer to almost every call
 	// here: a probe asks it without an error message to throw away.
-	if tx_table_probe(tx, TRIGGER_TABLE) == nil do return ERROR_NONE
+	if !tx_system_table_exists(tx, TRIGGER_TABLE, &tx.trigger_probe) do return ERROR_NONE
 	if tx.trigger_depth >= TRIGGER_MAX_DEPTH {
 		return errf(.Sql_Unsupported, "triggers nest more than %d deep", TRIGGER_MAX_DEPTH)
 	}

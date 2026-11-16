@@ -84,6 +84,11 @@ Row_Store :: struct {
 Table :: struct {
 	schema:          Table_Schema,
 	rows:            map[Row_Id]Row,
+	// key_scratch is where index_entry_key encodes a key before copying it into
+	// the arena at its exact length. Every caller mutates the table, which only
+	// the writer (or the transaction that owns a private table) does, so one
+	// buffer per table is never used twice at once.
+	key_scratch:     [dynamic]u8,
 	next_row_id:     u64,
 	next_sequence:   i64,
 	// next_int_key is the highest value an INTEGER PRIMARY KEY has held in a
@@ -201,6 +206,7 @@ table_destroy :: proc(t: ^Table) {
 	// the log holds every committed change.
 	page_rows_close(t.paged)
 	if len(t.index_dir) > 0 do delete(t.index_dir)
+	delete(t.key_scratch)
 	virtual.arena_destroy(&t.arena)
 	if t.store != nil do row_store_release(t.store)
 	free(t)
@@ -383,34 +389,39 @@ index_encode_value :: proc(w: ^Byte_Writer, t: ^Table, col: int, values: []Value
 // caller frees it.
 @(private)
 index_prefix_temp :: proc(t: ^Table, index: int, values: []Value) -> string {
-	w: Byte_Writer
-	bw_init(&w)
-	defer bw_destroy(&w)
+	// The writer's buffer is the result: one allocation sized for a typical key,
+	// no copy. The caller deletes it as before.
+	return index_prefix_in(t, index, values, context.allocator)
+}
+
+// index_prefix_in encodes the key columns of `values` into a buffer from `alloc`.
+// With a transaction arena it costs a bump allocation and nothing to free.
+index_prefix_in :: proc(t: ^Table, index: int, values: []Value, alloc: mem.Allocator) -> string {
+	w := Byte_Writer{data = make([dynamic]u8, 0, 32, alloc)}
 	for col in t.indexes[index].schema.columns {
 		index_encode_value(&w, t, col, values)
 	}
-	raw := bw_bytes(&w)
-	out := make([]u8, len(raw))
-	copy(out, raw)
-	return string(out)
+	return string(w.data[:])
 }
 
 // index_entry_key builds the full key stored in the tree: the prefix, plus the
 // row id for a non-unique index. It lives in the table arena.
 @(private)
 index_entry_key :: proc(t: ^Table, index: int, values: []Value, id: Row_Id) -> string {
-	w: Byte_Writer
-	bw_init(&w)
-	defer bw_destroy(&w)
+	// Encoded into the table's scratch buffer, which keeps its capacity between
+	// keys, and copied into the arena at its exact length: one bump allocation
+	// per key, where a heap buffer was allocated and freed for each.
+	w := Byte_Writer{data = t.key_scratch}
+	clear(&w.data)
 	for col in t.indexes[index].schema.columns {
 		index_encode_value(&w, t, col, values)
 	}
 	if !t.indexes[index].unique {
 		append_be_u64(&w, u64(id))
 	}
-	raw := bw_bytes(&w)
-	out := make([]u8, len(raw), t.arena_allocator)
-	copy(out, raw)
+	t.key_scratch = w.data
+	out := make([]u8, len(w.data), t.arena_allocator)
+	copy(out, w.data[:])
 	return string(out)
 }
 
@@ -888,13 +899,15 @@ table_index_remove_all :: proc(t: ^Table, values: []Value, id: Row_Id) {
 	}
 }
 
-table_insert :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
+// `validated` says the caller already proved the unique keys free (a staged
+// insert applied by its own commit), so the indexes are not probed again.
+table_insert :: proc(t: ^Table, id: Row_Id, values: []Value, validated := false) -> Error {
 	if t.paged != nil {
 		if page_rows_contains(t.paged, id) {
 			return errf(.Internal, "row id %d already exists in table %s", u64(id), t.schema.name)
 		}
-		if err := table_check_unique(t, values); err.kind != .None {
-			return err
+		if !validated {
+			if err := table_check_unique(t, values); err.kind != .None do return err
 		}
 		if put_err := page_rows_put(t.paged, id, values); put_err.kind != .None {
 			return put_err
@@ -906,8 +919,8 @@ table_insert :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
 	if _, exists := t.rows[id]; exists {
 		return errf(.Internal, "row id %d already exists in table %s", u64(id), t.schema.name)
 	}
-	if err := table_check_unique(t, values); err.kind != .None {
-		return err
+	if !validated {
+		if err := table_check_unique(t, values); err.kind != .None do return err
 	}
 	stored := clone_values(values)
 	if t.schema.auto_increment_column != NO_COLUMN {
@@ -1226,9 +1239,7 @@ table_collect :: proc(
 	if t.paged != nil {
 		ctx := Paged_Collect_Ctx{out = out}
 		_ = page_rows_scan(t.paged, alloc, &ctx, paged_collect_visit)
-		slice.sort_by(out[:], proc(a, b: Row) -> bool {
-			return u64(a.id) < u64(b.id)
-		})
+		rows_sort_by_id(out[:])
 		return
 	}
 	reserve(out, len(out) + len(t.rows))
@@ -1237,9 +1248,7 @@ table_collect :: proc(
 		if !visible do continue
 		append(out, Row{id = row.id, values = values})
 	}
-	slice.sort_by(out[:], proc(a, b: Row) -> bool {
-		return u64(a.id) < u64(b.id)
-	})
+	rows_sort_by_id(out[:])
 }
 
 // table_max_int returns the largest Int value in one column, or 0 when the

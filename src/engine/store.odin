@@ -4,6 +4,7 @@ import "core:os"
 import "core:fmt"
 import "core:sync"
 import "core:mem"
+import "core:mem/virtual"
 import "core:strings"
 import "base:runtime"
 import "core:thread"
@@ -68,6 +69,17 @@ Store :: struct {
 	lock: Db_Lock,
 	mutex:         sync.RW_Mutex,
 	tables:        map[string]^Table,
+	// arenas are transaction arenas a closed transaction handed back, emptied
+	// and ready. Opening an arena maps and commits fresh pages (VirtualAlloc on
+	// Windows), which was most of the cost of a small transaction: an empty write
+	// transaction took 14 us. arena_mutex guards the list, not the store, since
+	// readers open transactions concurrently.
+	arenas:        [dynamic]virtual.Arena,
+	arena_mutex:   sync.Mutex,
+	// apply_validated is set while tx_commit applies a transaction that held the
+	// write lock from its first statement: its inserts need no second unique
+	// probe. Replay and grouped commits leave it false.
+	apply_validated: bool,
 	commit_seq:    u64,
 	// last_commit_us is the wall clock of the last applied commit, fixed when
 	// the commit lands (not when the transaction started).
@@ -429,6 +441,8 @@ store_close :: proc(store: ^Store) {
 	for name, _ in store.collations do delete(name)
 	delete(store.collations)
 	delete(store.pinned_reads)
+	for &arena in store.arenas do virtual.arena_destroy(&arena)
+	delete(store.arenas)
 	stats_destroy(store)
 	log_close(&store.log)
 	db_lock_release(&store.lock)
@@ -1244,7 +1258,7 @@ store_apply :: proc(store: ^Store, op: Store_Op) -> Error {
 	case .Insert:
 		table, table_err := store_table_writable(store, op.name)
 		if table_err.kind != .None do return table_err
-		if insert_err := table_insert(table, op.row_id, op.values); insert_err.kind != .None {
+		if insert_err := table_insert(table, op.row_id, op.values, store.apply_validated); insert_err.kind != .None {
 			return insert_err
 		}
 		table.next_row_id = max(table.next_row_id, u64(op.row_id) + 1)

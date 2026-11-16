@@ -374,6 +374,12 @@ log_close :: proc(log: ^Commit_Log) {
 
 // log_append writes one transaction record and, when durable, waits for it to
 // reach stable storage before returning.
+// log_records reports whether appending to this log keeps anything: a store in
+// memory without a recording log has neither a file nor a buffer.
+log_records :: proc(log: ^Commit_Log) -> bool {
+	return log.memory_mode || log.file != nil
+}
+
 log_append :: proc(log: ^Commit_Log, commit_seq: u64, payload: []u8) -> Error {
 	record := make([]u8, LOG_RECORD_HEADER_LEN + len(payload))
 	defer delete(record)
@@ -382,7 +388,7 @@ log_append :: proc(log: ^Commit_Log, commit_seq: u64, payload: []u8) -> Error {
 	put_u64_le(record[8:16], commit_seq)
 	copy(record[LOG_RECORD_HEADER_LEN:], payload)
 	if log.memory_mode {
-		for byte in record do append(&log.memory, byte)
+		append(&log.memory, ..record)
 		log.size += i64(len(record))
 		return ERROR_NONE
 	}

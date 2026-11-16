@@ -9703,6 +9703,67 @@ test_full_text_phrase_prefix_and_column :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_insert_caches_follow_the_catalog :: proc(t: ^testing.T) {
+	// An insert remembers the table it resolved and whether `_grant` and
+	// `_trigger` exist, for the rest of its transaction. Every change that could
+	// make those answers wrong happens here between two inserts of one
+	// transaction, and the second insert must see it.
+	store := fresh_db(t, "insert_caches")
+	if store == nil do return
+	defer cleanup_db(store, "insert_caches")
+	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+	run(t, store, "CREATE TABLE log (msg TEXT)")
+
+	tx := db.tx_begin_write(store)
+	step :: proc(t: ^testing.T, tx: ^db.Tx, sql: string) -> bool {
+		result, err := db.sql_execute_in_tx(tx, sql)
+		db.sql_result_destroy(&result)
+		return testing.expectf(t, db.error_ok(err), "%s: %s", sql, err.message)
+	}
+	if !step(t, tx, "INSERT INTO t (id, v) VALUES (1, 'a')") do return
+	// A trigger created mid-transaction fires for the next insert: the cached
+	// "no trigger table" answer is gone with the create.
+	if !step(t, tx, "CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log (msg) VALUES (NEW.v); END") do return
+	if !step(t, tx, "INSERT INTO t (id, v) VALUES (2, 'b')") do return
+	// The keys registered without a trigger and with one both still guard
+	// uniqueness inside the transaction.
+	_, duplicate := db.sql_execute_in_tx(tx, "INSERT INTO t (id, v) VALUES (3, 'a')")
+	testing.expect_value(t, duplicate.kind, db.Error_Kind.Duplicate_Unique)
+	db.error_free(&duplicate)
+	// Dropping a table resets the cache too: the next insert into another table
+	// resolves it afresh, and the dropped one is gone.
+	if !step(t, tx, "CREATE TABLE scratch (x INTEGER)") do return
+	if !step(t, tx, "INSERT INTO scratch (x) VALUES (1)") do return
+	if !step(t, tx, "INSERT INTO t (id, v) VALUES (5, 'd')") do return
+	// A savepoint rollback drops the staged row, and the next insert stages into
+	// the restored record rather than the discarded one.
+	if !testing.expect(t, db.error_ok(db.tx_savepoint(tx, "s"))) do return
+	if !step(t, tx, "INSERT INTO t (id, v) VALUES (6, 'e')") do return
+	if !testing.expect(t, db.error_ok(db.tx_rollback_to_savepoint(tx, "s"))) do return
+	if !step(t, tx, "INSERT INTO t (id, v) VALUES (7, 'f')") do return
+	// The same on a table no trigger touches, so nothing else moves the cache
+	// between the rollback and the insert that must not reuse it.
+	if !step(t, tx, "INSERT INTO scratch (x) VALUES (10)") do return
+	if !testing.expect(t, db.error_ok(db.tx_savepoint(tx, "q"))) do return
+	if !step(t, tx, "INSERT INTO scratch (x) VALUES (11)") do return
+	if !testing.expect(t, db.error_ok(db.tx_rollback_to_savepoint(tx, "q"))) do return
+	if !step(t, tx, "INSERT INTO scratch (x) VALUES (12)") do return
+	testing.expect(t, db.error_ok(db.tx_commit(tx)))
+	testing.expect_value(t, scalar(t, store, "SELECT group_concat(x) FROM scratch").s, "1,10,12")
+
+	ids := run(t, store, "SELECT id FROM t ORDER BY id")
+	got := make([dynamic]i64, 0, 4)
+	defer delete(got)
+	for row in ids.rows do append(&got, row[0].i)
+	db.sql_result_destroy(&ids)
+	testing.expectf(t, len(got) == 4 && got[0] == 1 && got[1] == 2 && got[2] == 5 && got[3] == 7, "rows %v", got[:])
+	// The trigger fired for every insert into t after it was created: b, d and
+	// f; e was rolled back with its savepoint.
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM log").i, i64(3))
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM log WHERE msg = 'e'").i, i64(0))
+}
+
+@(test)
 test_full_text_cost :: proc(t: ^testing.T) {
 	// The scan follows the match, not the corpus: with five thousand documents and
 	// one match, the query visits a handful of rows. This is measured, not

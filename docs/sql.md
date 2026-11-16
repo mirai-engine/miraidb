@@ -153,6 +153,9 @@ ALTER TABLE t ALTER qty SET DATA TYPE REAL;  -- the standard's spelling
   A generated column is refused, because its value is computed rather than stored.
 - Text that names a column — a generated expression, a trigger body, a policy
   condition, a view — is stored as written and is **not** rewritten by a rename.
+- Inside an explicit transaction, a renamed table keeps answering to its old
+  name until `COMMIT`, and the new name is not visible before then. Statements
+  that follow a rename in the same transaction should use the old name.
 - A virtual table (full-text or spatial) keeps the column names its index was
   built with, so renaming one is refused.
 

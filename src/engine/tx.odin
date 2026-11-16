@@ -74,6 +74,20 @@ Tx :: struct {
 	trigger_new_present: bool,
 	trigger_old_present: bool,
 	trigger_depth:       int,
+	// grant_probe and trigger_probe remember whether `_grant` and `_trigger`
+	// exist for this transaction. Every inserted row asked both (four times in
+	// all, each through half a dozen maps keyed by name) and the answer changes
+	// only when this transaction creates, drops or renames a table or rolls back
+	// to a savepoint, which reset them.
+	grant_probe:         Probe_State,
+	trigger_probe:       Probe_State,
+	// insert_name, insert_table and insert_writes are the table the last insert
+	// resolved and its staging record: a statement that inserts many rows names
+	// one table, and resolving it went through six maps keyed by name per row.
+	// The same changes that reset the probes reset these.
+	insert_name:         string,
+	insert_table:        ^Table,
+	insert_writes:       ^Table_Writes,
 }
 
 Table_Writes :: struct {
@@ -180,6 +194,7 @@ tx_snapshot_destroy :: proc(tx: ^Tx, snapshot: ^Tx_Snapshot) {
 // tx_state_replace disposes the live containers and adopts the snapshot's.
 @(private)
 tx_state_replace :: proc(tx: ^Tx, snapshot: Tx_Snapshot) {
+	tx_forget_catalog_cache(tx)
 	current := tx_state_view(tx)
 	tx_snapshot_destroy(tx, &current)
 	tx.state.writes = snapshot.writes
@@ -220,6 +235,7 @@ tx_release_savepoint :: proc(tx: ^Tx, name: string) -> Error {
 // it open. Savepoints opened after it are discarded, and tables created after it
 // are destroyed.
 tx_rollback_to_savepoint :: proc(tx: ^Tx, name: string) -> Error {
+	tx_forget_catalog_cache(tx)
 	for i := len(tx.savepoints) - 1; i >= 0; i -= 1 {
 		if !strings.equal_fold(tx.savepoints[i].name, name) do continue
 		for j := len(tx.savepoints) - 1; j > i; j -= 1 do tx_snapshot_destroy(tx, &tx.savepoints[j].snapshot)
@@ -235,6 +251,79 @@ tx_rollback_to_savepoint :: proc(tx: ^Tx, name: string) -> Error {
 	return errf(.Invalid_Argument, "no such savepoint: %s", name)
 }
 
+Probe_State :: enum u8 {
+	Unknown,
+	Absent,
+	Present,
+}
+
+// tx_system_table_exists answers "does this system table exist" from the
+// transaction's cache, filling it on the first question. A CTE can shadow any
+// name, so while one is in scope the question goes to the catalog every time.
+tx_system_table_exists :: proc(tx: ^Tx, name: string, state: ^Probe_State) -> bool {
+	if len(tx.cte_tables) > 0 do return tx_table_probe(tx, name) != nil
+	switch state^ {
+	case .Absent:
+		return false
+	case .Present:
+		return true
+	case .Unknown:
+	}
+	exists := tx_table_probe(tx, name) != nil
+	state^ = exists ? .Present : .Absent
+	return exists
+}
+
+// tx_forget_catalog_cache drops the cached answers after a change that can
+// create, remove, rename or replace a table, or restore a savepoint.
+tx_forget_catalog_cache :: proc(tx: ^Tx) {
+	tx.grant_probe = .Unknown
+	tx.trigger_probe = .Unknown
+	tx.insert_name = ""
+	tx.insert_table = nil
+	tx.insert_writes = nil
+}
+
+// TX_ARENA_POOL is how many emptied arenas a store keeps: one per transaction
+// that can be open at once in practice (a writer and a few readers). An arena
+// that grew past its first block gives the extra blocks back when it is emptied,
+// so the pool holds at most this many first blocks.
+TX_ARENA_POOL :: 4
+
+// tx_arena_take gives a transaction an empty arena: one a closed transaction
+// returned when there is one, a new one otherwise.
+@(private)
+tx_arena_take :: proc(store: ^Store, arena: ^virtual.Arena) {
+	sync.mutex_lock(&store.arena_mutex)
+	if len(store.arenas) > 0 {
+		arena^ = pop(&store.arenas)
+		sync.mutex_unlock(&store.arena_mutex)
+		return
+	}
+	sync.mutex_unlock(&store.arena_mutex)
+	if arena_err := virtual.arena_init_growing(arena); arena_err != .None {
+		panic("miraidb: cannot allocate the transaction arena")
+	}
+}
+
+// tx_arena_give empties a transaction's arena and keeps it for the next one, or
+// releases it when the pool is full. Emptying frees every block but the first
+// and zeroes what the transaction used of it, so nothing of one transaction is
+// readable by the next.
+@(private)
+tx_arena_give :: proc(store: ^Store, arena: ^virtual.Arena) {
+	virtual.arena_free_all(arena)
+	sync.mutex_lock(&store.arena_mutex)
+	if len(store.arenas) < TX_ARENA_POOL {
+		append(&store.arenas, arena^)
+		sync.mutex_unlock(&store.arena_mutex)
+		arena^ = {}
+		return
+	}
+	sync.mutex_unlock(&store.arena_mutex)
+	virtual.arena_destroy(arena)
+}
+
 tx_begin_write :: proc(store: ^Store) -> ^Tx {
 	if store.read_only {
 		// Every write path already checks tx.read_only, so a read-only store
@@ -244,9 +333,7 @@ tx_begin_write :: proc(store: ^Store) -> ^Tx {
 	tx := new(Tx)
 	tx.store = store
 	tx.active = true
-	if arena_err := virtual.arena_init_growing(&tx.arena); arena_err != .None {
-		panic("miraidb: cannot allocate the transaction arena")
-	}
+	tx_arena_take(store, &tx.arena)
 	tx.alloc = virtual.arena_allocator(&tx.arena)
 	tx.read_seq = store.commit_seq
 	tx.read_tables = make(map[string]bool)
@@ -266,9 +353,7 @@ tx_begin_read :: proc(store: ^Store) -> ^Tx {
 	tx.store = store
 	tx.active = true
 	tx.read_only = true
-	if arena_err := virtual.arena_init_growing(&tx.arena); arena_err != .None {
-		panic("miraidb: cannot allocate the transaction arena")
-	}
+	tx_arena_take(store, &tx.arena)
 	tx.alloc = virtual.arena_allocator(&tx.arena)
 	tx.read_tables = make(map[string]bool)
 	tx.cte_tables = make(map[string]^Table)
@@ -383,7 +468,7 @@ tx_discard :: proc(tx: ^Tx) {
 	for table in tx.frozen_list do table_release(table)
 	delete(tx.frozen_list)
 	delete(tx.frozen)
-	virtual.arena_destroy(&tx.arena)
+	tx_arena_give(tx.store, &tx.arena)
 	pinned := tx.pinned
 	pinned_seq := tx.pinned_seq
 	// Row history is kept by default: a caller may pin a read to an older sequence
@@ -405,8 +490,10 @@ tx_discard :: proc(tx: ^Tx) {
 // --- Lookup ----------------------------------------------------------------
 
 tx_table :: proc(tx: ^Tx, name: string) -> (^Table, Error) {
-	// The key must outlive the statement's query arena.
-	tx.read_tables[strings.clone(name, tx.alloc)] = true
+	// The key must outlive the statement's query arena. It is cloned once per
+	// table: an insert looks up four tables (its own, grants and triggers twice),
+	// and cloning the name on every lookup cost more than the lookup.
+	if name not_in tx.read_tables do tx.read_tables[strings.clone(name, tx.alloc)] = true
 	if table, ok := tx.cte_tables[name]; ok {
 		return table, ERROR_NONE
 	}
@@ -433,8 +520,10 @@ tx_table :: proc(tx: ^Tx, name: string) -> (^Table, Error) {
 // every statement, which `tools/leakcheck` counted as two live allocations per
 // statement. Ask with this when the answer is a bool.
 tx_table_probe :: proc(tx: ^Tx, name: string) -> ^Table {
-	// The key must outlive the statement's query arena.
-	tx.read_tables[strings.clone(name, tx.alloc)] = true
+	// The key must outlive the statement's query arena. It is cloned once per
+	// table: an insert looks up four tables (its own, grants and triggers twice),
+	// and cloning the name on every lookup cost more than the lookup.
+	if name not_in tx.read_tables do tx.read_tables[strings.clone(name, tx.alloc)] = true
 	if table, ok := tx.cte_tables[name]; ok do return table
 	if table, ok := tx.state.altered[name]; ok do return table
 	if table, ok := tx.state.created[name]; ok do return table
@@ -472,6 +561,7 @@ tx_paged_alter_guard :: proc(tx: ^Tx, name: string) -> Error {
 // the extra columns for every existing row, so the commit only records the
 // schema and the store rebuilds the same way on replay.
 tx_alter_table :: proc(tx: ^Tx, name: string, next_schema: Table_Schema) -> Error {
+	tx_forget_catalog_cache(tx)
 	if tx.read_only do return errf(.Transaction_Read_Only, "cannot alter a table in a read transaction")
 	if guard_err := tx_paged_alter_guard(tx, name); guard_err.kind != .None do return guard_err
 	if _, created := tx.state.created[name]; created {
@@ -501,6 +591,7 @@ tx_alter_table :: proc(tx: ^Tx, name: string, next_schema: Table_Schema) -> Erro
 // conversion creates (two texts that become the same integer) are caught by the
 // uniqueness check of the rebuilt table.
 tx_alter_column_type :: proc(tx: ^Tx, name, column_name: string, next_type: Column_Type) -> Error {
+	tx_forget_catalog_cache(tx)
 	if tx.read_only do return errf(.Transaction_Read_Only, "cannot alter a table in a read transaction")
 	if guard_err := tx_paged_alter_guard(tx, name); guard_err.kind != .None do return guard_err
 	if _, created := tx.state.created[name]; created {
@@ -537,6 +628,7 @@ tx_alter_column_type :: proc(tx: ^Tx, name, column_name: string, next_type: Colu
 // rows staged in this transaction. Keys and auto-increment columns cannot go:
 // their identity is part of how the table is written.
 tx_drop_column :: proc(tx: ^Tx, name, column_name: string) -> Error {
+	tx_forget_catalog_cache(tx)
 	if tx.read_only do return errf(.Transaction_Read_Only, "cannot alter a table in a read transaction")
 	if guard_err := tx_paged_alter_guard(tx, name); guard_err.kind != .None do return guard_err
 	if _, created := tx.state.created[name]; created {
@@ -637,6 +729,7 @@ tx_drop_column :: proc(tx: ^Tx, name, column_name: string) -> Error {
 // tx_rename_table moves a table to a new name. The rows keep their ids; the
 // staged writes follow the table, so a commit applies the rename before them.
 tx_rename_table :: proc(tx: ^Tx, from, to: string) -> Error {
+	tx_forget_catalog_cache(tx)
 	if tx.read_only do return errf(.Transaction_Read_Only, "cannot alter a table in a read transaction")
 	if guard_err := tx_paged_alter_guard(tx, from); guard_err.kind != .None do return guard_err
 	if _, created := tx.state.created[from]; created {
@@ -711,10 +804,12 @@ tx_writes :: proc(tx: ^Tx, name: string, table: ^Table) -> ^Table_Writes {
 		return writes
 	}
 	writes := new(Table_Writes)
-	writes.inserts = make(map[Row_Id]Row)
+	// Sized for a statement that writes a batch: growing a map of 80-byte rows
+	// from empty rehashed it six times over 256 inserts.
+	writes.inserts = make(map[Row_Id]Row, 64)
 	writes.updates = make(map[Row_Id][]Value)
 	writes.deletes = make(map[Row_Id]bool)
-	writes.unique_keys = make(map[string]Row_Id)
+	writes.unique_keys = make(map[string]Row_Id, 64)
 	writes.next_row_id = table.next_row_id
 	writes.next_sequence = table.next_sequence
 	// The map key must outlive the caller's statement buffer, so it lives in the
@@ -772,9 +867,7 @@ tx_collect :: proc(tx: ^Tx, name: string, out: ^[dynamic]Row) -> Error {
 		write += 1
 	}
 	if write < len(out) do resize(out, write)
-	slice.sort_by(out[:], proc(a, b: Row) -> bool {
-		return u64(a.id) < u64(b.id)
-	})
+	rows_sort_by_id(out[:])
 	return ERROR_NONE
 }
 
@@ -856,6 +949,7 @@ tx_row_count :: proc(tx: ^Tx, name: string) -> (int, Error) {
 // --- DDL -------------------------------------------------------------------
 
 tx_create_table :: proc(tx: ^Tx, schema: ^Table_Schema) -> Error {
+	tx_forget_catalog_cache(tx)
 	if tx.read_only do return errf(.Transaction_Read_Only, "cannot create a table in a read transaction")
 	if _, exists := tx.state.created[schema.name]; exists {
 		return errf(.Table_Exists, "table %s was already created in this transaction", schema.name)
@@ -873,6 +967,7 @@ tx_create_table :: proc(tx: ^Tx, schema: ^Table_Schema) -> Error {
 }
 
 tx_drop_table :: proc(tx: ^Tx, name: string) -> Error {
+	tx_forget_catalog_cache(tx)
 	if tx.read_only do return errf(.Transaction_Read_Only, "cannot drop a table in a read transaction")
 	if created, ok := tx.state.created[name]; ok {
 		table_destroy(created)
@@ -902,8 +997,15 @@ tx_drop_table :: proc(tx: ^Tx, name: string) -> Error {
 // default; pass a value vector of exactly one entry per column.
 tx_insert :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error) {
 	if tx.read_only do return 0, errf(.Transaction_Read_Only, "cannot insert in a read transaction")
-	table, table_err := tx_table(tx, name)
-	if table_err.kind != .None do return 0, table_err
+	table: ^Table
+	cached := tx.insert_table != nil && len(tx.cte_tables) == 0 && tx.insert_name == name
+	if cached {
+		table = tx.insert_table
+	} else {
+		table_err: Error
+		table, table_err = tx_table(tx, name)
+		if table_err.kind != .None do return 0, table_err
+	}
 	if permission_err := tx_check_permission(tx, name, "insert"); permission_err.kind != .None {
 		return 0, permission_err
 	}
@@ -916,7 +1018,14 @@ tx_insert :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error) {
 			len(values),
 		)
 	}
-	writes := tx_writes(tx, name, table)
+	writes := cached ? tx.insert_writes : tx_writes(tx, name, table)
+	if !cached && len(tx.cte_tables) == 0 {
+		// The name may live in the caller's statement buffer; the arena copy
+		// outlives it.
+		tx.insert_name = strings.clone(name, tx.alloc)
+		tx.insert_table = table
+		tx.insert_writes = writes
+	}
 	id := Row_Id(writes.next_row_id)
 
 	row_values := make([]Value, len(values), tx.alloc)
@@ -973,9 +1082,13 @@ tx_insert :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error) {
 	if fk_err := fk_check_child(tx, table, row_values); fk_err.kind != .None {
 		return 0, fk_err
 	}
-	if err := tx_check_unique(tx, name, table, row_values, INVALID_ROW_ID); err.kind != .None {
+	keys := make([dynamic]string, 0, 2, tx.alloc)
+	if err := tx_check_unique(tx, name, table, row_values, INVALID_ROW_ID, &keys); err.kind != .None {
 		return 0, err
 	}
+	// With no trigger table, nothing runs between the check and the registration,
+	// so the keys the check encoded are the keys to register.
+	has_triggers := tx_system_table_exists(tx, TRIGGER_TABLE, &tx.trigger_probe)
 
 	// A BEFORE trigger sees the row that is about to be written, while nothing has
 	// been staged: if its body fails, there is nothing to roll back and the insert
@@ -993,7 +1106,11 @@ tx_insert :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error) {
 	}
 	writes.inserts[id] = Row{id = id, values = row_values}
 	writes.next_row_id = u64(id) + 1
-	tx_register_unique(tx, name, table, row_values, id)
+	if has_triggers {
+		tx_register_unique(tx, name, table, row_values, id)
+	} else {
+		tx_register_keys(tx, name, keys[:], id)
+	}
 	if trigger_err := trigger_fire(
 		tx,
 		name,
@@ -1270,17 +1387,33 @@ tx_drop_index :: proc(tx: ^Tx, table_name: string, name: string) -> Error {
 
 @(private)
 unique_key :: proc(tx: ^Tx, table: ^Table, index: int, values: []Value) -> string {
-	key := index_prefix_temp(table, index, values)
-	defer delete(key)
-	return strings.concatenate({table.indexes[index].schema.name, "\x00", key}, tx.alloc)
+	// Encoded straight into the transaction arena: one bump allocation, where the
+	// key used to go through a heap buffer, a heap copy and a concatenation.
+	name := table.indexes[index].schema.name
+	w := Byte_Writer{data = make([dynamic]u8, 0, len(name) + 40, tx.alloc)}
+	append(&w.data, ..transmute([]u8)name)
+	append(&w.data, 0)
+	for col in table.indexes[index].schema.columns do index_encode_value(&w, table, col, values)
+	return string(w.data[:])
 }
 
+// tx_check_unique proves no other row holds a unique key of `values`. When `keys`
+// is given it receives the keys it computed, one per unique index in index
+// order, so the caller can register them without encoding them again.
 @(private)
-tx_check_unique :: proc(tx: ^Tx, name: string, table: ^Table, values: []Value, ignore: Row_Id) -> Error {
+tx_check_unique :: proc(
+	tx: ^Tx,
+	name: string,
+	table: ^Table,
+	values: []Value,
+	ignore: Row_Id,
+	keys: ^[dynamic]string = nil,
+) -> Error {
 	writes := tx.state.writes[name]
 	for idx, i in table.indexes {
 		if !idx.unique do continue
 		key := unique_key(tx, table, i, values)
+		if keys != nil do append(keys, key)
 		if writes != nil {
 			if holder, taken := writes.unique_keys[key]; taken && holder != ignore {
 				return errf(
@@ -1291,14 +1424,7 @@ tx_check_unique :: proc(tx: ^Tx, name: string, table: ^Table, values: []Value, i
 			}
 		}
 		if committed, ok := tx.store.tables[name]; ok {
-			ids := table_index_lookup(committed, i, values)
-			defer delete(ids)
-			for id in ids {
-				if id == ignore do continue
-				if writes != nil {
-					if writes.deletes[id] do continue
-					if _, changed := writes.updates[id]; changed do continue
-				}
+			if tx_committed_key_taken(tx, committed, i, values, ignore, writes) {
 				return errf(
 					index_is_primary(table, i) ? .Duplicate_Primary_Key : .Duplicate_Unique,
 					"duplicate key for index %s",
@@ -1308,6 +1434,49 @@ tx_check_unique :: proc(tx: ^Tx, name: string, table: ^Table, values: []Value, i
 		}
 	}
 	return ERROR_NONE
+}
+
+// tx_committed_key_taken reports whether a committed row other than `ignore`
+// holds this key and still holds it in this transaction (not deleted, not
+// rewritten). An ordered in-memory index is walked in place: the answer needs no
+// list of ids and no heap key, which is what a lookup per insert used to cost.
+@(private)
+tx_committed_key_taken :: proc(
+	tx: ^Tx,
+	committed: ^Table,
+	index: int,
+	values: []Value,
+	ignore: Row_Id,
+	writes: ^Table_Writes,
+) -> bool {
+	holds :: proc(id: Row_Id, ignore: Row_Id, writes: ^Table_Writes) -> bool {
+		if id == ignore do return false
+		if writes != nil {
+			if writes.deletes[id] do return false
+			if _, changed := writes.updates[id]; changed do return false
+		}
+		return true
+	}
+	if committed.indexes[index].pages == nil && committed.indexes[index].schema.algorithm == .Btree {
+		prefix := index_prefix_in(committed, index, values, tx.alloc)
+		for node := lower_bound(&committed.indexes[index].tree, prefix); node != nil; node = node_next(node) {
+			if !strings.has_prefix(node.key, prefix) do break
+			if holds(node.value, ignore, writes) do return true
+		}
+		return false
+	}
+	ids := table_index_lookup(committed, index, values)
+	defer delete(ids)
+	for id in ids do if holds(id, ignore, writes) do return true
+	return false
+}
+
+// tx_register_keys records keys tx_check_unique computed for the same values.
+@(private)
+tx_register_keys :: proc(tx: ^Tx, name: string, keys: []string, id: Row_Id) {
+	writes, ok := tx.state.writes[name]
+	if !ok do return
+	for key in keys do writes.unique_keys[key] = id
 }
 
 @(private)
@@ -1354,7 +1523,11 @@ tx_commit :: proc(tx: ^Tx) -> Error {
 		append(&logged, op)
 	}
 	logged_count := len(logged)
-	payload := tx_encode_ops(logged[:])
+	// A store without a log (in memory, not recording) gets no payload: encoding
+	// every value of the commit to throw the bytes away was a third of the cost
+	// of a small write.
+	payload: []u8
+	if log_records(&tx.store.log) do payload = tx_encode_ops(logged[:])
 	delete(logged)
 	defer delete(payload)
 	next_seq := tx.store.commit_seq + 1
@@ -1369,6 +1542,12 @@ tx_commit :: proc(tx: ^Tx) -> Error {
 	// Ephemeral-only commits do not advance the sequence, so their versions are
 	// stamped with the current one and are visible to the next reader.
 	tx.store.apply_seq = has_log_record ? next_seq : tx.store.commit_seq
+	// Every insert was checked against the committed rows and the transaction's
+	// own keys when it was staged, and the write lock has been held since, so
+	// applying it does not probe the unique indexes again. Updates are still
+	// checked: two rows that swap keys collide halfway through the apply.
+	tx.store.apply_validated = true
+	defer tx.store.apply_validated = false
 	for op in ops {
 		if apply_err := store_apply(tx.store, op); apply_err.kind != .None {
 			// Applying a validated transaction must not fail. If it does, undo
@@ -1394,9 +1573,12 @@ tx_commit :: proc(tx: ^Tx) -> Error {
 	notify := tx.store.on_commit
 	notify_ctx := tx.store.on_commit_ctx
 	store := tx.store
-	// The staged values die with the transaction, so the hook gets a copy.
-	notify_ops := tx_clone_ops(ops)
-	defer tx_free_ops(notify_ops)
+	// The staged values die with the transaction, so the hook and the mirror get
+	// a copy - and only they do: a store nobody watches skips the copy of every
+	// value it just wrote.
+	notify_ops: []Store_Op
+	if notify != nil || len(store.sqlite_mirror) > 0 do notify_ops = tx_clone_ops(ops)
+	defer if notify_ops != nil do tx_free_ops(notify_ops)
 	tx_discard(tx)
 	// A database opened from a .sqlite file keeps that file current, so a client
 	// reading it with any SQLite driver sees the commit. O(state) per commit, by
@@ -1512,11 +1694,17 @@ tx_build_ops :: proc(tx: ^Tx) -> []Store_Op {
 
 @(private)
 map_keys_sorted :: proc(m: map[$K]$V) -> [dynamic]K where intrinsics.type_is_ordered(K) {
-	keys := make([dynamic]K)
+	keys := make([dynamic]K, 0, len(m))
 	for key in m do append(&keys, key)
-	slice.sort_by(keys[:], proc(a, b: K) -> bool {
-		return a < b
-	})
+	// Every commit sorts the ids it inserts, updates and deletes; the generic
+	// sort spent 42 us on 256 of them.
+	when K == Row_Id {
+		row_ids_sort(keys[:])
+	} else {
+		slice.sort_by(keys[:], proc(a, b: K) -> bool {
+			return a < b
+		})
+	}
 	return keys
 }
 

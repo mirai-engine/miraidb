@@ -5931,9 +5931,7 @@ collect_target_rows :: proc(
 				append(out, row)
 			}
 		}
-		slice.sort_by(out[:], proc(a, b: Row) -> bool {
-			return u64(a.id) < u64(b.id)
-		})
+		rows_sort_by_id(out[:])
 		return ERROR_NONE
 	}
 	return tx_collect(tx, table_name, out)
@@ -6386,9 +6384,7 @@ fts_scan_candidates :: proc(
 		result, match_err := fts_match_docs(tx, virtual, pattern.s)
 		if match_err.kind != .None do return nil, true, match_err
 		for doc in result.docs do append(&ids, doc)
-		slice.sort_by(ids[:], proc(a, b: Row_Id) -> bool {
-			return a < b
-		})
+		row_ids_sort(ids[:])
 		return ids, true, ERROR_NONE
 	}
 	return nil, false, ERROR_NONE
