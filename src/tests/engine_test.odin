@@ -13485,3 +13485,40 @@ test_host_collations :: proc(t: ^testing.T) {
 	_, gone := db.sql_execute(store, "SELECT 1 WHERE 'a' = 'a' COLLATE by_length")
 	testing.expect_value(t, gone.kind, db.Error_Kind.Invalid_Argument)
 }
+
+// --- Integer arithmetic ----------------------------------------------------
+
+// A 64-bit result that does not fit is an error, never a wrapped value, and the
+// two quotients the hardware division traps on (min / -1 and min % -1) answer
+// without killing the process. SQLite would promote to a real; PostgreSQL refuses
+// with "bigint out of range", and this engine refuses too, so a caller reads the
+// same reason from +, -, *, / and abs().
+@(test)
+test_integer_arithmetic_overflow :: proc(t: ^testing.T) {
+	store := fresh_db(t, "int_overflow")
+	if store == nil do return
+	defer cleanup_db(store, "int_overflow")
+
+	overflowing := []string{
+		"SELECT 9223372036854775807 + 1",
+		"SELECT 9223372036854775807 - (-1)",
+		"SELECT 2 * 9223372036854775807",
+		"SELECT (-9223372036854775808) / -1",
+		"SELECT abs(-9223372036854775808)",
+		"SELECT 9223372036854775807 + CAST(1 AS INTEGER)",
+	}
+	for statement in overflowing {
+		err := run_error(t, store, statement)
+		testing.expectf(t, err.kind == .Invalid_Argument, "%s answered instead of refusing", statement)
+	}
+
+	// The remainder of the same pair is zero and must not go through the trap.
+	remainder := scalar(t, store, "SELECT (-9223372036854775808) % -1")
+	testing.expect_value(t, remainder.i, i64(0))
+
+	// The edges that do fit still answer.
+	testing.expect_value(t, scalar(t, store, "SELECT 9223372036854775807 * 1").i, i64(max(i64)))
+	testing.expect_value(t, scalar(t, store, "SELECT 4611686018427387903 * 2").i, i64(9223372036854775806))
+	testing.expect_value(t, scalar(t, store, "SELECT -7 % 3").i, i64(-1))
+	testing.expect_value(t, scalar(t, store, "SELECT abs(-9223372036854775807)").i, i64(max(i64)))
+}

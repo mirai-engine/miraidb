@@ -172,6 +172,7 @@ refused | SELECT 1 = '1'                                 | invalid_type
 refused | SELECT CAST('12abc' AS INTEGER)                | invalid_type
 refused | SELECT 1/0                                     | division by zero
 refused | CREATE TABLE z (a INT) WITHOUT ROWID           | WITHOUT ROWID
+refused | SELECT 2 * 9223372036854775807                 | integer overflow
 ```
 
 One row is a real difference: `upper` folds the whole of Unicode, where SQLite
@@ -179,6 +180,11 @@ folds ASCII only, so `upper(char(233))` is `É` here and `é` there. The
 `printf('%.0f', 2.5)` row used to be a second one (this engine rounds half to
 even and older SQLite rounded half away from zero); SQLite 3.45 answers `2` as
 well, so the row is now a match, and the gate is what noticed.
+
+Integer arithmetic that does not fit is refused, as PostgreSQL refuses it, where
+SQLite promotes the result to a real: `2 * 9223372036854775807` is a real in
+SQLite and `integer overflow` here. The refusal is the same for `+`, `-`, `*`,
+`/`, `%` and `abs()`.
 
 ## Embedding and tooling
 

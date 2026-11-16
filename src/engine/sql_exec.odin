@@ -9,6 +9,8 @@ import "core:sync"
 import "core:time"
 import "core:unicode/utf8"
 
+import "base:intrinsics"
+
 // --- Results ---------------------------------------------------------------
 
 Sql_Result_Kind :: enum u8 {
@@ -4308,12 +4310,16 @@ eval_arithmetic :: proc(op: Binary_Op, left, right: Value) -> (Value, Error) {
 		}
 		#partial switch op {
 		case .Add:
-			return value_uint(a + b), ERROR_NONE
+			sum, overflow := intrinsics.overflow_add(a, b)
+			if overflow do return {}, integer_overflow_error()
+			return value_uint(sum), ERROR_NONE
 		case .Sub:
 			if b > a do return {}, errf(.Invalid_Argument, "unsigned subtraction underflows")
 			return value_uint(a - b), ERROR_NONE
 		case .Mul:
-			return value_uint(a * b), ERROR_NONE
+			product, overflow := intrinsics.overflow_mul(a, b)
+			if overflow do return {}, integer_overflow_error()
+			return value_uint(product), ERROR_NONE
 		case .Div:
 			if b == 0 do return {}, errf(.Invalid_Argument, "division by zero")
 			return value_uint(a / b), ERROR_NONE
@@ -4327,16 +4333,28 @@ eval_arithmetic :: proc(op: Binary_Op, left, right: Value) -> (Value, Error) {
 	b, _ := value_to_i64(right)
 	#partial switch op {
 	case .Add:
-		return value_int(a + b), ERROR_NONE
+		sum, overflow := intrinsics.overflow_add(a, b)
+		if overflow do return {}, integer_overflow_error()
+		return value_int(sum), ERROR_NONE
 	case .Sub:
-		return value_int(a - b), ERROR_NONE
+		difference, overflow := intrinsics.overflow_sub(a, b)
+		if overflow do return {}, integer_overflow_error()
+		return value_int(difference), ERROR_NONE
 	case .Mul:
-		return value_int(a * b), ERROR_NONE
+		product, overflow := intrinsics.overflow_mul(a, b)
+		if overflow do return {}, integer_overflow_error()
+		return value_int(product), ERROR_NONE
 	case .Div:
 		if b == 0 do return {}, errf(.Invalid_Argument, "division by zero")
+		// The one quotient that does not fit: min(i64) / -1. Answering it would
+		// fault in the hardware division, so it is an error like any other
+		// overflow.
+		if a == min(i64) && b == -1 do return {}, integer_overflow_error()
 		return value_int(a / b), ERROR_NONE
 	case .Mod:
 		if b == 0 do return {}, errf(.Invalid_Argument, "division by zero")
+		// min(i64) % -1 is zero, but the hardware division behind it traps.
+		if a == min(i64) && b == -1 do return value_int(0), ERROR_NONE
 		return value_int(a % b), ERROR_NONE
 	case:
 	}
@@ -4356,12 +4374,16 @@ eval_arithmetic_128 :: proc(op: Binary_Op, left, right: Value) -> (Value, Error)
 		b := value_as_u128(right)
 		#partial switch op {
 		case .Add:
-			return value_uint128(a + b), ERROR_NONE
+			sum, overflow := intrinsics.overflow_add(a, b)
+			if overflow do return {}, integer_overflow_error()
+			return value_uint128(sum), ERROR_NONE
 		case .Sub:
 			if b > a do return {}, errf(.Invalid_Argument, "unsigned subtraction underflows")
 			return value_uint128(a - b), ERROR_NONE
 		case .Mul:
-			return value_uint128(a * b), ERROR_NONE
+			product, overflow := intrinsics.overflow_mul(a, b)
+			if overflow do return {}, integer_overflow_error()
+			return value_uint128(product), ERROR_NONE
 		case .Div:
 			if b == 0 do return {}, errf(.Invalid_Argument, "division by zero")
 			return value_uint128(a / b), ERROR_NONE
@@ -4375,19 +4397,36 @@ eval_arithmetic_128 :: proc(op: Binary_Op, left, right: Value) -> (Value, Error)
 	b := value_as_i128(right)
 	#partial switch op {
 	case .Add:
-		return value_int128(a + b), ERROR_NONE
+		sum, overflow := intrinsics.overflow_add(a, b)
+		if overflow do return {}, integer_overflow_error()
+		return value_int128(sum), ERROR_NONE
 	case .Sub:
-		return value_int128(a - b), ERROR_NONE
+		difference, overflow := intrinsics.overflow_sub(a, b)
+		if overflow do return {}, integer_overflow_error()
+		return value_int128(difference), ERROR_NONE
 	case .Mul:
-		return value_int128(a * b), ERROR_NONE
+		product, overflow := intrinsics.overflow_mul(a, b)
+		if overflow do return {}, integer_overflow_error()
+		return value_int128(product), ERROR_NONE
 	case .Div:
 		if b == 0 do return {}, errf(.Invalid_Argument, "division by zero")
+		if a == min(i128) && b == -1 do return {}, integer_overflow_error()
 		return value_int128(a / b), ERROR_NONE
 	case .Mod:
 		if b == 0 do return {}, errf(.Invalid_Argument, "division by zero")
+		if a == min(i128) && b == -1 do return value_int128(0), ERROR_NONE
 		return value_int128(a % b), ERROR_NONE
 	}
 	return {}, errf(.Internal, "unknown arithmetic operator")
+}
+
+// integer_overflow_error is the one answer every arithmetic path gives when the
+// result does not fit: `+`, `-`, `*` and the two quotients that trap. SQLite
+// would promote a 64-bit result to a real; this engine refuses instead, which is
+// what PostgreSQL does and what the rest of this engine does with a CAST.
+@(private)
+integer_overflow_error :: proc() -> Error {
+	return errf(.Invalid_Argument, "integer overflow")
 }
 
 @(private)
@@ -4959,6 +4998,9 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		}
 		number, ok := value_to_i64(args[0])
 		if !ok do return {}, errf(.Invalid_Type, "abs() expects a number")
+		// abs(min(i64)) has no answer in 64 bits; SQLite answers "integer
+		// overflow" and so does this engine rather than return a negative.
+		if number == min(i64) do return {}, integer_overflow_error()
 		return value_int(number < 0 ? -number : number), ERROR_NONE
 	case "substr", "substring":
 		if len(args) < 2 || len(args) > 3 {
