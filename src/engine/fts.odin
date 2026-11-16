@@ -404,55 +404,182 @@ Fts_Match :: struct {
 FTS_BM25_K1 :: 1.2
 FTS_BM25_B :: 0.75
 
-// fts_match_docs answers "which documents contain this query, and how well".
-// The pattern is a list separated by spaces: terms in a row must all be present,
-// OR separates alternatives, AND is the juxtaposition it already is, and NOT
-// removes the documents that carry the next term. The score is BM25 over the
-// postings and the corpus totals, never over the documents: a query costs its
-// matches, not the vocabulary.
+// --- The query language -----------------------------------------------------
+//
+// A pattern is a sequence of items separated by spaces:
+//
+//	fox                 a term
+//	fox*                every term that starts with `fox`
+//	"quick brown fox"   a phrase: the words, adjacent and in this order
+//	"quick bro*"        a phrase whose last word is a prefix
+//	body:fox            a term (or `body:"a b"`, `body:fo*`) in one column only
+//	a OR b              either side; OR binds looser than juxtaposition
+//	a NOT b             the documents of `a` that do not match `b`
+//	a AND b             the same as `a b`
+//
+// A bare item that the tokenizer splits into several words (`don't`) is a phrase
+// of those words, so a query never asks for a token the index cannot hold.
+//
+// The index stores (term, document, count) and no positions. A plain term or
+// prefix is answered from the postings alone; a phrase or a column filter takes
+// the postings of its words as candidates and then reads each candidate's text
+// to confirm the order or the column. The cost is the documents that carry every
+// word, never the corpus.
+
+Fts_Item_Kind :: enum u8 {
+	Term,
+	Or,
+	Not,
+}
+
+Fts_Item :: struct {
+	kind:   Fts_Item_Kind,
+	// words are folded the way the index folds them; more than one is a phrase.
+	words:  []string,
+	// prefix makes the last word match every term that starts with it.
+	prefix: bool,
+	// column limits the item to one column of the table; empty means any.
+	column: string,
+}
+
+// fts_parse_query splits a MATCH pattern into items. It never fails: an unclosed
+// quote runs to the end of the pattern, and an item with no word is dropped.
+fts_parse_query :: proc(pattern: string, alloc: runtime.Allocator) -> [dynamic]Fts_Item {
+	items := make([dynamic]Fts_Item, 0, 4, alloc)
+	text := transmute([]u8)pattern
+	i := 0
+	for i < len(text) {
+		for i < len(text) && (text[i] == ' ' || text[i] == '\t' || text[i] == '\n' || text[i] == '\r') do i += 1
+		if i >= len(text) do break
+
+		// A run of word bytes followed by `:` names a column.
+		column := ""
+		start := i
+		for i < len(text) && fts_is_word_byte(text[i]) do i += 1
+		if i < len(text) && text[i] == ':' && i > start {
+			column = strings.clone(pattern[start:i], alloc)
+			i += 1
+		} else {
+			i = start
+		}
+
+		quoted := false
+		body := ""
+		prefix := false
+		if i < len(text) && text[i] == '"' {
+			quoted = true
+			i += 1
+			open := i
+			for i < len(text) && text[i] != '"' do i += 1
+			body = pattern[open:i]
+			if i < len(text) do i += 1 // the closing quote
+			if i < len(text) && text[i] == '*' {
+				prefix = true
+				i += 1
+			}
+		} else {
+			open := i
+			for i < len(text) && text[i] != ' ' && text[i] != '\t' && text[i] != '\n' && text[i] != '\r' do i += 1
+			body = pattern[open:i]
+		}
+		trimmed := strings.trim_space(body)
+		if strings.has_suffix(trimmed, "*") {
+			prefix = true
+			trimmed = strings.trim_right(trimmed, "*")
+		}
+
+		if !quoted && len(column) == 0 && !prefix {
+			if strings.equal_fold(trimmed, "or") {
+				append(&items, Fts_Item{kind = .Or})
+				continue
+			}
+			if strings.equal_fold(trimmed, "not") {
+				append(&items, Fts_Item{kind = .Not})
+				continue
+			}
+			// AND is the default between items; spelling it out changes nothing.
+			if strings.equal_fold(trimmed, "and") do continue
+		}
+		words := fts_tokens(trimmed, alloc)
+		if len(words) == 0 do continue
+		append(&items, Fts_Item{kind = .Term, words = words[:], prefix = prefix, column = column})
+	}
+	return items
+}
+
+// fts_tokens splits text into folded tokens with the rules fts_index_row uses.
+fts_tokens :: proc(text: string, alloc: runtime.Allocator) -> [dynamic]string {
+	tokens := make([dynamic]string, 0, 8, alloc)
+	bytes := transmute([]u8)text
+	start := -1
+	for b, i in bytes {
+		if fts_is_word_byte(b) {
+			if start < 0 do start = i
+			continue
+		}
+		if start >= 0 {
+			append(&tokens, fts_fold_word(text[start:i], alloc))
+			start = -1
+		}
+	}
+	if start >= 0 do append(&tokens, fts_fold_word(text[start:], alloc))
+	return tokens
+}
+
+// fts_match_docs answers "which documents match this query, and how well". The
+// score is BM25 over the postings and the corpus totals, never over the
+// documents: a query costs its matches, not the vocabulary.
 fts_match_docs :: proc(tx: ^Tx, table: Fts_Table, pattern: string) -> (^Fts_Match, Error) {
 	key := strings.concatenate({table.name, "\x00", pattern}, tx.alloc)
 	if tx.fts_cache == nil do tx.fts_cache = make(map[string]^Fts_Match)
 	if tx.fts_rank == nil do tx.fts_rank = make(map[string]string)
 	if cached, found := tx.fts_cache[key]; found do return cached, ERROR_NONE
 
+	items := fts_parse_query(pattern, tx.alloc)
+	for item in items {
+		if item.kind != .Term || len(item.column) == 0 do continue
+		if fts_column_position(tx, table, item.column) < 0 {
+			return nil, errf(.Column_Not_Found, "full-text table %s has no column %s", table.name, item.column)
+		}
+	}
+
 	match := new(Fts_Match)
 	match.docs = make(map[Row_Id]bool)
 	match.scores = make(map[Row_Id]f64)
 
-	group := make([dynamic]map[Row_Id]int, 0, 4, context.temp_allocator)
-	negative := make([dynamic]map[Row_Id]int, 0, 2, context.temp_allocator)
-	positive: [dynamic]string
-	defer {
-		for set in group do delete(set)
-		delete(group)
-		for set in negative do delete(set)
-		delete(negative)
-		delete(positive)
-	}
+	// Every postings map is owned here once; group, negative and positive only
+	// refer to them.
+	owned := make([dynamic]map[Row_Id]int, 0, 4, tx.alloc)
+	group := make([dynamic]map[Row_Id]int, 0, 4, tx.alloc)
+	negative := make([dynamic]map[Row_Id]int, 0, 2, tx.alloc)
+	positive := make([dynamic]map[Row_Id]int, 0, 4, tx.alloc)
+	defer for set in owned do delete(set)
+
 	negate_next := false
-	for piece in strings.split(pattern, " ") {
-		word := strings.trim_space(piece)
-		if len(word) == 0 do continue
-		if strings.equal_fold(word, "or") {
+	for item in items {
+		switch item.kind {
+		case .Or:
 			fts_merge_group(&match.docs, group[:])
 			clear(&group)
-			continue
-		}
-		if strings.equal_fold(word, "not") {
+		case .Not:
 			negate_next = true
-			continue
-		}
-		// AND is the default between terms; spelling it out changes nothing.
-		if strings.equal_fold(word, "and") do continue
-		postings, postings_err := fts_term_rows(tx, table, word)
-		if postings_err.kind != .None do return nil, postings_err
-		if negate_next {
-			append(&negative, postings)
-			negate_next = false
-		} else {
-			append(&group, postings)
-			append(&positive, strings.clone(fts_fold_word(word, tx.alloc), tx.alloc))
+		case .Term:
+			postings, postings_err := fts_item_rows(tx, table, item)
+			if postings_err.kind != .None {
+				delete(postings)
+				for set in owned do delete(set)
+				clear(&owned)
+				free(match)
+				return nil, postings_err
+			}
+			append(&owned, postings)
+			if negate_next {
+				append(&negative, postings)
+				negate_next = false
+			} else {
+				append(&group, postings)
+				append(&positive, postings)
+			}
 		}
 	}
 	fts_merge_group(&match.docs, group[:])
@@ -460,15 +587,12 @@ fts_match_docs :: proc(tx: ^Tx, table: Fts_Table, pattern: string) -> (^Fts_Matc
 		for doc in set do delete_key(&match.docs, doc)
 	}
 
-	// Score every document that carries a query term. A document excluded by NOT
+	// Score every document that matches a positive item. A document excluded by NOT
 	// keeps its score; nothing reads it.
 	docs_count, tokens := fts_stats_read(tx, table)
 	average := docs_count > 0 ? f64(tokens) / f64(docs_count) : 0
-	lengths := make(map[Row_Id]int, len(match.docs), context.temp_allocator)
-	defer delete(lengths)
-	for term in positive {
-		postings, postings_err := fts_term_rows(tx, table, term)
-		if postings_err.kind != .None do return nil, postings_err
+	lengths := make(map[Row_Id]int, len(match.docs), tx.alloc)
+	for postings in positive {
 		df := len(postings)
 		// Okapi idf, shifted so it is never negative.
 		idf := math.log(1 + (f64(docs_count) - f64(df) + 0.5) / (f64(df) + 0.5), math.E)
@@ -482,11 +606,135 @@ fts_match_docs :: proc(tx: ^Tx, table: Fts_Table, pattern: string) -> (^Fts_Matc
 			denominator := f64(tf) + FTS_BM25_K1 * (1 - FTS_BM25_B + FTS_BM25_B * length_ratio)
 			match.scores[doc] += idf * f64(tf) * (FTS_BM25_K1 + 1) / denominator
 		}
-		delete(postings)
 	}
 	tx.fts_cache[key] = match
 	tx.fts_rank[table.name] = key
 	return match, ERROR_NONE
+}
+
+// fts_item_rows answers one item: the documents that match it and, for each, how
+// many times (the `tf` BM25 reads). The caller owns the map.
+@(private)
+fts_item_rows :: proc(tx: ^Tx, table: Fts_Table, item: Fts_Item) -> (map[Row_Id]int, Error) {
+	last := len(item.words) - 1
+	if last == 0 && len(item.column) == 0 {
+		if item.prefix do return fts_prefix_rows(tx, table, item.words[0])
+		return fts_term_rows(tx, table, item.words[0])
+	}
+
+	// Candidates: the documents that hold every word. Each word narrows the set,
+	// so the verification below reads at most the smallest posting list.
+	candidates: map[Row_Id]int
+	for word, i in item.words {
+		postings: map[Row_Id]int
+		postings_err: Error
+		if i == last && item.prefix {
+			postings, postings_err = fts_prefix_rows(tx, table, word)
+		} else {
+			postings, postings_err = fts_term_rows(tx, table, word)
+		}
+		if postings_err.kind != .None {
+			delete(postings)
+			delete(candidates)
+			return make(map[Row_Id]int), postings_err
+		}
+		if i == 0 {
+			candidates = postings
+			continue
+		}
+		for doc in candidates {
+			if _, found := postings[doc]; !found do delete_key(&candidates, doc)
+		}
+		delete(postings)
+		if len(candidates) == 0 do break
+	}
+
+	// Verification: read the text and count where the words occur in order, in the
+	// named column or in any.
+	column := -1
+	if len(item.column) > 0 do column = fts_column_position(tx, table, item.column)
+	out := make(map[Row_Id]int)
+	for doc in candidates {
+		row, found := tx_get(tx, table.name, doc)
+		if !found do continue
+		count := 0
+		for value, position in row.values {
+			if column >= 0 && position != column do continue
+			if value.kind != .String do continue
+			count += fts_count_sequence(fts_tokens(value.s, tx.alloc)[:], item.words, item.prefix)
+		}
+		if count > 0 do out[doc] = count
+	}
+	delete(candidates)
+	return out, ERROR_NONE
+}
+
+// fts_count_sequence counts the places where `words` occur adjacent and in order
+// in `tokens`; with `prefix` the last word only has to start the token.
+@(private)
+fts_count_sequence :: proc(tokens: []string, words: []string, prefix: bool) -> int {
+	if len(words) == 0 || len(tokens) < len(words) do return 0
+	count := 0
+	last := len(words) - 1
+	outer: for start in 0 ..= len(tokens) - len(words) {
+		for word, i in words {
+			token := tokens[start + i]
+			if i == last && prefix {
+				if !strings.has_prefix(token, word) do continue outer
+			} else if token != word {
+				continue outer
+			}
+		}
+		count += 1
+	}
+	return count
+}
+
+// fts_column_position is the index of a named column in the document rows, or -1.
+@(private)
+fts_column_position :: proc(tx: ^Tx, table: Fts_Table, name: string) -> int {
+	documents := tx_table_probe(tx, table.name)
+	if documents == nil do return -1
+	for column, i in documents.schema.columns {
+		if strings.equal_fold(column.name, name) do return i
+	}
+	return -1
+}
+
+// fts_prefix_rows reads the postings of every term that starts with `prefix`, as
+// one range over the term index, and adds the counts per document.
+@(private)
+fts_prefix_rows :: proc(tx: ^Tx, table: Fts_Table, prefix: string) -> (map[Row_Id]int, Error) {
+	low := fts_fold_word(prefix, tx.alloc)
+	// The smallest string greater than every string with this prefix: the prefix
+	// with its last byte that is not 0xFF raised by one, the rest cut off.
+	high := ""
+	upper := transmute([]u8)strings.clone(low, tx.alloc)
+	for n := len(upper) - 1; n >= 0; n -= 1 {
+		if upper[n] != 0xFF {
+			upper[n] += 1
+			high = string(upper[:n + 1])
+			break
+		}
+	}
+	postings := make(map[Row_Id]int)
+	sql: string
+	params: []Value
+	if len(high) > 0 {
+		sql = strings.concatenate({"SELECT doc, tf FROM ", table.terms, " WHERE term >= ? AND term < ?"}, tx.alloc)
+		params = []Value{value_string(low), value_string(high)}
+	} else {
+		sql = strings.concatenate({"SELECT doc, tf FROM ", table.terms, " WHERE term >= ?"}, tx.alloc)
+		params = []Value{value_string(low)}
+	}
+	result, err := sql_execute_in_tx_params(tx, sql, params)
+	if err.kind != .None do return postings, err
+	defer sql_result_destroy(&result)
+	for row in result.rows {
+		if len(row) < 2 do continue
+		postings[Row_Id(row[0].i)] += int(row[1].i)
+	}
+	return postings, ERROR_NONE
 }
 
 // fts_merge_group intersects the postings of one conjunction and adds them to the
@@ -544,26 +792,51 @@ fts_rank_value :: proc(tx: ^Tx, table_name: string, doc: Row_Id) -> (f64, bool) 
 	return -score, true
 }
 
-// fts_query_terms splits a pattern into the positive terms it needs, folded the
-// same way the index is.
+// fts_query_terms collects the words a pattern asks for, folded the way the index
+// is: the exact words in `terms` and the prefixes in `prefixes`. A word after NOT
+// is not collected, since highlighting what the match excludes would mislead.
 @(private)
-fts_query_terms :: proc(pattern: string, alloc: runtime.Allocator) -> map[string]bool {
-	terms := make(map[string]bool, 8, alloc)
-	for piece in strings.split(pattern, " ") {
-		word := strings.trim_space(piece)
-		if len(word) == 0 do continue
-		if strings.equal_fold(word, "or") || strings.equal_fold(word, "and") || strings.equal_fold(word, "not") do continue
-		terms[fts_fold_word(word, alloc)] = true
+fts_query_terms :: proc(pattern: string, alloc: runtime.Allocator) -> (terms: map[string]bool, prefixes: [dynamic]string) {
+	terms = make(map[string]bool, 8, alloc)
+	prefixes = make([dynamic]string, 0, 2, alloc)
+	items := fts_parse_query(pattern, alloc)
+	negate_next := false
+	for item in items {
+		switch item.kind {
+		case .Or:
+		case .Not:
+			negate_next = true
+		case .Term:
+			if negate_next {
+				negate_next = false
+				continue
+			}
+			for word, i in item.words {
+				if item.prefix && i == len(item.words) - 1 {
+					append(&prefixes, word)
+				} else {
+					terms[word] = true
+				}
+			}
+		}
 	}
-	return terms
+	return
 }
 
 // fts_mark wraps every token that the pattern asks for with `[` and `]`. With
 // `window` it keeps a few tokens around the first match instead of the whole
-// text, which is what snippet() returns.
+// text, which is what snippet() returns. The words of a phrase are marked one by
+// one, and a column filter does not limit what is marked: the text passed in is
+// already the column the caller chose.
 fts_mark :: proc(text: string, pattern: string, window: bool) -> string {
-	terms := fts_query_terms(pattern, context.temp_allocator)
+	terms, prefixes := fts_query_terms(pattern, context.temp_allocator)
 	defer delete(terms)
+	defer delete(prefixes)
+	wanted :: proc(terms: map[string]bool, prefixes: []string, word: string) -> bool {
+		if terms[word] do return true
+		for prefix in prefixes do if strings.has_prefix(word, prefix) do return true
+		return false
+	}
 	Fts_Token :: struct {
 		start: int,
 		end:   int,
@@ -591,7 +864,7 @@ fts_mark :: proc(text: string, pattern: string, window: bool) -> string {
 
 	first_match := -1
 	for token, i in tokens {
-		if terms[token.word] {
+		if wanted(terms, prefixes[:], token.word) {
 			first_match = i
 			break
 		}
@@ -608,7 +881,7 @@ fts_mark :: proc(text: string, pattern: string, window: bool) -> string {
 		if i < low do continue
 		if i >= high do break
 		strings.write_string(&out, text[position:token.start])
-		if terms[token.word] {
+		if wanted(terms, prefixes[:], token.word) {
 			strings.write_string(&out, "[")
 			strings.write_string(&out, text[token.start:token.end])
 			strings.write_string(&out, "]")

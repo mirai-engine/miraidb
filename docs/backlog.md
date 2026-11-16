@@ -22,7 +22,7 @@ Rules for this file:
 
 | # | Area | Today's cost | Gap | Effort | Priority |
 |---|---|---|---|---|---|
-| D1 | Full-text term index and BM25 | **done**: index on `term` in the same transaction, BM25 `rank`, `snippet`/`highlight`, scan narrowed to the matches (`test_full_text_ranking`, `test_full_text_cost`) | phrases, prefix, column filters | M | P0 |
+| D1 | Full-text term index and BM25 | **done**: index on `term` in the same transaction, BM25 `rank`, `snippet`/`highlight`, scan narrowed to the matches, phrases, prefixes and column filters (`test_full_text_ranking`, `test_full_text_cost`, `test_full_text_phrase_prefix_and_column`) | parentheses, `NEAR` | M | done |
 | D2 | Spatial index | overlap is a scan of the boxes | node file, tree descent | M | P2 |
 | D3 | Snapshot cost — *done* | a read copies nothing (one reference per table); a commit copies the table it writes when a reader holds it, once per read generation: read after a commit 38 µs on the gate, commit against a reader 16.9 ms (`test_a_commit_copies_the_table_a_reader_holds`) | automatic version retention | M | P2 |
 | D4 | Page backend | `.sqlite` is rewritten whole per commit | pages in place, WAL frames, free list | XL | P1 |

@@ -500,14 +500,30 @@ SELECT body FROM docs WHERE docs MATCH 'fox';          -- one row
 SELECT body FROM docs WHERE docs MATCH 'fox OR dog';   -- both
 SELECT body FROM docs WHERE docs MATCH 'the fox';      -- both terms, one row
 SELECT body FROM docs WHERE docs MATCH 'a NOT fox';    -- the second row
+SELECT body FROM docs WHERE docs MATCH '"quick brown"'; -- a phrase
+SELECT body FROM docs WHERE docs MATCH 'qu*';          -- a prefix
+SELECT body FROM docs WHERE docs MATCH 'body:fox';     -- one column only
 SELECT body, rank FROM docs WHERE docs MATCH 'fox OR dog' ORDER BY rank;
 SELECT snippet(body, 'dog') FROM docs WHERE docs MATCH 'dog';
 SELECT highlight(body, 'dog') FROM docs WHERE docs MATCH 'dog';
 ```
 
-`MATCH` is case-insensitive over ASCII letters (`FOX` finds `fox`). Adjacent
-terms are a conjunction, `OR` is a union, and `NOT` removes the documents that
-carry the following term. `UPDATE` and `DELETE` maintain the index, `DROP TABLE`
+`MATCH` is case-insensitive over ASCII letters (`FOX` finds `fox`). A pattern is
+a list of items separated by spaces:
+
+| Item | Matches |
+|---|---|
+| `fox` | documents that contain the term |
+| `fox*` | documents that contain a term starting with `fox` |
+| `"quick brown fox"` | the words adjacent and in this order; `"quick bro*"` ends in a prefix |
+| `body:fox` | the item in one column only; it also takes a phrase or a prefix (`body:"a b"`, `body:fo*`) |
+| `a b`, `a AND b` | both items (`AND` is the default and changes nothing) |
+| `a OR b` | either item; `OR` binds looser than juxtaposition, so `a b OR c` is `(a b) OR c` |
+| `a NOT b` | the documents of `a` that do not match `b` |
+
+A bare item that the tokenizer splits into several words, such as `don't`, is a
+phrase of those words. Naming a column the table does not have is an error
+(`column_not_found`). `UPDATE` and `DELETE` maintain the index, `DROP TABLE`
 removes the index with the table, and a reopen keeps searching.
 
 `rank` is BM25 negated, so `ORDER BY rank` puts the best match first (the same
@@ -520,10 +536,14 @@ every match in the whole text.
 The query walks the postings of its terms and the scan visits the matching
 documents only, so the cost follows the answer rather than the vocabulary. A term
 that every document carries costs its postings, because ranking has to look at
-every candidate. Three limits remain: phrase queries (`"a b"`), prefix matching
-(`foo*`) and column filters (`body:foo`) are not implemented, and a pattern taken
-from a column of the row cannot narrow the scan (a constant or a `?` parameter
-can).
+every candidate. A prefix reads one range of the term index. The index keeps no
+positions and no column, so a phrase or a column filter takes the documents that
+carry all of its words as candidates and then reads each candidate's text to
+confirm the order or the column: the cost is the documents that hold every word,
+never the corpus. For a phrase item, `rank` counts the phrase's occurrences, not
+its words'. Grouping with parentheses and `NEAR` are not implemented, and a
+pattern taken from a column of the row cannot narrow the scan (a constant or a
+`?` parameter can).
 
 ## PostgreSQL spellings
 

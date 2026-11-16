@@ -9641,6 +9641,68 @@ test_full_text_ranking :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_full_text_phrase_prefix_and_column :: proc(t: ^testing.T) {
+	// The rest of the query language: a phrase needs its words adjacent and in
+	// order, a prefix matches every term that starts with it, and `col:` limits an
+	// item to one column. Ranking and the helpers follow the same items.
+	store := fresh_db(t, "fts_ops")
+	if store == nil do return
+	defer cleanup_db(store, "fts_ops")
+	run(t, store, "CREATE VIRTUAL TABLE notes USING fts5(title, body)")
+	run(
+		t,
+		store,
+		`INSERT INTO notes (title, body) VALUES
+		('fox report', 'the quick brown fox jumps'),
+		('brown paper', 'a fox that is quick and brown'),
+		('database notes', 'indexing and indexes in a database'),
+		('don''t panic', 'towels are useful')`,
+	)
+	count :: proc(t: ^testing.T, store: ^db.Store, pattern: string) -> i64 {
+		return scalar(t, store, fmt.tprintf("SELECT count(*) FROM notes WHERE notes MATCH '%s'", pattern)).i
+	}
+	// Phrase: both rows carry `quick` and `brown`, only one has them adjacent.
+	testing.expect_value(t, count(t, store, `"quick brown"`), i64(1))
+	testing.expect_value(t, count(t, store, `"brown quick"`), i64(0))
+	testing.expect_value(t, count(t, store, `"quick brown fox"`), i64(1))
+	// A phrase is still an item: it composes with OR and NOT.
+	testing.expect_value(t, count(t, store, `"quick brown" OR towels`), i64(2))
+	testing.expect_value(t, count(t, store, `fox NOT "quick brown"`), i64(1))
+	// Prefix: `index*` reaches `indexing` and `indexes`, `qu*` reaches `quick`.
+	testing.expect_value(t, count(t, store, "index*"), i64(1))
+	testing.expect_value(t, count(t, store, "qu*"), i64(2))
+	testing.expect_value(t, count(t, store, "zebra*"), i64(0))
+	testing.expect_value(t, count(t, store, `"quick bro*"`), i64(1))
+	// Column filter: `fox` is in both bodies but only one title.
+	testing.expect_value(t, count(t, store, "fox"), i64(2))
+	testing.expect_value(t, count(t, store, "title:fox"), i64(1))
+	testing.expect_value(t, count(t, store, "body:fox"), i64(2))
+	testing.expect_value(t, count(t, store, "title:bro*"), i64(1))
+	testing.expect_value(t, count(t, store, `body:"quick brown"`), i64(1))
+	testing.expect_value(t, count(t, store, `title:"quick brown"`), i64(0))
+	// A bare word the tokenizer splits is a phrase of its parts.
+	testing.expect_value(t, count(t, store, "don''t"), i64(1))
+	// AND is an operator that changes nothing, never a term to look for.
+	testing.expect_value(t, count(t, store, "fox AND quick"), i64(2))
+	// An unknown column is refused with its name.
+	_, bad := db.sql_execute(store, "SELECT count(*) FROM notes WHERE notes MATCH 'author:fox'")
+	testing.expect_value(t, bad.kind, db.Error_Kind.Column_Not_Found)
+
+	// Ranking reads the item's own count: the phrase-matching row ranks first.
+	rows := run(t, store, `SELECT title FROM notes WHERE notes MATCH '"quick brown" OR fox' ORDER BY rank LIMIT 1`)
+	if testing.expect_value(t, len(rows.rows), 1) {
+		testing.expect_value(t, rows.rows[0][0].s, "fox report")
+	}
+	db.sql_result_destroy(&rows)
+	// highlight marks prefixes and phrase words, and not what NOT excludes.
+	marked := run(t, store, "SELECT highlight(body, 'qu* NOT towels') FROM notes WHERE notes MATCH 'qu*' ORDER BY title LIMIT 1")
+	if testing.expect_value(t, len(marked.rows), 1) {
+		testing.expect_value(t, marked.rows[0][0].s, "a fox that is [quick] and brown")
+	}
+	db.sql_result_destroy(&marked)
+}
+
+@(test)
 test_full_text_cost :: proc(t: ^testing.T) {
 	// The scan follows the match, not the corpus: with five thousand documents and
 	// one match, the query visits a handful of rows. This is measured, not
