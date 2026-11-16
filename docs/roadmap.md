@@ -74,17 +74,18 @@ with peer-to-peer sync; its networked phases build on items 27 and 28.
 
 ## Suggested order
 
-1. **S1 and S2** first: they are what stops a real SQLite schema or query from
-   running at all, and each form is small, parser-heavy work with a differential
-   query to prove it.
-2. **R1 and R2** next: the two largest gaps against the reference, measured, with
-   the parity gate (item 5) landing alongside so the gain cannot slip back.
-3. **D23 and D34**: the two remaining ways the process can die instead of
+1. **The two leftovers of S1 and S2**, both small: `ON CONFLICT <resolution>` on
+   a constraint, and `UPDATE OR <resolution>`.
+2. **R1 and R2**: the two largest gaps against the reference, measured, with the
+   parity gate (item 5) landing alongside so the gain cannot slip back.
+3. **D36**: let the planner read partial and expression indexes, which are
+   enforced today but never read.
+4. **D23 and D34**: the two remaining ways the process can die instead of
    answering.
-4. **S3 to S6**, then **R3/R4**: the rest of the visible surface and the smaller
+5. **S3 to S6**, then **R3/R4**: the rest of the visible surface and the smaller
    speed items.
-5. **S7**, **D4/D24**, and the depth items of track C.
-6. **D15, D14** and the release gates, in that order.
+6. **S7**, **D4/D24**, and the depth items of track C.
+7. **D15, D14** and the release gates, in that order.
 
 ## Efficiency contract and current baseline
 
