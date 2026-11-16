@@ -37,6 +37,12 @@ def load(path):
     lib.sqlite3_errmsg.restype = ctypes.c_char_p
     lib.sqlite3_changes.argtypes = [ctypes.c_void_p]
     lib.sqlite3_changes.restype = ctypes.c_int
+    lib.sqlite3_reset.argtypes = [ctypes.c_void_p]
+    lib.sqlite3_reset.restype = ctypes.c_int
+    lib.sqlite3_clear_bindings.argtypes = [ctypes.c_void_p]
+    lib.sqlite3_clear_bindings.restype = ctypes.c_int
+    lib.sqlite3_bind_int.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+    lib.sqlite3_bind_int.restype = ctypes.c_int
     lib.sqlite3_libversion.restype = ctypes.c_char_p
     return lib
 
@@ -334,6 +340,32 @@ def main() -> int:
     assert lib.sqlite3_step(orphan) == MISUSE, "a statement of a closed connection is misuse"
     lib.sqlite3_finalize(orphan)
     lib.sqlite3_close(ghost)
+
+    # F2: sqlite3_reset keeps the bound values; dropping them is what
+    # sqlite3_clear_bindings is for, as SQLite documents. The loop this protects
+    # is the one every driver uses: prepare once, bind, step, reset, step again
+    # with the same values.
+    reset_db = ctypes.c_void_p()
+    assert lib.sqlite3_open(b":memory:", ctypes.byref(reset_db)) == OK
+    assert lib.sqlite3_exec(reset_db, b"CREATE TABLE rb (a INTEGER NOT NULL)", None, None, None) == OK
+    reset_stmt = ctypes.c_void_p()
+    assert lib.sqlite3_prepare_v2(reset_db, b"INSERT INTO rb VALUES (?)", -1, ctypes.byref(reset_stmt), None) == OK
+    assert lib.sqlite3_bind_int(reset_stmt, 1, 7) == OK
+    assert lib.sqlite3_step(reset_stmt) == DONE, "first insert"
+    assert lib.sqlite3_reset(reset_stmt) == OK
+    assert lib.sqlite3_step(reset_stmt) == DONE, "the binding survived the reset"
+    assert lib.sqlite3_reset(reset_stmt) == OK
+    assert lib.sqlite3_clear_bindings(reset_stmt) == OK
+    assert lib.sqlite3_step(reset_stmt) == CONSTRAINT, "a cleared binding is NULL, which NOT NULL refuses"
+    lib.sqlite3_finalize(reset_stmt)
+    reader = ctypes.c_void_p()
+    assert lib.sqlite3_prepare_v2(reset_db, b"SELECT a FROM rb ORDER BY a", -1, ctypes.byref(reader), None) == OK
+    kept_rows = []
+    while lib.sqlite3_step(reader) == ROW:
+        kept_rows.append(lib.sqlite3_column_int64(reader, 0))
+    lib.sqlite3_finalize(reader)
+    assert kept_rows == [7, 7], kept_rows
+    assert lib.sqlite3_close(reset_db) == OK
 
     print("rows:", rows)
     print("error path:", message)

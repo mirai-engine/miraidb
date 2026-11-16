@@ -229,9 +229,17 @@ embed_finalize :: proc(stmt: ^Embed_Statement) {
 	free(stmt)
 }
 
+// embed_clear_bindings sets every bound parameter back to NULL and keeps the
+// list's length, which is what SQLite's sqlite3_clear_bindings does: a statement
+// whose parameters were cleared still runs, with NULLs, instead of failing for
+// a count it never had.
 embed_clear_bindings :: proc(stmt: ^Embed_Statement) {
-	for value in stmt.params do value_deep_free(value, context.allocator)
-	clear(&stmt.params)
+	if stmt == nil do return
+	for &value in stmt.params {
+		if value.kind == .Null do continue
+		value_deep_free(value, context.allocator)
+		value = value_null()
+	}
 }
 
 // Embed_Parameter_Count reports how many positional parameters the statement
@@ -289,12 +297,12 @@ embed_bind_blob :: proc(stmt: ^Embed_Statement, index: int, value: []u8) -> Erro
 	return embed_bind(stmt, index, value_bytes(bytes))
 }
 
-// embed_reset discards the current result and bindings so the statement can run
-// again.
+// embed_reset discards the current result so the statement can run again. The
+// bound values stay: SQLite's sqlite3_reset keeps them, and the call a caller
+// makes to drop them is sqlite3_clear_bindings (F2).
 embed_reset :: proc(stmt: ^Embed_Statement) {
 	if stmt == nil do return
 	sql_result_destroy(&stmt.result)
-	embed_clear_bindings(stmt)
 	stmt.started = false
 	stmt.done = false
 	stmt.row = 0
