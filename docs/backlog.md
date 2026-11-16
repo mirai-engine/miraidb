@@ -33,7 +33,7 @@ Rules for this file:
 | R2 | every index entry is an encoded string | fixed-size keys where the column allows | M |
 | R3 | pruning walks every row of every table after each statement | prune what the commit touched | S |
 | R4 | a committed row is copied from the transaction arena to the table | hand the staged row over | M |
-| S1 | `CHECK`, column `REFERENCES`, `CONSTRAINT` names, `DESC` and partial/expression indexes, `CURRENT_TIMESTAMP` are refused | accept the schema real SQLite files declare | M |
+| S1 | partial and expression indexes are refused (the rest landed) | the two index kinds | M |
 | S2 | `UPDATE OR <resolution>` is refused; the rest landed | the UPDATE resolutions | S |
 | S3 | `RIGHT`, `FULL` and `NATURAL` joins are refused | the three joins | M |
 | S4 | `FILTER`, `WINDOW`, aggregate `ORDER BY`, ordered-set aggregates missing | the aggregate surface | M |
@@ -128,11 +128,24 @@ gains a query per shape that compares the answer with SQLite's.
 
 ## S1 — The schema real files declare
 
-**Now refused.** `CHECK` constraints (column and table), `CONSTRAINT <name>`
-before a constraint, a column-level `REFERENCES` (only `FOREIGN KEY (…)
-REFERENCES` parses), `DEFERRABLE INITIALLY DEFERRED`, `DESC` on an index column,
-partial indexes (`WHERE`), indexes over expressions, and `CURRENT_TIMESTAMP` /
-`CURRENT_DATE` / `CURRENT_TIME`, both as values and as a `DEFAULT`.
+**Done.** `CHECK` constraints, column and table level, named or not, enforced
+on every write path (they run in `tx_insert`/`tx_update`, before a row is
+staged) with SQLite's message and `SQLITE_CONSTRAINT_CHECK`; a column's own
+CHECK goes with it on `DROP COLUMN`, and one that another part of the table
+uses blocks the drop or a rename. `CONSTRAINT <name>` before any constraint. A
+column-level `REFERENCES`, with the parent's primary key implied and a table
+referencing itself. `DEFERRABLE INITIALLY DEFERRED` foreign keys, verified at
+COMMIT. `CURRENT_TIMESTAMP`/`CURRENT_DATE`/`CURRENT_TIME`, and a DEFAULT that
+calls a function evaluated per row. `ASC`/`DESC` on index and key columns. The
+schema keeps them in a new optional section (`docs/file-format.md`), an export
+writes the CHECKs and per-row defaults into the `.sqlite` file, and an import
+reads them from the file's declaration (`test_check_constraints`,
+`test_column_references_and_defaults`, `test_deferred_foreign_keys`,
+`scripts/shell_smoke.py`).
+
+**Now refused.** Partial indexes (`WHERE`), indexes over expressions, and
+`ON CONFLICT <resolution>` on a constraint. An import still leaves out an index
+of the first two kinds (D24), and still does not carry `REFERENCES`.
 
 **Why first.** A schema that uses any of them fails at `CREATE TABLE`, so
 nothing written against it runs; and an imported file whose index is partial or

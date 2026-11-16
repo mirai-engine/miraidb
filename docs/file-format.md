@@ -83,25 +83,43 @@ Each operation starts with a `u8` kind and a length-prefixed table name
 
 ```text
 string  table name
-u8      table flags (bit 0 ephemeral, bit 1 event)
+u8      table flags (bit 0 ephemeral, bit 1 event, bit 2 extras follow)
 u32     column count
 column*:
     string  name
-    u8      type kind (0 Bool, 1 Int, 2 Uint, 3 Float, 4 String,
-                       5 Bytes, 6 Timestamp, 7 Uuid)
+    u8      type kind (see Type_Kind in schema.odin)
     u8      width (1/2/4/8/16 for Int and Uint, 4/8 for Float, 0 otherwise)
-    u8      flags (2 unique, 4 not null, 8 autoincrement, 16 has default;
-                   bit 1 is reserved)
-    value*  default value, only when the flag is set
-    i64*    sequence start/increment/min/max, only for autoincrement
+    u8 u8   inner kind and width, for Option, Result, Array and Product
+    u8 u8   right kind and width, for Result
+    u8 + (u8 u8)*  component count and (kind, width) pairs, for Product
+    u8      flags (bit 1 unique, 2 not null, 3 autoincrement, 4 has default,
+                   5 named type, 6 collation, 7 generated)
+    string  named type, collation, generated expression: each when its flag is set
+    value   default value, when it has one
+    i64*4   sequence start/increment/min/max, for autoincrement
 u32     primary key column count
 u32*    primary key column positions, in key order
+u32     foreign key count
+foreign key*:
+    string  name
+    u8 u8   on delete, on update
+    string  referenced table
+    u32 + u32*  column count and positions
+    u32 + u32*  referenced column count and positions
 u32     index count
 index*:
     string  index name
     u8      flags (1 unique, 2 implicit)
+    u8      algorithm (0 btree, 1 hash, 2 direct)
     u32     column count
     u32*    column positions
+extras, only when table flag bit 2 is set:
+    u32     CHECK count
+    check*: string name | string expression | string column (empty: table level)
+    u32     per-row default count
+    default*: u32 column position | string expression
+    u32     deferred foreign key count
+    u32*    positions of the DEFERRABLE INITIALLY DEFERRED foreign keys
 ```
 
 `implicit` marks the indexes generated from the primary key and from `UNIQUE`
@@ -435,6 +453,12 @@ there, because the sequence check would reject everything after a gap anyway.
 ## Compatibility policy
 
 - Unknown record kinds or column types are rejected, not skipped.
+- Version 16, without a version change, adds the extras section of a schema:
+  CHECK constraints, per-row defaults (a DEFAULT that calls a function, such as
+  `CURRENT_TIMESTAMP`) and deferred foreign keys. Table flag bit 2 marks it and
+  is set only on a table that has one of them, so a database that uses none
+  stays readable by an earlier build of version 16. An earlier build that opens
+  a table with extras reads it wrongly; the section is new in 0.15.
 - Version 15 adds the foreign keys of a table to the schema encoding: name, both
   actions, referenced table and the two column lists.
 - Version 14 stores a `PRODUCT` column as a component list: a count byte then

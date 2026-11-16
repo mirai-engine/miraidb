@@ -375,6 +375,11 @@ Column_Def :: struct {
 	generated:     bool,
 	generated_sql: string,
 	default:  ^Expr,
+	// default_sql is the DEFAULT's text, kept for a default that has to be
+	// evaluated per row (one that calls a function, like CURRENT_TIMESTAMP).
+	default_sql: string,
+	// checks are the column's CHECK clauses.
+	checks: []Check_Constraint,
 }
 
 // Table_Constraint is a table-level PRIMARY KEY or UNIQUE clause. Columns are
@@ -389,6 +394,10 @@ Table_Constraint :: struct {
 	ref_columns: []string,
 	on_delete:   Foreign_Key_Action,
 	on_update:   Foreign_Key_Action,
+	deferred:    bool,
+	// A table-level CHECK uses check_sql instead of columns.
+	is_check:    bool,
+	check_sql:   string,
 }
 
 Create_Type_Stmt :: struct {

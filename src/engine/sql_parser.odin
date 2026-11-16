@@ -553,6 +553,56 @@ parse_select :: proc(p: ^Parser) -> Statement {
 return select
 }
 
+// parse_fk_clauses reads what may follow REFERENCES t (cols): ON DELETE / ON
+// UPDATE actions, MATCH (accepted; SQLite ignores it too) and the deferral.
+@(private)
+parse_fk_clauses :: proc(p: ^Parser) -> (on_delete, on_update: Foreign_Key_Action, deferred: bool) {
+	for {
+		if p_match_keyword(p, "on") {
+			if p_match_keyword(p, "delete") {
+				on_delete = parse_fk_action(p)
+			} else if p_match_keyword(p, "update") {
+				on_update = parse_fk_action(p)
+			} else {
+				p_fail(p, .Sql_Syntax, "expected DELETE or UPDATE after ON")
+				return
+			}
+			continue
+		}
+		if p_match_keyword(p, "match") {
+			p_ident(p)
+			continue
+		}
+		break
+	}
+	// [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE]
+	not_deferrable := false
+	if p_is_keyword(p, "not") {
+		p_advance(p)
+		if !p_expect_keyword(p, "deferrable") do return
+		not_deferrable = true
+	} else if !p_match_keyword(p, "deferrable") {
+		return
+	}
+	if p_match_keyword(p, "initially") {
+		if p_match_keyword(p, "deferred") {
+			deferred = !not_deferrable
+		} else {
+			p_expect_keyword(p, "immediate")
+		}
+	}
+	return
+}
+
+// p_refuse_conflict_clause refuses `ON CONFLICT <resolution>` on a constraint:
+// it changes what a violation does, and ignoring it would answer differently.
+@(private)
+p_refuse_conflict_clause :: proc(p: ^Parser) -> bool {
+	if !p_is_keyword(p, "on") do return false
+	p_fail(p, .Sql_Unsupported, "ON CONFLICT on a constraint is not supported: use INSERT OR <resolution>")
+	return true
+}
+
 // parse_values_select reads `VALUES (a, b), (c, d)` as the query SQLite makes of
 // it: one row per tuple, columns named column1, column2, …, and every tuple the
 // same width.
@@ -1399,17 +1449,17 @@ parse_create_table :: proc(p: ^Parser, ephemeral: bool, event: bool) -> Statemen
 			}
 			p_expect_punct(p, ")")
 			constraint.ref_columns = refs[:]
-			for p_match_keyword(p, "on") {
-				if p_match_keyword(p, "delete") {
-					constraint.on_delete = parse_fk_action(p)
-				} else if p_match_keyword(p, "update") {
-					constraint.on_update = parse_fk_action(p)
-				} else {
-					p_fail(p, .Sql_Syntax, "expected DELETE or UPDATE after ON")
-					break
-				}
-			}
+			constraint.on_delete, constraint.on_update, constraint.deferred = parse_fk_clauses(p)
 			append(&constraints, constraint)
+			if !p_match_punct(p, ",") do break
+			continue
+		}
+		if p_match_keyword(p, "check") {
+			if !p_is_punct(p, "(") {
+				p_fail(p, .Sql_Syntax, "CHECK needs a parenthesized expression")
+				break
+			}
+			append(&constraints, Table_Constraint{name = constraint_name, is_check = true, check_sql = p_capture_paren_source(p)})
 			if !p_match_punct(p, ",") do break
 			continue
 		}
@@ -1426,10 +1476,14 @@ parse_create_table :: proc(p: ^Parser, ephemeral: bool, event: bool) -> Statemen
 			cols := make([dynamic]string, 0, 2, p.alloc)
 			for {
 				append(&cols, p_ident(p))
+				// A key column may carry a direction; it orders the key's storage in
+				// SQLite and changes no answer, so it is accepted.
+				if !p_match_keyword(p, "asc") do p_match_keyword(p, "desc")
 				if !p_match_punct(p, ",") do break
 			}
 			p_expect_punct(p, ")")
 			constraint.columns = cols[:]
+			if conflict_err := p_refuse_conflict_clause(p); conflict_err do break
 			append(&constraints, constraint)
 			if !p_match_punct(p, ",") do break
 			continue
@@ -1454,10 +1508,52 @@ parse_create_table :: proc(p: ^Parser, ephemeral: bool, event: bool) -> Statemen
 			}
 			p_expect_punct(p, ")")
 		}
+		column_checks := make([dynamic]Check_Constraint, 0, 0, p.alloc)
+		pending_name := ""
 		for {
+			// `CONSTRAINT name` may precede any column constraint; it names a CHECK
+			// in error messages and is otherwise only a label.
+			if p_match_keyword(p, "constraint") {
+				pending_name = p_ident(p)
+				continue
+			}
 			if p_match_keyword(p, "primary") {
 				p_expect_keyword(p, "key")
 				column.primary = true
+				if !p_match_keyword(p, "asc") do p_match_keyword(p, "desc")
+				if p_refuse_conflict_clause(p) do break
+				continue
+			}
+			if p_match_keyword(p, "check") {
+				if !p_is_punct(p, "(") {
+					p_fail(p, .Sql_Syntax, "CHECK needs a parenthesized expression")
+					break
+				}
+				append(&column_checks, Check_Constraint{name = pending_name, sql = p_capture_paren_source(p), column = column.name})
+				pending_name = ""
+				continue
+			}
+			if p_match_keyword(p, "references") {
+				// A column-level foreign key: the same as FOREIGN KEY (column).
+				fk: Table_Constraint
+				fk.name = pending_name
+				pending_name = ""
+				fk.is_foreign = true
+				cols := make([]string, 1, p.alloc)
+				cols[0] = column.name
+				fk.columns = cols
+				fk.ref_table = p_ident(p)
+				if p_match_punct(p, "(") {
+					refs := make([dynamic]string, 0, 1, p.alloc)
+					for {
+						append(&refs, p_ident(p))
+						if !p_match_punct(p, ",") do break
+					}
+					p_expect_punct(p, ")")
+					fk.ref_columns = refs[:]
+				}
+				fk.on_delete, fk.on_update, fk.deferred = parse_fk_clauses(p)
+				append(&constraints, fk)
 				continue
 			}
 			if p_match_keyword(p, "autoincrement") || p_match_keyword(p, "auto_increment") {
@@ -1486,18 +1582,25 @@ parse_create_table :: proc(p: ^Parser, ephemeral: bool, event: bool) -> Statemen
 			}
 			if p_match_keyword(p, "unique") {
 				column.unique = true
+				if p_refuse_conflict_clause(p) do break
 				continue
 			}
 			if p_match_keyword(p, "not") {
 				p_expect_keyword(p, "null")
 				column.not_null = true
+				if p_refuse_conflict_clause(p) do break
 				continue
 			}
 			if p_match_keyword(p, "null") {
 				continue
 			}
 			if p_match_keyword(p, "default") {
-				column.default = parse_primary(p)
+				start := token_offset(p.lexer.src, p.current.line, p.current.column)
+				column.default = parse_unary(p)
+				end := p.current.kind == .EOF ? len(p.lexer.src) : token_offset(p.lexer.src, p.current.line, p.current.column)
+				if start >= 0 && end >= start && end <= len(p.lexer.src) {
+					column.default_sql = strings.trim_space(p.lexer.src[start:end])
+				}
 				continue
 			}
 			if p_match_keyword(p, "collate") {
@@ -1538,6 +1641,7 @@ parse_create_table :: proc(p: ^Parser, ephemeral: bool, event: bool) -> Statemen
 			}
 			break
 		}
+		column.checks = column_checks[:]
 		append(&columns, column)
 		if !p_match_punct(p, ",") do break
 	}
@@ -1614,6 +1718,32 @@ p_capture_paren_text :: proc(p: ^Parser) -> string {
 	return strings.to_string(builder)
 }
 
+// p_capture_paren_source returns the source text between a `(` and its matching
+// `)`, exactly as written: quotes, case and spacing included. A CHECK keeps this
+// text, because SQLite's error message quotes it and a quoted identifier has to
+// survive being parsed again.
+@(private)
+p_capture_paren_source :: proc(p: ^Parser) -> string {
+	if !p_is_punct(p, "(") do return ""
+	open := token_offset(p.lexer.src, p.current.line, p.current.column)
+	depth := 0
+	for p.current.kind != .EOF {
+		if p.current.kind == .Punct && p.current.text == "(" do depth += 1
+		if p.current.kind == .Punct && p.current.text == ")" {
+			depth -= 1
+			if depth == 0 {
+				close := token_offset(p.lexer.src, p.current.line, p.current.column)
+				p_advance(p)
+				if open + 1 > close do return ""
+				return strings.clone(strings.trim_space(p.lexer.src[open + 1:close]), p.alloc)
+			}
+		}
+		p_advance(p)
+	}
+	p_fail(p, .Sql_Syntax, "unbalanced parentheses")
+	return ""
+}
+
 @(private)
 parse_create_index :: proc(p: ^Parser, unique: bool) -> Statement {
 	stmt: Create_Index_Stmt
@@ -1644,6 +1774,13 @@ parse_create_index :: proc(p: ^Parser, unique: bool) -> Statement {
 	columns := make([dynamic]string, 0, 2, p.alloc)
 	for {
 		append(&columns, p_ident(p))
+		// ASC/DESC order an index's storage, which answers no query differently:
+		// every ORDER BY is applied by the executor or matched to the walk.
+		if p_match_keyword(p, "collate") {
+			p_fail(p, .Sql_Unsupported, "COLLATE on an index column is not supported: declare it on the column")
+			return stmt
+		}
+		if !p_match_keyword(p, "asc") do p_match_keyword(p, "desc")
 		if !p_match_punct(p, ",") do break
 	}
 	p_expect_punct(p, ")")
@@ -2120,6 +2257,20 @@ parse_primary :: proc(p: ^Parser) -> ^Expr {
 				if number > p.param_count do p.param_count = number
 				return e
 			}
+		}
+		// SQLite's time keywords: the current UTC moment as text, as datetime(),
+		// date() and time() of 'now' give it.
+		if p_is_keyword(p, "current_timestamp") || p_is_keyword(p, "current_date") || p_is_keyword(p, "current_time") {
+			function := "datetime"
+			if p_is_keyword(p, "current_date") do function = "date"
+			if p_is_keyword(p, "current_time") do function = "time"
+			p_advance(p)
+			if p_match_punct(p, "(") do p_expect_punct(p, ")")
+			args := make([]^Expr, 1, p.alloc)
+			args[0] = expr_literal(p, value_string("now"))
+			e := new(Expr, p.alloc)
+			e^ = Call_Expr{name = function, args = args}
+			return e
 		}
 		// The SQL-standard session values are written without parentheses:
 		// `SELECT current_user`. They are calls, not column names.

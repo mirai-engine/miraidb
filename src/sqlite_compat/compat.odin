@@ -133,7 +133,7 @@ sqlite_code :: proc(err: engine.Error) -> c.int {
 	switch err.kind {
 	case .None:
 		return SQLITE_OK
-	case .Duplicate_Primary_Key, .Duplicate_Unique, .Not_Null_Violation:
+	case .Duplicate_Primary_Key, .Duplicate_Unique, .Not_Null_Violation, .Check_Violation:
 		return SQLITE_CONSTRAINT
 	case .Invalid_Type:
 		return SQLITE_MISMATCH
@@ -179,6 +179,8 @@ sqlite_extended_code :: proc(err: engine.Error) -> c.int {
 		return SQLITE_CONSTRAINT_UNIQUE
 	case .Not_Null_Violation:
 		return SQLITE_CONSTRAINT_NOTNULL
+	case .Check_Violation:
+		return SQLITE_CONSTRAINT_CHECK
 	}
 	return sqlite_code(err)
 }

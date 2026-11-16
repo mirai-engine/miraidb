@@ -94,6 +94,9 @@ Tx :: struct {
 	// trigger's statement nests inside the one that fired it.
 	undo:                [dynamic]Stage_Undo,
 	undo_depth:          int,
+	// deferred_fks names the child tables whose DEFERRABLE INITIALLY DEFERRED
+	// keys this transaction may have broken; COMMIT verifies them.
+	deferred_fks:        map[string]bool,
 }
 
 Table_Writes :: struct {
@@ -746,6 +749,9 @@ tx_drop_column :: proc(tx: ^Tx, name, column_name: string) -> Error {
 	if current_err.kind != .None do return current_err
 	index, found := schema_column_index(&current.schema, column_name)
 	if !found do return errf(.Column_Not_Found, "column %s does not exist in %s", column_name, name)
+	if checks_use_column(&current.schema, column_name, skip_own = true) {
+		return errf(.Sql_Unsupported, "cannot drop column %s: a CHECK constraint of %s uses it", column_name, name)
+	}
 	if current.schema.columns[index].unique || current.schema.columns[index].auto_increment {
 		return errf(.Sql_Unsupported, "cannot drop the key column %s", column_name)
 	}
@@ -794,6 +800,13 @@ tx_drop_column :: proc(tx: ^Tx, name, column_name: string) -> Error {
 	if current.schema.auto_increment_column > index {
 		next_schema.auto_increment_column = current.schema.auto_increment_column - 1
 	}
+	// The column's own CHECK constraints go with it.
+	kept_checks := make([dynamic]Check_Constraint, 0, len(current.schema.checks), tx.alloc)
+	for check in current.schema.checks {
+		if strings.equal_fold(check.column, column_name) do continue
+		append(&kept_checks, check)
+	}
+	next_schema.checks = kept_checks[:]
 	schema := next_schema
 	replacement, create_err := table_create(&schema)
 	if create_err.kind != .None do return create_err
@@ -883,6 +896,11 @@ tx_rename_column :: proc(tx: ^Tx, table_name, from, to: string) -> Error {
 	current, current_err := tx_table(tx, table_name)
 	if current_err.kind != .None do return current_err
 	if strings.equal_fold(from, to) do return ERROR_NONE
+	if checks_use_column(&current.schema, from) {
+		// SQLite rewrites the CHECK's text; this engine does not rewrite SQL text
+		// yet, and a CHECK naming a missing column would refuse every later write.
+		return errf(.Sql_Unsupported, "cannot rename column %s: a CHECK constraint of %s uses it", from, table_name)
+	}
 	for existing in current.schema.columns {
 		if strings.equal_fold(existing.name, to) {
 			return errf(.Invalid_Argument, "column %s already exists in %s", to, table_name)
@@ -1163,7 +1181,9 @@ tx_insert :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error) {
 			if column.auto_increment {
 				v = value_int(writes.next_sequence)
 			} else {
-				v = column_default(column)
+				default_value, default_err := column_default_for_row(tx, column)
+				if default_err.kind != .None do return 0, default_err
+				v = default_value
 			}
 		} else if v.kind == .Null && column.auto_increment {
 			v = value_int(writes.next_sequence)
@@ -1190,6 +1210,11 @@ tx_insert :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error) {
 		row_values[i] = value_clone(coerced, tx.alloc)
 	}
 
+	// CHECK runs on the final row, before anything is staged, so a refused row
+	// leaves nothing behind (INSERT OR IGNORE relies on that).
+	if check_err := checks_enforce(tx, table, row_values); check_err.kind != .None {
+		return 0, check_err
+	}
 	if fk_err := fk_check_child(tx, table, row_values); fk_err.kind != .None {
 		return 0, fk_err
 	}
@@ -1287,7 +1312,9 @@ tx_update :: proc(tx: ^Tx, name: string, id: Row_Id, values: []Value) -> Error {
 			v = value_int(next)
 		}
 		if v.kind == .Default {
-			v = column_default(column)
+			default_value, default_err := column_default_for_row(tx, column)
+			if default_err.kind != .None do return default_err
+			v = default_value
 		} else if v.kind == .Null && column.auto_increment {
 			v = value_uint(u64(id))
 		}
@@ -1297,6 +1324,9 @@ tx_update :: proc(tx: ^Tx, name: string, id: Row_Id, values: []Value) -> Error {
 			return errf(.Not_Null_Violation, "column %s.%s cannot be NULL", name, column.name)
 		}
 		row_values[i] = value_clone(coerced, tx.alloc)
+	}
+	if check_err := checks_enforce(tx, table, row_values); check_err.kind != .None {
+		return check_err
 	}
 	if fk_err := fk_check_child(tx, table, row_values); fk_err.kind != .None {
 		return fk_err
@@ -1641,6 +1671,12 @@ tx_commit :: proc(tx: ^Tx) -> Error {
 	if tx.read_only {
 		tx_discard(tx)
 		return ERROR_NONE
+	}
+	if len(tx.deferred_fks) > 0 {
+		if fk_err := fk_check_deferred(tx); fk_err.kind != .None {
+			tx_discard(tx)
+			return fk_err
+		}
 	}
 	started_us := now_microseconds()
 	ops := tx_build_ops(tx)

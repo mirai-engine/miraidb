@@ -41,6 +41,11 @@ fk_parent_exists :: proc(tx: ^Tx, fk: Foreign_Key, child_values: []Value) -> (bo
 // parent. A key with a NULL component is not enforced, which is the SQL rule.
 fk_check_child :: proc(tx: ^Tx, table: ^Table, values: []Value) -> Error {
 	for fk in table.schema.foreign_keys {
+		if fk.deferred {
+			// Checked when the transaction commits (fk_check_deferred).
+			fk_defer(tx, table.schema.name)
+			continue
+		}
 		has_null := false
 		for column in fk.columns {
 			if values[column].kind == .Null do has_null = true
@@ -56,6 +61,48 @@ fk_check_child :: proc(tx: ^Tx, table: ^Table, values: []Value) -> Error {
 				table.schema.name,
 				fk.ref_table,
 			)
+		}
+	}
+	return ERROR_NONE
+}
+
+// fk_defer notes a child table whose deferred keys the commit has to verify.
+@(private)
+fk_defer :: proc(tx: ^Tx, child: string) {
+	if tx.deferred_fks == nil do tx.deferred_fks = make(map[string]bool, 4, tx.alloc)
+	if child in tx.deferred_fks do return
+	tx.deferred_fks[strings.clone(child, tx.alloc)] = true
+}
+
+// fk_check_deferred verifies, at COMMIT, every deferred foreign key of the tables
+// the transaction touched: each row whose key has no NULL must have its parent
+// now. It reads the whole child table, so a deferred key costs its table's rows
+// once per committing transaction that touched it.
+fk_check_deferred :: proc(tx: ^Tx) -> Error {
+	for name in tx.deferred_fks {
+		table := tx_table_probe(tx, name)
+		if table == nil do continue
+		rows := make([dynamic]Row)
+		defer delete(rows)
+		if collect_err := tx_collect(tx, name, &rows); collect_err.kind != .None do return collect_err
+		for fk in table.schema.foreign_keys {
+			if !fk.deferred do continue
+			for row in rows {
+				has_null := false
+				for column in fk.columns do if row.values[column].kind == .Null do has_null = true
+				if has_null do continue
+				found, check_err := fk_parent_exists(tx, fk, row.values)
+				if check_err.kind != .None do return check_err
+				if !found {
+					return errf(
+						.Invalid_Argument,
+						"deferred foreign key %s on %s has no matching row in %s at commit",
+						fk.name,
+						name,
+						fk.ref_table,
+					)
+				}
+			}
 		}
 	}
 	return ERROR_NONE
@@ -130,6 +177,12 @@ fk_parent_delete :: proc(
 			delete(rows)
 			continue
 		}
+		if child.fk.on_delete == .Restrict && child.fk.deferred {
+			// The children may get a new parent before COMMIT; the commit decides.
+			fk_defer(tx, child.table.schema.name)
+			delete(rows)
+			continue
+		}
 		if child.fk.on_delete == .Restrict {
 			delete(rows)
 			return errf(
@@ -180,6 +233,11 @@ fk_parent_update :: proc(
 			return match_err
 		}
 		if len(rows) == 0 {
+			delete(rows)
+			continue
+		}
+		if child.fk.on_update == .Restrict && child.fk.deferred {
+			fk_defer(tx, child.table.schema.name)
 			delete(rows)
 			continue
 		}

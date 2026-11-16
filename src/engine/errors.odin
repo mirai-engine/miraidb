@@ -18,6 +18,8 @@ Error_Kind :: enum u8 {
 	Duplicate_Primary_Key,
 	Duplicate_Unique,
 	Not_Null_Violation,
+	// Check_Violation is a row a CHECK constraint refused.
+	Check_Violation,
 	Auto_Increment_Requires_Integer,
 	Sql_Syntax,
 	Sql_Unsupported,
@@ -100,6 +102,8 @@ error_kind_name :: proc(kind: Error_Kind) -> string {
 		return "duplicate_unique"
 	case .Not_Null_Violation:
 		return "not_null_violation"
+	case .Check_Violation:
+		return "check_violation"
 	case .Auto_Increment_Requires_Integer:
 		return "auto_increment_requires_integer"
 	case .Sql_Syntax:

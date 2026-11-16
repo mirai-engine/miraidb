@@ -898,6 +898,29 @@ sqlite_value_text :: proc(value: Value, alloc: mem.Allocator) -> string {
 // sqlite_import materialises the file into a store: one table per non-system
 // table, with the schema inferred from the declared types and the rows inserted
 // through the normal statement path so constraints apply.
+// Declared_Rules is a file's CREATE TABLE as the engine's parser reads it; the
+// import takes its DEFAULT and CHECK clauses.
+Declared_Rules :: struct {
+	query: Query,
+	stmt:  Create_Table_Stmt,
+}
+
+@(private)
+sqlite_declared_rules :: proc(sql: string) -> (Declared_Rules, bool) {
+	if len(sql) == 0 do return {}, false
+	query, err := sql_parse(sql)
+	if err.kind != .None {
+		error_free(&err)
+		return {}, false
+	}
+	stmt, ok := query.statement.(Create_Table_Stmt)
+	if !ok {
+		query_destroy(&query)
+		return {}, false
+	}
+	return Declared_Rules{query = query, stmt = stmt}, true
+}
+
 sqlite_import :: proc(
 	file: ^Sqlite_File,
 	store: ^Store,
@@ -912,6 +935,11 @@ sqlite_import :: proc(
 		sqlite_infer_columns(&table, rows_of_table)
 		create := strings.builder_make(alloc)
 		defer strings.builder_destroy(&create)
+		// The file's own declaration, read with the engine's parser, gives the
+		// DEFAULT and CHECK clauses the inferred columns do not carry. A
+		// declaration the parser cannot read imports without them, as before.
+		declared, declared_ok := sqlite_declared_rules(table.sql)
+		defer if declared_ok do query_destroy(&declared.query)
 		strings.write_string(&create, "CREATE TABLE ")
 		sqlite_write_ident(&create, table.name)
 		strings.write_string(&create, " (")
@@ -921,6 +949,25 @@ sqlite_import :: proc(
 			strings.write_byte(&create, ' ')
 			strings.write_string(&create, column_type_name(Column_Type{kind = column.inferred}))
 			if column.not_null do strings.write_string(&create, " NOT NULL")
+			if declared_ok {
+				for definition in declared.stmt.columns {
+					if !strings.equal_fold(definition.name, column.name) do continue
+					if len(definition.default_sql) > 0 {
+						strings.write_string(&create, " DEFAULT (")
+						strings.write_string(&create, definition.default_sql)
+						strings.write_byte(&create, ')')
+					}
+					for check in definition.checks {
+						if len(check.name) > 0 {
+							strings.write_string(&create, " CONSTRAINT ")
+							sqlite_write_ident(&create, check.name)
+						}
+						strings.write_string(&create, " CHECK (")
+						strings.write_string(&create, check.sql)
+						strings.write_byte(&create, ')')
+					}
+				}
+			}
 			// A text key is declared inline here even though the engine keeps it as
 			// an index: the import only has to hand the engine a schema it accepts,
 			// and an export writes the key as an index row (D33).
@@ -937,6 +984,20 @@ sqlite_import :: proc(
 			if len(group) == 1 && table.columns[group[0]].primary_key do continue
 			strings.write_string(&create, ", UNIQUE (")
 			sqlite_write_group(&create, &table, group)
+		}
+		if declared_ok {
+			for constraint in declared.stmt.constraints {
+				if !constraint.is_check do continue
+				strings.write_string(&create, ", ")
+				if len(constraint.name) > 0 {
+					strings.write_string(&create, "CONSTRAINT ")
+					sqlite_write_ident(&create, constraint.name)
+					strings.write_byte(&create, ' ')
+				}
+				strings.write_string(&create, "CHECK (")
+				strings.write_string(&create, constraint.check_sql)
+				strings.write_byte(&create, ')')
+			}
 		}
 		strings.write_string(&create, ")")
 		if _, create_err := sql_execute_in_tx(tx, strings.to_string(create)); create_err.kind != .None {

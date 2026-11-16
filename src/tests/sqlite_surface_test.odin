@@ -303,3 +303,126 @@ test_row_values :: proc(t: ^testing.T) {
 	testing.expect_value(t, run_error(t, store, "SELECT (1, 2)").kind, db.Error_Kind.Sql_Syntax)
 	testing.expect_value(t, run_error(t, store, "SELECT (1, 2) = (1, 2, 3)").kind, db.Error_Kind.Sql_Syntax)
 }
+
+@(test)
+test_check_constraints :: proc(t: ^testing.T) {
+	store := fresh_db(t, "checks")
+	if store == nil do return
+
+	run(t, store, `CREATE TABLE p (
+		id INTEGER PRIMARY KEY,
+		name TEXT CONSTRAINT name_len CHECK (length(name) > 1),
+		qty INTEGER CHECK (qty >= 0),
+		CHECK (qty < 100 OR name = 'big'))`)
+	run(t, store, "INSERT INTO p VALUES (1, 'ab', 5)")
+	named := run_error(t, store, "INSERT INTO p VALUES (2, 'a', 5)")
+	testing.expect_value(t, named.kind, db.Error_Kind.Check_Violation)
+	testing.expect_value(t, named.message, "CHECK constraint failed: name_len")
+	unnamed := run_error(t, store, "INSERT INTO p VALUES (3, 'cd', -1)")
+	testing.expect_value(t, unnamed.message, "CHECK constraint failed: qty >= 0")
+	testing.expect_value(t, run_error(t, store, "INSERT INTO p VALUES (4, 'cd', 500)").kind, db.Error_Kind.Check_Violation)
+	run(t, store, "INSERT INTO p VALUES (5, 'big', 500)")
+	// NULL passes a CHECK, as in SQL.
+	run(t, store, "INSERT INTO p VALUES (6, NULL, NULL)")
+	testing.expect_value(t, run_error(t, store, "UPDATE p SET qty = -5 WHERE id = 1").kind, db.Error_Kind.Check_Violation)
+	// OR IGNORE skips a row a CHECK refuses.
+	run(t, store, "INSERT OR IGNORE INTO p VALUES (7, 'x', 1), (8, 'xy', 1)")
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM p").i, i64(4))
+	// A malformed CHECK is refused with the table.
+	testing.expect(t, run_error(t, store, "CREATE TABLE bad (x INTEGER CHECK (x >))").kind != .None)
+
+	// The constraints are part of the schema the log keeps.
+	db.store_close(store)
+	reopened, err := db.store_open("_test_checks", {persistent = true, create = false, durable = false})
+	testing.expect(t, db.error_ok(err))
+	defer cleanup_db(reopened, "checks")
+	testing.expect_value(t, run_error(t, reopened, "INSERT INTO p VALUES (9, 'z', 1)").kind, db.Error_Kind.Check_Violation)
+	run(t, reopened, "INSERT INTO p VALUES (10, 'zz', 1)")
+
+	// A column's own CHECK goes with the column; one that names it from the
+	// table blocks the drop, and a rename is refused rather than left dangling.
+	run(t, reopened, "CREATE TABLE d (id INTEGER PRIMARY KEY, q INTEGER CHECK (q > 0), r INTEGER, CHECK (r < 10))")
+	run(t, reopened, "ALTER TABLE d DROP COLUMN q")
+	testing.expect_value(t, run_error(t, reopened, "ALTER TABLE d DROP COLUMN r").kind, db.Error_Kind.Sql_Unsupported)
+	testing.expect_value(t, run_error(t, reopened, "ALTER TABLE d RENAME COLUMN r TO s").kind, db.Error_Kind.Sql_Unsupported)
+	testing.expect_value(t, run_error(t, reopened, "INSERT INTO d VALUES (1, 50)").kind, db.Error_Kind.Check_Violation)
+}
+
+@(test)
+test_column_references_and_defaults :: proc(t: ^testing.T) {
+	store := fresh_db(t, "col_refs")
+	if store == nil do return
+
+	run(t, store, "CREATE TABLE p (id INTEGER PRIMARY KEY)")
+	run(t, store, "INSERT INTO p VALUES (1)")
+	// A column-level REFERENCES, with the parent's key implied.
+	run(t, store, "CREATE TABLE c (id INTEGER PRIMARY KEY, pid INTEGER CONSTRAINT to_p REFERENCES p ON DELETE CASCADE, note TEXT DEFAULT 'none')")
+	run(t, store, "INSERT INTO c (id, pid) VALUES (1, 1)")
+	testing.expect(t, run_error(t, store, "INSERT INTO c (id, pid) VALUES (2, 99)").kind != .None)
+	testing.expect_value(t, scalar(t, store, "SELECT note FROM c WHERE id = 1").s, "none")
+	run(t, store, "DELETE FROM p WHERE id = 1")
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM c").i, i64(0))
+	// A table may reference itself.
+	run(t, store, "CREATE TABLE tree (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES tree (id))")
+	run(t, store, "INSERT INTO tree VALUES (1, NULL), (2, 1)")
+	testing.expect(t, run_error(t, store, "INSERT INTO tree VALUES (3, 42)").kind != .None)
+
+	// CURRENT_TIMESTAMP and its siblings, as values and as a per-row DEFAULT.
+	testing.expect_value(t, scalar(t, store, "SELECT length(CURRENT_TIMESTAMP)").i, i64(19))
+	testing.expect_value(t, scalar(t, store, "SELECT length(CURRENT_DATE)").i, i64(10))
+	testing.expect_value(t, scalar(t, store, "SELECT length(CURRENT_TIME)").i, i64(8))
+	run(t, store, "CREATE TABLE stamps (id INTEGER PRIMARY KEY, at TEXT DEFAULT CURRENT_TIMESTAMP, n INTEGER DEFAULT (1 + 1))")
+	run(t, store, "INSERT INTO stamps (id) VALUES (1)")
+	testing.expect(t, db.value_is_truthy(scalar(t, store, "SELECT at = datetime('now') OR at < datetime('now') FROM stamps")))
+	testing.expect_value(t, scalar(t, store, "SELECT n FROM stamps").i, i64(2))
+
+	// Index and key columns may carry a direction.
+	run(t, store, "CREATE INDEX stamps_at ON stamps (at DESC, id ASC)")
+	run(t, store, "CREATE TABLE k (a INTEGER, b INTEGER, PRIMARY KEY (a DESC, b))")
+	// ON CONFLICT on a constraint would change what a violation does: refused.
+	testing.expect_value(t, run_error(t, store, "CREATE TABLE oc (x INTEGER UNIQUE ON CONFLICT REPLACE)").kind, db.Error_Kind.Sql_Unsupported)
+
+	// The per-row default survives a reopen.
+	db.store_close(store)
+	reopened, err := db.store_open("_test_col_refs", {persistent = true, create = false, durable = false})
+	testing.expect(t, db.error_ok(err))
+	defer cleanup_db(reopened, "col_refs")
+	run(t, reopened, "INSERT INTO stamps (id) VALUES (2)")
+	testing.expect_value(t, scalar(t, reopened, "SELECT length(at) FROM stamps WHERE id = 2").i, i64(19))
+}
+
+@(test)
+test_deferred_foreign_keys :: proc(t: ^testing.T) {
+	store := fresh_db(t, "deferred_fk")
+	if store == nil do return
+	defer cleanup_db(store, "deferred_fk")
+
+	run(t, store, "CREATE TABLE p (id INTEGER PRIMARY KEY)")
+	run(t, store, "CREATE TABLE c (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p (id) DEFERRABLE INITIALLY DEFERRED)")
+	// The child may come first; the commit finds its parent.
+	tx := db.tx_begin_write(store)
+	testing.expect(t, func_exec(t, tx, "INSERT INTO c VALUES (1, 10)"))
+	testing.expect(t, func_exec(t, tx, "INSERT INTO p VALUES (10)"))
+	testing.expect(t, db.error_ok(db.tx_commit(tx)))
+	// A commit that leaves a child without its parent is refused and rolled back.
+	tx = db.tx_begin_write(store)
+	testing.expect(t, func_exec(t, tx, "INSERT INTO c VALUES (2, 20)"))
+	broken := db.tx_commit(tx)
+	testing.expect(t, broken.kind != .None)
+	db.error_free(&broken)
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM c").i, i64(1))
+	// A parent replaced within the transaction is fine.
+	tx = db.tx_begin_write(store)
+	testing.expect(t, func_exec(t, tx, "DELETE FROM p WHERE id = 10"))
+	testing.expect(t, func_exec(t, tx, "INSERT INTO p VALUES (10)"))
+	testing.expect(t, db.error_ok(db.tx_commit(tx)))
+	// In autocommit the statement is the transaction: checked at its end.
+	testing.expect(t, run_error(t, store, "INSERT INTO c VALUES (3, 30)").kind != .None)
+	// NOT DEFERRABLE and INITIALLY IMMEDIATE check at once, as before.
+	run(t, store, "CREATE TABLE i (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p (id) DEFERRABLE INITIALLY IMMEDIATE)")
+	tx = db.tx_begin_write(store)
+	_, now := db.sql_execute_in_tx(tx, "INSERT INTO i VALUES (1, 77)")
+	testing.expect(t, now.kind != .None)
+	db.error_free(&now)
+	db.tx_rollback(tx)
+}

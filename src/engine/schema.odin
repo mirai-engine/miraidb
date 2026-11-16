@@ -299,6 +299,9 @@ Column :: struct {
 	// expression text evaluated against the row being stored.
 	generated:      bool,
 	generated_sql:  string,
+	// default_sql is a DEFAULT that has to be evaluated for every row, such as
+	// CURRENT_TIMESTAMP; a constant default is default_value instead.
+	default_sql:    string,
 }
 
 // Index_Algorithm selects how an index answers equality lookups. Btree keeps
@@ -334,6 +337,19 @@ Foreign_Key :: struct {
 	ref_columns: []int,
 	on_delete:   Foreign_Key_Action,
 	on_update:   Foreign_Key_Action,
+	// deferred is DEFERRABLE INITIALLY DEFERRED: the key is checked at COMMIT,
+	// so a transaction may write the child before its parent.
+	deferred:    bool,
+}
+
+// Check_Constraint is a CHECK clause: the row is refused when the expression is
+// false (NULL passes, as in SQL). `sql` is the expression's text.
+Check_Constraint :: struct {
+	name: string,
+	sql:  string,
+	// column names the column a column-level CHECK was declared on; it goes with
+	// that column when the column is dropped. Empty for a table-level CHECK.
+	column: string,
 }
 
 Table_Schema :: struct {
@@ -351,6 +367,22 @@ Table_Schema :: struct {
 	auto_increment_column: int,
 	// foreign_keys ties this table's columns to a parent table.
 	foreign_keys:         []Foreign_Key,
+	// checks are the table's CHECK constraints, column and table level alike.
+	checks:               []Check_Constraint,
+}
+
+// SCHEMA_HAS_EXTRAS marks a schema record that carries the section written after
+// the indexes: CHECK constraints, per-row defaults and deferred foreign keys. It
+// is set only when the table has one of them, so a database that uses none stays
+// readable by a build that predates the section.
+SCHEMA_HAS_EXTRAS :: u8(1 << 2)
+
+@(private)
+schema_has_extras :: proc(schema: ^Table_Schema) -> bool {
+	if len(schema.checks) > 0 do return true
+	for col in schema.columns do if len(col.default_sql) > 0 do return true
+	for fk in schema.foreign_keys do if fk.deferred do return true
+	return false
 }
 
 NO_COLUMN :: -1
@@ -1025,6 +1057,8 @@ schema_encode :: proc(w: ^Byte_Writer, schema: ^Table_Schema) {
 	flags := u8(0)
 	if schema.ephemeral do flags |= 1 << 0
 	if schema.event do flags |= 1 << 1
+	extras := schema_has_extras(schema)
+	if extras do flags |= SCHEMA_HAS_EXTRAS
 	bw_write_u8(w, flags)
 	bw_write_u32(w, u32(len(schema.columns)))
 	for col in schema.columns {
@@ -1101,6 +1135,26 @@ schema_encode :: proc(w: ^Byte_Writer, schema: ^Table_Schema) {
 		for col in idx.columns {
 			bw_write_u32(w, u32(col))
 		}
+	}
+	if extras {
+		bw_write_u32(w, u32(len(schema.checks)))
+		for check in schema.checks {
+			bw_write_string(w, check.name)
+			bw_write_string(w, check.sql)
+			bw_write_string(w, check.column)
+		}
+		defaults := 0
+		for col in schema.columns do if len(col.default_sql) > 0 do defaults += 1
+		bw_write_u32(w, u32(defaults))
+		for col, i in schema.columns {
+			if len(col.default_sql) == 0 do continue
+			bw_write_u32(w, u32(i))
+			bw_write_string(w, col.default_sql)
+		}
+		deferred := 0
+		for fk in schema.foreign_keys do if fk.deferred do deferred += 1
+		bw_write_u32(w, u32(deferred))
+		for fk, i in schema.foreign_keys do if fk.deferred do bw_write_u32(w, u32(i))
 	}
 }
 
@@ -1214,6 +1268,30 @@ schema_decode :: proc(r: ^Byte_Reader, alloc: mem.Allocator) -> Table_Schema {
 	schema.indexes = indexes
 	schema.primary_key = primary_key
 	schema.auto_increment_column = auto_increment_column
+	if schema_flags & SCHEMA_HAS_EXTRAS != 0 {
+		nchecks := int(br_read_u32(r))
+		if r.bad do return schema
+		checks := make([]Check_Constraint, nchecks, alloc)
+		for i in 0 ..< nchecks {
+			checks[i].name = br_read_string(r, alloc)
+			checks[i].sql = br_read_string(r, alloc)
+			checks[i].column = br_read_string(r, alloc)
+		}
+		schema.checks = checks
+		ndefaults := int(br_read_u32(r))
+		for _ in 0 ..< ndefaults {
+			position := int(br_read_u32(r))
+			text := br_read_string(r, alloc)
+			if r.bad || position < 0 || position >= len(columns) do return schema
+			columns[position].default_sql = text
+		}
+		ndeferred := int(br_read_u32(r))
+		for _ in 0 ..< ndeferred {
+			position := int(br_read_u32(r))
+			if r.bad || position < 0 || position >= len(schema.foreign_keys) do return schema
+			schema.foreign_keys[position].deferred = true
+		}
+	}
 	return schema
 }
 
@@ -1265,6 +1343,9 @@ schema_copy :: proc(schema: ^Table_Schema, alloc: mem.Allocator) -> Table_Schema
 		if col.generated {
 			out.columns[i].generated_sql = strings.clone(col.generated_sql, alloc)
 		}
+		if len(col.default_sql) > 0 {
+			out.columns[i].default_sql = strings.clone(col.default_sql, alloc)
+		}
 		if col.has_default {
 			out.columns[i].default_value = value_clone(col.default_value, alloc)
 		}
@@ -1285,6 +1366,10 @@ schema_copy :: proc(schema: ^Table_Schema, alloc: mem.Allocator) -> Table_Schema
 		out.indexes[i] = idx
 		out.indexes[i].name = strings.clone(idx.name, alloc)
 		out.indexes[i].columns = slice.clone(idx.columns, alloc)
+	}
+	out.checks = make([]Check_Constraint, len(schema.checks), alloc)
+	for check, i in schema.checks {
+		out.checks[i] = Check_Constraint{name = strings.clone(check.name, alloc), sql = strings.clone(check.sql, alloc), column = strings.clone(check.column, alloc)}
 	}
 	return out
 }

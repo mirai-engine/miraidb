@@ -124,6 +124,31 @@ def main() -> int:
             text=True,
             timeout=120,
         )
+        # A SQLite file's CHECK and per-row DEFAULT survive the import: the
+        # engine reads the file's own declaration for them.
+        import sqlite3
+
+        source = os.path.join(work, "rules.sqlite")
+        rules = sqlite3.connect(source)
+        rules.execute(
+            "CREATE TABLE r (id INTEGER PRIMARY KEY, name TEXT CHECK (length(name) > 0), "
+            "at TEXT DEFAULT CURRENT_TIMESTAMP, CONSTRAINT pos CHECK (id > 0))"
+        )
+        rules.execute("INSERT INTO r (id, name) VALUES (1, 'a')")
+        rules.commit()
+        rules.close()
+        imported_db = os.path.join(work, "rules_db")
+        subprocess.run([BINARY, "import-sqlite", windows_path(source), windows_path(imported_db)], capture_output=True, timeout=120)
+
+        def ask(statement: str) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                [BINARY, "sql", windows_path(imported_db), statement], capture_output=True, text=True, timeout=120
+            )
+
+        refused_check = ask("INSERT INTO r (id, name) VALUES (2, '')")
+        refused_named = ask("INSERT INTO r (id, name) VALUES (-1, 'b')")
+        accepted = ask("INSERT INTO r (id, name) VALUES (3, 'c')")
+        stamped = ask("SELECT length(at) FROM r WHERE id = 3")
 
         checks = {
             "last line without newline": "tail-without-newline" in tail.stdout,
@@ -143,6 +168,9 @@ def main() -> int:
             "import": "imported 2 rows into imported" in out,
             "import clean": "line " not in out,
             "output redirected": dumped.count("INSERT INTO t") == 2,
+            "import keeps a CHECK": "CHECK constraint failed: length(name) > 0" in refused_check.stderr,
+            "import keeps a named CHECK": "CHECK constraint failed: pos" in refused_named.stderr,
+            "import keeps a per-row DEFAULT": accepted.returncode == 0 and "19" in stamped.stdout,
         }
         failed = [name for name, ok in checks.items() if not ok]
         for name, ok in checks.items():

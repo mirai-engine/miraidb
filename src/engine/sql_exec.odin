@@ -205,7 +205,7 @@ statement_fails_partially :: proc(statement: Statement) -> bool {
 @(private)
 conflict_skippable :: proc(kind: Error_Kind) -> bool {
 	#partial switch kind {
-	case .Duplicate_Primary_Key, .Duplicate_Unique, .Not_Null_Violation:
+	case .Duplicate_Primary_Key, .Duplicate_Unique, .Not_Null_Violation, .Check_Violation:
 		return true
 	}
 	return false
@@ -6400,7 +6400,15 @@ sql_exec_create_table :: proc(tx: ^Tx, stmt: Create_Table_Stmt, params: []Value)
 		if column.auto_increment {
 			schema.auto_increment_column = i
 		}
-		if definition.default != nil {
+		if definition.default != nil && expr_calls_a_function(definition.default) && len(definition.default_sql) > 0 {
+			// A default that calls a function (CURRENT_TIMESTAMP, random(), …)
+			// is evaluated for each row, as SQLite does, not once now. Parse it
+			// here so a bad one is refused when the table is created.
+			check_query, _, check_err := sql_parse_expression(definition.default_sql)
+			if check_err.kind != .None do return {}, check_err
+			query_destroy(&check_query)
+			column.default_sql = strings.clone(definition.default_sql, tx.alloc)
+		} else if definition.default != nil {
 			value, eval_err := eval_expr(
 				&Eval_Ctx{params = params, now_us = now_microseconds()},
 				definition.default,
@@ -6420,9 +6428,26 @@ sql_exec_create_table :: proc(tx: ^Tx, stmt: Create_Table_Stmt, params: []Value)
 		schema.primary_key = pk
 	}
 
+	checks := make([dynamic]Check_Constraint, 0, 0, tx.alloc)
+	for definition in stmt.columns {
+		for check in definition.checks do append(&checks, check)
+	}
+	for constraint in stmt.constraints {
+		if constraint.is_check do append(&checks, Check_Constraint{name = constraint.name, sql = constraint.check_sql})
+	}
+	for check, i in checks {
+		// Parsed now so a malformed CHECK is refused with the table.
+		check_query, _, check_err := sql_parse_expression(check.sql)
+		if check_err.kind != .None do return {}, check_err
+		query_destroy(&check_query)
+		checks[i] = Check_Constraint{name = strings.clone(check.name, tx.alloc), sql = strings.clone(check.sql, tx.alloc), column = strings.clone(check.column, tx.alloc)}
+	}
+	schema.checks = checks[:]
+
 	indexes := make([dynamic]Index_Schema, 0, len(stmt.constraints), tx.alloc)
 	foreign_keys := make([dynamic]Foreign_Key, 0, len(stmt.constraints), tx.alloc)
 	for constraint in stmt.constraints {
+		if constraint.is_check do continue
 		positions := make([]int, len(constraint.columns), tx.alloc)
 		for name, i in constraint.columns {
 			position, found := schema_column_index(&schema, name)
@@ -6433,28 +6458,45 @@ sql_exec_create_table :: proc(tx: ^Tx, stmt: Create_Table_Stmt, params: []Value)
 		}
 		if constraint.is_foreign {
 			// Resolve the referenced columns against the parent schema, which
-			// must already exist and key the columns uniquely.
-			parent, parent_err := tx_table(tx, constraint.ref_table)
-			if parent_err.kind != .None {
-				return {}, errf(
-					.Table_Not_Found,
-					"foreign key %s references missing table %s",
-					stmt.name,
-					constraint.ref_table,
-				)
+			// must already exist and key the columns uniquely. A table may
+			// reference itself, before it exists.
+			parent_schema: ^Table_Schema
+			if strings.equal_fold(constraint.ref_table, stmt.name) {
+				parent_schema = &schema
+			} else {
+				parent, parent_err := tx_table(tx, constraint.ref_table)
+				if parent_err.kind != .None {
+					return {}, errf(
+						.Table_Not_Found,
+						"foreign key %s references missing table %s",
+						stmt.name,
+						constraint.ref_table,
+					)
+				}
+				parent_schema = &parent.schema
 			}
-			if len(constraint.ref_columns) != len(positions) {
+			ref_names := constraint.ref_columns
+			if len(ref_names) == 0 {
+				// `REFERENCES parent` with no columns names the parent's primary key.
+				if len(parent_schema.primary_key) == 0 {
+					return {}, errf(.Invalid_Argument, "foreign key on %s references %s, which has no primary key", stmt.name, constraint.ref_table)
+				}
+				names := make([]string, len(parent_schema.primary_key), tx.alloc)
+				for position, i in parent_schema.primary_key do names[i] = parent_schema.columns[position].name
+				ref_names = names
+			}
+			if len(ref_names) != len(positions) {
 				return {}, errf(
 					.Invalid_Argument,
 					"foreign key on %s lists %d columns but references %d",
 					stmt.name,
 					len(positions),
-					len(constraint.ref_columns),
+					len(ref_names),
 				)
 			}
-			ref_positions := make([]int, len(constraint.ref_columns), tx.alloc)
-			for name, i in constraint.ref_columns {
-				position, found := schema_column_index(&parent.schema, name)
+			ref_positions := make([]int, len(ref_names), tx.alloc)
+			for name, i in ref_names {
+				position, found := schema_column_index(parent_schema, name)
 				if !found {
 					return {}, errf(
 						.Column_Not_Found,
@@ -6465,7 +6507,7 @@ sql_exec_create_table :: proc(tx: ^Tx, stmt: Create_Table_Stmt, params: []Value)
 				}
 				ref_positions[i] = position
 			}
-			if !schema_columns_unique(&parent.schema, ref_positions) {
+			if !schema_columns_unique(parent_schema, ref_positions) {
 				return {}, errf(
 					.Invalid_Argument,
 					"foreign key on %s must reference a unique key of %s",
@@ -6488,6 +6530,7 @@ sql_exec_create_table :: proc(tx: ^Tx, stmt: Create_Table_Stmt, params: []Value)
 					ref_columns = ref_positions,
 					on_delete = constraint.on_delete,
 					on_update = constraint.on_update,
+					deferred = constraint.deferred,
 				},
 			)
 			continue
@@ -7220,6 +7263,95 @@ value_compare_collated :: proc(
 
 // Generated_Plan holds the parsed expressions of a table's generated columns.
 // It is built once per statement so a row only evaluates them.
+// expr_calls_a_function reports whether an expression contains a function call,
+// which makes a DEFAULT per-row rather than constant.
+@(private)
+expr_calls_a_function :: proc(e: ^Expr) -> bool {
+	found := false
+	expr_walk(e, proc(node: ^Expr, user: rawptr) -> bool {
+		if _, is_call := node^.(Call_Expr); is_call do (^bool)(user)^ = true
+		return true
+	}, &found)
+	return found
+}
+
+// store_expression parses an expression the engine evaluates per row (a CHECK,
+// a per-row DEFAULT) once and keeps it for the life of the store: text that
+// arrived with the schema is re-read on every write otherwise.
+@(private)
+store_expression :: proc(store: ^Store, text: string) -> (^Expr, Error) {
+	sync.mutex_lock(&store.expr_cache_mutex)
+	defer sync.mutex_unlock(&store.expr_cache_mutex)
+	if cached, ok := store.expr_cache[text]; ok do return cached.expr, ERROR_NONE
+	query, expr, err := sql_parse_expression(text)
+	if err.kind != .None do return nil, err
+	entry := new(Cached_Expression)
+	entry.query = query
+	entry.expr = expr
+	store.expr_cache[strings.clone(text)] = entry
+	return expr, ERROR_NONE
+}
+
+// checks_enforce evaluates a table's CHECK constraints against a row about to be
+// written. NULL passes and false refuses, as in SQL.
+checks_enforce :: proc(tx: ^Tx, table: ^Table, values: []Value) -> Error {
+	if len(table.schema.checks) == 0 do return ERROR_NONE
+	sources: [1]Source
+	sources[0] = Source{table = table, row = Row{values = values}}
+	ctx := Eval_Ctx{tx = tx, sources = sources[:], now_us = now_microseconds()}
+	for check in table.schema.checks {
+		expr, parse_err := store_expression(tx.store, check.sql)
+		if parse_err.kind != .None do return parse_err
+		value, eval_err := eval_expr(&ctx, expr)
+		if eval_err.kind != .None do return eval_err
+		if value.kind == .Null || value_is_truthy(value) do continue
+		label := len(check.name) > 0 ? check.name : check.sql
+		return errf(.Check_Violation, "CHECK constraint failed: %s", label)
+	}
+	return ERROR_NONE
+}
+
+// checks_use_column reports whether a CHECK constraint of the schema names the
+// column, which an ALTER that drops or renames it has to respect.
+checks_use_column :: proc(schema: ^Table_Schema, column: string, skip_own := false) -> bool {
+	Probe :: struct {
+		column: string,
+		found:  bool,
+	}
+	for check in schema.checks {
+		// A column's own CHECK goes with it when the column is dropped.
+		if skip_own && strings.equal_fold(check.column, column) do continue
+		query, expr, err := sql_parse_expression(check.sql)
+		if err.kind != .None {
+			error_free(&err)
+			continue
+		}
+		probe := Probe{column = column}
+		expr_walk(expr, proc(node: ^Expr, user: rawptr) -> bool {
+			probe := (^Probe)(user)
+			if reference, ok := node^.(Column_Expr); ok && strings.equal_fold(reference.name, probe.column) {
+				probe.found = true
+			}
+			return true
+		}, &probe)
+		query_destroy(&query)
+		if probe.found do return true
+	}
+	return false
+}
+
+// column_default_for_row gives a column's default for one row: a per-row DEFAULT
+// is evaluated now, a constant one is the stored value.
+column_default_for_row :: proc(tx: ^Tx, column: Column) -> (Value, Error) {
+	if len(column.default_sql) == 0 do return column_default(column), ERROR_NONE
+	expr, parse_err := store_expression(tx.store, column.default_sql)
+	if parse_err.kind != .None do return {}, parse_err
+	ctx := Eval_Ctx{tx = tx, now_us = now_microseconds()}
+	value, eval_err := eval_expr(&ctx, expr)
+	if eval_err.kind != .None do return {}, eval_err
+	return value_clone(value, tx.alloc), ERROR_NONE
+}
+
 Generated_Plan :: struct {
 	columns: [dynamic]int,
 	queries: [dynamic]Query,

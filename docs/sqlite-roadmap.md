@@ -9,7 +9,7 @@ says how much of the surface runs and what is left.
 
 `python scripts/sqlite_gaps.py` runs every built-in function and pragma of the
 inventory, and 63 grammar shapes, through the CLI on an in-memory database.
-Measured today: functions **73 / 121**, pragmas **54 / 63**, grammar **41 / 63**.
+Measured today: functions **75 / 121**, pragmas **54 / 63**, grammar **47 / 63**.
 
 The function count leaves out ten names SQLite builds only for its own tests
 (`expr_compare`, `fpdecode`, `oom`, …). A function or pragma counts as present
@@ -29,11 +29,11 @@ The detail of each item is in [backlog.md](backlog.md); the order is in
 
 | Item | Missing today |
 |---|---|
-| **S1** — the schema real files declare | `CHECK` (column and table), `CONSTRAINT <name>`, column-level `REFERENCES`, `DEFERRABLE INITIALLY DEFERRED`, `DESC` index columns, partial indexes, expression indexes, `CURRENT_TIMESTAMP` / `CURRENT_DATE` / `CURRENT_TIME` |
+| **S1** — the schema real files declare | partial indexes, expression indexes, `ON CONFLICT` on a constraint |
 | **S2** — statement and expression forms | `UPDATE OR <resolution>` |
 | **S3** — joins | `RIGHT`, `FULL`, `NATURAL` |
 | **S4** — aggregates and windows | `FILTER`, the `WINDOW` clause, `ORDER BY` inside an aggregate, `median`, `percentile`, `percentile_cont`, `percentile_disc`, `json_group_array`, `json_group_object` |
-| **S5** — functions | `acosh`, `asinh`, `atanh`, `cosh`, `sinh`, `tanh`, `ln`, `ceiling`, `power`, `if`, `soundex`, `unistr`, `unistr_quote`, `affinity`, `timediff`, `current_date`, `current_time`, `likely`, `unlikely`, `likelihood`, `sqlite_source_id`, `sqlite_compileoption_get`, `sqlite_compileoption_used`, `sqlite_offset`, `json_insert`, `json_patch`, `json_pretty`, `json_parse`, `json_error_position`, `json_array_insert`, and 13 `jsonb_*` functions |
+| **S5** — functions | `acosh`, `asinh`, `atanh`, `cosh`, `sinh`, `tanh`, `ln`, `ceiling`, `power`, `if`, `soundex`, `unistr`, `unistr_quote`, `affinity`, `timediff`, `likely`, `unlikely`, `likelihood`, `sqlite_source_id`, `sqlite_compileoption_get`, `sqlite_compileoption_used`, `sqlite_offset`, `json_insert`, `json_patch`, `json_pretty`, `json_parse`, `json_error_position`, `json_array_insert`, and 13 `jsonb_*` functions |
 | **S6** — statements and pragmas | `EXPLAIN QUERY PLAN`, `REINDEX`, `INSTEAD OF` triggers, `INDEXED BY`/`NOT INDEXED`, `generate_series`, `VACUUM` and `ATTACH ':memory:'` in memory; pragmas `collation_list`, `module_list`, `temp_store`, `incremental_vacuum`, `shrink_memory`, `soft_heap_limit64`, `temp_store_directory`, `data_store_directory`, `legacy_file_format` |
 | **S7** — typing | a column with no declared type, SQLite's affinity rules, comparison across storage classes, `WITHOUT ROWID` as a write target (`ANY` columns exist) |
 | **D4**, **D24** — the `.sqlite` mirror | secondary index b-trees patched in place; a reported skip for an index the engine cannot express |

@@ -39,7 +39,7 @@ that way.
 
 | # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
-| 8 | **S1 — the schema real files declare** | `CHECK`, `CONSTRAINT` names, column `REFERENCES`, deferrable foreign keys, `DESC` index columns, partial and expression indexes, `CURRENT_TIMESTAMP` and its siblings. A schema using any of them fails at `CREATE TABLE`. | M | — |
+| 8 | **S1 — the schema real files declare** — *partly done* | Done: `CHECK`, `CONSTRAINT` names, column `REFERENCES`, deferred foreign keys, `ASC`/`DESC` columns, `CURRENT_TIMESTAMP` and per-row defaults. Left: partial and expression indexes. | M | — |
 | 9 | **S2 — statement and expression forms** — *done but one* | Done: `IS` values, `IS DISTINCT FROM`, bitwise operators, `->`/`->>`, `LIMIT a, b`, `INSERT OR IGNORE/FAIL/ROLLBACK`, `REPLACE INTO`, `INTERSECT`/`EXCEPT`, `NULLS FIRST/LAST`, derived tables and `VALUES`, row values; a failed statement is undone whole inside a transaction. Left: `UPDATE OR <resolution>`. | S | — |
 | 10 | **S3 — joins** | `RIGHT`, `FULL`, `NATURAL`. | M | — |
 | 11 | **S4 — aggregates and windows** | `FILTER`, the `WINDOW` clause, `ORDER BY` inside an aggregate, `median` and the percentiles, `json_group_array`/`_object`. | M | — |
