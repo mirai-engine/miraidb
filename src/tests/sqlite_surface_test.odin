@@ -197,3 +197,109 @@ test_insert_conflict_resolutions :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT v FROM a WHERE id = 1").s, "z")
 	testing.expect_value(t, count(t, store, "a"), i64(4))
 }
+
+@(private = "file")
+column_ints :: proc(t: ^testing.T, store: ^db.Store, sql: string) -> [dynamic]i64 {
+	out := make([dynamic]i64, context.temp_allocator)
+	result := run(t, store, sql)
+	defer db.sql_result_destroy(&result)
+	for row in result.rows do append(&out, row[0].kind == .Null ? -1 : row[0].i)
+	return out
+}
+
+@(private = "file")
+expect_ints :: proc(t: ^testing.T, store: ^db.Store, sql: string, want: []i64) {
+	got := column_ints(t, store, sql)
+	ok := len(got) == len(want)
+	if ok do for v, i in want do if got[i] != v do ok = false
+	testing.expectf(t, ok, "%s: got %v, want %v (-1 is NULL)", sql, got[:], want)
+}
+
+@(test)
+test_compound_operators :: proc(t: ^testing.T) {
+	store := fresh_db(t, "compound_ops")
+	if store == nil do return
+	defer cleanup_db(store, "compound_ops")
+
+	run(t, store, "CREATE TABLE n (x INTEGER)")
+	run(t, store, "INSERT INTO n VALUES (1), (2), (2), (3), (NULL)")
+	expect_ints(t, store, "SELECT x FROM n INTERSECT SELECT 2 ORDER BY 1", {2})
+	expect_ints(t, store, "SELECT x FROM n EXCEPT SELECT 2 ORDER BY 1", {-1, 1, 3})
+	// Left to right: the UNION removes the duplicate, the UNION ALL after it adds one.
+	expect_ints(t, store, "SELECT 1 UNION SELECT 1 UNION ALL SELECT 1", {1, 1})
+	expect_ints(t, store, "SELECT x FROM n UNION ALL SELECT 5 EXCEPT SELECT 1 ORDER BY 1", {-1, 2, 3, 5})
+	expect_ints(t, store, "SELECT x FROM n INTERSECT SELECT 2 UNION SELECT 9 ORDER BY 1", {2, 9})
+}
+
+@(test)
+test_nulls_first_and_last :: proc(t: ^testing.T) {
+	store := fresh_db(t, "nulls_order")
+	if store == nil do return
+	defer cleanup_db(store, "nulls_order")
+
+	run(t, store, "CREATE TABLE n (id INTEGER PRIMARY KEY, x INTEGER)")
+	run(t, store, "CREATE INDEX n_x ON n (x)")
+	run(t, store, "INSERT INTO n VALUES (1, 2), (2, NULL), (3, 1)")
+	// The defaults: NULL is the smallest value.
+	expect_ints(t, store, "SELECT x FROM n ORDER BY x", {-1, 1, 2})
+	expect_ints(t, store, "SELECT x FROM n ORDER BY x DESC", {2, 1, -1})
+	// Explicit placement, whatever the direction; the index walk cannot give it.
+	expect_ints(t, store, "SELECT x FROM n ORDER BY x NULLS LAST", {1, 2, -1})
+	expect_ints(t, store, "SELECT x FROM n ORDER BY x DESC NULLS FIRST", {-1, 2, 1})
+	expect_ints(t, store, "SELECT id, row_number() OVER (ORDER BY x NULLS LAST) AS r FROM n ORDER BY r", {3, 1, 2})
+	// An ORDER BY expression that fails is the statement's error. It used to sort
+	// as NULL, so a misspelt column or a window here returned unsorted rows.
+	testing.expect_value(t, run_error(t, store, "SELECT id FROM n ORDER BY no_such_column").kind, db.Error_Kind.Column_Not_Found)
+	testing.expect(t, run_error(t, store, "SELECT id FROM n ORDER BY row_number() OVER (ORDER BY x)").kind != .None)
+}
+
+@(test)
+test_derived_tables_and_values :: proc(t: ^testing.T) {
+	store := fresh_db(t, "derived")
+	if store == nil do return
+	defer cleanup_db(store, "derived")
+
+	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+	run(t, store, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+	expect_ints(t, store, "SELECT s.v FROM (SELECT v FROM t WHERE v > 10) AS s ORDER BY s.v", {20, 30})
+	expect_ints(t, store, "SELECT count(*) FROM (SELECT id FROM t UNION SELECT 7)", {4})
+	expect_ints(t, store, "SELECT column1 FROM (VALUES (5, 'a'), (6, 'b'))", {5, 6})
+	expect_ints(t, store, "VALUES (8), (9)", {8, 9})
+	expect_ints(t, store, "SELECT t.v FROM t JOIN (VALUES (2), (3)) AS k ON k.column1 = t.id ORDER BY t.v", {20, 30})
+	testing.expect_value(t, run_error(t, store, "SELECT * FROM (VALUES (1), (2, 3))").kind, db.Error_Kind.Sql_Syntax)
+
+	// A CTE or derived table named like a real table hides it for its statement
+	// only: the next statement of the same transaction reads the table again.
+	tx := db.tx_begin_write(store)
+	shadow, shadow_err := db.sql_execute_in_tx(tx, "WITH t AS (SELECT 99 AS v) SELECT v FROM t")
+	testing.expect(t, db.error_ok(shadow_err))
+	if testing.expect_value(t, len(shadow.rows), 1) do testing.expect_value(t, shadow.rows[0][0].i, i64(99))
+	db.sql_result_destroy(&shadow)
+	real, real_err := db.sql_execute_in_tx(tx, "SELECT count(*) FROM t")
+	testing.expect(t, db.error_ok(real_err))
+	if testing.expect_value(t, len(real.rows), 1) do testing.expect_value(t, real.rows[0][0].i, i64(3))
+	db.sql_result_destroy(&real)
+	db.tx_rollback(tx)
+}
+
+@(test)
+test_row_values :: proc(t: ^testing.T) {
+	store := fresh_db(t, "row_values")
+	if store == nil do return
+	defer cleanup_db(store, "row_values")
+
+	run(t, store, "CREATE TABLE p (a INTEGER, b TEXT)")
+	run(t, store, "INSERT INTO p VALUES (1, 'x'), (2, 'y'), (2, 'z'), (3, NULL)")
+	expect_ints(t, store, "SELECT a FROM p WHERE (a, b) = (2, 'y')", {2})
+	expect_ints(t, store, "SELECT a FROM p WHERE (a, b) > (2, 'y') ORDER BY a", {2, 3})
+	expect_ints(t, store, "SELECT a FROM p WHERE (a, b) IN ((1, 'x'), (2, 'z')) ORDER BY a", {1, 2})
+	expect_ints(t, store, "SELECT a FROM p WHERE (a, b) IN (SELECT a, b FROM p WHERE a > 1) ORDER BY a", {2, 2})
+	// NULL in a deciding column makes the comparison unknown.
+	testing.expect_value(t, scalar(t, store, "SELECT (1, NULL) = (1, 2)").kind, db.Value_Kind.Null)
+	testing.expect_value(t, scalar(t, store, "SELECT (1, 2) IN (SELECT 1, NULL)").kind, db.Value_Kind.Null)
+	testing.expect(t, db.value_is_truthy(scalar(t, store, "SELECT (1, NULL) < (2, 0)")))
+	testing.expect(t, db.value_is_truthy(scalar(t, store, "SELECT (NULL, 1) IS (NULL, 1)")))
+	// A row value alone, or of the wrong width, is refused as in SQLite.
+	testing.expect_value(t, run_error(t, store, "SELECT (1, 2)").kind, db.Error_Kind.Sql_Syntax)
+	testing.expect_value(t, run_error(t, store, "SELECT (1, 2) = (1, 2, 3)").kind, db.Error_Kind.Sql_Syntax)
+}

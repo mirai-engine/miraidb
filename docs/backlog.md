@@ -34,7 +34,7 @@ Rules for this file:
 | R3 | pruning walks every row of every table after each statement | prune what the commit touched | S |
 | R4 | a committed row is copied from the transaction arena to the table | hand the staged row over | M |
 | S1 | `CHECK`, column `REFERENCES`, `CONSTRAINT` names, `DESC` and partial/expression indexes, `CURRENT_TIMESTAMP` are refused | accept the schema real SQLite files declare | M |
-| S2 | five forms are refused; eight landed | parser and executor work, each small | M |
+| S2 | `UPDATE OR <resolution>` is refused; the rest landed | the UPDATE resolutions | S |
 | S3 | `RIGHT`, `FULL` and `NATURAL` joins are refused | the three joins | M |
 | S4 | `FILTER`, `WINDOW`, aggregate `ORDER BY`, ordered-set aggregates missing | the aggregate surface | M |
 | S5 | 48 of 121 built-in functions missing | math, JSON/JSONB, text, introspection | M |
@@ -157,9 +157,17 @@ right needed statement atomicity: a statement that failed inside a transaction
 used to leave the rows it staged before the failing one, and now a per-statement
 undo log takes it back whole (`test_a_failed_statement_is_undone_in_a_transaction`).
 
-**Now refused.** `INTERSECT` and `EXCEPT`, `NULLS FIRST` / `NULLS LAST`, `VALUES`
-as a table in `FROM`, row values (`(a, b) = (1, 2)`, `(a, b) IN (SELECT …)`), and
-`UPDATE OR <resolution>`. A unique key an `UPDATE` changes is checked against the
+`INTERSECT` and `EXCEPT`, with the chain applied left to right (a `UNION`
+anywhere used to deduplicate the whole result); `NULLS FIRST` / `NULLS LAST`; a
+subquery or `VALUES` in `FROM`, and `VALUES` as a statement; row values in
+comparisons, `IN` lists and `IN (SELECT …)` (`test_compound_operators`,
+`test_nulls_first_and_last`, `test_derived_tables_and_values`,
+`test_row_values`). Two wrong answers were found and fixed on the way: a CTE's
+name stayed bound for the rest of a transaction, hiding a real table of that
+name from later statements, and an `ORDER BY` expression that failed (a misspelt
+column, a window function) sorted as NULL instead of failing the statement.
+
+**Now refused.** `UPDATE OR <resolution>`. A unique key an `UPDATE` changes is checked against the
 statement's result, where SQLite checks it row by row; a statement whose rows
 collide only partway through succeeds here (`docs/sqlite.md`).
 

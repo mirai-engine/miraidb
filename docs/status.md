@@ -135,7 +135,7 @@ the gaps are named rather than left to be discovered.
   and checks both).
 - `miraidb sql --json <db> <statement>` prints a result as one JSON array of
   rows, which is how `scripts/differential.py` compares answers against SQLite:
-  one schema, one set of rows and 103 queries through both engines, with 6
+  one schema, one set of rows and 120 queries through both engines, with 5
   refusals and 6 intentional differences listed in the script. SQLite is asked
   through Python's `sqlite3` module, which hands back typed values: the
   `sqlite3 -json` shell used before prints `90.0` as `90`, and with the
@@ -150,7 +150,7 @@ the gaps are named rather than left to be discovered.
   `linux_arm64` and `darwin_arm64`. The POSIX lock is the reason it is checked:
   it carried a missing `core:sys/posix` import and two wrong integer types until
   this round, so the code that a Linux build would run had never been compiled.
-- 276 integration tests covering CRUD, recovery, constraints, transactions,
+- 280 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
@@ -394,7 +394,7 @@ than 1000 bytes cannot be indexed and the insert says so.
   characters, `substr` counts a negative start from the end, `WHERE` converts a
   text to a number first, `--json` keeps the `.0` on a real, and `INSERT OR
   REPLACE` is implemented instead of refused by accident (`AUDIT-10` P-B1/P-B2/
-  P-B3/P-B7). `OR ROLLBACK`, `OR FAIL` and `OR IGNORE` are named refusals.
+  P-B3/P-B7). `OR IGNORE`, `OR FAIL` and `OR ROLLBACK` followed (roadmap S2).
 - **The leak report was real, and now a statement leaves nothing.** A tracking
   allocator around the store (`tools/leakcheck`) showed five live allocations per
   read where the suite printed nine lines per statement, and it now shows **zero**

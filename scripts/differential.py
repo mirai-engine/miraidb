@@ -188,6 +188,27 @@ QUERIES = [
     "SELECT json_extract('{\"A\":1}', '$.a'), json_extract('{\"A\":1}', '$.A')",
     # LIMIT <offset>, <count>.
     "SELECT id FROM emp ORDER BY id LIMIT 2, 3",
+    # INTERSECT and EXCEPT, and a chain applied left to right.
+    "SELECT dept FROM emp INTERSECT SELECT id FROM dept",
+    "SELECT id FROM dept EXCEPT SELECT dept FROM emp",
+    "SELECT dept FROM emp UNION SELECT 1 UNION ALL SELECT 1",
+    "SELECT n FROM nums EXCEPT SELECT 1 UNION SELECT 9 ORDER BY 1",
+    # NULLS FIRST / LAST, in a statement and in a window.
+    "SELECT id, dept FROM emp ORDER BY dept NULLS LAST, id",
+    "SELECT id, salary FROM emp ORDER BY salary DESC NULLS FIRST, id",
+    "SELECT id, row_number() OVER (ORDER BY dept DESC NULLS LAST, id) FROM emp ORDER BY id",
+    # Derived tables and VALUES.
+    "SELECT * FROM (SELECT id FROM emp) AS sub",
+    "SELECT s.dept, count(*) FROM (SELECT dept FROM emp WHERE dept IS NOT NULL) AS s GROUP BY s.dept ORDER BY s.dept",
+    "SELECT * FROM (VALUES (1, 'a'), (2, 'b'))",
+    "VALUES (1, 2), (3, NULL)",
+    "SELECT emp.name, v.column2 FROM emp JOIN (VALUES (1, 'one'), (2, 'two')) v ON v.column1 = emp.dept ORDER BY emp.id",
+    # Row values.
+    "SELECT id FROM emp WHERE (dept, name) = (1, 'ana')",
+    "SELECT id FROM emp WHERE (dept, id) > (1, 1) ORDER BY id",
+    "SELECT id FROM emp WHERE (dept, name) IN ((1, 'luis'), (2, 'ana')) ORDER BY id",
+    "SELECT id FROM emp WHERE (dept, name) IN (SELECT id, 'maria' FROM dept) ORDER BY id",
+    "SELECT (1, NULL) = (1, 2), (1, 2) < (1, 3), (1, 2) IS (1, 2)",
 ]
 
 # The engine refuses these and says why; SQLite answers them. A refusal that
@@ -197,7 +218,6 @@ REFUSED = {
     "SELECT emp.id FROM emp FULL JOIN dept ON emp.dept = dept.id": "FULL joins are refused, not approximated",
     "SELECT emp.id FROM emp NATURAL JOIN dept": "NATURAL joins are refused, not approximated",
 
-    "SELECT * FROM (SELECT id FROM emp) AS sub": "a subquery in FROM is not supported",
     "SELECT id FROM emp WHERE EXISTS (SELECT 1 FROM dept WHERE dept.id = emp.dept)": "a correlated reference is not resolved (features.md E2)",
 
     "SELECT sum(n) FILTER (WHERE n > 1) FROM nums": "an aggregate FILTER is not implemented; windows accept one",

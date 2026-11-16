@@ -17,6 +17,8 @@ Parser :: struct {
 	// counter for the whole parser, not one per rule, because every nesting that
 	// costs stack goes through parse_expression.
 	expression_depth: int,
+	// derived_count numbers the derived tables a statement does not name.
+	derived_count: int,
 }
 
 // sql_parse turns one SQL statement into a Query tree. The Query owns an arena
@@ -69,7 +71,7 @@ p_fail :: proc(p: ^Parser, kind: Error_Kind, format: string, args: ..any) -> Err
 @(private)
 p_is_clause_keyword :: proc(p: ^Parser) -> bool {
 	if p.current.kind != .Ident do return false
-	for keyword in ([]string{"from", "where", "group", "order", "limit", "offset", "having", "union", "returning"}) {
+	for keyword in ([]string{"from", "where", "group", "order", "limit", "offset", "having", "union", "intersect", "except", "returning", "window"}) {
 		if strings.equal_fold(p.current.text, keyword) do return true
 	}
 	return false
@@ -262,6 +264,11 @@ parse_statement :: proc(p: ^Parser) -> Statement {
 			with.select_stmt = select_stmt
 		}
 		return with
+	}
+	if p_is_keyword(p, "values") {
+		values := parse_values_select(p)
+		// ORDER BY and LIMIT may follow, as after any query.
+		return values
 	}
 	if p_is_keyword(p, "insert") || p_is_keyword(p, "replace") do return parse_insert(p)
 	if p_is_keyword(p, "update") do return parse_update(p)
@@ -486,6 +493,7 @@ parse_select :: proc(p: ^Parser) -> Statement {
 			} else {
 				p_match_keyword(p, "asc")
 			}
+			item.nulls = parse_nulls_order(p)
 			append(&orders, item)
 			if !p_match_punct(p, ",") do break
 		}
@@ -502,13 +510,24 @@ parse_select :: proc(p: ^Parser) -> Statement {
 	if select.offset == nil && p_match_keyword(p, "offset") {
 		select.offset = parse_expression(p)
 	}
-		// UNION [ALL | DISTINCT] chains more terms. ORDER BY, LIMIT and OFFSET of
-	// any term apply to the compound as a whole, so they move to this select.
+	// UNION [ALL | DISTINCT], INTERSECT and EXCEPT chain more terms, applied left
+	// to right. ORDER BY, LIMIT and OFFSET of any term apply to the compound as a
+	// whole, so they move to this select.
 	parts := make([dynamic]Compound_Select, 0, 2, p.alloc)
 	for {
-		if !p_match_keyword(p, "union") do break
-		all := p_match_keyword(p, "all")
-		if !all do p_match_keyword(p, "distinct")
+		op: Compound_Op
+		all := false
+		if p_match_keyword(p, "union") {
+			all = p_match_keyword(p, "all")
+			if !all do p_match_keyword(p, "distinct")
+			op = all ? .Union_All : .Union
+		} else if p_match_keyword(p, "intersect") {
+			op = .Intersect
+		} else if p_match_keyword(p, "except") {
+			op = .Except
+		} else {
+			break
+		}
 		select_stmt, ok := parse_select(p).(Select_Stmt)
 		if !ok do break
 		if len(select_stmt.order_by) > 0 && len(select.order_by) == 0 {
@@ -527,17 +546,62 @@ parse_select :: proc(p: ^Parser) -> Statement {
 		// up in one list.
 		inner := select_stmt.compound
 		select_stmt.compound = nil
-		append(&parts, Compound_Select{all = all, select_stmt = select_stmt})
+		append(&parts, Compound_Select{all = all, op = op, select_stmt = select_stmt})
 		for extra in inner do append(&parts, extra)
 	}
 	select.compound = parts[:]
 return select
 }
 
+// parse_values_select reads `VALUES (a, b), (c, d)` as the query SQLite makes of
+// it: one row per tuple, columns named column1, column2, …, and every tuple the
+// same width.
+@(private)
+parse_values_select :: proc(p: ^Parser) -> Select_Stmt {
+	p_expect_keyword(p, "values")
+	first: Select_Stmt
+	parts := make([dynamic]Compound_Select, 0, 2, p.alloc)
+	width := -1
+	for row := 0; ; row += 1 {
+		if !p_expect_punct(p, "(") do break
+		items := make([dynamic]Select_Item, 0, 4, p.alloc)
+		for {
+			item := Select_Item{expr = parse_expression(p)}
+			if row == 0 do item.alias = fmt.aprintf("column%d", len(items) + 1, allocator = p.alloc)
+			append(&items, item)
+			if !p_match_punct(p, ",") do break
+		}
+		p_expect_punct(p, ")")
+		if width < 0 do width = len(items)
+		if len(items) != width {
+			p_fail(p, .Sql_Syntax, "all VALUES must have the same number of terms")
+			break
+		}
+		if row == 0 {
+			first.projections = items[:]
+		} else {
+			append(&parts, Compound_Select{all = true, op = .Union_All, select_stmt = Select_Stmt{projections = items[:]}})
+		}
+		if !p_match_punct(p, ",") do break
+	}
+	first.compound = parts[:]
+	return first
+}
+
+// parse_nulls_order reads an optional NULLS FIRST / NULLS LAST.
+@(private)
+parse_nulls_order :: proc(p: ^Parser) -> Nulls_Order {
+	if !p_match_keyword(p, "nulls") do return .Default
+	if p_match_keyword(p, "first") do return .First
+	if p_match_keyword(p, "last") do return .Last
+	p_fail(p, .Sql_Syntax, "expected FIRST or LAST after NULLS")
+	return .Default
+}
+
 @(private)
 p_is_table_clause_keyword :: proc(p: ^Parser) -> bool {
 	if p.current.kind != .Ident do return false
-	for keyword in ([]string{"where", "group", "having", "order", "limit", "offset", "join", "inner", "left", "cross", "outer", "natural", "right", "full", "on", "union", "using", "set", "values", "returning"}) {
+	for keyword in ([]string{"where", "group", "having", "order", "limit", "offset", "join", "inner", "left", "cross", "outer", "natural", "right", "full", "on", "union", "intersect", "except", "using", "set", "values", "returning", "window"}) {
 		if strings.equal_fold(p.current.text, keyword) do return true
 	}
 	return false
@@ -625,6 +689,26 @@ column_expr :: proc(p: ^Parser, table: string, column: string) -> ^Expr {
 
 parse_table_ref :: proc(p: ^Parser) -> Table_Ref {
 	ref: Table_Ref
+	// A derived table: `(SELECT …) [AS] name` or `(VALUES …) [AS] name`. SQLite
+	// names an unaliased one itself, and so does this.
+	if p_match_punct(p, "(") {
+		sub := new(Select_Stmt, p.alloc)
+		if p_is_keyword(p, "values") {
+			sub^ = parse_values_select(p)
+		} else if select_stmt, ok := parse_select(p).(Select_Stmt); ok {
+			sub^ = select_stmt
+		}
+		p_expect_punct(p, ")")
+		ref.subquery = sub
+		p.derived_count += 1
+		ref.name = fmt.aprintf("(subquery-%d)", p.derived_count, allocator = p.alloc)
+		if p_match_keyword(p, "as") {
+			ref.name = p_ident(p)
+		} else if (p.current.kind == .Ident || p.current.kind == .Quoted_Ident) && !p_is_table_clause_keyword(p) {
+			ref.name = p_ident(p)
+		}
+		return ref
+	}
 	ref.name = p_ident(p)
 	if p_match_punct(p, ".") {
 		// schema.table: keep the qualifier, `name` is the table.
@@ -1743,27 +1827,27 @@ parse_comparison :: proc(p: ^Parser) -> ^Expr {
 	left := parse_operand(p)
 	for {
 		if p_match_punct(p, "=") || p_match_punct(p, "==") {
-			left = expr_binary(p, .Eq, left, parse_operand(p))
+			left = p_compare(p, .Eq, left, parse_operand(p))
 			continue
 		}
 		if p_match_punct(p, "!=") || p_match_punct(p, "<>") {
-			left = expr_binary(p, .Ne, left, parse_operand(p))
+			left = p_compare(p, .Ne, left, parse_operand(p))
 			continue
 		}
 		if p_match_punct(p, "<=") {
-			left = expr_binary(p, .Le, left, parse_operand(p))
+			left = p_compare(p, .Le, left, parse_operand(p))
 			continue
 		}
 		if p_match_punct(p, ">=") {
-			left = expr_binary(p, .Ge, left, parse_operand(p))
+			left = p_compare(p, .Ge, left, parse_operand(p))
 			continue
 		}
 		if p_match_punct(p, "<") {
-			left = expr_binary(p, .Lt, left, parse_operand(p))
+			left = p_compare(p, .Lt, left, parse_operand(p))
 			continue
 		}
 		if p_match_punct(p, ">") {
-			left = expr_binary(p, .Gt, left, parse_operand(p))
+			left = p_compare(p, .Gt, left, parse_operand(p))
 			continue
 		}
 		if p_match_keyword(p, "is") {
@@ -1780,7 +1864,7 @@ parse_comparison :: proc(p: ^Parser) -> ^Expr {
 				p_expect_keyword(p, "from")
 				negated = !negated
 			}
-			left = expr_binary(p, negated ? .Is_Not : .Is, left, parse_operand(p))
+			left = p_compare(p, negated ? .Is_Not : .Is, left, parse_operand(p))
 			continue
 		}
 		negated := false
@@ -1820,6 +1904,17 @@ parse_comparison :: proc(p: ^Parser) -> ^Expr {
 				}
 			}
 			p_expect_punct(p, ")")
+			if _, is_row := row_value_items(left); is_row {
+				// `(a, b) IN ((1, 2), (3, 4))` is `(a, b) = (1, 2) OR (a, b) = (3, 4)`.
+				any: ^Expr
+				for item in items {
+					term := p_compare(p, .Eq, left, item)
+					any = any == nil ? term : expr_binary(p, .Or, any, term)
+				}
+				if any == nil do any = expr_literal(p, value_bool(false))
+				left = negated ? expr_unary(p, .Not, any) : any
+				continue
+			}
 			e := new(Expr, p.alloc)
 			e^ = In_Expr{operand = left, items = items[:], negated = negated}
 			left = e
@@ -2108,6 +2203,7 @@ parse_primary :: proc(p: ^Parser) -> ^Expr {
 						} else {
 							_ = p_match_keyword(p, "asc")
 						}
+						item.nulls = parse_nulls_order(p)
 						append(&items, item)
 						if !p_match_punct(p, ",") do break
 					}
@@ -2211,6 +2307,17 @@ parse_primary :: proc(p: ^Parser) -> ^Expr {
 				return e
 			}
 			inner := parse_expression(p)
+			if p_is_punct(p, ",") {
+				// A row value, `(a, b)`. Comparisons and IN take it apart into
+				// scalar terms; anywhere else it is refused when evaluated.
+				items := make([dynamic]^Expr, 0, 2, p.alloc)
+				append(&items, inner)
+				for p_match_punct(p, ",") do append(&items, parse_expression(p))
+				p_expect_punct(p, ")")
+				e := new(Expr, p.alloc)
+				e^ = Call_Expr{name = ROW_VALUE_CALL, args = items[:]}
+				return e
+			}
 			p_expect_punct(p, ")")
 			return inner
 		}
@@ -2221,6 +2328,60 @@ parse_primary :: proc(p: ^Parser) -> ^Expr {
 		return nil
 	}
 	p_fail(p, .Sql_Syntax, "unexpected token %q", token.text)
+	return nil
+}
+
+// ROW_VALUE_CALL names the node a row value `(a, b)` parses to. It has a space,
+// so no function a statement can call has this name.
+ROW_VALUE_CALL :: "row value"
+
+row_value_items :: proc(e: ^Expr) -> ([]^Expr, bool) {
+	if e == nil do return nil, false
+	call, is_call := e^.(Call_Expr)
+	if !is_call || call.name != ROW_VALUE_CALL do return nil, false
+	return call.args, true
+}
+
+// p_compare builds a comparison, taking row values apart into the scalar terms
+// SQL defines them by: `(a, b) = (c, d)` is `a = c AND b = d`, `(a, b) < (c, d)`
+// is `a < c OR (a = c AND b < d)`, and IS / IS NOT likewise. NULL then behaves as
+// it does in SQLite, because it does in each term.
+@(private)
+p_compare :: proc(p: ^Parser, op: Binary_Op, left, right: ^Expr) -> ^Expr {
+	l, left_row := row_value_items(left)
+	r, right_row := row_value_items(right)
+	if !left_row && !right_row do return expr_binary(p, op, left, right)
+	if left_row != right_row || len(l) != len(r) {
+		p_fail(p, .Sql_Syntax, "row value misused")
+		return nil
+	}
+	#partial switch op {
+	case .Eq, .Is:
+		all: ^Expr
+		for i in 0 ..< len(l) {
+			term := expr_binary(p, op, l[i], r[i])
+			all = all == nil ? term : expr_binary(p, .And, all, term)
+		}
+		return all
+	case .Ne, .Is_Not:
+		any: ^Expr
+		for i in 0 ..< len(l) {
+			term := expr_binary(p, op, l[i], r[i])
+			any = any == nil ? term : expr_binary(p, .Or, any, term)
+		}
+		return any
+	case .Lt, .Le, .Gt, .Ge:
+		// Built from the last column back: the last term uses the operator as
+		// written, every earlier one its strict form or equality and the rest.
+		strict := op == .Le ? Binary_Op.Lt : op == .Ge ? Binary_Op.Gt : op
+		result := expr_binary(p, op, l[len(l) - 1], r[len(r) - 1])
+		for i := len(l) - 2; i >= 0; i -= 1 {
+			equal_then := expr_binary(p, .And, expr_binary(p, .Eq, l[i], r[i]), result)
+			result = expr_binary(p, .Or, expr_binary(p, strict, l[i], r[i]), equal_then)
+		}
+		return result
+	}
+	p_fail(p, .Sql_Syntax, "row value misused")
 	return nil
 }
 

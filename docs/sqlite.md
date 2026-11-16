@@ -35,7 +35,7 @@ script lists.
 
 | Feature | Status | Notes |
 |---|---|---|
-| SELECT with joins, subqueries, aggregates | done | engine syntax; `INNER`/`LEFT`/`CROSS`, no `NATURAL`/`RIGHT`/`FULL` (refused with a reason) |
+| SELECT with joins, subqueries, aggregates | done | `INNER`/`LEFT`/`CROSS`, no `NATURAL`/`RIGHT`/`FULL` (refused with a reason); a subquery or `VALUES` in `FROM` (a derived table, named `(subquery-N)` when unaliased); `UNION [ALL]`, `INTERSECT` and `EXCEPT` applied left to right; `VALUES (…), (…)` as a statement, with columns `column1`, `column2`, … |
 | INSERT / UPDATE / DELETE | done | `RETURNING` with `*` or a column list. Conflict resolution as SQLite's: `OR ABORT` (the default: a failed statement is undone whole, inside a transaction too), `OR IGNORE` (skips a row that breaks a key or `NOT NULL`), `OR FAIL` (keeps the rows before the failing one), `OR REPLACE` and `REPLACE INTO` (delete the colliding rows, fire no delete trigger). `OR ROLLBACK` is `ABORT` when the statement owns its transaction and refused inside one a caller opened |
 | CREATE/DROP TABLE, ALTER | done | `ALTER` adds, drops and renames columns and renames the table; type changes are refused |
 | CREATE/DROP INDEX, UNIQUE | done | btree, hash, direct |
@@ -62,7 +62,9 @@ script lists.
 
 | Feature | Status | Notes |
 |---|---|---|
-| WHERE, ORDER BY, LIMIT/OFFSET | done | stable sort, NULLs first |
+| WHERE, ORDER BY, LIMIT/OFFSET | done | stable sort, NULL the smallest value; `NULLS FIRST`/`NULLS LAST`; `LIMIT <offset>, <count>`. An `ORDER BY` expression that fails is the statement's error (a window function there is refused) |
+| Row values | done | `(a, b) = (1, 2)`, `<`, `<=`, `>`, `>=`, `IS`, `IN ((…), (…))` and `IN (SELECT a, b …)`; a row value anywhere else is "row value misused", as in SQLite |
+| Operators | done | `IS`/`IS NOT` between values, `IS [NOT] DISTINCT FROM`, `& \| ~ << >>` at SQLite's precedence, `->` and `->>` |
 | GROUP BY, HAVING | done | `HAVING` takes the expression, not a projection alias |
 | DISTINCT | done | over the projected row, and inside an aggregate (`count(DISTINCT x)`) |
 | IN, EXISTS, scalar subqueries | done | three-valued logic: a `NULL` in the list makes a non-match unknown |

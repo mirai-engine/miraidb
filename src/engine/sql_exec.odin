@@ -910,6 +910,9 @@ select_output_may_shrink :: proc(stmt: Select_Stmt) -> bool {
 }
 
 Eval_Ctx :: struct {
+	// order_err is the first error an ORDER BY expression raised while the sort
+	// keys were built; the statement returns it instead of sorting.
+	order_err: Error,
 	tx:      ^Tx,
 	sources: []Source,
 	group:   [][]Source,
@@ -947,12 +950,53 @@ sql_run_query :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sql_Re
 	}
 	with_stmt, is_with := statement.(With_Stmt)
 	if !is_with do return {}, errf(.Sql_Unsupported, "not a query")
+	// A CTE's name lasts for its statement: inside a transaction the next
+	// statement must see the table of that name again, not this query.
+	scope := cte_scope_begin(tx)
+	defer cte_scope_end(tx, &scope)
 	for cte in with_stmt.ctes {
 		table, cte_err := tx_materialize_cte(tx, cte, params, with_stmt.recursive)
 		if cte_err.kind != .None do return {}, cte_err
-		tx.cte_tables[strings.clone(cte.name, tx.alloc)] = table
+		cte_scope_bind(tx, &scope, cte.name, table)
 	}
 	return sql_exec_select(tx, with_stmt.select_stmt, params)
+}
+
+@(private)
+select_has_derived_join :: proc(stmt: Select_Stmt) -> bool {
+	for join in stmt.joins do if join.table.subquery != nil do return true
+	return false
+}
+
+// Cte_Scope remembers what each name a statement bound in `cte_tables` meant
+// before, so the end of the statement puts it back.
+Cte_Scope :: struct {
+	names:    [dynamic]string,
+	previous: [dynamic]^Table,
+}
+
+@(private)
+cte_scope_begin :: proc(tx: ^Tx) -> Cte_Scope {
+	return Cte_Scope{names = make([dynamic]string, 0, 2, tx.alloc), previous = make([dynamic]^Table, 0, 2, tx.alloc)}
+}
+
+@(private)
+cte_scope_bind :: proc(tx: ^Tx, scope: ^Cte_Scope, name: string, table: ^Table) {
+	key := strings.clone(name, tx.alloc)
+	append(&scope.names, key)
+	append(&scope.previous, tx.cte_tables[key] or_else nil)
+	tx.cte_tables[key] = table
+}
+
+@(private)
+cte_scope_end :: proc(tx: ^Tx, scope: ^Cte_Scope) {
+	for i := len(scope.names) - 1; i >= 0; i -= 1 {
+		if scope.previous[i] != nil {
+			tx.cte_tables[scope.names[i]] = scope.previous[i]
+		} else {
+			delete_key(&tx.cte_tables, scope.names[i])
+		}
+	}
 }
 
 // tx_materialize_cte evaluates a common table expression into a temporary table
@@ -998,25 +1042,75 @@ clone_row_values :: proc(values: []Value, alloc: mem.Allocator) -> []Value {
 	return out
 }
 
+// compound_apply joins the rows of one more term to the result so far. Every
+// operator but UNION ALL answers distinct rows; the result keeps the order in
+// which its rows first appeared.
 @(private)
-compound_admit :: proc(rows: ^[dynamic][]Value, seen: ^map[string]bool, values: []Value, dedup: bool) {
-	if !dedup {
-		append(rows, clone_row_values(values, context.allocator))
+compound_apply :: proc(rows: ^[dynamic][]Value, term: [][]Value, op: Compound_Op) {
+	if op == .Union_All {
+		for row in term do append(rows, clone_row_values(row, context.allocator))
 		return
 	}
-	key := encode_output_key(values)
-	if key in seen^ {
-		delete(key)
-		return
+	in_term := make(map[string]bool)
+	defer {
+		for key in in_term do delete(key)
+		delete(in_term)
 	}
-	seen^[key] = true
-	append(rows, clone_row_values(values, context.allocator))
+	if op != .Union {
+		for row in term {
+			key := encode_output_key(row)
+			if key in in_term {
+				delete(key)
+				continue
+			}
+			in_term[key] = true
+		}
+	}
+	seen := make(map[string]bool)
+	defer {
+		for key in seen do delete(key)
+		delete(seen)
+	}
+	kept := make([dynamic][]Value, 0, len(rows))
+	for row in rows {
+		key := encode_output_key(row)
+		keep := !(key in seen)
+		switch op {
+		case .Intersect:
+			keep = keep && key in in_term
+		case .Except:
+			keep = keep && !(key in in_term)
+		case .Union, .Union_All:
+		}
+		if keep {
+			seen[key] = true
+			append(&kept, row)
+		} else {
+			delete(key)
+			free_values(row)
+		}
+	}
+	if op == .Union {
+		for row in term {
+			key := encode_output_key(row)
+			if key in seen {
+				delete(key)
+				continue
+			}
+			seen[key] = true
+			append(&kept, clone_row_values(row, context.allocator))
+		}
+	}
+	delete(rows^)
+	rows^ = kept
 }
 
-// sql_exec_compound evaluates a UNION chain: every term runs, duplicates are
-// dropped unless the term is UNION ALL, and the tail clauses (ORDER BY, LIMIT,
-// OFFSET) apply to the merged result. When a tail exists the rows pass through
-// a temporary table, which lets the ordinary select path order them.
+// sql_exec_compound evaluates a compound query left to right, as SQLite does:
+// `a UNION b` keeps the distinct rows of both, `a UNION ALL b` appends b,
+// `a INTERSECT b` keeps the distinct rows of a that b has, and `a EXCEPT b` the
+// distinct rows of a that b lacks. The tail clauses (ORDER BY, LIMIT, OFFSET)
+// apply to the result. When a tail exists the rows pass through a temporary
+// table, which lets the ordinary select path order them.
 @(private)
 sql_exec_compound :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Result, Error) {
 	base := stmt
@@ -1030,24 +1124,12 @@ sql_exec_compound :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_R
 	defer sql_result_destroy(&first)
 	if len(first.columns) == 0 do return {}, errf(.Internal, "compound query without columns")
 
-	seen := make(map[string]bool)
 	rows := make([dynamic][]Value, 0, len(first.rows))
 	defer {
 		for row in rows do free_values(row)
 		delete(rows)
-		for key in seen do delete(key)
-		delete(seen)
 	}
-	// UNION drops duplicates; a chain of UNION ALL terms keeps everything.
-	dedup := true
-	for part in stmt.compound {
-		if !part.all do continue
-		dedup = false
-	}
-	for part in stmt.compound {
-		if !part.all do dedup = true
-	}
-	for row in first.rows do compound_admit(&rows, &seen, row, dedup)
+	for row in first.rows do append(&rows, clone_row_values(row, context.allocator))
 
 	for part in stmt.compound {
 		term := part.select_stmt
@@ -1062,11 +1144,11 @@ sql_exec_compound :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_R
 			sql_result_destroy(&result)
 			return {}, errf(
 				.Invalid_Argument,
-				"each UNION term must return %d columns",
+				"each term of a compound query must return %d columns",
 				len(first.columns),
 			)
 		}
-		for row in result.rows do compound_admit(&rows, &seen, row, dedup)
+		compound_apply(&rows, result.rows, part.op)
 		sql_result_destroy(&result)
 	}
 
@@ -1246,11 +1328,7 @@ window_order_key :: proc(ctx: ^Eval_Ctx, window: Window_Expr) -> ([]u8, Error) {
 		if has && len(collation) > 0 {
 			value = collate_ordered_value(value, collation)
 		}
-		start := len(w.data)
-		value_encode_key(&w, value)
-		if item.descending {
-			for i in start ..< len(w.data) do w.data[i] = ~w.data[i]
-		}
+		order_key_append(&w, value, item)
 	}
 	raw := bw_bytes(&w)
 	out := make([]u8, len(raw))
@@ -2563,6 +2641,28 @@ sql_exec_stream_select :: proc(
 }
 
 sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Result, Error) {
+	// Derived tables are materialized first, under their names, for this select.
+	if stmt.from.subquery != nil || select_has_derived_join(stmt) {
+		scope := cte_scope_begin(tx)
+		defer cte_scope_end(tx, &scope)
+		refs := make([dynamic]Table_Ref, 0, 1 + len(stmt.joins), tx.alloc)
+		append(&refs, stmt.from)
+		for join in stmt.joins do append(&refs, join.table)
+		for ref in refs {
+			if ref.subquery == nil do continue
+			table, derived_err := tx_materialize_cte(tx, Cte{name = ref.name, select_stmt = ref.subquery^}, params, false)
+			if derived_err.kind != .None do return {}, derived_err
+			cte_scope_bind(tx, &scope, ref.name, table)
+		}
+		inner := stmt
+		inner.from.subquery = nil
+		inner.joins = make([]Join_Clause, len(stmt.joins), tx.alloc)
+		for join, i in stmt.joins {
+			inner.joins[i] = join
+			inner.joins[i].table.subquery = nil
+		}
+		return sql_exec_select(tx, inner, params)
+	}
 	if len(stmt.compound) > 0 do return sql_exec_compound(tx, stmt, params)
 	// A collation the statement cannot honour is refused before a row exists: an
 	// unknown name, or a host comparison where a folded key is required.
@@ -3401,6 +3501,14 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		delete(group_keep)
 	}
 
+	if ctx.order_err.kind != .None {
+		for row in output {
+			free_values(row.values)
+			delete(row.sort_key)
+		}
+		delete(output)
+		return {}, ctx.order_err
+	}
 	if len(stmt.order_by) > 0 {
 		slice.sort_by(output[:], proc(a, b: Output_Row) -> bool {
 			return string(sort_key_bytes(a.sort_key)) < string(sort_key_bytes(b.sort_key))
@@ -3600,13 +3708,7 @@ build_order_key :: proc(
 		if has && len(collation) > 0 {
 			value = collate_ordered_value(value, collation)
 		}
-		start := len(w.data)
-		value_encode_key(&w, value)
-		if item.descending {
-			for i in start ..< len(w.data) {
-				w.data[i] = ~w.data[i]
-			}
-		}
+		order_key_append(&w, value, item)
 	}
 	write_be_u64(&w, u64(row_id))
 	raw := bw_bytes(&w)
@@ -3614,6 +3716,25 @@ build_order_key :: proc(
 	copy(out, raw)
 	bw_destroy(&w)
 	return out
+}
+
+// order_key_append encodes one ORDER BY value so that comparing keys byte by
+// byte gives the requested order: descending inverts the value's bytes, and an
+// explicit NULLS FIRST/LAST puts a leading byte that decides where NULL goes,
+// whatever the direction.
+@(private)
+order_key_append :: proc(w: ^Byte_Writer, value: Value, item: Order_Item) {
+	if item.nulls != .Default {
+		is_null := value.kind == .Null
+		marker: u8 = 1
+		if is_null do marker = item.nulls == .First ? 0 : 2
+		append(&w.data, marker)
+	}
+	start := len(w.data)
+	value_encode_key(w, value)
+	if item.descending {
+		for i in start ..< len(w.data) do w.data[i] = ~w.data[i]
+	}
 }
 
 // collate_ordered_value folds a text value the way a collation sorts it.
@@ -3660,7 +3781,17 @@ eval_order_value :: proc(
 		}
 	}
 	value, eval_err := eval_expr(ctx, expr)
-	if eval_err.kind != .None do return value_null()
+	if eval_err.kind != .None {
+		// The statement answers this error once the keys are built. Sorting the
+		// row as NULL instead made `ORDER BY no_such_column` (or a window function
+		// in ORDER BY) return the rows unsorted with no word of why.
+		if ctx.order_err.kind == .None {
+			ctx.order_err = eval_err
+		} else {
+			error_free(&eval_err)
+		}
+		return value_null()
+	}
 	return value
 }
 
@@ -3916,6 +4047,10 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 		if len(sub.rows) == 0 || len(sub.rows[0]) == 0 do return value_null(), ERROR_NONE
 		return sub.rows[0][0], ERROR_NONE
 	case In_Expr:
+		if row, is_row := row_value_items(e.operand); is_row {
+			if e.subquery == nil do return {}, errf(.Sql_Syntax, "row value misused")
+			return eval_row_in_subquery(ctx, row, e.subquery, e.negated)
+		}
 		operand, operand_err := eval_expr(ctx, e.operand)
 		if operand_err.kind != .None do return {}, operand_err
 		if operand.kind == .Null do return value_null(), ERROR_NONE
@@ -4001,6 +4136,51 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 		return ctx.params[e.index], ERROR_NONE
 	}
 	return {}, errf(.Internal, "unknown expression")
+}
+
+// eval_row_in_subquery answers `(a, b) IN (SELECT x, y …)`: true when a row of
+// the subquery equals the tuple, NULL when no row does but one could (a NULL on
+// either side of a column that decides it), false otherwise.
+@(private)
+eval_row_in_subquery :: proc(ctx: ^Eval_Ctx, row: []^Expr, subquery: ^Select_Stmt, negated: bool) -> (Value, Error) {
+	if ctx.tx == nil do return {}, errf(.Sql_Unsupported, "subqueries need a transaction")
+	tuple := make([]Value, len(row), context.temp_allocator)
+	for item, i in row {
+		value, err := eval_expr(ctx, item)
+		if err.kind != .None do return {}, err
+		tuple[i] = value
+	}
+	sub, sub_err := sql_exec_select(ctx.tx, subquery^, ctx.params)
+	if sub_err.kind != .None do return {}, sub_err
+	defer sql_result_destroy(&sub)
+	if len(sub.columns) != len(tuple) {
+		return {}, errf(.Sql_Syntax, "sub-select returns %d columns - expected %d", len(sub.columns), len(tuple))
+	}
+	found := false
+	unknown := false
+	for candidate in sub.rows {
+		match := true
+		maybe := false
+		for value, i in tuple {
+			if value.kind == .Null || candidate[i].kind == .Null {
+				maybe = true
+				continue
+			}
+			if !value_equal(value, candidate[i]) {
+				match = false
+				break
+			}
+		}
+		if !match do continue
+		if maybe {
+			unknown = true
+			continue
+		}
+		found = true
+		break
+	}
+	if !found && unknown do return value_null(), ERROR_NONE
+	return value_bool(negated ? !found : found), ERROR_NONE
 }
 
 eval_binary :: proc(
@@ -4681,7 +4861,9 @@ eval_case :: proc(ctx: ^Eval_Ctx, e: Case_Expr) -> (Value, Error) {
 }
 
 eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
-
+	// A row value is taken apart by the comparison that holds it; reaching it
+	// here means it stands alone, which SQLite refuses with the same words.
+	if call.name == ROW_VALUE_CALL do return {}, errf(.Sql_Syntax, "row value misused")
 	if scalar_minmax(call) {
 		return eval_scalar_minmax(ctx, call)
 	}
@@ -6679,6 +6861,7 @@ index_order_for :: proc(
 	direction := stmt.order_by[0].descending
 	for item in stmt.order_by {
 		if item.descending != direction do return index, false, false
+		if item.nulls != .Default do return index, false, false
 	}
 	for &candidate, position in table.indexes {
 		if candidate.pages != nil do continue

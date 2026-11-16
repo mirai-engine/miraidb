@@ -232,9 +232,18 @@ Select_Item :: struct {
 	star:  bool,
 }
 
+// Nulls_Order is an explicit NULLS FIRST / NULLS LAST. Without one NULL sorts as
+// the smallest value: first ascending, last descending, as in SQLite.
+Nulls_Order :: enum u8 {
+	Default,
+	First,
+	Last,
+}
+
 Order_Item :: struct {
 	expr:       ^Expr,
 	descending: bool,
+	nulls:      Nulls_Order,
 }
 
 Table_Ref :: struct {
@@ -247,6 +256,9 @@ Table_Ref :: struct {
 	// as_of is `FROM t AS OF <seq>`: read the rows as they were at that commit.
 	// The scan then uses the versions the table keeps instead of the live rows.
 	as_of: ^Expr,
+	// subquery is a derived table, `FROM (SELECT …) AS name` or `FROM (VALUES …)`:
+	// it is materialized under `name` before the statement reads it.
+	subquery: ^Select_Stmt,
 }
 
 // Join_Clause chains one table onto the query. `left` turns the inner join into
@@ -277,9 +289,19 @@ Select_Stmt :: struct {
 	compound:    []Compound_Select,
 }
 
-// Compound_Select is one term of a compound query. `all` keeps duplicates.
+// Compound_Op joins a term to everything before it, left to right.
+Compound_Op :: enum u8 {
+	Union,
+	Union_All,
+	Intersect,
+	Except,
+}
+
+// Compound_Select is one term of a compound query and the operator that joins
+// it to the terms before it. `all` is set for UNION ALL.
 Compound_Select :: struct {
 	all:         bool,
+	op:          Compound_Op,
 	select_stmt: Select_Stmt,
 }
 
