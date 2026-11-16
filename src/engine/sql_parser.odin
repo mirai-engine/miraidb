@@ -493,8 +493,13 @@ parse_select :: proc(p: ^Parser) -> Statement {
 	}
 	if p_match_keyword(p, "limit") {
 		select.limit = parse_expression(p)
+		// SQLite's `LIMIT <offset>, <count>`: the first number is the offset.
+		if p_match_punct(p, ",") {
+			select.offset = select.limit
+			select.limit = parse_expression(p)
+		}
 	}
-	if p_match_keyword(p, "offset") {
+	if select.offset == nil && p_match_keyword(p, "offset") {
 		select.offset = parse_expression(p)
 	}
 		// UNION [ALL | DISTINCT] chains more terms. ORDER BY, LIMIT and OFFSET of
@@ -1719,7 +1724,7 @@ parse_not :: proc(p: ^Parser) -> ^Expr {
 // parse_operand parses an additive expression and any COLLATE that follows it.
 @(private)
 parse_operand :: proc(p: ^Parser) -> ^Expr {
-	expr := parse_additive(p)
+	expr := parse_bitwise(p)
 	for p_match_keyword(p, "collate") {
 		name := p_ident_or_keyword(p)
 		e := new(Expr, p.alloc)
@@ -1758,10 +1763,19 @@ parse_comparison :: proc(p: ^Parser) -> ^Expr {
 		}
 		if p_match_keyword(p, "is") {
 			negated := p_match_keyword(p, "not")
-			p_expect_keyword(p, "null")
-			e := new(Expr, p.alloc)
-			e^ = Is_Null_Expr{operand = left, negated = negated}
-			left = e
+			if p_match_keyword(p, "null") {
+				e := new(Expr, p.alloc)
+				e^ = Is_Null_Expr{operand = left, negated = negated}
+				left = e
+				continue
+			}
+			// `a IS [NOT] DISTINCT FROM b` is `a IS NOT b` (or `a IS b`) by
+			// definition; any other right side is SQLite's null-safe comparison.
+			if p_match_keyword(p, "distinct") {
+				p_expect_keyword(p, "from")
+				negated = !negated
+			}
+			left = expr_binary(p, negated ? .Is_Not : .Is, left, parse_operand(p))
 			continue
 		}
 		negated := false
@@ -1848,6 +1862,33 @@ parse_comparison :: proc(p: ^Parser) -> ^Expr {
 	return left
 }
 
+// parse_bitwise reads `& | << >>`, which SQLite binds looser than `+` and
+// tighter than the comparisons, all at one level, left to right.
+@(private)
+parse_bitwise :: proc(p: ^Parser) -> ^Expr {
+	left := parse_additive(p)
+	for {
+		if p_match_punct(p, "&") {
+			left = expr_binary(p, .Bit_And, left, parse_additive(p))
+			continue
+		}
+		if p_match_punct(p, "|") {
+			left = expr_binary(p, .Bit_Or, left, parse_additive(p))
+			continue
+		}
+		if p_match_punct(p, "<<") {
+			left = expr_binary(p, .Shift_Left, left, parse_additive(p))
+			continue
+		}
+		if p_match_punct(p, ">>") {
+			left = expr_binary(p, .Shift_Right, left, parse_additive(p))
+			continue
+		}
+		break
+	}
+	return left
+}
+
 @(private)
 parse_additive :: proc(p: ^Parser) -> ^Expr {
 	left := parse_multiplicative(p)
@@ -1898,6 +1939,9 @@ parse_unary :: proc(p: ^Parser) -> ^Expr {
 	if p_match_punct(p, "+") {
 		return expr_unary(p, .Plus, parse_unary(p))
 	}
+	if p_match_punct(p, "~") {
+		return expr_unary(p, .Bit_Not, parse_unary(p))
+	}
 	expr := parse_primary(p)
 	// `x::type` is PostgreSQL's cast. It binds tighter than any operator, so
 	// `-1::text` is `-(1::text)` and `a::int + 1` casts `a` alone.
@@ -1906,6 +1950,19 @@ parse_unary :: proc(p: ^Parser) -> ^Expr {
 		if !target_ok do return nil
 		e := new(Expr, p.alloc)
 		e^ = Cast_Expr{operand = expr, target = target}
+		expr = e
+	}
+	// `json -> path` and `json ->> path` are SQLite's spellings of a JSON lookup:
+	// the first answers JSON text, the second the SQL value json_extract gives.
+	for expr != nil && (p_is_punct(p, "->") || p_is_punct(p, "->>")) {
+		name := p_is_punct(p, "->") ? "json_arrow" : "json_arrow_value"
+		p_advance(p)
+		path := parse_primary(p)
+		args := make([]^Expr, 2, p.alloc)
+		args[0] = expr
+		args[1] = path
+		e := new(Expr, p.alloc)
+		e^ = Call_Expr{name = name, args = args}
 		expr = e
 	}
 	return expr

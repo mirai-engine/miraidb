@@ -76,8 +76,8 @@ script lists.
 
 ## Functions
 
-**Implemented (73 of the 121 user-facing names, measured by
-`scripts/sqlite_gaps.py`):** `abs` and the trigonometric/logarithmic set (`acos`, `asin`,
+**Implemented (the count is in [sqlite-roadmap.md](sqlite-roadmap.md),
+measured by `scripts/sqlite_gaps.py`):** `abs` and the trigonometric/logarithmic set (`acos`, `asin`,
 `atan`, `atan2`, `cos`, `sin`, `tan`, `degrees`, `radians`, `pi`, `exp`,
 `log`, `log2`, `log10`), `ceil`/`floor`/`round`/`trunc`/`sign`/`sqrt`/`pow`/
 `mod`, `char`, `unicode`, `hex`, `unhex`, `quote`, `format`/`printf`,

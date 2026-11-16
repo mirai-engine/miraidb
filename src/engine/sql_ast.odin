@@ -20,12 +20,23 @@ Binary_Op :: enum u8 {
 	And,
 	Or,
 	Concat,
+	// Is and Is_Not compare with NULL as an ordinary value: `NULL IS NULL` is true
+	// and `1 IS NOT NULL` is true, where `=` would answer NULL. `IS [NOT] DISTINCT
+	// FROM` parses to them.
+	Is,
+	Is_Not,
+	// The bitwise operators work on 64-bit integers, as SQLite's do.
+	Bit_And,
+	Bit_Or,
+	Shift_Left,
+	Shift_Right,
 }
 
 Unary_Op :: enum u8 {
 	Neg,
 	Plus,
 	Not,
+	Bit_Not,
 }
 
 // MAX_EXPRESSION_DEPTH bounds how deeply an expression may nest. Parsing and

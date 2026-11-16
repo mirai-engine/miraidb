@@ -498,7 +498,7 @@ json_path_find :: proc(root: Json_Value, path: string) -> (Json_Value, bool) {
 			if current.kind != .Object do return {}, false
 			found := false
 			for key, i in current.keys {
-				if strings.equal_fold(key, name) {
+				if key == name {
 					current = current.values[i]
 					found = true
 					break
@@ -517,7 +517,7 @@ json_path_find :: proc(root: Json_Value, path: string) -> (Json_Value, bool) {
 				if current.kind != .Object do return {}, false
 				found := false
 				for key, i in current.keys {
-					if strings.equal_fold(key, name) {
+					if key == name {
 						current = current.values[i]
 						found = true
 						break
@@ -628,6 +628,29 @@ json_call :: proc(name: string, args: []Value) -> (Value, bool, Error) {
 			append(&items, Json_Value{kind = .Null} if !found else target)
 		}
 		return value_string(json_write(Json_Value{kind = .Array, items = items[:]}, context.allocator)), true, ERROR_NONE
+	case "json_arrow", "json_arrow_value":
+		// `doc -> x` and `doc ->> x`. A path starting with `$` is a path; any other
+		// text is one object key and an integer one array slot, as SQLite reads them.
+		if len(args) != 2 do return {}, true, errf(.Invalid_Argument, "-> takes a document and a path")
+		if args[0].kind != .String || args[1].kind == .Null do return value_null(), true, ERROR_NONE
+		doc, ok := json_parse(args[0].s, context.allocator)
+		if !ok do return {}, true, errf(.Invalid_Argument, "malformed JSON")
+		defer json_destroy(doc, context.allocator)
+		path: string
+		#partial switch args[1].kind {
+		case .String:
+			path = strings.has_prefix(args[1].s, "$") ? args[1].s : fmt.tprintf("$[\"%s\"]", args[1].s)
+		case .Int, .Uint:
+			path = fmt.tprintf("$[%s]", value_format(args[1], context.temp_allocator))
+		case:
+			return value_null(), true, ERROR_NONE
+		}
+		target, found := json_path_find(doc, path)
+		if !found do return value_null(), true, ERROR_NONE
+		if strings.equal_fold(name, "json_arrow") {
+			return value_string(json_write(target, context.allocator)), true, ERROR_NONE
+		}
+		return json_to_value(target, context.allocator), true, ERROR_NONE
 	case "json_array_length":
 		if len(args) != 1 && len(args) != 2 do return {}, true, errf(.Invalid_Argument, "json_array_length() takes one or two arguments")
 		if args[0].kind != .String do return {}, true, errf(.Invalid_Type, "json_array_length() expects text")
@@ -671,7 +694,7 @@ json_call :: proc(name: string, args: []Value) -> (Value, bool, Error) {
 
 // json_call_name reports whether a function name belongs to the JSON family.
 json_call_name :: proc(name: string) -> bool {
-	for candidate in ([]string{"json", "json_valid", "json_type", "json_extract", "json_array", "json_object", "json_quote", "json_array_length", "json_set", "json_replace", "json_remove"}) {
+	for candidate in ([]string{"json", "json_arrow", "json_arrow_value", "json_valid", "json_type", "json_extract", "json_array", "json_object", "json_quote", "json_array_length", "json_set", "json_replace", "json_remove"}) {
 		if strings.equal_fold(name, candidate) do return true
 	}
 	return false
@@ -738,7 +761,7 @@ json_path_find_ptr :: proc(root: ^Json_Value, path: string) -> (^Json_Value, boo
 			if current.kind != .Object do return nil, false
 			found := -1
 			for key, i in current.keys {
-				if strings.equal_fold(key, name) {
+				if key == name {
 					found = i
 					break
 				}

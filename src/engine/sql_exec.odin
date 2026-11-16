@@ -3975,6 +3975,16 @@ eval_binary :: proc(
 		if value_is_truthy(right) do return value_bool(true), ERROR_NONE
 		if value_is_null(left) || value_is_null(right) do return value_null(), ERROR_NONE
 		return value_bool(false), ERROR_NONE
+	case .Is, .Is_Not:
+		same: bool
+		if value_is_null(left) || value_is_null(right) {
+			same = value_is_null(left) && value_is_null(right)
+		} else {
+			order, ok := value_compare_collated(left, right, collation, store)
+			// Values of different classes are never the same value.
+			same = ok && order == .Equal
+		}
+		return value_bool(op == .Is ? same : !same), ERROR_NONE
 	case:
 	}
 	if value_is_null(left) || value_is_null(right) {
@@ -4013,7 +4023,22 @@ eval_binary :: proc(
 		return value_string(strings.concatenate({left_text, right_text})), ERROR_NONE
 	case .Add, .Sub, .Mul, .Div, .Mod:
 		return eval_arithmetic(op, left, right)
-	case .And, .Or:
+	case .Bit_And, .Bit_Or, .Shift_Left, .Shift_Right:
+		a, a_ok := value_bit_operand(left)
+		b, b_ok := value_bit_operand(right)
+		if !a_ok || !b_ok do return {}, errf(.Invalid_Type, "bitwise operators need integers")
+		#partial switch op {
+		case .Bit_And:
+			return value_int(a & b), ERROR_NONE
+		case .Bit_Or:
+			return value_int(a | b), ERROR_NONE
+		case .Shift_Left:
+			return value_int(bit_shift(a, b)), ERROR_NONE
+		case .Shift_Right:
+			// A negative count shifts the other way, as in SQLite.
+			return value_int(bit_shift(a, b == min(i64) ? max(i64) : -b)), ERROR_NONE
+		}
+	case .And, .Or, .Is, .Is_Not:
 	}
 	return {}, errf(.Internal, "unknown binary operator")
 }
@@ -4186,8 +4211,37 @@ eval_unary :: proc(op: Unary_Op, operand: Value) -> (Value, Error) {
 	case .Not:
 		if operand.kind == .Null do return value_null(), ERROR_NONE
 		return value_bool(!value_is_truthy(operand)), ERROR_NONE
+	case .Bit_Not:
+		if operand.kind == .Null do return value_null(), ERROR_NONE
+		v, ok := value_bit_operand(operand)
+		if !ok do return {}, errf(.Invalid_Type, "~ needs an integer")
+		return value_int(~v), ERROR_NONE
 	}
 	return {}, errf(.Internal, "unknown unary operator")
+}
+
+// value_bit_operand converts an operand of a bitwise operator to the 64-bit
+// integer SQLite works on: a real is truncated, numeric text is read as a
+// number (text that is not a number is 0), and a blob is not an integer.
+@(private)
+value_bit_operand :: proc(v: Value) -> (i64, bool) {
+	if v.kind == .String {
+		parsed, ok := value_parse_number(strings.trim_space(v.s))
+		if !ok do return 0, true
+		return value_to_i64(parsed)
+	}
+	if !value_is_numeric(v) do return 0, false
+	return value_to_i64(v)
+}
+
+// bit_shift moves `a` left by `count` bits (right when negative); a count of 64
+// or more empties it, keeping the sign on a right shift as SQLite does.
+@(private)
+bit_shift :: proc(a: i64, count: i64) -> i64 {
+	if count >= 64 do return 0
+	if count <= -64 do return a < 0 ? -1 : 0
+	if count >= 0 do return i64(u64(a) << u64(count))
+	return a >> u64(-count)
 }
 
 @(private)

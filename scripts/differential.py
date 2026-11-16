@@ -176,6 +176,18 @@ QUERIES = [
     # NULLs sort first in both engines, and a SUM of integers stays an integer.
     "SELECT n, m FROM nums ORDER BY m",
     "SELECT typeof(SUM(n)) FROM nums",
+    # IS between values: NULL is an ordinary value on both sides.
+    "SELECT id, dept IS 1, dept IS NOT 2, dept IS NULL FROM emp ORDER BY id",
+    "SELECT id, salary IS DISTINCT FROM 90.0, salary IS NOT DISTINCT FROM NULL FROM emp ORDER BY id",
+    "SELECT count(*) FROM emp WHERE dept IS NOT 1",
+    # Bitwise operators, their precedence and their NULLs.
+    "SELECT n, n & 1, n | 4, ~n, n << 2, n >> 1 FROM nums ORDER BY n, m",
+    "SELECT 1 + 2 & 3, 1 << 2 + 1, -8 >> 1, 1 << 64, 6.7 & 3",
+    # JSON operators: a path, a key and an array slot.
+    "SELECT '{\"a\":{\"b\":[1,2]}}' -> '$.a', '{\"a\":{\"b\":[1,2]}}' ->> '$.a.b[1]', '{\"a\":\"x\"}' ->> 'a', '[5,6]' ->> 1",
+    "SELECT json_extract('{\"A\":1}', '$.a'), json_extract('{\"A\":1}', '$.A')",
+    # LIMIT <offset>, <count>.
+    "SELECT id FROM emp ORDER BY id LIMIT 2, 3",
 ]
 
 # The engine refuses these and says why; SQLite answers them. A refusal that

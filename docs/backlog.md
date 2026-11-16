@@ -34,7 +34,7 @@ Rules for this file:
 | R3 | pruning walks every row of every table after each statement | prune what the commit touched | S |
 | R4 | a committed row is copied from the transaction arena to the table | hand the staged row over | M |
 | S1 | `CHECK`, column `REFERENCES`, `CONSTRAINT` names, `DESC` and partial/expression indexes, `CURRENT_TIMESTAMP` are refused | accept the schema real SQLite files declare | M |
-| S2 | eleven common statement and expression forms are refused | parser and executor work, each small | M |
+| S2 | seven common statement and expression forms are refused (four landed) | parser and executor work, each small | M |
 | S3 | `RIGHT`, `FULL` and `NATURAL` joins are refused | the three joins | M |
 | S4 | `FILTER`, `WINDOW`, aggregate `ORDER BY`, ordered-set aggregates missing | the aggregate surface | M |
 | S5 | 48 of 121 built-in functions missing | math, JSON/JSONB, text, introspection | M |
@@ -145,12 +145,16 @@ rows and the planner uses it only when the query implies its `WHERE`.
 
 ## S2 — Statement and expression forms
 
-**Now refused.** `INSERT OR IGNORE` (and the `OR ABORT`/`FAIL`/`ROLLBACK`
-spellings), `REPLACE INTO`, `INTERSECT` and `EXCEPT`, `LIMIT <offset>, <count>`,
-`IS` / `IS NOT` between two values (only `IS NULL` parses), `IS [NOT] DISTINCT
-FROM`, `NULLS FIRST` / `NULLS LAST`, the bitwise operators `& | ~ << >>`, the JSON
-operators `->` and `->>`, `VALUES` as a table in `FROM`, and row values
-(`(a, b) = (1, 2)`, `(a, b) IN (SELECT …)`).
+**Done.** `IS` / `IS NOT` between any two values and `IS [NOT] DISTINCT FROM`;
+the bitwise operators `& | ~ << >>` at SQLite's precedence; the JSON operators
+`->` and `->>` (a path, a key or an array slot); `LIMIT <offset>, <count>`
+(`test_is_compares_null_as_a_value`, `test_bitwise_operators`,
+`test_json_arrow_operators`, `test_limit_with_a_comma`, and differential
+queries). JSON object keys became case sensitive on the way, as SQLite's are.
+
+**Now refused.** `INSERT OR IGNORE` (and the `OR FAIL`/`ROLLBACK` spellings),
+`REPLACE INTO`, `INTERSECT` and `EXCEPT`, `NULLS FIRST` / `NULLS LAST`, `VALUES`
+as a table in `FROM`, and row values (`(a, b) = (1, 2)`, `(a, b) IN (SELECT …)`).
 
 **Done when.** Each runs and matches SQLite in the differential corpus, including
 the `NULL` cases (`NULL IS NULL` is true, `1 & NULL` is `NULL`).
