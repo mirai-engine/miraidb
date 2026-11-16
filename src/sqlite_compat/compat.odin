@@ -70,6 +70,11 @@ Database :: struct {
 Statement :: struct {
 	db:   ^Database,
 	stmt: ^engine.Embed_Statement,
+	// text_cache owns every C string this statement handed to the caller:
+	// sqlite3_column_text and sqlite3_column_name return a pointer that is valid
+	// until the next step, reset or finalize, and the engine's own strings are
+	// not NUL-terminated, so each answer is cloned here and freed then.
+	text_cache: [dynamic]cstring,
 }
 
 @(private)
@@ -82,6 +87,28 @@ db_of :: proc(handle: rawptr) -> ^Database {
 stmt_of :: proc(handle: rawptr) -> ^Statement {
 	if !engine.handle_is_live(handle) do return nil
 	return cast(^Statement)handle
+}
+
+@(private)
+stmt_clear_text_cache :: proc(stmt: ^Statement) {
+	if stmt == nil do return
+	for text in stmt.text_cache do delete(text)
+	clear(&stmt.text_cache)
+}
+
+// column_text renders a column as the C string SQLite would hand out: every
+// value kind has a text form, NULL is a NULL pointer, and the answer lives until
+// the statement moves or closes. The engine's strings are not NUL-terminated, so
+// each answer is a clone.
+@(private)
+column_text :: proc(stmt: ^Statement, index: int) -> (text: cstring, is_null: bool) {
+	value, ok := engine.embed_column_value(stmt.stmt, index)
+	if !ok || value.kind == .Null do return nil, true
+	rendered := engine.sqlite_value_text(value, context.allocator)
+	defer delete(rendered)
+	clone := strings.clone_to_cstring(rendered, context.allocator)
+	append(&stmt.text_cache, clone)
+	return clone, false
 }
 
 // Blob is an open handle on one BLOB column of one row. Reads and writes touch
@@ -364,6 +391,8 @@ sqlite3_finalize :: proc "c" (handle: rawptr) -> c.int {
 	if stmt == nil do return SQLITE_MISUSE
 	if stmt.db != nil do delete_key(&stmt.db.statements, handle)
 	engine.handle_forget(handle)
+	stmt_clear_text_cache(stmt)
+	delete(stmt.text_cache)
 	engine.embed_finalize(stmt.stmt)
 	free(stmt)
 	return SQLITE_OK
@@ -374,6 +403,7 @@ sqlite3_reset :: proc "c" (handle: rawptr) -> c.int {
 	context = runtime.default_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return SQLITE_MISUSE
+	stmt_clear_text_cache(stmt)
 	engine.embed_reset(stmt.stmt)
 	return SQLITE_OK
 }
@@ -469,6 +499,7 @@ sqlite3_step :: proc "c" (handle: rawptr) -> c.int {
 	context = runtime.default_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return SQLITE_MISUSE
+	stmt_clear_text_cache(stmt)
 	has_row, err := engine.embed_step(stmt.stmt)
 	if err.kind != .None {
 		return fail(stmt.db, err)
@@ -489,10 +520,11 @@ sqlite3_column_count :: proc "c" (handle: rawptr) -> c.int {
 sqlite3_column_name :: proc "c" (handle: rawptr, index: c.int) -> cstring {
 	context = runtime.default_context()
 	stmt := stmt_of(handle)
-	if stmt == nil do return ""
+	if stmt == nil do return nil
 	name := engine.embed_column_name(stmt.stmt, int(index))
-	if len(name) == 0 do return ""
-	return cstring(raw_data(name))
+	clone := strings.clone_to_cstring(name, context.allocator)
+	append(&stmt.text_cache, clone)
+	return clone
 }
 
 @(export)
@@ -539,10 +571,10 @@ sqlite3_column_double :: proc "c" (handle: rawptr, index: c.int) -> c.double {
 sqlite3_column_text :: proc "c" (handle: rawptr, index: c.int) -> cstring {
 	context = runtime.default_context()
 	stmt := stmt_of(handle)
-	if stmt == nil do return ""
-	text := engine.embed_column_text(stmt.stmt, int(index))
-	if len(text) == 0 do return ""
-	return cstring(raw_data(text))
+	if stmt == nil do return nil
+	text, is_null := column_text(stmt, int(index))
+	if is_null do return nil
+	return text
 }
 
 @(export)
@@ -560,7 +592,11 @@ sqlite3_column_bytes :: proc "c" (handle: rawptr, index: c.int) -> c.int {
 	context = runtime.default_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return 0
-	return c.int(len(engine.embed_column_blob(stmt.stmt, int(index))))
+	// SQLite answers the size of the text or blob form of the value, which for a
+	// number is the length of its rendering, not zero.
+	text, is_null := column_text(stmt, int(index))
+	if is_null do return 0
+	return c.int(len(string(text)))
 }
 
 @(export)

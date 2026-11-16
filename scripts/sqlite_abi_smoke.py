@@ -43,6 +43,12 @@ def load(path):
     lib.sqlite3_clear_bindings.restype = ctypes.c_int
     lib.sqlite3_bind_int.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
     lib.sqlite3_bind_int.restype = ctypes.c_int
+    lib.sqlite3_column_bytes.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    lib.sqlite3_column_bytes.restype = ctypes.c_int
+    lib.sqlite3_column_double.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    lib.sqlite3_column_double.restype = ctypes.c_double
+    lib.sqlite3_column_type.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    lib.sqlite3_column_type.restype = ctypes.c_int
     lib.sqlite3_libversion.restype = ctypes.c_char_p
     return lib
 
@@ -406,6 +412,26 @@ def main() -> int:
     lib.sqlite3_finalize(lengths)
     assert seen == [3, 3], seen
     assert lib.sqlite3_close(text_db) == OK
+
+    # F10: column_text renders every value, answers NULL for NULL, and its bytes
+    # are NUL-terminated. Before this, an integer or a real answered "", and the
+    # pointer came from an engine string that was not terminated at all.
+    render_db = ctypes.c_void_p()
+    assert lib.sqlite3_open(b":memory:", ctypes.byref(render_db)) == OK
+    render_stmt = ctypes.c_void_p()
+    assert lib.sqlite3_prepare_v2(render_db, b"SELECT 42, 2.5, 'text', NULL, x'00ff'", -1,
+                                  ctypes.byref(render_stmt), None) == OK
+    assert lib.sqlite3_step(render_stmt) == ROW
+    assert lib.sqlite3_column_text(render_stmt, 0) == b"42", lib.sqlite3_column_text(render_stmt, 0)
+    assert lib.sqlite3_column_text(render_stmt, 1) == b"2.5", lib.sqlite3_column_text(render_stmt, 1)
+    assert lib.sqlite3_column_text(render_stmt, 2) == b"text"
+    assert lib.sqlite3_column_text(render_stmt, 3) is None, "NULL is a NULL pointer"
+    assert lib.sqlite3_column_bytes(render_stmt, 0) == 2, "the bytes of a rendered integer"
+    assert lib.sqlite3_column_bytes(render_stmt, 2) == 4
+    assert lib.sqlite3_column_bytes(render_stmt, 3) == 0
+    assert lib.sqlite3_column_type(render_stmt, 0) == 1 and lib.sqlite3_column_type(render_stmt, 3) == 5
+    lib.sqlite3_finalize(render_stmt)
+    assert lib.sqlite3_close(render_db) == OK
 
     print("rows:", rows)
     print("error path:", message)
