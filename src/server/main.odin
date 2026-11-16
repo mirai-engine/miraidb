@@ -286,7 +286,24 @@ serve :: proc(connection: ^Connection) {
 	n, recv_err := net.recv(client, buffer[:])
 	if recv_err != nil || n <= 0 do return
 	if db.pg_is_startup(buffer[:n]) {
-		serve_postgres(connection)
+		// A startup that begins with an SSLRequest is a question, not a session:
+		// the answer is one byte, 'S' to continue with TLS or 'N' to continue in
+		// the clear. Answering the authentication request instead desynchronises
+		// libpq, whose default sslmode is `prefer`, so psql and psycopg could not
+		// connect at all without sslmode=disable. This server has no TLS, so the
+		// answer is N and the loop waits for the real startup that follows.
+		for {
+			probe, probe_ok := db.pg_parse_startup(buffer[:n])
+			if !probe_ok || !probe.ssl_request do break
+			refusal := []u8{'N'}
+			_ = send(connection, refusal[:])
+			n, recv_err = net.recv(client, buffer[:])
+			if recv_err != nil || n <= 0 do return
+		}
+		if db.pg_is_startup(buffer[:n]) {
+			serve_postgres(connection)
+			return
+		}
 		return
 	}
 	if db.ws_is_upgrade(buffer[:n]) {

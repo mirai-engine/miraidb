@@ -300,6 +300,30 @@ def main() -> int:
     try:
         check("the server owns the database", wait_healthy(port, server))
 
+        # A PostgreSQL client opens with an SSLRequest before anything else. The
+        # answer is one byte: 'N' when the server has no TLS. Answering the
+        # authentication request instead desynchronised libpq, whose default
+        # sslmode is `prefer`, so psql and psycopg could not connect at all.
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as probe:
+            probe.sendall(struct.pack("!ii", 8, 80877103))
+            answer = probe.recv(1)
+        check("an SSLRequest is answered N on the PostgreSQL port", answer == b"N", repr(answer))
+        # After the refusal the same socket carries the plaintext startup: the
+        # engine's own PostgreSQL path answers ReadyForQuery for a query.
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as session:
+            session.sendall(struct.pack("!ii", 8, 80877103))
+            assert session.recv(1) == b"N"
+            startup = b"user\x00root\x00database\x00x\x00\x00"
+            session.sendall(struct.pack("!ii", 4 + len(startup), 196608) + startup)
+            seen = b""
+            deadline = time.time() + 5
+            while b"Z" not in seen and time.time() < deadline:
+                chunk = session.recv(4096)
+                if not chunk:
+                    break
+                seen += chunk
+        check("the startup completes after the refusal", b"Z" in seen, seen[:40])
+
         # Client A creates and writes; client B reads the same state.
         check("create through the broker", post(port, "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)")["affected"] >= 0)
         first = post(port, "INSERT INTO notes (id, body) VALUES (1, 'one'), (2, 'two')")
