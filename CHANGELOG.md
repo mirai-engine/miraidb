@@ -2,6 +2,42 @@
 
 ## 0.15
 
+- PostgreSQL clients work for real. The server framed its input by TCP read, so a
+  driver's pipelined Parse/Bind/Describe/Execute/Sync lost everything after Parse
+  and hung; reusing a statement name freed a slice of the network buffer and
+  killed the process; no `client_encoding` was sent, which crashed psycopg's C
+  build; and `Execute` repeated a RowDescription whose types disagreed with
+  `Describe`. All four are fixed, and a connection now keeps a transaction across
+  messages (with PostgreSQL's aborted state), runs several statements per Query,
+  sends command tags and SQLSTATE codes, and answers `DEALLOCATE`/`DISCARD`.
+- The PostgreSQL dialect an ORM sends first: `x::type`, `SERIAL`, identity
+  columns, `$n` parameters, PostgreSQL's type names (`VARCHAR(n)`, `DOUBLE
+  PRECISION`, `TIMESTAMP WITH TIME ZONE`, `JSONB`, `NUMERIC(p, s)`, …),
+  `information_schema.tables`/`columns`, `pg_catalog.pg_tables`, `public.t`, and
+  `version()`, `current_database()`, `current_user`, `current_schema`.
+- Full-text search takes phrases (`"a b"`), prefixes (`foo*`) and column filters
+  (`body:foo`), with no change to the index format.
+- A transaction reuses an emptied arena instead of mapping a new one: an empty
+  write transaction fell from 14.4 to 0.7 us. Rows collected in row-id order are
+  sorted by a typed introsort instead of `slice.sort_by`, which copied both
+  80-byte rows into every comparison: iterating 256 rows fell from 70 to 15 us.
+- The write path does less: a commit sorts its row ids with the typed sort,
+  clones nothing for a commit hook nobody registered, encodes no payload for a
+  store without a log, and does not probe an insert's unique keys a second time
+  when its own commit applies it; a table name joins the read set once, and a
+  unique key is encoded into the transaction arena and checked by walking the
+  index in place. 256 inserts fell from 1 645 to 762 us and 256 updates from
+  2 339 to 1 142 us (in memory, `benchmarks/parity`).
+- A transaction remembers whether `_grant` and `_trigger` exist and which table
+  its last insert resolved, and resets both on any catalog change or savepoint
+  rollback; the unique keys a check encodes are the ones it registers; index keys
+  are encoded into a per-table buffer. 256 inserts: 762 to 681 us.
+- `benchmarks/parity` runs the reference database's own benchmark suite
+  (schemas, generator, sizes) against this engine.
+- The differential and compatibility gates read SQLite through Python's module
+  and decode the CLI's output as UTF-8, so they no longer report the `sqlite3`
+  shell's number formatting, or the Windows code page, as differences.
+
 - The first packaged release: the engine, the CLI, the server, the shared
   library with its header, and the Python binding over the C ABI.
 - Append-only commit log with CRC32C per record, snapshots, compaction and a

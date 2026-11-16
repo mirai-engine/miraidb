@@ -48,7 +48,7 @@ SQL surface, but never links SQLite and never needs it to run.
 3. **Replay is the recovery model.** The commit log is the database. Startup
    replays it record by record; a torn tail is detected by CRC32C and cut.
 4. **Everything is data.** Schemas, rows and index keys are encoded with one
-   versioned format, so the log, the indexes and the future wire protocol agree.
+   versioned format, so the log, the indexes and the wire protocol agree.
 5. **The core owns its invariants.** Only the engine decides what a valid row
    is; SQL, reducers and subscriptions all go through the same insert/update
    path.
@@ -60,15 +60,23 @@ SQL surface, but never links SQLite and never needs it to run.
 
 ```text
 miraidb/
-├── scripts/build.py       build and test helper (Python, not part of the engine)
 ├── src/
 │   ├── engine/            the database: values, schema, tables, log, tx, SQL, host
 │   ├── cli/               the `miraidb` command line
+│   ├── server/            `miraidb-server`: HTTP, WebSocket frames and PostgreSQL
+│   ├── capi/              the C ABI, built as `miraidb.dll` / `libmiraidb`
+│   ├── sqlite_compat/     the `sqlite3_*` facade, built as `sqlite3_miraidb.dll`
+│   ├── client/            the Odin client SDK
 │   └── tests/             integration tests (`odin test src/tests`)
+├── include/miraidb.h      the C header for the ABI
 ├── examples/
-│   └── todo/              reducers + subscriptions in a small Odin program
+│   ├── todo/              reducers + subscriptions in a small Odin program
+│   └── embed_c/           the database embedded in a C program
 ├── sdk/
-│   └── python/           a typed client over the C ABI (`scripts/sdk_smoke.py`)
+│   └── python/            a typed client over the C ABI (`scripts/sdk_smoke.py`)
+├── benchmarks/            the recorded baseline and the reference-suite port
+├── tools/leakcheck/       the allocation report `scripts/leaks.py` gates
+├── scripts/               build, CI and every test harness (Python, not part of the engine)
 ├── docs/
 │   ├── architecture.md    modules, invariants, transaction and subscription model
 │   ├── file-format.md     commit log and snapshot layout, records, recovery
@@ -77,7 +85,8 @@ miraidb/
 │   ├── roadmap.md         the plan: phases, what is asked for, what "done" means
 │   ├── backlog.md         depth work: what is shallow today and what "done" means
 │   ├── security.md        what the server trusts, refuses and does not defend
-│   └── status.md          what is done, partial and not started
+│   ├── status.md          what is done, partial and not started
+│   └── versioning-plan.md the proposal: branches, merge and peer-to-peer sync
 ├── CONTRIBUTING.md
 ├── LICENSE-APACHE
 ├── LICENSE-MIT
@@ -102,10 +111,11 @@ odin test src/tests
 ```
 
 Odin `dev-2026-10` or newer (`ODIN=/path/to/odin` when it is not on `PATH`). The
-engine and the CLI are pure Odin and use only `core` packages. The `scripts/`
-directory holds the test harnesses, all Python: `build.py`, `ci.py`,
-`conformance.py`, `shell_smoke.py`, `capi_smoke.py`, `sqlite_abi_smoke.py`,
-`roadmap.py`, `fuzz.py` and `soak.py`.
+engine and the CLI are pure Odin and use only `core` packages. The harnesses in
+`scripts/` are Python; `python3 scripts/ci.py --list` names every gate they make
+up. The DLL smokes need a Python that can load a Windows DLL: pass
+`--windows-python C:/path/to/python.exe` (a Windows path) or set
+`MIRAIDB_WINDOWS_PYTHON`, otherwise `ci.py` skips them and says so.
 
 ## Using the CLI
 
@@ -161,27 +171,25 @@ _, exec_err := db.sql_execute(store, `
     )`)
 ```
 
-A reducer is an Odin procedure that receives the open transaction:
+A reducer is an Odin procedure that receives the open transaction. Values reach
+the statement as bind parameters (`?`, or PostgreSQL's `$1`), never as text
+spliced into it:
 
 ```odin
-import "core:fmt"
-import "core:strings"
-
 add_score :: proc(ctx: ^db.Reducer_Ctx, args: []db.Value) -> db.Error {
-	name, _ := strings.replace_all(args[0].s, "'", "''")
-	points, _ := db.value_to_f64(args[1])
-	statement := fmt.aprintf("UPDATE player SET score = score + %v WHERE name = '%s'", points, name)
-	defer delete(statement)
-	_, err := db.sql_execute_in_tx(ctx.tx, statement)
+	// args are (name, points); the statement takes them as (points, name).
+	result, err := db.sql_execute_in_tx_params(
+		ctx.tx,
+		"UPDATE player SET score = score + ? WHERE name = ?",
+		[]db.Value{args[1], args[0]},
+	)
+	db.sql_result_destroy(&result)
 	return err
 }
 
 db.host_register(host, "add_score", []db.Column_Type{db.type_string, db.type_float}, add_score)
 db.host_call(host, "add_score", []db.Value{db.value_string("ana"), db.value_float(1)})
 ```
-
-The dialect has no bind parameters yet, so a reducer that takes values builds
-the statement with escaped text (M2 adds prepared statements).
 
 If the handler returns an error, the whole call rolls back. Subscription
 updates arrive after the commit:
@@ -207,14 +215,19 @@ Integer widths are enforced on store.
 `SELECT` with `INNER`/`LEFT`/`CROSS` joins, `CASE`, common table expressions
 (recursive included), `DISTINCT`, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`,
 `LIMIT`/`OFFSET`, scalar and aggregate functions (`count(DISTINCT x)` included),
-window frames with `ROWS BETWEEN`, subqueries (`IN`, `EXISTS`, scalar) and
-positional `?` parameters; views (with parameters and `OR REPLACE`), `AFTER`
-triggers with `WHEN`, row-level security policies, `SET`/`SHOW`, `DESCRIBE`,
+window functions with `ROWS`, `RANGE` and `GROUPS` frames, subqueries (`IN`,
+`EXISTS`, scalar), positional `?` and numbered `$n` parameters; views (with
+parameters and `OR REPLACE`), `BEFORE` and `AFTER` triggers with `WHEN`,
+row-level security policies, `SET`/`SHOW`, `DESCRIBE`,
 `EXPLAIN` with cost estimates and the planned join order, `SAVEPOINT`,
-`ATTACH`/`DETACH`, `AS OF <seq>` for a past commit, and `TRUNCATE`.
+`ATTACH`/`DETACH`, `AS OF <seq>` for a past commit, and `TRUNCATE`. The
+PostgreSQL spellings an ORM sends first are accepted too: `x::type`, `SERIAL`,
+identity columns, PostgreSQL's type names, `information_schema` and the session
+functions (`docs/sql.md`, PostgreSQL spellings).
 
 **Search and documents.** FTS5 virtual tables with BM25 ranking (`rank`),
-`snippet` and `highlight`, backed by an index in ordinary tables; spatial
+phrases, prefixes and column filters, `snippet` and `highlight`, backed by an
+index in ordinary tables; spatial
 tables of bounding boxes; JSON functions and the `json_each`/`json_tree` table
 functions; dates and times.
 
@@ -232,7 +245,9 @@ module ABI v1/v2 for out-of-process extensions.
 
 **Network.** `miraidb-server` over HTTP (`/call`, `/query`, `/subscribe`,
 `/unsubscribe`, `/wire`, `/health`, `/metrics`), WebSocket binary frames and the
-PostgreSQL wire protocol; HMAC-hashed session tokens, HS256 JWTs, per-connection
+PostgreSQL wire protocol (`psql` and psycopg 3 work against it: transactions
+across messages, pipelined extended queries, command tags, SQLSTATE codes);
+HMAC-hashed session tokens, HS256 JWTs, per-connection
 identity, connection limits, byte accounting, a bounded outbox, deflate
 compression and per-call work budgets.
 
@@ -267,6 +282,9 @@ Status and planning:
 [roadmap.md](docs/roadmap.md) (the pending order),
 [backlog.md](docs/backlog.md) (the depth work, with cost) and
 [pending.md](docs/pending.md) (the weighted roadmap `roadmap.py` regenerates).
+[versioning-plan.md](docs/versioning-plan.md) is the proposal for what comes
+after the roadmap: commits with an identity, branches, row-level merge, and
+peer-to-peer sync between users, an office peer and a VPS.
 
 ## Roadmap
 
@@ -279,7 +297,7 @@ Status and planning:
 | M5 | Hosted mode: `miraidb-server` over HTTP/WebSocket/Postgres, authentication, connection-scoped authorization **(done)** |
 | M6 | Retries with backoff, request timeouts, connection limits **(transport caps done; retry policy and per-route timeouts remain, `docs/backlog.md` D15)** |
 | M7 | Module ABI: trusted native Odin extensions **(done out of process: `LOAD EXTENSION … AT 'host:port'`)**, sandboxed modules with enforced memory and time **(remaining, D12c)** |
-| M8 | Hardening: statement fuzzing and a soak harness (`scripts/fuzz.py`, `scripts/soak.py`), fault injection at every write of a workload (`Fault_Vfs`), latency histograms, `PRAGMA integrity_check` and `foreign_key_check`, transport caps, opt-in background compaction, a benchmark gate against a recorded baseline **(done)**; process-level load tests and a readable leak report remain |
+| M8 | Hardening: statement fuzzing and a soak harness (`scripts/fuzz.py`, `scripts/soak.py`), fault injection at every write of a workload (`Fault_Vfs`), latency histograms, `PRAGMA integrity_check` and `foreign_key_check`, transport caps, opt-in background compaction, a benchmark gate against a recorded baseline, a leak report that names the file and line (`tools/leakcheck`) **(done)**; process-level load tests remain |
 
 Snapshots and compaction came before the network layer on purpose: without
 them, recovery time grows with the log and range queries scan the table.

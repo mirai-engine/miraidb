@@ -39,3 +39,4 @@ __pycache__/
 
 # page_rss.py workspace
 /_page_rss/
+.index/
