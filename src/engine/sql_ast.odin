@@ -441,7 +441,11 @@ Drop_Table_Stmt :: struct {
 Create_Index_Stmt :: struct {
 	name:          string,
 	table:         string,
+	// columns names each key part; exprs holds the text of a part that is an
+	// expression (empty for a plain column), and where_sql a partial index's WHERE.
 	columns:       []string,
+	exprs:         []string,
+	where_sql:     string,
 	unique:        bool,
 	algorithm:     Index_Algorithm,
 	if_not_exists: bool,

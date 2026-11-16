@@ -4915,10 +4915,12 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		return value_string(fts_mark(args[0].s, args[1].s, window)), ERROR_NONE
 	case "lower":
 		if len(args) != 1 do return {}, errf(.Invalid_Argument, "lower() takes one argument")
+		if args[0].kind == .Null do return value_null(), ERROR_NONE
 		if args[0].kind != .String do return {}, errf(.Invalid_Type, "lower() expects text")
 		return value_string(strings.to_lower(args[0].s)), ERROR_NONE
 	case "upper":
 		if len(args) != 1 do return {}, errf(.Invalid_Argument, "upper() takes one argument")
+		if args[0].kind == .Null do return value_null(), ERROR_NONE
 		if args[0].kind != .String do return {}, errf(.Invalid_Type, "upper() expects text")
 		return value_string(strings.to_upper(args[0].s)), ERROR_NONE
 	case "length", "char_length":
@@ -5024,6 +5026,7 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		return value_string(strings.clone(text[begin:end])), ERROR_NONE
 	case "replace":
 		if len(args) != 3 do return {}, errf(.Invalid_Argument, "replace() takes three arguments")
+		for arg in args do if arg.kind == .Null do return value_null(), ERROR_NONE
 		for arg in args {
 			if arg.kind != .String do return {}, errf(.Invalid_Type, "replace() expects text")
 		}
@@ -5039,6 +5042,7 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		return value_string(strings.clone(strings.to_string(builder))), ERROR_NONE
 	case "sign":
 		if len(args) != 1 do return {}, errf(.Invalid_Argument, "sign() takes one argument")
+		if args[0].kind == .Null do return value_null(), ERROR_NONE
 		if number, ok := value_to_f64(args[0]); ok {
 			if number > 0 do return value_int(1), ERROR_NONE
 			if number < 0 do return value_int(-1), ERROR_NONE
@@ -5067,6 +5071,7 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		return value_float(math.ceil(number)), ERROR_NONE
 	case "sqrt":
 		if len(args) != 1 do return {}, errf(.Invalid_Argument, "sqrt() takes one argument")
+		if args[0].kind == .Null do return value_null(), ERROR_NONE
 		number, ok := value_to_f64(args[0])
 		if !ok do return {}, errf(.Invalid_Type, "sqrt() expects a number")
 		if number < 0 do return {}, errf(.Invalid_Argument, "sqrt() needs a non-negative number")
@@ -5163,10 +5168,11 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		return value_string("3.54.1"), ERROR_NONE
 	case "instr":
 		if len(args) != 2 do return {}, errf(.Invalid_Argument, "instr() takes two arguments")
+		// NULL first: the check after the type test could never be reached.
+		if args[0].kind == .Null || args[1].kind == .Null do return value_null(), ERROR_NONE
 		if args[0].kind != .String || args[1].kind != .String {
 			return {}, errf(.Invalid_Type, "instr() expects text")
 		}
-		if args[0].kind == .Null || args[1].kind == .Null do return value_null(), ERROR_NONE
 		at := strings.index(args[0].s, args[1].s)
 		if at < 0 do return value_int(0), ERROR_NONE
 		// The answer is a character position, the offset found is a byte one.
@@ -5175,6 +5181,11 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		builder := strings.builder_make()
 		defer strings.builder_destroy(&builder)
 		for arg in args {
+			// SQLite reads a NULL argument as code point 0.
+			if arg.kind == .Null {
+				strings.write_byte(&builder, 0)
+				continue
+			}
 			if arg.kind != .Int do return {}, errf(.Invalid_Type, "char() expects integers")
 			strings.write_rune(&builder, rune(arg.i))
 		}
@@ -5314,6 +5325,7 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		return value_bool(glob_match(args[1].s, args[0].s)), ERROR_NONE
 	case "format", "printf":
 		if len(args) == 0 do return {}, errf(.Invalid_Argument, "format() needs a pattern")
+		if args[0].kind == .Null do return value_null(), ERROR_NONE
 		if args[0].kind != .String do return {}, errf(.Invalid_Type, "format() expects a text pattern")
 		return value_string(sq_format(args[0].s, args[1:])), ERROR_NONE
 	}
@@ -5714,6 +5726,7 @@ unique_conflicts :: proc(tx: ^Tx, table: ^Table, values: []Value) -> [dynamic]Ro
 	ids := make([dynamic]Row_Id, 0, 2, tx.alloc)
 	for idx, i in table.indexes {
 		if !idx.unique do continue
+		if !index_row_included(table, i, values) do continue
 		found := table_index_lookup(table, i, values)
 		for id in found {
 			seen := false
@@ -5728,6 +5741,32 @@ unique_conflicts :: proc(tx: ^Tx, table: ^Table, values: []Value) -> [dynamic]Ro
 		delete(found)
 	}
 	return ids
+}
+
+// row_with_defaults gives a row with every DEFAULT the statement left implicit
+// filled in, coerced to the column's type, as tx_insert would store it.
+@(private)
+row_with_defaults :: proc(tx: ^Tx, table: ^Table, values: []Value) -> []Value {
+	out := make([]Value, len(values), tx.alloc)
+	for value, i in values {
+		out[i] = value
+		if value.kind != .Default || i >= len(table.schema.columns) do continue
+		column := table.schema.columns[i]
+		filled, fill_err := column_default_for_row(tx, column)
+		if fill_err.kind != .None {
+			error_free(&fill_err)
+			out[i] = value_null()
+			continue
+		}
+		coerced, coerce_err := value_coerce(filled, column.type)
+		if coerce_err.kind != .None {
+			error_free(&coerce_err)
+			out[i] = filled
+			continue
+		}
+		out[i] = coerced
+	}
+	return out
 }
 
 @(private)
@@ -5887,9 +5926,14 @@ sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Res
 			//
 			// The duplicate-key answer explained the first attempt, and this branch
 			// answers the statement instead: its message is freed here.
-			error_free(&insert_err)
-			conflicts := unique_conflicts(tx, table, values)
+			// The conflicts are looked up with the row as it would be stored: a
+			// column the statement left out holds its default, which a key or a
+			// partial index's WHERE may read.
+			conflicts := unique_conflicts(tx, table, row_with_defaults(tx, table, values))
 			defer delete(conflicts)
+			// Without a row to replace the failure stands; it used to be freed first
+			// and the statement reported a row it never inserted.
+			if len(conflicts) > 0 do error_free(&insert_err)
 			for id in conflicts {
 				if fts_err := fts_delete_if_virtual(tx, stmt.table, id); fts_err.kind != .None {
 					return {}, fts_err
@@ -6605,6 +6649,10 @@ sql_exec_create_index :: proc(tx: ^Tx, stmt: Create_Index_Stmt) -> (Sql_Result, 
 	if table_err.kind != .None do return {}, table_err
 	columns := make([]int, len(stmt.columns), tx.alloc)
 	for name, i in stmt.columns {
+		if i < len(stmt.exprs) && len(stmt.exprs[i]) > 0 {
+			columns[i] = NO_COLUMN
+			continue
+		}
 		index, found := schema_column_index(&table.schema, name)
 		if !found {
 			return {}, errf(.Column_Not_Found, "column %s does not exist in %s", name, stmt.table)
@@ -6636,11 +6684,122 @@ sql_exec_create_index :: proc(tx: ^Tx, stmt: Create_Index_Stmt) -> (Sql_Result, 
 		columns   = columns,
 		unique    = stmt.unique,
 		algorithm = stmt.algorithm,
+		where_sql = stmt.where_sql,
+		exprs     = stmt.exprs,
+	}
+	if !index_is_plain(index) && stmt.algorithm != .Btree {
+		return {}, errf(.Sql_Unsupported, "a partial or expression index is a btree index")
+	}
+	// Every row the index will hold is tried now: an expression that fails, and a
+	// UNIQUE index the rows already break, are this statement's error rather than
+	// a commit that cannot apply.
+	if verify_err := index_verify_rows(tx, table, stmt.table, index); verify_err.kind != .None {
+		return {}, verify_err
 	}
 	if add_err := tx_create_index(tx, stmt.table, index); add_err.kind != .None {
 		return {}, add_err
 	}
 	return Sql_Result{kind = .Ack}, ERROR_NONE
+}
+
+// INDEX_FORBIDDEN_CALLS are functions an index may not use: their answer
+// changes from one evaluation to the next, so a key computed today would not be
+// found tomorrow. SQLite refuses the same.
+INDEX_FORBIDDEN_CALLS :: []string{
+	"random", "randomblob", "now", "uuid", "changes", "total_changes", "last_insert_rowid",
+	"current_identity", "has_role", "rank", "snippet", "highlight",
+}
+
+// index_expression_refusal names why an expression cannot be part of an index,
+// or answers "" when it can.
+@(private)
+index_expression_refusal :: proc(expr: ^Expr) -> string {
+	Probe :: struct {
+		reason: string,
+	}
+	probe: Probe
+	expr_walk(expr, proc(node: ^Expr, user: rawptr) -> bool {
+		probe := (^Probe)(user)
+		#partial switch e in node^ {
+		case Subquery_Expr:
+			probe.reason = "a subquery"
+		case Param_Expr:
+			probe.reason = "a parameter"
+		case Window_Expr:
+			probe.reason = "a window function"
+		case In_Expr:
+			if e.subquery != nil do probe.reason = "a subquery"
+		case Call_Expr:
+			for name in INDEX_FORBIDDEN_CALLS {
+				if strings.equal_fold(e.name, name) do probe.reason = "a non-deterministic function"
+			}
+			if expr_is_aggregate(node) do probe.reason = "an aggregate"
+			// date('now') and its siblings answer the current moment.
+			for arg in e.args {
+				if literal, ok := arg^.(Literal_Expr); ok && literal.value.kind == .String && strings.equal_fold(literal.value.s, "now") {
+					probe.reason = "the current time"
+				}
+			}
+		}
+		return true
+	}, &probe)
+	return probe.reason
+}
+
+// index_verify_rows checks a partial or expression index, and any UNIQUE index,
+// against the rows it is about to hold: an expression it cannot evaluate, a key
+// two rows share. It answers before the index is staged.
+@(private)
+index_verify_rows :: proc(tx: ^Tx, table: ^Table, table_name: string, index: Index_Schema) -> Error {
+	for text in index.exprs {
+		if len(text) == 0 do continue
+		query, expr, err := sql_parse_expression(text)
+		if err.kind != .None do return err
+		defer query_destroy(&query)
+		if reason := index_expression_refusal(expr); len(reason) > 0 {
+			return errf(.Sql_Unsupported, "index %s cannot use %s in a key expression", index.name, reason)
+		}
+	}
+	if len(index.where_sql) > 0 {
+		query, expr, err := sql_parse_expression(index.where_sql)
+		if err.kind != .None do return err
+		defer query_destroy(&query)
+		if reason := index_expression_refusal(expr); len(reason) > 0 {
+			return errf(.Sql_Unsupported, "index %s cannot use %s in its WHERE", index.name, reason)
+		}
+	}
+	if index_is_plain(index) && !index.unique do return ERROR_NONE
+	exprs, exprs_err := index_exprs_make(index)
+	if exprs_err.kind != .None do return exprs_err
+	defer index_exprs_destroy(exprs)
+	// A table of one index, the one being created, so the key builders apply.
+	probe := Table{schema = table.schema}
+	probe_indexes := [1]Index{Index{schema = index, unique = index.unique, exprs = exprs}}
+	probe.indexes = probe_indexes[:]
+	rows := make([dynamic]Row)
+	defer delete(rows)
+	if collect_err := tx_collect(tx, table_name, &rows); collect_err.kind != .None do return collect_err
+	seen := make(map[string]bool)
+	defer {
+		for key in seen do delete(key)
+		delete(seen)
+	}
+	for row in rows {
+		if validate_err := index_validate_row(tx, &probe, row.values); validate_err.kind != .None do return validate_err
+		if !index.unique || !index_row_included(&probe, 0, row.values) do continue
+		w: Byte_Writer
+		bw_init(&w)
+		has_null := index_encode_parts(&w, &probe, 0, row.values)
+		key := string(bw_bytes(&w))
+		if has_null || !(key in seen) {
+			if !has_null do seen[strings.clone(key)] = true
+			bw_destroy(&w)
+			continue
+		}
+		bw_destroy(&w)
+		return errf(.Duplicate_Unique, "UNIQUE constraint failed: index %s", index.name)
+	}
+	return ERROR_NONE
 }
 
 sql_exec_drop_index :: proc(tx: ^Tx, stmt: Drop_Index_Stmt) -> (Sql_Result, Error) {
@@ -6908,6 +7067,8 @@ index_order_for :: proc(
 	}
 	for &candidate, position in table.indexes {
 		if candidate.pages != nil do continue
+		// A partial or expression index does not hold every row by its columns.
+		if !index_is_plain(candidate.schema) do continue
 		if len(candidate.schema.columns) != len(stmt.order_by) do continue
 		if direction && !candidate.unique do continue
 		matched := true
@@ -7007,6 +7168,7 @@ join_index_probe :: proc(
 			if !found do continue
 			for &index, i in table.indexes {
 				if len(index.schema.columns) == 0 do continue
+				if !index_is_plain(index.schema) do continue
 				// A probe answers an index that leads with the column it binds.
 				if index.schema.columns[0] != column_index do continue
 				return Index_Probe{index = i, column = column_index, value = side[1]}, true
@@ -7159,6 +7321,7 @@ comparison_sides :: proc(
 @(private)
 index_for_single_column :: proc(table: ^Table, column: int) -> (int, bool) {
 	for index, i in table.indexes {
+		if !index_is_plain(index.schema) do continue
 		if len(index.schema.columns) == 1 && index.schema.columns[0] == column {
 			return i, true
 		}

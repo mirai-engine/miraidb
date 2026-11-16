@@ -39,7 +39,7 @@ that way.
 
 | # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
-| 8 | **S1 — the schema real files declare** — *partly done* | Done: `CHECK`, `CONSTRAINT` names, column `REFERENCES`, deferred foreign keys, `ASC`/`DESC` columns, `CURRENT_TIMESTAMP` and per-row defaults. Left: partial and expression indexes. | M | — |
+| 8 | **S1 — the schema real files declare** — *done but one* | Done: `CHECK`, `CONSTRAINT` names, column `REFERENCES`, deferred foreign keys, `ASC`/`DESC` columns, `CURRENT_TIMESTAMP` and per-row defaults, partial and expression indexes, many NULLs in a UNIQUE column. Left: `ON CONFLICT` on a constraint. | S | — |
 | 9 | **S2 — statement and expression forms** — *done but one* | Done: `IS` values, `IS DISTINCT FROM`, bitwise operators, `->`/`->>`, `LIMIT a, b`, `INSERT OR IGNORE/FAIL/ROLLBACK`, `REPLACE INTO`, `INTERSECT`/`EXCEPT`, `NULLS FIRST/LAST`, derived tables and `VALUES`, row values; a failed statement is undone whole inside a transaction. Left: `UPDATE OR <resolution>`. | S | — |
 | 10 | **S3 — joins** | `RIGHT`, `FULL`, `NATURAL`. | M | — |
 | 11 | **S4 — aggregates and windows** | `FILTER`, the `WINDOW` clause, `ORDER BY` inside an aggregate, `median` and the percentiles, `json_group_array`/`_object`. | M | — |
@@ -47,29 +47,30 @@ that way.
 | 13 | **S6 — statements and pragmas** | `EXPLAIN QUERY PLAN`, `REINDEX`, `INSTEAD OF` triggers, `INDEXED BY`, `generate_series`, `VACUUM`/`ATTACH` in memory, 9 pragmas. | M | — |
 | 14 | **S7 — affinity and `WITHOUT ROWID`** | `ANY` columns exist; left: an untyped column, SQLite's affinity rules, comparison across storage classes (refused today), `WITHOUT ROWID` as a write target. | L | — |
 | 15 | **D4 — secondary indexes in the mirror** | A table with a secondary index re-encodes the `.sqlite` file per commit. | L | — |
-| 16 | **D24 — the mirror's last gaps** | A counted skip for an index the engine cannot express, and a mirror fuzz pass. | S | 8 |
+| 16 | **D36 — partial and expression indexes in plans** | The planner skips them; match a predicate to a partial index's WHERE and an expression to its index. | M | 8 |
+| 17 | **D24 — the mirror's last gaps** | A counted skip for an index the engine cannot express, and a mirror fuzz pass. | S | 8 |
 
 ## C. Hardening and release
 
 | # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
-| 17 | **D23 — allocation failure** | A failed allocation is a crash, not `.Out_Of_Memory`; start with an allocator that fails the nth call. | M | — |
-| 18 | **D34 — Linux suite and heap sanitizer** | The threaded suite crashes on Linux; then CI on Linux and macOS with `-sanitize:address`, the suite sanitized as a gate (the CLI already is, on Windows), and scripts that find a binary without `.exe`. | M | — |
-| 19 | **D8 — fault injection beyond the log** | Snapshot, rotation, the mirror, a kill during a page flush. | S | — |
-| 20 | **D3 — version retention** | Automatic retention tied to the oldest reader; `AS OF` on a join. | M | — |
-| 21 | **D5 — the rest of the page store** | Leaf merge, versions on paged tables, a read without the shared lock for its whole life; with D18, a reader that trusts the pages. | L | — |
-| 22 | **D11 — triggers and policies in a transaction** | Order them against the rows of the same transaction. | S | — |
-| 23 | **D2 — spatial tree** | Node pages and a descent instead of a scan over box columns. | M | — |
-| 24 | **D10 — precision and time** | Decimal scale, `TIMESTAMPTZ`, streaming blobs. | M | — |
-| 25 | **D35 — diagnostics** | Map nodes freed through the wrong allocator, error ownership across the API, a file open per commit for the log index. | M | 18 |
-| 26 | **D15 — network hardening** | TLS, HTTP/2, backpressure, per-route timeouts, a load test. | M | — |
-| 27 | **D14 — replication** | `GET /log?since=<seq>` and a follower applying through replay. | XL | 26 |
-| 28 | **Auth review** | Rate limits, token lifetime, adversarial tests over subscriptions and budgets; tokens travel in clear until TLS; **grants are opt-in**, so a database with no grant rows accepts every statement from every client. | S | — |
-| 29 | **Release and packaging** | `scripts/package.py` builds and checks one archive. Left: one archive per target, a version policy, a byte-for-byte reproducible build. | M | 18 |
-| 30 | **Licence and notice review** | MIT/Apache-2.0 with no vendored third-party source; confirm before each release. | external | — |
+| 18 | **D23 — allocation failure** | A failed allocation is a crash, not `.Out_Of_Memory`; start with an allocator that fails the nth call. | M | — |
+| 19 | **D34 — Linux suite and heap sanitizer** | The threaded suite crashes on Linux; then CI on Linux and macOS with `-sanitize:address`, the suite sanitized as a gate (the CLI already is, on Windows), and scripts that find a binary without `.exe`. | M | — |
+| 20 | **D8 — fault injection beyond the log** | Snapshot, rotation, the mirror, a kill during a page flush. | S | — |
+| 21 | **D3 — version retention** | Automatic retention tied to the oldest reader; `AS OF` on a join. | M | — |
+| 22 | **D5 — the rest of the page store** | Leaf merge, versions on paged tables, a read without the shared lock for its whole life; with D18, a reader that trusts the pages. | L | — |
+| 23 | **D11 — triggers and policies in a transaction** | Order them against the rows of the same transaction. | S | — |
+| 24 | **D2 — spatial tree** | Node pages and a descent instead of a scan over box columns. | M | — |
+| 25 | **D10 — precision and time** | Decimal scale, `TIMESTAMPTZ`, streaming blobs. | M | — |
+| 26 | **D35 — diagnostics** | Map nodes freed through the wrong allocator, error ownership across the API, a file open per commit for the log index. | M | 19 |
+| 27 | **D15 — network hardening** | TLS, HTTP/2, backpressure, per-route timeouts, a load test. | M | — |
+| 28 | **D14 — replication** | `GET /log?since=<seq>` and a follower applying through replay. | XL | 27 |
+| 29 | **Auth review** | Rate limits, token lifetime, adversarial tests over subscriptions and budgets; tokens travel in clear until TLS; **grants are opt-in**, so a database with no grant rows accepts every statement from every client. | S | — |
+| 30 | **Release and packaging** | `scripts/package.py` builds and checks one archive. Left: one archive per target, a version policy, a byte-for-byte reproducible build. | M | 19 |
+| 31 | **Licence and notice review** | MIT/Apache-2.0 with no vendored third-party source; confirm before each release. | external | — |
 
 After these, [versioning-plan.md](versioning-plan.md) proposes version control
-with peer-to-peer sync; its networked phases build on items 26 and 27.
+with peer-to-peer sync; its networked phases build on items 27 and 28.
 
 ## Suggested order
 

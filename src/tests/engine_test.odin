@@ -1445,7 +1445,8 @@ test_errors_mid_scan_are_clean :: proc(t: ^testing.T) {
 	aggregate_err := run_error(t, store, "SELECT count(*), sum(amount) FROM entry WHERE memo <= 1")
 	testing.expect_value(t, aggregate_err.kind, db.Error_Kind.Invalid_Type)
 	// A projection error after a good row: the same double free lived there.
-	projection_err := run_error(t, store, "SELECT upper(memo) FROM entry")
+	// (upper(NULL) used to be the error here; it is NULL now, as in SQLite.)
+	projection_err := run_error(t, store, "SELECT memo + 1 FROM entry")
 	testing.expect_value(t, projection_err.kind, db.Error_Kind.Invalid_Type)
 	// The store still answers and the rows are intact.
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM entry").i, i64(3))

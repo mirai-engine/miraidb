@@ -1215,6 +1215,9 @@ tx_insert :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error) {
 	if check_err := checks_enforce(tx, table, row_values); check_err.kind != .None {
 		return 0, check_err
 	}
+	if index_err := index_validate_row(tx, table, row_values); index_err.kind != .None {
+		return 0, index_err
+	}
 	if fk_err := fk_check_child(tx, table, row_values); fk_err.kind != .None {
 		return 0, fk_err
 	}
@@ -1327,6 +1330,9 @@ tx_update :: proc(tx: ^Tx, name: string, id: Row_Id, values: []Value) -> Error {
 	}
 	if check_err := checks_enforce(tx, table, row_values); check_err.kind != .None {
 		return check_err
+	}
+	if index_err := index_validate_row(tx, table, row_values); index_err.kind != .None {
+		return index_err
 	}
 	if fk_err := fk_check_child(tx, table, row_values); fk_err.kind != .None {
 		return fk_err
@@ -1459,13 +1465,10 @@ tx_create_index :: proc(tx: ^Tx, table_name: string, index: Index_Schema) -> Err
 	if tx.read_only do return errf(.Transaction_Read_Only, "cannot create an index in a read transaction")
 	table, table_err := tx_table(tx, table_name)
 	if table_err.kind != .None do return table_err
-	stored := Index_Schema {
-		name      = strings.clone(index.name, tx.alloc),
-		unique    = index.unique,
-		implicit  = false,
-		algorithm = index.algorithm,
-		columns   = slice.clone(index.columns, tx.alloc),
-	}
+	// A full copy, so a partial index keeps its WHERE and an expression index
+	// its expressions.
+	stored := schema_index_copy(index, tx.alloc)
+	stored.implicit = false
 	for existing in table.schema.indexes {
 		if strings.equal_fold(existing.name, stored.name) {
 			return errf(.Index_Exists, "index %s already exists", stored.name)
@@ -1478,7 +1481,8 @@ tx_create_index :: proc(tx: ^Tx, table_name: string, index: Index_Schema) -> Err
 			return errf(.Index_Exists, "index %s already exists", stored.name)
 		}
 	}
-	for col in stored.columns {
+	for col, part in stored.columns {
+		if col == NO_COLUMN && part < len(stored.exprs) && len(stored.exprs[part]) > 0 do continue
 		if col < 0 || col >= len(table.schema.columns) {
 			return errf(.Invalid_Argument, "index %s refers to a missing column", stored.name)
 		}
@@ -1547,7 +1551,7 @@ unique_key :: proc(tx: ^Tx, table: ^Table, index: int, values: []Value) -> strin
 	w := Byte_Writer{data = make([dynamic]u8, 0, len(name) + 40, tx.alloc)}
 	append(&w.data, ..transmute([]u8)name)
 	append(&w.data, 0)
-	for col in table.indexes[index].schema.columns do index_encode_value(&w, table, col, values)
+	index_encode_parts(&w, table, index, values)
 	return string(w.data[:])
 }
 
@@ -1566,6 +1570,10 @@ tx_check_unique :: proc(
 	writes := tx.state.writes[name]
 	for idx, i in table.indexes {
 		if !idx.unique do continue
+		// A row outside a partial index is not constrained by it, and a key with a
+		// NULL constrains nothing.
+		if !index_row_included(table, i, values) do continue
+		if index_key_has_null(table, i, values) do continue
 		key := unique_key(tx, table, i, values)
 		if keys != nil do append(keys, key)
 		if writes != nil {
@@ -1642,6 +1650,10 @@ tx_register_unique :: proc(tx: ^Tx, name: string, table: ^Table, values: []Value
 	if !ok do return
 	for idx, i in table.indexes {
 		if !idx.unique do continue
+		// A row outside a partial index is not constrained by it, and a key with a
+		// NULL constrains nothing.
+		if !index_row_included(table, i, values) do continue
+		if index_key_has_null(table, i, values) do continue
 		key := unique_key(tx, table, i, values)
 		undo_note_unique(tx, writes, key)
 		writes.unique_keys[key] = id
@@ -1654,6 +1666,10 @@ tx_unregister_unique :: proc(tx: ^Tx, name: string, table: ^Table, values: []Val
 	if !ok do return
 	for idx, i in table.indexes {
 		if !idx.unique do continue
+		// A row outside a partial index is not constrained by it, and a key with a
+		// NULL constrains nothing.
+		if !index_row_included(table, i, values) do continue
+		if index_key_has_null(table, i, values) do continue
 		key := unique_key(tx, table, i, values)
 		if holder, present := writes.unique_keys[key]; present && holder == id {
 			undo_note_unique(tx, writes, key)

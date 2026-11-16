@@ -426,3 +426,85 @@ test_deferred_foreign_keys :: proc(t: ^testing.T) {
 	db.error_free(&now)
 	db.tx_rollback(tx)
 }
+
+@(test)
+test_partial_and_expression_indexes :: proc(t: ^testing.T) {
+	store := fresh_db(t, "partial_idx")
+	if store == nil do return
+
+	run(t, store, "CREATE TABLE u (id INTEGER PRIMARY KEY, email TEXT, deleted INTEGER DEFAULT 0)")
+	run(t, store, "INSERT INTO u (id, email) VALUES (1, 'A@x.io'), (2, 'b@x.io'), (3, NULL), (4, NULL)")
+	// Unique over an expression, among the live rows only.
+	run(t, store, "CREATE UNIQUE INDEX u_live ON u (lower(email)) WHERE deleted = 0")
+	testing.expect_value(t, run_error(t, store, "INSERT INTO u (id, email) VALUES (5, 'a@X.io')").kind, db.Error_Kind.Duplicate_Unique)
+	run(t, store, "UPDATE u SET deleted = 1 WHERE id = 1")
+	run(t, store, "INSERT INTO u (id, email) VALUES (5, 'a@X.io')")
+	// A row outside the index is not constrained by it, and moving it back in is.
+	run(t, store, "INSERT INTO u (id, email, deleted) VALUES (6, 'b@x.io', 1)")
+	testing.expect_value(t, run_error(t, store, "UPDATE u SET deleted = 0 WHERE id = 1").kind, db.Error_Kind.Duplicate_Unique)
+	// OR IGNORE and REPLACE see the index, the defaults of the row included.
+	run(t, store, "INSERT OR IGNORE INTO u (id, email) VALUES (8, 'B@x.io'), (9, 'c@x.io')")
+	run(t, store, "REPLACE INTO u (id, email) VALUES (10, 'C@X.IO')")
+	expect_ints(t, store, "SELECT id FROM u ORDER BY id", {1, 2, 3, 4, 5, 6, 10})
+	// Queries answer from the rows, whatever the index holds.
+	expect_ints(t, store, "SELECT id FROM u WHERE lower(email) = 'b@x.io' ORDER BY id", {2, 6})
+	expect_ints(t, store, "SELECT id FROM u WHERE deleted = 0 ORDER BY id", {2, 3, 4, 5, 10})
+
+	// A UNIQUE index the rows already break is refused, plain or not.
+	run(t, store, "CREATE TABLE d (id INTEGER PRIMARY KEY, x INTEGER)")
+	run(t, store, "INSERT INTO d VALUES (1, 5), (2, 5), (3, 6)")
+	testing.expect_value(t, run_error(t, store, "CREATE UNIQUE INDEX d_x ON d (x)").kind, db.Error_Kind.Duplicate_Unique)
+	expect_ints(t, store, "SELECT count(*) FROM d WHERE x = 5", {2})
+	run(t, store, "CREATE UNIQUE INDEX d_pair ON d (x, id % 2)")
+	run(t, store, "CREATE UNIQUE INDEX d_six ON d (x) WHERE x > 5")
+	// What changes between evaluations cannot key an index.
+	testing.expect_value(t, run_error(t, store, "CREATE INDEX d_r ON d (random())").kind, db.Error_Kind.Sql_Unsupported)
+	testing.expect_value(t, run_error(t, store, "CREATE INDEX d_n ON d (x) WHERE x > (SELECT 1)").kind, db.Error_Kind.Sql_Unsupported)
+	testing.expect_value(t, run_error(t, store, "CREATE INDEX d_t ON d (date('now'))").kind, db.Error_Kind.Sql_Unsupported)
+
+	// The index survives a reopen and is enforced after it.
+	db.store_close(store)
+	reopened, err := db.store_open("_test_partial_idx", {persistent = true, create = false, durable = false})
+	testing.expect(t, db.error_ok(err))
+	defer cleanup_db(reopened, "partial_idx")
+	testing.expect_value(t, run_error(t, reopened, "INSERT INTO u (id, email) VALUES (11, 'B@X.IO')").kind, db.Error_Kind.Duplicate_Unique)
+	run(t, reopened, "INSERT INTO u (id, email, deleted) VALUES (12, 'B@X.IO', 1)")
+	testing.expect_value(t, run_error(t, reopened, "INSERT INTO d VALUES (4, 6)").kind, db.Error_Kind.Duplicate_Unique)
+	run(t, reopened, "DROP INDEX d_six")
+	run(t, reopened, "INSERT INTO d VALUES (4, 6)")
+}
+
+@(test)
+test_unique_allows_many_nulls :: proc(t: ^testing.T) {
+	// SQL holds no two NULLs equal, so a UNIQUE column takes any number of them;
+	// the engine refused the second.
+	store := fresh_db(t, "unique_nulls")
+	if store == nil do return
+	defer cleanup_db(store, "unique_nulls")
+
+	run(t, store, "CREATE TABLE n (id INTEGER PRIMARY KEY, x INTEGER UNIQUE, a INTEGER, b INTEGER, UNIQUE (a, b))")
+	run(t, store, "INSERT INTO n VALUES (1, NULL, 1, NULL), (2, NULL, 1, NULL), (3, 5, 1, 2)")
+	testing.expect_value(t, run_error(t, store, "INSERT INTO n VALUES (4, 5, 9, 9)").kind, db.Error_Kind.Duplicate_Unique)
+	testing.expect_value(t, run_error(t, store, "INSERT INTO n VALUES (5, 7, 1, 2)").kind, db.Error_Kind.Duplicate_Unique)
+	expect_ints(t, store, "SELECT count(*) FROM n WHERE x IS NULL", {2})
+	run(t, store, "UPDATE n SET x = NULL WHERE id = 3")
+	run(t, store, "DELETE FROM n WHERE id = 1")
+	expect_ints(t, store, "SELECT id FROM n WHERE x IS NULL ORDER BY id", {2, 3})
+	run(t, store, "INSERT INTO n VALUES (6, 5, NULL, NULL)")
+}
+
+@(test)
+test_functions_give_null_for_null :: proc(t: ^testing.T) {
+	store := fresh_db(t, "null_args")
+	if store == nil do return
+	defer cleanup_db(store, "null_args")
+
+	for sql in ([]string{
+		"SELECT lower(NULL)", "SELECT upper(NULL)", "SELECT replace(NULL, 'a', 'b')",
+		"SELECT replace('a', NULL, 'b')", "SELECT instr(NULL, 'a')", "SELECT sign(NULL)",
+		"SELECT sqrt(NULL)", "SELECT printf(NULL)",
+	}) {
+		testing.expectf(t, scalar(t, store, sql).kind == .Null, "%s should be NULL", sql)
+	}
+	testing.expect_value(t, scalar(t, store, "SELECT hex(char(NULL))").s, "00")
+}

@@ -52,6 +52,196 @@ Index :: struct {
 	// of a paged table: the keys then live in the index file and the pool bounds
 	// what a lookup costs, instead of every key staying in RAM.
 	pages: ^Ordered_Pages,
+	// exprs holds the parsed WHERE and key expressions of a partial or
+	// expression index; nil for an index over plain columns.
+	exprs: ^Index_Exprs,
+}
+
+// Index_Exprs is what a partial or expression index evaluates for each row. The
+// values an evaluation produces live in `scratch` only until the key is encoded;
+// the mutex keeps two readers of one table (an integrity check) apart.
+Index_Exprs :: struct {
+	where_expr: ^Expr,
+	parts:      []^Expr,
+	queries:    [dynamic]Query,
+	scratch:    virtual.Arena,
+	mutex:      sync.Mutex,
+}
+
+// index_exprs_make parses a partial or expression index's texts once, when the
+// index is built in memory. A plain index needs none and gets nil.
+index_exprs_make :: proc(schema: Index_Schema) -> (^Index_Exprs, Error) {
+	if index_is_plain(schema) do return nil, ERROR_NONE
+	exprs := new(Index_Exprs)
+	if arena_err := virtual.arena_init_growing(&exprs.scratch); arena_err != .None {
+		free(exprs)
+		return nil, errf(.Out_Of_Memory, "cannot create the scratch of index %s", schema.name)
+	}
+	if len(schema.where_sql) > 0 {
+		query, expr, err := sql_parse_expression(schema.where_sql)
+		if err.kind != .None {
+			index_exprs_destroy(exprs)
+			return nil, err
+		}
+		append(&exprs.queries, query)
+		exprs.where_expr = expr
+	}
+	exprs.parts = make([]^Expr, len(schema.exprs))
+	for text, i in schema.exprs {
+		if len(text) == 0 do continue
+		query, expr, err := sql_parse_expression(text)
+		if err.kind != .None {
+			index_exprs_destroy(exprs)
+			return nil, err
+		}
+		append(&exprs.queries, query)
+		exprs.parts[i] = expr
+	}
+	return exprs, ERROR_NONE
+}
+
+index_exprs_destroy :: proc(exprs: ^Index_Exprs) {
+	if exprs == nil do return
+	for &query in exprs.queries do query_destroy(&query)
+	delete(exprs.queries)
+	delete(exprs.parts)
+	virtual.arena_destroy(&exprs.scratch)
+	free(exprs)
+}
+
+// index_eval evaluates one expression of an index against a row. The answer is
+// in the index's scratch arena: the caller encodes it before the scratch is
+// emptied. An error makes the value NULL here; the write path asks
+// index_validate_row first, so a row whose expression fails never gets this far.
+@(private)
+index_eval :: proc(t: ^Table, exprs: ^Index_Exprs, expr: ^Expr, values: []Value) -> Value {
+	sources: [1]Source
+	sources[0] = Source{table = t, row = Row{values = values}}
+	ctx := Eval_Ctx{sources = sources[:]}
+	context.allocator = virtual.arena_allocator(&exprs.scratch)
+	value, err := eval_expr(&ctx, expr)
+	if err.kind != .None {
+		error_free(&err)
+		return value_null()
+	}
+	return value
+}
+
+// index_row_included reports whether a row belongs to an index: always for a
+// full index, and for a partial one when its WHERE is true.
+index_row_included :: proc(t: ^Table, index: int, values: []Value) -> bool {
+	exprs := t.indexes[index].exprs
+	if exprs == nil || exprs.where_expr == nil do return true
+	sync.mutex_lock(&exprs.mutex)
+	defer sync.mutex_unlock(&exprs.mutex)
+	defer virtual.arena_free_all(&exprs.scratch)
+	value := index_eval(t, exprs, exprs.where_expr, values)
+	return value.kind != .Null && value_is_truthy(value)
+}
+
+// index_encode_parts writes the key of a row for one index: each plain column
+// folded by its collation, each expression by the COLLATE it carries. It reports
+// whether a part is NULL: such a key constrains nothing in a UNIQUE index, since
+// SQL holds no two NULLs equal.
+index_encode_parts :: proc(w: ^Byte_Writer, t: ^Table, index: int, values: []Value) -> (has_null: bool) {
+	exprs := t.indexes[index].exprs
+	if exprs == nil || len(exprs.parts) == 0 {
+		for col in t.indexes[index].schema.columns {
+			if values[col].kind == .Null do has_null = true
+			index_encode_value(w, t, col, values)
+		}
+		return
+	}
+	sync.mutex_lock(&exprs.mutex)
+	defer sync.mutex_unlock(&exprs.mutex)
+	defer virtual.arena_free_all(&exprs.scratch)
+	for col, i in t.indexes[index].schema.columns {
+		if i >= len(exprs.parts) || exprs.parts[i] == nil {
+			if values[col].kind == .Null do has_null = true
+			index_encode_value(w, t, col, values)
+			continue
+		}
+		value := index_eval(t, exprs, exprs.parts[i], values)
+		if value.kind == .Null do has_null = true
+		if collation, has := collate_name(exprs.parts[i]); has && len(collation) > 0 {
+			value = collate_ordered_value(value, collation)
+		}
+		value_encode_key(w, value)
+	}
+	return
+}
+
+// index_part_values gives the key parts of a row for an index as values, each
+// expression evaluated and cloned into `alloc`: what the `.sqlite` export writes
+// into an index b-tree, where SQLite reads them back.
+index_part_values :: proc(t: ^Table, index: int, values: []Value, alloc: mem.Allocator) -> []Value {
+	columns := t.indexes[index].schema.columns
+	out := make([]Value, len(columns), alloc)
+	exprs := t.indexes[index].exprs
+	for col, i in columns {
+		if exprs == nil || i >= len(exprs.parts) || exprs.parts[i] == nil {
+			if col >= 0 && col < len(values) do out[i] = values[col]
+			continue
+		}
+		sync.mutex_lock(&exprs.mutex)
+		value := index_eval(t, exprs, exprs.parts[i], values)
+		out[i] = value_clone(value, alloc)
+		virtual.arena_free_all(&exprs.scratch)
+		sync.mutex_unlock(&exprs.mutex)
+	}
+	return out
+}
+
+// table_index_position finds an index of the table by name.
+table_index_position :: proc(t: ^Table, name: string) -> (int, bool) {
+	for index, i in t.indexes do if index.schema.name == name do return i, true
+	return -1, false
+}
+
+// index_key_has_null reports whether a row's key for an index has a NULL part.
+index_key_has_null :: proc(t: ^Table, index: int, values: []Value) -> bool {
+	w: Byte_Writer
+	bw_init(&w)
+	defer bw_destroy(&w)
+	return index_encode_parts(&w, t, index, values)
+}
+
+// index_validate_row evaluates every WHERE and key expression of the table's
+// indexes for a row about to be written, so an expression that fails (a type it
+// cannot take) is the statement's error instead of a NULL key at apply time.
+index_validate_row :: proc(tx: ^Tx, t: ^Table, values: []Value) -> Error {
+	for index in t.indexes {
+		if index.exprs == nil do continue
+		sources: [1]Source
+		sources[0] = Source{table = t, row = Row{values = values}}
+		ctx := Eval_Ctx{tx = tx, sources = sources[:]}
+		if index.exprs.where_expr != nil {
+			if _, err := eval_expr(&ctx, index.exprs.where_expr); err.kind != .None do return err
+		}
+		for part in index.exprs.parts {
+			if part == nil do continue
+			if _, err := eval_expr(&ctx, part); err.kind != .None do return err
+		}
+	}
+	return ERROR_NONE
+}
+
+// table_index_put_row adds a row to one index, when it belongs there.
+@(private)
+table_index_put_row :: proc(t: ^Table, index: int, values: []Value, id: Row_Id) -> Error {
+	if !index_row_included(t, index, values) do return ERROR_NONE
+	key := index_entry_key(t, index, values, id)
+	if put_err := table_index_put(t, index, key, id); put_err.kind != .None do return put_err
+	return table_index_map_add(t, index, values, id)
+}
+
+// table_index_remove_row takes a row out of one index, when it was there.
+@(private)
+table_index_remove_row :: proc(t: ^Table, index: int, values: []Value, id: Row_Id) {
+	if !index_row_included(t, index, values) do return
+	key := index_entry_key(t, index, values, id)
+	table_index_remove_key(t, index, key)
+	table_index_map_remove(t, index, values, id)
 }
 
 // Index_Bucket holds the rows that share one indexed key.
@@ -167,6 +357,12 @@ table_create :: proc(schema: ^Table_Schema) -> (^Table, Error) {
 			lookup = make(map[string]^Index_Bucket),
 		}
 		rbtree.init_cmp(&t.indexes[i].tree, index_cmp)
+		exprs, exprs_err := index_exprs_make(t.schema.indexes[i])
+		if exprs_err.kind != .None {
+			table_destroy(t)
+			return nil, exprs_err
+		}
+		t.indexes[i].exprs = exprs
 	}
 	return t, ERROR_NONE
 }
@@ -205,6 +401,7 @@ table_destroy :: proc(t: ^Table) {
 		rbtree.destroy(&t.indexes[i].tree)
 		table_index_map_free(t, i)
 		ordered_close(t.indexes[i].pages)
+		index_exprs_destroy(t.indexes[i].exprs)
 	}
 	delete(t.indexes)
 	// A paged table is closed, not deleted: the caller removes the file when the
@@ -313,7 +510,9 @@ schema_normalize :: proc(schema: ^Table_Schema) -> Error {
 	if len(schema.primary_key) > 0 {
 		covered := false
 		for i in 0 ..< len(schema.indexes) {
-			if schema.indexes[i].unique && schema_index_matches(&schema.indexes[i], schema.primary_key) {
+			// A partial or expression index does not hold every key, so it cannot
+			// stand in for the primary key or a UNIQUE column.
+			if schema.indexes[i].unique && index_is_plain(schema.indexes[i]) && schema_index_matches(&schema.indexes[i], schema.primary_key) {
 				covered = true
 				break
 			}
@@ -335,7 +534,7 @@ schema_normalize :: proc(schema: ^Table_Schema) -> Error {
 		covered := false
 		for j in 0 ..< len(schema.indexes) {
 			idx := schema.indexes[j]
-			if len(idx.columns) == 1 && idx.columns[0] == i && idx.unique {
+			if len(idx.columns) == 1 && idx.columns[0] == i && idx.unique && index_is_plain(idx) {
 				covered = true
 				break
 			}
@@ -406,9 +605,7 @@ index_prefix_temp :: proc(t: ^Table, index: int, values: []Value) -> string {
 // With a transaction arena it costs a bump allocation and nothing to free.
 index_prefix_in :: proc(t: ^Table, index: int, values: []Value, alloc: mem.Allocator) -> string {
 	w := Byte_Writer{data = make([dynamic]u8, 0, 32, alloc)}
-	for col in t.indexes[index].schema.columns {
-		index_encode_value(&w, t, col, values)
-	}
+	index_encode_parts(&w, t, index, values)
 	return string(w.data[:])
 }
 
@@ -421,10 +618,10 @@ index_entry_key :: proc(t: ^Table, index: int, values: []Value, id: Row_Id) -> s
 	// per key, where a heap buffer was allocated and freed for each.
 	w := Byte_Writer{data = t.key_scratch}
 	clear(&w.data)
-	for col in t.indexes[index].schema.columns {
-		index_encode_value(&w, t, col, values)
-	}
-	if !t.indexes[index].unique {
+	has_null := index_encode_parts(&w, t, index, values)
+	// Two rows may both hold NULL in a UNIQUE column; the row id keeps their
+	// entries apart, as it does in a non-unique index.
+	if !t.indexes[index].unique || has_null {
 		append_be_u64(&w, u64(id))
 	}
 	t.key_scratch = w.data
@@ -619,10 +816,8 @@ index_key_len :: proc(t: ^Table, index: int, values: []Value, id: Row_Id) -> int
 	w: Byte_Writer
 	bw_init(&w)
 	defer bw_destroy(&w)
-	for col in t.indexes[index].schema.columns {
-		index_encode_value(&w, t, col, values)
-	}
-	if !t.indexes[index].unique {
+	has_null := index_encode_parts(&w, t, index, values)
+	if !t.indexes[index].unique || has_null {
 		append_be_u64(&w, u64(id))
 	}
 	return len(w.data)
@@ -804,7 +999,7 @@ table_index_scan :: proc(
 table_primary_key_index :: proc(t: ^Table) -> (int, bool) {
 	if len(t.schema.primary_key) == 0 do return -1, false
 	for i in 0 ..< len(t.indexes) {
-		if t.indexes[i].schema.unique &&
+		if t.indexes[i].schema.unique && index_is_plain(t.indexes[i].schema) &&
 		   schema_index_matches(&t.indexes[i].schema, t.schema.primary_key) {
 			return i, true
 		}
@@ -826,6 +1021,8 @@ table_find_primary_key :: proc(t: ^Table, pk_values: []Value) -> (Row_Id, bool) 
 table_check_unique :: proc(t: ^Table, values: []Value, ignore: Row_Id = Row_Id(max(u64))) -> Error {
 	for idx, i in t.indexes {
 		if !idx.unique do continue
+		if !index_row_included(t, i, values) do continue
+		if index_key_has_null(t, i, values) do continue
 		ids := table_index_lookup(t, i, values)
 		defer delete(ids)
 		for id in ids {
@@ -889,11 +1086,7 @@ table_touch_sequence :: proc(t: ^Table, values: []Value) {
 @(private)
 table_index_add_all :: proc(t: ^Table, values: []Value, id: Row_Id) -> Error {
 	for _, i in t.indexes {
-		key := index_entry_key(t, i, values, id)
-		if put_err := table_index_put(t, i, key, id); put_err.kind != .None do return put_err
-		if map_err := table_index_map_add(t, i, values, id); map_err.kind != .None {
-			return map_err
-		}
+		if put_err := table_index_put_row(t, i, values, id); put_err.kind != .None do return put_err
 	}
 	return ERROR_NONE
 }
@@ -901,9 +1094,7 @@ table_index_add_all :: proc(t: ^Table, values: []Value, id: Row_Id) -> Error {
 @(private)
 table_index_remove_all :: proc(t: ^Table, values: []Value, id: Row_Id) {
 	for _, i in t.indexes {
-		key := index_entry_key(t, i, values, id)
-		table_index_remove_key(t, i, key)
-		table_index_map_remove(t, i, values, id)
+		table_index_remove_row(t, i, values, id)
 	}
 }
 
@@ -941,11 +1132,7 @@ table_insert :: proc(t: ^Table, id: Row_Id, values: []Value, validated := false)
 	t.rows[id] = Row{id = id, values = stored, created_seq = t.apply_seq}
 	table_order_add(t, id)
 	for _, i in t.indexes {
-		key := index_entry_key(t, i, stored, id)
-		if put_err := table_index_put(t, i, key, id); put_err.kind != .None do return put_err
-		if map_err := table_index_map_add(t, i, stored, id); map_err.kind != .None {
-			return map_err
-		}
+		if put_err := table_index_put_row(t, i, stored, id); put_err.kind != .None do return put_err
 	}
 	return ERROR_NONE
 }
@@ -976,9 +1163,7 @@ table_update :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
 		return err
 	}
 	for _, i in t.indexes {
-		key := index_entry_key(t, i, row.values, id)
-		table_index_remove_key(t, i, key)
-		table_index_map_remove(t, i, row.values, id)
+		table_index_remove_row(t, i, row.values, id)
 	}
 	// The current values become a version, so a reader that started earlier
 	// keeps its view.
@@ -1002,11 +1187,7 @@ table_update :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
 		versions = row.versions,
 	}
 	for _, i in t.indexes {
-		key := index_entry_key(t, i, stored, id)
-		if put_err := table_index_put(t, i, key, id); put_err.kind != .None do return put_err
-		if map_err := table_index_map_add(t, i, stored, id); map_err.kind != .None {
-			return map_err
-		}
+		if put_err := table_index_put_row(t, i, stored, id); put_err.kind != .None do return put_err
 	}
 	return ERROR_NONE
 }
@@ -1023,9 +1204,7 @@ table_delete :: proc(t: ^Table, id: Row_Id) -> bool {
 	row, exists := t.rows[id]
 	if !exists do return false
 	for _, i in t.indexes {
-		key := index_entry_key(t, i, row.values, id)
-		table_index_remove_key(t, i, key)
-		table_index_map_remove(t, i, row.values, id)
+		table_index_remove_row(t, i, row.values, id)
 	}
 	// Tombstone instead of erasing: the live values stay owned by the row and are
 	// visible to snapshots taken before this sequence, so no extra version is
@@ -1078,9 +1257,7 @@ table_insert_borrowed :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
 	t.rows[id] = Row{id = id, values = values, created_seq = t.apply_seq}
 	table_order_add(t, id)
 	for _, i in t.indexes {
-		key := index_entry_key(t, i, values, id)
-		if put_err := table_index_put(t, i, key, id); put_err.kind != .None do return put_err
-		if map_err := table_index_map_add(t, i, values, id); map_err.kind != .None do return map_err
+		if put_err := table_index_put_row(t, i, values, id); put_err.kind != .None do return put_err
 	}
 	return ERROR_NONE
 }
@@ -1436,7 +1613,9 @@ table_add_index :: proc(t: ^Table, index: Index_Schema) -> Error {
 			return errf(.Index_Exists, "index %s already exists", index.name)
 		}
 	}
-	for col in index.columns {
+	for col, i in index.columns {
+		is_expression := i < len(index.exprs) && len(index.exprs[i]) > 0
+		if is_expression && col == NO_COLUMN do continue
 		if col < 0 || col >= len(t.schema.columns) {
 			return errf(.Invalid_Argument, "index %s refers to a missing column", index.name)
 		}
@@ -1460,6 +1639,9 @@ table_add_index :: proc(t: ^Table, index: Index_Schema) -> Error {
 		lookup = make(map[string]^Index_Bucket),
 	}
 	rbtree.init_cmp(&t.indexes[position].tree, index_cmp)
+	exprs, exprs_err := index_exprs_make(stored)
+	if exprs_err.kind != .None do return exprs_err
+	t.indexes[position].exprs = exprs
 	if attach_err := table_index_attach_pages(t, position); attach_err.kind != .None {
 		return attach_err
 	}
@@ -1474,12 +1656,9 @@ table_add_index :: proc(t: ^Table, index: Index_Schema) -> Error {
 		return ERROR_NONE
 	}
 	for _, row in t.rows {
-		key := index_entry_key(t, position, row.values, row.id)
-		if put_err := table_index_put(t, position, key, row.id); put_err.kind != .None {
+		if row.deleted_seq != 0 do continue
+		if put_err := table_index_put_row(t, position, row.values, row.id); put_err.kind != .None {
 			return errf(put_err.kind, "cannot grow index %s: %s", index.name, put_err.message)
-		}
-		if map_err := table_index_map_add(t, position, row.values, row.id); map_err.kind != .None {
-			return map_err
 		}
 	}
 	return ERROR_NONE
@@ -1495,13 +1674,8 @@ Add_Index_Ctx :: struct {
 @(private)
 add_index_visit :: proc(ctx: rawptr, row: Row) -> bool {
 	add := cast(^Add_Index_Ctx)ctx
-	key := index_entry_key(add.table, add.position, row.values, row.id)
-	if put_err := table_index_put(add.table, add.position, key, row.id); put_err.kind != .None {
+	if put_err := table_index_put_row(add.table, add.position, row.values, row.id); put_err.kind != .None {
 		add.err = put_err
-		return false
-	}
-	if map_err := table_index_map_add(add.table, add.position, row.values, row.id); map_err.kind != .None {
-		add.err = map_err
 		return false
 	}
 	return true
@@ -1518,6 +1692,7 @@ table_drop_index :: proc(t: ^Table, name: string) -> Error {
 		rbtree.destroy(&t.indexes[i].tree)
 		table_index_map_free(t, i)
 		table_index_detach_pages(t, i, true)
+		index_exprs_destroy(t.indexes[i].exprs)
 		shorter := make([]Index, len(t.indexes) - 1)
 		copy(shorter[:i], t.indexes[:i])
 		copy(shorter[i:], t.indexes[i + 1:])
@@ -1541,5 +1716,10 @@ schema_index_copy :: proc(index: Index_Schema, alloc: mem.Allocator) -> Index_Sc
 	out := index
 	out.name = strings.clone(index.name, alloc)
 	out.columns = slice.clone(index.columns, alloc)
+	if len(index.where_sql) > 0 do out.where_sql = strings.clone(index.where_sql, alloc)
+	if len(index.exprs) > 0 {
+		out.exprs = make([]string, len(index.exprs), alloc)
+		for text, i in index.exprs do out.exprs[i] = strings.clone(text, alloc)
+	}
 	return out
 }

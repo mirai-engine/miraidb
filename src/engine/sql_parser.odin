@@ -1772,19 +1772,39 @@ parse_create_index :: proc(p: ^Parser, unique: bool) -> Statement {
 	}
 	p_expect_punct(p, "(")
 	columns := make([dynamic]string, 0, 2, p.alloc)
+	exprs := make([dynamic]string, 0, 2, p.alloc)
+	any_expression := false
 	for {
-		append(&columns, p_ident(p))
+		// A key part is a column or an expression. It is parsed as an expression
+		// and kept as a column when that is all it is; otherwise its text is kept.
+		start := token_offset(p.lexer.src, p.current.line, p.current.column)
+		part := parse_expression(p)
+		end := p.current.kind == .EOF ? len(p.lexer.src) : token_offset(p.lexer.src, p.current.line, p.current.column)
+		if part == nil do return stmt
+		if column, is_column := part^.(Column_Expr); is_column && len(column.table) == 0 {
+			append(&columns, column.name)
+			append(&exprs, "")
+		} else {
+			append(&columns, "")
+			append(&exprs, strings.trim_space(p.lexer.src[start:end]))
+			any_expression = true
+		}
 		// ASC/DESC order an index's storage, which answers no query differently:
 		// every ORDER BY is applied by the executor or matched to the walk.
-		if p_match_keyword(p, "collate") {
-			p_fail(p, .Sql_Unsupported, "COLLATE on an index column is not supported: declare it on the column")
-			return stmt
-		}
 		if !p_match_keyword(p, "asc") do p_match_keyword(p, "desc")
 		if !p_match_punct(p, ",") do break
 	}
 	p_expect_punct(p, ")")
 	stmt.columns = columns[:]
+	if any_expression do stmt.exprs = exprs[:]
+	// A partial index: `WHERE <expression>` to the end of the statement.
+	if p_is_keyword(p, "where") {
+		p_advance(p)
+		start := token_offset(p.lexer.src, p.current.line, p.current.column)
+		if parse_expression(p) == nil do return stmt
+		end := p.current.kind == .EOF ? len(p.lexer.src) : token_offset(p.lexer.src, p.current.line, p.current.column)
+		stmt.where_sql = strings.trim_right(strings.trim_space(p.lexer.src[start:end]), ";")
+	}
 	return stmt
 }
 

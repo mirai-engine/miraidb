@@ -53,6 +53,10 @@ SETUP = [
     "CREATE TABLE nums (n INTEGER, m REAL, t TEXT)",
     "INSERT INTO nums (n, m, t) VALUES (1, 1.5, 'a'), (1, 2.0, 'b'), (2, NULL, 'A'), "
     "(3, 3.5, NULL), (NULL, 4.0, 'c'), (2, 2.0, 'a')",
+    # Partial and expression indexes exist while every query runs: a planner
+    # that read one where it holds only some rows would answer differently.
+    "CREATE INDEX emp_lower_name ON emp (lower(name)) WHERE dept IS NOT NULL",
+    "CREATE INDEX nums_partial ON nums (n) WHERE m > 2",
     "CREATE TABLE kv (k TEXT PRIMARY KEY, v INTEGER)",
     "INSERT INTO kv (k, v) VALUES ('a', 1), ('b', 2)",
     "CREATE TABLE audit (id INTEGER PRIMARY KEY, k TEXT, old_v INTEGER, new_v INTEGER)",
@@ -209,6 +213,12 @@ QUERIES = [
     "SELECT id FROM emp WHERE (dept, name) IN ((1, 'luis'), (2, 'ana')) ORDER BY id",
     "SELECT id FROM emp WHERE (dept, name) IN (SELECT id, 'maria' FROM dept) ORDER BY id",
     "SELECT (1, NULL) = (1, 2), (1, 2) < (1, 3), (1, 2) IS (1, 2)",
+    # Queries a partial or an expression index could be tempted to answer.
+    "SELECT id FROM emp WHERE lower(name) = 'ana' ORDER BY id",
+    "SELECT n FROM nums WHERE n = 2 ORDER BY n",
+    "SELECT n FROM nums WHERE n > 0 ORDER BY n",
+    # A NULL argument gives NULL, not an error.
+    "SELECT lower(NULL), upper(NULL), replace(NULL, 'a', 'b'), instr(NULL, 'a'), sign(NULL), sqrt(NULL), printf(NULL), hex(char(NULL))",
 ]
 
 # The engine refuses these and says why; SQLite answers them. A refusal that

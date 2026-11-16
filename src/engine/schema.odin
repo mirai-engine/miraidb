@@ -319,7 +319,29 @@ Index_Schema :: struct {
 	unique:    bool,
 	implicit:  bool, // generated from the primary key or a UNIQUE column
 	algorithm: Index_Algorithm,
+	// where_sql makes a partial index: only the rows for which it is true are in
+	// the index, and a UNIQUE one constrains only those rows.
+	where_sql: string,
+	// exprs is set for an index over expressions: one text per key part, empty
+	// where the part is the plain column `columns[i]`, and that column is
+	// NO_COLUMN where the part is an expression.
+	exprs:     []string,
 }
+
+// index_is_plain reports an index over plain columns with no WHERE: the only
+// kind the planner reads. A partial or expression index is maintained and
+// enforced, but a query never walks it.
+index_is_plain :: proc(index: Index_Schema) -> bool {
+	return len(index.where_sql) == 0 && len(index.exprs) == 0
+}
+
+// INDEX_HAS_EXTRAS marks an index encoding followed by its WHERE text and its
+// expression texts. Only a partial or expression index sets it, so every other
+// index encodes as before.
+INDEX_HAS_EXTRAS :: u8(1 << 2)
+
+// INDEX_EXPRESSION_COLUMN is how NO_COLUMN travels in an index encoding.
+INDEX_EXPRESSION_COLUMN :: u32(0xFFFF_FFFF)
 
 // Foreign_Key_Action is what happens to referencing rows when the referenced key
 // is deleted or updated.
@@ -504,7 +526,9 @@ schema_validate :: proc(schema: ^Table_Schema) -> Error {
 		}
 		seen_columns := make(map[int]bool, len(idx.columns))
 		defer delete(seen_columns)
-		for col in idx.columns {
+		for col, part in idx.columns {
+			// An expression part has no column of its own.
+			if col == NO_COLUMN && part < len(idx.exprs) && len(idx.exprs[part]) > 0 do continue
 			if col < 0 || col >= len(schema.columns) {
 				return errf(.Invalid_Argument, "index %s refers to a missing column", idx.name)
 			}
@@ -1029,10 +1053,17 @@ index_encode :: proc(w: ^Byte_Writer, index: ^Index_Schema) {
 	flags := u8(0)
 	if index.unique do flags |= 1 << 0
 	if index.implicit do flags |= 1 << 1
+	extras := !index_is_plain(index^)
+	if extras do flags |= INDEX_HAS_EXTRAS
 	bw_write_u8(w, flags)
 	bw_write_u8(w, u8(index.algorithm))
 	bw_write_u32(w, u32(len(index.columns)))
-	for col in index.columns do bw_write_u32(w, u32(col))
+	for col in index.columns do bw_write_u32(w, col == NO_COLUMN ? INDEX_EXPRESSION_COLUMN : u32(col))
+	if extras {
+		bw_write_string(w, index.where_sql)
+		bw_write_u32(w, u32(len(index.exprs)))
+		for text in index.exprs do bw_write_string(w, text)
+	}
 }
 
 index_decode :: proc(r: ^Byte_Reader, alloc: mem.Allocator) -> Index_Schema {
@@ -1045,8 +1076,19 @@ index_decode :: proc(r: ^Byte_Reader, alloc: mem.Allocator) -> Index_Schema {
 	n := int(br_read_u32(r))
 	if r.bad do return index
 	columns := make([]int, n, alloc)
-	for i in 0 ..< n do columns[i] = int(br_read_u32(r))
+	for i in 0 ..< n {
+		raw := br_read_u32(r)
+		columns[i] = raw == INDEX_EXPRESSION_COLUMN ? NO_COLUMN : int(raw)
+	}
 	index.columns = columns
+	if flags & INDEX_HAS_EXTRAS != 0 {
+		index.where_sql = br_read_string(r, alloc)
+		nexprs := int(br_read_u32(r))
+		if r.bad do return index
+		exprs := make([]string, nexprs, alloc)
+		for i in 0 ..< nexprs do exprs[i] = br_read_string(r, alloc)
+		index.exprs = exprs
+	}
 	return index
 }
 
@@ -1124,18 +1166,7 @@ schema_encode :: proc(w: ^Byte_Writer, schema: ^Table_Schema) {
 		for col in fk.ref_columns do bw_write_u32(w, u32(col))
 	}
 	bw_write_u32(w, u32(len(schema.indexes)))
-	for idx in schema.indexes {
-		bw_write_string(w, idx.name)
-		index_flags := u8(0)
-		if idx.unique do index_flags |= 1 << 0
-		if idx.implicit do index_flags |= 1 << 1
-		bw_write_u8(w, index_flags)
-		bw_write_u8(w, u8(idx.algorithm))
-		bw_write_u32(w, u32(len(idx.columns)))
-		for col in idx.columns {
-			bw_write_u32(w, u32(col))
-		}
-	}
+	for &idx in schema.indexes do index_encode(w, &idx)
 	if extras {
 		bw_write_u32(w, u32(len(schema.checks)))
 		for check in schema.checks {
@@ -1249,20 +1280,8 @@ schema_decode :: proc(r: ^Byte_Reader, alloc: mem.Allocator) -> Table_Schema {
 	if r.bad do return schema
 	indexes := make([]Index_Schema, nindexes, alloc)
 	for i in 0 ..< nindexes {
-		idx: Index_Schema
-		idx.name = br_read_string(r, alloc)
-		flags := br_read_u8(r)
-		idx.unique = flags & (1 << 0) != 0
-		idx.implicit = flags & (1 << 1) != 0
-		idx.algorithm = Index_Algorithm(br_read_u8(r))
-		n := int(br_read_u32(r))
+		indexes[i] = index_decode(r, alloc)
 		if r.bad do return schema
-		cols := make([]int, n, alloc)
-		for j in 0 ..< n {
-			cols[j] = int(br_read_u32(r))
-		}
-		idx.columns = cols
-		indexes[i] = idx
 	}
 	schema.columns = columns
 	schema.indexes = indexes
@@ -1363,9 +1382,7 @@ schema_copy :: proc(schema: ^Table_Schema, alloc: mem.Allocator) -> Table_Schema
 	}
 	out.indexes = make([]Index_Schema, len(schema.indexes), alloc)
 	for idx, i in schema.indexes {
-		out.indexes[i] = idx
-		out.indexes[i].name = strings.clone(idx.name, alloc)
-		out.indexes[i].columns = slice.clone(idx.columns, alloc)
+		out.indexes[i] = schema_index_copy(idx, alloc)
 	}
 	out.checks = make([]Check_Constraint, len(schema.checks), alloc)
 	for check, i in schema.checks {

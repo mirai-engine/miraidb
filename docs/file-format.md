@@ -109,10 +109,12 @@ foreign key*:
 u32     index count
 index*:
     string  index name
-    u8      flags (1 unique, 2 implicit)
+    u8      flags (1 unique, 2 implicit, 4 extras follow)
     u8      algorithm (0 btree, 1 hash, 2 direct)
     u32     column count
-    u32*    column positions
+    u32*    column positions (0xFFFFFFFF for a part that is an expression)
+    string  WHERE of a partial index, when flag 4 is set
+    u32 + string*  one text per key part, empty for a plain column, when flag 4 is set
 extras, only when table flag bit 2 is set:
     u32     CHECK count
     check*: string name | string expression | string column (empty: table level)
@@ -459,6 +461,10 @@ there, because the sequence check would reject everything after a gap anyway.
   is set only on a table that has one of them, so a database that uses none
   stays readable by an earlier build of version 16. An earlier build that opens
   a table with extras reads it wrongly; the section is new in 0.15.
+- Likewise, index flag 4 carries a partial index's WHERE and an expression
+  index's key texts, in a schema and in a `Create_Index` record; only such an
+  index sets it. A UNIQUE index stores an entry whose key has a NULL with the row
+  id after it, as a non-unique one does, so two NULL keys never collide.
 - Version 15 adds the foreign keys of a table to the schema encoding: name, both
   actions, referenced table and the two column lists.
 - Version 14 stores a `PRODUCT` column as a component list: a count byte then

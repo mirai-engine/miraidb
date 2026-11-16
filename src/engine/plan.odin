@@ -728,6 +728,7 @@ plan_probe_ready :: proc(
 			if !found do continue
 			leads := false
 			for &index in table.indexes {
+				if !index_is_plain(index.schema) do continue
 				if len(index.schema.columns) > 0 && index.schema.columns[0] == column_index {
 					leads = true
 					break
