@@ -2,8 +2,9 @@ package engine
 
 import "core:mem"
 import "core:mem/virtual"
-import "core:strings"
 import "core:fmt"
+import "core:strconv"
+import "core:strings"
 
 Parser :: struct {
 	lexer:       Lexer,
@@ -624,6 +625,15 @@ parse_table_ref :: proc(p: ^Parser) -> Table_Ref {
 		// schema.table: keep the qualifier, `name` is the table.
 		ref.schema = ref.name
 		ref.name = p_ident(p)
+		// PostgreSQL's schemas: `public` is this database, and the catalog views a
+		// client reads (`information_schema.tables`, `pg_catalog.pg_tables`) are
+		// system tables built from the live schema. The written name stays the
+		// alias so `tables.table_name` still resolves.
+		if mapped, is_catalog := pg_catalog_table(ref.schema, ref.name); is_catalog {
+			ref.alias = ref.name
+			ref.name = mapped
+			ref.schema = ""
+		}
 	}
 	if p_match_punct(p, "(") {
 		args := make([dynamic]^Expr, 0, 2, p.alloc)
@@ -1102,9 +1112,70 @@ parse_type_ref :: proc(p: ^Parser) -> (t: Column_Type, builtin: bool, name: stri
 		}, true, name
 	}
 	if kind, width, found := type_kind_from_name(name); found {
+		p_skip_type_words(p, upper)
 		return Column_Type{kind = kind, width = width}, true, name
 	}
+	if serial_width := pg_serial_width(upper); serial_width > 0 {
+		return Column_Type{kind = .Int, width = serial_width}, true, name
+	}
 	return {}, false, name
+}
+
+// p_skip_type_words reads the words that finish a type the SQL standard spells
+// in more than one: `DOUBLE PRECISION`, `CHARACTER VARYING`, `TIMESTAMP WITH TIME
+// ZONE`, `TIME WITHOUT TIME ZONE`. The words change nothing the engine stores.
+@(private)
+p_skip_type_words :: proc(p: ^Parser, upper: string) {
+	switch upper {
+	case "DOUBLE":
+		p_match_keyword(p, "precision")
+	case "CHARACTER", "CHAR", "NCHAR":
+		p_match_keyword(p, "varying")
+	case "TIMESTAMP", "TIME", "TIMESTAMPTZ", "TIMETZ":
+		if p_is_keyword(p, "with") || p_is_keyword(p, "without") {
+			p_advance(p)
+			p_expect_keyword(p, "time")
+			p_expect_keyword(p, "zone")
+		}
+	}
+}
+
+// pg_serial_width is the integer width a PostgreSQL SERIAL type stands for, or 0
+// when the name is not one. SERIAL is an integer column with a sequence behind
+// it; the column definition turns the sequence on.
+pg_serial_width :: proc(upper: string) -> u8 {
+	switch upper {
+	case "SMALLSERIAL", "SERIAL2":
+		return 2
+	case "SERIAL", "SERIAL4", "BIGSERIAL", "SERIAL8":
+		return 8
+	}
+	return 0
+}
+
+// parse_cast_target reads the type after `CAST(x AS` or `x::`, with the length or
+// precision PostgreSQL and SQLite both allow and ignore: `VARCHAR(20)`,
+// `NUMERIC(10, 2)`.
+@(private)
+parse_cast_target :: proc(p: ^Parser) -> (Column_Type, bool) {
+	type_name := p_ident_or_keyword(p)
+	upper := strings.to_upper(type_name, context.temp_allocator)
+	kind, width, type_ok := type_kind_from_name(type_name)
+	if !type_ok {
+		if serial := pg_serial_width(upper); serial > 0 {
+			kind, width, type_ok = .Int, serial, true
+		}
+	}
+	if !type_ok {
+		p_fail(p, .Sql_Syntax, "unknown cast target %q", type_name)
+		return {}, false
+	}
+	p_skip_type_words(p, upper)
+	if p_match_punct(p, "(") {
+		for !p_is_punct(p, ")") && p.current.kind != .EOF do p_advance(p)
+		p_expect_punct(p, ")")
+	}
+	return Column_Type{kind = kind, width = width}, true
 }
 
 @(private)
@@ -1274,6 +1345,10 @@ parse_create_table :: proc(p: ^Parser, ephemeral: bool, event: bool) -> Statemen
 		parsed, builtin, type_name := parse_type_ref(p)
 		if builtin {
 			column.type = parsed
+			if pg_serial_width(strings.to_upper(type_name, context.temp_allocator)) > 0 {
+				column.autoinc = true
+				column.sequence = default_sequence()
+			}
 		} else {
 			// Not a builtin: defer to the type catalog when the statement runs.
 			column.type_name = type_name
@@ -1339,8 +1414,23 @@ parse_create_table :: proc(p: ^Parser, ephemeral: bool, event: bool) -> Statemen
 				if p_is_keyword(p, "as") {
 					p_advance(p)
 				} else {
-					p_match_keyword(p, "always")
+					if !p_match_keyword(p, "always") && p_match_keyword(p, "by") {
+						p_expect_keyword(p, "default")
+					}
 					if !p_expect_keyword(p, "as") do break
+				}
+				// `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY` is the standard
+				// spelling of an autoincrement column. BY DEFAULT and ALWAYS both
+				// give a value when the insert names none; ALWAYS does not refuse an
+				// explicit one here.
+				if p_match_keyword(p, "identity") {
+					column.autoinc = true
+					column.sequence = default_sequence()
+					if p_match_punct(p, "(") {
+						for !p_is_punct(p, ")") && p.current.kind != .EOF do p_advance(p)
+						p_expect_punct(p, ")")
+					}
+					continue
 				}
 				if !p_is_punct(p, "(") {
 					p_fail(p, .Sql_Syntax, "GENERATED AS needs a parenthesized expression")
@@ -1808,7 +1898,17 @@ parse_unary :: proc(p: ^Parser) -> ^Expr {
 	if p_match_punct(p, "+") {
 		return expr_unary(p, .Plus, parse_unary(p))
 	}
-	return parse_primary(p)
+	expr := parse_primary(p)
+	// `x::type` is PostgreSQL's cast. It binds tighter than any operator, so
+	// `-1::text` is `-(1::text)` and `a::int + 1` casts `a` alone.
+	for expr != nil && p_match_punct(p, "::") {
+		target, target_ok := parse_cast_target(p)
+		if !target_ok do return nil
+		e := new(Expr, p.alloc)
+		e^ = Cast_Expr{operand = expr, target = target}
+		expr = e
+	}
+	return expr
 }
 
 @(private)
@@ -1852,24 +1952,39 @@ parse_primary :: proc(p: ^Parser) -> ^Expr {
 			p_advance(p)
 			return expr_literal(p, value_bool(false))
 		}
+		// `$1`, `$2`, … are PostgreSQL's numbered parameters: `$n` binds the n-th
+		// value, may repeat, and the statement takes as many as the largest n.
+		if len(token.text) > 1 && token.text[0] == '$' {
+			number, number_ok := strconv.parse_int(token.text[1:], 10)
+			if number_ok && number >= 1 {
+				p_advance(p)
+				e := new(Expr, p.alloc)
+				e^ = Param_Expr{index = number - 1}
+				if number > p.param_count do p.param_count = number
+				return e
+			}
+		}
+		// The SQL-standard session values are written without parentheses:
+		// `SELECT current_user`. They are calls, not column names.
+		if p_is_keyword(p, "current_user") || p_is_keyword(p, "session_user") ||
+		   p_is_keyword(p, "current_schema") || p_is_keyword(p, "current_catalog") {
+			name := strings.to_lower(p.current.text, p.alloc)
+			p_advance(p)
+			if p_match_punct(p, "(") do p_expect_punct(p, ")")
+			e := new(Expr, p.alloc)
+			e^ = Call_Expr{name = name}
+			return e
+		}
 		if p_is_keyword(p, "cast") {
 			p_advance(p)
 			p_expect_punct(p, "(")
 			operand := parse_expression(p)
 			p_expect_keyword(p, "as")
-			type_name := p_ident_or_keyword(p)
-			kind, width, type_ok := type_kind_from_name(type_name)
-			if !type_ok {
-				p_fail(p, .Sql_Syntax, "unknown cast target %q", type_name)
-				return nil
-			}
-			if p_match_punct(p, "(") {
-				for !p_is_punct(p, ")") && p.current.kind != .EOF do p_advance(p)
-				p_expect_punct(p, ")")
-			}
+			target, target_ok := parse_cast_target(p)
+			if !target_ok do return nil
 			p_expect_punct(p, ")")
 			e := new(Expr, p.alloc)
-			e^ = Cast_Expr{operand = operand, target = Column_Type{kind = kind, width = width}}
+			e^ = Cast_Expr{operand = operand, target = target}
 			return e
 		}
 		if p_is_keyword(p, "exists") {

@@ -134,7 +134,7 @@ rather than hidden in this table.
 | F11 | Compression and row-size hints | done | deflate encoder (fixed Huffman + LZ77) in `deflate.odin`, HTTP zlib negotiation, `row_bytes` hints |
 | F12 | Connection limits and backpressure | done | connection cap with 503, 4 MiB request limit, per-client byte accounting |
 | F13 | Metrics endpoint | done | `GET /metrics` with requests, errors, commit sequence and subscriptions |
-| F14 | PostgreSQL wire protocol | done | startup, SSLRequest, simple and extended query, text and binary parameters/results, plan-only `Describe`, Sync/Close/Flush |
+| F14 | PostgreSQL wire protocol | done | startup with the standard ParameterStatus set, SSLRequest, simple query with several statements, extended query framed per message (several to a packet), `Describe` that announces the types `Execute` encodes, skip-to-`Sync` after an error, text and binary parameters/results, transactions across messages with the aborted state, PostgreSQL command tags and SQLSTATE codes, `DEALLOCATE`/`DISCARD`; the dialect spellings are in `docs/sql.md` (PostgreSQL spellings) |
 
 ## G. Modules and ABI
 

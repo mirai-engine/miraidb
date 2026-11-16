@@ -27,12 +27,13 @@ import zipfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIST = os.path.join(ROOT, "dist")
 
-VERSION_SOURCE = os.path.join(ROOT, "src", "capi", "capi.odin")
+# ENGINE_VERSION_TEXT is what miraidb_version() and SQL's version() answer.
+VERSION_SOURCE = os.path.join(ROOT, "src", "engine", "util.odin")
 
 
 def version() -> str:
     text = open(VERSION_SOURCE, encoding="utf-8").read()
-    match = re.search(r'miraidb ([0-9][0-9.]*)', text)
+    match = re.search(r'ENGINE_VERSION_TEXT :: "miraidb ([0-9][0-9.]*)"', text)
     if not match:
         raise SystemExit(f"cannot read the version from {VERSION_SOURCE}")
     return match.group(1)

@@ -769,5 +769,5 @@ miraidb_issue_token :: proc "c" (handle: rawptr, identity: rawptr, ttl_us: c.lon
 @(export)
 miraidb_version :: proc "c" () -> cstring {
 	context = runtime.default_context()
-	return "miraidb 0.15"
+	return engine.ENGINE_VERSION_TEXT
 }

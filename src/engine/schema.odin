@@ -163,7 +163,17 @@ type_kind_from_name :: proc(name: string) -> (kind: Type_Kind, width: u8, ok: bo
 		return .Float, 4, true
 	case "REAL", "DOUBLE", "FLOAT", "FLOAT8", "FLOAT64":
 		return .Float, 8, true
+	// NUMERIC and DECIMAL are binary floating point here, as they are in SQLite's
+	// REAL affinity: the declared precision and scale are read and not enforced.
+	// Exact decimals are backlog D10.
+	case "NUMERIC", "DECIMAL", "MONEY":
+		return .Float, 8, true
 	case "TEXT", "STRING", "VARCHAR":
+		return .String, 0, true
+	// The PostgreSQL and SQL-standard spellings of text. JSON and JSONB are kept as
+	// their text: the json_* functions read them. DATE and TIME are ISO-8601 text,
+	// the way SQLite stores them, so they sort and compare as dates.
+	case "CHAR", "CHARACTER", "NCHAR", "NVARCHAR", "CLOB", "CITEXT", "NAME", "JSON", "JSONB", "XML", "DATE", "TIME", "TIMETZ", "INET", "CIDR", "MACADDR":
 		return .String, 0, true
 	case "BLOB", "BYTES", "BYTEA":
 		return .Bytes, 0, true

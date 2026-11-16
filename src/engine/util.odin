@@ -10,3 +10,7 @@ map_erase :: proc(m: ^map[$K]$V, key: K) -> bool {
 	_, _, ok := runtime.map_erase_static(m, &k)
 	return ok
 }
+
+// ENGINE_VERSION_TEXT is what `miraidb_version()` and SQL's `version()` answer.
+// scripts/package.py names the archive after it.
+ENGINE_VERSION_TEXT :: "miraidb 0.15"

@@ -122,20 +122,96 @@ pg_ready_for_query :: proc(status: u8) -> []u8 {
 	return pg_message('Z', body[:])
 }
 
+// PG_STARTUP_PARAMETERS are the ParameterStatus messages a server sends once a
+// client is authenticated, with the values that describe this engine: text is
+// UTF-8, timestamps are integers in ISO format and `\` in a string is a
+// character, not an escape.
+PG_STARTUP_PARAMETERS :: [][2]string {
+	{"server_version", "14.0"},
+	{"server_encoding", "UTF8"},
+	{"client_encoding", "UTF8"},
+	{"DateStyle", "ISO, MDY"},
+	{"IntervalStyle", "postgres"},
+	{"TimeZone", "UTC"},
+	{"integer_datetimes", "on"},
+	{"standard_conforming_strings", "on"},
+	{"is_superuser", "off"},
+	{"session_authorization", "miraidb"},
+	{"application_name", ""},
+}
+
 pg_command_complete :: proc(tag: string) -> []u8 {
 	body: [dynamic]u8
 	pg_put_cstring(&body, tag)
 	return pg_message('C', body[:])
 }
 
-pg_error_response :: proc(message: string) -> []u8 {
+pg_error_response :: proc(message: string, code := "XX000") -> []u8 {
 	body: [dynamic]u8
 	append(&body, 'S')
 	pg_put_cstring(&body, "ERROR")
+	// V is the severity that is never translated; C is the SQLSTATE a driver
+	// turns into an exception class (psycopg's UniqueViolation, JDBC's state).
+	append(&body, 'V')
+	pg_put_cstring(&body, "ERROR")
+	append(&body, 'C')
+	pg_put_cstring(&body, code)
 	append(&body, 'M')
 	pg_put_cstring(&body, message)
 	append(&body, 0)
 	return pg_message('E', body[:])
+}
+
+// pg_error_from is an engine error as an ErrorResponse with its SQLSTATE.
+pg_error_from :: proc(err: Error) -> []u8 {
+	return pg_error_response(err.message, pg_sqlstate(err.kind))
+}
+
+// pg_sqlstate is the PostgreSQL error code closest to an engine error kind.
+pg_sqlstate :: proc(kind: Error_Kind) -> string {
+	#partial switch kind {
+	case .Table_Not_Found:
+		return "42P01" // undefined_table
+	case .Column_Not_Found:
+		return "42703" // undefined_column
+	case .Table_Exists:
+		return "42P07" // duplicate_table
+	case .Index_Exists:
+		return "42P07"
+	case .Index_Not_Found:
+		return "42704" // undefined_object
+	case .Duplicate_Primary_Key, .Duplicate_Unique:
+		return "23505" // unique_violation
+	case .Not_Null_Violation:
+		return "23502" // not_null_violation
+	case .Invalid_Type:
+		return "42804" // datatype_mismatch
+	case .Invalid_Argument:
+		return "22023" // invalid_parameter_value
+	case .Sql_Syntax:
+		return "42601" // syntax_error
+	case .Sql_Unsupported, .Sql_Not_A_Query:
+		return "0A000" // feature_not_supported
+	case .Transaction_Read_Only:
+		return "25006" // read_only_sql_transaction
+	case .Transaction_Closed:
+		return "25P01" // no_active_sql_transaction
+	case .Permission_Denied:
+		return "42501" // insufficient_privilege
+	case .Cancelled:
+		return "57014" // query_canceled
+	case .Quota_Exceeded:
+		return "54000" // program_limit_exceeded
+	case .Locked:
+		return "55P03" // lock_not_available
+	case .Out_Of_Memory:
+		return "53200" // out_of_memory
+	case .Io:
+		return "58030" // io_error
+	case .Corrupt_Log:
+		return "XX001" // data_corrupted
+	}
+	return "XX000" // internal_error
 }
 
 pg_row_description :: proc(columns: []string) -> []u8 {
@@ -153,6 +229,14 @@ pg_row_description :: proc(columns: []string) -> []u8 {
 	return pg_message('T', body[:])
 }
 
+// pg_text_value is a value in PostgreSQL's text format. It differs from the
+// engine's own formatting for a boolean, which PostgreSQL spells `t` and `f`
+// (psycopg reads anything else as false).
+pg_text_value :: proc(value: Value, alloc: mem.Allocator) -> string {
+	if value.kind == .Bool do return value.b ? "t" : "f"
+	return value_format(value, alloc)
+}
+
 pg_data_row :: proc(row: []Value, alloc: mem.Allocator) -> []u8 {
 	body: [dynamic]u8
 	pg_put_i16(&body, i16(len(row)))
@@ -161,7 +245,7 @@ pg_data_row :: proc(row: []Value, alloc: mem.Allocator) -> []u8 {
 			pg_put_i32(&body, -1)
 			continue
 		}
-		text := value_format(value, alloc)
+		text := pg_text_value(value, alloc)
 		pg_put_i32(&body, i32(len(text)))
 		append(&body, ..transmute([]u8)text)
 	}
@@ -195,7 +279,7 @@ pg_simple_query :: proc(host: ^Host, sql: string) -> []u8 {
 	out := make([dynamic]u8, 0, 256)
 	result, exec_err := sql_execute(host.store, sql)
 	if exec_err.kind != .None {
-		append(&out, ..pg_error_response(exec_err.message))
+		append(&out, ..pg_error_from(exec_err))
 		append(&out, ..pg_ready_for_query('I'))
 		return out[:]
 	}
@@ -232,6 +316,12 @@ Pg_Portal :: struct {
 	// formats lists one result format code per column (0 text, 1 binary); an
 	// empty list means text.
 	formats: []i16,
+	// ran is set when a Describe of this portal ran the statement: `answer` holds
+	// what Execute will send (the rows and the CommandComplete, or the error), so
+	// the column types Describe announced are the ones the rows are encoded in,
+	// and the statement runs once.
+	ran:     bool,
+	answer:  []u8,
 }
 
 // Pg_Statement is a parsed statement: its SQL and the parameter type OIDs the
@@ -241,10 +331,33 @@ Pg_Statement :: struct {
 	param_types: []u32,
 }
 
-// Pg_Session keeps the prepared statements and portals of one connection.
+// Pg_Session keeps the prepared statements and portals of one connection, and
+// the transaction a `BEGIN` opened. While `tx` is set the connection holds the
+// store's write lock, so the transport must not let another statement in until
+// it is closed (see pg_session_in_transaction).
 Pg_Session :: struct {
 	statements: map[string]Pg_Statement,
 	portals:    map[string]Pg_Portal,
+	tx:         ^Tx,
+	// failed is PostgreSQL's aborted transaction: a statement failed after BEGIN,
+	// and everything but ROLLBACK (or COMMIT, which rolls back) is refused.
+	failed:     bool,
+	// skip is the extended protocol's error rule: after an ErrorResponse every
+	// message is discarded until the next Sync, which answers ReadyForQuery.
+	skip:       bool,
+}
+
+// pg_session_in_transaction reports whether a BEGIN is open on this connection.
+pg_session_in_transaction :: proc(session: ^Pg_Session) -> bool {
+	return session != nil && session.tx != nil
+}
+
+// pg_session_status is the ReadyForQuery status byte: idle, in a transaction, or
+// in a failed one.
+@(private)
+pg_session_status :: proc(session: ^Pg_Session) -> u8 {
+	if session == nil || session.tx == nil do return 'I'
+	return session.failed ? 'E' : 'T'
 }
 
 pg_session_init :: proc() -> ^Pg_Session {
@@ -256,15 +369,22 @@ pg_session_init :: proc() -> ^Pg_Session {
 
 pg_session_destroy :: proc(session: ^Pg_Session) {
 	if session == nil do return
-	for _, statement in session.statements {
+	// A connection that goes away inside a transaction loses it, as in PostgreSQL.
+	if session.tx != nil {
+		tx_rollback(session.tx)
+		session.tx = nil
+	}
+	for key, statement in session.statements {
 		delete(statement.sql)
 		delete(statement.param_types)
+		delete(key)
 	}
 	delete(session.statements)
 	for name, portal in session.portals {
 		for value in portal.params do value_deep_free(value, context.allocator)
 		delete(portal.params)
 		delete(portal.formats)
+		delete(portal.answer)
 		delete(portal.sql)
 		delete(name)
 	}
@@ -550,7 +670,7 @@ pg_data_row_binary :: proc(row: []Value, oids: []u32, formats: []i16) -> []u8 {
 			append(&body, ..value.bytes)
 			continue
 		}
-		text := value_format(value, context.temp_allocator)
+		text := pg_text_value(value, context.temp_allocator)
 		pg_put_i32(&body, i32(len(text)))
 		append(&body, ..transmute([]u8)text)
 	}
@@ -566,8 +686,15 @@ pg_handle_session_message :: proc(
 	data: []u8,
 ) -> (response: []u8, close: bool) {
 	if len(data) < 5 do return pg_error_response("short message"), true
+	if data[0] == 'Q' {
+		length := int(pg_get_i32(data, 1))
+		if length < 4 || 1 + length > len(data) {
+			return pg_error_response("bad Query length"), true
+		}
+		sql, _ := pg_read_cstring(data[5:1 + length])
+		return pg_session_simple_query(host, session, sql), false
+	}
 	if data[0] != 'P' && data[0] != 'B' && data[0] != 'D' && data[0] != 'E' && data[0] != 'S' && data[0] != 'H' && data[0] != 'C' {
-		// Simple messages work exactly as before.
 		return pg_handle_message(host, data)
 	}
 	length := int(pg_get_i32(data, 1))
@@ -575,7 +702,9 @@ pg_handle_session_message :: proc(
 		return pg_error_response("bad message length"), true
 	}
 	body := data[5:1 + length]
+	if session.skip && data[0] != 'S' do return nil, false
 	out := make([dynamic]u8, 0, 128)
+	defer if pg_has_error(out[:]) do session.skip = true
 	switch data[0] {
 	case 'P':
 		name, consumed := pg_read_cstring(body)
@@ -586,8 +715,11 @@ pg_handle_session_message :: proc(
 		if existing, found := session.statements[name]; found {
 			delete(existing.sql)
 			delete(existing.param_types)
-			delete_key(&session.statements, name)
-			delete(name)
+			// Free the key the map owns. `name` points into the network buffer:
+			// freeing it crashed the server on the second unnamed Parse, which is
+			// what every driver sends.
+			stored_key, _ := delete_key(&session.statements, name)
+			delete(stored_key)
 		}
 		types_rest := rest[sql_consumed:]
 		param_count := int(pg_get_i16(types_rest, 0))
@@ -609,7 +741,6 @@ pg_handle_session_message :: proc(
 		statement, found := session.statements[statement_name]
 		if !found {
 			append(&out, ..pg_error_response(fmt.aprintf("unknown statement %s", statement_name)))
-			append(&out, ..pg_ready_for_query('I'))
 			return out[:], false
 		}
 		cursor := rest[statement_consumed:]
@@ -649,8 +780,10 @@ pg_handle_session_message :: proc(
 			for value in portal.params do value_deep_free(value, context.allocator)
 			delete(portal.params)
 			delete(portal.formats)
+			delete(portal.answer)
 			delete(portal.sql)
-			delete_key(&session.portals, portal_name)
+			stored_key, _ := delete_key(&session.portals, portal_name)
+			delete(stored_key)
 		}
 		bound := make([]Value, len(params))
 		copy(bound, params[:])
@@ -666,13 +799,35 @@ pg_handle_session_message :: proc(
 		name, name_consumed := pg_read_cstring(body[1:])
 		if name_consumed == 0 do return pg_error_response("bad Describe"), true
 		if target == 'S' {
-			statement, _ := session.statements[name]
-			append(&out, ..pg_parameter_description(statement.param_types))
+			statement, known := session.statements[name]
+			if !known {
+				append(&out, ..pg_error_response(fmt.tprintf("unknown statement %s", name)))
+				return out[:], false
+			}
+			append(&out, ..pg_parameter_description(pg_statement_param_types(statement)))
 			append(&out, ..pg_describe_select(host, statement.sql))
 		} else if portal, known := session.portals[name]; known {
-			append(&out, ..pg_describe_select(host, portal.sql))
+			// A portal has its values, so it can answer exactly: run it now and
+			// keep what Execute will send.
+			if !portal.ran {
+				description, answer := pg_portal_run(host, session, portal)
+				portal.ran = true
+				portal.answer = answer
+				session.portals[name] = portal
+				append(&out, ..description)
+				delete(description)
+				if pg_has_error(answer) {
+					// The error belongs to this Describe; Execute has nothing left.
+					append(&out, ..answer)
+					delete(portal.answer)
+					portal.answer = nil
+					session.portals[name] = portal
+				}
+			} else {
+				append(&out, ..pg_no_data())
+			}
 		} else {
-			append(&out, ..pg_no_data())
+			append(&out, ..pg_error_response(fmt.tprintf("unknown portal %s", name)))
 		}
 	case 'E':
 		portal_name, consumed := pg_read_cstring(body)
@@ -680,13 +835,27 @@ pg_handle_session_message :: proc(
 		portal, found := session.portals[portal_name]
 		if !found {
 			append(&out, ..pg_error_response(fmt.aprintf("unknown portal %s", portal_name)))
-			append(&out, ..pg_ready_for_query('I'))
 			return out[:], false
 		}
-		append(&out, ..pg_extended_execute(host, portal))
-		append(&out, ..pg_ready_for_query('I'))
+		// No ReadyForQuery here: Sync owns it, and a client that pipelines
+		// Execute messages reads one per Sync.
+		if portal.ran {
+			append(&out, ..portal.answer)
+			delete(portal.answer)
+			portal.answer = nil
+			// Executing a portal again runs it again, as PostgreSQL does for a
+			// portal that has run to completion.
+			portal.ran = false
+			session.portals[portal_name] = portal
+		} else {
+			description, answer := pg_portal_run(host, session, portal)
+			delete(description)
+			append(&out, ..answer)
+			delete(answer)
+		}
 	case 'S':
-		append(&out, ..pg_ready_for_query('I'))
+		session.skip = false
+		append(&out, ..pg_ready_for_query(pg_session_status(session)))
 	case 'H':
 		// Flush: the response is already buffered here.
 	case 'C':
@@ -697,14 +866,18 @@ pg_handle_session_message :: proc(
 			if existing, found := session.statements[name]; found {
 				delete(existing.sql)
 				delete(existing.param_types)
-				delete_key(&session.statements, name)
+				stored_key, _ := delete_key(&session.statements, name)
+				delete(stored_key)
 			}
 		} else if body[0] == 'P' {
 			if portal, found := session.portals[name]; found {
 				for value in portal.params do value_deep_free(value, context.allocator)
 				delete(portal.params)
+				delete(portal.formats)
+				delete(portal.answer)
 				delete(portal.sql)
-				delete_key(&session.portals, name)
+				stored_key, _ := delete_key(&session.portals, name)
+				delete(stored_key)
 			}
 		}
 		append(&out, ..pg_close_complete())
@@ -712,26 +885,348 @@ pg_handle_session_message :: proc(
 	return out[:], false
 }
 
-// pg_extended_execute runs one bound portal. It returns the result messages
-// without the trailing ReadyForQuery, which Sync owns.
-pg_extended_execute :: proc(host: ^Host, portal: Pg_Portal) -> []u8 {
+// pg_portal_run runs one bound portal and returns its two halves: the
+// description (RowDescription, or NoData) and the answer Execute sends (the
+// DataRows and CommandComplete, or an ErrorResponse). Both are built from the
+// same result, so the type a column is announced with is the type its values are
+// encoded in.
+pg_portal_run :: proc(host: ^Host, session: ^Pg_Session, portal: Pg_Portal) -> (description: []u8, answer: []u8) {
+	describe := make([dynamic]u8, 0, 64)
 	out := make([dynamic]u8, 0, 128)
-	result, exec_err := sql_execute_params(host.store, portal.sql, portal.params)
+	if handled := pg_transaction_control(host, session, portal.sql, &out); handled {
+		append(&describe, ..pg_no_data())
+		return describe[:], out[:]
+	}
+	if session != nil && session.failed {
+		append(&describe, ..pg_no_data())
+		append(&out, ..pg_error_response(PG_ABORTED, "25P02"))
+		return describe[:], out[:]
+	}
+	result, exec_err := pg_run(host, session, portal.sql, portal.params)
 	if exec_err.kind != .None {
-		append(&out, ..pg_error_response(exec_err.message))
-		return out[:]
+		if session != nil && session.tx != nil do session.failed = true
+		append(&describe, ..pg_no_data())
+		append(&out, ..pg_error_from(exec_err))
+		return describe[:], out[:]
 	}
 	defer sql_result_destroy(&result)
 	if len(result.columns) > 0 {
 		oids := pg_column_oids(result.columns, result.rows)
 		defer delete(oids)
-		append(&out, ..pg_row_description_typed(result.columns, oids))
+		append(&describe, ..pg_row_description_formats(result.columns, oids, portal.formats))
 		for row in result.rows {
 			append(&out, ..pg_data_row_binary(row, oids, portal.formats))
 		}
-		append(&out, ..pg_command_complete(fmt.aprintf("SELECT %d", len(result.rows))))
 	} else {
-		append(&out, ..pg_command_complete("OK"))
+		append(&describe, ..pg_no_data())
 	}
+	append(&out, ..pg_command_complete(pg_command_tag(portal.sql, &result)))
+	return describe[:], out[:]
+}
+
+// pg_has_error reports whether a response holds an ErrorResponse message.
+@(private)
+pg_has_error :: proc(bytes: []u8) -> bool {
+	i := 0
+	for i + 5 <= len(bytes) {
+		if bytes[i] == 'E' do return true
+		length := int(u32(bytes[i + 1]) << 24 | u32(bytes[i + 2]) << 16 | u32(bytes[i + 3]) << 8 | u32(bytes[i + 4]))
+		if length < 4 do return false
+		i += 1 + length
+	}
+	return false
+}
+
+// pg_statement_param_types is the ParameterDescription of a statement: the types
+// the client declared, and text for every parameter it left unspecified or did
+// not declare at all, so a driver learns how many values to bind.
+@(private)
+pg_statement_param_types :: proc(statement: Pg_Statement) -> []u32 {
+	count := len(statement.param_types)
+	if query, parse_err := sql_parse(statement.sql); parse_err.kind == .None {
+		count = max(count, query.param_count)
+		query_destroy(&query)
+	}
+	types := make([]u32, count, context.temp_allocator)
+	for i in 0 ..< count {
+		types[i] = 25
+		if i < len(statement.param_types) && statement.param_types[i] != 0 do types[i] = statement.param_types[i]
+	}
+	return types
+}
+
+// pg_row_description_formats is a typed RowDescription that also states the
+// format each column will arrive in, which a binary-reading driver checks.
+@(private)
+pg_row_description_formats :: proc(columns: []string, oids: []u32, formats: []i16) -> []u8 {
+	body: [dynamic]u8
+	pg_put_i16(&body, i16(len(columns)))
+	for column, i in columns {
+		oid := i < len(oids) ? oids[i] : u32(25)
+		binary := len(formats) == 1 ? formats[0] == 1 : i < len(formats) && formats[i] == 1
+		// A column whose type has no binary encoder is sent as text; say so.
+		if binary && !pg_binary_supported(oid) do binary = false
+		pg_put_cstring(&body, column)
+		pg_put_i32(&body, 0)
+		pg_put_i16(&body, 0)
+		pg_put_i32(&body, i32(oid))
+		pg_put_i16(&body, i16(pg_oid_width(oid)))
+		pg_put_i32(&body, -1)
+		pg_put_i16(&body, binary ? 1 : 0)
+	}
+	return pg_message('T', body[:])
+}
+
+// pg_binary_supported names the types pg_data_row_binary can encode.
+@(private)
+pg_binary_supported :: proc(oid: u32) -> bool {
+	switch oid {
+	case 20, 701, 16, 2950, 17:
+		return true
+	}
+	return false
+}
+
+PG_ABORTED :: "current transaction is aborted, commands ignored until end of transaction block"
+
+// pg_run executes one statement in the session's open transaction, or in one of
+// its own when there is none.
+@(private)
+pg_run :: proc(host: ^Host, session: ^Pg_Session, sql: string, params: []Value) -> (Sql_Result, Error) {
+	if session != nil && session.tx != nil do return sql_execute_in_tx_params(session.tx, sql, params)
+	return sql_execute_params(host.store, sql, params)
+}
+
+// pg_session_simple_query runs a Query message: one or more statements separated
+// by `;`, each answered in turn, then one ReadyForQuery. As in PostgreSQL, the
+// first error ends the message and the statements after it are not run.
+pg_session_simple_query :: proc(host: ^Host, session: ^Pg_Session, sql: string) -> []u8 {
+	out := make([dynamic]u8, 0, 256)
+	statements := sql_split_statements(sql, context.temp_allocator)
+	defer delete(statements)
+	if len(statements) == 0 {
+		// An empty query has its own answer.
+		append(&out, ..pg_message('I', nil))
+	}
+	for statement in statements {
+		if handled := pg_transaction_control(host, session, statement, &out); handled {
+			continue
+		}
+		if session.failed {
+			append(&out, ..pg_error_response(PG_ABORTED, "25P02"))
+			break
+		}
+		result, exec_err := pg_run(host, session, statement, nil)
+		if exec_err.kind != .None {
+			if session.tx != nil do session.failed = true
+			append(&out, ..pg_error_from(exec_err))
+			break
+		}
+		if len(result.columns) > 0 {
+			// Text values, typed columns: a driver parses `3` as an integer only
+			// when the description says int8.
+			oids := pg_column_oids(result.columns, result.rows)
+			append(&out, ..pg_row_description_typed(result.columns, oids))
+			delete(oids)
+			for row in result.rows {
+				append(&out, ..pg_data_row(row, context.temp_allocator))
+			}
+		}
+		append(&out, ..pg_command_complete(pg_command_tag(statement, &result)))
+		sql_result_destroy(&result)
+	}
+	append(&out, ..pg_ready_for_query(pg_session_status(session)))
 	return out[:]
+}
+
+// pg_transaction_control answers BEGIN, COMMIT and ROLLBACK against the session.
+// It returns false for any other statement, including `ROLLBACK TO <savepoint>`,
+// which runs inside the open transaction like any statement.
+@(private)
+pg_transaction_control :: proc(host: ^Host, session: ^Pg_Session, sql: string, out: ^[dynamic]u8) -> bool {
+	if session == nil do return false
+	words := strings.fields(sql, context.temp_allocator)
+	if len(words) == 0 do return false
+	first := strings.to_upper(strings.trim_right(words[0], ";"), context.temp_allocator)
+	second := ""
+	if len(words) > 1 do second = strings.to_upper(strings.trim_right(words[1], ";"), context.temp_allocator)
+	switch first {
+	case "BEGIN", "START":
+		if first == "START" && second != "TRANSACTION" do return false
+		if session.tx == nil {
+			session.tx = tx_begin_write(host.store)
+			session.failed = false
+		}
+		// PostgreSQL warns about a nested BEGIN and keeps the open transaction.
+		append(out, ..pg_command_complete("BEGIN"))
+		return true
+	case "COMMIT", "END":
+		if session.tx == nil {
+			append(out, ..pg_command_complete("COMMIT"))
+			return true
+		}
+		tx := session.tx
+		session.tx = nil
+		if session.failed {
+			// COMMIT of an aborted transaction rolls it back and says so.
+			session.failed = false
+			tx_rollback(tx)
+			append(out, ..pg_command_complete("ROLLBACK"))
+			return true
+		}
+		if err := tx_commit(tx); err.kind != .None {
+			append(out, ..pg_error_from(err))
+			return true
+		}
+		append(out, ..pg_command_complete("COMMIT"))
+		return true
+	case "DEALLOCATE", "DISCARD":
+		// Prepared statements are session state, so these never reach the
+		// engine. psycopg sends `DEALLOCATE ALL` after a rollback.
+		target := second
+		if target == "PREPARE" && len(words) > 2 {
+			target = strings.to_upper(strings.trim_right(words[2], ";"), context.temp_allocator)
+		}
+		if first == "DISCARD" || target == "ALL" {
+			for key, statement in session.statements {
+				delete(statement.sql)
+				delete(statement.param_types)
+				delete(key)
+			}
+			clear(&session.statements)
+			append(out, ..pg_command_complete(first == "DISCARD" ? "DISCARD ALL" : "DEALLOCATE ALL"))
+			return true
+		}
+		name := strings.trim_right(words[len(words) - 1], ";")
+		if existing, found := session.statements[name]; found {
+			delete(existing.sql)
+			delete(existing.param_types)
+			stored_key, _ := delete_key(&session.statements, name)
+			delete(stored_key)
+		}
+		append(out, ..pg_command_complete("DEALLOCATE"))
+		return true
+	case "ROLLBACK", "ABORT":
+		if second == "TO" do return false
+		if session.tx != nil {
+			tx_rollback(session.tx)
+			session.tx = nil
+		}
+		session.failed = false
+		append(out, ..pg_command_complete("ROLLBACK"))
+		return true
+	}
+	return false
+}
+
+// pg_command_tag is the CommandComplete text PostgreSQL sends for a statement:
+// `SELECT 3`, `INSERT 0 2`, `UPDATE 1`, `CREATE TABLE`. Drivers read the count
+// from it (psycopg's `rowcount`, JDBC's update count), so it has to be exact.
+pg_command_tag :: proc(sql: string, result: ^Sql_Result) -> string {
+	words := strings.fields(sql, context.temp_allocator)
+	if len(words) == 0 do return "EMPTY"
+	verb := strings.to_upper(strings.trim_right(words[0], ";("), context.temp_allocator)
+	count := result.affected
+	if len(result.columns) > 0 && (verb == "INSERT" || verb == "UPDATE" || verb == "DELETE") {
+		count = max(count, len(result.rows))
+	}
+	switch verb {
+	case "SELECT", "WITH", "VALUES", "TABLE", "SHOW", "EXPLAIN", "DESCRIBE", "PRAGMA":
+		return fmt.tprintf("SELECT %d", len(result.rows))
+	case "INSERT", "REPLACE":
+		return fmt.tprintf("INSERT 0 %d", count)
+	case "UPDATE", "DELETE":
+		return fmt.tprintf("%s %d", verb, count)
+	case "CREATE", "DROP", "ALTER":
+		// The object is the first word that is not a modifier.
+		for word in words[1:] {
+			object := strings.to_upper(strings.trim_right(word, ";("), context.temp_allocator)
+			switch object {
+			case "OR", "REPLACE", "UNIQUE", "TEMP", "TEMPORARY", "VIRTUAL", "IF", "NOT", "EXISTS":
+				continue
+			}
+			return fmt.tprintf("%s %s", verb, object)
+		}
+		return verb
+	case "TRUNCATE":
+		return "TRUNCATE TABLE"
+	}
+	return verb
+}
+
+// sql_split_statements cuts a script into statements at the `;` that end them.
+// A `;` inside a quoted string, a quoted name, a comment or a trigger body
+// (`CREATE TRIGGER … BEGIN …; …; END`) does not end anything. Empty statements
+// are dropped; the slices point into `sql`.
+sql_split_statements :: proc(sql: string, alloc := context.allocator) -> [dynamic]string {
+	out := make([dynamic]string, 0, 2, alloc)
+	text := transmute([]u8)sql
+	start := 0
+	depth := 0 // BEGIN/CASE … END nesting inside a trigger body
+	trigger := false
+	word_start := -1
+	i := 0
+	flush_word :: proc(sql: string, word_start: int, end: int, start: int, trigger: ^bool, depth: ^int) {
+		if word_start < 0 do return
+		word := sql[word_start:end]
+		if !trigger^ && strings.equal_fold(word, "trigger") {
+			// Only a trigger that this statement creates has a body.
+			head := strings.to_upper(strings.trim_space(sql[start:word_start]), context.temp_allocator)
+			if strings.has_prefix(head, "CREATE") do trigger^ = true
+			return
+		}
+		if !trigger^ do return
+		if strings.equal_fold(word, "begin") || strings.equal_fold(word, "case") {
+			depth^ += 1
+		} else if strings.equal_fold(word, "end") && depth^ > 0 {
+			depth^ -= 1
+		}
+	}
+	for i < len(text) {
+		c := text[i]
+		is_word := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+		if is_word {
+			if word_start < 0 do word_start = i
+			i += 1
+			continue
+		}
+		flush_word(sql, word_start, i, start, &trigger, &depth)
+		word_start = -1
+		switch {
+		case c == '\'' || c == '"' || c == '`':
+			i += 1
+			for i < len(text) {
+				if text[i] == c {
+					// A doubled quote is the quote character itself.
+					if i + 1 < len(text) && text[i + 1] == c {
+						i += 2
+						continue
+					}
+					break
+				}
+				i += 1
+			}
+			i += 1
+		case c == '-' && i + 1 < len(text) && text[i + 1] == '-':
+			for i < len(text) && text[i] != '\n' do i += 1
+		case c == '/' && i + 1 < len(text) && text[i + 1] == '*':
+			i += 2
+			for i + 1 < len(text) && !(text[i] == '*' && text[i + 1] == '/') do i += 1
+			i += 2
+		case c == ';' && depth == 0:
+			piece := strings.trim_space(sql[start:i])
+			if len(piece) > 0 do append(&out, piece)
+			start = i + 1
+			trigger = false
+			i += 1
+		case:
+			i += 1
+		}
+	}
+	flush_word(sql, word_start, min(i, len(text)), start, &trigger, &depth)
+	if start < len(text) {
+		piece := strings.trim_space(sql[start:])
+		if len(piece) > 0 do append(&out, piece)
+	}
+	return out
 }

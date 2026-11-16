@@ -4811,6 +4811,24 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 			if value.kind != .Null do return value, ERROR_NONE
 		}
 		return value_null(), ERROR_NONE
+	// The session functions a PostgreSQL client asks for on connect. The answers
+	// name this engine, so a driver that logs them says what it talks to.
+	case "version":
+		if len(args) != 0 do return {}, errf(.Invalid_Argument, "version() takes no arguments")
+		return value_string(ENGINE_VERSION_TEXT), ERROR_NONE
+	case "current_database", "current_catalog":
+		if len(args) != 0 do return {}, errf(.Invalid_Argument, "%s() takes no arguments", lowered)
+		return value_string("miraidb"), ERROR_NONE
+	case "current_schema":
+		if len(args) != 0 do return {}, errf(.Invalid_Argument, "current_schema() takes no arguments")
+		return value_string("public"), ERROR_NONE
+	case "current_user", "session_user", "user":
+		// The role name. An identity is not a role, so this is the one name a
+		// session has; `current_identity()` is the caller the policies see.
+		if len(args) != 0 do return {}, errf(.Invalid_Argument, "%s takes no arguments", lowered)
+		return value_string("miraidb"), ERROR_NONE
+	case "pg_backend_pid":
+		return value_int(0), ERROR_NONE
 	case "now", "current_timestamp":
 		if len(args) != 0 {
 			return {}, errf(.Invalid_Argument, "now() takes no arguments")

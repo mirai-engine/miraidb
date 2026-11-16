@@ -167,6 +167,12 @@ lexer_next :: proc(l: ^Lexer) -> Token {
 		return Token{kind = .Number, text = l.src[start:l.pos], line = line, column = column}
 	}
 
+	// `$1` is a PostgreSQL parameter; the parser reads it from an identifier.
+	if c == '$' && l.pos + 1 < len(l.src) && is_digit(l.src[l.pos + 1]) {
+		lexer_advance(l)
+		for l.pos < len(l.src) && is_digit(lexer_peek(l)) do lexer_advance(l)
+		return Token{kind = .Ident, text = l.src[start:l.pos], line = line, column = column}
+	}
 	if is_ident_start(c) {
 		lexer_advance(l)
 		for l.pos < len(l.src) && is_ident_char(lexer_peek(l)) do lexer_advance(l)
@@ -215,6 +221,12 @@ lexer_next :: proc(l: ^Lexer) -> Token {
 		if lexer_peek(l) == '|' {
 			lexer_advance(l)
 			return Token{kind = .Punct, text = "||", line = line, column = column}
+		}
+	case ':':
+		// PostgreSQL's cast, `x::type`.
+		if lexer_peek(l) == ':' {
+			lexer_advance(l)
+			return Token{kind = .Punct, text = "::", line = line, column = column}
 		}
 	}
 

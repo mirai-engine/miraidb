@@ -48,10 +48,11 @@ def read(path: str) -> str:
 
 
 def check_version() -> None:
-    capi = read("src/capi/capi.odin")
-    match = re.search(r'miraidb ([0-9][0-9.]*)', capi)
+    # One constant answers miraidb_version() and SQL's version().
+    source = read("src/engine/util.odin")
+    match = re.search(r'ENGINE_VERSION_TEXT :: "miraidb ([0-9][0-9.]*)"', source)
     if not match:
-        fail("the version string is not in src/capi/capi.odin")
+        fail("ENGINE_VERSION_TEXT is not in src/engine/util.odin")
         return
     version = match.group(1)
     changelog = read("CHANGELOG.md")

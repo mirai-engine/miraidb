@@ -171,6 +171,22 @@ statement_end :: proc(server: ^Server) {
 	sync.mutex_unlock(&server.statements)
 }
 
+// statement_pause keeps the statement lock and tells the watchdog nothing is
+// running: a Postgres transaction is open and waiting for its client.
+@(private)
+statement_pause :: proc(server: ^Server) {
+	sync.atomic_store(&server.statement_running, false)
+}
+
+// statement_resume starts the next statement of a transaction whose connection
+// already holds the statement lock.
+@(private)
+statement_resume :: proc(server: ^Server) {
+	db.store_clear_cancel(server.host.store)
+	sync.atomic_store(&server.statement_started_ns, time.tick_now()._nsec)
+	sync.atomic_store(&server.statement_running, true)
+}
+
 // statement_watchdog cancels a statement that has spent its time. Cancellation
 // is cooperative: the executor checks the flag between rows and answers
 // `cancelled`, so the client gets an error instead of a dead server.
@@ -337,28 +353,73 @@ serve_postgres :: proc(connection: ^Connection) {
 	hello := db.pg_authentication_ok()
 	_ = send(connection, hello)
 	delete(hello)
-	version := db.pg_parameter_status("server_version", "14.0")
-	_ = send(connection, version)
-	delete(version)
+	// The parameters every PostgreSQL server reports after authentication.
+	// Drivers read them without checking: psycopg's C build crashed (a null
+	// `client_encoding`) when only `server_version` was sent.
+	for parameter in db.PG_STARTUP_PARAMETERS {
+		status := db.pg_parameter_status(parameter[0], parameter[1])
+		_ = send(connection, status)
+		delete(status)
+	}
 	ready := db.pg_ready_for_query('I')
 	_ = send(connection, ready)
 	delete(ready)
 	session := db.pg_session_init()
-	defer db.pg_session_destroy(session)
+	// A BEGIN holds the store's write lock until COMMIT or ROLLBACK, so the
+	// connection keeps the statement lock for that whole time: another
+	// connection waits for the transaction instead of taking the statement lock
+	// and then blocking on the store forever while this one cannot get back in
+	// to commit. `holding` says the lock is this connection's between messages.
+	holding := false
+	defer {
+		db.pg_session_destroy(session)
+		if holding do statement_end(connection.port)
+	}
+	// A read is not a message: a driver sends Parse, Bind, Describe, Execute and
+	// Sync in one packet, and a large Query arrives in several. `pending` holds
+	// what has arrived, and each complete message (a type byte and a length that
+	// counts itself) is handled in order. Treating one read as one message lost
+	// everything after the first, and psycopg waited forever for its Sync.
+	pending := make([dynamic]u8, 0, 64 * 1024)
+	defer delete(pending)
 	buffer: [64 * 1024]u8
 	for {
 		n, recv_err := net.recv(client, buffer[:])
 		if recv_err != nil || n <= 0 do return
-		statement_begin(connection.port)
-		response, close := db.pg_handle_session_message(host, session, buffer[:n])
-		statement_end(connection.port)
-		if len(response) > 0 {
-			_ = send(connection, response)
-			delete(response)
+		append(&pending, ..buffer[:n])
+		for len(pending) >= 5 {
+			length := int(u32(pending[1]) << 24 | u32(pending[2]) << 16 | u32(pending[3]) << 8 | u32(pending[4]))
+			if length > PG_MAX_MESSAGE do return
+			total := length >= 4 ? 1 + length : len(pending)
+			if len(pending) < total do break
+			if holding {
+				statement_resume(connection.port)
+			} else {
+				statement_begin(connection.port)
+			}
+			response, close := db.pg_handle_session_message(host, session, pending[:total])
+			holding = db.pg_session_in_transaction(session)
+			if holding {
+				// Idle in a transaction: the watchdog must not time the wait for
+				// the client's next message as a running statement.
+				statement_pause(connection.port)
+			} else {
+				statement_end(connection.port)
+			}
+			remove_range(&pending, 0, total)
+			if len(response) > 0 {
+				_ = send(connection, response)
+				delete(response)
+			}
+			if close do return
 		}
-		if close do return
 	}
 }
+
+// PG_MAX_MESSAGE bounds one frontend message, so a length field cannot make the
+// server buffer without limit. PostgreSQL's own limit for a query is 1 GiB; this
+// engine has no use for one larger than this.
+PG_MAX_MESSAGE :: 64 * 1024 * 1024
 
 // policy_send queues `bytes` in the client's outbox and writes them. When the
 // outbox budget is exceeded the message is discarded and the connection is
