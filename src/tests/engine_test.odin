@@ -13522,3 +13522,38 @@ test_integer_arithmetic_overflow :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT -7 % 3").i, i64(-1))
 	testing.expect_value(t, scalar(t, store, "SELECT abs(-9223372036854775807)").i, i64(max(i64)))
 }
+
+// A window inside the expression around it is not a column of the result:
+// `sum(v) OVER () + 1` projects one value, not three. The answers used to live in
+// slots behind the visible columns, and every output path that publishes a whole
+// row -- `--json`, the SDK, the wire -- published them too.
+@(test)
+test_window_inside_an_expression_is_one_column :: proc(t: ^testing.T) {
+	store := fresh_db(t, "window_columns")
+	if store == nil do return
+	defer cleanup_db(store, "window_columns")
+
+	run(t, store, "CREATE TABLE t (v INTEGER)")
+	run(t, store, "INSERT INTO t VALUES (1), (2), (3), (4)")
+
+	plain := run(t, store, "SELECT sum(v) OVER () + 1 AS s FROM t")
+	defer db.sql_result_destroy(&plain)
+	testing.expect_value(t, len(plain.rows), 4)
+	testing.expect_value(t, len(plain.columns), 1)
+	for row in plain.rows {
+		testing.expect_value(t, len(row), 1)
+		testing.expect_value(t, row[0].i, i64(11))
+	}
+
+	limited := run(t, store, "SELECT sum(v) OVER () + 1 AS s FROM t LIMIT 1")
+	defer db.sql_result_destroy(&limited)
+	testing.expect_value(t, len(limited.rows), 1)
+	testing.expect_value(t, len(limited.rows[0]), 1)
+
+	// Two windows in one expression, and a plain column beside it.
+	both := run(t, store, "SELECT v, sum(v) OVER () + count(v) OVER () AS s FROM t ORDER BY v")
+	defer db.sql_result_destroy(&both)
+	testing.expect_value(t, len(both.rows), 4)
+	testing.expect_value(t, len(both.rows[0]), 2)
+	testing.expect_value(t, both.rows[0][1].i, i64(14))
+}

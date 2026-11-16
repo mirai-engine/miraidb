@@ -3473,6 +3473,20 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			ctx.grouped = false
 			ctx.sources = nil
 		}
+		// The slots behind the visible columns held the windows' answers for the
+		// projections that read them. They are not columns of the result: free
+		// them and cut the row back to what the statement projects, before ORDER
+		// BY, DISTINCT and the answer are built. `--json` publishes every value a
+		// row holds, so leaving them in made `sum(v) OVER () + 1` answer three
+		// columns; the table renderer masked the extras with the column count.
+		if len(nested_windows) > 0 {
+			for &row in output {
+				for i := len(expanded); i < len(row.values); i += 1 {
+					value_deep_free(row.values[i], context.allocator)
+				}
+				row.values = row.values[:len(expanded)]
+			}
+		}
 		// ORDER BY runs on the completed rows, so an alias that names a window
 		// projection sorts on its value. A grouped row has no source behind it: its
 		// group answers, which is what lets `ORDER BY count(*)` beside a window read
