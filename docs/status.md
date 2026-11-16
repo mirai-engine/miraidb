@@ -122,7 +122,7 @@ the gaps are named rather than left to be discovered.
 ### Tooling
 
 - `python3 scripts/ci.py` runs every gate in one command and reports each one;
-  it is what "green" means. 27 gates (`--list` prints them): the suite, the
+  it is what "green" means. 28 gates (`--list` prints them): the suite, the
   corpus, the smokes, the measurements, the SQLite surface count, the
   heap sanitizer and the document check.
 - `miraidb` has 17 commands: `create`, `sql`, `sqlite`, `import-sqlite`,

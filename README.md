@@ -69,6 +69,7 @@ miraidb/
 │   ├── client/            the Odin client SDK
 │   └── tests/             integration tests (`odin test src/tests`)
 ├── include/miraidb.h      the C header for the ABI
+├── include/sqlite3_miraidb.h  the C header for the sqlite3_* facade
 ├── examples/
 │   ├── todo/              reducers + subscriptions in a small Odin program
 │   └── embed_c/           the database embedded in a C program

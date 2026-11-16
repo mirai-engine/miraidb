@@ -138,6 +138,9 @@ def build_gates(args: argparse.Namespace) -> list[Gate]:
             [sys.executable, "scripts/leaks.py", "--odin", args.odin, "--repeat", "1000"],
         )
     )
+    # A library with symbols and no header is not an API: this compares each
+    # header with what its package exports, and compiles both on their own.
+    gates.append(Gate("ABI headers", [sys.executable, "scripts/abi_header.py"]))
     gates.append(Gate("documentation consistency", [sys.executable, "scripts/docs_check.py"]))
     gates.append(Gate("roadmap is consistent", [sys.executable, "scripts/roadmap.py", "--check"]))
     return gates
