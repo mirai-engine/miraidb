@@ -88,6 +88,12 @@ Tx :: struct {
 	insert_name:         string,
 	insert_table:        ^Table,
 	insert_writes:       ^Table_Writes,
+	// undo records what each change to the staged rows replaced, while a
+	// statement is open (undo_depth > 0), so a statement that fails halfway can
+	// be taken back without touching the work of the statements before it. A
+	// trigger's statement nests inside the one that fired it.
+	undo:                [dynamic]Stage_Undo,
+	undo_depth:          int,
 }
 
 Table_Writes :: struct {
@@ -98,6 +104,108 @@ Table_Writes :: struct {
 	unique_keys: map[string]Row_Id,
 	next_row_id: u64,
 	next_sequence: i64,
+}
+
+// Stage_Undo is one change to a transaction's staged rows, as it was before the
+// change: whether the slot was filled and what it held.
+Stage_Undo_Kind :: enum u8 {
+	Insert,
+	Update,
+	Delete,
+	Unique,
+	Counters,
+}
+
+Stage_Undo :: struct {
+	kind:          Stage_Undo_Kind,
+	writes:        ^Table_Writes,
+	id:            Row_Id,
+	key:           string,
+	had:           bool,
+	row:           Row,
+	values:        []Value,
+	holder:        Row_Id,
+	next_row_id:   u64,
+	next_sequence: i64,
+}
+
+// tx_statement_begin opens a statement whose staged changes can be taken back
+// as a unit, and returns the mark tx_statement_end needs. Statements nest.
+tx_statement_begin :: proc(tx: ^Tx) -> int {
+	if tx.undo == nil do tx.undo = make([dynamic]Stage_Undo, 0, 16, tx.alloc)
+	tx.undo_depth += 1
+	return len(tx.undo)
+}
+
+// tx_statement_end closes a statement. A failed one has every change it staged
+// since `mark` undone, newest first, so the transaction holds exactly what it
+// held before the statement began; SQLite calls this ABORT.
+tx_statement_end :: proc(tx: ^Tx, mark: int, failed: bool) {
+	if failed do tx_statement_undo(tx, mark)
+	tx.undo_depth -= 1
+	if tx.undo_depth == 0 do clear(&tx.undo)
+}
+
+// tx_statement_undo takes back the changes staged since `mark`, newest first.
+tx_statement_undo :: proc(tx: ^Tx, mark: int) {
+	for i := len(tx.undo) - 1; i >= mark; i -= 1 {
+		u := tx.undo[i]
+		w := u.writes
+		switch u.kind {
+		case .Insert:
+			if u.had do w.inserts[u.id] = u.row
+			else do map_erase(&w.inserts, u.id)
+		case .Update:
+			if u.had do w.updates[u.id] = u.values
+			else do map_erase(&w.updates, u.id)
+		case .Delete:
+			if u.had do w.deletes[u.id] = true
+			else do map_erase(&w.deletes, u.id)
+		case .Unique:
+			if u.had do w.unique_keys[u.key] = u.holder
+			else do map_erase(&w.unique_keys, u.key)
+		case .Counters:
+			w.next_row_id = u.next_row_id
+			w.next_sequence = u.next_sequence
+		}
+	}
+	resize(&tx.undo, mark)
+	// The cached table and staging record are still right: undo changes rows,
+	// not which table a name resolves to.
+}
+
+@(private)
+undo_note_insert :: #force_inline proc(tx: ^Tx, w: ^Table_Writes, id: Row_Id) {
+	if tx.undo_depth == 0 do return
+	row, had := w.inserts[id]
+	append(&tx.undo, Stage_Undo{kind = .Insert, writes = w, id = id, had = had, row = row})
+}
+
+@(private)
+undo_note_update :: #force_inline proc(tx: ^Tx, w: ^Table_Writes, id: Row_Id) {
+	if tx.undo_depth == 0 do return
+	values, had := w.updates[id]
+	append(&tx.undo, Stage_Undo{kind = .Update, writes = w, id = id, had = had, values = values})
+}
+
+@(private)
+undo_note_delete :: #force_inline proc(tx: ^Tx, w: ^Table_Writes, id: Row_Id) {
+	if tx.undo_depth == 0 do return
+	_, had := w.deletes[id]
+	append(&tx.undo, Stage_Undo{kind = .Delete, writes = w, id = id, had = had})
+}
+
+@(private)
+undo_note_unique :: #force_inline proc(tx: ^Tx, w: ^Table_Writes, key: string) {
+	if tx.undo_depth == 0 do return
+	holder, had := w.unique_keys[key]
+	append(&tx.undo, Stage_Undo{kind = .Unique, writes = w, key = key, had = had, holder = holder})
+}
+
+@(private)
+undo_note_counters :: #force_inline proc(tx: ^Tx, w: ^Table_Writes) {
+	if tx.undo_depth == 0 do return
+	append(&tx.undo, Stage_Undo{kind = .Counters, writes = w, next_row_id = w.next_row_id, next_sequence = w.next_sequence})
 }
 
 // Tx_Index_Op is index DDL staged by a transaction. It is applied after the rows
@@ -1074,7 +1182,10 @@ tx_insert :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error) {
 				return 0, errf(.Invalid_Argument, "column %s.%s is outside its sequence range", name, column.name)
 			}
 			next := number + column.sequence.increment
-			if next > writes.next_sequence do writes.next_sequence = next
+			if next > writes.next_sequence {
+				undo_note_counters(tx, writes)
+				writes.next_sequence = next
+			}
 		}
 		row_values[i] = value_clone(coerced, tx.alloc)
 	}
@@ -1104,6 +1215,8 @@ tx_insert :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error) {
 	); trigger_err.kind != .None {
 		return 0, trigger_err
 	}
+	undo_note_insert(tx, writes, id)
+	undo_note_counters(tx, writes)
 	writes.inserts[id] = Row{id = id, values = row_values}
 	writes.next_row_id = u64(id) + 1
 	if has_triggers {
@@ -1205,8 +1318,10 @@ tx_update :: proc(tx: ^Tx, name: string, id: Row_Id, values: []Value) -> Error {
 		return trigger_err
 	}
 	if _, staged := writes.inserts[id]; staged {
+		undo_note_insert(tx, writes, id)
 		writes.inserts[id] = Row{id = id, values = row_values}
 	} else {
+		undo_note_update(tx, writes, id)
 		writes.updates[id] = row_values
 	}
 	tx_register_unique(tx, name, table, row_values, id)
@@ -1263,11 +1378,14 @@ tx_delete_impl :: proc(tx: ^Tx, name: string, id: Row_Id, fire_triggers: bool) -
 	writes := tx_writes(tx, name, table)
 	tx_unregister_unique(tx, name, table, previous.values, id)
 	if _, staged := writes.inserts[id]; staged {
+		undo_note_insert(tx, writes, id)
 		map_erase(&writes.inserts, id)
 	} else {
 		if _, updated := writes.updates[id]; updated {
+			undo_note_update(tx, writes, id)
 			map_erase(&writes.updates, id)
 		}
+		undo_note_delete(tx, writes, id)
 		writes.deletes[id] = true
 	}
 	if fire_triggers {
@@ -1285,6 +1403,12 @@ tx_truncate :: proc(tx: ^Tx, name: string) -> Error {
 	if table.schema.event do return errf(.Sql_Unsupported, "event table %s is append-only", name)
 	if permission_err := tx_check_permission(tx, name, "delete"); permission_err.kind != .None {
 		return permission_err
+	}
+	if tx.undo_depth > 0 {
+		// TRUNCATE empties the staging maps wholesale; recording every entry to
+		// put it back is not done, so it is refused where a statement could need
+		// to take it back.
+		return errf(.Sql_Unsupported, "TRUNCATE cannot run inside another statement")
 	}
 	writes := tx_writes(tx, name, table)
 	clear(&writes.inserts)
@@ -1476,7 +1600,10 @@ tx_committed_key_taken :: proc(
 tx_register_keys :: proc(tx: ^Tx, name: string, keys: []string, id: Row_Id) {
 	writes, ok := tx.state.writes[name]
 	if !ok do return
-	for key in keys do writes.unique_keys[key] = id
+	for key in keys {
+		undo_note_unique(tx, writes, key)
+		writes.unique_keys[key] = id
+	}
 }
 
 @(private)
@@ -1485,7 +1612,9 @@ tx_register_unique :: proc(tx: ^Tx, name: string, table: ^Table, values: []Value
 	if !ok do return
 	for idx, i in table.indexes {
 		if !idx.unique do continue
-		writes.unique_keys[unique_key(tx, table, i, values)] = id
+		key := unique_key(tx, table, i, values)
+		undo_note_unique(tx, writes, key)
+		writes.unique_keys[key] = id
 	}
 }
 
@@ -1497,6 +1626,7 @@ tx_unregister_unique :: proc(tx: ^Tx, name: string, table: ^Table, values: []Val
 		if !idx.unique do continue
 		key := unique_key(tx, table, i, values)
 		if holder, present := writes.unique_keys[key]; present && holder == id {
+			undo_note_unique(tx, writes, key)
 			map_erase(&writes.unique_keys, key)
 		}
 	}

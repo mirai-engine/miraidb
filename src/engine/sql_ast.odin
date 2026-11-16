@@ -296,6 +296,13 @@ Insert_Stmt :: struct {
 	conflict_assignments: []Assignment,
 	// INSERT OR REPLACE: the rows the new one collides with are deleted first.
 	conflict_replace: bool,
+	// INSERT OR IGNORE skips a row that breaks a UNIQUE, PRIMARY KEY, NOT NULL or
+	// CHECK constraint. OR FAIL stops at that row and keeps the rows before it.
+	// OR ROLLBACK also ends the transaction, which is only possible when the
+	// statement owns it.
+	conflict_ignore:   bool,
+	conflict_fail:     bool,
+	conflict_rollback: bool,
 }
 
 // Returning lists the rows a mutation reports back: every column with `*`, or

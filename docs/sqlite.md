@@ -36,7 +36,7 @@ script lists.
 | Feature | Status | Notes |
 |---|---|---|
 | SELECT with joins, subqueries, aggregates | done | engine syntax; `INNER`/`LEFT`/`CROSS`, no `NATURAL`/`RIGHT`/`FULL` (refused with a reason) |
-| INSERT / UPDATE / DELETE | done | `RETURNING` with `*` or a column list; `INSERT OR REPLACE` deletes on any unique conflict, `OR ABORT` (the default), `OR ROLLBACK`/`FAIL`/`IGNORE` refused with a reason |
+| INSERT / UPDATE / DELETE | done | `RETURNING` with `*` or a column list. Conflict resolution as SQLite's: `OR ABORT` (the default: a failed statement is undone whole, inside a transaction too), `OR IGNORE` (skips a row that breaks a key or `NOT NULL`), `OR FAIL` (keeps the rows before the failing one), `OR REPLACE` and `REPLACE INTO` (delete the colliding rows, fire no delete trigger). `OR ROLLBACK` is `ABORT` when the statement owns its transaction and refused inside one a caller opened |
 | CREATE/DROP TABLE, ALTER | done | `ALTER` adds, drops and renames columns and renames the table; type changes are refused |
 | CREATE/DROP INDEX, UNIQUE | done | btree, hash, direct |
 | CREATE/DROP VIEW | done | `OR REPLACE`, parameters, materialization |
@@ -137,6 +137,7 @@ behaviour here will see different results:
 | `CAST(300 AS TINYINT)` | `300` (INTEGER affinity) | error: the value does not fit the declared width |
 | `WHERE int_col = '1'` | compares through affinity | error `cannot compare int with string` |
 | `HAVING c > 1` where `c` aliases `count(*)` | works | error `column c does not exist` |
+| `UPDATE t SET u = u + 990` whose rows collide only partway through | error: a unique key is checked row by row | succeeds when the final rows are distinct: a statement's keys are checked against its result |
 
 ## The claims in this file are executed
 

@@ -40,7 +40,7 @@ that way.
 | # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
 | 8 | **S1 — the schema real files declare** | `CHECK`, `CONSTRAINT` names, column `REFERENCES`, deferrable foreign keys, `DESC` index columns, partial and expression indexes, `CURRENT_TIMESTAMP` and its siblings. A schema using any of them fails at `CREATE TABLE`. | M | — |
-| 9 | **S2 — statement and expression forms** — *partly done* | Done: `IS`/`IS NOT` values, `IS DISTINCT FROM`, bitwise operators, `->`/`->>`, `LIMIT a, b`. Left: `INSERT OR IGNORE`, `REPLACE INTO`, `INTERSECT`/`EXCEPT`, `NULLS FIRST/LAST`, `VALUES` in `FROM`, row values. | M | — |
+| 9 | **S2 — statement and expression forms** — *partly done* | Done: `IS`/`IS NOT` values, `IS DISTINCT FROM`, bitwise operators, `->`/`->>`, `LIMIT a, b`, `INSERT OR IGNORE/FAIL/ROLLBACK`, `REPLACE INTO`, and a failed statement undone whole inside a transaction. Left: `INTERSECT`/`EXCEPT`, `NULLS FIRST/LAST`, `VALUES` in `FROM`, row values, `UPDATE OR <resolution>`. | M | — |
 | 10 | **S3 — joins** | `RIGHT`, `FULL`, `NATURAL`. | M | — |
 | 11 | **S4 — aggregates and windows** | `FILTER`, the `WINDOW` clause, `ORDER BY` inside an aggregate, `median` and the percentiles, `json_group_array`/`_object`. | M | — |
 | 12 | **S5 — functions** | 48 missing: hyperbolic math and aliases, `timediff`, `soundex`, `unistr`, planner hints, introspection, the rest of JSON and the `jsonb_*` family. | M | — |

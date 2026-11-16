@@ -34,7 +34,7 @@ Rules for this file:
 | R3 | pruning walks every row of every table after each statement | prune what the commit touched | S |
 | R4 | a committed row is copied from the transaction arena to the table | hand the staged row over | M |
 | S1 | `CHECK`, column `REFERENCES`, `CONSTRAINT` names, `DESC` and partial/expression indexes, `CURRENT_TIMESTAMP` are refused | accept the schema real SQLite files declare | M |
-| S2 | seven common statement and expression forms are refused (four landed) | parser and executor work, each small | M |
+| S2 | five forms are refused; eight landed | parser and executor work, each small | M |
 | S3 | `RIGHT`, `FULL` and `NATURAL` joins are refused | the three joins | M |
 | S4 | `FILTER`, `WINDOW`, aggregate `ORDER BY`, ordered-set aggregates missing | the aggregate surface | M |
 | S5 | 48 of 121 built-in functions missing | math, JSON/JSONB, text, introspection | M |
@@ -151,10 +151,17 @@ the bitwise operators `& | ~ << >>` at SQLite's precedence; the JSON operators
 (`test_is_compares_null_as_a_value`, `test_bitwise_operators`,
 `test_json_arrow_operators`, `test_limit_with_a_comma`, and differential
 queries). JSON object keys became case sensitive on the way, as SQLite's are.
+`INSERT OR IGNORE`, `OR FAIL`, `OR ROLLBACK` (where the statement owns its
+transaction) and `REPLACE INTO` (`test_insert_conflict_resolutions`). Making them
+right needed statement atomicity: a statement that failed inside a transaction
+used to leave the rows it staged before the failing one, and now a per-statement
+undo log takes it back whole (`test_a_failed_statement_is_undone_in_a_transaction`).
 
-**Now refused.** `INSERT OR IGNORE` (and the `OR FAIL`/`ROLLBACK` spellings),
-`REPLACE INTO`, `INTERSECT` and `EXCEPT`, `NULLS FIRST` / `NULLS LAST`, `VALUES`
-as a table in `FROM`, and row values (`(a, b) = (1, 2)`, `(a, b) IN (SELECT …)`).
+**Now refused.** `INTERSECT` and `EXCEPT`, `NULLS FIRST` / `NULLS LAST`, `VALUES`
+as a table in `FROM`, row values (`(a, b) = (1, 2)`, `(a, b) IN (SELECT …)`), and
+`UPDATE OR <resolution>`. A unique key an `UPDATE` changes is checked against the
+statement's result, where SQLite checks it row by row; a statement whose rows
+collide only partway through succeeds here (`docs/sqlite.md`).
 
 **Done when.** Each runs and matches SQLite in the differential corpus, including
 the `NULL` cases (`NULL IS NULL` is true, `1 & NULL` is `NULL`).

@@ -105,8 +105,21 @@ sql_run_statement :: proc(store: ^Store, statement: Statement, params: []Value) 
 		return result, exec_err
 	case Insert_Stmt, Update_Stmt, Delete_Stmt, Create_Table_Stmt, Alter_Table_Stmt, Create_Type_Stmt, Drop_Table_Stmt, Create_Index_Stmt, Drop_Index_Stmt, Create_View_Stmt, Drop_View_Stmt, Create_Policy_Stmt, Drop_Policy_Stmt, Truncate_Stmt, Create_Trigger_Stmt, Drop_Trigger_Stmt, Grant_Stmt, Create_Virtual_Table_Stmt, Load_Extension_Stmt:
 		tx := tx_begin_write(store)
+		// OR FAIL undoes the failing row alone, which needs the statement journal
+		// even here, where a plain failure simply discards the transaction.
+		fail_mode := statement_fails_partially(stmt)
+		mark := fail_mode ? tx_statement_begin(tx) : 0
 		result, exec_err := sql_exec_mutation(tx, stmt, params)
+		if fail_mode do tx_statement_end(tx, mark, false)
 		if exec_err.kind != .None {
+			if fail_mode {
+				// The rows before the failing one stay, as SQLite keeps them.
+				if commit_err := tx_commit(tx); commit_err.kind != .None {
+					error_free(&exec_err)
+					return {}, commit_err
+				}
+				return {}, exec_err
+			}
 			tx_rollback(tx)
 			return {}, exec_err
 		}
@@ -179,6 +192,25 @@ sql_execute_in_tx_params :: proc(tx: ^Tx, sql: string, params: []Value) -> (Sql_
 	return result, ERROR_NONE
 }
 
+// statement_fails_partially reports INSERT OR FAIL, the one resolution that
+// keeps a statement's rows before the one that failed.
+@(private)
+statement_fails_partially :: proc(statement: Statement) -> bool {
+	insert, ok := statement.(Insert_Stmt)
+	return ok && insert.conflict_fail
+}
+
+// conflict_skippable reports the failures INSERT OR IGNORE and OR FAIL act on:
+// the constraints a row breaks by itself, checked before anything is staged.
+@(private)
+conflict_skippable :: proc(kind: Error_Kind) -> bool {
+	#partial switch kind {
+	case .Duplicate_Primary_Key, .Duplicate_Unique, .Not_Null_Violation:
+		return true
+	}
+	return false
+}
+
 // sql_run_statement_in_tx dispatches an already parsed statement inside a
 // transaction.
 @(private)
@@ -186,7 +218,21 @@ sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value) 
 	switch stmt in statement {
 	case Select_Stmt, With_Stmt:
 		return sql_run_query(tx, stmt, params)
-	case Insert_Stmt, Update_Stmt, Delete_Stmt, Create_Table_Stmt, Alter_Table_Stmt, Create_Type_Stmt, Drop_Table_Stmt, Create_Index_Stmt, Drop_Index_Stmt, Create_View_Stmt, Drop_View_Stmt, Create_Policy_Stmt, Drop_Policy_Stmt, Truncate_Stmt, Create_Trigger_Stmt, Drop_Trigger_Stmt, Grant_Stmt, Create_Virtual_Table_Stmt, Load_Extension_Stmt:
+	case Insert_Stmt, Update_Stmt, Delete_Stmt:
+		if insert, is_insert := stmt.(Insert_Stmt); is_insert && insert.conflict_rollback {
+			return {}, errf(
+				.Sql_Unsupported,
+				"INSERT OR ROLLBACK cannot end a transaction the caller opened: use OR ABORT and ROLLBACK",
+			)
+		}
+		// A data statement that fails is taken back as a unit (SQLite's ABORT): the
+		// transaction keeps the work of the statements before it and none of this
+		// one's. OR FAIL keeps the rows before the failing one instead.
+		mark := tx_statement_begin(tx)
+		result, err := sql_exec_mutation(tx, stmt, params)
+		tx_statement_end(tx, mark, err.kind != .None && !statement_fails_partially(stmt))
+		return result, err
+	case Create_Table_Stmt, Alter_Table_Stmt, Create_Type_Stmt, Drop_Table_Stmt, Create_Index_Stmt, Drop_Index_Stmt, Create_View_Stmt, Drop_View_Stmt, Create_Policy_Stmt, Drop_Policy_Stmt, Truncate_Stmt, Create_Trigger_Stmt, Drop_Trigger_Stmt, Grant_Stmt, Create_Virtual_Table_Stmt, Load_Extension_Stmt:
 		return sql_exec_mutation(tx, stmt, params)
 	case Set_Stmt:
 		return sql_exec_set(tx.store, stmt, params, tx.locked)
@@ -5634,8 +5680,18 @@ sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Res
 			return {}, apply_err
 		}
 		// The stored row is already coerced, so the CHECK predicate sees the
-		// values the table would hold.
+		// values the table would hold. Under OR FAIL a row is its own unit: if it
+		// fails, what it staged (a trigger's work included) is taken back and the
+		// rows before it stay.
+		row_mark := stmt.conflict_fail ? tx_statement_begin(tx) : 0
 		row_id, insert_err := tx_insert(tx, stmt.table, values)
+		if stmt.conflict_fail do tx_statement_end(tx, row_mark, insert_err.kind != .None)
+		if insert_err.kind != .None && stmt.conflict_ignore && conflict_skippable(insert_err.kind) {
+			// INSERT OR IGNORE: the row breaks a constraint by itself and is skipped;
+			// nothing of it was staged.
+			error_free(&insert_err)
+			continue
+		}
 		if insert_err.kind == .None {
 			if fts_err := fts_index_if_virtual(tx, stmt.table, row_id, values, true); fts_err.kind != .None {
 				return {}, fts_err

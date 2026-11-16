@@ -108,3 +108,92 @@ test_limit_with_a_comma :: proc(t: ^testing.T) {
 		testing.expect_value(t, result.rows[2][0].i, i64(5))
 	}
 }
+
+@(test)
+test_a_failed_statement_is_undone_in_a_transaction :: proc(t: ^testing.T) {
+	// SQLite's default resolution is ABORT: a statement that fails inside a
+	// transaction is taken back whole, and the statements before it stay. The
+	// engine used to keep the rows a statement staged before its failing row.
+	store := fresh_db(t, "stmt_abort")
+	if store == nil do return
+	defer cleanup_db(store, "stmt_abort")
+
+	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE)")
+	run(t, store, "INSERT INTO t VALUES (100, 1000)")
+	tx := db.tx_begin_write(store)
+	ok := func_exec(t, tx, "INSERT INTO t VALUES (1, 10)")
+	testing.expect(t, ok)
+	_, dup := db.sql_execute_in_tx(tx, "INSERT INTO t VALUES (2, 20), (3, 30), (2, 40), (4, 50)")
+	testing.expect_value(t, dup.kind, db.Error_Kind.Duplicate_Primary_Key)
+	db.error_free(&dup)
+	// An UPDATE that collides halfway is undone too.
+	_, clash := db.sql_execute_in_tx(tx, "UPDATE t SET u = 7")
+	testing.expect(t, clash.kind != .None)
+	db.error_free(&clash)
+	testing.expect(t, func_exec(t, tx, "INSERT INTO t VALUES (5, 50)"))
+	testing.expect(t, db.error_ok(db.tx_commit(tx)))
+
+	result := run(t, store, "SELECT id, u FROM t ORDER BY id")
+	defer db.sql_result_destroy(&result)
+	if testing.expect_value(t, len(result.rows), 3) {
+		testing.expect_value(t, result.rows[0][0].i, i64(1))
+		testing.expect_value(t, result.rows[0][1].i, i64(10))
+		testing.expect_value(t, result.rows[1][0].i, i64(5))
+		testing.expect_value(t, result.rows[2][0].i, i64(100))
+		testing.expect_value(t, result.rows[2][1].i, i64(1000))
+	}
+}
+
+@(private = "file")
+func_exec :: proc(t: ^testing.T, tx: ^db.Tx, sql: string) -> bool {
+	result, err := db.sql_execute_in_tx(tx, sql)
+	db.sql_result_destroy(&result)
+	if !testing.expectf(t, db.error_ok(err), "%s failed: %s", sql, err.message) {
+		db.error_free(&err)
+		return false
+	}
+	return true
+}
+
+@(test)
+test_insert_conflict_resolutions :: proc(t: ^testing.T) {
+	store := fresh_db(t, "conflict_modes")
+	if store == nil do return
+	defer cleanup_db(store, "conflict_modes")
+
+	count :: proc(t: ^testing.T, store: ^db.Store, table: string) -> i64 {
+		sql := table == "a" ? "SELECT count(*) FROM a" : table == "b" ? "SELECT count(*) FROM b" : "SELECT count(*) FROM c"
+		return scalar(t, store, sql).i
+	}
+
+	// OR IGNORE skips the rows that break a key or NOT NULL and keeps the rest.
+	run(t, store, "CREATE TABLE a (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+	run(t, store, "INSERT INTO a VALUES (1, 'a')")
+	run(t, store, "INSERT OR IGNORE INTO a VALUES (1, 'x'), (2, 'b'), (3, NULL), (4, 'd')")
+	testing.expect_value(t, count(t, store, "a"), i64(3))
+	testing.expect_value(t, scalar(t, store, "SELECT v FROM a WHERE id = 1").s, "a")
+
+	// OR FAIL stops at the failing row and keeps the rows before it.
+	run(t, store, "CREATE TABLE b (id INTEGER PRIMARY KEY)")
+	run(t, store, "INSERT INTO b VALUES (5)")
+	failed := run_error(t, store, "INSERT OR FAIL INTO b VALUES (1), (2), (5), (3)")
+	testing.expect_value(t, failed.kind, db.Error_Kind.Duplicate_Primary_Key)
+	testing.expect_value(t, count(t, store, "b"), i64(3))
+	testing.expect_value(t, scalar(t, store, "SELECT max(id) FROM b WHERE id < 5").i, i64(2))
+
+	// OR ROLLBACK in a statement that owns its transaction is ABORT; inside a
+	// transaction the caller opened it is refused, with the reason.
+	run(t, store, "CREATE TABLE c (id INTEGER PRIMARY KEY)")
+	testing.expect_value(t, run_error(t, store, "INSERT OR ROLLBACK INTO c VALUES (1), (1)").kind, db.Error_Kind.Duplicate_Primary_Key)
+	testing.expect_value(t, count(t, store, "c"), i64(0))
+	tx := db.tx_begin_write(store)
+	_, refused := db.sql_execute_in_tx(tx, "INSERT OR ROLLBACK INTO c VALUES (1)")
+	testing.expect_value(t, refused.kind, db.Error_Kind.Sql_Unsupported)
+	db.error_free(&refused)
+	db.tx_rollback(tx)
+
+	// REPLACE INTO is INSERT OR REPLACE.
+	run(t, store, "REPLACE INTO a VALUES (1, 'z'), (9, 'n')")
+	testing.expect_value(t, scalar(t, store, "SELECT v FROM a WHERE id = 1").s, "z")
+	testing.expect_value(t, count(t, store, "a"), i64(4))
+}
