@@ -205,13 +205,31 @@ lexer_next :: proc(l: ^Lexer) -> Token {
 			lexer_advance(l)
 			return Token{kind = .Punct, text = "<>", line = line, column = column}
 		}
+		if lexer_peek(l) == '<' {
+			lexer_advance(l)
+			return Token{kind = .Punct, text = "<<", line = line, column = column}
+		}
 		return Token{kind = .Punct, text = "<", line = line, column = column}
 	case '>':
 		if lexer_peek(l) == '=' {
 			lexer_advance(l)
 			return Token{kind = .Punct, text = ">=", line = line, column = column}
 		}
+		if lexer_peek(l) == '>' {
+			lexer_advance(l)
+			return Token{kind = .Punct, text = ">>", line = line, column = column}
+		}
 		return Token{kind = .Punct, text = ">", line = line, column = column}
+	case '-':
+		// SQLite's JSON operators: `->` answers JSON, `->>` an SQL value.
+		if lexer_peek(l) == '>' {
+			lexer_advance(l)
+			if lexer_peek(l) == '>' {
+				lexer_advance(l)
+				return Token{kind = .Punct, text = "->>", line = line, column = column}
+			}
+			return Token{kind = .Punct, text = "->", line = line, column = column}
+		}
 	case '!':
 		if lexer_peek(l) == '=' {
 			lexer_advance(l)

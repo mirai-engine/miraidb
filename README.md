@@ -309,8 +309,8 @@ What comes next is in [docs/roadmap.md](docs/roadmap.md), split by the two goals
 **match or beat the reference model** on its own benchmark suite (the engine is
 faster on an empty transaction and still 1.6–4× slower elsewhere,
 [RESULTS.md](benchmarks/parity/RESULTS.md)), and **bring SQLite's features**
-(73 of 121 functions, 54 of 63 pragmas and 30 of 63 grammar shapes today,
-measured by `scripts/sqlite_gaps.py`), plus the hardening a release needs.
+(measured by `scripts/sqlite_gaps.py`; the counts are in
+[sqlite-roadmap.md](docs/sqlite-roadmap.md)), plus the hardening a release needs.
 
 ## Not implemented: a second writer, and replication
 

@@ -2,6 +2,27 @@
 
 ## 0.15
 
+- SQLite's surface, roadmap S1 and S2 (grammar shapes measured by
+  `scripts/sqlite_gaps.py`: 30 of 63 before, 47 now):
+  - `CHECK` constraints (column and table, named or not, on every write path),
+    `CONSTRAINT <name>`, a column's `REFERENCES`, `DEFERRABLE INITIALLY DEFERRED`
+    foreign keys checked at COMMIT, `CURRENT_TIMESTAMP`/`_DATE`/`_TIME`, a
+    `DEFAULT` that calls a function evaluated per row, and `ASC`/`DESC` on index
+    and key columns. They live in a new optional section of the schema encoding
+    (`docs/file-format.md`), travel into an exported `.sqlite` file and are read
+    back from an imported one.
+  - `IS`/`IS NOT` between values, `IS [NOT] DISTINCT FROM`, `& | ~ << >>`, `->`
+    and `->>`, `LIMIT a, b`, `INSERT OR IGNORE/FAIL/ROLLBACK`, `REPLACE INTO`,
+    `INTERSECT`, `EXCEPT`, `NULLS FIRST/LAST`, subqueries and `VALUES` in
+    `FROM`, `VALUES` as a statement, and row values.
+  - Left: partial and expression indexes, and `UPDATE OR <resolution>`.
+- Wrong answers found and fixed on the way: a statement that failed inside a
+  transaction kept the rows it staged before the failing one (a per-statement
+  undo log now takes it back whole, SQLite's ABORT); a `UNION` anywhere in a
+  compound deduplicated the whole result; a CTE's name stayed bound for the rest
+  of a transaction, hiding a table of that name; an `ORDER BY` expression that
+  failed (a misspelt column, a window function) sorted as NULL instead of failing
+  the statement; and JSON object keys were matched without case.
 - A commit read its own freed transaction: `tx_commit` cleared
   `apply_validated` in a `defer` through `tx.store`, after `tx_discard` had freed
   `tx`. When the heap reused the block, the process died with no message, about

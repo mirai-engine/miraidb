@@ -59,6 +59,12 @@ BACKGROUND_COMPACT_INTERVAL_MS :: 100
 // Store is one database: a set of tables plus the commit sequence that orders
 // every change. It is safe for one writer and many readers; the write lock is
 // held for the whole duration of a write transaction.
+// Cached_Expression is one parsed expression and the query that owns its nodes.
+Cached_Expression :: struct {
+	query: Query,
+	expr:  ^Expr,
+}
+
 Store :: struct {
 	// host is the process that owns this store, when there is one. It lets a
 	// statement reach the module registry (LOAD EXTENSION); a store used without a
@@ -76,6 +82,10 @@ Store :: struct {
 	// readers open transactions concurrently.
 	arenas:        [dynamic]virtual.Arena,
 	arena_mutex:   sync.Mutex,
+	// expr_cache holds the parsed CHECK and per-row DEFAULT expressions, keyed by
+	// their text (store_expression).
+	expr_cache:       map[string]^Cached_Expression,
+	expr_cache_mutex: sync.Mutex,
 	// apply_validated is set while tx_commit applies a transaction that held the
 	// write lock from its first statement: its inserts need no second unique
 	// probe. Replay and grouped commits leave it false.
@@ -443,6 +453,12 @@ store_close :: proc(store: ^Store) {
 	delete(store.pinned_reads)
 	for &arena in store.arenas do virtual.arena_destroy(&arena)
 	delete(store.arenas)
+	for text, entry in store.expr_cache {
+		delete(text)
+		query_destroy(&entry.query)
+		free(entry)
+	}
+	delete(store.expr_cache)
 	stats_destroy(store)
 	log_close(&store.log)
 	db_lock_release(&store.lock)

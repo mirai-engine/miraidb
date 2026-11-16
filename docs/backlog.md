@@ -33,8 +33,8 @@ Rules for this file:
 | R2 | every index entry is an encoded string | fixed-size keys where the column allows | M |
 | R3 | pruning walks every row of every table after each statement | prune what the commit touched | S |
 | R4 | a committed row is copied from the transaction arena to the table | hand the staged row over | M |
-| S1 | `CHECK`, column `REFERENCES`, `CONSTRAINT` names, `DESC` and partial/expression indexes, `CURRENT_TIMESTAMP` are refused | accept the schema real SQLite files declare | M |
-| S2 | eleven common statement and expression forms are refused | parser and executor work, each small | M |
+| S1 | partial and expression indexes are refused (the rest landed) | the two index kinds | M |
+| S2 | `UPDATE OR <resolution>` is refused; the rest landed | the UPDATE resolutions | S |
 | S3 | `RIGHT`, `FULL` and `NATURAL` joins are refused | the three joins | M |
 | S4 | `FILTER`, `WINDOW`, aggregate `ORDER BY`, ordered-set aggregates missing | the aggregate surface | M |
 | S5 | 48 of 121 built-in functions missing | math, JSON/JSONB, text, introspection | M |
@@ -128,11 +128,24 @@ gains a query per shape that compares the answer with SQLite's.
 
 ## S1 — The schema real files declare
 
-**Now refused.** `CHECK` constraints (column and table), `CONSTRAINT <name>`
-before a constraint, a column-level `REFERENCES` (only `FOREIGN KEY (…)
-REFERENCES` parses), `DEFERRABLE INITIALLY DEFERRED`, `DESC` on an index column,
-partial indexes (`WHERE`), indexes over expressions, and `CURRENT_TIMESTAMP` /
-`CURRENT_DATE` / `CURRENT_TIME`, both as values and as a `DEFAULT`.
+**Done.** `CHECK` constraints, column and table level, named or not, enforced
+on every write path (they run in `tx_insert`/`tx_update`, before a row is
+staged) with SQLite's message and `SQLITE_CONSTRAINT_CHECK`; a column's own
+CHECK goes with it on `DROP COLUMN`, and one that another part of the table
+uses blocks the drop or a rename. `CONSTRAINT <name>` before any constraint. A
+column-level `REFERENCES`, with the parent's primary key implied and a table
+referencing itself. `DEFERRABLE INITIALLY DEFERRED` foreign keys, verified at
+COMMIT. `CURRENT_TIMESTAMP`/`CURRENT_DATE`/`CURRENT_TIME`, and a DEFAULT that
+calls a function evaluated per row. `ASC`/`DESC` on index and key columns. The
+schema keeps them in a new optional section (`docs/file-format.md`), an export
+writes the CHECKs and per-row defaults into the `.sqlite` file, and an import
+reads them from the file's declaration (`test_check_constraints`,
+`test_column_references_and_defaults`, `test_deferred_foreign_keys`,
+`scripts/shell_smoke.py`).
+
+**Now refused.** Partial indexes (`WHERE`), indexes over expressions, and
+`ON CONFLICT <resolution>` on a constraint. An import still leaves out an index
+of the first two kinds (D24), and still does not carry `REFERENCES`.
 
 **Why first.** A schema that uses any of them fails at `CREATE TABLE`, so
 nothing written against it runs; and an imported file whose index is partial or
@@ -145,12 +158,31 @@ rows and the planner uses it only when the query implies its `WHERE`.
 
 ## S2 — Statement and expression forms
 
-**Now refused.** `INSERT OR IGNORE` (and the `OR ABORT`/`FAIL`/`ROLLBACK`
-spellings), `REPLACE INTO`, `INTERSECT` and `EXCEPT`, `LIMIT <offset>, <count>`,
-`IS` / `IS NOT` between two values (only `IS NULL` parses), `IS [NOT] DISTINCT
-FROM`, `NULLS FIRST` / `NULLS LAST`, the bitwise operators `& | ~ << >>`, the JSON
-operators `->` and `->>`, `VALUES` as a table in `FROM`, and row values
-(`(a, b) = (1, 2)`, `(a, b) IN (SELECT …)`).
+**Done.** `IS` / `IS NOT` between any two values and `IS [NOT] DISTINCT FROM`;
+the bitwise operators `& | ~ << >>` at SQLite's precedence; the JSON operators
+`->` and `->>` (a path, a key or an array slot); `LIMIT <offset>, <count>`
+(`test_is_compares_null_as_a_value`, `test_bitwise_operators`,
+`test_json_arrow_operators`, `test_limit_with_a_comma`, and differential
+queries). JSON object keys became case sensitive on the way, as SQLite's are.
+`INSERT OR IGNORE`, `OR FAIL`, `OR ROLLBACK` (where the statement owns its
+transaction) and `REPLACE INTO` (`test_insert_conflict_resolutions`). Making them
+right needed statement atomicity: a statement that failed inside a transaction
+used to leave the rows it staged before the failing one, and now a per-statement
+undo log takes it back whole (`test_a_failed_statement_is_undone_in_a_transaction`).
+
+`INTERSECT` and `EXCEPT`, with the chain applied left to right (a `UNION`
+anywhere used to deduplicate the whole result); `NULLS FIRST` / `NULLS LAST`; a
+subquery or `VALUES` in `FROM`, and `VALUES` as a statement; row values in
+comparisons, `IN` lists and `IN (SELECT …)` (`test_compound_operators`,
+`test_nulls_first_and_last`, `test_derived_tables_and_values`,
+`test_row_values`). Two wrong answers were found and fixed on the way: a CTE's
+name stayed bound for the rest of a transaction, hiding a real table of that
+name from later statements, and an `ORDER BY` expression that failed (a misspelt
+column, a window function) sorted as NULL instead of failing the statement.
+
+**Now refused.** `UPDATE OR <resolution>`. A unique key an `UPDATE` changes is checked against the
+statement's result, where SQLite checks it row by row; a statement whose rows
+collide only partway through succeeds here (`docs/sqlite.md`).
 
 **Done when.** Each runs and matches SQLite in the differential corpus, including
 the `NULL` cases (`NULL IS NULL` is true, `1 & NULL` is `NULL`).

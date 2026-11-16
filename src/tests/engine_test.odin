@@ -8371,12 +8371,9 @@ test_insert_or_replace :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM audit").i, i64(0))
 	testing.expect_value(t, scalar(t, store, "SELECT v FROM audited WHERE id = 1").s, "new")
 
-	// The actions that are not implemented say so, instead of "expected into".
-	unsupported := run_error(t, store, "INSERT OR ROLLBACK INTO t VALUES (9, 'q', 'r')")
-	testing.expect_value(t, unsupported.kind, db.Error_Kind.Sql_Unsupported)
-	testing.expect(t, strings.contains(unsupported.message, "OR ROLLBACK"))
-	testing.expect_value(t, run_error(t, store, "INSERT OR IGNORE INTO t VALUES (9, 'q', 'r')").kind, db.Error_Kind.Sql_Unsupported)
-	// ABORT is what a plain INSERT already does.
+	// The other resolutions are in test_insert_conflict_resolutions; an unknown
+	// one is still a syntax error rather than "expected into".
+	testing.expect_value(t, run_error(t, store, "INSERT OR SKIP INTO t VALUES (9, 'q', 'r')").kind, db.Error_Kind.Sql_Syntax)
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t").i, i64(3))
 }
 

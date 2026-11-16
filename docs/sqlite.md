@@ -35,10 +35,10 @@ script lists.
 
 | Feature | Status | Notes |
 |---|---|---|
-| SELECT with joins, subqueries, aggregates | done | engine syntax; `INNER`/`LEFT`/`CROSS`, no `NATURAL`/`RIGHT`/`FULL` (refused with a reason) |
-| INSERT / UPDATE / DELETE | done | `RETURNING` with `*` or a column list; `INSERT OR REPLACE` deletes on any unique conflict, `OR ABORT` (the default), `OR ROLLBACK`/`FAIL`/`IGNORE` refused with a reason |
-| CREATE/DROP TABLE, ALTER | done | `ALTER` adds, drops and renames columns and renames the table; type changes are refused |
-| CREATE/DROP INDEX, UNIQUE | done | btree, hash, direct |
+| SELECT with joins, subqueries, aggregates | done | `INNER`/`LEFT`/`CROSS`, no `NATURAL`/`RIGHT`/`FULL` (refused with a reason); a subquery or `VALUES` in `FROM` (a derived table, named `(subquery-N)` when unaliased); `UNION [ALL]`, `INTERSECT` and `EXCEPT` applied left to right; `VALUES (…), (…)` as a statement, with columns `column1`, `column2`, … |
+| INSERT / UPDATE / DELETE | done | `RETURNING` with `*` or a column list. Conflict resolution as SQLite's: `OR ABORT` (the default: a failed statement is undone whole, inside a transaction too), `OR IGNORE` (skips a row that breaks a key or `NOT NULL`), `OR FAIL` (keeps the rows before the failing one), `OR REPLACE` and `REPLACE INTO` (delete the colliding rows, fire no delete trigger). `OR ROLLBACK` is `ABORT` when the statement owns its transaction and refused inside one a caller opened |
+| CREATE/DROP TABLE, ALTER | done | `CHECK` (column and table, named with `CONSTRAINT` or not), `DEFAULT` (one that calls a function, like `CURRENT_TIMESTAMP`, is evaluated per row), `NOT NULL`, `UNIQUE`, `PRIMARY KEY` with `ASC`/`DESC`. `ALTER` adds, drops and renames columns, changes a column's type and renames the table; a column's own CHECK goes with it, and a CHECK that names a column blocks dropping or renaming it. `ON CONFLICT` on a constraint is refused |
+| CREATE/DROP INDEX, UNIQUE | done | btree, hash, direct; `ASC`/`DESC` columns accepted (they order SQLite's storage, not an answer). Partial indexes and indexes over expressions are refused |
 | CREATE/DROP VIEW | done | `OR REPLACE`, parameters, materialization |
 | CREATE TYPE | done | engine extension |
 | CREATE EVENT TABLE | done | engine extension |
@@ -62,7 +62,9 @@ script lists.
 
 | Feature | Status | Notes |
 |---|---|---|
-| WHERE, ORDER BY, LIMIT/OFFSET | done | stable sort, NULLs first |
+| WHERE, ORDER BY, LIMIT/OFFSET | done | stable sort, NULL the smallest value; `NULLS FIRST`/`NULLS LAST`; `LIMIT <offset>, <count>`. An `ORDER BY` expression that fails is the statement's error (a window function there is refused) |
+| Row values | done | `(a, b) = (1, 2)`, `<`, `<=`, `>`, `>=`, `IS`, `IN ((…), (…))` and `IN (SELECT a, b …)`; a row value anywhere else is "row value misused", as in SQLite |
+| Operators | done | `IS`/`IS NOT` between values, `IS [NOT] DISTINCT FROM`, `& \| ~ << >>` at SQLite's precedence, `->` and `->>` |
 | GROUP BY, HAVING | done | `HAVING` takes the expression, not a projection alias |
 | DISTINCT | done | over the projected row, and inside an aggregate (`count(DISTINCT x)`) |
 | IN, EXISTS, scalar subqueries | done | three-valued logic: a `NULL` in the list makes a non-match unknown |
@@ -71,13 +73,13 @@ script lists.
 | `||` string concatenation | done | tested with text and numbers |
 | COLLATE (BINARY, NOCASE, RTRIM) | done | on a column, in comparisons, in unique keys and index probes |
 | Window functions, FILTER | partial | `OVER` with `PARTITION BY`/`ORDER BY` and `ROWS`/`RANGE`/`GROUPS` frames; aggregate `FILTER (WHERE …)` is not implemented, and windows beside `GROUP BY` are refused |
-| Foreign keys | done | `ON DELETE`/`ON UPDATE` `RESTRICT`/`CASCADE`, enforced on every path |
+| Foreign keys | done | `FOREIGN KEY (…) REFERENCES` and a column's `REFERENCES t [(col)]` (the parent's key when no column is named, the table itself allowed); `ON DELETE`/`ON UPDATE` `RESTRICT`/`CASCADE`; `DEFERRABLE INITIALLY DEFERRED` checked at COMMIT. Always enforced, on every path |
 | `AS OF <seq>` | done | engine extension: read a table as it was |
 
 ## Functions
 
-**Implemented (73 of the 121 user-facing names, measured by
-`scripts/sqlite_gaps.py`):** `abs` and the trigonometric/logarithmic set (`acos`, `asin`,
+**Implemented (the count is in [sqlite-roadmap.md](sqlite-roadmap.md),
+measured by `scripts/sqlite_gaps.py`):** `abs` and the trigonometric/logarithmic set (`acos`, `asin`,
 `atan`, `atan2`, `cos`, `sin`, `tan`, `degrees`, `radians`, `pi`, `exp`,
 `log`, `log2`, `log10`), `ceil`/`floor`/`round`/`trunc`/`sign`/`sqrt`/`pow`/
 `mod`, `char`, `unicode`, `hex`, `unhex`, `quote`, `format`/`printf`,
@@ -137,6 +139,9 @@ behaviour here will see different results:
 | `CAST(300 AS TINYINT)` | `300` (INTEGER affinity) | error: the value does not fit the declared width |
 | `WHERE int_col = '1'` | compares through affinity | error `cannot compare int with string` |
 | `HAVING c > 1` where `c` aliases `count(*)` | works | error `column c does not exist` |
+| `UPDATE t SET u = u + 990` whose rows collide only partway through | error: a unique key is checked row by row | succeeds when the final rows are distinct: a statement's keys are checked against its result |
+| `COMMIT` a deferred foreign key fails | the transaction stays open until `ROLLBACK` | the transaction is rolled back |
+| foreign keys | enforced only after `PRAGMA foreign_keys = ON` | always enforced |
 
 ## The claims in this file are executed
 

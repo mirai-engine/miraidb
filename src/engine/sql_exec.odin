@@ -105,8 +105,21 @@ sql_run_statement :: proc(store: ^Store, statement: Statement, params: []Value) 
 		return result, exec_err
 	case Insert_Stmt, Update_Stmt, Delete_Stmt, Create_Table_Stmt, Alter_Table_Stmt, Create_Type_Stmt, Drop_Table_Stmt, Create_Index_Stmt, Drop_Index_Stmt, Create_View_Stmt, Drop_View_Stmt, Create_Policy_Stmt, Drop_Policy_Stmt, Truncate_Stmt, Create_Trigger_Stmt, Drop_Trigger_Stmt, Grant_Stmt, Create_Virtual_Table_Stmt, Load_Extension_Stmt:
 		tx := tx_begin_write(store)
+		// OR FAIL undoes the failing row alone, which needs the statement journal
+		// even here, where a plain failure simply discards the transaction.
+		fail_mode := statement_fails_partially(stmt)
+		mark := fail_mode ? tx_statement_begin(tx) : 0
 		result, exec_err := sql_exec_mutation(tx, stmt, params)
+		if fail_mode do tx_statement_end(tx, mark, false)
 		if exec_err.kind != .None {
+			if fail_mode {
+				// The rows before the failing one stay, as SQLite keeps them.
+				if commit_err := tx_commit(tx); commit_err.kind != .None {
+					error_free(&exec_err)
+					return {}, commit_err
+				}
+				return {}, exec_err
+			}
 			tx_rollback(tx)
 			return {}, exec_err
 		}
@@ -179,6 +192,25 @@ sql_execute_in_tx_params :: proc(tx: ^Tx, sql: string, params: []Value) -> (Sql_
 	return result, ERROR_NONE
 }
 
+// statement_fails_partially reports INSERT OR FAIL, the one resolution that
+// keeps a statement's rows before the one that failed.
+@(private)
+statement_fails_partially :: proc(statement: Statement) -> bool {
+	insert, ok := statement.(Insert_Stmt)
+	return ok && insert.conflict_fail
+}
+
+// conflict_skippable reports the failures INSERT OR IGNORE and OR FAIL act on:
+// the constraints a row breaks by itself, checked before anything is staged.
+@(private)
+conflict_skippable :: proc(kind: Error_Kind) -> bool {
+	#partial switch kind {
+	case .Duplicate_Primary_Key, .Duplicate_Unique, .Not_Null_Violation, .Check_Violation:
+		return true
+	}
+	return false
+}
+
 // sql_run_statement_in_tx dispatches an already parsed statement inside a
 // transaction.
 @(private)
@@ -186,7 +218,21 @@ sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value) 
 	switch stmt in statement {
 	case Select_Stmt, With_Stmt:
 		return sql_run_query(tx, stmt, params)
-	case Insert_Stmt, Update_Stmt, Delete_Stmt, Create_Table_Stmt, Alter_Table_Stmt, Create_Type_Stmt, Drop_Table_Stmt, Create_Index_Stmt, Drop_Index_Stmt, Create_View_Stmt, Drop_View_Stmt, Create_Policy_Stmt, Drop_Policy_Stmt, Truncate_Stmt, Create_Trigger_Stmt, Drop_Trigger_Stmt, Grant_Stmt, Create_Virtual_Table_Stmt, Load_Extension_Stmt:
+	case Insert_Stmt, Update_Stmt, Delete_Stmt:
+		if insert, is_insert := stmt.(Insert_Stmt); is_insert && insert.conflict_rollback {
+			return {}, errf(
+				.Sql_Unsupported,
+				"INSERT OR ROLLBACK cannot end a transaction the caller opened: use OR ABORT and ROLLBACK",
+			)
+		}
+		// A data statement that fails is taken back as a unit (SQLite's ABORT): the
+		// transaction keeps the work of the statements before it and none of this
+		// one's. OR FAIL keeps the rows before the failing one instead.
+		mark := tx_statement_begin(tx)
+		result, err := sql_exec_mutation(tx, stmt, params)
+		tx_statement_end(tx, mark, err.kind != .None && !statement_fails_partially(stmt))
+		return result, err
+	case Create_Table_Stmt, Alter_Table_Stmt, Create_Type_Stmt, Drop_Table_Stmt, Create_Index_Stmt, Drop_Index_Stmt, Create_View_Stmt, Drop_View_Stmt, Create_Policy_Stmt, Drop_Policy_Stmt, Truncate_Stmt, Create_Trigger_Stmt, Drop_Trigger_Stmt, Grant_Stmt, Create_Virtual_Table_Stmt, Load_Extension_Stmt:
 		return sql_exec_mutation(tx, stmt, params)
 	case Set_Stmt:
 		return sql_exec_set(tx.store, stmt, params, tx.locked)
@@ -864,6 +910,9 @@ select_output_may_shrink :: proc(stmt: Select_Stmt) -> bool {
 }
 
 Eval_Ctx :: struct {
+	// order_err is the first error an ORDER BY expression raised while the sort
+	// keys were built; the statement returns it instead of sorting.
+	order_err: Error,
 	tx:      ^Tx,
 	sources: []Source,
 	group:   [][]Source,
@@ -901,12 +950,53 @@ sql_run_query :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sql_Re
 	}
 	with_stmt, is_with := statement.(With_Stmt)
 	if !is_with do return {}, errf(.Sql_Unsupported, "not a query")
+	// A CTE's name lasts for its statement: inside a transaction the next
+	// statement must see the table of that name again, not this query.
+	scope := cte_scope_begin(tx)
+	defer cte_scope_end(tx, &scope)
 	for cte in with_stmt.ctes {
 		table, cte_err := tx_materialize_cte(tx, cte, params, with_stmt.recursive)
 		if cte_err.kind != .None do return {}, cte_err
-		tx.cte_tables[strings.clone(cte.name, tx.alloc)] = table
+		cte_scope_bind(tx, &scope, cte.name, table)
 	}
 	return sql_exec_select(tx, with_stmt.select_stmt, params)
+}
+
+@(private)
+select_has_derived_join :: proc(stmt: Select_Stmt) -> bool {
+	for join in stmt.joins do if join.table.subquery != nil do return true
+	return false
+}
+
+// Cte_Scope remembers what each name a statement bound in `cte_tables` meant
+// before, so the end of the statement puts it back.
+Cte_Scope :: struct {
+	names:    [dynamic]string,
+	previous: [dynamic]^Table,
+}
+
+@(private)
+cte_scope_begin :: proc(tx: ^Tx) -> Cte_Scope {
+	return Cte_Scope{names = make([dynamic]string, 0, 2, tx.alloc), previous = make([dynamic]^Table, 0, 2, tx.alloc)}
+}
+
+@(private)
+cte_scope_bind :: proc(tx: ^Tx, scope: ^Cte_Scope, name: string, table: ^Table) {
+	key := strings.clone(name, tx.alloc)
+	append(&scope.names, key)
+	append(&scope.previous, tx.cte_tables[key] or_else nil)
+	tx.cte_tables[key] = table
+}
+
+@(private)
+cte_scope_end :: proc(tx: ^Tx, scope: ^Cte_Scope) {
+	for i := len(scope.names) - 1; i >= 0; i -= 1 {
+		if scope.previous[i] != nil {
+			tx.cte_tables[scope.names[i]] = scope.previous[i]
+		} else {
+			delete_key(&tx.cte_tables, scope.names[i])
+		}
+	}
 }
 
 // tx_materialize_cte evaluates a common table expression into a temporary table
@@ -952,25 +1042,75 @@ clone_row_values :: proc(values: []Value, alloc: mem.Allocator) -> []Value {
 	return out
 }
 
+// compound_apply joins the rows of one more term to the result so far. Every
+// operator but UNION ALL answers distinct rows; the result keeps the order in
+// which its rows first appeared.
 @(private)
-compound_admit :: proc(rows: ^[dynamic][]Value, seen: ^map[string]bool, values: []Value, dedup: bool) {
-	if !dedup {
-		append(rows, clone_row_values(values, context.allocator))
+compound_apply :: proc(rows: ^[dynamic][]Value, term: [][]Value, op: Compound_Op) {
+	if op == .Union_All {
+		for row in term do append(rows, clone_row_values(row, context.allocator))
 		return
 	}
-	key := encode_output_key(values)
-	if key in seen^ {
-		delete(key)
-		return
+	in_term := make(map[string]bool)
+	defer {
+		for key in in_term do delete(key)
+		delete(in_term)
 	}
-	seen^[key] = true
-	append(rows, clone_row_values(values, context.allocator))
+	if op != .Union {
+		for row in term {
+			key := encode_output_key(row)
+			if key in in_term {
+				delete(key)
+				continue
+			}
+			in_term[key] = true
+		}
+	}
+	seen := make(map[string]bool)
+	defer {
+		for key in seen do delete(key)
+		delete(seen)
+	}
+	kept := make([dynamic][]Value, 0, len(rows))
+	for row in rows {
+		key := encode_output_key(row)
+		keep := !(key in seen)
+		switch op {
+		case .Intersect:
+			keep = keep && key in in_term
+		case .Except:
+			keep = keep && !(key in in_term)
+		case .Union, .Union_All:
+		}
+		if keep {
+			seen[key] = true
+			append(&kept, row)
+		} else {
+			delete(key)
+			free_values(row)
+		}
+	}
+	if op == .Union {
+		for row in term {
+			key := encode_output_key(row)
+			if key in seen {
+				delete(key)
+				continue
+			}
+			seen[key] = true
+			append(&kept, clone_row_values(row, context.allocator))
+		}
+	}
+	delete(rows^)
+	rows^ = kept
 }
 
-// sql_exec_compound evaluates a UNION chain: every term runs, duplicates are
-// dropped unless the term is UNION ALL, and the tail clauses (ORDER BY, LIMIT,
-// OFFSET) apply to the merged result. When a tail exists the rows pass through
-// a temporary table, which lets the ordinary select path order them.
+// sql_exec_compound evaluates a compound query left to right, as SQLite does:
+// `a UNION b` keeps the distinct rows of both, `a UNION ALL b` appends b,
+// `a INTERSECT b` keeps the distinct rows of a that b has, and `a EXCEPT b` the
+// distinct rows of a that b lacks. The tail clauses (ORDER BY, LIMIT, OFFSET)
+// apply to the result. When a tail exists the rows pass through a temporary
+// table, which lets the ordinary select path order them.
 @(private)
 sql_exec_compound :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Result, Error) {
 	base := stmt
@@ -984,24 +1124,12 @@ sql_exec_compound :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_R
 	defer sql_result_destroy(&first)
 	if len(first.columns) == 0 do return {}, errf(.Internal, "compound query without columns")
 
-	seen := make(map[string]bool)
 	rows := make([dynamic][]Value, 0, len(first.rows))
 	defer {
 		for row in rows do free_values(row)
 		delete(rows)
-		for key in seen do delete(key)
-		delete(seen)
 	}
-	// UNION drops duplicates; a chain of UNION ALL terms keeps everything.
-	dedup := true
-	for part in stmt.compound {
-		if !part.all do continue
-		dedup = false
-	}
-	for part in stmt.compound {
-		if !part.all do dedup = true
-	}
-	for row in first.rows do compound_admit(&rows, &seen, row, dedup)
+	for row in first.rows do append(&rows, clone_row_values(row, context.allocator))
 
 	for part in stmt.compound {
 		term := part.select_stmt
@@ -1016,11 +1144,11 @@ sql_exec_compound :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_R
 			sql_result_destroy(&result)
 			return {}, errf(
 				.Invalid_Argument,
-				"each UNION term must return %d columns",
+				"each term of a compound query must return %d columns",
 				len(first.columns),
 			)
 		}
-		for row in result.rows do compound_admit(&rows, &seen, row, dedup)
+		compound_apply(&rows, result.rows, part.op)
 		sql_result_destroy(&result)
 	}
 
@@ -1200,11 +1328,7 @@ window_order_key :: proc(ctx: ^Eval_Ctx, window: Window_Expr) -> ([]u8, Error) {
 		if has && len(collation) > 0 {
 			value = collate_ordered_value(value, collation)
 		}
-		start := len(w.data)
-		value_encode_key(&w, value)
-		if item.descending {
-			for i in start ..< len(w.data) do w.data[i] = ~w.data[i]
-		}
+		order_key_append(&w, value, item)
 	}
 	raw := bw_bytes(&w)
 	out := make([]u8, len(raw))
@@ -2517,6 +2641,28 @@ sql_exec_stream_select :: proc(
 }
 
 sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Result, Error) {
+	// Derived tables are materialized first, under their names, for this select.
+	if stmt.from.subquery != nil || select_has_derived_join(stmt) {
+		scope := cte_scope_begin(tx)
+		defer cte_scope_end(tx, &scope)
+		refs := make([dynamic]Table_Ref, 0, 1 + len(stmt.joins), tx.alloc)
+		append(&refs, stmt.from)
+		for join in stmt.joins do append(&refs, join.table)
+		for ref in refs {
+			if ref.subquery == nil do continue
+			table, derived_err := tx_materialize_cte(tx, Cte{name = ref.name, select_stmt = ref.subquery^}, params, false)
+			if derived_err.kind != .None do return {}, derived_err
+			cte_scope_bind(tx, &scope, ref.name, table)
+		}
+		inner := stmt
+		inner.from.subquery = nil
+		inner.joins = make([]Join_Clause, len(stmt.joins), tx.alloc)
+		for join, i in stmt.joins {
+			inner.joins[i] = join
+			inner.joins[i].table.subquery = nil
+		}
+		return sql_exec_select(tx, inner, params)
+	}
 	if len(stmt.compound) > 0 do return sql_exec_compound(tx, stmt, params)
 	// A collation the statement cannot honour is refused before a row exists: an
 	// unknown name, or a host comparison where a folded key is required.
@@ -3355,6 +3501,14 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		delete(group_keep)
 	}
 
+	if ctx.order_err.kind != .None {
+		for row in output {
+			free_values(row.values)
+			delete(row.sort_key)
+		}
+		delete(output)
+		return {}, ctx.order_err
+	}
 	if len(stmt.order_by) > 0 {
 		slice.sort_by(output[:], proc(a, b: Output_Row) -> bool {
 			return string(sort_key_bytes(a.sort_key)) < string(sort_key_bytes(b.sort_key))
@@ -3554,13 +3708,7 @@ build_order_key :: proc(
 		if has && len(collation) > 0 {
 			value = collate_ordered_value(value, collation)
 		}
-		start := len(w.data)
-		value_encode_key(&w, value)
-		if item.descending {
-			for i in start ..< len(w.data) {
-				w.data[i] = ~w.data[i]
-			}
-		}
+		order_key_append(&w, value, item)
 	}
 	write_be_u64(&w, u64(row_id))
 	raw := bw_bytes(&w)
@@ -3568,6 +3716,25 @@ build_order_key :: proc(
 	copy(out, raw)
 	bw_destroy(&w)
 	return out
+}
+
+// order_key_append encodes one ORDER BY value so that comparing keys byte by
+// byte gives the requested order: descending inverts the value's bytes, and an
+// explicit NULLS FIRST/LAST puts a leading byte that decides where NULL goes,
+// whatever the direction.
+@(private)
+order_key_append :: proc(w: ^Byte_Writer, value: Value, item: Order_Item) {
+	if item.nulls != .Default {
+		is_null := value.kind == .Null
+		marker: u8 = 1
+		if is_null do marker = item.nulls == .First ? 0 : 2
+		append(&w.data, marker)
+	}
+	start := len(w.data)
+	value_encode_key(w, value)
+	if item.descending {
+		for i in start ..< len(w.data) do w.data[i] = ~w.data[i]
+	}
 }
 
 // collate_ordered_value folds a text value the way a collation sorts it.
@@ -3614,7 +3781,17 @@ eval_order_value :: proc(
 		}
 	}
 	value, eval_err := eval_expr(ctx, expr)
-	if eval_err.kind != .None do return value_null()
+	if eval_err.kind != .None {
+		// The statement answers this error once the keys are built. Sorting the
+		// row as NULL instead made `ORDER BY no_such_column` (or a window function
+		// in ORDER BY) return the rows unsorted with no word of why.
+		if ctx.order_err.kind == .None {
+			ctx.order_err = eval_err
+		} else {
+			error_free(&eval_err)
+		}
+		return value_null()
+	}
 	return value
 }
 
@@ -3870,6 +4047,10 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 		if len(sub.rows) == 0 || len(sub.rows[0]) == 0 do return value_null(), ERROR_NONE
 		return sub.rows[0][0], ERROR_NONE
 	case In_Expr:
+		if row, is_row := row_value_items(e.operand); is_row {
+			if e.subquery == nil do return {}, errf(.Sql_Syntax, "row value misused")
+			return eval_row_in_subquery(ctx, row, e.subquery, e.negated)
+		}
 		operand, operand_err := eval_expr(ctx, e.operand)
 		if operand_err.kind != .None do return {}, operand_err
 		if operand.kind == .Null do return value_null(), ERROR_NONE
@@ -3957,6 +4138,51 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 	return {}, errf(.Internal, "unknown expression")
 }
 
+// eval_row_in_subquery answers `(a, b) IN (SELECT x, y …)`: true when a row of
+// the subquery equals the tuple, NULL when no row does but one could (a NULL on
+// either side of a column that decides it), false otherwise.
+@(private)
+eval_row_in_subquery :: proc(ctx: ^Eval_Ctx, row: []^Expr, subquery: ^Select_Stmt, negated: bool) -> (Value, Error) {
+	if ctx.tx == nil do return {}, errf(.Sql_Unsupported, "subqueries need a transaction")
+	tuple := make([]Value, len(row), context.temp_allocator)
+	for item, i in row {
+		value, err := eval_expr(ctx, item)
+		if err.kind != .None do return {}, err
+		tuple[i] = value
+	}
+	sub, sub_err := sql_exec_select(ctx.tx, subquery^, ctx.params)
+	if sub_err.kind != .None do return {}, sub_err
+	defer sql_result_destroy(&sub)
+	if len(sub.columns) != len(tuple) {
+		return {}, errf(.Sql_Syntax, "sub-select returns %d columns - expected %d", len(sub.columns), len(tuple))
+	}
+	found := false
+	unknown := false
+	for candidate in sub.rows {
+		match := true
+		maybe := false
+		for value, i in tuple {
+			if value.kind == .Null || candidate[i].kind == .Null {
+				maybe = true
+				continue
+			}
+			if !value_equal(value, candidate[i]) {
+				match = false
+				break
+			}
+		}
+		if !match do continue
+		if maybe {
+			unknown = true
+			continue
+		}
+		found = true
+		break
+	}
+	if !found && unknown do return value_null(), ERROR_NONE
+	return value_bool(negated ? !found : found), ERROR_NONE
+}
+
 eval_binary :: proc(
 	op: Binary_Op,
 	left: Value,
@@ -3975,6 +4201,16 @@ eval_binary :: proc(
 		if value_is_truthy(right) do return value_bool(true), ERROR_NONE
 		if value_is_null(left) || value_is_null(right) do return value_null(), ERROR_NONE
 		return value_bool(false), ERROR_NONE
+	case .Is, .Is_Not:
+		same: bool
+		if value_is_null(left) || value_is_null(right) {
+			same = value_is_null(left) && value_is_null(right)
+		} else {
+			order, ok := value_compare_collated(left, right, collation, store)
+			// Values of different classes are never the same value.
+			same = ok && order == .Equal
+		}
+		return value_bool(op == .Is ? same : !same), ERROR_NONE
 	case:
 	}
 	if value_is_null(left) || value_is_null(right) {
@@ -4013,7 +4249,22 @@ eval_binary :: proc(
 		return value_string(strings.concatenate({left_text, right_text})), ERROR_NONE
 	case .Add, .Sub, .Mul, .Div, .Mod:
 		return eval_arithmetic(op, left, right)
-	case .And, .Or:
+	case .Bit_And, .Bit_Or, .Shift_Left, .Shift_Right:
+		a, a_ok := value_bit_operand(left)
+		b, b_ok := value_bit_operand(right)
+		if !a_ok || !b_ok do return {}, errf(.Invalid_Type, "bitwise operators need integers")
+		#partial switch op {
+		case .Bit_And:
+			return value_int(a & b), ERROR_NONE
+		case .Bit_Or:
+			return value_int(a | b), ERROR_NONE
+		case .Shift_Left:
+			return value_int(bit_shift(a, b)), ERROR_NONE
+		case .Shift_Right:
+			// A negative count shifts the other way, as in SQLite.
+			return value_int(bit_shift(a, b == min(i64) ? max(i64) : -b)), ERROR_NONE
+		}
+	case .And, .Or, .Is, .Is_Not:
 	}
 	return {}, errf(.Internal, "unknown binary operator")
 }
@@ -4186,8 +4437,37 @@ eval_unary :: proc(op: Unary_Op, operand: Value) -> (Value, Error) {
 	case .Not:
 		if operand.kind == .Null do return value_null(), ERROR_NONE
 		return value_bool(!value_is_truthy(operand)), ERROR_NONE
+	case .Bit_Not:
+		if operand.kind == .Null do return value_null(), ERROR_NONE
+		v, ok := value_bit_operand(operand)
+		if !ok do return {}, errf(.Invalid_Type, "~ needs an integer")
+		return value_int(~v), ERROR_NONE
 	}
 	return {}, errf(.Internal, "unknown unary operator")
+}
+
+// value_bit_operand converts an operand of a bitwise operator to the 64-bit
+// integer SQLite works on: a real is truncated, numeric text is read as a
+// number (text that is not a number is 0), and a blob is not an integer.
+@(private)
+value_bit_operand :: proc(v: Value) -> (i64, bool) {
+	if v.kind == .String {
+		parsed, ok := value_parse_number(strings.trim_space(v.s))
+		if !ok do return 0, true
+		return value_to_i64(parsed)
+	}
+	if !value_is_numeric(v) do return 0, false
+	return value_to_i64(v)
+}
+
+// bit_shift moves `a` left by `count` bits (right when negative); a count of 64
+// or more empties it, keeping the sign on a right shift as SQLite does.
+@(private)
+bit_shift :: proc(a: i64, count: i64) -> i64 {
+	if count >= 64 do return 0
+	if count <= -64 do return a < 0 ? -1 : 0
+	if count >= 0 do return i64(u64(a) << u64(count))
+	return a >> u64(-count)
 }
 
 @(private)
@@ -4581,7 +4861,9 @@ eval_case :: proc(ctx: ^Eval_Ctx, e: Case_Expr) -> (Value, Error) {
 }
 
 eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
-
+	// A row value is taken apart by the comparison that holds it; reaching it
+	// here means it stands alone, which SQLite refuses with the same words.
+	if call.name == ROW_VALUE_CALL do return {}, errf(.Sql_Syntax, "row value misused")
 	if scalar_minmax(call) {
 		return eval_scalar_minmax(ctx, call)
 	}
@@ -5580,8 +5862,18 @@ sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Res
 			return {}, apply_err
 		}
 		// The stored row is already coerced, so the CHECK predicate sees the
-		// values the table would hold.
+		// values the table would hold. Under OR FAIL a row is its own unit: if it
+		// fails, what it staged (a trigger's work included) is taken back and the
+		// rows before it stay.
+		row_mark := stmt.conflict_fail ? tx_statement_begin(tx) : 0
 		row_id, insert_err := tx_insert(tx, stmt.table, values)
+		if stmt.conflict_fail do tx_statement_end(tx, row_mark, insert_err.kind != .None)
+		if insert_err.kind != .None && stmt.conflict_ignore && conflict_skippable(insert_err.kind) {
+			// INSERT OR IGNORE: the row breaks a constraint by itself and is skipped;
+			// nothing of it was staged.
+			error_free(&insert_err)
+			continue
+		}
 		if insert_err.kind == .None {
 			if fts_err := fts_index_if_virtual(tx, stmt.table, row_id, values, true); fts_err.kind != .None {
 				return {}, fts_err
@@ -6108,7 +6400,15 @@ sql_exec_create_table :: proc(tx: ^Tx, stmt: Create_Table_Stmt, params: []Value)
 		if column.auto_increment {
 			schema.auto_increment_column = i
 		}
-		if definition.default != nil {
+		if definition.default != nil && expr_calls_a_function(definition.default) && len(definition.default_sql) > 0 {
+			// A default that calls a function (CURRENT_TIMESTAMP, random(), …)
+			// is evaluated for each row, as SQLite does, not once now. Parse it
+			// here so a bad one is refused when the table is created.
+			check_query, _, check_err := sql_parse_expression(definition.default_sql)
+			if check_err.kind != .None do return {}, check_err
+			query_destroy(&check_query)
+			column.default_sql = strings.clone(definition.default_sql, tx.alloc)
+		} else if definition.default != nil {
 			value, eval_err := eval_expr(
 				&Eval_Ctx{params = params, now_us = now_microseconds()},
 				definition.default,
@@ -6128,9 +6428,26 @@ sql_exec_create_table :: proc(tx: ^Tx, stmt: Create_Table_Stmt, params: []Value)
 		schema.primary_key = pk
 	}
 
+	checks := make([dynamic]Check_Constraint, 0, 0, tx.alloc)
+	for definition in stmt.columns {
+		for check in definition.checks do append(&checks, check)
+	}
+	for constraint in stmt.constraints {
+		if constraint.is_check do append(&checks, Check_Constraint{name = constraint.name, sql = constraint.check_sql})
+	}
+	for check, i in checks {
+		// Parsed now so a malformed CHECK is refused with the table.
+		check_query, _, check_err := sql_parse_expression(check.sql)
+		if check_err.kind != .None do return {}, check_err
+		query_destroy(&check_query)
+		checks[i] = Check_Constraint{name = strings.clone(check.name, tx.alloc), sql = strings.clone(check.sql, tx.alloc), column = strings.clone(check.column, tx.alloc)}
+	}
+	schema.checks = checks[:]
+
 	indexes := make([dynamic]Index_Schema, 0, len(stmt.constraints), tx.alloc)
 	foreign_keys := make([dynamic]Foreign_Key, 0, len(stmt.constraints), tx.alloc)
 	for constraint in stmt.constraints {
+		if constraint.is_check do continue
 		positions := make([]int, len(constraint.columns), tx.alloc)
 		for name, i in constraint.columns {
 			position, found := schema_column_index(&schema, name)
@@ -6141,28 +6458,45 @@ sql_exec_create_table :: proc(tx: ^Tx, stmt: Create_Table_Stmt, params: []Value)
 		}
 		if constraint.is_foreign {
 			// Resolve the referenced columns against the parent schema, which
-			// must already exist and key the columns uniquely.
-			parent, parent_err := tx_table(tx, constraint.ref_table)
-			if parent_err.kind != .None {
-				return {}, errf(
-					.Table_Not_Found,
-					"foreign key %s references missing table %s",
-					stmt.name,
-					constraint.ref_table,
-				)
+			// must already exist and key the columns uniquely. A table may
+			// reference itself, before it exists.
+			parent_schema: ^Table_Schema
+			if strings.equal_fold(constraint.ref_table, stmt.name) {
+				parent_schema = &schema
+			} else {
+				parent, parent_err := tx_table(tx, constraint.ref_table)
+				if parent_err.kind != .None {
+					return {}, errf(
+						.Table_Not_Found,
+						"foreign key %s references missing table %s",
+						stmt.name,
+						constraint.ref_table,
+					)
+				}
+				parent_schema = &parent.schema
 			}
-			if len(constraint.ref_columns) != len(positions) {
+			ref_names := constraint.ref_columns
+			if len(ref_names) == 0 {
+				// `REFERENCES parent` with no columns names the parent's primary key.
+				if len(parent_schema.primary_key) == 0 {
+					return {}, errf(.Invalid_Argument, "foreign key on %s references %s, which has no primary key", stmt.name, constraint.ref_table)
+				}
+				names := make([]string, len(parent_schema.primary_key), tx.alloc)
+				for position, i in parent_schema.primary_key do names[i] = parent_schema.columns[position].name
+				ref_names = names
+			}
+			if len(ref_names) != len(positions) {
 				return {}, errf(
 					.Invalid_Argument,
 					"foreign key on %s lists %d columns but references %d",
 					stmt.name,
 					len(positions),
-					len(constraint.ref_columns),
+					len(ref_names),
 				)
 			}
-			ref_positions := make([]int, len(constraint.ref_columns), tx.alloc)
-			for name, i in constraint.ref_columns {
-				position, found := schema_column_index(&parent.schema, name)
+			ref_positions := make([]int, len(ref_names), tx.alloc)
+			for name, i in ref_names {
+				position, found := schema_column_index(parent_schema, name)
 				if !found {
 					return {}, errf(
 						.Column_Not_Found,
@@ -6173,7 +6507,7 @@ sql_exec_create_table :: proc(tx: ^Tx, stmt: Create_Table_Stmt, params: []Value)
 				}
 				ref_positions[i] = position
 			}
-			if !schema_columns_unique(&parent.schema, ref_positions) {
+			if !schema_columns_unique(parent_schema, ref_positions) {
 				return {}, errf(
 					.Invalid_Argument,
 					"foreign key on %s must reference a unique key of %s",
@@ -6196,6 +6530,7 @@ sql_exec_create_table :: proc(tx: ^Tx, stmt: Create_Table_Stmt, params: []Value)
 					ref_columns = ref_positions,
 					on_delete = constraint.on_delete,
 					on_update = constraint.on_update,
+					deferred = constraint.deferred,
 				},
 			)
 			continue
@@ -6569,6 +6904,7 @@ index_order_for :: proc(
 	direction := stmt.order_by[0].descending
 	for item in stmt.order_by {
 		if item.descending != direction do return index, false, false
+		if item.nulls != .Default do return index, false, false
 	}
 	for &candidate, position in table.indexes {
 		if candidate.pages != nil do continue
@@ -6927,6 +7263,95 @@ value_compare_collated :: proc(
 
 // Generated_Plan holds the parsed expressions of a table's generated columns.
 // It is built once per statement so a row only evaluates them.
+// expr_calls_a_function reports whether an expression contains a function call,
+// which makes a DEFAULT per-row rather than constant.
+@(private)
+expr_calls_a_function :: proc(e: ^Expr) -> bool {
+	found := false
+	expr_walk(e, proc(node: ^Expr, user: rawptr) -> bool {
+		if _, is_call := node^.(Call_Expr); is_call do (^bool)(user)^ = true
+		return true
+	}, &found)
+	return found
+}
+
+// store_expression parses an expression the engine evaluates per row (a CHECK,
+// a per-row DEFAULT) once and keeps it for the life of the store: text that
+// arrived with the schema is re-read on every write otherwise.
+@(private)
+store_expression :: proc(store: ^Store, text: string) -> (^Expr, Error) {
+	sync.mutex_lock(&store.expr_cache_mutex)
+	defer sync.mutex_unlock(&store.expr_cache_mutex)
+	if cached, ok := store.expr_cache[text]; ok do return cached.expr, ERROR_NONE
+	query, expr, err := sql_parse_expression(text)
+	if err.kind != .None do return nil, err
+	entry := new(Cached_Expression)
+	entry.query = query
+	entry.expr = expr
+	store.expr_cache[strings.clone(text)] = entry
+	return expr, ERROR_NONE
+}
+
+// checks_enforce evaluates a table's CHECK constraints against a row about to be
+// written. NULL passes and false refuses, as in SQL.
+checks_enforce :: proc(tx: ^Tx, table: ^Table, values: []Value) -> Error {
+	if len(table.schema.checks) == 0 do return ERROR_NONE
+	sources: [1]Source
+	sources[0] = Source{table = table, row = Row{values = values}}
+	ctx := Eval_Ctx{tx = tx, sources = sources[:], now_us = now_microseconds()}
+	for check in table.schema.checks {
+		expr, parse_err := store_expression(tx.store, check.sql)
+		if parse_err.kind != .None do return parse_err
+		value, eval_err := eval_expr(&ctx, expr)
+		if eval_err.kind != .None do return eval_err
+		if value.kind == .Null || value_is_truthy(value) do continue
+		label := len(check.name) > 0 ? check.name : check.sql
+		return errf(.Check_Violation, "CHECK constraint failed: %s", label)
+	}
+	return ERROR_NONE
+}
+
+// checks_use_column reports whether a CHECK constraint of the schema names the
+// column, which an ALTER that drops or renames it has to respect.
+checks_use_column :: proc(schema: ^Table_Schema, column: string, skip_own := false) -> bool {
+	Probe :: struct {
+		column: string,
+		found:  bool,
+	}
+	for check in schema.checks {
+		// A column's own CHECK goes with it when the column is dropped.
+		if skip_own && strings.equal_fold(check.column, column) do continue
+		query, expr, err := sql_parse_expression(check.sql)
+		if err.kind != .None {
+			error_free(&err)
+			continue
+		}
+		probe := Probe{column = column}
+		expr_walk(expr, proc(node: ^Expr, user: rawptr) -> bool {
+			probe := (^Probe)(user)
+			if reference, ok := node^.(Column_Expr); ok && strings.equal_fold(reference.name, probe.column) {
+				probe.found = true
+			}
+			return true
+		}, &probe)
+		query_destroy(&query)
+		if probe.found do return true
+	}
+	return false
+}
+
+// column_default_for_row gives a column's default for one row: a per-row DEFAULT
+// is evaluated now, a constant one is the stored value.
+column_default_for_row :: proc(tx: ^Tx, column: Column) -> (Value, Error) {
+	if len(column.default_sql) == 0 do return column_default(column), ERROR_NONE
+	expr, parse_err := store_expression(tx.store, column.default_sql)
+	if parse_err.kind != .None do return {}, parse_err
+	ctx := Eval_Ctx{tx = tx, now_us = now_microseconds()}
+	value, eval_err := eval_expr(&ctx, expr)
+	if eval_err.kind != .None do return {}, eval_err
+	return value_clone(value, tx.alloc), ERROR_NONE
+}
+
 Generated_Plan :: struct {
 	columns: [dynamic]int,
 	queries: [dynamic]Query,

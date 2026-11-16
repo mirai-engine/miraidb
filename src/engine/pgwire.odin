@@ -184,6 +184,8 @@ pg_sqlstate :: proc(kind: Error_Kind) -> string {
 		return "23505" // unique_violation
 	case .Not_Null_Violation:
 		return "23502" // not_null_violation
+	case .Check_Violation:
+		return "23514" // check_violation
 	case .Invalid_Type:
 		return "42804" // datatype_mismatch
 	case .Invalid_Argument:

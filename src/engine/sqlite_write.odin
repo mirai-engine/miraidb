@@ -645,6 +645,12 @@ sqlite_master_sql :: proc(table: ^Table) -> string {
 		if column.not_null || sqlite_column_is_key(&table.schema, i) {
 			strings.write_string(&builder, " NOT NULL")
 		}
+		// A per-row default is SQL text SQLite evaluates the same way.
+		if len(column.default_sql) > 0 {
+			strings.write_string(&builder, " DEFAULT (")
+			strings.write_string(&builder, column.default_sql)
+			strings.write_byte(&builder, ')')
+		}
 	}
 	// The key is declared inline, as SQLite declares it, and its index is written
 	// as the automatic index a declaration implies (see the index loop). A text
@@ -657,6 +663,18 @@ sqlite_master_sql :: proc(table: ^Table) -> string {
 			if i > 0 do strings.write_string(&builder, ", ")
 			sqlite_write_ident(&builder, table.schema.columns[position].name)
 		}
+		strings.write_byte(&builder, ')')
+	}
+	// CHECK constraints travel as written, so SQLite keeps enforcing them.
+	for check in table.schema.checks {
+		strings.write_string(&builder, ", ")
+		if len(check.name) > 0 {
+			strings.write_string(&builder, "CONSTRAINT ")
+			sqlite_write_ident(&builder, check.name)
+			strings.write_byte(&builder, ' ')
+		}
+		strings.write_string(&builder, "CHECK (")
+		strings.write_string(&builder, check.sql)
 		strings.write_byte(&builder, ')')
 	}
 	strings.write_string(&builder, ")")
@@ -770,7 +788,7 @@ sqlite_file_write :: proc(store: ^Store, path: string, alloc := context.allocato
 			master[4] = value_string(sqlite_master_sql(table))
 			if imported && original.has_rules {
 				loss := fmt.aprintf(
-					"%s was rebuilt from the engine's model, which does not hold REFERENCES, UNIQUE, CHECK, DEFAULT, COLLATE or a generated column",
+					"%s was rebuilt from the engine's model, which does not hold REFERENCES, UNIQUE, a constant DEFAULT, COLLATE or a generated column",
 					table.schema.name,
 				)
 				append(&store.mirror_losses, loss)

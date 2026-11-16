@@ -20,12 +20,23 @@ Binary_Op :: enum u8 {
 	And,
 	Or,
 	Concat,
+	// Is and Is_Not compare with NULL as an ordinary value: `NULL IS NULL` is true
+	// and `1 IS NOT NULL` is true, where `=` would answer NULL. `IS [NOT] DISTINCT
+	// FROM` parses to them.
+	Is,
+	Is_Not,
+	// The bitwise operators work on 64-bit integers, as SQLite's do.
+	Bit_And,
+	Bit_Or,
+	Shift_Left,
+	Shift_Right,
 }
 
 Unary_Op :: enum u8 {
 	Neg,
 	Plus,
 	Not,
+	Bit_Not,
 }
 
 // MAX_EXPRESSION_DEPTH bounds how deeply an expression may nest. Parsing and
@@ -221,9 +232,18 @@ Select_Item :: struct {
 	star:  bool,
 }
 
+// Nulls_Order is an explicit NULLS FIRST / NULLS LAST. Without one NULL sorts as
+// the smallest value: first ascending, last descending, as in SQLite.
+Nulls_Order :: enum u8 {
+	Default,
+	First,
+	Last,
+}
+
 Order_Item :: struct {
 	expr:       ^Expr,
 	descending: bool,
+	nulls:      Nulls_Order,
 }
 
 Table_Ref :: struct {
@@ -236,6 +256,9 @@ Table_Ref :: struct {
 	// as_of is `FROM t AS OF <seq>`: read the rows as they were at that commit.
 	// The scan then uses the versions the table keeps instead of the live rows.
 	as_of: ^Expr,
+	// subquery is a derived table, `FROM (SELECT …) AS name` or `FROM (VALUES …)`:
+	// it is materialized under `name` before the statement reads it.
+	subquery: ^Select_Stmt,
 }
 
 // Join_Clause chains one table onto the query. `left` turns the inner join into
@@ -266,9 +289,19 @@ Select_Stmt :: struct {
 	compound:    []Compound_Select,
 }
 
-// Compound_Select is one term of a compound query. `all` keeps duplicates.
+// Compound_Op joins a term to everything before it, left to right.
+Compound_Op :: enum u8 {
+	Union,
+	Union_All,
+	Intersect,
+	Except,
+}
+
+// Compound_Select is one term of a compound query and the operator that joins
+// it to the terms before it. `all` is set for UNION ALL.
 Compound_Select :: struct {
 	all:         bool,
+	op:          Compound_Op,
 	select_stmt: Select_Stmt,
 }
 
@@ -285,6 +318,13 @@ Insert_Stmt :: struct {
 	conflict_assignments: []Assignment,
 	// INSERT OR REPLACE: the rows the new one collides with are deleted first.
 	conflict_replace: bool,
+	// INSERT OR IGNORE skips a row that breaks a UNIQUE, PRIMARY KEY, NOT NULL or
+	// CHECK constraint. OR FAIL stops at that row and keeps the rows before it.
+	// OR ROLLBACK also ends the transaction, which is only possible when the
+	// statement owns it.
+	conflict_ignore:   bool,
+	conflict_fail:     bool,
+	conflict_rollback: bool,
 }
 
 // Returning lists the rows a mutation reports back: every column with `*`, or
@@ -335,6 +375,11 @@ Column_Def :: struct {
 	generated:     bool,
 	generated_sql: string,
 	default:  ^Expr,
+	// default_sql is the DEFAULT's text, kept for a default that has to be
+	// evaluated per row (one that calls a function, like CURRENT_TIMESTAMP).
+	default_sql: string,
+	// checks are the column's CHECK clauses.
+	checks: []Check_Constraint,
 }
 
 // Table_Constraint is a table-level PRIMARY KEY or UNIQUE clause. Columns are
@@ -349,6 +394,10 @@ Table_Constraint :: struct {
 	ref_columns: []string,
 	on_delete:   Foreign_Key_Action,
 	on_update:   Foreign_Key_Action,
+	deferred:    bool,
+	// A table-level CHECK uses check_sql instead of columns.
+	is_check:    bool,
+	check_sql:   string,
 }
 
 Create_Type_Stmt :: struct {

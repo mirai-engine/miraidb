@@ -996,7 +996,13 @@ repl :: proc(store: ^db.Store) {
 			}
 			err := db.tx_commit(session)
 			session = nil
-			if !db.error_ok(err) do fail(err)
+			if !db.error_ok(err) {
+				// The transaction is rolled back (a deferred foreign key it broke, for
+				// one); the session goes on, as SQLite's shell does.
+				fmt.eprintfln("error: %s", err.message)
+				db.error_free(&err)
+				continue
+			}
 			fmt.println("commit")
 			continue
 		}
