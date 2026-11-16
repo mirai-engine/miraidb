@@ -475,6 +475,46 @@ def main() -> int:
     assert not empty.value, "a comment-only text prepares no statement"
     assert lib.sqlite3_close(tail_db) == OK
 
+    # F1: exec runs the callback once per row, over every statement in the text,
+    # with NULL as a NULL pointer, and a non-zero answer stops it. Before this the
+    # callback was discarded, so a caller that read rows through exec -- the
+    # shell, a loader -- was told OK and given nothing.
+    CALLBACK = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_int,
+                                ctypes.POINTER(ctypes.c_char_p),
+                                ctypes.POINTER(ctypes.c_char_p))
+    seen_rows = []
+
+    @CALLBACK
+    def collect(arg, count, values, names):
+        seen_rows.append(tuple(values[i] for i in range(count)))
+        return 0
+
+    exec_db = ctypes.c_void_p()
+    assert lib.sqlite3_open(b":memory:", ctypes.byref(exec_db)) == OK
+    script = (b"CREATE TABLE ex (a INTEGER, b TEXT);"
+              b"INSERT INTO ex VALUES (1, 'x');"
+              b"INSERT INTO ex VALUES (2, 'y')")
+    assert lib.sqlite3_exec(exec_db, script, ctypes.cast(collect, ctypes.c_void_p), None, None) == OK
+    assert seen_rows == [], "the inserts produce no row"
+    assert lib.sqlite3_exec(exec_db, b"SELECT a, b FROM ex ORDER BY a",
+                            ctypes.cast(collect, ctypes.c_void_p), None, None) == OK
+    assert seen_rows == [(b"1", b"x"), (b"2", b"y")], seen_rows
+
+    seen_rows.clear()
+    assert lib.sqlite3_exec(exec_db, b"SELECT NULL, 3, 'z'", ctypes.cast(collect, ctypes.c_void_p), None, None) == OK
+    assert seen_rows == [(None, b"3", b"z")], seen_rows
+
+    stopped = []
+
+    @CALLBACK
+    def stop(arg, count, values, names):
+        stopped.append(values[0])
+        return 1
+
+    assert lib.sqlite3_exec(exec_db, b"SELECT a FROM ex", ctypes.cast(stop, ctypes.c_void_p), None, None) == OK
+    assert stopped == [b"1"], stopped
+    assert lib.sqlite3_close(exec_db) == OK
+
     print("rows:", rows)
     print("error path:", message)
     print("blob io:", blobs_ok)

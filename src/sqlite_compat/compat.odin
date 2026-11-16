@@ -446,19 +446,86 @@ sqlite3_total_changes :: proc "c" (handle: rawptr) -> c.int {
 	return sqlite3_changes(handle)
 }
 
+// Exec_Callback is the function sqlite3_exec calls once per row: the values in
+// their text form, NULL as a NULL pointer, and the column names.
+Exec_Callback :: #type proc "c" (
+	arg: rawptr,
+	count: c.int,
+	values: [^]cstring,
+	names: [^]cstring,
+) -> c.int
+
+// exec_with_callback runs one statement and calls back once per row. This is the
+// contract sqlite3_exec exists for: the shell's .dump, a bulk loader, anything
+// that reads rows without preparing a statement. A non-zero answer from the
+// callback stops the statement, as SQLite documents.
+@(private)
+exec_with_callback :: proc(db: ^Database, sql: string, callback: Exec_Callback, arg: rawptr) -> c.int {
+	stmt := engine.embed_prepare(db.conn, sql)
+	if stmt == nil do return fail_connection(db)
+	defer engine.embed_finalize(stmt)
+	count := engine.embed_column_count(stmt)
+	names := make([]cstring, count, context.allocator)
+	defer {
+		for name in names do if name != nil do delete(name)
+		delete(names)
+	}
+	for i in 0 ..< count {
+		names[i] = strings.clone_to_cstring(engine.embed_column_name(stmt, i), context.allocator)
+	}
+	values := make([]cstring, count, context.allocator)
+	defer delete(values)
+	for {
+		for i in 0 ..< count {
+			if values[i] != nil {
+				delete(values[i])
+				values[i] = nil
+			}
+		}
+		has_row, step_err := engine.embed_step(stmt)
+		if step_err.kind != .None do return fail(db, step_err)
+		if !has_row do break
+		for i in 0 ..< count {
+			value, ok := engine.embed_column_value(stmt, i)
+			if !ok || value.kind == .Null do continue
+			rendered := engine.sqlite_value_text(value, context.allocator)
+			values[i] = strings.clone_to_cstring(rendered, context.allocator)
+			delete(rendered)
+		}
+		if callback(arg, c.int(count), raw_data(values), raw_data(names)) != 0 do break
+	}
+	return SQLITE_OK
+}
+
 @(export)
 sqlite3_exec :: proc "c" (handle: rawptr, sql: cstring, callback: rawptr, arg: rawptr, errmsg: ^cstring) -> c.int {
 	context = runtime.default_context()
-	context = runtime.default_context()
-	_ = callback
-	_ = arg
 	if errmsg != nil do errmsg^ = nil
 	db := db_of(handle)
 	if db == nil || sql == nil do return SQLITE_MISUSE
-	if err := engine.embed_exec(db.conn, string(sql)); err.kind != .None {
-		return fail(db, err)
+	// The text may hold several statements, which is what every caller of exec
+	// passes: each one runs, and the first failure stops the rest.
+	remaining := string(sql)
+	for len(remaining) > 0 {
+		end := statement_end(remaining)
+		if end <= 0 do break
+		statement := strings.trim_space(remaining[:end])
+		remaining = remaining[end:]
+		if !only_space_or_comments(statement) {
+			code: c.int
+			if callback != nil {
+				code = exec_with_callback(db, statement, transmute(Exec_Callback)callback, arg)
+			} else if err := engine.embed_exec(db.conn, statement); err.kind != .None {
+				code = fail(db, err)
+			}
+			if code != SQLITE_OK {
+				if errmsg != nil && len(db.last_error) > 0 do errmsg^ = cstring(raw_data(db.last_error))
+				return code
+			}
+			db.last_code = SQLITE_OK
+			db.last_extended = SQLITE_OK
+		}
 	}
-	db.last_code = SQLITE_OK
 	return SQLITE_OK
 }
 
