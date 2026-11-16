@@ -221,6 +221,30 @@ attach a collation of its own: comparisons, `ORDER BY`, unique keys and index
 probes all fold the text the same way, so `name TEXT COLLATE NOCASE UNIQUE`
 rejects `ALICE` beside `Alice` and `WHERE name = 'ALICE'` still uses the index.
 
+A program can also register a comparison of its own (`store_register_collation` in
+the engine, `miraidb_create_collation` from C) and name it the same way:
+
+```sql
+SELECT count(*) FROM people WHERE name = 'Søren' COLLATE spanish;
+```
+
+The callback answers negative, zero or positive, and it is asked wherever a
+comparison happens: `WHERE`, `ON`, `HAVING`, `CASE` and the comparison an `IS` or a
+`BETWEEN` makes. A name nobody registered is an error (`no such collation: x`),
+as it is in SQLite, instead of quietly comparing bytes.
+
+A host comparison has no **folded form**: two texts can compare equal and still
+differ byte for byte, and this engine orders, groups and indexes by a key it folds
+from the text (`NOCASE` lowercases it, `RTRIM` trims it). So `ORDER BY`, `GROUP BY`,
+`DISTINCT`, a window's `PARTITION BY`/`ORDER BY`, an index and a column declaration
+all refuse a host collation with `collation x cannot order, group or key`, naming
+the reason. Refusing beats answering in the wrong order: `ORDER BY name COLLATE
+spanish` would sort by bytes while `WHERE … COLLATE spanish` compared differently.
+
+The three built-in names are reserved and cannot be replaced. Registrations belong
+to the process - one connection's C registrations are dropped when it closes - and
+nothing about them is written to the database.
+
 ## Expressions
 
 - Literals: numbers (`42`, `-1.5`, `1e9`), strings (`'text'`, `''` escapes a

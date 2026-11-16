@@ -366,6 +366,42 @@ def main() -> int:
     assert lib.miraidb_create_function(db, b"twice", -1, twice, None) == OK
     assert lib.miraidb_exec(db, b"SELECT twice(1, 2)") == OK, lib.miraidb_errmsg(db)
 
+    # A collation registered from C decides when two texts are equal, and SQL names
+    # it with COLLATE. Two texts compare by length first, then by bytes, so 'ab' and
+    # 'xy' are different, 'ab' < 'abc', and equality is exact.
+    COLLATION = ctypes.CFUNCTYPE(
+        ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
+        ctypes.c_void_p, ctypes.c_int,
+    )
+
+    @COLLATION
+    def by_length(user, a, a_length, b, b_length):
+        left = ctypes.string_at(a, a_length) if a_length else b""
+        right = ctypes.string_at(b, b_length) if b_length else b""
+        if len(left) != len(right):
+            return -1 if len(left) < len(right) else 1
+        return (left > right) - (left < right)
+
+    lib.miraidb_create_collation.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, COLLATION, ctypes.c_void_p,
+    ]
+    lib.miraidb_unregister_collation.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    lib.miraidb_unregister_collation.restype = ctypes.c_int
+    assert lib.miraidb_create_collation(db, b"by_length", by_length, None) == OK
+    assert lib.miraidb_create_collation(db, b"by_length", COLLATION(), None) == ERROR, "a collation needs a callback"
+    assert lib.miraidb_create_collation(db, b"nocase", by_length, None) == ERROR, "the builtins are reserved"
+    assert lib.miraidb_exec(db, b"CREATE TABLE coll (name TEXT)") == OK
+    assert lib.miraidb_exec(db, b"INSERT INTO coll (name) VALUES ('ab'), ('abc'), ('xy')") == OK
+    assert scalar(lib, db, b"SELECT count(*) FROM coll WHERE name < 'abc' COLLATE by_length") == 2
+    assert scalar(lib, db, b"SELECT count(*) FROM coll WHERE name = 'ab' COLLATE by_length") == 1
+    # A host comparison cannot be folded into a key, so the ordering is refused
+    # rather than answered in the wrong order.
+    assert lib.miraidb_exec(db, b"SELECT name FROM coll ORDER BY name COLLATE by_length") == ERROR
+    assert "cannot order" in lib.miraidb_errmsg(db).decode(), lib.miraidb_errmsg(db)
+    assert lib.miraidb_unregister_collation(db, b"by_length") == OK
+    assert lib.miraidb_unregister_collation(db, b"by_length") == ERROR, "already gone"
+    assert lib.miraidb_exec(db, b"SELECT 1 WHERE 'a' = 'a' COLLATE by_length") == ERROR, "an unknown name is refused"
+
     # The error path reports a message instead of crashing.
     assert lib.miraidb_exec(db, b"SELECT * FROM missing") == ERROR
     message = lib.miraidb_errmsg(db).decode()

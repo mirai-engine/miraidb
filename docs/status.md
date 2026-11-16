@@ -146,7 +146,7 @@ the gaps are named rather than left to be discovered.
   `linux_arm64` and `darwin_arm64`. The POSIX lock is the reason it is checked:
   it carried a missing `core:sys/posix` import and two wrong integer types until
   this round, so the code that a Linux build would run had never been compiled.
-- 263 integration tests covering CRUD, recovery, constraints, transactions,
+- 264 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
@@ -420,6 +420,15 @@ than 1000 bytes cannot be indexed and the insert says so.
   what it needs, and the CLI prunes after every statement because it keeps no
   history: `INSERT OR REPLACE` repeated 2 000 times went from 1.6 KiB to 1.2 KiB
   per statement (`test_prune_history_respects_a_pin`).
+- **A collation can come from the program.** `store_register_collation` (and
+  `miraidb_create_collation`) registers a comparison, and `COLLATE <name>` asks it
+  wherever a comparison happens: `WHERE`, `ON`, `HAVING`, `CASE`. The three
+  built-in names stay the engine's and cannot be replaced; an unknown name is now
+  refused (it used to fall back to `BINARY`, which answered a question nobody
+  asked). A host comparison has no folded form, so `ORDER BY`, `GROUP BY`,
+  `DISTINCT`, a window's own ordering and a column declaration refuse it with a
+  message instead of sorting by bytes while comparing differently
+  (`test_host_collations`).
 - **A window can sit inside a larger expression.** The executor fills the window
   into a hidden slot of the row and evaluates the projection afterwards, so
   `count(*) * 100.0 / sum(count(*)) OVER ()` answers, with or without `GROUP BY`.

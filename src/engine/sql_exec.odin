@@ -2518,6 +2518,9 @@ sql_exec_stream_select :: proc(
 
 sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Result, Error) {
 	if len(stmt.compound) > 0 do return sql_exec_compound(tx, stmt, params)
+	// A collation the statement cannot honour is refused before a row exists: an
+	// unknown name, or a host comparison where a folded key is required.
+	if guard_err := select_collation_guard(tx, stmt); guard_err.kind != .None do return {}, guard_err
 	// The planner may run the relations of a join in another order. The output
 	// order of `SELECT *` stays the written one (star_sources below reads the
 	// statement), so only what is executed moves.
@@ -3830,7 +3833,7 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 		if left_err.kind != .None do return {}, left_err
 		right, right_err := eval_expr(ctx, e.right)
 		if right_err.kind != .None do return {}, right_err
-		return eval_binary(e.op, left, right, collation)
+		return eval_binary(e.op, left, right, collation, ctx.tx != nil ? ctx.tx.store : nil)
 	case Unary_Expr:
 		operand, operand_err := eval_expr(ctx, e.operand)
 		if operand_err.kind != .None do return {}, operand_err
@@ -3954,7 +3957,13 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 	return {}, errf(.Internal, "unknown expression")
 }
 
-eval_binary :: proc(op: Binary_Op, left, right: Value, collation: string = "") -> (Value, Error) {
+eval_binary :: proc(
+	op: Binary_Op,
+	left: Value,
+	right: Value,
+	collation: string = "",
+	store: ^Store = nil,
+) -> (Value, Error) {
 	#partial switch op {
 	case .And:
 		if !value_is_null(left) && !value_is_truthy(left) do return value_bool(false), ERROR_NONE
@@ -3973,7 +3982,7 @@ eval_binary :: proc(op: Binary_Op, left, right: Value, collation: string = "") -
 	}
 	switch op {
 	case .Eq, .Ne, .Lt, .Le, .Gt, .Ge:
-		order, ok := value_compare_collated(left, right, collation)
+		order, ok := value_compare_collated(left, right, collation, store)
 		if !ok {
 			return {}, errf(
 				.Invalid_Type,
@@ -6038,6 +6047,18 @@ sql_exec_create_table :: proc(tx: ^Tx, stmt: Create_Table_Stmt, params: []Value)
 		collation := ""
 		if len(definition.collation) > 0 {
 			if !collation_known(definition.collation) {
+				// A registered host comparison cannot be a column's collation: the
+				// column's text is folded into the keys that index it and order it, and
+				// a host comparison has no fold. Comparing against it explicitly is fine.
+				if _, is_host := store_collation(tx.store, definition.collation); is_host {
+					return {}, errf(
+						.Sql_Unsupported,
+						"collation %s cannot be a column's collation on %s: it has no folded key to index or order by; use COLLATE %s in a comparison instead",
+						definition.collation,
+						definition.name,
+						definition.collation,
+					)
+				}
 				return {}, errf(
 					.Sql_Unsupported,
 					"unknown collation %s on column %s",
@@ -6869,20 +6890,20 @@ collate_name :: proc(expr: ^Expr) -> (string, bool) {
 	return "", false
 }
 
-// value_compare_collated applies an expression-level collation to text keys.
-// BINARY (the default) and unknown names fall back to the plain comparison.
+// value_compare_collated applies an expression-level collation to two texts. The
+// three built-in names fold the text into a byte comparison; a host comparison is
+// asked, which is the whole point of registering one. BINARY (the default) and an
+// empty name are the plain comparison, and a name nobody knows was refused before
+// the statement ran (collation_problem).
 @(private)
-value_compare_collated :: proc(a, b: Value, collation: string) -> (order: slice.Ordering, ok: bool) {
+value_compare_collated :: proc(
+	a, b: Value,
+	collation: string,
+	store: ^Store,
+) -> (order: slice.Ordering, ok: bool) {
 	if len(collation) > 0 && a.kind == .String && b.kind == .String {
-		if strings.equal_fold(collation, "nocase") {
-			left := strings.to_lower(a.s, context.temp_allocator)
-			right := strings.to_lower(b.s, context.temp_allocator)
-			return string_ordering(strings.compare(left, right)), true
-		}
-		if strings.equal_fold(collation, "rtrim") {
-			left := strings.trim_right(a.s, " ")
-			right := strings.trim_right(b.s, " ")
-			return string_ordering(strings.compare(left, right)), true
+		if compared, known := collation_compare(store, collation, a.s, b.s); known {
+			return string_ordering(compared), true
 		}
 	}
 	return value_compare(a, b)

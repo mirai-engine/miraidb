@@ -13001,3 +13001,88 @@ test_error_free_releases_the_message :: proc(t: ^testing.T) {
 	db.error_free(&nothing)
 	db.error_free(nil)
 }
+
+// A collation a host registers decides when two texts are equal, and SQL names it
+// with COLLATE. It is used where a comparison happens; where the engine folds the
+// text into a key it is refused with a message, because a host comparison has no
+// folded form and answering in the wrong order would be worse than not answering.
+@(private)
+collation_by_length :: proc(a, b: string, user: rawptr) -> int {
+	if len(a) != len(b) do return len(a) < len(b) ? -1 : 1
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	}
+	return 0
+}
+
+@(test)
+test_host_collations :: proc(t: ^testing.T) {
+	store := fresh_db(t, "host_collation")
+	if store == nil do return
+	defer cleanup_db(store, "host_collation")
+	run(t, store, "CREATE TABLE w (name TEXT)")
+
+	// A name nobody registered is refused, as SQLite refuses it: a comparison that
+	// falls back to BINARY answers a question nobody asked.
+	_, unknown := db.sql_execute(store, "SELECT 1 WHERE 'a' = 'a' COLLATE spanish")
+	testing.expect_value(t, unknown.kind, db.Error_Kind.Invalid_Argument)
+
+	testing.expect(t, db.error_ok(db.store_register_collation(store, "by_length", collation_by_length)))
+	testing.expect_value(t, db.store_collation_count(store), 1)
+	// The three built-in names belong to the engine.
+	reserved := db.store_register_collation(store, "NOCASE", collation_by_length)
+	testing.expect_value(t, reserved.kind, db.Error_Kind.Invalid_Argument)
+
+	run(t, store, "INSERT INTO w (name) VALUES ('ab'), ('abc'), ('xy'), ('abcd')")
+	// Equality and ordering ask the host comparison: 'ab' and 'xy' have the same
+	// length and are ordered by bytes, 'abc' is longer.
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM w WHERE name = 'ab' COLLATE by_length").i, i64(1))
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM w WHERE name < 'abc' COLLATE by_length").i, i64(2))
+	testing.expect(t, scalar(t, store, "SELECT 'ab' = 'xy' COLLATE by_length").b == false)
+	testing.expect(t, scalar(t, store, "SELECT 'ab' < 'xy' COLLATE by_length").b)
+	// HAVING and CASE ask it too, because they compare.
+	testing.expect_value(t, scalar(t, store, "SELECT CASE WHEN 'ab' = 'xy' COLLATE by_length THEN 1 ELSE 0 END").i, i64(0))
+	// One row per length: 2 ('ab', 'xy'), 3 ('abc'), 4 ('abcd'). Only the group of
+	// length 3 has a single row and a name that sorts before 'abcd' by the host
+	// comparison, so the HAVING clause keeps exactly one group.
+	having := run(
+		t,
+		store,
+		"SELECT length(name) AS n FROM w GROUP BY n HAVING count(*) = 1 AND min(name) < 'abcd' COLLATE by_length",
+	)
+	testing.expect_value(t, len(having.rows), 1)
+	testing.expect_value(t, having.rows[0][0].i, i64(3))
+
+	// Where a key is folded, the statement is refused instead of misordered.
+	for statement in ([]string {
+		"SELECT name FROM w ORDER BY name COLLATE by_length",
+		"SELECT name FROM w GROUP BY name COLLATE by_length",
+		"SELECT DISTINCT name COLLATE by_length FROM w",
+		"SELECT sum(length(name)) OVER (ORDER BY name COLLATE by_length) FROM w",
+	}) {
+		_, refused := db.sql_execute(store, statement)
+		testing.expectf(
+			t,
+			refused.kind == db.Error_Kind.Sql_Unsupported,
+			"%s should be refused, answered %s",
+			statement,
+			db.error_kind_name(refused.kind),
+		)
+	}
+	// A column cannot carry one either: its text is folded into every key.
+	_, column := db.sql_execute(store, "CREATE TABLE bad (x TEXT COLLATE by_length)")
+	testing.expect_value(t, column.kind, db.Error_Kind.Sql_Unsupported)
+
+	// The built-in names still fold: NOCASE matches 'ab' against 'AB', which the
+	// host comparison would not (same length, different bytes).
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM w WHERE name = 'AB' COLLATE nocase").i, i64(1))
+	testing.expect(t, scalar(t, store, "SELECT 'ab' = 'AB' COLLATE by_length").b == false)
+	// Dropping it unregisters it, and the name is unknown again.
+	testing.expect(t, db.store_unregister_collation(store, "By_Length"))
+	testing.expect_value(t, db.store_collation_count(store), 0)
+	_, gone := db.sql_execute(store, "SELECT 1 WHERE 'a' = 'a' COLLATE by_length")
+	testing.expect_value(t, gone.kind, db.Error_Kind.Invalid_Argument)
+}

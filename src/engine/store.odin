@@ -93,6 +93,9 @@ Store :: struct {
 	// functions are the host's scalar functions, keyed by their lowercased name.
 	// They live in this process, not in the log: a reopen starts without them.
 	functions:     map[string]Scalar_Function_Def,
+	// collations holds the host comparisons a program registered. It is process
+	// state, not database state: nothing about it is logged.
+	collations:    map[string]Collation_Def,
 	// cancelled asks the next row loop to stop. It is cooperative: a running
 	// statement checks it between rows, so the caller still owns the outcome.
 	cancelled:     bool,
@@ -270,6 +273,7 @@ store_open :: proc(path: string, options: Store_Options) -> (^Store, Error) {
 	store.attached = make(map[string]^Store)
 	store.variables = make(map[string]Value)
 	store.functions = make(map[string]Scalar_Function_Def)
+	store.collations = make(map[string]Collation_Def)
 	store.pinned_reads = make([dynamic]u64)
 	store.persistent = settings.persistent
 	store.vfs = settings.vfs
@@ -422,6 +426,8 @@ store_close :: proc(store: ^Store) {
 	delete(store.variables)
 	for name, _ in store.functions do delete(name)
 	delete(store.functions)
+	for name, _ in store.collations do delete(name)
+	delete(store.collations)
 	delete(store.pinned_reads)
 	stats_destroy(store)
 	log_close(&store.log)

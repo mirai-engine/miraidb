@@ -158,6 +158,35 @@ typedef int (*miraidb_function)(void *user, const miraidb_value *args, int argc,
 int miraidb_create_function(miraidb_conn db, const char *name, int arity,
                             miraidb_function callback, void *user);
 
+/* Collations. A program can decide when two texts are equal and which comes first,
+ * and SQL names that comparison with COLLATE:
+ *
+ *   static int by_length(void *user, const void *a, int a_len,
+ *                        const void *b, int b_len) {
+ *       if (a_len != b_len) return a_len < b_len ? -1 : 1;
+ *       return memcmp(a, b, a_len);           // 0 when they are equal
+ *   }
+ *   miraidb_create_collation(db, "by_length", by_length, NULL);
+ *   -- SELECT * FROM t WHERE name = 'abc' COLLATE by_length;
+ *
+ * The callback answers negative, zero or positive, and the byte ranges are valid
+ * only while it runs. BINARY, NOCASE and RTRIM are built in and cannot be replaced;
+ * registering a name again replaces the comparison. Registrations last until the
+ * connection closes and are not part of the database.
+ *
+ * A host comparison has no *folded* form: two texts can compare equal and still
+ * differ byte for byte, and the engine orders, groups and indexes by a key it folds
+ * from the text. So COLLATE with a host collation is accepted where a comparison
+ * happens - WHERE, ON, HAVING, CASE - and refused with a message in ORDER BY,
+ * GROUP BY, DISTINCT, an index and a column declaration, rather than answered in
+ * the wrong order. */
+typedef int (*miraidb_collation)(void *user, const void *a, int a_length,
+                                 const void *b, int b_length);
+
+int miraidb_create_collation(miraidb_conn db, const char *name,
+                             miraidb_collation callback, void *user);
+int miraidb_unregister_collation(miraidb_conn db, const char *name);
+
 /* Identity and credentials. Row policies filter by the identity the connection
  * carries. A connection that never set one carries the all-zero identity, so a
  * policy that compares against current_identity() matches no row until an

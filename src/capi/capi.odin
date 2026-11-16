@@ -70,6 +70,27 @@ Capi_Function :: struct {
 	user:     rawptr,
 }
 
+// Capi_Collation_Callback compares two texts and answers negative, zero or
+// positive. The byte ranges are valid for the duration of the call only.
+Capi_Collation_Callback :: #type proc "c" (
+	user:    rawptr,
+	a:       [^]u8,
+	a_length: c.int,
+	b:       [^]u8,
+	b_length: c.int,
+) -> c.int
+
+// Capi_Collation is one registered comparison. `block` is the heap block the two
+// slices point into, so the name the store cloned is independent of it.
+@(private)
+Capi_Collation :: struct {
+	callback: Capi_Collation_Callback,
+	user:     rawptr,
+	// name is the registration's key, owned here so a close can drop the entry
+	// before the trampoline it points at goes away.
+	name:     string,
+}
+
 Capi_Connection :: struct {
 	embed:   ^engine.Embed_Conn,
 	last:    string, // owned, NUL-terminated
@@ -78,8 +99,10 @@ Capi_Connection :: struct {
 	// close can make every one of them misuse instead of leaving them dangling.
 	statements: map[rawptr]^Capi_Statement,
 	// functions are the per-registration trampolines, freed with the connection:
-	// the store holds the user pointer they carry, not their lifetime.
-	functions: [dynamic]^Capi_Function,
+	// the store holds the user pointer they carry, not their lifetime. The same is
+	// true of `collations`, and closing the connection unregisters both.
+	functions:  [dynamic]^Capi_Function,
+	collations: [dynamic]^Capi_Collation,
 }
 
 Capi_Statement :: struct {
@@ -179,6 +202,14 @@ miraidb_close :: proc "c" (handle: rawptr) {
 	delete(keys)
 	for function in conn.functions do free(function)
 	delete(conn.functions)
+	// A comparison is dropped before its trampoline: the store would otherwise hold
+	// a user pointer into memory this close is about to free.
+	for collation in conn.collations {
+		engine.store_unregister_collation(conn.embed.store, collation.name)
+		delete(collation.name)
+		free(collation)
+	}
+	delete(conn.collations)
 	engine.handle_forget(rawptr(conn))
 	engine.embed_close(conn.embed)
 	delete(conn.last)
@@ -588,6 +619,82 @@ miraidb_create_function :: proc "c" (
 		return MIRAIDB_ERROR
 	}
 	append(&conn.functions, entry)
+	return MIRAIDB_OK
+}
+
+// capi_collation_call adapts a C comparison to the engine's. The engine hands it
+// two strings, which are valid while it compares them: the callback gets the bytes
+// and lengths, and a nil pointer for an empty text, which is what a C callback
+// expects for a zero length.
+@(private)
+capi_collation_call :: proc(a: string, b: string, user: rawptr) -> int {
+	collation := (^Capi_Collation)(user)
+	if collation == nil || collation.callback == nil do return 0
+	a_bytes: [^]u8
+	b_bytes: [^]u8
+	if len(a) > 0 do a_bytes = raw_data(a)
+	if len(b) > 0 do b_bytes = raw_data(b)
+	return int(
+		collation.callback(
+			collation.user,
+			a_bytes,
+			c.int(len(a)),
+			b_bytes,
+			c.int(len(b)),
+		),
+	)
+}
+
+// miraidb_create_collation registers a comparison SQL can name: `WHERE name =
+// 'x' COLLATE spanish`. The name is case-insensitive and cannot be one of the three
+// built in (BINARY, NOCASE, RTRIM), and registering the same name again replaces
+// it. A host comparison cannot fold a text into an index key, so a column
+// declaration, an index, an ORDER BY, GROUP BY or DISTINCT that names it is
+// refused with a message rather than answered in the wrong order. Registrations
+// last until the connection closes and are not part of the database.
+@(export)
+miraidb_create_collation :: proc "c" (
+	handle: rawptr,
+	name: cstring,
+	callback: Capi_Collation_Callback,
+	user: rawptr,
+) -> c.int {
+	context = runtime.default_context()
+	conn := capi_conn(handle)
+	if conn == nil do return MIRAIDB_MISUSE
+	if name == nil || callback == nil do return MIRAIDB_ERROR
+	entry := new(Capi_Collation)
+	entry.callback = callback
+	entry.user = user
+	entry.name = strings.clone(string(name))
+	err := engine.store_register_collation(conn.embed.store, string(name), capi_collation_call, rawptr(entry))
+	if err.kind != .None {
+		free(entry)
+		return MIRAIDB_ERROR
+	}
+	append(&conn.collations, entry)
+	return MIRAIDB_OK
+}
+
+// miraidb_unregister_collation drops one. It answers MIRAIDB_OK when one was
+// there and MIRAIDB_ERROR when the name was not registered.
+@(export)
+miraidb_unregister_collation :: proc "c" (handle: rawptr, name: cstring) -> c.int {
+	context = runtime.default_context()
+	conn := capi_conn(handle)
+	if conn == nil do return MIRAIDB_MISUSE
+	if name == nil do return MIRAIDB_ERROR
+	if !engine.store_unregister_collation(conn.embed.store, string(name)) do return MIRAIDB_ERROR
+	// The trampoline this name pointed at is ours to free, and dropping it twice
+	// would leak it: forget it here.
+	for collation, i in conn.collations {
+		if strings.equal_fold(collation.name, string(name)) {
+			unordered_remove(&conn.collations, i)
+			delete(collation.name)
+			free(collation)
+			break
+		}
+	}
 	return MIRAIDB_OK
 }
 
