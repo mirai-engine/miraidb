@@ -2,6 +2,16 @@
 
 ## 0.15
 
+- Partial and expression indexes (the last of roadmap S1 but `ON CONFLICT` on a
+  constraint): maintained, enforced when UNIQUE, persisted (index flag 4) and
+  written into an exported `.sqlite` file that `PRAGMA integrity_check` accepts.
+  The planner does not read them yet (D36). On the way: a UNIQUE column takes any
+  number of NULLs, as SQL says; `CREATE UNIQUE INDEX` over rows that share a key
+  is refused instead of silently dropping one from the index; `REPLACE` no
+  longer reports a row it did not insert; `lower`, `upper`, `replace`, `instr`,
+  `sign`, `sqrt` and `printf` give NULL for NULL; and an export writes constant
+  DEFAULTs.
+
 - SQLite's surface, roadmap S1 and S2 (grammar shapes measured by
   `scripts/sqlite_gaps.py`: 30 of 63 before, 47 now):
   - `CHECK` constraints (column and table, named or not, on every write path),

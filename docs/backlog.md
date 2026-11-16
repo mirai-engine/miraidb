@@ -33,7 +33,7 @@ Rules for this file:
 | R2 | every index entry is an encoded string | fixed-size keys where the column allows | M |
 | R3 | pruning walks every row of every table after each statement | prune what the commit touched | S |
 | R4 | a committed row is copied from the transaction arena to the table | hand the staged row over | M |
-| S1 | partial and expression indexes are refused (the rest landed) | the two index kinds | M |
+| S1 | `ON CONFLICT` on a constraint is refused; the rest landed | the constraint resolutions | S |
 | S2 | `UPDATE OR <resolution>` is refused; the rest landed | the UPDATE resolutions | S |
 | S3 | `RIGHT`, `FULL` and `NATURAL` joins are refused | the three joins | M |
 | S4 | `FILTER`, `WINDOW`, aggregate `ORDER BY`, ordered-set aggregates missing | the aggregate surface | M |
@@ -55,6 +55,7 @@ Rules for this file:
 | D23 | depth, row quota and budget are bounded | an allocation failure is a crash, not an error | M |
 | D24 | an index the engine cannot express is dropped on import | a counted skip, and a mirror fuzz pass | S |
 | D34 | the Linux suite crashes under the threaded runner; the sanitizer covers the Windows CLI, not the suite | find the corruption, run the suite sanitized on every platform | M |
+| D36 | a query never reads a partial or expression index | match a query's predicate to the index | M |
 | D35 | diagnostics: test-side leak lines, map nodes freed through the wrong allocator, error ownership | one sweep | M |
 
 ---
@@ -143,9 +144,25 @@ reads them from the file's declaration (`test_check_constraints`,
 `test_column_references_and_defaults`, `test_deferred_foreign_keys`,
 `scripts/shell_smoke.py`).
 
-**Now refused.** Partial indexes (`WHERE`), indexes over expressions, and
-`ON CONFLICT <resolution>` on a constraint. An import still leaves out an index
-of the first two kinds (D24), and still does not carry `REFERENCES`.
+Partial indexes (`WHERE`) and indexes over expressions, unique or not: a row
+outside a partial index is not constrained by it, a key is the expression's value
+(its `COLLATE` included), an expression that changes between evaluations
+(`random()`, `'now'`, a subquery) is refused as SQLite refuses it, and the export
+writes such an index's own entries so `PRAGMA integrity_check` passes and SQLite
+enforces it (`test_partial_and_expression_indexes`). Three wrong answers found on
+the way, fixed: `CREATE UNIQUE INDEX` over rows that already shared a key was
+accepted and the index lost a row, so a lookup by that key answered fewer rows
+than the table held; a UNIQUE column refused a second NULL, where SQL holds no
+two NULLs equal (`test_unique_allows_many_nulls`); and `REPLACE` that found no
+row to replace freed its error and reported a row it never inserted, which a
+column left to its DEFAULT made happen. `lower`, `upper`, `replace`, `instr`,
+`sign`, `sqrt` and `printf` give NULL for NULL instead of failing
+(`test_functions_give_null_for_null`). The export now writes constant DEFAULTs
+too.
+
+**Now refused.** `ON CONFLICT <resolution>` on a constraint. An import does not
+carry `REFERENCES` (a file may list a child before its parent). The planner does
+not read a partial or expression index yet (D36).
 
 **Why first.** A schema that uses any of them fails at `CREATE TABLE`, so
 nothing written against it runs; and an imported file whose index is partial or
@@ -438,6 +455,18 @@ macOS with `-sanitize:address`, the Windows suite runs under the sanitizer as a
 gate (it is the CLI only today), and the scripts that hardcode a
 `.exe` (`ci.py`, `page_rss.py`, `plan_check.py`, `bench.py`, `lock_smoke.py`,
 `broker_smoke.py`) find the binary on every platform.
+
+## D36 — The planner and partial or expression indexes
+
+**Now.** A partial or expression index is maintained and enforced, but the
+planner skips it: `index_is_plain` keeps it out of every probe, range and
+ordered walk, so a query answers from the rows and pays a scan where SQLite would
+read the index.
+
+**Done when.** A predicate that implies a partial index's WHERE (the same term,
+or a stronger bound) may read it, and an expression a query compares is matched
+to an index over the same expression text; `scripts/plan_check.py` gains both
+plans and the differential corpus keeps passing with the indexes present.
 
 ## D35 — Diagnostics
 

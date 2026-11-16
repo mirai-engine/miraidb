@@ -448,17 +448,27 @@ sqlite_write_index_tree :: proc(
 	alloc: mem.Allocator,
 ) -> int {
 	if len(index.columns) == 0 do return 0
-	keys := make([][]Value, len(rows), alloc)
+	keys := make([dynamic][]Value, 0, len(rows), alloc)
 	defer delete(keys)
-	for row, i in rows {
+	// A partial index holds only its rows, and an expression index the values of
+	// its expressions over the file's own values, which is what SQLite checks.
+	position, has_position := table_index_position(table, index.name)
+	plain := index_is_plain(index) || !has_position
+	for row in rows {
 		values := make([]Value, len(index.columns) + 1, alloc)
-		for column, position in index.columns {
-			if column >= 0 && column < len(row.values) do values[position] = row.values[column]
+		if plain {
+			for column, part in index.columns {
+				if column >= 0 && column < len(row.values) do values[part] = row.values[column]
+			}
+		} else {
+			if !index_row_included(table, position, row.values) do continue
+			parts := index_part_values(table, position, row.values, alloc)
+			copy(values, parts)
 		}
 		values[len(index.columns)] = value_int(row.rowid)
-		keys[i] = values
+		append(&keys, values)
 	}
-	slice.sort_by(keys, proc(a, b: []Value) -> bool {
+	slice.sort_by(keys[:], proc(a, b: []Value) -> bool {
 		for i in 0 ..< len(a) - 1 {
 			order, ok := value_compare(a[i], b[i])
 			if ok && order != .Equal do return order == .Less
@@ -598,11 +608,17 @@ sqlite_index_sql :: proc(table: ^Table, index: Index_Schema) -> string {
 	strings.write_string(&builder, " (")
 	for position, i in index.columns {
 		if i > 0 do strings.write_string(&builder, ", ")
-		if position >= 0 && position < len(table.schema.columns) {
+		if i < len(index.exprs) && len(index.exprs[i]) > 0 {
+			strings.write_string(&builder, index.exprs[i])
+		} else if position >= 0 && position < len(table.schema.columns) {
 			sqlite_write_ident(&builder, table.schema.columns[position].name)
 		}
 	}
 	strings.write_byte(&builder, ')')
+	if len(index.where_sql) > 0 {
+		strings.write_string(&builder, " WHERE ")
+		strings.write_string(&builder, index.where_sql)
+	}
 	return strings.to_string(builder)
 }
 
@@ -645,7 +661,17 @@ sqlite_master_sql :: proc(table: ^Table) -> string {
 		if column.not_null || sqlite_column_is_key(&table.schema, i) {
 			strings.write_string(&builder, " NOT NULL")
 		}
-		// A per-row default is SQL text SQLite evaluates the same way.
+		// A constant default is written as its literal, for the kinds SQLite
+		// spells the same way; a per-row one is SQL text SQLite evaluates alike.
+		if column.has_default && len(column.default_sql) == 0 {
+			#partial switch column.default_value.kind {
+			case .Int, .Uint, .Float, .String:
+				literal := value_sql_literal(column.default_value)
+				strings.write_string(&builder, " DEFAULT ")
+				strings.write_string(&builder, literal)
+				if column.default_value.kind == .String do delete(literal)
+			}
+		}
 		if len(column.default_sql) > 0 {
 			strings.write_string(&builder, " DEFAULT (")
 			strings.write_string(&builder, column.default_sql)
@@ -788,7 +814,7 @@ sqlite_file_write :: proc(store: ^Store, path: string, alloc := context.allocato
 			master[4] = value_string(sqlite_master_sql(table))
 			if imported && original.has_rules {
 				loss := fmt.aprintf(
-					"%s was rebuilt from the engine's model, which does not hold REFERENCES, UNIQUE, a constant DEFAULT, COLLATE or a generated column",
+					"%s was rebuilt from the engine's model, which does not hold REFERENCES, UNIQUE, COLLATE or a generated column",
 					table.schema.name,
 				)
 				append(&store.mirror_losses, loss)
