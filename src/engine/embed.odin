@@ -44,6 +44,11 @@ Embed_Conn :: struct {
 	store:      ^Store,
 	owns_store: bool,
 	last_error: Error,
+	// changes is the rows the most recent statement affected, whichever way it
+	// ran: through embed_exec or through a statement that reached its end. SQLite
+	// keeps one counter per connection for the same reason, so a caller can ask
+	// after an exec as well as after a step (F3).
+	changes:    int,
 }
 
 // embed_open opens the engine format, or imports a SQLite file into memory.
@@ -129,6 +134,7 @@ embed_exec :: proc(conn: ^Embed_Conn, sql: string) -> Error {
 	store_clear_cancel(conn.store)
 	result, exec_err := sql_execute(conn.store, sql)
 	if exec_err.kind != .None do return embed_fail(conn, exec_err)
+	conn.changes = result.affected
 	sql_result_destroy(&result)
 	embed_succeed(conn)
 	return ERROR_NONE
@@ -198,6 +204,7 @@ embed_exec_params :: proc(conn: ^Embed_Conn, sql: string, params: []Value) -> Er
 	store_clear_cancel(conn.store)
 	result, exec_err := sql_execute_params(conn.store, sql, params)
 	if exec_err.kind != .None do return embed_fail(conn, exec_err)
+	conn.changes = result.affected
 	sql_result_destroy(&result)
 	embed_succeed(conn)
 	return ERROR_NONE
@@ -357,10 +364,12 @@ embed_step :: proc(stmt: ^Embed_Statement) -> (has_row: bool, err: Error) {
 	}
 	if stmt.result.kind != .Rows {
 		stmt.done = true
+		stmt.conn.changes = stmt.result.affected
 		return false, ERROR_NONE
 	}
 	if stmt.row >= len(stmt.result.rows) {
 		stmt.done = true
+		stmt.conn.changes = stmt.result.affected
 		return false, ERROR_NONE
 	}
 	stmt.row += 1
@@ -477,5 +486,13 @@ embed_column_is_null :: proc(stmt: ^Embed_Statement, index: int) -> bool {
 embed_changes :: proc(stmt: ^Embed_Statement) -> int {
 	if stmt == nil do return 0
 	return stmt.result.affected
+}
+
+// embed_last_changes reports the rows the connection's most recent statement
+// affected, whether it ran through embed_exec or through a step that reached its
+// end. A statement's own count is embed_changes.
+embed_last_changes :: proc(conn: ^Embed_Conn) -> int {
+	if conn == nil do return 0
+	return conn.changes
 }
 

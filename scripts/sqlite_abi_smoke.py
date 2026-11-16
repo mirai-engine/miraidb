@@ -367,6 +367,24 @@ def main() -> int:
     assert kept_rows == [7, 7], kept_rows
     assert lib.sqlite3_close(reset_db) == OK
 
+    # F3: changes() counts the rows of the last statement whichever way it ran.
+    # A caller that uses sqlite3_exec -- the shell, a loader -- used to read 0
+    # after a two-row UPDATE, which is a wrong answer, not a missing feature.
+    changes_db = ctypes.c_void_p()
+    assert lib.sqlite3_open(b":memory:", ctypes.byref(changes_db)) == OK
+    assert lib.sqlite3_exec(changes_db, b"CREATE TABLE ch (a INTEGER)", None, None, None) == OK
+    assert lib.sqlite3_exec(changes_db, b"INSERT INTO ch VALUES (1)", None, None, None) == OK
+    assert lib.sqlite3_exec(changes_db, b"INSERT INTO ch VALUES (2)", None, None, None) == OK
+    assert lib.sqlite3_exec(changes_db, b"UPDATE ch SET a = a + 10", None, None, None) == OK
+    assert lib.sqlite3_changes(changes_db) == 2, "exec leaves the row count"
+    assert lib.sqlite3_total_changes(changes_db) == 2
+    change_stmt = ctypes.c_void_p()
+    assert lib.sqlite3_prepare_v2(changes_db, b"DELETE FROM ch", -1, ctypes.byref(change_stmt), None) == OK
+    assert lib.sqlite3_step(change_stmt) == DONE
+    assert lib.sqlite3_changes(changes_db) == 2, "a stepped statement leaves the row count too"
+    lib.sqlite3_finalize(change_stmt)
+    assert lib.sqlite3_close(changes_db) == OK
+
     print("rows:", rows)
     print("error path:", message)
     print("blob io:", blobs_ok)

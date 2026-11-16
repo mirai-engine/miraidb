@@ -55,7 +55,6 @@ SQLITE_NULL :: c.int(5)
 
 Database :: struct {
 	conn:         ^engine.Embed_Conn,
-	last_changes: c.int,
 	last_code:    c.int,  // what sqlite3_errcode answers
 	last_extended: c.int, // what sqlite3_extended_errcode answers
 	// extended is set by sqlite3_extended_result_codes: with it, sqlite3_errcode
@@ -311,7 +310,9 @@ sqlite3_changes :: proc "c" (handle: rawptr) -> c.int {
 	context = runtime.default_context()
 	db := db_of(handle)
 	if db == nil do return 0
-	return db.last_changes
+	// The counter belongs to the connection and is set by whichever statement ran
+	// last, through exec or through a step that reached its end (F3).
+	return c.int(engine.embed_last_changes(db.conn))
 }
 
 @(export)
@@ -361,7 +362,6 @@ sqlite3_finalize :: proc "c" (handle: rawptr) -> c.int {
 	context = runtime.default_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return SQLITE_MISUSE
-	if stmt.db != nil do stmt.db.last_changes = c.int(engine.embed_changes(stmt.stmt))
 	if stmt.db != nil do delete_key(&stmt.db.statements, handle)
 	engine.handle_forget(handle)
 	engine.embed_finalize(stmt.stmt)
@@ -466,7 +466,6 @@ sqlite3_step :: proc "c" (handle: rawptr) -> c.int {
 		return fail(stmt.db, err)
 	}
 	if has_row do return SQLITE_ROW
-	if stmt.db != nil do stmt.db.last_changes = c.int(engine.embed_changes(stmt.stmt))
 	return SQLITE_DONE
 }
 
