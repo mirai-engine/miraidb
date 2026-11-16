@@ -218,7 +218,8 @@ QUERIES = [
     "SELECT n FROM nums WHERE n = 2 ORDER BY n",
     "SELECT n FROM nums WHERE n > 0 ORDER BY n",
     # A NULL argument gives NULL, not an error.
-    "SELECT lower(NULL), upper(NULL), replace(NULL, 'a', 'b'), instr(NULL, 'a'), sign(NULL), sqrt(NULL), printf(NULL), hex(char(NULL))",
+    "SELECT lower(NULL), upper(NULL), replace(NULL, 'a', 'b'), instr(NULL, 'a'), sign(NULL), sqrt(NULL), printf(NULL), hex(char(NULL))",    # SQLite's other spellings and its planner hints.
+    "SELECT ceiling(1.2), power(2, 10), ln(1), ln(0), likely(5), unlikely(NULL), likelihood(3, 0.5)",
 ]
 
 # The engine refuses these and says why; SQLite answers them. A refusal that

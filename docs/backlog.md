@@ -37,7 +37,7 @@ Rules for this file:
 | S2 | `UPDATE OR <resolution>` is refused; the rest landed | the UPDATE resolutions | S |
 | S3 | `RIGHT`, `FULL` and `NATURAL` joins are refused | the three joins | M |
 | S4 | `FILTER`, `WINDOW`, aggregate `ORDER BY`, ordered-set aggregates missing | the aggregate surface | M |
-| S5 | 48 of 121 built-in functions missing | math, JSON/JSONB, text, introspection | M |
+| S5 | 39 of 121 built-in functions missing | math, JSON/JSONB, text, introspection | M |
 | S6 | eight statements and 9 pragmas missing | `EXPLAIN QUERY PLAN`, `REINDEX`, `INSTEAD OF`, `generate_series`, … | M |
 | S7 | `ANY` columns exist; an untyped column, affinity and cross-class comparison do not; `WITHOUT ROWID` cannot be written | SQLite's typing rules | L |
 | D2 | overlap on an `rtree` table is a scan | node pages and a descent | M |
@@ -224,7 +224,7 @@ and the ordered-set aggregates `median`, `percentile`, `percentile_cont`,
 
 ## S5 — Built-in functions
 
-**Missing (48 of 121).**
+**Missing (39 of 121).** `if`, `ceiling`, `power`, `ln` and the planner hints landed.
 
 - Math: `acosh`, `asinh`, `atanh`, `cosh`, `sinh`, `tanh`, `ln`, and the aliases
   `ceiling`, `power`.

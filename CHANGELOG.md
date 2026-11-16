@@ -2,6 +2,8 @@
 
 ## 0.15
 
+- `if`, `ceiling`, `power`, `ln`, `likely`, `unlikely` and `likelihood`, as in SQLite
+  (82 of 121 functions).
 - Partial and expression indexes (the last of roadmap S1 but `ON CONFLICT` on a
   constraint): maintained, enforced when UNIQUE, persisted (index flag 4) and
   written into an exported `.sqlite` file that `PRAGMA integrity_check` accepts.

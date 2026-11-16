@@ -4902,7 +4902,29 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 	}
 	lowered := strings.to_lower(call.name)
 	defer delete(lowered)
+	// SQLite's other spellings of functions the engine has.
+	dispatch := lowered
 	switch lowered {
+	case "if":
+		dispatch = "iif"
+	case "ceiling":
+		dispatch = "ceil"
+	case "power":
+		dispatch = "pow"
+	}
+	switch dispatch {
+	case "ln":
+		if len(args) != 1 do return {}, errf(.Invalid_Argument, "ln() takes one argument")
+		if args[0].kind == .Null do return value_null(), ERROR_NONE
+		number, ok := value_to_f64(args[0])
+		if !ok do return {}, errf(.Invalid_Type, "ln() expects a number")
+		// SQLite answers NULL outside the domain.
+		if number <= 0 do return value_null(), ERROR_NONE
+		return value_float(math.ln(number)), ERROR_NONE
+	case "likely", "unlikely", "likelihood":
+		// Planner hints in SQLite: the value passes through unchanged.
+		if len(args) < 1 do return {}, errf(.Invalid_Argument, "%s() needs an argument", call.name)
+		return args[0], ERROR_NONE
 	case "snippet", "highlight":
 		if len(args) != 2 {
 			return {}, errf(.Invalid_Argument, "%s() takes text and a pattern", call.name)
