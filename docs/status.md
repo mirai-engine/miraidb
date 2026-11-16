@@ -420,6 +420,13 @@ than 1000 bytes cannot be indexed and the insert says so.
   what it needs, and the CLI prunes after every statement because it keeps no
   history: `INSERT OR REPLACE` repeated 2 000 times went from 1.6 KiB to 1.2 KiB
   per statement (`test_prune_history_respects_a_pin`).
+- **Two defects a Linux build found.** `uuid_format` answered a slice of a local
+  array - a string pointing into a frame the caller had already left, which works
+  only while nothing overwrites that stack - and the newer toolchain refuses it
+  outright. And `filepath.abs` on POSIX fails when the file does not exist yet, so
+  the *first* open of a database failed on Linux (the lock file is created by the
+  open itself): the directory is resolved and the name appended. Windows never saw
+  either, which is the point of building elsewhere.
 - **A collation can come from the program.** `store_register_collation` (and
   `miraidb_create_collation`) registers a comparison, and `COLLATE <name>` asks it
   wherever a comparison happens: `WHERE`, `ON`, `HAVING`, `CASE`. The three

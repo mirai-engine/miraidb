@@ -671,6 +671,20 @@ gate.
    commit**: a file-open per commit, not a leak, and the first thing to look at
    when commit latency matters.
 
+## The Linux suite crashes under the threaded runner
+
+Building with Odin for Linux (`dev-2026-11`) works and the CLI runs: a database
+opens, writes, reopens and reads. `odin test src/tests` under the default runner
+(two threads) dies in `test_aggregates_and_order` with a Rust-style map panic
+followed by a segmentation fault, while the same test alone passes. That is memory
+corruption rather than a logic difference - most likely the arena-backed maps
+(`mine_table`'s `Tx_Snapshot` maps are `make(map, …, tx.alloc)`), because Odin frees
+a map's nodes through the allocator that is current when the node is removed. Next:
+bisect with `-define:ODIN_TEST_THREADS=1` and a narrowed name list, then either stop
+building those maps in the arena or release them before the arena dies. Once that is
+green, the ASAN heap pass runs with the same toolchain
+(`-sanitize:address`), which is what the audit item has been waiting for.
+
 ## Ordering, if this becomes the roadmap again
 
 Ordered by what protects the rest, not by what is most interesting. Fixed items

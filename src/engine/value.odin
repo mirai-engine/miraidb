@@ -640,7 +640,10 @@ value_format_to :: proc(b: ^strings.Builder, v: Value) {
 		}
 		strings.write_string(b, "'")
 	case .Uuid:
-		strings.write_string(b, uuid_format(v.uuid))
+		// The text belongs to the builder, so the buffer lives here and not inside
+		// uuid_format.
+		uuid_buffer: [36]u8
+		strings.write_string(b, uuid_format(v.uuid, &uuid_buffer))
 	case .Array:
 		strings.write_string(b, "[")
 		for item, i in v.list {
@@ -694,9 +697,13 @@ write_i128 :: proc(b: ^strings.Builder, value: i128) {
 	write_u128(b, u128(value))
 }
 
-uuid_format :: proc(u: Uuid) -> string {
+// uuid_format writes the 36 characters of a UUID into `buf` and answers them. It
+// takes the buffer because the earlier version returned a slice of a local array:
+// a string that points into a frame the caller has already left. The new Linux
+// toolchain refuses that outright, and it was right to - it is a use-after-scope
+// that happens to work while nothing overwrites the frame.
+uuid_format :: proc(u: Uuid, buf: ^[36]u8) -> string {
 	hex_digits := "0123456789abcdef"
-	buf: [36]u8
 	pos := 0
 	for c, i in u {
 		if i == 4 || i == 6 || i == 8 || i == 10 {

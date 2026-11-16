@@ -84,7 +84,23 @@ db_lock_acquire :: proc(directory: string, role: Db_Lock_Role = .Writer) -> (Db_
 	}
 	key, key_err := filepath.abs(path, context.temp_allocator)
 	if key_err != nil {
-		return {}, errf(.Io, "cannot resolve %s: %v", path, key_err)
+		// POSIX `abs` resolves the whole path and fails when the file does not exist
+		// yet, which is exactly the case on the first open of a database (the lock
+		// file is created by the open itself). The directory does exist, so resolve
+		// that and append the name: two opens of one database still produce one key,
+		// which is all the in-process registry asks of it.
+		resolved_dir, dir_err := filepath.abs(directory, context.temp_allocator)
+		if dir_err != nil {
+			return {}, errf(.Io, "cannot resolve %s: %v", path, key_err)
+		}
+		joined, join_ok := filepath.join(
+			{resolved_dir, LOCK_FILE_NAME},
+			context.temp_allocator,
+		)
+		if join_ok != nil {
+			return {}, errf(.Io, "cannot build the lock path for %s: %v", directory, join_ok)
+		}
+		key = joined
 	}
 
 	registry := lock_registry_needed()
