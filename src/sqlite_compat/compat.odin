@@ -426,13 +426,21 @@ sqlite3_bind_double :: proc "c" (handle: rawptr, index: c.int, value: c.double) 
 @(export)
 sqlite3_bind_text :: proc "c" (handle: rawptr, index: c.int, value: cstring, length: c.int, destructor: rawptr) -> c.int {
 	context = runtime.default_context()
-	context = runtime.default_context()
-	_ = length
 	_ = destructor
 	stmt := stmt_of(handle)
 	if stmt == nil || value == nil do return SQLITE_MISUSE
 	if int(index) < 1 || int(index) > engine.Embed_Parameter_Count(stmt.stmt) do return SQLITE_RANGE
-	if engine.embed_bind_text(stmt.stmt, int(index) - 1, string(value)).kind == .None do return SQLITE_OK
+	// SQLite's contract: a non-negative length is the byte count, and only a
+	// negative one means "up to the terminator". `string(value)` always stops at
+	// the first NUL, so a text with one embedded used to arrive as zero bytes.
+	text: string
+	if length >= 0 {
+		bytes := ([^]u8)(rawptr(value))
+		text = string(bytes[:int(length)])
+	} else {
+		text = string(value)
+	}
+	if engine.embed_bind_text(stmt.stmt, int(index) - 1, text).kind == .None do return SQLITE_OK
 	return SQLITE_ERROR
 }
 

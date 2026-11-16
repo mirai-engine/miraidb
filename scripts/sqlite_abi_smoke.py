@@ -385,6 +385,28 @@ def main() -> int:
     lib.sqlite3_finalize(change_stmt)
     assert lib.sqlite3_close(changes_db) == OK
 
+    # F4: a non-negative length is the byte count. `string(value)` used to stop at
+    # the first NUL, so a text with an embedded one arrived as zero bytes.
+    text_db = ctypes.c_void_p()
+    assert lib.sqlite3_open(b":memory:", ctypes.byref(text_db)) == OK
+    assert lib.sqlite3_exec(text_db, b"CREATE TABLE txt (a TEXT)", None, None, None) == OK
+    text_stmt = ctypes.c_void_p()
+    assert lib.sqlite3_prepare_v2(text_db, b"INSERT INTO txt VALUES (?)", -1, ctypes.byref(text_stmt), None) == OK
+    assert lib.sqlite3_bind_text(text_stmt, 1, b"a\x00b", 3, None) == OK
+    assert lib.sqlite3_step(text_stmt) == DONE
+    assert lib.sqlite3_reset(text_stmt) == OK
+    assert lib.sqlite3_bind_text(text_stmt, 1, b"abc", -1, None) == OK
+    assert lib.sqlite3_step(text_stmt) == DONE
+    lib.sqlite3_finalize(text_stmt)
+    lengths = ctypes.c_void_p()
+    assert lib.sqlite3_prepare_v2(text_db, b"SELECT length(a) FROM txt", -1, ctypes.byref(lengths), None) == OK
+    seen = []
+    while lib.sqlite3_step(lengths) == ROW:
+        seen.append(lib.sqlite3_column_int64(lengths, 0))
+    lib.sqlite3_finalize(lengths)
+    assert seen == [3, 3], seen
+    assert lib.sqlite3_close(text_db) == OK
+
     print("rows:", rows)
     print("error path:", message)
     print("blob io:", blobs_ok)
