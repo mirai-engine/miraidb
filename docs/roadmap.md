@@ -45,7 +45,8 @@ reference's own benchmark suite, ported as `benchmarks/parity` and run on the
 same machine ([RESULTS.md](../benchmarks/parity/RESULTS.md)), puts this engine at
 this engine ahead on an empty transaction (0.50 us against 0.62) and behind
 everywhere else: writes are 1.6 to 2.9 times slower in memory (they were 3 to 15
-before the write-path rounds) and scans and index lookups 3 to 11 times slower.
+before the write-path rounds), a 256-row scan about 3 times (it was 9 before
+rows kept their id order) and an index lookup 3 to 4 times.
 The remaining causes are measured and listed there, in order of payoff. The rows below are this engine against its own recorded baseline, which
 is what the CI gate checks; they are not a comparison with the reference.
 

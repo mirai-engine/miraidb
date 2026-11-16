@@ -32,6 +32,10 @@
   its last insert resolved, and resets both on any catalog change or savepoint
   rollback; the unique keys a check encodes are the ones it registers; index keys
   are encoded into a per-table buffer. 256 inserts: 762 to 681 us.
+- A table keeps an ordered list of its row ids beside its map, maintained by
+  the writers only, so a scan walks it and returns rows sorted without visiting
+  empty map slots or sorting: 256 rows fell from 15 to 4.6 us. `row_ids_sort`
+  no longer borrows the temp allocator on every commit.
 - `benchmarks/parity` runs the reference database's own benchmark suite
   (schemas, generator, sizes) against this engine.
 - The differential and compatibility gates read SQLite through Python's module

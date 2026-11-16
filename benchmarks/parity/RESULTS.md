@@ -116,12 +116,34 @@ from 286 us of staging and 178 us of commit to 216 and 161. The benchmark moves
 less than that, because its timed routine also prunes row history after the
 commit, as the CLI does, and that walks the table.
 
+## Fourth round: rows in id order
+
+A scan walked the table's hash map and then sorted what it found. After a
+truncate the map keeps its capacity, so 256 rows meant visiting 4 096 slots,
+and the sort cost as much again. Each table now keeps an ordered list of its
+row ids beside the map: inserts append (ids are handed out in increasing
+order; an id that arrives out of order is placed by binary search), pruning
+history compacts it, a truncate clears it and a copy-on-write clone derives
+its own. A scan walks the list and looks each id up, so the rows come out
+sorted with no sort. Only writers touch the list, because readers share
+tables. If a scan does not meet every row of the map it is redone from the
+map, so a writer that forgot the list would cost speed, never rows.
+`test_scans_come_out_in_row_id_order` walks every writer path.
+
+| Workload | Round 3 | Round 4 | Reference | Round 4 ÷ reference |
+|---|---:|---:|---:|---:|
+| iterate 256 rows (u32_u64_str) | 15.1 | 4.6 | 1.65 | 2.8× |
+| iterate 256 rows (u32_u64_u64) | 16.2 | 4.6 | 1.47 | 3.1× |
+
+The same round made `row_ids_sort` allocation-free: it had borrowed the temp
+allocator, which nothing frees in a long-running server, on every commit.
+
 ## What the numbers say
 
 The engine is still **not** as fast as the reference. It is now faster on an empty
 transaction, and writes went from 3–15× slower to 1.6–2.9× in memory. Scans and
-index lookups are unchanged by this round (3 to 11 times slower than the
-reference, faster than SQLite).
+index lookups were 3 to 11 times slower; scans are now about 3 times slower
+than the reference after round four, and still faster than SQLite.
 
 Where the remaining write time goes, measured with timers inside `tx_insert` and
 `tx_commit` (256 inserts into a table with one unique index): about 1.15 us per
@@ -134,10 +156,10 @@ into the table arena.
 
 What would close the rest, in order of payoff:
 
-1. **Keep rows in id order** (a B-tree or pages instead of a hash map), so a scan
-   neither chases a pointer per row nor sorts; this is most of the iterate gap,
-   and it also removes the map insert that is now the largest single cost of
-   staging a row.
+1. **Store rows contiguously.** Round four removed the sort and the empty slots,
+   but a scan still looks every id up in a map; rows stored in id order (pages
+   or a B-tree of rows) would make it a walk over memory, and remove the map
+   insert that is the largest single cost of staging a row.
 2. **Key the index trees by fixed-size values** where the key allows it (an
    integer column), instead of an encoded string per entry: the index entry is
    the largest share of applying a row.

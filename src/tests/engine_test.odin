@@ -9764,6 +9764,137 @@ test_insert_caches_follow_the_catalog :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_scans_come_out_in_row_id_order :: proc(t: ^testing.T) {
+	// A scan walks the table's ordered id list instead of its map. Every writer
+	// keeps that list right: inserts in several transactions, deletes with their
+	// history pruned, a truncate, a commit while a reader holds the table (which
+	// copies it), and ids that arrive out of order.
+	store := fresh_db(t, "row_order")
+	if store == nil do return
+	defer cleanup_db(store, "row_order")
+	run(t, store, "CREATE TABLE t (n INTEGER NOT NULL)")
+	for batch in 0 ..< 3 {
+		tx := db.tx_begin_write(store)
+		for i in 0 ..< 200 {
+			_, err := db.tx_insert(tx, "t", []db.Value{db.value_int(i64(batch * 200 + i))})
+			if !testing.expect(t, db.error_ok(err)) do return
+		}
+		testing.expect(t, db.error_ok(db.tx_commit(tx)))
+	}
+	ascending :: proc(t: ^testing.T, store: ^db.Store, expected_count: int, label: string) {
+		tx := db.tx_begin_read(store)
+		defer db.tx_end(tx)
+		table := db.tx_table_probe(tx, "t")
+		rows := make([dynamic]db.Row)
+		defer db.table_collect_release(table, &rows)
+		db.table_collect(table, &rows)
+		testing.expectf(t, len(rows) == expected_count, "%s: %d rows, expected %d", label, len(rows), expected_count)
+		for i in 1 ..< len(rows) {
+			if rows[i - 1].id >= rows[i].id {
+				testing.expectf(t, false, "%s: row %d has id %d after %d", label, i, rows[i].id, rows[i - 1].id)
+				return
+			}
+		}
+	}
+	ascending(t, store, 600, "after three batches")
+
+	run(t, store, "DELETE FROM t WHERE n % 3 = 0")
+	ascending(t, store, 400, "after deletes, history kept")
+	db.store_prune_history(store)
+	ascending(t, store, 400, "after the history is pruned")
+
+	// A reader holds the table while a commit changes it: the commit copies the
+	// table, and both the reader's view and the new one stay ordered.
+	reader := db.tx_begin_read(store)
+	run(t, store, "INSERT INTO t (n) VALUES (1000), (1001)")
+	{
+		table := db.tx_table_probe(reader, "t")
+		rows := make([dynamic]db.Row)
+		db.table_collect(table, &rows)
+		testing.expect_value(t, len(rows), 400)
+		db.table_collect_release(table, &rows)
+	}
+	db.tx_end(reader)
+	ascending(t, store, 402, "after a commit under a reader")
+
+	run(t, store, "DELETE FROM t")
+	run(t, store, "INSERT INTO t (n) VALUES (1), (2), (3)")
+	db.store_prune_history(store)
+	ascending(t, store, 3, "after emptying and refilling")
+	run(t, store, "TRUNCATE t")
+	ascending(t, store, 0, "after a truncate")
+	run(t, store, "INSERT INTO t (n) VALUES (7)")
+	ascending(t, store, 1, "after a truncate and an insert")
+
+	// Ids that arrive out of order (a replay, an explicit row id) are placed.
+	{
+		schema := db.Table_Schema{name = "loose"}
+		columns := []db.Column{{name = "n", type = db.Column_Type{kind = .Int, width = 8}}}
+		schema.columns = columns
+		loose, create_err := db.table_create(&schema)
+		if testing.expect(t, db.error_ok(create_err)) {
+			for id in ([]u64{50, 10, 30, 20, 40, 10}) {
+				_ = db.table_insert(loose, db.Row_Id(id), []db.Value{db.value_int(i64(id))})
+			}
+			rows := make([dynamic]db.Row)
+			db.table_collect(loose, &rows)
+			got := make([dynamic]u64, 0, 5)
+			for row in rows do append(&got, u64(row.id))
+			testing.expectf(t, len(got) == 5 && got[0] == 10 && got[1] == 20 && got[4] == 50, "out-of-order ids came out %v", got[:])
+			delete(got)
+			db.table_collect_release(loose, &rows)
+			db.table_destroy(loose)
+		}
+	}
+}
+
+@(test)
+test_typed_sorts_agree_with_the_library :: proc(t: ^testing.T) {
+	// The two introsorts that replaced slice.sort_by on the hot paths, against
+	// slice.sort, on random input, sorted input, reversed input and duplicates,
+	// at sizes that exercise the insertion sort, the quicksort and the heapsort.
+	state := u64(0x9e3779b97f4a7c15)
+	next :: proc(state: ^u64) -> u64 {
+		state^ ~= state^ << 13
+		state^ ~= state^ >> 7
+		state^ ~= state^ << 17
+		return state^
+	}
+	for size in ([]int{0, 1, 2, 5, 23, 24, 25, 100, 1000, 5000}) {
+		for shape in 0 ..< 4 {
+			ids := make([]db.Row_Id, size)
+			defer delete(ids)
+			for i in 0 ..< size {
+				switch shape {
+				case 0:
+					ids[i] = db.Row_Id(next(&state))
+				case 1:
+					ids[i] = db.Row_Id(i)
+				case 2:
+					ids[i] = db.Row_Id(size - i)
+				case 3:
+					ids[i] = db.Row_Id(next(&state) % 7)
+				}
+			}
+			expected := slice.clone(ids)
+			defer delete(expected)
+			slice.sort(expected)
+			rows := make([]db.Row, size)
+			defer delete(rows)
+			for id, i in ids do rows[i].id = id
+			db.row_ids_sort(ids)
+			db.rows_sort_by_id(rows)
+			for i in 0 ..< size {
+				if ids[i] != expected[i] || rows[i].id != expected[i] {
+					testing.expectf(t, false, "size %d shape %d differs at %d", size, shape, i)
+					break
+				}
+			}
+		}
+	}
+}
+
+@(test)
 test_full_text_cost :: proc(t: ^testing.T) {
 	// The scan follows the match, not the corpus: with five thousand documents and
 	// one match, the query visits a handful of rows. This is measured, not

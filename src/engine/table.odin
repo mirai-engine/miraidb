@@ -89,6 +89,12 @@ Table :: struct {
 	// the writer (or the transaction that owns a private table) does, so one
 	// buffer per table is never used twice at once.
 	key_scratch:     [dynamic]u8,
+	// order holds the id of every row in `rows`, ascending. A scan walks it
+	// instead of the map, so it neither visits the empty slots a map keeps after
+	// deletes (4 096 of them for 256 rows after a truncate) nor sorts what it
+	// collected. Only writers maintain it; a borrowed table may list ids its
+	// owner has since freed, and a scan skips an id the map does not hold.
+	order:           [dynamic]Row_Id,
 	next_row_id:     u64,
 	next_sequence:   i64,
 	// next_int_key is the highest value an INTEGER PRIMARY KEY has held in a
@@ -207,6 +213,7 @@ table_destroy :: proc(t: ^Table) {
 	page_rows_close(t.paged)
 	if len(t.index_dir) > 0 do delete(t.index_dir)
 	delete(t.key_scratch)
+	delete(t.order)
 	virtual.arena_destroy(&t.arena)
 	if t.store != nil do row_store_release(t.store)
 	free(t)
@@ -295,6 +302,7 @@ table_prune_versions :: proc(t: ^Table, before_seq: u64) {
 		}
 		map_erase(&t.rows, id)
 	}
+	if len(dead) > 0 do table_order_compact(t)
 }
 
 // schema_normalize adds the implicit unique indexes for the primary key and for
@@ -931,6 +939,7 @@ table_insert :: proc(t: ^Table, id: Row_Id, values: []Value, validated := false)
 		}
 	}
 	t.rows[id] = Row{id = id, values = stored, created_seq = t.apply_seq}
+	table_order_add(t, id)
 	for _, i in t.indexes {
 		key := index_entry_key(t, i, stored, id)
 		if put_err := table_index_put(t, i, key, id); put_err.kind != .None do return put_err
@@ -1053,6 +1062,7 @@ table_truncate :: proc(t: ^Table) {
 		table_free_row(row)
 	}
 	clear(&t.rows)
+	clear(&t.order)
 	for _, i in t.indexes {
 		rbtree.destroy(&t.indexes[i].tree, false)
 		rbtree.init_cmp(&t.indexes[i].tree, index_cmp)
@@ -1066,6 +1076,7 @@ table_truncate :: proc(t: ^Table) {
 table_insert_borrowed :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
 	if _, exists := t.rows[id]; exists do return errf(.Internal, "row id %d already exists", u64(id))
 	t.rows[id] = Row{id = id, values = values, created_seq = t.apply_seq}
+	table_order_add(t, id)
 	for _, i in t.indexes {
 		key := index_entry_key(t, i, values, id)
 		if put_err := table_index_put(t, i, key, id); put_err.kind != .None do return put_err
@@ -1173,6 +1184,11 @@ table_snapshot :: proc(source: ^Table) -> ^Table {
 		// version chain belongs to the source table and is not copied.
 		clone.rows[row.id] = Row{id = row.id, values = row.values, created_seq = row.created_seq}
 	}
+	reserve(&clone.order, len(clone.rows))
+	for id in source.order {
+		if id in clone.rows do append(&clone.order, id)
+	}
+	if len(clone.order) != len(clone.rows) do table_order_rebuild(clone)
 	return clone
 }
 
@@ -1243,12 +1259,74 @@ table_collect :: proc(
 		return
 	}
 	reserve(out, len(out) + len(t.rows))
+	// The order lists every row in id order, so the rows come out sorted. A table
+	// whose order does not cover its rows (none should exist) still answers, the
+	// slow way.
+	if len(t.order) >= len(t.rows) {
+		start := len(out)
+		present_count := 0
+		for id in t.order {
+			row, present := t.rows[id]
+			if !present do continue
+			present_count += 1
+			values, visible := row_values_at(row, seq)
+			if !visible do continue
+			append(out, Row{id = row.id, values = values})
+		}
+		// Every row of the map was met: the scan is complete. Otherwise a writer
+		// added a row without listing it, and the scan is redone from the map so
+		// that no row is ever missed.
+		if present_count == len(t.rows) do return
+		resize(out, start)
+	}
 	for _, row in t.rows {
 		values, visible := row_values_at(row, seq)
 		if !visible do continue
 		append(out, Row{id = row.id, values = values})
 	}
 	rows_sort_by_id(out[:])
+}
+
+// table_order_add records a new row id. Ids are handed out in increasing order,
+// so this is an append; an id that arrives out of order (a replay, an explicit
+// row id) is placed by binary search.
+table_order_add :: proc(t: ^Table, id: Row_Id) {
+	n := len(t.order)
+	if n == 0 || t.order[n - 1] < id {
+		append(&t.order, id)
+		return
+	}
+	low, high := 0, n
+	for low < high {
+		middle := (low + high) / 2
+		if t.order[middle] < id {
+			low = middle + 1
+		} else {
+			high = middle
+		}
+	}
+	if low < n && t.order[low] == id do return
+	inject_at(&t.order, low, id)
+}
+
+// table_order_compact drops the ids whose rows are gone, keeping the order.
+table_order_compact :: proc(t: ^Table) {
+	write := 0
+	for id in t.order {
+		if id not_in t.rows do continue
+		t.order[write] = id
+		write += 1
+	}
+	resize(&t.order, write)
+}
+
+// table_order_rebuild makes the order from the map, for a table whose order
+// could not be derived from another one.
+table_order_rebuild :: proc(t: ^Table) {
+	clear(&t.order)
+	reserve(&t.order, len(t.rows))
+	for id in t.rows do append(&t.order, id)
+	row_ids_sort(t.order[:])
 }
 
 // table_max_int returns the largest Int value in one column, or 0 when the

@@ -111,8 +111,10 @@ rows_heapsort :: proc(data: []Row) {
 	}
 }
 
-// row_ids_sort orders row ids with the same introsort; `slice.sort` on 256 plain
-// integers took 42 us.
+// row_ids_sort orders row ids in place with the same introsort, specialised to
+// plain ids: `slice.sort` on 256 of them took 42 us. It allocates nothing (an
+// earlier version borrowed the temp allocator, which nothing frees in a server
+// that runs for days, and every commit sorts its ids).
 row_ids_sort :: proc(ids: []Row_Id) {
 	if len(ids) < 2 do return
 	sorted := true
@@ -123,9 +125,71 @@ row_ids_sort :: proc(ids: []Row_Id) {
 		}
 	}
 	if sorted do return
-	// Sort through the row sort: an id is the only field it reads.
-	rows := make([]Row, len(ids), context.temp_allocator)
-	for id, i in ids do rows[i].id = id
-	rows_sort_by_id(rows)
-	for row, i in rows do ids[i] = row.id
+	depth := 0
+	for n := len(ids); n > 0; n >>= 1 do depth += 2
+	ids_introsort(ids, depth)
+}
+
+@(private)
+ids_introsort :: proc(ids: []Row_Id, depth: int) {
+	data := ids
+	limit := depth
+	for len(data) > 24 {
+		if limit == 0 {
+			ids_heapsort(data)
+			return
+		}
+		limit -= 1
+		last := len(data) - 1
+		middle := last / 2
+		if data[middle] < data[0] do data[middle], data[0] = data[0], data[middle]
+		if data[last] < data[0] do data[last], data[0] = data[0], data[last]
+		if data[middle] < data[last] do data[middle], data[last] = data[last], data[middle]
+		pivot := data[last]
+		store := 0
+		for i in 0 ..< last {
+			if data[i] < pivot {
+				data[i], data[store] = data[store], data[i]
+				store += 1
+			}
+		}
+		data[store], data[last] = data[last], data[store]
+		if store < len(data) - store {
+			ids_introsort(data[:store], limit)
+			data = data[store + 1:]
+		} else {
+			ids_introsort(data[store + 1:], limit)
+			data = data[:store]
+		}
+	}
+	for i in 1 ..< len(data) {
+		current := data[i]
+		j := i
+		for j > 0 && data[j - 1] > current {
+			data[j] = data[j - 1]
+			j -= 1
+		}
+		data[j] = current
+	}
+}
+
+@(private)
+ids_heapsort :: proc(data: []Row_Id) {
+	n := len(data)
+	sift :: proc(data: []Row_Id, start, end: int) {
+		root := start
+		for {
+			child := 2 * root + 1
+			if child >= end do return
+			if child + 1 < end && data[child] < data[child + 1] do child += 1
+			if data[root] >= data[child] do return
+			data[root], data[child] = data[child], data[root]
+			root = child
+		}
+	}
+	for start := n / 2 - 1; start >= 0; start -= 1 do sift(data, start, n)
+	for end := n - 1; end > 0; end -= 1 {
+		data[0], data[end] = data[end], data[0]
+		sift(data, 0, end)
+	}
 }
