@@ -81,9 +81,12 @@ miraidb/
 │   ├── architecture.md    modules, invariants, transaction and subscription model
 │   ├── file-format.md     commit log and snapshot layout, records, recovery
 │   ├── sql.md             the supported SQL subset
-│   ├── features.md        the parity matrix and its execution order
-│   ├── roadmap.md         the plan: phases, what is asked for, what "done" means
-│   ├── backlog.md         depth work: what is shallow today and what "done" means
+│   ├── features.md        the parity matrix (closed, 94/94)
+│   ├── roadmap.md         the one list of open work, in priority order
+│   ├── backlog.md         the detail of each open item: today, cost, done when
+│   ├── closing-plan.md    the record of what was closed, with its evidence
+│   ├── sqlite.md          SQLite compatibility, with claims CI executes
+│   ├── sqlite-roadmap.md  SQLite's surface: measured, missing, incompatible
 │   ├── security.md        what the server trusts, refuses and does not defend
 │   ├── status.md          what is done, partial and not started
 │   └── versioning-plan.md the proposal: branches, merge and peer-to-peer sync
@@ -279,9 +282,9 @@ missing), [sqlite-roadmap.md](docs/sqlite-roadmap.md) and
 Status and planning:
 [status.md](docs/status.md) (measurements, what is deliberately not claimed),
 [features.md](docs/features.md) (the parity matrix, 94 rows),
-[roadmap.md](docs/roadmap.md) (the pending order),
-[backlog.md](docs/backlog.md) (the depth work, with cost) and
-[pending.md](docs/pending.md) (the weighted roadmap `roadmap.py` regenerates).
+[roadmap.md](docs/roadmap.md) (the one list of open work, in priority order),
+[backlog.md](docs/backlog.md) (the detail and cost of each open item) and
+[closing-plan.md](docs/closing-plan.md) (what was closed, with its evidence).
 [versioning-plan.md](docs/versioning-plan.md) is the proposal for what comes
 after the roadmap: commits with an identity, branches, row-level merge, and
 peer-to-peer sync between users, an office peer and a VPS.
@@ -302,6 +305,13 @@ peer-to-peer sync between users, an office peer and a VPS.
 Snapshots and compaction came before the network layer on purpose: without
 them, recovery time grows with the log and range queries scan the table.
 
+What comes next is in [docs/roadmap.md](docs/roadmap.md), split by the two goals:
+**match or beat the reference model** on its own benchmark suite (the engine is
+faster on an empty transaction and still 1.6–4× slower elsewhere,
+[RESULTS.md](benchmarks/parity/RESULTS.md)), and **bring SQLite's features**
+(73 of 121 functions, 54 of 63 pragmas and 30 of 63 grammar shapes today,
+measured by `scripts/sqlite_gaps.py`), plus the hardening a release needs.
+
 ## Not implemented: a second writer, and replication
 
 One process **owns** one log. A second writer on the same directory is refused with
@@ -314,7 +324,7 @@ so `--read-only` (or `Store_Options.read_only`) opens beside a live writer, answ
 from a replay of the log at open, refuses every mutation and makes a compaction
 wait. The writer, in turn, opens its page files without replaying them: the
 catalog names the sequence, every page file carries it, and a mismatch means a
-replay, never a wrong answer (`docs/backlog.md` D18b).
+replay, never a wrong answer (`docs/backlog.md` D18).
 
 A second process can also **use** the database through the owner:
 `miraidb-server` serves the wire protocol over HTTP, WebSocket frames and

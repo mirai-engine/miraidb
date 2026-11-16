@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Recomputes the weighted roadmap totals in docs/pending.md.
+"""Recomputes the weighted roadmap totals in docs/closing-plan.md.
 
 The table is the source of truth for progress, so it must never drift: a row
 counts fully when its state starts with `done`, and by the number it leads with
 otherwise (`2.5: ...` counts 2.5 points). Run this after editing a row.
 
-    python3 scripts/roadmap.py          # rewrite docs/pending.md
+    python3 scripts/roadmap.py          # rewrite docs/closing-plan.md
     python3 scripts/roadmap.py --check  # fail when it is stale
 """
 
@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 import sys
 
-PATH = "docs/pending.md"
+PATH = "docs/closing-plan.md"
 PHASE_RE = re.compile(r"^## (P\d) — (.+?) \((\d+)\) — ([\d.]+)\s*$")
 ROW_RE = re.compile(r"^\| (\d+) \|")
 DONE_RE = re.compile(r"^done\b")
@@ -91,7 +91,7 @@ def main() -> int:
         if updated != text or problems:
             for problem in problems:
                 print(problem, file=sys.stderr)
-            print("docs/pending.md is stale; run python3 scripts/roadmap.py", file=sys.stderr)
+            print("docs/closing-plan.md is stale; run python3 scripts/roadmap.py", file=sys.stderr)
             return 1
         print(f"roadmap consistent: {total_earned:g}/{total_weight:g}")
         return 0

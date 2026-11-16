@@ -9,7 +9,8 @@ The inventory is generated from the reference source (SQLite 3.54.1) so it never
 drifts: `python3 scripts/sqlite_inventory.py --sqlite ../sqlite` writes
 `docs/sqlite-inventory.md` with every keyword, built-in function and pragma.
 
-This matrix records what is done, partial or missing. A row is `done` only when
+This matrix records what is done, partial or missing; how much of the surface
+runs, and the plan for the rest, is [sqlite-roadmap.md](sqlite-roadmap.md). A row is `done` only when
 a test covers it, and `scripts/differential.py` checks the statements and
 functions listed here against the system `sqlite3`: the answers must match, or
 the statement must be one of the refusals or the intentional differences the
@@ -75,8 +76,8 @@ script lists.
 
 ## Functions
 
-**Implemented (66 of the 131 names the inventory lists, plus aliases and
-families):** `abs` and the trigonometric/logarithmic set (`acos`, `asin`,
+**Implemented (73 of the 121 user-facing names, measured by
+`scripts/sqlite_gaps.py`):** `abs` and the trigonometric/logarithmic set (`acos`, `asin`,
 `atan`, `atan2`, `cos`, `sin`, `tan`, `degrees`, `radians`, `pi`, `exp`,
 `log`, `log2`, `log10`), `ceil`/`floor`/`round`/`trunc`/`sign`/`sqrt`/`pow`/
 `mod`, `char`, `unicode`, `hex`, `unhex`, `quote`, `format`/`printf`,
@@ -92,16 +93,8 @@ as scalars, `trim`/`ltrim`/`rtrim` with a character set, `random`, `zeroblob`,
 and `has_role` (engine extensions), plus `count`, `sum`, `avg`, `min`, `max`,
 `total`.
 
-**Missing, verified by running each one:** `CASE` (a statement, not a function),
-`current_timestamp` as a keyword, `ceiling`, `ln`, `power`, `timediff`,
-`median`/`percentile`/`percentile_cont`/`percentile_disc`, `soundex`,
-`json_patch`/`json_insert`/`json_pretty`/`json_array_insert`/`json_group_array`/
-`json_group_object`/`json_error_position`, the whole `jsonb_*` family,
-`unistr`/`unistr_quote`, `likelihood`/`likely`/`unlikely`/`unknown`,
-`sqlite_compileoption_used`/`sqlite_compileoption_get`, `sqlite_source_id`,
-`sqlite_offset`, `sqlite_filestat`, `sqlite_walstat`, and the names SQLite keeps
-for its own internals (`expr_compare`, `fpdecode`, `datedebug`, `oom`,
-`affinity`, `parseuri`, `implies_nonnull_row`).
+**Missing:** the list `scripts/sqlite_gaps.py --missing` prints, grouped by
+roadmap item in [sqlite-roadmap.md](sqlite-roadmap.md) (S4 and S5).
 
 ## Pragmas
 

@@ -2,6 +2,20 @@
 
 ## 0.15
 
+- The planning documents are one list again. `docs/roadmap.md` holds every open
+  item, split by goal: speed against the reference model (R1–R4, measured by its
+  own benchmark suite), SQLite's surface (S1–S7) and hardening (the D items).
+  `docs/backlog.md` keeps only open items; what closed, with its evidence, is in
+  `docs/closing-plan.md` (formerly `pending.md`, which held nothing pending).
+  `docs/sqlite-roadmap.md` was rewritten from a measurement: it listed CTEs,
+  savepoints, windows and JSON as missing long after they landed.
+- `scripts/sqlite_gaps.py` runs every SQLite function and pragma and 63 grammar
+  shapes through the CLI: 73 of 121 functions, 54 of 63 pragmas and 30 of 63
+  shapes run today. A CI gate fails when `docs/sqlite-roadmap.md` states other
+  counts, so the document cannot drift again (26 gates).
+- `docs/security.md` no longer says a deep expression takes the server down: the
+  depth bound closed that; an allocation failure still can (D23).
+
 - PostgreSQL clients work for real. The server framed its input by TCP read, so a
   driver's pipelined Parse/Bind/Describe/Execute/Sync lost everything after Parse
   and hung; reusing a statement name freed a slice of the network buffer and

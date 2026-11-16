@@ -86,6 +86,11 @@ def build_gates(args: argparse.Namespace) -> list[Gate]:
             [sys.executable, "scripts/compat_check.py", "--bin", "./bin/miraidb.exe"],
         )
     )
+    # How much of SQLite's function, pragma and grammar surface answers; the
+    # counts docs/sqlite-roadmap.md states have to be the measured ones.
+    gates.append(
+        Gate("SQLite surface", [sys.executable, "scripts/sqlite_gaps.py", "--check", "--bin", "./bin/miraidb.exe"])
+    )
     gates.append(
         Gate(
             "mirror cost",

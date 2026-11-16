@@ -1,156 +1,115 @@
 # Roadmap: what is left, in priority order
 
-The parity matrix is closed (`docs/features.md`, 94 rows, 100/100) and the work
-that closed it is recorded at the end of this file. This file is the
-authoritative order for what is left; [backlog.md](backlog.md) carries the detail
-and the cost of each item, and [status.md](status.md) the measurements.
+This is the one list of open work. [backlog.md](backlog.md) carries the detail of
+each item (today, cost, done when), [status.md](status.md) the measurements, and
+[closing-plan.md](closing-plan.md) the record of everything already closed.
 
-**Scope note.** End-user documentation (guide, SQL reference, tutorials) is out
-of scope here: it is maintained outside this repository. This file plans engine
-work only — features, acceptance criteria and order.
+The project has two goals, and the open work is split by them, plus the
+hardening a release needs:
 
-**Priority rule.** Order is set by what blocks real use and what protects
-everything else, not by what is most interesting. An item that removes a risk of
-a wrong answer outranks an item that adds a capability; an item another item
-depends on outranks the dependent; a release gate waits until the thing it
-releases is worth shipping.
+- **A. The reference model, equalled or beaten.** The feature matrix is closed
+  ([features.md](features.md), 94/94), so what is left on this axis is speed and
+  depth: the reference's own benchmark suite still puts this engine behind on
+  every workload but the empty transaction.
+- **B. SQLite's features.** Measured by `scripts/sqlite_gaps.py` and kept honest
+  by a CI gate: **73 of 121** built-in functions, **54 of 63** pragmas and **30 of
+  63** grammar shapes run today ([sqlite-roadmap.md](sqlite-roadmap.md)).
+- **C. Hardening and release.** What has to be true before a public release.
 
-## Open items
+**Priority rule.** An item that removes a risk of a wrong answer outranks one
+that adds a capability; an item another depends on outranks the dependent; a
+release gate waits until what it releases is worth shipping. Every SQLite gap is
+refused with a message today, never answered differently, so track B adds
+capability without fixing wrong answers, and the differential runner keeps it
+that way.
+
+## A. The reference model
 
 | # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
-| 1 | **D23 — resource limits** — *partly done* | Done: the depth bound (an expression may nest 100 levels; the parser and the evaluator both refuse, where 155-178 levels used to kill the process), the quota applied while the projection produces rows **and while a join produces its intermediate** (a cross join of 40 000 combinations with a quota of 100 refuses after fewer than 1 000 rows; a statement that can shrink its output — `DISTINCT`, `GROUP BY`/`HAVING`, an aggregate, a window — is judged by what it emits, so `count(*)` over that join still answers), and the work budget reachable from the server. `LIMIT` is pushed into the scan and into a join's last step when nothing filters or shrinks the rows (`SELECT id FROM t LIMIT 10` reads 10 rows of 1 000; `LIMIT 3 OFFSET 2` reads five). Both caps are reachable from the command line (`--row-quota=N`, `--budget=N`), and making them reachable exposed two defects that are fixed: the quota path freed a row a second time (a release build died with exit 116 and no message) and the budget message reported `0 work` because it read the count after destroying the result. What is left: an allocation that fails is still a crash rather than `.Out_Of_Memory` (no reproduction yet). An audit item (`AUDIT-9` A4/A5). | M | — |
-| 2 | **ASAN pass** over the CLI, soak and conformance — *partly done* | Bounds and stack are covered today. Odin's heap allocator is not intercepted on Windows (a deliberate use-after-free is not reported), so the heap half runs with the POSIX toolchain in #11. | 1 round | 11 |
-| 3 | **D2 — spatial tree** | Node pages and a descent replace the scan over box columns. | M | — |
-| 4 | **D10 — precision and time** | Decimal arithmetic with scale, `TIMESTAMPTZ`, streaming blobs. | M | — |
-| 5 | **D14 — replication** | `GET /log?since=<seq>`, a follower applying through the replay path, tested against a lagging follower and a dead leader. Failover stays unclaimed. The networking plan is below. | XL | — |
-| 6 | **D12c — module sandbox** | Deterministic execution with enforced memory and time; today a module is a process with a work budget and the caller's clock. | L | — |
-| 7 | **D15 — network hardening** | TLS, HTTP/2, backpressure, per-route timeouts, a load test. | M | — |
-| 8 | **D16 — client generation from the catalog** | Emit the Python binding from the schema; the hand-written one is the contract it has to meet. | M | — |
-| 9 | **D4 — a secondary index in the mirror** | A table with a secondary index re-encodes the whole `.sqlite` file on every commit, because only table-b-tree leaves are patched. Patch the index b-trees too (a moved key can jump leaves), or state the fallback where a user will read it. | L | — |
-| 10 | **D5 / D17 — the rest of the page store** | Merge an index leaf that loses its last entry; keep more than one version per row so `AS OF` and `ALTER` work on a paged table; let a read of a paged store run without holding the shared lock for its whole life; let a read-only open trust the pages when it can prove nothing is in flight. | L | — |
-| 11 | **CI on Linux and macOS** — *the compile half is done* | The POSIX lock is fixed: `lock_posix.odin` was missing its `core:sys/posix` import and used `mode_t` (a bit_set) and `l_start` (an `off_t`) as if they were integers, so it had never compiled; with the fix, `src/engine`, `src/server`, `src/capi`, `src/sqlite_compat`, `src/tests` and `src/cli` all pass `odin check` for linux_amd64, linux_arm64 and darwin_arm64. What is left: a CI job that runs the suite on all three (so the lock, the VFS and `-sanitize:address` are proven there, which is also the heap half of #2), and the scripts that hardcode a `.exe` binary: `ci.py`, `page_rss.py`, `plan_check.py`, `bench.py`, `lock_smoke.py`, `broker_smoke.py`. | M | — |
-| 12 | **Release and packaging** | `scripts/package.py` builds `dist/miraidb-<version>-<target>.zip` from the version the library reports and `--check` gates its manifest. Left: publish one archive per target, decide the version policy, and verify an archive builds twice byte for byte. | M | 11 |
-| 13 | **Auth review** | The internal pass found one client's identity leaking into the next (fixed, `test_connection_identity`). Left: rate limits, a token lifetime policy, adversarial tests over subscriptions and budgets, the fact that without TLS (#7) a token travels in clear, and that **grants are opt-in**: a database with no grant rows allows every statement to every client, so a fresh deployment accepts anonymous writes until its grants exist. | S | — |
-| 14 | **Licence and notice review** | MIT/Apache-2.0 with no vendored third-party source; confirm before each public release. | external | — |
+| 1 | **R1 — rows stored in id order** | Rows in a map keyed by id make a 256-row scan 2.8–3.1× the reference and put a map insert in every staged row. Store them contiguously in id order. | L | — |
+| 2 | **R2 — fixed-size index keys** | Index entries are encoded strings: an index filter is 3–4× the reference and the entry is the largest share of applying a row. Key integer columns by value. | M | — |
+| 3 | **R3 — prune what a commit touched** | Pruning walks every row of every table after each statement. | S | — |
+| 4 | **R4 — hand the staged row to the table** | About 4% of an insert is a copy from the arena to the table. | M | 1 |
+| 5 | **Parity gate** | `scripts/bench.py` gates the parity workloads, measured twice per run, so a regression against the reference fails CI. | S | — |
+| 6 | **D12 — module sandbox** | A module is a process with a work budget; the reference runs modules deterministically with enforced limits. | L | — |
+| 7 | **D16 — generated clients** | Generate the Python binding from the catalog, then a second language. | M | — |
 
-After these items, [versioning-plan.md](versioning-plan.md) proposes version
-control with peer-to-peer sync; its first networked phase builds on #5 and #7.
+## B. SQLite's features
+
+| # | Item | What is left | Effort | Depends on |
+|---|---|---|---|---|
+| 8 | **S1 — the schema real files declare** | `CHECK`, `CONSTRAINT` names, column `REFERENCES`, deferrable foreign keys, `DESC` index columns, partial and expression indexes, `CURRENT_TIMESTAMP` and its siblings. A schema using any of them fails at `CREATE TABLE`. | M | — |
+| 9 | **S2 — statement and expression forms** | `INSERT OR IGNORE`, `REPLACE INTO`, `INTERSECT`/`EXCEPT`, `LIMIT a, b`, `IS`/`IS NOT` values, `IS DISTINCT FROM`, `NULLS FIRST/LAST`, bitwise operators, `->`/`->>`, `VALUES` in `FROM`, row values. | M | — |
+| 10 | **S3 — joins** | `RIGHT`, `FULL`, `NATURAL`. | M | — |
+| 11 | **S4 — aggregates and windows** | `FILTER`, the `WINDOW` clause, `ORDER BY` inside an aggregate, `median` and the percentiles, `json_group_array`/`_object`. | M | — |
+| 12 | **S5 — functions** | 48 missing: hyperbolic math and aliases, `timediff`, `soundex`, `unistr`, planner hints, introspection, the rest of JSON and the `jsonb_*` family. | M | — |
+| 13 | **S6 — statements and pragmas** | `EXPLAIN QUERY PLAN`, `REINDEX`, `INSTEAD OF` triggers, `INDEXED BY`, `generate_series`, `VACUUM`/`ATTACH` in memory, 9 pragmas. | M | — |
+| 14 | **S7 — affinity and `WITHOUT ROWID`** | `ANY` columns exist; left: an untyped column, SQLite's affinity rules, comparison across storage classes (refused today), `WITHOUT ROWID` as a write target. | L | — |
+| 15 | **D4 — secondary indexes in the mirror** | A table with a secondary index re-encodes the `.sqlite` file per commit. | L | — |
+| 16 | **D24 — the mirror's last gaps** | A counted skip for an index the engine cannot express, and a mirror fuzz pass. | S | 8 |
+
+## C. Hardening and release
+
+| # | Item | What is left | Effort | Depends on |
+|---|---|---|---|---|
+| 17 | **D23 — allocation failure** | A failed allocation is a crash, not `.Out_Of_Memory`; start with an allocator that fails the nth call. | M | — |
+| 18 | **D34 — Linux suite and heap sanitizer** | The threaded suite crashes on Linux; then CI on Linux and macOS with `-sanitize:address`, and scripts that find a binary without `.exe`. | M | — |
+| 19 | **D8 — fault injection beyond the log** | Snapshot, rotation, the mirror, a kill during a page flush. | S | — |
+| 20 | **D3 — version retention** | Automatic retention tied to the oldest reader; `AS OF` on a join. | M | — |
+| 21 | **D5 — the rest of the page store** | Leaf merge, versions on paged tables, a read without the shared lock for its whole life; with D18, a reader that trusts the pages. | L | — |
+| 22 | **D11 — triggers and policies in a transaction** | Order them against the rows of the same transaction. | S | — |
+| 23 | **D2 — spatial tree** | Node pages and a descent instead of a scan over box columns. | M | — |
+| 24 | **D10 — precision and time** | Decimal scale, `TIMESTAMPTZ`, streaming blobs. | M | — |
+| 25 | **D35 — diagnostics** | Map nodes freed through the wrong allocator, error ownership across the API, a file open per commit for the log index. | M | 18 |
+| 26 | **D15 — network hardening** | TLS, HTTP/2, backpressure, per-route timeouts, a load test. | M | — |
+| 27 | **D14 — replication** | `GET /log?since=<seq>` and a follower applying through replay. | XL | 26 |
+| 28 | **Auth review** | Rate limits, token lifetime, adversarial tests over subscriptions and budgets; tokens travel in clear until TLS; **grants are opt-in**, so a database with no grant rows accepts every statement from every client. | S | — |
+| 29 | **Release and packaging** | `scripts/package.py` builds and checks one archive. Left: one archive per target, a version policy, a byte-for-byte reproducible build. | M | 18 |
+| 30 | **Licence and notice review** | MIT/Apache-2.0 with no vendored third-party source; confirm before each release. | external | — |
+
+After these, [versioning-plan.md](versioning-plan.md) proposes version control
+with peer-to-peer sync; its networked phases build on items 26 and 27.
+
+## Suggested order
+
+1. **S1 and S2** first: they are what stops a real SQLite schema or query from
+   running at all, and each form is small, parser-heavy work with a differential
+   query to prove it.
+2. **R1 and R2** next: the two largest gaps against the reference, measured, with
+   the parity gate (item 5) landing alongside so the gain cannot slip back.
+3. **D23 and D34**: the two remaining ways the process can die instead of
+   answering.
+4. **S3 to S6**, then **R3/R4**: the rest of the visible surface and the smaller
+   speed items.
+5. **S7**, **D4/D24**, and the depth items of track C.
+6. **D15, D14** and the release gates, in that order.
 
 ## Efficiency contract and current baseline
 
 The contract is that the engine stays **equal or better** than the reference
-model in every measurable dimension. **It does not meet that today.** The
-reference's own benchmark suite, ported as `benchmarks/parity` and run on the
-same machine ([RESULTS.md](../benchmarks/parity/RESULTS.md)), puts this engine at
-this engine ahead on an empty transaction (0.50 us against 0.62) and behind
-everywhere else: writes are 1.6 to 2.9 times slower in memory (they were 3 to 15
-before the write-path rounds), a 256-row scan about 3 times (it was 9 before
-rows kept their id order) and an index lookup 3 to 4 times.
-The remaining causes are measured and listed there, in order of payoff. The rows below are this engine against its own recorded baseline, which
-is what the CI gate checks; they are not a comparison with the reference.
+model in every measurable dimension. **It does not meet that today**: on the
+reference's own suite ([RESULTS.md](../benchmarks/parity/RESULTS.md)) this engine
+is ahead on an empty transaction (0.50 µs against 0.62) and behind everywhere
+else: writes 1.6–2.9× in memory, a 256-row scan about 3×, an index lookup 3–4×.
+Track A is the plan to close it.
+
+The rows below are this engine against its own recorded baseline, which is what
+the CI gate checks; they are not a comparison with the reference.
 
 | Dimension | Baseline today | Contract |
 |---|---|---|
-| Insert throughput | 46 838 /s on the 20k gate (baseline 42 219); 54 580 /s over 50k, run directly | not worse on the same hardware. CI fails on bytes per row (10%) only, and reports wall clock twice per run, because this machine alone moved a metric by 30x with no code change; `--strict-time` enforces the 10% on a quiet machine |
-| Read transaction, anyone reading | **10.7 µs** over 50k rows warm; opening one after a commit is **38 µs** on the gate (21 µs over 50 000 rows): it copies nothing | should cost the rows the transaction touches; it costs one reference per table |
-| Commit with a read open | **16.9 ms** over 20 000 rows, **46 ms** over 50 000: it copies the table it writes and leaves the old one to the reader | the copy a commit pays is the rows of the table it writes, and only while a reader is open (D3) |
+| Insert throughput | 46 838 /s on the 20k gate (baseline 42 219); 54 580 /s over 50k, run directly | not worse on the same hardware. CI fails on bytes per row (10%) only, and reports wall clock twice per run, because this machine alone moved a metric by 30x with no code change; `--strict-time` enforces 10% on a quiet machine |
+| Read transaction, anyone reading | **10.7 µs** over 50k rows warm; opening one after a commit is **38 µs** on the gate (21 µs over 50 000 rows): it copies nothing | costs one reference per table |
+| Commit with a read open | **16.9 ms** over 20 000 rows, **46 ms** over 50 000: it copies the table it writes and leaves the old one to the reader | the copy is the rows of the table written, and only while a reader is open |
 | Commit record | one record, CRC32C, group commit | durability never traded for speed silently |
 | Compaction | 0.48 s for 50k rows, one file left | same |
 | Memory per row | `Row` 80 B, `Value` 24 B | no growth without a written reason |
-| Join, inner side | a nested loop reads the inner rows its ON clause names (`test_join_probes_the_inner_index`: 1 200 rows where a scan read 200 200) | O(rows the outer row matches) |
-| Ordered read | `ORDER BY <index key>` walks the index: 137 ms against 342 ms sorted over 50 000 rows, and `LIMIT 5` reads five rows in 4.6 ms where the sort took 115 ms | an ordered query costs the rows it returns, not a sort |
-| Subscription delta | O(rows touched), for a join too: an equi-join is indexed by its key, so a commit probes the matches (one candidate for an insert, six for a base-row change, in a fixture of 200 authors and 900 books, where it used to read 200 and 900) | O(rows touched) for the table the commit changed |
+| Join, inner side | a nested loop reads the inner rows its ON clause names (1 200 rows where a scan read 200 200) | O(rows the outer row matches) |
+| Ordered read | `ORDER BY <index key>` walks the index; `LIMIT 5` reads five rows | an ordered query costs the rows it returns |
+| Subscription delta | O(rows touched), for a join too: an equi-join is indexed by its key | O(rows touched) for the table the commit changed |
 
-These are the numbers the gate compares against and the targets the engine is
-held to, and every row is met today. The read row is met by moving the copy
-rather than hiding it: a read copies nothing, and the commit pays for the table it
-writes while a reader holds it, once per read generation. `bench-read` reports the
-read and that commit separately, and `scripts/bench.py` gates both. The
-subscription row is met by the join index, and
-`test_join_subscription_probes_the_join_key` counts the candidates a commit
-walks, so a regression to the scan fails the suite.
-
-## Reusing the engine's networking for D14
-
-The engine this tool accompanies (checked out as `mirai-engine`) already has a
-networking library in the same language, Odin, so the follower does not need a new
-protocol: it can import `net` and carry replicated commit records as its messages.
-The package is about 12.000 lines across 48 files and exposes
-`repl_peer_allocate` / `_connected` / `_disconnected` / `_release`, the authority
-operations (`Authority_Request` / `_Grant` / `_Release`) as system messages, plus
-`channel`, `clock`, `conditioner`, `baseline` and `pool`.
-
-| Piece there | What it gives a follower |
-|---|---|
-| `channel` | datagrams delivered whole and in order, or not at all; one reliable channel and one unreliable, kept by the library |
-| `replication` / `protocol` | the message set for peers and the rules for what is sent once and in what order |
-| `baseline` + `collection` | "start from this state, then apply changes": our snapshot plus records after `seq` maps onto it directly |
-| `clock` | ticks numbered alike on both ends, which is what makes applying a record deterministic |
-| `peer` / `host` / `connection` | connection lifecycle and queues; a full reliable queue refuses messages instead of dropping the connection |
-| `conditioner` | simulated latency, jitter and loss: the test rig for a lagging or flapping follower |
-
-What miraidb brings: the segmented log with CRC32C per record, the replay path and
-the snapshot with an offset index. What the engine brings: transport, ordering
-guarantees and the harness. D14 is mostly wiring: name a baseline, stream records
-after it, apply through `commitlog`, expose the last applied sequence.
-
-## What this costs
-
-| Work | New engine lines (order of magnitude) |
-|---|---|
-| The second-pass items (D31, D30, D27, D28, D29) | ~2.000 |
-| The first audit's items (D22–D26: server, limits, the mirror, the C ABI, doc claims) | ~2.500 |
-| The grammar and the depth work (D9, ASAN, D2, D10, D14, D12c, D15, D16, D1 and the residuals) | ~14.000 |
-| The release gates (CI, packaging, auth, licences) | ~1.000 |
-
-## Closed already (for the record)
-
-The items below were in this table and are done; each entry names the code and
-the test or gate that proves it. The engineering gates that watch them today are
-listed in `docs/status.md` and run by `scripts/ci.py` (25 gates).
-
-| Item | Evidence |
-|---|---|
-| **D1 — the rest of full-text search** | Phrases (`"a b"`, with a prefix last word), prefixes (`foo*`, one range over the term index) and column filters (`body:foo`), composing with `OR` and `NOT`; `AND` was already an operator, not a term. The index format did not change: a phrase or a column filter verifies its candidates against the stored text, so it costs the documents that hold every word. `test_full_text_phrase_prefix_and_column`. |
-| **PostgreSQL clients, for real** | Driven with `psql` and psycopg 3, the server had four defects that kept every real driver out: it read one TCP packet as one message (a driver's pipelined Parse/Bind/Describe/Execute/Sync lost everything after Parse and waited forever), it freed a slice of the network buffer when a statement name was reused (the second unnamed Parse killed the process), it sent no `client_encoding` (psycopg's C build crashed), and `Execute` repeated the RowDescription with different types than `Describe` had announced. Fixed, with transactions that span messages, the aborted state, several statements per Query, command tags, SQLSTATE codes, and the dialect: `::`, `SERIAL`, identity columns, `$n`, PostgreSQL's type names, `information_schema`/`pg_catalog.pg_tables`, the session functions. `test_postgres_dialect`, `test_postgres_session_transactions`, `test_postgres_extended_query`. |
-| **D9 — the rest of the grammar** | `GROUP BY` on a projection alias, `JOIN … USING` with the merged column printed once, `RANGE`/`GROUPS` frames with offsets in the order value, `BEFORE` triggers, `ALTER TABLE … ALTER [COLUMN] c [SET DATA] TYPE t` (every row rewritten through `CAST`, refused if a value does not convert), a window beside `GROUP BY` (its input rows are the groups, so `sum(count(*)) OVER ()` is the total of the per-group counts), a window inside a larger expression (filled into a hidden slot before the projection is evaluated), host functions from SQL and from C, and host collations: a program registers a comparison and SQL names it with `COLLATE`, asked wherever a comparison happens and refused - with the reason - where the engine would have to fold the text into a key. An unknown collation name is refused too, as SQLite refuses it. `test_group_by_a_projection_alias`, `test_join_using`, `test_window_range_and_groups_frames`, `test_before_triggers`, `test_alter_column_type`, `test_windows_beside_group_by`, `test_windows_inside_expressions`, `test_host_functions`, `test_host_collations`, `scripts/capi_smoke.py`. |
-| **Diagnostics — a leak report a human can read** | The `+++ leak` lines were real: five live allocations per read, most of them error messages a caller had asked for and dropped ("table _view is not visible to this transaction", built once per statement). `tx_table_probe` now answers "is that a table?" without building anything, `error_free` gives a message back, and the rest were the lexer's quoted text, the read set, the plan's steps, the projection names, a `to_lower` copy per comparison, the `EXPLAIN` fragments, `PRAGMA`'s lowered name and its rows array, and the slices a `RETURNING` that never returns builds. A tombstone now frees the row values it dropped. `tools/leakcheck` reports zero for every read shape and a flat count for writes, printing the file and line of anything left behind; `scripts/leaks.py` applies the budgets and measures the CLI working set (gate 25). The suite's own line count fell from 289 878 to 116 741 and the remainder is test-side. |
-| **D18a — writer lock** | `<directory>/lock` held with an OS lock (Windows `LockFileEx`, POSIX `fcntl`), released on close and on death; the refusal names the owner. `test_writer_lock` and `scripts/lock_smoke.py` with two processes. |
-| **D18b — a reader beside the writer** | Two lock bytes: the writer's exclusive, the reader's shared. A read-only open replays, refuses every mutation and waits out a compaction; a paged database opens from `<db>/catalog` and trusts the page files only when every sequence agrees (the 60k-row peak fell from 33.9 MiB to 6.4 MiB). `test_read_only_opens_beside_a_writer`, `test_trusted_open_skips_the_replay`. |
-| **D18c — broker mode** | `miraidb-server` owns the directory and serves HTTP wire messages, TCP frames with a per-connection owner, and Postgres; `scripts/broker_smoke.py` runs two processes, reads a write from a second client and refuses a second owner. |
-| **D22 — the server, for real** | A thread per connection, so a subscriber no longer blocks anyone; `host.on_update` wired to the transport, so a subscription delivers a delta per commit (`scripts/broker_smoke.py` holds a subscription open, writes from another client and reads the delta); `ATTACH`, `LOAD EXTENSION` and `VACUUM INTO` refused to clients with `Permission_Denied` unless the server was started with `--allow-host` (`test_host_statements_need_host_access`); `--statement-timeout-ms` cancels a statement that outlives it and the server keeps serving (the gate proves the error, the survival and the untouched table). `docs/security.md` states what a token buys and what is not defended. Statements still run one at a time, which the store's single identity field requires. |
-| **D24 — the `.sqlite` mirror** | A file stays readable through DDL: the full rewrite honours the room the 100-byte header needs, so an empty `sqlite_master` (a dropped last table) no longer writes a malformed file; an imported file's indexes are read and recreated, so a plan walks one and `DROP INDEX` finds it. `scripts/sqlite_abi_smoke.py` runs `DROP TABLE`, `ALTER TABLE`, `INSERT`, `DROP INDEX` and `CREATE INDEX` through the facade and verifies integrity, rows and `sqlite_master` with Python's `sqlite3`; `test_empty_export_is_a_readable_file` and `test_imported_indexes_are_planned_and_droppable` cover the two defects. |
-| **D30 — the differential and the gate** | `differential.py` decides the row order from the statement's own top-level `ORDER BY` (a window's `OVER (… ORDER BY …)` no longer counts, so the three window queries that were reported as differences now agree), compares a cell by type as well as value, and carries 94 queries with 6 refusals and 7 intentional differences. It found the printf format bug on the way. `bench.py` fails on bytes per row (10%) and reports every time metric twice per run with its spread, because this machine moves one by 30x with no code change; `--strict-time` enforces 10% on a quiet box. |
-| **D26 — docs whose claims are executed** | The compatibility matrix is a table CI runs: `docs/sqlite.md` carries a ```compat block of sixteen claims — `matches` (both engines agree), `ours` (this engine answers what is written and SQLite answers something else) and `refused` (the statement fails with the reason named) — and `scripts/compat_check.py` runs each through the CLI's `--json` and through SQLite's Python module on separate in-memory databases. Writing it corrected two sentences: `printf('%.0f', 2.5)` answers 2 here and 3 in SQLite (this engine rounds half to even, SQLite half away from zero), and the split is now a row rather than prose. Gate 24, so a claim that stops being true fails CI. |
-| **D27 — the mirror keeps the schema it does not model** | A rewrite re-emits the file's own text for every object it did not change: `ALTER TABLE parent …` leaves `child`'s `REFERENCES … ON DELETE CASCADE`, `CHECK`, `DEFAULT` and `COLLATE` alone, keeps the views and triggers, and — with the automatic indexes D33 taught the writer to number — keeps a table whose declaration spells a `UNIQUE` column, a text or a composite `PRIMARY KEY` exactly as it was, `sql` and index numbers included. `--mirror-report` names whatever had to be rebuilt (`mirror-lost:`). What a rebuild still cannot hold is stated: the table the DDL itself changed, a `GENERATED` column (SQLite computes it and does not store it) and a `WITHOUT ROWID` table (its rows have no rowid to patch). `scripts/sqlite_abi_smoke.py` compares `sqlite_master` before and after an `ALTER` for the plain, keyed and declaration-backed shapes and proves a duplicate is still refused; `test_rewrite_keeps_a_keyed_table_as_it_was` does it through the engine's own mirror. |
-| **D25 — the C ABI, completely** | 33 `miraidb_*` exports and 43 `sqlite3_*` exports reach every lever the engine has: `miraidb_open_ex` (read-only, in-memory, no-sync, paged), `miraidb_interrupt`/`sqlite3_interrupt` (the cancellation belongs to the statement, so the connection keeps serving), the two caps and `miraidb_work_used`, and an identity — `miraidb_set_identity`, `miraidb_identity`, `miraidb_issue_token`, `miraidb_authenticate`, which answers `MIRAIDB_DENIED` for an unknown or expired token and changes nobody. A token is a row of the database, so the lookups were moved from `Host` to `Store` (`store_token_key`, `store_authenticate`); the key cache moved with them, which stopped a leak, and `_meta` is created on first use because an embedded database has no host to create it. The `sqlite3_*` face answers SQLite's primary result codes and, when asked, the narrow constraint ones (`_PRIMARYKEY` 1555, `_UNIQUE` 2067, `_NOTNULL` 1299); `include/miraidb.h` states the threading contract. `scripts/capi_smoke.py` proves the round trip across a reopen, a policy hiding another caller's rows, an expired token and a connection that never authenticated; `scripts/sqlite_abi_smoke.py` proves each code in both modes. |
-| **D33 — the export writes a schema it can back** | A primary key is declared in the exported table text and its index is written as the automatic index a declaration implies (`sqlite_autoindex_<table>_1`, no SQL), so a text key, a composite key and a `UNIQUE` column all leave a file `PRAGMA integrity_check` calls `ok` and that refuses a duplicate and a null key — where a text key used to produce "wrong # of entries in index sqlite_autoindex_k_1" and a `UNIQUE` column was silently dropped. An import reads a column `UNIQUE`, a table-level `UNIQUE (a, b)` and a table-level `PRIMARY KEY (a, b)` out of the table text and recreates them, so the constraint survives the trip and is enforced afterwards. `test_keys_cross_a_sqlite_file_both_ways`, `test_import_keeps_the_keys_sqlite_declared`, and the `src/tests/fixtures/keys.sqlite` fixture (five shapes whose automatic indexes carry no SQL). |
-| **D32 — bytes and characters** | Three edges fixed: the CLI decodes its arguments from the wide command line (`src/cli/args_windows.odin`), so `SELECT 'é'` reaches the parser as `C3 A9` instead of one ANSI byte; `hex()` of text iterates the bytes rather than runes, so `hex('é')` is `C3A9` where it answered `E9`; and both JSON writers escape a byte that is not part of a UTF-8 sequence as `\u00XX`, so `--json` output always parses (`test_text_is_bytes_and_json_stays_valid`, and `scripts/shell_smoke.py` sends the statement through argv and checks the document). |
-| **D28 — opening in memory** | `:memory:`, the empty path, `file::memory:`, `file::memory:?cache=shared` and `file:<name>?mode=memory` open a private in-memory database: `store_path_is_memory` recognises the spellings in `store_open`, the one door the CLI, the C ABI and the facade all go through, so none of them needed its own rule. `test_open_in_memory_the_way_sqlite_does` opens all five, writes, reads and proves a second open is empty and no directory was made; `scripts/capi_smoke.py` and `scripts/sqlite_abi_smoke.py` open each spelling through the DLL. |
-| **D29 — handles, and the bind index** | The embedding layers keep a set of live handles (`src/engine/handles.odin`) and check a handle by value before dereferencing it, so a statement used after `finalize` or through a closed connection answers `MIRAIDB_MISUSE`/`SQLITE_MISUSE` instead of reading freed memory, and a second `finalize` does nothing. Closing a connection finalizes the statements it still owns, so they become misuse too. `embed_prepare` parses eagerly, which gives `Embed_Parameter_Count` and turns a bind past it into `SQLITE_RANGE` (25) instead of a silent growth; a syntax error now fails at prepare. `test_bind_range_and_live_handles` covers the range and the registry; `scripts/capi_smoke.py` and `scripts/sqlite_abi_smoke.py` run the hostile sequences through both DLLs. |
-| **D31 — the wrong answers** | Text positions count characters, so `length('héllo')` is 5, `instr` answers a character position and `substr` follows SQLite for a negative start, a start of zero and a negative length (`test_text_positions_count_characters`, 21 cases); `WHERE` converts a text to a number first, so `WHERE 'a'` keeps no row (`test_text_truth_is_numeric`, 17 literals); `--json` and the engine JSON writer keep the `.0` on a real, with `json_type`/`json_extract` agreeing on the type (`test_json_keeps_real_type`, `scripts/shell_smoke.py`); `INSERT OR REPLACE` deletes on any unique conflict and inserts, without delete triggers (`test_insert_or_replace`). |
-| **D6 — the join constants** | The join delta, the probe, the order searched by cost with measured constants, the range written as two comparisons, the subscription walking the planned order, and the star expanded from the statement. Each has its test (`test_join_subscription_walks_the_planned_order`, `test_plan_reads_a_range_written_as_two_comparisons`, `test_plan_does_not_cross_join_before_it_can_filter`, …) and gate 7 judges the plan by rows visited. |
-| **D8 — fault injection** | `Fault_Vfs` fails any operation at any call, or writes short; `test_fault_injection` arms every write of a workload and proves the reopen sees exactly the commits that reported success. |
-| **Benchmark gate** | `benchmarks/baseline.json` plus `scripts/bench.py --check`: bytes per row within 10% of the baseline, which is a property of the format and the one thing CI can fail on. Every time metric is measured **twice in the same run** and reported with its spread, because three runs of one workload on this machine gave 15.6, 22.6 and 46.3 µs for a read transaction and 5.3 and 73.6 ms for a commit with a reader open. `--strict-time` fails on 10% against the baseline and is for a quiet box (`--record` first). |
-| **D11 — DDL inside a transaction** | Index operations are staged like row changes, applied after them, and rolled back with them; `DROP INDEX` finds an index created earlier in the same transaction and a duplicate create is refused before apply (`test_ddl_in_transaction`). |
-| **D1 — full-text index and BM25** | The `term` index is created with the table, `rank` is BM25 over the postings, `snippet`/`highlight` mark the match, and a rare term visits at most 8 rows of 5 000 (`test_full_text_ranking`, `test_full_text_cost`). |
-| **D13 — the stored result on a retry** | The response commits with the request id and `host_call_once_result` answers a retry with it (`test_idempotent_result`). |
-| **D17 — rows on disk** | A store opened with `paged_tables` keeps each table in a 4 KiB-page file under `<db>/tables`: a cache over the log, flushed after the log record is durable, frame 0 reserved for the header. A single-table query streams the pages; `ORDER BY`/`GROUP BY`/`DISTINCT`/windows/`AS OF`/joins/staged writes fall back to collecting. `scripts/page_rss.py` is a gate: a table 63× the pool adds 316 KiB to the statement and four times the rows adds the same. |
-| **D19 — `CASE` expressions** | Both forms, anywhere an expression is allowed, including policies and triggers; `NULL` conditions match nothing, no `ELSE` gives `NULL`, only the chosen branch is evaluated. `test_case_expressions`, and seven `CASE` queries in the differential corpus. `GROUP BY` on a projection alias is still D9. |
-| **D20 — differential runner** | `scripts/differential.py` is a gate: 94 queries answer identically through this engine and the system `sqlite3`, 6 statements are refused with a reason and 7 differ on purpose. It found the ORDER BY tie order (fixed with a row-id tiebreak) and the missing scalar `min`/`max` and `trim(s, chars)` (fixed); a refusal that stops refusing fails the gate. Its two blind spots (a window's `ORDER BY` read as the result's order, and `1` compared as `1.0`) were fixed in **D30**, and the corpus grew from 55 to 94 then. |
-| **D5 — index keys in pages** | Each index of a paged table is a B+tree of 4 KiB pages under `<db>/indexes/…` with its own pool, chained leaves and a cursor without a parent stack; point lookups, ranges, `UNIQUE`, updates, deletes and `TRUNCATE` go through the pages. An empty leaf is not merged yet (a delete never answers wrongly). |
-| **D6 — the planner** (the first half) | `ANALYZE` measures rows, distinct values, NULLs, the numeric range and a sixteen-bucket histogram into `<db>/stats`; the planner prices scan against probe and prints `est. N rows, cost C`; joins run in the planned order with each `ON` attached to the step that completes the relations it names. `scripts/plan_check.py` guards the plans (`test_analyze_and_plan_estimates`, `test_plan_reorders_a_join`). The join delta is item 2, and the order is searched by cost: a produced row is measured at 5.1 µs and a step whose `ON` cannot be answered yet multiplies by its whole relation, so it runs last (`test_plan_does_not_cross_join_before_it_can_filter`). |
-| **D4 — `.sqlite` pages in place** | The mirror patches the leaf of every changed row, the separator its parent stores and page 1: three pages (12 KiB) per commit at 10k, 100k and 250k rows, where re-encoding wrote 172 KiB, 1.8 MB and 4.8 MB. Splits, empty-leaf unlink, free-list reuse and torn-commit recovery through a rollback journal in SQLite's format; `scripts/mirror_cost.py` checks the file with real `sqlite3`. |
-| **D3 — `AS OF` and version pruning** | `FROM t AS OF <seq>` reads the versions the table keeps and `store_prune_versions` discards what no reader can ask for (`test_as_of`); automatic retention and `AS OF` on a join remain in D3's backlog entry. |
-| **D3 — a read that copies nothing** | A read transaction shares the tables: one reference per table, no rows copied, and the store's read cache is gone with it. A commit that has to change a table a reader holds copies **that** table (`table_cow_clone`), so the copy is per written table and only while a reader is open. The first read after a commit fell from 24 ms to 38 µs on the gate (21 µs over 50 000 rows); the commit that pays for a live reader is 16.9 ms (46 ms over 50 000). `test_a_commit_copies_the_table_a_reader_holds` proves the reader keeps its values, that the table a commit does not write is not copied, and that a commit nobody reads copies nothing; `bench-read` reports both numbers and `scripts/bench.py` gates both. |
-| **D7 — scheduler durability** | `_schedule.at_us` is a column and commits; a restart resumes pending work (`test_durability_after_restart`). |
-| **D12a / D12b — work budget and module latency** | One unit per row touched, a per-statement and a per-call budget that rolls the call back (`test_work_budget`); one pooled socket per module, one frame each way. |
-| **Page memory gate** | `scripts/page_rss.py --check` reads a table far larger than the pool and bounds what the statement adds; `scripts/plan_check.py` guards the plans a measured fixture must produce. |
-| **Sanitizer pass (bounds and stack)** | The suite runs under `-sanitize:address` with no bounds or stack report; the heap half is item 6, because Odin's allocator on Windows bypasses the sanitizer's interception (verified with a deliberate use-after-free). |
-| **Documentation consistency gate** | `scripts/docs_check.py`: version, test count, gate count, CLI commands, relative links, roadmap/backlog cross-references, orphan documents and the names the project does not use. Backlog D21. |
-| **Audit corrections** | Two items once written down as gaps (D7, D13) were already durable, two wrong answers in `IN`/`NOT IN` and `DISTINCT` aggregates were found and fixed with tests, and the capabilities that three documents understated (the README, the CLI usage and the SQLite matrix) were rewritten. |
-
-The three asks of the original plan — access from several processes, a per-term
-full-text index, and pages on disk — are all closed above. What remains is
-depth, not absence.
+Every row of this table is met today and gated by `scripts/bench.py`, the read
+and commit numbers by `bench-read`, and the subscription row by
+`test_join_subscription_probes_the_join_key`. The engineering gates are listed in
+`docs/status.md` and run by `scripts/ci.py` (26 gates).

@@ -352,7 +352,7 @@ Two shapes avoid the re-evaluation:
 
 `DISTINCT`, `ORDER BY`, `LIMIT` and policies still take the full evaluation and
 diff. Their deltas are correct; making them incremental is a refinement
-(`docs/pending.md`, #30).
+(`docs/closing-plan.md`, #30).
 
 ## Diagnostics
 

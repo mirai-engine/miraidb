@@ -1,521 +1,289 @@
-# Backlog: depth work
+# Backlog: the detail of what is open
 
-The parity matrix is closed: every feature in `docs/features.md` has an
-interface, a test and a documented cost, and `docs/roadmap.md` orders what is
-left. This file is the other axis — **depth**. It lists the places where the
-implementation answers the interface at a lower cost than a mature engine would,
-what the current behaviour actually costs, what "done" means, and how big the
-work is.
+[roadmap.md](roadmap.md) orders the open work; this file holds the detail of each
+item: what the engine does today, what it costs, what "done" means and how big
+the work is. Items that are closed leave this file. Their evidence is recorded
+in [closing-plan.md](closing-plan.md), and their full write-ups are in the git
+history of this file.
+
+Item names say which goal an item serves:
+
+- **R** — the reference model: be as fast as it is, or faster, on its own
+  benchmark suite ([RESULTS.md](../benchmarks/parity/RESULTS.md)).
+- **S** — SQLite's surface: the functions, pragmas and grammar measured by
+  `scripts/sqlite_gaps.py` ([sqlite-roadmap.md](sqlite-roadmap.md)).
+- **D** — depth and hardening: the places where the engine answers correctly at
+  a cost or a risk a mature engine would not accept. D-numbers are the historic
+  ones, so a gap in the sequence is an item that was closed.
 
 Rules for this file:
 
 1. An entry moves onto the roadmap only when its **Done when** block is a set of
-   tests, not a paragraph. Until then the interface stays as it is and the cost
-   below is the honest answer.
+   tests, not a paragraph.
 2. Nothing here may be claimed in `README.md`, `docs/status.md` or a commit
-   message until its tests exist. The "Not claimed today" line of each entry is
-   the wording to use.
+   message until its tests exist.
 3. Effort is in engine lines, not calendar time: **S** < 500, **M** 500–1.500,
    **L** 1.500–4.000, **XL** > 4.000.
 
 ## Summary
 
-| # | Area | Today's cost | Gap | Effort | Priority |
-|---|---|---|---|---|---|
-| D1 | Full-text term index and BM25 | **done**: index on `term` in the same transaction, BM25 `rank`, `snippet`/`highlight`, scan narrowed to the matches, phrases, prefixes and column filters (`test_full_text_ranking`, `test_full_text_cost`, `test_full_text_phrase_prefix_and_column`) | parentheses, `NEAR` | M | done |
-| D2 | Spatial index | overlap is a scan of the boxes | node file, tree descent | M | P2 |
-| D3 | Snapshot cost — *done* | a read copies nothing (one reference per table); a commit copies the table it writes when a reader holds it, once per read generation: read after a commit 38 µs on the gate, commit against a reader 16.9 ms (`test_a_commit_copies_the_table_a_reader_holds`) | automatic version retention | M | P2 |
-| D4 | Page backend | `.sqlite` is rewritten whole per commit | pages in place, WAL frames, free list | XL | P1 |
-| D5 | Persistent indexes | **done**: index keys live in B+trees of pages, with a pool, a cursor over chained leaves and a memory gate | merging empty leaves; a trusted open without replay (D18b) | L | P0 |
-| D6 | Query planner — *done* | `ANALYZE` measures row counts, per-column distinct/NULL counts, the numeric range and a sixteen-bucket histogram into `<db>/stats`; the plan prices scan against probe from those numbers, picks between index candidates, prints `est. N rows, cost C`, prices a range written as two comparisons as one band, serves `ORDER BY` from an index, and searches the join order by cost — a step whose ON can be answered is preferred, because one that cannot multiplies the intermediate result by the whole relation (`test_plan_reorders_a_join`, `test_plan_does_not_cross_join_before_it_can_filter`, `scripts/plan_check.py`) | **nothing** | — | — |
-| D7 | Scheduler durability | **durable** (due time is a logged column) | recovery test | S | — |
-| D8 | Crash injection | **done**: `Fault_Vfs` fails any operation at any call, and `test_fault_injection` walks the write offsets | same for the snapshot and the mirror writes | S | P1 |
-| D9 | SQL grammar | 33 statements, **`ROWS`/`RANGE`/`GROUPS` frames, trigger `WHEN` and `BEFORE`, `RENAME COLUMN`, `GROUP BY` on an alias and `JOIN … USING` done** (`test_window_frames`, `test_window_range_and_groups_frames`, `test_trigger_when`, `test_before_triggers`, `test_alter_rename_column`, `test_group_by_a_projection_alias`, `test_join_using`) | windows beside `GROUP BY`, `ALTER` type changes, user functions | L | P2 |
-| D10 | Types and precision | `Int128` as two `u64` | decimal arithmetic, time zones | M | P3 |
-| D11 | Virtual-table breadth | **done**: index DDL is staged and applied after the rows (`test_ddl_in_transaction`) | triggers/policies in the same transaction | S | P1 |
-| D12a | Metering granularity | **per row read and written, with a budget that aborts** | — | S | done |
-| D12b | Module call latency | **one pooled socket per module** | — | S | done |
-| D12c | Module determinism | **caller's clock travels in the call**; no VM | deterministic VM, enforced quotas | L | P2 |
-| D13 | Exactly-once across restarts | **done**: request id and result commit with the effects; a retry returns the stored result (`test_idempotent_result`) | — | S | P2 |
-| D14 | Replication | one process, one log | log shipping, follower reads, failover | XL | P3 |
-| D15 | Network hardening | HTTP/WS subset with caps | TLS, HTTP/2, backpressure, per-route timeouts | M | P3 |
-| D16 | Clients | **Python binding over the C ABI, with a smoke gate** | generation per catalog | M | P3 |
-| D17 | Rows on disk | **done**: paged tables, pool, free list, flush order, streaming scan with aggregates, memory gate | index pages (D5), a trusted open without replay (D18b) | XL | P0 |
-| D18a | Second writer | **done**: `lock` file, OS lock, refusal naming the owner (`test_writer_lock`, `scripts/lock_smoke.py`) | — | S | P0 |
-| D18b | Reader beside writer — *done* | **a reader opens beside the writer** (two lock bytes: writer exclusive, reader shared; `read_only` replays into memory, refuses every write and keeps compaction waiting) and **a paged database opens without replaying**: `<db>/catalog` names the schema and the log index names the last record, and the open trusts the page files only when both sequences agree (`test_read_only_opens_beside_a_writer`, `test_trusted_open_skips_the_replay`, `scripts/lock_smoke.py`) | a follower that tails commits; a read-only open of a quiescent database could trust the pages too, but a reader cannot know whether the writer beside it has pages in flight | L | P1 |
-| D18c | Broker mode | **done**: `miraidb-server` owns the directory, clients speak the wire over HTTP, TCP frames or Postgres; two processes proven by `scripts/broker_smoke.py` | — | M | P1 |
+| Item | Today | Gap | Effort |
+|---|---|---|---|
+| R1 | rows live in a map keyed by id; a scan looks every id up | rows stored in id order | L |
+| R2 | every index entry is an encoded string | fixed-size keys where the column allows | M |
+| R3 | pruning walks every row of every table after each statement | prune what the commit touched | S |
+| R4 | a committed row is copied from the transaction arena to the table | hand the staged row over | M |
+| S1 | `CHECK`, column `REFERENCES`, `CONSTRAINT` names, `DESC` and partial/expression indexes, `CURRENT_TIMESTAMP` are refused | accept the schema real SQLite files declare | M |
+| S2 | eleven common statement and expression forms are refused | parser and executor work, each small | M |
+| S3 | `RIGHT`, `FULL` and `NATURAL` joins are refused | the three joins | M |
+| S4 | `FILTER`, `WINDOW`, aggregate `ORDER BY`, ordered-set aggregates missing | the aggregate surface | M |
+| S5 | 48 of 121 built-in functions missing | math, JSON/JSONB, text, introspection | M |
+| S6 | eight statements and 9 pragmas missing | `EXPLAIN QUERY PLAN`, `REINDEX`, `INSTEAD OF`, `generate_series`, … | M |
+| S7 | `ANY` columns exist; an untyped column, affinity and cross-class comparison do not; `WITHOUT ROWID` cannot be written | SQLite's typing rules | L |
+| D2 | overlap on an `rtree` table is a scan | node pages and a descent | M |
+| D3 | versions stay until `store_prune_versions` is called | automatic retention, `AS OF` on a join | M |
+| D4 | a table with a secondary index re-encodes the `.sqlite` mirror | patch the index b-trees | L |
+| D5 | paged tables: no leaf merge, one version per row | the rest of the page store (with D17) | L |
+| D8 | the fault walk covers the log | snapshot, rotation and mirror | S |
+| D10 | decimals are floats, timestamps have no zone | decimal scale, `TIMESTAMPTZ`, streaming blobs | M |
+| D11 | index DDL is atomic | triggers and policies ordered against the rows of their transaction | S |
+| D12 | a module is a process with a work budget | a deterministic sandbox | L |
+| D14 | one process owns one log | log shipping to followers | XL |
+| D15 | HTTP/1.1 and WebSocket with caps | TLS, HTTP/2, backpressure, timeouts, a load test | M |
+| D16 | a hand-written Python binding | bindings generated from the catalog, more languages | M |
+| D18 | a read-only open replays | a reader that trusts the pages of a quiescent writer | M |
+| D23 | depth, row quota and budget are bounded | an allocation failure is a crash, not an error | M |
+| D24 | an index the engine cannot express is dropped on import | a counted skip, and a mirror fuzz pass | S |
+| D34 | the Linux suite crashes under the threaded runner; the heap half of ASAN waits on it | find the corruption, then run ASAN on POSIX | M |
+| D35 | diagnostics: test-side leak lines, map nodes freed through the wrong allocator, error ownership | one sweep | M |
 
 ---
 
-## D1 — Full-text: index the term column
+## R — the reference model
 
-**Done.** `CREATE VIRTUAL TABLE … USING fts5(cols)` now creates, in the same
-transaction (D11 made that possible):
+The reference's own suite, ported as `benchmarks/parity` and run on the same
+machine, is the measure. In memory this engine is faster on an empty
+transaction (0.50 µs against 0.62) and slower on everything else: inserts
+1.6–2.9×, updates 2.3×, a 256-row scan about 3×, an index filter 3–4×. On disk
+(written, not synced, the reference's own contract) inserts are 3.0–4.8×.
+SQLite, measured in the same run, also beats this engine on inserts and on
+updates by a wide margin, so the target is not only the reference. Where the
+time goes is measured in [RESULTS.md](../benchmarks/parity/RESULTS.md); the four
+items below are its list, in order of payoff.
 
-```sql
-_fts_<name>_terms (term, doc, tf)       -- one posting per distinct term per document
-_fts_<name>_docs  (doc, length)         -- tokens per document
-_fts_<name>_stats (id, docs, tokens)    -- corpus size and total tokens, one row
-```
+**Done when, for the whole track.** Every workload of `bin/parity.exe mem` and
+`bin/parity.exe disk` is at or under the reference's figure on the same machine,
+and `scripts/bench.py` gains a gate that fails on a regression of the parity
+numbers, measured twice per run like the existing time metrics.
 
-with an index on `term`, one on `doc` and one on the document length. A query
-walks the postings of its terms; the scan over the documents is narrowed to the
-matching rows (`fts_scan_candidates`), so the cost follows the postings of the
-query instead of the vocabulary or the corpus. `rank` is BM25 negated (lower is
-better, so `ORDER BY rank` puts the best first), computed from document frequency,
-term count and document length. `snippet()` and `highlight()` mark the tokens the
-pattern asks for, `AND` is accepted as the juxtaposition it already was, and the
-per-query work is cached per transaction.
+## R1 — Rows stored in id order
 
-**Cost now.** One index probe per query term plus one probe per matching posting;
-a term that every document carries costs its postings, because ranking has to
-look at every candidate. That bound is written down, not hidden.
+**Now.** A table keeps its rows in `map[Row_Id]Row` plus a sorted id list
+(`Table.order`), so a scan walks the list and looks each id up in the map, and
+staging a row pays a map insert, the largest single cost of an insert.
 
-**Measured.** `test_full_text_cost`: 5000 documents, one rare term → at most 8
-rows visited; a term in every document → its postings, never the vocabulary. A
-bulk load stays linear: 5000 documents insert with one row visited per document.
+**Done when.** Rows live contiguously in id order (an array of rows with a
+tombstone, or pages of rows), a scan is a walk over memory, the map insert is
+gone from staging, and `test_scans_come_out_in_row_id_order` plus the
+copy-on-write tests still pass. Measured: iterate within the reference's 1.65 µs,
+and the insert workloads move by the map's share.
 
-**Left.** Phrase queries (`"a b"`), prefix (`foo*`) and column filters
-(`body:foo`), and a `MATCH` whose pattern is a column of the row (only constants
-and parameters narrow the scan).
+## R2 — Fixed-size index keys
+
+**Now.** Every index entry is a key encoded into a string (`index_entry_key`),
+compared byte by byte, and copied into the table arena on apply: the largest
+share of applying a row, and the cost of an index filter.
+
+**Done when.** An index over integer columns keys its tree by the integer (or a
+fixed-width tuple) and an index over text keys by the text it already holds; the
+filter workloads reach 4.05 µs and an insert with `btree_each_column` its
+reference figure.
+
+## R3 — Prune only what a commit touched
+
+**Now.** Pruning row history walks every row of every table, and the CLI and the
+C ABI prune after each statement.
+
+**Done when.** A commit records the rows it versioned and the prune visits those
+only; a test proves a commit to one table never visits another.
+
+## R4 — Hand the staged row to the table
+
+**Now.** A committed row is copied from the transaction arena to the table's heap
+(about 4% of an insert, measured).
+
+**Done when.** The table takes ownership of the staged values. The ownership has
+to survive savepoints, `ALTER` and rollback, which is why this is last.
+
+---
+
+## S — SQLite's surface
+
+Measured by `python scripts/sqlite_gaps.py`, which runs every built-in function
+and pragma of SQLite 3.54.1 and 63 grammar shapes through the CLI. Every gap below
+is **refused with a message**, never answered differently: that is the property
+`scripts/differential.py` guards, and each item keeps it. An item is done when
+its shapes run, `sqlite_gaps.py --check` is updated, and the differential corpus
+gains a query per shape that compares the answer with SQLite's.
+
+## S1 — The schema real files declare
+
+**Now refused.** `CHECK` constraints (column and table), `CONSTRAINT <name>`
+before a constraint, a column-level `REFERENCES` (only `FOREIGN KEY (…)
+REFERENCES` parses), `DEFERRABLE INITIALLY DEFERRED`, `DESC` on an index column,
+partial indexes (`WHERE`), indexes over expressions, and `CURRENT_TIMESTAMP` /
+`CURRENT_DATE` / `CURRENT_TIME`, both as values and as a `DEFAULT`.
+
+**Why first.** A schema that uses any of them fails at `CREATE TABLE`, so
+nothing written against it runs; and an imported file whose index is partial or
+over an expression loses that index today (D24).
+
+**Done when.** Each form is accepted and enforced: a `CHECK` that fails refuses
+the row with SQLite's message and `SQLITE_CONSTRAINT_CHECK` through the facade; a
+deferred foreign key is checked at `COMMIT`; a partial index holds only matching
+rows and the planner uses it only when the query implies its `WHERE`.
+
+## S2 — Statement and expression forms
+
+**Now refused.** `INSERT OR IGNORE` (and the `OR ABORT`/`FAIL`/`ROLLBACK`
+spellings), `REPLACE INTO`, `INTERSECT` and `EXCEPT`, `LIMIT <offset>, <count>`,
+`IS` / `IS NOT` between two values (only `IS NULL` parses), `IS [NOT] DISTINCT
+FROM`, `NULLS FIRST` / `NULLS LAST`, the bitwise operators `& | ~ << >>`, the JSON
+operators `->` and `->>`, `VALUES` as a table in `FROM`, and row values
+(`(a, b) = (1, 2)`, `(a, b) IN (SELECT …)`).
+
+**Done when.** Each runs and matches SQLite in the differential corpus, including
+the `NULL` cases (`NULL IS NULL` is true, `1 & NULL` is `NULL`).
+
+## S3 — Joins
+
+**Now refused.** `RIGHT`, `FULL` and `NATURAL` joins, with a message that says to
+write an inner or left join (`test_unsupported_joins_are_refused`).
+
+**Done when.** `RIGHT` runs as a mirrored `LEFT`, `FULL` as a left join plus the
+unmatched right rows, and `NATURAL` as `USING` over the shared column names; the
+refusal test becomes an answer test.
+
+## S4 — Aggregates and windows
+
+**Now refused.** `FILTER (WHERE …)` on an aggregate or a window, a named `WINDOW`
+clause, `ORDER BY` inside an aggregate's arguments (`group_concat(x ORDER BY x)`),
+and the ordered-set aggregates `median`, `percentile`, `percentile_cont`,
+`percentile_disc`; `json_group_array` and `json_group_object` are missing.
+
+**Done when.** Each runs and matches SQLite.
+
+## S5 — Built-in functions
+
+**Missing (48 of 121).**
+
+- Math: `acosh`, `asinh`, `atanh`, `cosh`, `sinh`, `tanh`, `ln`, and the aliases
+  `ceiling`, `power`.
+- Text and logic: `if` (an alias of `iif`), `soundex`, `unistr`, `unistr_quote`,
+  `affinity`.
+- Date: `timediff`, and `current_date` / `current_time` as functions (S1 covers
+  the keywords).
+- Planner hints: `likely`, `unlikely`, `likelihood` (identity functions).
+- Introspection: `sqlite_source_id`, `sqlite_compileoption_get`,
+  `sqlite_compileoption_used`, `sqlite_offset`.
+- JSON: `json_insert`, `json_patch`, `json_pretty`, `json_parse`,
+  `json_error_position`, `json_array_insert`, and the whole `jsonb_*` family
+  (13 functions: SQLite's binary JSON; a first version can store it as text and
+  answer the same values).
+
+**Done when.** `sqlite_gaps.py` lists none of them, and each family has
+differential queries.
+
+## S6 — Statements and pragmas
+
+**Missing statements.** `EXPLAIN QUERY PLAN` (`EXPLAIN` exists), `REINDEX`,
+`INSTEAD OF` triggers on a view, `INDEXED BY` / `NOT INDEXED`, the
+`generate_series` table function, `VACUUM` and `ATTACH ':memory:'` on an
+in-memory database (SQLite accepts both; here the first is refused as "nothing to
+compact" and the second as a missing file).
+
+**Missing pragmas (9 of 63).** `collation_list`, `module_list`, `temp_store`,
+`incremental_vacuum`, `shrink_memory`, `soft_heap_limit64`,
+`temp_store_directory`, `data_store_directory`, `legacy_file_format`. The last
+three are deprecated in SQLite; answering them is enough.
+
+**Done when.** `sqlite_gaps.py` lists none of them.
+
+## S7 — Affinity, untyped columns and `WITHOUT ROWID`
+
+**Now.** A column declared `ANY` keeps each value's storage class (`typeof()`
+reports it), but a column with **no** declared type (`CREATE TABLE t(x)`) is a
+syntax error, a typed column coerces rather than applying SQLite's affinity
+rules, and a comparison across classes is refused (`'1' = 1` answers "cannot
+compare string with int", where SQLite answers 0 by its ordering of classes).
+`WITHOUT ROWID` tables are read from a file but refused as a `CREATE TABLE`.
+
+**Design.** An undeclared type becomes `ANY`; SQLite's affinity (the five rules
+over the declared type name) becomes one function used on insert; comparison
+across classes follows SQLite's order (NULL < numbers < text < blob) with its
+numeric conversion for an affinity column. `WITHOUT ROWID` maps onto a table
+whose primary key is its row identity.
+
+**Done when.** An untyped column round-trips mixed values through the engine and
+through a `.sqlite` export, and comparisons between classes match SQLite in the
+differential corpus.
+
+---
+
+## D — depth and hardening
 
 ## D2 — Spatial: an actual tree
 
 **Now.** `CREATE VIRTUAL TABLE … USING rtree(id, minx, maxx, miny, maxy)` stores
-the boxes as the table's own columns; overlap is the caller's range predicate.
-
-**Cost.** O(rows) for a query without a bound; selective predicates stay cheap
-because the executor still evaluates them per row.
+the boxes as the table's own columns; overlap is the caller's range predicate,
+O(rows) for a query without a bound.
 
 **Done when.** Boxes live in node pages with a fanout, a query descends from the
-root using the query rectangle, and a benchmark in `scripts/` shows the descent
-doing materially less work than the scan on 100k boxes. Keep the current layout
-as the fallback for `WITHOUT ROWID`-style tables if the tree cannot be built.
+root, and a benchmark shows the descent doing materially less work than the scan
+on 100k boxes.
 
-**Not claimed today.** "Spatial index" — today it is a spatial *table*.
+**Not claimed today.** "Spatial index"; it is a spatial *table*.
 
-## D3 — Snapshot cost and history
+## D3 — Version retention
 
-**Done: a read copies nothing.** A read transaction takes one reference per table
-(`table_share`) instead of building a snapshot, so opening it after a commit costs
-38 µs on the gate and 21 µs over 50 000 rows, where it cost 24 ms. The copy moved
-to the write side, where it is also per table: `store_apply` calls
-`store_table_writable`, which clones the table (`table_cow_clone`) only when a
-reader holds it, and only for the table the commit writes. The clone copies the
-row map (presized) and the index trees shape for shape, borrows the values through
-the shared `Row_Store`, and leaves the old table to its readers; the old table
-becomes read-only and the copy frees the history and tombstones its readers can no
-longer see. After the copy the store owns the table again, so the commit after it
-mutates in place: a long reader costs one copy per table, not one per commit. The
-store's read cache, its reference-counted entries and the `READ_CACHE_LIMIT` guard
-are gone with it.
+**Now.** `SELECT … FROM t AS OF <seq>` reads the versions a table keeps
+(`test_as_of`). Versions stay until `store_prune_versions(store, before_seq)` is
+called with the oldest sequence in use; there is no automatic policy, history is
+not counted against a memory budget, and `AS OF` on a join is refused.
 
-`bench-read` reports the read and the commit that pays for a live reader
-separately (`first_read_us`, `commit_with_reader_us`) and `scripts/bench.py` gates
-both, so a copy that reappears on the read side, or a commit that copies when
-nobody reads, fails CI. `test_a_commit_copies_the_table_a_reader_holds` proves the
-reader keeps its values, that the table a commit does not write is the same object
-before and after, and that a commit nobody reads copies nothing;
-`test_snapshot_survives_dropping_the_source` proves a reader outlives a `DROP`.
+**Done when.** Retention follows the oldest open reader automatically, a test
+proves a long-lived database with updates stays bounded, and `AS OF` works on a
+join.
 
-What this file used to claim — "~11 µs per transaction including the first" — was
-measured wrong: `bench-read` ran a `SELECT count(*)` before it started the clock,
-and that statement published the read cache. Measured directly, `table_snapshot`
-cost 117 ms on 50 000 rows because it rebuilt every index; the shape-for-shape
-clone of the index trees (no comparisons, no rebalancing) brought a copy to 36 ms,
-and moving the copy to the writer took it out of the read path entirely.
+## D4 — Secondary indexes in the `.sqlite` mirror
 
-**Left.** The copy a commit pays is still O(rows of the written table) while a
-reader is open — that is the price of a reader that never blocks a writer. Nothing
-copies rows on the read side. Automatic version retention (below) is the only
-remaining piece of D3.
+**Now.** The mirror patches the leaf of every changed row (three pages per
+commit at 250k rows), but only table b-trees are patched: a table with a
+secondary index re-encodes the whole file on every commit.
 
-**History (done).** `SELECT ... FROM t AS OF <seq>` reads the rows as they were at
-that commit: the scan walks the versions `row_values_at` keeps instead of the live
-values, and it does not use an index, because the keys of that commit are not the
-live ones. A sequence beyond the log is clamped to the last commit. The live table
-is read, not the frozen snapshot, because the snapshot is built for the present
-and drops the versions a past read needs. `test_as_of` covers an update, a delete,
-an insert, a read before all three and the prune.
+**Done when.** Index b-trees are patched too (a moved key can jump leaves), and
+`scripts/mirror_cost.py` gains a table with a secondary index whose per-commit
+bytes stay flat as the table grows.
 
-**Retention.** Versions stay until `store_prune_versions(store, before_seq)` is
-called with the oldest sequence still in use; the server calls it when a
-subscription or reader falls behind. There is no automatic policy yet, and the
-history is not counted against a memory budget: a long-lived database that never
-prunes grows with every update.
+## D5 — The rest of the page store (with D17)
 
-**Left.** `AS OF` on a join (refused with a clear error), an automatic retention
-policy tied to the oldest open reader, and an index over the versions to make a
-past read narrow as a live one does.
+**Now.** Paged tables (`--paged`) keep rows and index keys in 4 KiB pages with a
+pool, chained leaves and a memory gate (`scripts/page_rss.py`).
 
-## D17 — Rows on disk
+**Left.** Merge an index leaf that loses its last entry; keep more than one
+version per row so `AS OF` and `ALTER` work on a paged table; and let a read of a
+paged store run without holding the shared lock for its whole life.
 
-**Done.** `src/engine/page.odin` holds the storage: 4 KiB slotted pages with a
-checksum per page, cells encoded like the log, a free list linked through free
-pages and headed in page 0, a buffer pool with a clock hand, pins and write-back,
-and a streaming reader. Flush order is data pages first, then page 0 with
-`applied_seq`, proved by breaking each write of a flush. `page_frames` data
-frames plus a reserved header frame; `test_page_store_streams_within_the_pool`
-reads a file of more than forty pages with four.
+**Done when.** Each of the three has a test, and `page_rss.py` still passes.
 
-`store_open(..., paged_tables = true, page_frames = N)` gives each user table a
-file under `<db>/tables`, applied to by the commit path and flushed after the log
-record is durable. The file is a cache: open discards it and replays. The
-executor streams a paged table for a single-table query (`WHERE`, projections,
-aggregates, `LIMIT`), and falls back to collecting for `ORDER BY`, `GROUP BY`,
-`DISTINCT`, windows, `AS OF`, joins, staged writes and index-answered filters.
-`test_paged_table_roundtrip` and `test_paged_table_churn` cover it;
-`scripts/page_rss.py --check` bounds the statement's memory (316 KiB for 15k and
-60k rows through an 8-frame pool).
+## D8 — Fault injection beyond the log
 
-**Bugs this stage found.** The header frame could be handed to a row page, and
-the next flush wrote the header over it, so those rows never reached the disk
-(119 of 100000 after a reopen). Compaction renumbered slots while the row
-directory addresses rows by slot, so a churned page lost rows. The streaming
-visitor allocated one `Source` slice per row in the transaction arena, making
-the scan's memory grow with the table.
+**Now.** `Fault_Vfs` fails any operation at any call, and `test_fault_injection`
+arms every write of a workload and proves the reopen sees exactly the commits
+that reported success.
 
-**Left.** Index keys in pages (D5), trusting the page files on open instead of
-replaying the log (D18b), a paged table with versions so `AS OF` and `ALTER` can
-work on it, and a read that does not take the shared lock.
-
-## D18 — Access from another process
-
-**Now.** Several *connections* to one host work. Several *processes* on one
-database directory do not share it: the first one owns it, and the others are
-refused with `locked` naming the owner (`pid` and start time), so nothing is
-silently corrupted. The lock is an OS lock on `<directory>/lock` (Windows
-`LockFileEx`, POSIX `fcntl`) and it disappears with the process, including a
-killed one.
-
-**Broker mode (done).** `miraidb-server <db>` owns the directory and serves
-clients: one HTTP request per wire message (`POST /query`, `/call`, `/subscribe`,
-`/wire`), WebSocket frames carrying one message each with a per-connection owner,
-and the Postgres startup plus simple queries. Subscriptions belong to the
-connection that made them (`host_subscribe_many_owned`, `host_drop_owned`), so two
-clients have independent views of the same database, and the outbox budget closes
-a connection that falls behind instead of letting it grow.
-
-`scripts/broker_smoke.py` proves it with real processes: it starts the server on a
-directory, creates and writes through it, reads the write from a different client,
-checks that the read carries the commit sequence, that **a second server on the
-same directory is refused with `locked`**, that six concurrent readers agree, that
-a later write is visible to the next read, and that a client that closes without
-telling the server does not disturb the owner.
-
-The auth review found a second, worse bug: the identity was stored on the store,
-so a client that authenticated lent its rows to every later client. Each client
-now carries its own identity (`Client.identity`): a request runs with its
-caller's identity, a token or `SET identity` inside a request is kept for that
-connection, and a new connection starts from the default.
-`test_connection_identity` covers two authenticated clients, an unauthenticated
-one, a bad token and `SET identity`.
-
-That test found a real bug: the server read the request once and parsed it, so a
-request whose body arrived in a second segment was answered
-`bad request`. The
-loop now keeps reading while the parser reports an incomplete message (the new
-`Error_Kind.Incomplete`), which is what makes an HTTP body over a Nagle boundary
-work.
-
-**What remains.** (b) with D17: a read-only open beside a writer, without going
-through the owner. And the broker's own load limit: one thread accepts and serves
-connections, so a slow client is bounded by the outbox budget rather than by
-concurrency.
-
-**Done when.** A second opener gets a refusal naming the owner — proven twice:
-`test_writer_lock` in-process and `scripts/lock_smoke.py` with two real processes;
-with pages, a reader sees a committed row written by another process; broker mode
-serves two clients with independent subscriptions from one owner.
-
-**Not claimed today.** "Multi-process access" beyond refusing a second writer.
-
-## D4 — A page-oriented backend: **done**
-
-**Now.** `src/engine/sqlite_mirror.odin`. A database opened from a `.sqlite` file
-reads the file's layout once — for every table, the leaf pages its b-tree is made
-of, the rowids each leaf holds, and the rowid the store's rows map to — and after
-a commit it rewrites only what changed: the leaf page of each row the commit
-inserted, updated or deleted, the separator that leaf's parent stores for it, the
-parent page and its ancestors when a page has to split, and page 1, whose header
-carries the change counter, the page count and the free list. A full page splits
-into as many pages as its cells need; a leaf that loses its last row is unlinked
-and put on the free list, and the next growth takes that page back instead of
-making the file longer.
-
-**Cost.** Three pages (12 KiB) per commit, whatever the table holds, because a
-commit touches one leaf, its parent and the header: `scripts/mirror_cost.py
---check` builds a 1828 KiB table and asserts three commits write less than the
-file, and prints the numbers — 12 KiB per commit at 10k, 100k and 250k rows,
-where re-encoding would write 172 KiB, 1.8 MB and 4.8 MB.
-
-**How it keeps the promise under a crash.** Before a page moves, its original
-goes into a rollback journal in SQLite's own format (magic, nonce, per-page
-checksum, sector-padded records); the data pages are written, then page 1, then
-the journal is deleted. An engine or a SQLite that finds the journal restores the
-pages and removes it, so an interrupted commit leaves the previous state readable
-(`test_mirror_survives_a_torn_commit`). Recovery belongs to the file's owner: a
-plain reader applies a hot journal in memory and leaves it on disk.
-
-**What it re-encodes instead.** A table with no single INTEGER primary key (its
-rowid would not be stable), a table with a secondary index (the index b-trees are
-not patched yet, and a stale index is worse than a slow commit), any schema
-change, a file with a write-ahead log, and a tree deeper than three levels. The
-fallback is `sqlite_file_write` plus a fresh map, so a commit never fails over it.
-
-**Bugs this cost.** (1) `direct` — the check for "the parent is the root" was
-written as "the parent's first child is the first leaf", which is also true of the
-left-most interior page of a three-level tree: deleting a row on a 250k-row table
-then tried to pack 1183 children into one page and re-encoded the file. It is
-`len(chain) == 1` now. (2) An empty leaf breaks SQLite's cursor: a delete that
-emptied a page left it in the tree, our own reader accepted it, and SQLite said
-`database disk image is malformed`. Emptying a leaf now unlinks and frees it.
-(3) The journal was written after the header was patched, so a rollback restored
-the new header; page 1's original is captured before anything is staged.
-
-**Not claimed today.** "SQLite as a storage backend" — it is a mirror: the commit
-log is the truth, a secondary index re-encodes its table, and writing the file
-with another driver while the engine holds it open is not detected.
-
-## D5 — Index keys in pages: **done** (a trusted open is D18b)
-
-**Now.** An index of a paged table is a B+tree of 4 KiB pages in
-`<db>/indexes/<table>/<index>`, with the same pool, checksum, free list and flush
-order as the row files. Leaf cells hold `key | row id` in key order and each leaf
-links to the next, so a cursor walks a range without a parent stack; a branch
-holds a separator and a child per cell; page 0 holds the root, the height and the
-entry count. The keys leave the table arena, so `table_memory` reports the pool
-instead of one entry per row, and a point lookup on 3000 rows visits at most four
-rows. `CREATE INDEX` on a paged table walks the row pages and fills the tree,
-`DROP INDEX` closes and removes the file, `TRUNCATE` starts a fresh one, and a
-reopen rebuilds them with the table pages (the replay is still the source of
-truth).
-
-**Cost / bugs found.** The first version of `table_add_index` built its visitor
-context without the table pointer, so a `CREATE INDEX` after a reopen crashed
-with a segmentation fault while the same statement in a fresh session sometimes
-worked — the stack happened to hold the right pointer. `test_paged_index_pages`
-now creates an index after a reopen. A leaf that loses its last entry is left in
-place (no merge yet); the cursor walks past empty leaves, which is why a delete
-is still correct, and the test deletes a third of 5000 keys to prove it.
-
-**Left.** A merge between neighbours, and trusting the header when its
-`applied_seq` matches the log (D18b) instead of replaying.
-
-**Not claimed today.** "Persistent indexes" as in "opening does not touch them".
-
-## D6 — A planner with numbers
-
-**Now.** `src/engine/stats.odin` measures each table once (rows, distinct non-null
-values, NULLs, and for numeric columns the range plus sixteen equi-width buckets)
-and keeps them in `<db>/stats`. `src/engine/plan.odin` prices a scan against an
-index probe, picks the cheapest of the predicates that have an index, and orders
-the relations of a join so the one that keeps the fewest rows per outer row runs
-first, attaching every ON to the step that completes the relations it names. The
-executor takes the same decisions the plan prints (`test_analyze_and_plan_estimates`,
-`test_plan_reorders_a_join`), and `scripts/plan_check.py` is the regression gate
-that fails when a known-good plan gets worse.
-
-**Done: the join delta.** A join subscription indexes the key of an equi-join
-instead of collecting the joined tables. `host_join_plan_probes` reads every `ON`
-clause and, for each equality between two plain columns of the same type, records
-a probe in both directions: the later source is found from the values of the
-earlier ones, and the earlier source is found from the changed row when the commit
-touched the later one. `host_join_index` files each source's rows under that key
-(buckets live in the subscription's arena) and follows inserts, updates and deletes,
-so a commit evaluates the matches and not the table. An expression that cannot be
-indexed (an arithmetic key, two different types, a `FLOAT` key, a paged source)
-takes the full re-evaluation instead, which is correct and slow rather than wrong.
-`test_join_subscription_probes_the_join_key` counts the candidates: over 200
-authors and 900 books an insert walks one and a base-row change walks six, where
-the collect walked 200 and 900; the answers are checked against a fresh
-subscription after every step.
-
-**Done: the inner side of a join is probed.** `join_index_probe` reads the ON
-clause of a nested-loop step and finds an equality that binds a column leading one
-of the inner table's indexes; `join_probe_rows` evaluates the outer side per outer
-row, coerces the value, folds it by the column's collation and prefix-scans the
-index, so the loop reads the matches. A probe that cannot be answered — the value
-side names the inner table, the value does not coerce, the table has staged
-writes, it is a view or a table function — falls back to the scan for that step,
-which is why a wrong probe cannot shorten a result. `EXPLAIN` names the index, and
-`test_join_probes_the_inner_index` bounds the rows read (about 1 200 where the scan
-read 200 200 over 200 authors and 1 000 books) and checks the answers, the
-expression key that cannot be probed, a LEFT join and the plan line.
-
-**Done: `ORDER BY` from an index.** `index_order_for` matches the ORDER BY against
-an index whose key it names completely, in order, all ascending (or descending on a
-unique index, where no two rows tie); `index_order_ids` walks the tree in order, or
-backwards with `node_prev`, and stops as soon as a LIMIT has the rows it needs when
-nothing else can drop one. The same statement over 50 000 rows takes 137 ms against
-342 ms sorted, and `ORDER BY id LIMIT 5` reads five rows in 4.6 ms.
-`test_order_by_comes_from_the_index` compares the sequence with the sorted one, ties
-included, and counts the rows a LIMIT reads.
-
-**Done: the constants are measured.** A scan row, a row fetched by id and one
-descent through the tree were timed over a 200 000-row table (100.8 ns, 456.3 ns and
-600 ns), and `plan.odin` holds those numbers with the measurement written beside
-them: an index row costs 4.5 scan rows and a probe 6. The plan reads the values it is given: a prepared
-`v < ?` bound to 50 keeps the estimate `v < 50` gets, so the histogram decides the
-access as well as the estimate (`test_plan_reads_a_bound_value`). A view is priced from the relation its own
-query reads, and `EXPLAIN` says so
-(`test_plan_prices_a_view_from_its_own_from`). The statistics announce their age: `EXPLAIN` ends with
-`note: statistics measured at commit N, data at commit M`, or with `note: no
-statistics measured` when `ANALYZE` never ran, so an estimate never passes for a
-measurement (`test_explain_announces_stale_statistics`). The incremental subscription path (`host_join_prepare`) lays out the
-walk in the order the query was written, so a subscription and the same query can
-do different work for the same delta.
-
-**Cost.** A join is evaluated in the order it was written; the only cardinality
-information is "this predicate has an index".
-
-**Done when.** `ANALYZE` stores per-column statistics, the planner prices scan
-vs probe vs join order from them, and `EXPLAIN` prints the chosen plan with its
-estimated rows. Add a regression benchmark that fails if a known-good plan
-regresses.
-
-**Not claimed today.** "Cost-based optimizer".
-
-## D7 — Scheduler durability: **done**
-
-**Now.** The due time is a column of `_schedule`, updated through the normal
-commit path by `host_reschedule_or_drop`, so a restart replays pending work. This
-was documented as a gap by mistake; `test_durability_after_restart` proves the
-behaviour (schedule survives a reopen, does not fire early, fires exactly once,
-and the row is gone afterwards).
-
-**What remains.** "Cancel after firing but before committing fires twice" is not
-tested: there is no fault injection (D8) to prove it.
-
-## D8 — Fault injection
-
-**Now.** `Fault_Vfs` wraps any file system and fails the nth call of one
-operation (open, read, write, seek, truncate, sync, remove), or makes a write land
-only part of its bytes. `test_fault_injection` arms the fault at every write of a
-short workload — the log header, the record of `CREATE TABLE`, the record of each
-commit — reopens without the fault, and asserts that the rows that landed are
-exactly the commits that reported success: never a third state. Short writes are
-failures now: `log_file_write` refuses a write that lands fewer bytes than the
-record needs, so a half-written record is never recorded as a commit. A read
-fault during replay is reported as an error and the database opens once reads
-work again.
-
-**Cost.** The same walk over the snapshot file and the `.sqlite` mirror is not
-written yet; `scripts/fuzz.py` and `scripts/soak.py` still cover the statement
-side.
-
-**Done when.** The same N-by-N walk covers snapshot writes, rotation and the
-mirror, and a kill during a dirty flush is tested once pages exist.
-
-**Not claimed today.** "Crash-safe" beyond the torn-tail cases and the write
-walk that exists now.
-
-## D9 — The rest of the grammar
-
-**Now.** 32 statement kinds. Refused with `sql_unsupported`: collations beyond
-`BINARY`/`NOCASE`/`RTRIM`, a window in `WHERE`/`GROUP BY`/`HAVING` (those run before
-the rows exist) and a window inside a window. `GROUP BY` does not resolve a
-projection alias (`GROUP BY d` where `d` is `dept AS d`), although `ORDER BY` does.
-
-**Done: a window inside a larger expression.** `sum(n) OVER () + 1`, and the
-percentage idiom `count(*) * 100.0 / sum(count(*)) OVER ()`, which used to be
-refused with "cannot be evaluated here". `expr_walk` (a visitor with a per-node
-stop) is the walker the tree was missing: `expr_collect_windows` numbers every
-window inside a projection, the row keeps those answers in hidden slots behind the
-visible columns, and after `apply_windows` the projection is evaluated once more
-with a node-to-slot map in `Eval_Ctx`, so the arithmetic reads a filled answer
-instead of the window. Nested and top-level windows mix, `ORDER BY` may name the
-alias, and a call or a `CASE` around the window is walked the same way. A window
-inside a window and a window in `WHERE` are still refused.
-
-The work found a wrong answer of its own: `select_output_may_shrink` asked whether
-a **top-level** projection was a window, so a nested one was invisible to the
-`LIMIT` pushdown and `SELECT sum(v) OVER () + 1 FROM t LIMIT 1` read one row and
-answered 2 instead of 16. It now uses `expr_has_window`; a projection without a
-window still pushes the limit down. `test_windows_inside_expressions` covers the
-arithmetic, the call and `CASE` shapes, the grouped percentage, both `LIMIT`
-directions and the refusals.
-
-**Done: host functions.** A program registers a scalar function on the store
-(`store_register_function`, `src/engine/functions.odin`) and SQL calls it. The
-registry is consulted where a name would otherwise be "unknown function", so the
-builtins keep their names and a registration cannot shadow `upper()`; the arity is
-exact or -1 and is checked before the handler runs; the arguments are evaluated by
-the engine, so a host function runs per row, in `WHERE`, and as the argument of an
-aggregate, where it sees the group. `Scalar_Function` takes `(args, user)` and
-returns `(Value, Error)`, and an error kind travels as the statement's error. The
-registry is per process and never logged, and `store_close` frees it with the keys
-it cloned. `miraidb_create_function(db, name, arity, callback, user)` is the C side:
-`miraidb_value` carries a tag, an integer, a real and a borrowed buffer, text a
-callback returns is copied before the callback's buffer goes away, and the C entry
-lives in the connection so `miraidb_close` frees it. `test_host_functions` covers
-the calls, the arity and handler errors, the group argument, a builtin keeping its
-name and unregistering; `scripts/capi_smoke.py` does the same through ctypes with a
-real callback, both directions of text included.
-
-**Done: a window beside `GROUP BY`.** The window's input rows are the groups: the
-aggregate branch captures each group's partition key, order key and arguments
-while `ctx.grouped` is set, so the argument of an aggregate window may be an
-aggregate and `sum(count(*)) OVER ()` answers the total of the per-group counts
-(the test compares it with `sum(n)` over a CTE of the same groups). Filling runs
-after the grouping, in a tail both branches share; a grouped row rebuilds its
-`ORDER BY` key from the group it came from, which is what lets `ORDER BY` name
-either the window projection or the aggregate. A frame whose rows have no source
-is aggregated over the captured argument values (`eval_aggregate_values`, with
-the same comparison and accumulation rules as `eval_aggregate`), and a `RANGE`
-frame with an offset is refused beside `GROUP BY` with a message that says why.
-`DISTINCT` inside a window is fixed on the way: the parser built the call and
-dropped the flag, so `count(DISTINCT v) OVER (…)` counted every row.
-`test_windows_beside_group_by` covers the totals, `avg`/`max`, a running window,
-the rank tie, `row_number` over partitions, `first_value`, an empty group set, a
-`RANGE` refusal and both `DISTINCT` shapes.
-
-**Done: `ALTER TABLE … ALTER COLUMN c TYPE t`.** The declaration changes and
-every stored row is rewritten through `value_cast`, the function `CAST` uses, so
-`INTEGER` to `TEXT` gives the digits and `TEXT` to `INTEGER` parses the number.
-A value the cast refuses (`'thirty'` to an integer) refuses the whole statement
-and leaves every row as it was; a conversion that merges two unique keys is
-caught by the rebuilt table's uniqueness check. The rewrite goes through the same
-`alter_row_values` the log replay uses, which now returns the conversion error
-instead of a silent copy — so a reopened database holds the new type, which the
-test checks. `SET DATA TYPE` is accepted beside `TYPE`; a generated column is
-refused, because its value is computed rather than stored; a paged table keeps
-the existing refusal. `test_alter_column_type` covers both spellings, the
-surviving index, both refusals, the generated column, the unchanged type as a
-no-op and the reopen.
-
-**Done: `ALTER TABLE RENAME COLUMN`.** A rename keeps the rows and the indexes:
-indexes refer to columns by position and a rename keeps the count, so the stored
-values are mapped by position instead of by name (matching by name would find
-nothing and turn every value into its default — the bug the test caught). Adding
-or dropping a column still matches by name because the count changes. Text that
-names a column (a generated expression, a trigger body, a policy, a view) is not
-rewritten, and a virtual table is refused. `test_alter_rename_column` covers the
-rename, the unique index still rejecting duplicates, the refusals and a reopen.
-
-**Done: trigger WHEN.** `CREATE TRIGGER ... WHEN <condition>` keeps the
-condition as text and parses it when the trigger fires, with NEW and OLD in
-scope; a false or NULL condition means the trigger does not fire for that row,
-which is not an error. The condition is parsed at `CREATE TRIGGER` too, so a
-syntax error is reported there. A catalog written before the column existed gets
-it on first use (`ALTER TABLE _triggers ADD COLUMN when_text`), so older
-databases keep their triggers. `test_trigger_when` covers INSERT/UPDATE/DELETE
-conditions, a NULL condition, the creation-time error and the migration.
-
-**Done: `ROWS` window frames.** `OVER (... ROWS BETWEEN <bound> AND <bound>)`
-with `UNBOUNDED PRECEDING/FOLLOWING`, `<n> PRECEDING/FOLLOWING` and
-`CURRENT ROW`; the shorthand `ROWS <bound>` ends at the current row. An explicit
-frame moves the aggregates and the value functions (`first_value`,
-`last_value`, `nth_value`); an empty frame is an empty group (`count` 0, `sum`
-NULL). A frame on a ranking function is accepted and does not change it. `RANGE`
-and `GROUPS` need value arithmetic between rows, so they are refused with a
-message rather than approximated. `test_window_frames` covers the shapes,
-partitioning, the shorthand, the empty frame and both refusals.
-
-**Done when.** Each refusal becomes a test; the list above is the checklist and
-must not shrink by approximation.
-
-**Not claimed today.** "SQLite-compatible SQL".
+**Done when.** The same walk covers snapshot writes, log rotation and the
+`.sqlite` mirror, and a kill during a dirty page flush.
 
 ## D10 — Precision and time
 
@@ -525,977 +293,130 @@ microseconds since the epoch without a zone; blobs are copied whole.
 **Done when.** Decimal arithmetic with a declared scale, `TIMESTAMPTZ`
 normalising to UTC, streaming blob reads, and conformance cases for rounding.
 
-**Not claimed today.** "Fixed-point arithmetic".
+## D11 — Triggers and policies inside a transaction
 
-## D11 — Virtual tables inside a transaction
+**Now.** Index DDL is staged, applied after the rows and rolled back with them
+(`test_ddl_in_transaction`).
 
-**Now.** `CREATE INDEX` and `DROP INDEX` behave like any other change: they are
-staged in the transaction, applied after the rows of the same commit (so the index
-is built once, from the final rows), and rolled back with it. `DROP INDEX`
-without `ON` also resolves an index created earlier in the same transaction, and a
-duplicate name is refused before apply. `test_ddl_in_transaction` covers a table
-created with its rows and index, an index over rows written in the same commit,
-and a rollback that leaves no index behind.
+**Left.** A trigger or policy created in the same transaction as the rows it
+affects is not ordered against those rows.
 
-**Left.** Triggers and policies created in the same transaction as the rows they
-affect are not ordered against those rows yet.
+## D12 — The module sandbox
 
-**Not claimed today.** "Atomic DDL" for triggers and policies; index DDL is
-atomic and tested.
+**Now.** Metering (one unit per row, a budget that rolls a call back) and latency
+(one pooled socket per module) are done, and a call carries the caller's clock.
+A module is still a process: the host bounds the work per call, not the module's
+memory, time or randomness.
 
-## D12 — Modules: metering and latency are done, the sandbox is not
-
-**Metering (D12a, done).** `Tx.work_units` charges one unit per row read or
-written; `host_set_work_budget` sets a ceiling and a call that exceeds it is
-rolled back with `quota_exceeded`, so a runaway reducer cannot commit partial
-work. `host_work_units_last` reports what the previous call spent, which is how a
-caller sizes the budget. `test_work_budget` proves the abort and the rollback.
-
-**Latency (D12b, done).** A call writes a frame and reads a frame on a **pooled
-socket** per module instead of connecting again; a socket the peer closed while
-idle is dropped and the call redials once. `test_remote_module` makes two calls
-and asserts the listener accepted exactly one connection.
-
-**Determinism (D12c, done for the clock).** A call carries the caller's
-`now_us` in its frame, and the receiving side runs the reducer with that clock
-(`host_call_once_at`) instead of its own, so replaying a call reproduces it.
-`test_remote_module` fixes the caller's clock and asserts the module stored it.
-What is still unclaimed is a VM that also controls randomness, memory and time
-limits; the host can bound the work per call (D12a) but not the module's internals.
-
-## D13 — Exactly-once across restarts
-
-**Done.** `host_call_once` inserts the request id and the reducer's result into
-`_request` **inside the reducer's transaction**, so the id, the response and the
-effects commit together; a restart replays it and a retry is a no-op.
-`host_call_once_result` (and its `_at` form with the caller's clock) returns the
-stored response on a retry and the fresh one on the first run, so a caller that
-lost the reply gets the same answer instead of reading the state again.
-`test_idempotent_result` covers the first call, the retry (counter unchanged), a
-different id, and a reducer that names no result. `test_durability_after_restart`
-covers the restart.
+**Done when.** Modules run in a deterministic sandbox with enforced memory and
+time limits, so replaying a call reproduces it. The reference runs its modules
+this way, which makes this a parity item as much as a hardening one.
 
 ## D14 — Replication
 
-**Now.** One process owns one log. There is no replication code in the tree.
+**Now.** One process owns one log; there is no replication code.
 
-**Done when.** A follower catches up from the log, reads are served locally, a
-leader change is safe against a torn log, and the tests cover a partition. This
-is the largest single item on the list and nothing depends on it today.
+**Done when.** `GET /log?since=<seq>` streams records, a follower applies them
+through the replay path and serves reads, and tests cover a lagging follower and
+a dead leader. Failover stays unclaimed. [versioning-plan.md](versioning-plan.md)
+builds its networked phases on this.
 
-**Not claimed today.** Nothing at all.
+**Reusing the engine's networking.** The engine this database accompanies
+(checked out as `mirai-engine`) has a networking library in Odin, so the
+follower needs no new protocol: it can import `net` and carry commit records as
+its messages.
+
+| Piece there | What it gives a follower |
+|---|---|
+| `channel` | datagrams delivered whole and in order, or not at all; one reliable channel and one unreliable |
+| `replication` / `protocol` | the message set for peers and the rules for what is sent once and in what order |
+| `baseline` + `collection` | "start from this state, then apply changes": a snapshot plus the records after `seq` |
+| `clock` | ticks numbered alike on both ends, which makes applying a record deterministic |
+| `peer` / `host` / `connection` | connection lifecycle and queues; a full reliable queue refuses instead of dropping |
+| `conditioner` | simulated latency, jitter and loss: the rig for a lagging or flapping follower |
+
+This database brings the segmented log with CRC32C per record, the replay path
+and the snapshot with an offset index; D14 is mostly wiring.
 
 ## D15 — Network hardening
 
 **Now.** HTTP/1.1 and WebSocket with request, header and frame caps; the wire
-protocol runs over both.
+protocol runs over both, and the PostgreSQL protocol on the same port.
 
-**Done when.** TLS termination (or `openssl`-style handoff), HTTP/2, per-route
-timeouts, backpressure on a slow reader, and a load test in `scripts/`.
+**Done when.** TLS (or a documented handoff to a terminator), HTTP/2, per-route
+timeouts, backpressure on a slow reader, and a load test in `scripts/`. Until
+TLS exists a token travels in clear, which the auth review must state.
 
-**Not claimed today.** "Production HTTP server".
+## D16 — Clients generated from the catalog
 
-## D16 — A client in another language: **done for Python**
+**Now.** `sdk/python/miraidb.py` wraps the C ABI by hand (`scripts/sdk_smoke.py`
+is its gate), and `miraidb codegen` emits Odin structs.
 
-**Now.** `sdk/python/miraidb.py` wraps the C ABI with `Connection`, `Statement`
-and `Row`: `connect`, `execute`, `query`, `prepare`, binds of every scalar type,
-iteration, error messages and reconnection. `scripts/sdk_smoke.py` runs the path a
-user would (create, bind, read by name and by position, update, a prepared
-statement, an error, a reopen) and is a gate in `scripts/ci.py`.
+**Done when.** The Python binding is generated from a schema and meets the
+hand-written one's smoke test; the reference generates clients for several
+languages, so a second language (TypeScript or C#) follows.
 
-**What remains.** Only one language, and generation is per-catalog for Odin
-(`codegen`). Generating this binding from a schema would be the next step; the
-hand-written module is the contract a generated one has to meet.
+## D18 — A reader that trusts the pages
 
----
+**Now.** A writer and read-only readers share a directory (two lock bytes), and
+a paged database opens without replay when its sequences agree.
 
-## Correctness — nothing accepted may answer a different question
+**Left.** A read-only open beside a live writer still replays, because a reader
+cannot know whether the writer has pages in flight; and the broker serves with
+one accepting thread, so a slow client is bounded by its outbox budget rather
+than by concurrency.
 
-**Found while auditing this list, and fixed.** `NATURAL`, `RIGHT` and `FULL` were
-not keywords the parser knew, so each was read as an alias for the table before
-it: `FROM a NATURAL JOIN b` became a cross join and `FROM a RIGHT JOIN b ON …` an
-inner join. Both returned rows; nothing in the suite complained, because the
-suite asserts what the engine answers, not what it should have refused.
-`test_unsupported_joins_are_refused` pins the three refusals now (`JOIN … USING`
-was already refused).
+## D23 — Resource limits: allocation failure
 
-**The gate that would have caught it.** `scripts/conformance.py` holds twenty
-hand-written cases with substrings they must contain. That checks what someone
-thought to write down. What the parser *accepts* needs a second oracle:
-`sqlite3` answers the same statements, so a corpus can be run through both and the
-answers compared — equal rows, or a parse-time refusal on our side with a reason.
-Anything else is a silent difference in meaning, which is the one class of bug a
-test suite written by the same hand cannot find. `sqlite3` 3.53.4 is on the WSL
-image (`/usr/bin/sqlite3`), so the runner belongs with the POSIX CI work; the
-corpus can be generated from the grammar (`docs/sql.md`) plus the shapes that bit
-us: aliases, keyword lookalikes, `AS OF`, `TRUNCATE`, `RETURNING`.
+**Done.** Expression depth (100 levels, parser and evaluator), the row quota
+while a projection or a join produces rows, the work budget, `LIMIT` pushed into
+the scan, and both caps reachable from the CLI (`--row-quota=N`, `--budget=N`).
 
-## Diagnostics — what the leak report still says
+**Left.** An allocation that fails is still a crash rather than
+`.Out_Of_Memory`. There is no reproduction yet; the first step is an allocator
+that fails the nth allocation, the way `Fault_Vfs` fails the nth write.
 
-**Settled.** The `+++ leak` lines were real: a tracking allocator around the store
-(`tools/leakcheck`) found five live allocations per read where the suite printed
-nine lines per statement, most of them error messages a caller had asked for and
-dropped. Reads are at zero, writes are flat, and the suite's own line count fell
-from 289 878 to 116 741.
+## D24 — The mirror's last gaps
 
-**The tool is the report.** It prints, per shape, how many blocks are still live,
-their total size, and the file and line that allocated them, plus the first bytes
-of a block whose contents are text, which is how the six "table X is not visible"
-messages were identified. `scripts/leaks.py` builds it, applies the budgets and
-measures the CLI's working set with `--repeat`; CI runs it as the "leak budgets"
-gate.
+**Now.** DDL keeps the file valid, an imported file's indexes are recreated, and
+`scripts/sqlite_abi_smoke.py` checks integrity after `DROP`, `ALTER` and index
+DDL.
 
-**What is left, in order.**
+**Left.** A schema change re-encodes the whole file; an index the engine cannot
+express (partial or over an expression, until S1) is left out of an import
+silently, which should be a counted and reported skip; and the mirror has no fuzz
+pass of its own (random DDL and DML, integrity after each chunk).
 
-1. **The 116 741 lines the suite still prints are test-side.** A test that asserts
-   a statement fails drops the error, and a store closed by `cleanup_db` frees
-   memory the tracker saw allocated; neither is an engine leak, and the gate is
-   what says so. Making the suite quiet would mean every test freeing every error
-   it expected, which is worth doing only if the noise starts hiding something.
-2. **A map node freed through the wrong allocator.** Odin frees a map's nodes with
-   whichever allocator is current, and the engine builds several maps in the
-   transaction arena: removing a node from one frees arena memory through the
-   process allocator. It is harmless while the arena outlives the map (it always
-   does here) and the tool counts these instead of failing, but a map that outlived
-   its arena would be a real crash. The candidates are `Tx_Snapshot`'s maps.
-3. **About 250 bytes per commit on the CLI's working set** for `INSERT OR REPLACE`
-   and 120 for `UPDATE` over 2 000 statements: the commit log's in-memory index
-   grows with the log, which is data rather than a leak, and it is the number to
-   watch if a long-lived process needs a bound (`VACUUM` compacts the log).
-4. **Error ownership across the API.** `error_free` exists and the engine frees the
-   messages it swallows, but a host that receives an error and drops it still leaks
-   that message: the C ABI, the server handlers and the tests do this today. The
-   next step is one sweep, not one fix per site: any entry point that returns
-   `Error` should say in its comment that the message is the caller's.
-5. **`log_index_append` opens the index sidecar, seeks and writes 16 bytes on every
-   commit**: a file-open per commit, not a leak, and the first thing to look at
-   when commit latency matters.
+## D34 — The Linux suite and the heap sanitizer
 
-## The Linux suite crashes under the threaded runner
+**Now.** Every package passes `odin check` for linux_amd64, linux_arm64 and
+darwin_arm64, and the CLI runs on Linux. `odin test src/tests` under the default
+two-thread runner dies in `test_aggregates_and_order` with a map panic and a
+segmentation fault, while the test alone passes: memory corruption, most likely
+a map built in a transaction arena whose nodes are freed through another
+allocator (`Tx_Snapshot`'s maps). On Windows the suite runs under
+`-sanitize:address` for bounds and stack, but Odin's heap allocator is not
+intercepted there.
 
-Building with Odin for Linux (`dev-2026-11`) works and the CLI runs: a database
-opens, writes, reopens and reads. `odin test src/tests` under the default runner
-(two threads) dies in `test_aggregates_and_order` with a Rust-style map panic
-followed by a segmentation fault, while the same test alone passes. That is memory
-corruption rather than a logic difference - most likely the arena-backed maps
-(`mine_table`'s `Tx_Snapshot` maps are `make(map, …, tx.alloc)`), because Odin frees
-a map's nodes through the allocator that is current when the node is removed. Next:
-bisect with `-define:ODIN_TEST_THREADS=1` and a narrowed name list, then either stop
-building those maps in the arena or release them before the arena dies. Once that is
-green, the ASAN heap pass runs with the same toolchain
-(`-sanitize:address`), which is what the audit item has been waiting for.
+**Done when.** The threaded suite is green on Linux, a CI job runs it on Linux and
+macOS with `-sanitize:address` (the heap half), and the scripts that hardcode a
+`.exe` (`ci.py`, `page_rss.py`, `plan_check.py`, `bench.py`, `lock_smoke.py`,
+`broker_smoke.py`) find the binary on every platform.
 
-## Ordering, if this becomes the roadmap again
+## D35 — Diagnostics
 
-Ordered by what protects the rest, not by what is most interesting. Fixed items
-stay listed so the order can be read as a whole.
+**Now.** `tools/leakcheck` reports zero live allocations for every read shape and
+a flat count for writes; `scripts/leaks.py` is a CI gate.
 
-1. **D8** (done), **D11** (done), **D1** (done): the small items that protect
-   everything else.
-2. **Correctness gate** (above): a differential runner against `sqlite3`. It is
-   the only protection against the class of bug that just bit — an accepted
-   statement that means something else — and it is worth more than any feature
-   because a wrong answer costs more than a slow one.
-3. **D4**: the largest win a user can feel, and the engine now has the pieces.
-4. **POSIX CI**: `-sanitize:address` for the whole suite, `lock_posix.odin` and
-   `rss_linux.odin` exercised, and the scripts taught to find `bin/miraidb`
-   without `.exe` (`ci.py`, `page_rss.py`, `plan_check.py`, `bench.py`,
-   `lock_smoke.py` and `broker_smoke.py` all hardcode a Windows binary).
-5. **D6 leftovers**: probe the inner side of a join, `ORDER BY` from an index,
-   statistics that say they are stale, and the histogram
-   for a bound parameter (a plan chosen at bind time, or a re-plan when a value
-   lands).
-6. **Leak report** (above): make the diagnostics usable again.
-7. **D9**, **D2**, **D10**, **D16**: independent surface work.
-8. **D12c**, **D15**, **D14**: the module sandbox, the network, replication.
-9. **Licences** and the release review last, before each public release.
+**Left, in order.**
 
-## D19 — CASE expressions: **done**
-
-**Done.** Both forms parse and evaluate anywhere an expression is allowed:
-projections, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `UPDATE … SET`, policies
-and triggers. A `NULL` operand or condition matches nothing, no `ELSE` gives
-`NULL`, and only the chosen branch is evaluated, so
-`CASE WHEN d = 0 THEN NULL ELSE n / d END` is safe. `test_case_expressions`
-covers the forms, the NULL rules, the grouping expression and a nested `CASE`,
-and `scripts/differential.py` compares seven `CASE` queries against `sqlite3`.
-What it did not fix: `GROUP BY` still does not resolve a projection alias
-(`GROUP BY d` for `dept AS d`), which is in D9 and in the runner's refusal
-list.
-
-**Why it matters.** It is the most used conditional expression in SQLite queries
-(conditional aggregation, bucketing, `ORDER BY` keys) and the only statement the
-compatibility matrix still lists as missing. A query ported from SQLite either
-fails or is rewritten as several `iif()` calls.
-
-**Scope.** Simple (`CASE x WHEN a THEN …`) and searched (`CASE WHEN cond THEN …`)
-forms, evaluated wherever an expression is allowed: projections, `WHERE`,
-`GROUP BY`, `HAVING`, `ORDER BY`, `UPDATE … SET` and generated columns. Evaluate
-it as an expression, not as syntax sugar, so policies and triggers see it too.
-`ELSE` absent yields `NULL`; a `NULL` condition is not true; the result type is
-the common type of the chosen branch, as `value_compare`/coercion already decide
-for `iif`.
-
-**Done when.** Both forms parse, the tests cover the branch chosen, the missing
-`ELSE`, a `NULL` condition, a `NULL` branch and a nested `CASE`; `docs/sqlite.md`
-turns the row `done`; and a `CASE` in a policy or trigger works.
-
-**Cost.** M (one parser production, one evaluator case, tests).
-
-## D20 — A differential runner against SQLite: **done**
-
-**Done.** `scripts/differential.py` is the twenty-third gate: one schema, one set
-of rows and 95 queries go through this engine and SQLite (Python's `sqlite3`
-module, which keeps integers and reals apart where the `sqlite3 -json` shell
-does not), and the
-answers must match (as sequences when the query says `ORDER BY`, as multisets
-otherwise). Seven statements are refused here and answered there, each with the
-reason in the script, and the runner fails when a refusal stops refusing; four
-differ on purpose and fail when they converge. It found two things on its first
-run: `ORDER BY` ties came back in map order instead of row id order (fixed, with
-the tiebreak in the sort key), and the scalar forms `min(a, b)`/`max(a, b)` and
-`trim(s, chars)` were missing (fixed). The corpus should keep growing; a
-correlated subquery is in the refusal list, because `features.md` E2 says the
-reference is not resolved.
-
-**Why it exists.** `scripts/conformance.py` runs 20 statements through the CLI
-and checks substrings of the output. It is a smoke: no joins, CTEs, windows, triggers, JSON,
-`ALTER`, `UPSERT`, three-valued logic or `DISTINCT` aggregates. The audit of this
-tree found two wrong answers (`IN`/`NOT IN` with `NULL`, `DISTINCT` inside an
-aggregate) that the suite could not see, and neither could this corpus.
-
-**Why it matters.** A hand-written suite tests what its author thought of. A
-differential runner tests the engine against a reference implementation over a
-corpus: same schema, same rows, same query, and the answers must match exactly
-(or the engine must refuse the statement with a reason, and the refusal is listed
-as intentional). That is the only cheap way to find the next `IN`/`NULL`.
-
-**Scope.** Build the same database through both engines (avoiding features that
-are intentionally absent), run a corpus of queries and compare the rows, the
-column names and the order where the query says `ORDER BY`. Start with the
-existing 20 cases plus: inner/left/cross joins, aggregates with `DISTINCT`,
-`GROUP BY`/`HAVING`, window frames, `LIKE`/`GLOB`/`ESCAPE`, `CAST`, integer
-overflow, `IN`/`NOT IN`/`BETWEEN` with `NULL`, subqueries, `UPSERT` with
-`excluded`, `RETURNING`, CTEs, triggers, JSON functions and `ALTER`. A statement
-the engine refuses is recorded in a list with the reason, so a new refusal fails
-the gate until someone writes it down.
-
-**Not in scope.** Cases where SQLite's behaviour is deliberately different
-(`1/0`, `CAST('abc' AS INTEGER)`, integer overflow, comparing text with a
-number). They are listed in `docs/sqlite.md` and in this file, so the runner
-skips them with a comment.
-
-**Done when.** The runner is a CI gate, the corpus covers the areas above, and a
-deliberate wrong answer (e.g. `count(DISTINCT x)` returning the row count) makes
-it fail.
-
-**Cost.** M (a generator for the corpus, the two databases, the comparison and
-the refusal list).
-
-## D21 — Documentation that cannot drift
-
-**Done.** `scripts/docs_check.py` is a CI gate: it reads the version the library
-reports and compares it with `CHANGELOG.md`; counts the `@(test)` declarations
-and compares them with `status.md`; asks `ci.py --list` how many gates exist and
-compares every document that states the number; compares the CLI commands the
-usage text lists with the list in `status.md`; resolves every relative link in
-`README.md` and `docs/*.md`; checks that every `D<n>` named in the roadmap exists
-in this file and that each roadmap row has the five cells the table needs;
-refuses an orphan document (one no other document links to); and scans the tree
-for the names the project does not use.
-
-**Why.** Three of the findings in the audit were sentences that had stopped being
-true — a test count, a gate count, and a matrix row that claimed a feature nobody
-had written — and nothing failed when the engine moved on.
-
-**Left.** It checks numbers and links, not prose: a paragraph that describes an
-old design (the kind of thing the audit found in `sql.md` and `README.md`) still
-needs a reader. The gate makes the cheap half impossible; the other half stays an
-editorial duty, listed in `CONTRIBUTING.md`.
-
-## D22 — The server, for real — **done**
-
-**Done: a thread per connection, and the delta path.** Each accepted socket gets
-its own thread (`src/server/main.odin`: `thread.create_and_start_with_data`), the
-registry behind it is locked (`Host.clients_mutex`, so a connection's counters can
-be bumped by a statement thread while another thread registers), writes to a
-socket happen under that socket's lock, and `host.on_update` is finally wired to
-the transport: a commit finds the connection that owns the subscription
-(`host_subscription_owner`) and writes one delta frame into it.
-`scripts/broker_smoke.py` runs a subscriber and a second client at the same time,
-reads the delta the write produced, and checks that two frames in one read both
-answer. The frame loop also waits for the rest of a frame that has not arrived
-instead of closing the socket, which the old one did.
-
-Statements still run **one at a time**, under `Server.statements`: the store
-carries the caller's identity while a statement executes (`store_set_identity`),
-so two statements at once would see each other's. A slow query therefore queues
-the others rather than running beside them, which is what step 2 is for.
-
-**Done: the host-touching statements.** `ATTACH`, `LOAD EXTENSION` and
-`VACUUM INTO` name a path or a module the client chose, so the server refuses
-them with `Permission_Denied` unless it was started with `--allow-host`
-(`Store.host_access`, set from the server; an embedded open starts with it on).
-`test_host_statements_need_host_access` proves the refusal, the unchanged commit
-sequence, that reading/writing/DDL still work, and that turning it back on
-restores the statement; `broker_smoke.py` proves it over the wire. `docs/security.md`
-is the written model: what a token buys, that grants are opt-in, and what is not
-defended. The gate also turned up a bug in the gate itself: `decode` in
-`broker_smoke.py` read the error *kind* as the message length, so no error text
-had ever been matched.
-
-**Done: what bounds one statement.** `--statement-timeout-ms=N` arms a watchdog
-thread. A statement announces itself to it (`statement_begin`, which also clears
-a stale cancellation), and the watchdog polls every 2 ms against a monotonic
-tick: when the statement has spent its time it sets `store.cancel` through
-`sync.atomic_store`, which every row loop in the executor checks and answers
-`cancelled`. A cancelled statement is an error, not a crash: the gate starts a
-second server with a 300 ms limit, asks for a four-way cross join, reads
-`cancelled`, then reads `SELECT 1` and the table it never wrote. `--budget=N`
-sets the engine's per-statement work budget, which refuses *after* the work.
-`store.cancel` and its read side are atomic now, so the flag is sound across the
-two threads that touch it.
-
-**Left for its own items.** Grants are opt-in (a database with no grant rows
-allows every statement), which is a policy decision rather than a bug: it is
-listed in the auth review. TLS, HTTP/2 and backpressure are D15; the row quota
-and a depth bound are D23.
-
-**Second half: who may ask.** A wire request runs under the connection's identity,
-and identity is whatever the bearer token said — or nothing. Grants are opt-in:
-`permission_allows` answers `true` when `_grant` has no rows, which is the state of
-every database that never created one. So an unauthenticated client can create,
-read, write and drop tables, and can also run `LOAD EXTENSION` (native code in the
-host process) and `ATTACH` (a file path in the host). Verified against a running
-server: `CREATE TABLE`, `INSERT`, `SELECT`, `DROP TABLE` all answered 200, and
-`LOAD EXTENSION` / `ATTACH` reached their loaders.
-
-**Next.**
-
-1. ~~Serve connections concurrently and prove it.~~ Done; `broker_smoke.py` holds
-   a subscription open while another client writes and reads the delta.
-2. Wire a per-statement work budget and a cancel route (`store_set_work_budget`,
-   `store_cancel`) so a stuck statement ends with `.Cancelled` instead of ending
-   the process, and a client that leaves stops its work.
-3. Refuse the host-touching statements (`ATTACH`, `LOAD EXTENSION`, `VACUUM INTO`,
-   DDL) to a remote client unless the server was started with a flag that allows
-   them; keep them allowed on the local embed path.
-4. Write the threat model down in `docs/`: what a server without a token is
-   trusted to do, and what `--any` changes.
-
-**Acceptance.** Two clients at once, one of them subscribed (`broker_smoke.py`
-grows a second concurrent client); a statement that spends more than the budget
-returns `.Cancelled`; a remote client's `LOAD EXTENSION` is refused and the same
-statement through the embed API still works; the document exists and says what is
-refused.
-
-**Cost.** L. It is the difference between a demo of the wire protocol and a server.
-
-## D32 — A byte is not a character, on the way in or out — *done* (see `docs/roadmap.md`, closed)
-
-**Now.** Three symptoms of one confusion, measured while growing the differential
-corpus in D30:
-
-| Symptom | Command | Today | SQLite / expected |
-|---|---|---|---|
-| The CLI receives its arguments in the ANSI code page | `miraidb sql --json db "SELECT 'é'"` | `[[<0xE9>]]`, not valid JSON | `[["é"]]`, and `hex` of it is `C3A9` |
-| `--json` prints a byte that is not UTF-8 | same command | a raw `0xE9` in the JSON text | a JSON document a parser accepts |
-| `hex()` of text answers code points | `SELECT hex('é')` (from a UTF-8 file, where the bytes are right) | `E9` | `C3A9` |
-| An invalid byte becomes a replacement character | `SELECT hex('é')` through argv | `FFFD` | the bytes it holds, or an error |
-
-The file path is correct: a statement read from a UTF-8 file (`.read`, a piped
-`repl`) stores `C3 A9`, so the engine's storage is fine and the defect is at the
-edges — argument decoding, the JSON writer, and `hex`.
-
-**Next.**
-
-1. Decode the process arguments as UTF-8, not the ANSI code page, on Windows (the
-   `os.args` conversion; check Linux while there).
-2. Make the JSON writer produce valid JSON for any text: escape a byte that does
-   not form UTF-8 as a `\uFFFD` (and document it) or print the value as
-   `{"$bytes":"<hex>"}` — but never emit an invalid document.
-3. Decide what a text *is*: `hex`, `octet_length`, `length` and `substr` cannot
-   disagree. SQLite treats text as UTF-8 bytes, and positions by character; the
-   engine should do the same, with `hex` on the bytes.
-4. A test in `scripts/shell_smoke.py` that pipes `SELECT 'é'` through `--json` and
-   through `hex` and compares both against SQLite.
-
-**Done.** All four: `src/cli/args_windows.odin` re-reads the wide command line
-(`CommandLineToArgvW` + `wstring_to_utf8`), so an argument the user typed as `é`
-arrives as `C3 A9` instead of `0xE9`; `sq_hex` iterates the bytes of a text
-(`for c in text` yields runes, which is what produced `E9`); and both JSON writers
-escape a byte that does not form a UTF-8 sequence as its Latin-1 reading
-(`\u00e9`), so the document always parses. `length`/`instr`/`substr` already
-count characters from the D31 round, so `hex` (bytes) and a position (characters)
-now answer their own question instead of disagreeing.
-
-**Acceptance.** `--json` output parses with any JSON library for a database that
-holds non-ASCII text; `hex('é')` is `C3A9`; `length('é')` is 1; the argument path
-and the file path agree. — `test_text_is_bytes_and_json_stays_valid` checks the
-engine side and `scripts/shell_smoke.py` sends the statement through argv and
-parses the answer.
-
-**Cost.** S.
-
-## D33 — The export writes a schema it cannot back — **done** (see `docs/roadmap.md`, closed)
-
-Closed by writing the key the way SQLite writes it: the table text declares the
-primary key (text, composite or rowid alias), its index is the automatic index the
-declaration implies (`sqlite_autoindex_<table>_1`, no SQL), and a `UNIQUE` column
-travels as a named index row. The import reads the key clauses back out of the
-table text. Measured both ways with real `sqlite3` and covered by
-`test_keys_cross_a_sqlite_file_both_ways` and
-`test_import_keeps_the_keys_sqlite_declared`. The plan below is the one that was
-followed, except that step 2 started as "emit the engine's own index name" and
-was changed to the automatic index once the model text was the only text the
-writer controls, which makes the number always 1.
-
-**Now.** Found while doing D27, with Python's `sqlite3` as the judge:
-
-```
-$ ./bin/miraidb.exe sql db "CREATE TABLE k (code TEXT PRIMARY KEY, v INTEGER)"   # engine DDL
-$ ./bin/miraidb.exe export-sqlite db k.sqlite
-$ sqlite3 k.sqlite "PRAGMA integrity_check"
-wrong # of entries in index sqlite_autoindex_k_1
-Error in 2nd command line argument: database disk image is malformed
-```
-
-The writer emits `CREATE TABLE "k" ("code" TEXT, "v" INTEGER, PRIMARY KEY
-("code"))` and no `sqlite_autoindex_k_1` row. SQLite creates the automatic index
-from the declaration, finds no b-tree for it, and rejects the file. A
-`WITHOUT ROWID` table takes the same path. The same file also loses an inline
-`UNIQUE`: re-importing `CREATE TABLE child (code TEXT UNIQUE)` and exporting it
-gives `PRAGMA index_list(child)` = only `child_pkey`, so duplicates are accepted
-after the round trip.
-
-**Where the defect lives** (checked in the tree, so the next session does not have
-to rediscover it):
-
-- `schema_normalize` (`src/engine/table.odin:284`) already appends a unique index
-  for the primary key and for every `UNIQUE` column, named `<table>_pkey` and
-  `<table>_<col>_key`, with `implicit = true`.
-- `sqlite_file_write` **skips exactly those**: `if index.implicit do continue`
-  (`src/engine/sqlite_write.odin:741`), which is why the constraint leaves no
-  index in the file.
-- `sqlite_master_sql` (`:595`) writes `PRIMARY KEY (col)` inline whenever the key
-  is one column, including a text one; SQLite then wants an automatic index that
-  the file does not carry.
-- `Sqlite_Column` (`src/engine/sqlite_file.odin:22`) has no `unique` field, so an
-  import cannot carry the constraint into the engine.
-
-**Next.**
-
-1. `sqlite_master_sql`: write `PRIMARY KEY (col)` inline **only** when the key is
-   the rowid alias (one column, type `.Int`). A text or composite key is carried
-   by an index row instead.
-2. The index loop: instead of skipping every implicit index, skip only that rowid
-   alias and emit the rest through `sqlite_index_sql` under the engine's own name
-   (`k_pkey`, `u_code_key`). Emitting `sqlite_autoindex_<table>_<n>` rows instead
-   was considered and rejected: SQLite numbers those by declaration order while
-   the engine orders the primary key first, so the name can bind a constraint to
-   the wrong b-tree.
-3. `sqlite_file.odin`: add `unique: bool` to `Sqlite_Column`, parse it in
-   `sqlite_columns_from_sql` (a column constraint, and a table-level
-   `UNIQUE (col)` with one column), and have `sqlite_import` put `UNIQUE` in the
-   recreated `CREATE TABLE`, so the engine enforces it and exports it.
-4. A gate: export a text primary key, a composite key, a `UNIQUE` column and a
-   table imported from a `WITHOUT ROWID` file; `PRAGMA integrity_check` is `ok`,
-   `PRAGMA index_list` shows the unique index, and an `INSERT` duplicate is
-   refused after importing a `UNIQUE` column.
-5. After that, `mirror_text_keepable` can allow `UNIQUE` and a text primary key
-   (their indexes will exist in the file), which is the rest of D27: only
-   `GENERATED` and `WITHOUT ROWID` would remain, as documented limits.
-
-**Acceptance.** The three shapes export to files SQLite opens and indexes; an
-imported `UNIQUE` still refuses a duplicate.
-
-**Cost.** M. It shares its mechanism with D27's remainder, and doing it there
-finishes both.
-
-## D23 — Resource limits — *partly done*
-
-**Done.** The depth bound. `MAX_EXPRESSION_DEPTH :: 100` counts the outermost
-expression as level one, and both halves enforce it: `parse_expression` refuses a
-tree that nests deeper (so 99 levels of parentheses parse and 100 do not) and
-`eval_expr` refuses while it descends, which is the half a `+` chain of 2 000
-terms needs, since it parses iteratively as a left-deep tree. Before this the
-process died at 166 nested parentheses, 178 terms in one chain and 155 nested
-`CASE`s, by stack overflow, with no message and no exit code. The boundary is
-measured on a release build and stated in `test_expression_depth_is_bounded`,
-which also proves the test process survives all three shapes.
-
-The quota is read where rows appear: `sql_exec_select` stops as soon as the
-projection passes `max_rows_per_query`, except when the statement carries
-`LIMIT`/`OFFSET`, which bound their own rows (the post-check applies there).
-
-**Now.** Three ways to lose the process, all measured on the shipped CLI:
-
-| Input | Result |
-|---|---|
-| `SELECT ((((…1…))))` 170 deep | exit 253 (`0xC00000FD`, stack overflow), no message |
-| `SELECT 1+1+…` 2 000 terms | exit 253 |
-| `SELECT CASE WHEN 1 THEN …` 300 deep | exit 253 |
-| a three-way join with a 2·10⁹-row intermediate | `sql_exec.odin: Index 1 is out of range 0..<0` |
-
-The first three are a recursive descent and a recursive evaluator with no depth
-bound; the fourth is `make` returning `nil` under memory pressure and the code
-indexing it anyway. Separately, `max_rows_per_query` is compared with the row count
-**after** the result is built, so the cap that exists to prevent the spike cannot
-prevent it, and neither the quota nor the work budget is reachable from the CLI,
-the server or the C ABI.
-
-**Next.**
-
-1. ~~A depth counter in the parser and the evaluator.~~ Done at 100 levels.
-2. ~~Check the row quota while rows accumulate.~~ Done for the projection, and
-   now for the join: a step refuses as soon as it has produced `quota + 1`
-   candidates, which is the spike the audit measured (a cross join of 40 000
-   combinations with a quota of 100 refuses after fewer than 1 000 rows, where it
-   used to build all 40 000). A statement whose output can shrink — `DISTINCT`,
-   `GROUP BY`/`HAVING`, an aggregate, a window — is still judged by what it emits,
-   so `SELECT count(*) FROM a, b` answers.
-   ~~`LIMIT` is not pushed into the scan.~~ Done: a statement with `LIMIT`, no
-   `WHERE`, no `ORDER BY`, no `DISTINCT`, no aggregate, no window and no policy
-   stops its scan once it has `LIMIT + OFFSET` rows, and a join stops at its last
-   step the same way. `SELECT id FROM t LIMIT 10` reads 10 rows of a 1 000-row
-   table, `LIMIT 3 OFFSET 2` reads five, and `SELECT u.id, t.id FROM u, t LIMIT 5`
-   reads fewer than 300 rows of the 200 × 1 000 it used to build
-   (`test_limit_stops_the_scan`). Left: an allocation that fails is still a
-   crash.
-3. Treat a failed allocation as an error (`.Out_Of_Memory` or the existing
-   `.Quota_Exceeded`) everywhere the executor allocates per row. Not started: the
-   audit saw it as `Index 1 is out of range 0..<0` and that path still needs a
-   reproduction before it can be fixed honestly.
-
-**Acceptance.** A test that nests exactly the limit (answers) and the limit plus
-one (refuses, process alive); a test with a small quota over a cross join that
-fails fast instead of materializing (`test_row_quota_stops_a_cross_join`, which
-counts the rows the join built: fewer than 1 000 of the 40 000 that exist, and an
-aggregate over the same join still answers 40 000). Left: a CLI flag that sets the
-quota, and `LIMIT` pushed into the scan.
-
-**Reachable from the command line.** `miraidb sql db "SELECT …" --row-quota=N
---budget=N` sets both caps on the store the command opens; both are session
-properties and nothing about them reaches the log. Reaching them exposed two
-defects, both fixed: the quota path in `sql_exec_select` freed the row a second
-time — once through the row loop or `window_sources` and once in the refusal —
-which a release build reports as exit 116 with no message, and the work-budget
-message said `0 work` because it read `result.work` after `sql_result_destroy`.
-The gate for the crash is `scripts/shell_smoke.py` ("row quota refuses"), because
-the memory tracker only prints `+++ bad free` and lets the suite pass.
-
-**Cost.** M. The counting is small; finding every recursive path is the work.
-
-## D24 — The `.sqlite` mirror, completely — *partly done*
-
-**Done.** Both defects the audit found are fixed and gated.
-
-*The empty `sqlite_master`.* `sqlite_build_tree` with no cells returned an empty
-leaf whose content offset was `usable`, ignoring the `reserve` its caller passed.
-The `sqlite_master` tree reserves the 100-byte file header so its root can move
-to page 1, and with the offset at `usable` the move had no room and returned
-early — leaving page 1 with no b-tree header at all. `sqlite3` reads that as
-`database disk image is malformed`, which is what a `DROP TABLE` produced. The
-empty branch honours `reserve` now, so an empty database and a dropped last table
-both write a file that opens (`test_empty_export_is_a_readable_file`, and the
-gate checks `PRAGMA integrity_check` from Python's `sqlite3`).
-
-*Indexes on import.* `sqlite_master_visit` skipped every row of type `index`.
-`Sqlite_File.indexes` collects them (name, table, the SQL SQLite stored), and
-`sqlite_import` runs each `CREATE INDEX` as it stands inside the import
-transaction; a partial index that this engine cannot express is retried without
-its `WHERE`, and if that fails too it is left out rather than failing the import.
-`test_imported_indexes_are_planned_and_droppable` proves the plan names the index
-and `DROP INDEX` answers `index_not_found` only for an index that is really gone.
-
-*The gate.* `scripts/sqlite_abi_smoke.py` now opens a real `.sqlite` file through
-the facade, runs `DROP TABLE`, `ALTER TABLE`, `INSERT`, `DROP INDEX` and
-`CREATE INDEX`, closes, and verifies with Python's `sqlite3`: integrity, rows,
-and which objects remain in `sqlite_master`. A second fixture drops the last
-table and expects a valid empty database. Before the fix, the mirrored file was
-`malformed` after that drop (reproduced with the CLI and `sqlite3` 3.53).
-
-**What is left.** A schema change still re-encodes the whole file (the mirror's
-cost, measured by `mirror_cost.py`); a partial or expression index that fails
-both attempts disappears silently, which should become a counted and reported
-skip; and the mirror has no fuzz pass of its own.
-
-**Now.** Two defects in the compatibility path, both reproduced against files that
-`sqlite3` opened and closed cleanly:
-
-- `DROP TABLE` on a table that **held rows** leaves the file malformed —
-  `PRAGMA integrity_check` answers `database disk image is malformed` and
-  `sqlite_master` cannot be read. Dropping an empty table, truncating, adding a
-  column, creating an index and updating rows are all fine, so the defect is in
-  the full rewrite that DDL falls back to (`sqlite_mirror.odin`: `needs_full`)
-  when it has to release the pages of a non-empty table.
-- An imported file's **indexes are ignored**: the plan is a full scan and
-  `DROP INDEX` answers `index_not_found`, while `sqlite3` sees the index in
-  `sqlite_master`. Correct answers, missing access path, and one statement SQLite
-  accepts that this engine refuses.
-
-The ABI gate (`sqlite_abi_smoke.py`) creates a table, inserts, prepares and reads
-blobs — no `DROP`, no `ALTER`, no `DROP INDEX` — which is why neither defect fails
-CI.
-
-**Next.**
-
-1. ~~Fix the full-rewrite path and prove it with `PRAGMA integrity_check`.~~ Done.
-2. ~~Read the indexes of an imported file.~~ Done, including the retry without
-   `WHERE`.
-3. ~~Extend the ABI gate to DDL.~~ Done. Left: a fuzz pass (random DDL and DML,
-   integrity after each chunk) and a counted skip for an index that cannot be
-   expressed.
-
-**Acceptance.** The four DDL statements survive a round trip through the engine and
-are valid for `sqlite3`; an imported index shows in `EXPLAIN` and can be dropped;
-the gate fails if either regresses.
-
-**Cost.** M.
-
-## D25 — The C ABI, completely: **done**
-
-**Now.** 33 `miraidb_*` exports and 43 `sqlite3_*` exports, and the engine's
-levers are all on the C side:
-
-- **Opening**: `miraidb_open_ex(path, flags)` with read-only, in-memory, no-sync
-  and paged bits; `miraidb_open` is that call with no flags. The header states the
-  surprising part — a path that is already a SQLite file is imported into memory
-  and mirrored back on every commit — because a caller that does not know it will
-  wonder why opening a 250 000-row file takes seconds.
-- **Stopping work**: `miraidb_interrupt` and `sqlite3_interrupt` cancel the
-  running statement from any thread; the cancellation belongs to that statement, so
-  `embed_exec`, `embed_exec_params` and `embed_start` clear the flag before their
-  own work and an interrupted connection keeps serving.
-- **Capping work**: `miraidb_set_row_quota`, `miraidb_set_work_budget`,
-  `miraidb_work_used`. Caps are session properties, never schema.
-- **Saying who you are**: `miraidb_set_identity`, `miraidb_identity`,
-  `miraidb_issue_token`, `miraidb_authenticate`. An identity is the 32 bytes of an
-  `IDENTITY` value; a token is 67 characters and is stored as an HMAC digest, so a
-  copied database file holds no usable credential. `miraidb_authenticate` answers
-  the new `MIRAIDB_DENIED` (3) for an unknown or expired token and leaves the
-  identity alone.
-- **Result codes**: `sqlite3_errcode` answers SQLite's primary codes —
-  `SQLITE_CONSTRAINT` (19), `SQLITE_MISMATCH` (20), `SQLITE_INTERRUPT` (9),
-  `SQLITE_BUSY` (5), `SQLITE_READONLY` (8), `SQLITE_AUTH` (23), `SQLITE_TOOBIG`
-  (13), `SQLITE_NOTADB` (26) — and, with
-  `sqlite3_extended_result_codes(db, 1)`, the narrow constraint code
-  (`_PRIMARYKEY` 1555, `_UNIQUE` 2067, `_NOTNULL` 1299).
-  `sqlite3_extended_errcode` answers the narrow code in either mode.
-- **Misuse**: a dead handle answers `MIRAIDB_MISUSE`/`SQLITE_MISUSE` and does
-  nothing; a bind past the statement's parameters is `SQLITE_RANGE` (25).
-- **Threads**: stated in `include/miraidb.h` — one connection and its statements
-  belong to one thread at a time, two threads may use two connections on the same
-  file, `miraidb_interrupt` is the one call that may run against a busy
-  connection, and nothing else is synchronised.
-
-**What it took.** A token is a row in the database and its digest is built from a
-key in `_meta`, but every lookup went through a `Host`, so a C connection could
-not authenticate anything. `store_token_key`, `store_token_digest`,
-`store_issue_token` and `store_authenticate` do the same work for a store, with
-the clock passed in; the key cache moved from `Host` to `Store`, which also
-stopped `host_destroy` from leaking it. The key is created in `_meta` by
-`store_token_key`, because an embedded database has no `host_init` to create that
-table — without it every connection invented a key of its own and no token
-survived a reopen, which the smoke caught as "invalid or expired token".
-
-**Acceptance.** `scripts/capi_smoke.py` exercises every new call, including the
-round trip across a close and a reopen, a policy that hides another caller's rows,
-an expired token that changes nobody, and a connection that never authenticated
-(which matches no policy row, exactly as a server connection does before
-`AUTH`). `scripts/sqlite_abi_smoke.py` proves each result code in both modes.
-`include/miraidb.h` documents the model.
-
-## D26 — Docs whose claims are executed — **done** (see `docs/roadmap.md`, closed)
-
-The matrix is executable: `docs/sqlite.md` carries a ```compat block and
-`scripts/compat_check.py` runs every claim in it through the CLI's `--json` and
-through SQLite's Python module, each on its own in-memory database, as gate 24.
-Writing it corrected one statement: `printf('%.0f', 2.5)` answers 2 here and 3 in
-SQLite, which is now a row rather than prose.
-
-**Now.** `docs_check.py` verifies shape: counts, links, forbidden names, five-cell
-roadmap rows. It does not verify a sentence. Two rows of `docs/sqlite.md` still said
-`BEFORE` triggers and `RANGE`/`GROUPS` frames are refused, and both have worked
-since `0a59dbb` and `763bb3b` — this audit found them by reading, not by running
-anything.
-
-**Next.** Turn the compatibility matrix into data the gate executes: a table of
-`(statement, expectation)` where `expectation` is `works` or `refused`, run
-against both this engine and `sqlite3`, with the matrix rows generated from it or
-checked against it. Start with the rows that name a refusal, because those are the
-ones that go stale when a feature lands, then the `done` rows that are cheap to
-state as one statement.
-
-**Acceptance.** A row that says `refused` while the engine answers fails CI, and
-the reverse too; the SQLite matrix is generated or cross-checked from the same
-file.
-
-**Cost.** S.
-
-## D31 — The three wrong answers — *done* (see `docs/roadmap.md`, closed)
-
-**Now.** Three sentences that answered and were wrong, found by the second audit
-pass (`AUDIT-10`) by running 47 edge queries through both engines. All three are
-fixed and covered by tests now; the table is what the audit measured:
-
-| Query | SQLite | this engine |
-|---|---|---|
-| `SELECT substr('abcdef', -3)` | `def` | `abcdef` |
-| `SELECT 1 WHERE 'a'` | 0 rows | 1 row |
-| `SELECT 1.0` (`--json`) | `1.0` | `1` |
-
-The first is a missing feature that fails silently: a negative start counts from the
-end in SQLite, and the engine takes the absolute value path and returns the whole
-string. `substr` is tested, but only with a positive index
-(`test_functions` uses `substr(s, 3, 5)`), so nothing noticed.
-
-The second is a semantics choice with the wrong default. `WHERE` asks a value for its
-truth, and the engine's rule is "a non-empty text is true". SQLite converts the text
-to a number first, so `'a'` is `0` and the row is dropped; `'1'` is true. The
-difference is invisible until a predicate is written against a text column by mistake
-— which is exactly when it matters.
-
-The third is rendering, not data: `typeof(1.0)` answers `real`, and the JSON writer
-prints `1` for it because the format string drops a trailing `.0`. A JSON consumer
-gets an integer where the schema promised a real, and the differential runner cannot
-see it (it also treats `1` and `1.0` as equal; D30).
-
-`INSERT OR REPLACE` belongs here too: the parser refuses it with "expected into" and
-neither `REFUSED` in the differential nor `docs/sqlite.md` says so.
-
-**Next.** *(1 is done: `substr` follows SQLite and text positions count
-characters everywhere they are reported — `length`, `instr` and `substr` — tested
-in `test_text_positions_count_characters` over 21 cases and against SQLite over
-660.)*
-
-1. ~~`substr`/`substring`: a negative start counts from the end, a negative length
-   returns the characters before the start (SQLite's rule), and both are tested at
-   the boundary (start equal to length, start below the string, length 0).~~
-2. ~~`WHERE`: cast to a number the way SQLite does (`'12'` → 12, `'12a'` → 12, `'a'` →
-   0, `''` → 0, `x'…'` → 0), then test truth against that. Keep the current strictness
-   for comparisons (`1 = '1'` stays an error, listed in `DIFFERENT`): this is about
-   *truth*, not about comparison.~~ Done in `text_number_prefix`, tested over
-   seventeen literals in `test_text_truth_is_numeric`.
-3. ~~The JSON writer keeps the `.0` for a real, so a consumer can tell the types
-   apart.~~ Done for both writers: `Json_Value` carries an `is_integer` bit that
-   the parser and `json_from_value` set, and the CLI's `--json` path prints
-   `%d.0`. `json_type` and `json_extract` now agree on the type too.
-4. ~~`INSERT OR REPLACE`: implement it as `INSERT` + delete-on-conflict, or list it as
-   refused in `REFUSED` and in `docs/sqlite.md`. Refusing is acceptable; refusing
-   quietly is not.~~ Implemented: `unique_conflicts` collects the rows that collide on
-   any unique index, they are deleted through a staging delete that runs no trigger
-   program (SQLite fires delete triggers for a REPLACE only with recursive triggers
-   on), and the insert is retried. `OR ROLLBACK`/`FAIL`/`IGNORE` are named refusals.
-
-**Acceptance.** Each of the four has a test that fails today; the corpus in D30 holds
-them; `docs/sql.md` states the negative-index rule and the truth rule.
-
-**Cost.** S.
-
-## D30 — The differential cannot lie — *done* (see `docs/roadmap.md`, closed)
-
-**Now.** Two ways `scripts/differential.py` can look at a difference and not see it:
-
-- **Ordering by substring.** `compare()` decides the rows are ordered when
-  `"order by" in statement.lower()`. An `OVER (… ORDER BY …)` or a subquery with its
-  own `ORDER BY` therefore makes the *outer* result compared position by position,
-  while the outer query promises no order at all. Three window queries were reported
-  as differences whose multisets were identical in this pass; the same defect can hide
-  a real difference behind a lucky order.
-- **Types as values.** `same_cell` compares `1` and `1.0` as equal, so a query that
-  returns the wrong type passes.
-
-And the gate advertised more than it enforced: `docs/roadmap.md` said a 10% regression
-fails, while `scripts/bench.py` accepted 3x for every time metric and compared against a
-number recorded on another machine (it printed `machine` and never compared it). Runs on
-this machine in one session produced 31 603 and 57 403 inserts/s, 15.6/22.6/46.3 µs for a
-read transaction, and 5.3/73.6 ms for a commit with a reader open, with no code change:
-wall clock here is not gated at 10% by anything, and pretending otherwise was the lie.
-
-*Done*: `--check` fails on bytes per row (a property of the format, 10% against the
-baseline) and **reports** every time metric measured twice in the same run with its
-spread; `--strict-time` enforces 10% against the baseline for a quiet machine after
-`--record`. The roadmap says exactly that.
-
-**Next.**
-
-1. Decide "ordered" from the statement's own top level: the outermost `ORDER BY` after
-   the last closing parenthesis of the `FROM`/`WHERE`/`GROUP BY` region, or — simpler
-   and safer — compare as a multiset *and* as a sequence, and accept a query when
-   either matches, while a query that names a top-level `ORDER BY` must match the
-   sequence.
-2. Compare types: a cell carries its kind, so `int 1` and `real 1.0` differ.
-3. Adopt the 47 queries of `AUDIT-10` as the corpus, with the three D31 bugs listed in
-   `DIFFERENT` until they are fixed and moved to `QUERIES` after.
-4. The performance gate: measure a reference (a fixed, simple workload) in the same run
-   and compare against *that*, so a loaded machine and slower code are distinguishable;
-   keep the stored baseline as history. Then the roadmap can say 10% and mean it.
-
-**Acceptance.** A window query that returns the right multiset in any order passes; one
-that drops a row fails; a query returning `1` where SQLite returns `1.0` fails; the
-performance gate fails on a 15% regression of a same-run reference and passes on a
-loaded machine.
-
-**Cost.** S for the runner, M for the same-run reference.
-
-## D27 — The mirror keeps the schema it does not model — **done** (see `docs/roadmap.md`, closed)
-
-Closed by numbering the automatic indexes: the writer walks the constraints of
-the kept text in declaration order and writes `sqlite_autoindex_<table>_<n>` for
-each, matched to the engine index that carries it. A table whose text spells a
-`UNIQUE` column, a text key or a composite key therefore keeps its text through a
-rewrite. `GENERATED` and `WITHOUT ROWID` stay rebuilt and are stated as limits.
-Covered by
-`test_rewrite_keeps_a_keyed_table_as_it_was` and the `sqlite_master` comparison
-in `scripts/sqlite_abi_smoke.py`.
-
-**Now.** One `ALTER TABLE` through the engine rewrites the user's `.sqlite` file with
-the engine's own idea of the schema (`AUDIT-10` P-A1). Measured on a file that SQLite
-created:
-
-```sql
--- before
-CREATE TABLE child (id INTEGER PRIMARY KEY,
-  pid INTEGER NOT NULL REFERENCES parent(id) ON DELETE CASCADE,
-  code TEXT UNIQUE CHECK (length(code) > 2),
-  note TEXT DEFAULT 'n' COLLATE NOCASE)
-
--- after `ALTER TABLE parent ADD COLUMN extra INTEGER`
-CREATE TABLE "child" ("id" INTEGER NOT NULL, "pid" INTEGER NOT NULL,
-  "code" TEXT, "note" TEXT, PRIMARY KEY ("id"))
-```
-
-`PRAGMA foreign_key_list(child)` is empty afterwards. In the same experiment the file's
-view and trigger disappeared (three objects before, one after), and a
-`GENERATED ALWAYS AS (a*2)` column is imported as `NULL` and written back as a plain
-NULL column.
-
-The mechanism is two halves that each looked reasonable: `sqlite_import` recreates a
-table from `Sqlite_Column` (name, type, NOT NULL, PRIMARY KEY), and `sqlite_file_write`
-emits `CREATE TABLE` from the engine's `Table_Schema`. Any DDL forces the full rewrite,
-so everything the engine does not model is dropped — silently, on a file that is the
-user's database.
-
-D24 closed the *corruption* in that path (the empty `sqlite_master`) and the *indexes*
-on import. It did not close this, and the roadmap said DDL was safe, which was true of
-integrity and false of semantics.
-
-**Progress.** Step 1 and half of step 2 are in: `store_mirror_keep` remembers every
-catalog entry as the file spelled it, with a signature of the model the engine built
-from it, and a rewrite re-emits that text for a table whose signature still matches and
-for every view and trigger. `--mirror-report` prints a `mirror-lost:` line for each
-table it had to rebuild. `scripts/sqlite_abi_smoke.py` compares `sqlite_master` before
-and after an ALTER and proves `child` keeps `REFERENCES … ON DELETE CASCADE`, `CHECK`,
-`DEFAULT` and `COLLATE`, and that the view and the trigger survive.
-
-**Next.**
-
-1. ~~Keep each imported object's original SQL: `Sqlite_Table.sql` already carries the
-   `CREATE TABLE` text and is currently unused by the writer.~~ Done above. What
-   remains: a table whose `UNIQUE`, non-integer `PRIMARY KEY` or `WITHOUT ROWID` shape
-   SQLite backs with an automatic index still has to be rebuilt, because the writer
-   emits no index row for an implicit one (`if index.implicit do continue`,
-   `src/engine/sqlite_write.odin:741`) — D33 holds that work, and it lets the text be
-   kept for those tables too, since `mirror_text_keepable` only refuses them for
-   that reason. Extend it to views and
-   triggers (they are rows in `sqlite_master` with SQL), and keep them in the mirror as
-   opaque objects the engine does not evaluate but must not delete.
-2. On a rewrite, re-emit the original SQL for every object whose engine-side schema is
-   unchanged. For a table the engine *did* change (a column added), apply the change to
-   the original statement or fall back to the generated one — and in that second case,
-   say so: a `mirror_reason` the CLI's `--mirror-report` prints and the file's owner can
-   read.
-3. Refuse rather than degrade: a `ALTER`/`CREATE`/`DROP` that the engine cannot express
-   against a table whose SQL carries constraints it does not model answers
-   `mirror_unrepresentable` (or the existing `.Unsupported`) instead of writing a
-   weaker schema. Losing a user's foreign keys silently is worse than refusing the
-   statement.
-4. Import a `GENERATED` column as generated, or refuse the table with a reason. A NULL
-   column with the right name is the one outcome nobody can recover from.
-5. Gate it: a fixture with FK, UNIQUE, CHECK, DEFAULT, COLLATE, a view, a trigger and a
-   generated column goes through `INSERT`, `ALTER… ADD COLUMN`, `CREATE INDEX`,
-   `DROP INDEX` and `DROP TABLE`, and `sqlite_master` is compared (normalised) against
-   the expectation, plus `PRAGMA integrity_check` and a foreign-key check from a real
-   `sqlite3`.
-
-**Acceptance.** The fixture above keeps its constraints, view, trigger and generated
-column through every DDL the engine accepts; a DDL it cannot express is refused with a
-reason; `docs/sqlite.md` states which of the two happened.
-
-**Cost.** L. It is a design decision (preserve the text, or model the constraints and
-emit them) before it is code, and this item exists so the decision is written down.
-
-## D28 — Open the way SQLite opens — *done* (see `docs/roadmap.md`, closed)
-
-**Now.** The measure that started it (`AUDIT-10` P-A2):
-
-```
-$ ./bin/miraidb.exe sql ":memory:" "SELECT 1"
-miraidb: io: cannot create :memory:: INVALID_NAME
-
-sqlite3_open(':memory:')                   -> 1  (SQLITE_ERROR)
-sqlite3_open('')                           -> 1
-sqlite3_open('file::memory:?cache=shared') -> 1
-```
-
-`src/sqlite_compat` exists so a program written against `sqlite3_*` can link against
-this engine instead, and the first thing such a program does is open an in-memory
-database, so no such program could start.
-
-**Done.** `store_path_is_memory` recognises `:memory:`, the empty path,
-`file::memory:`, `file::memory:?cache=shared` and `file:<name>?mode=memory`, and
-`store_open` turns any of them into a non-persistent store with no path. That is
-the single door the CLI, the C ABI and the facade use, so there is one rule to
-keep right instead of three. In memory there is no log, no directory, no page
-files and nothing to compact, and every open is a fresh database.
-
-**Acceptance, met.** `test_open_in_memory_the_way_sqlite_does` opens all five
-spellings, writes, reads, proves a second open does not see the first one's table
-and that no directory named `:memory:` appears; `scripts/capi_smoke.py` and
-`scripts/sqlite_abi_smoke.py` open each spelling through the DLL and read a row
-back. `./bin/miraidb.exe sql ":memory:" "SELECT 1"` answers `1`.
-
-## D29 — A C handle is never a dangling pointer — *done* (see `docs/roadmap.md`, closed)
-
-**Now.** `capi_stmt` was a cast of the caller's pointer (`src/capi/capi.odin`), so
-after `miraidb_finalize` the memory was free and the next call read it
-(`AUDIT-10` P-A3):
-
-```
-miraidb_step(stmt) after finalize   -> 101    (DONE, from freed memory)
-miraidb_bind_text(stmt, 1, "x")     -> access violation reading 0xFFFFFFFFFFFFFFF9
-```
-
-The second call ended the host process. `bind` also took any index:
-`miraidb_bind_int(stmt, 99, 1)` answered `OK` because `embed_bind` grew the
-parameter list to fit, so a typo became a NULL parameter instead of a range error.
-
-**Done.**
-
-1. `src/engine/handles.odin` keeps the set of live handles. Both embedding layers
-   register what they hand out and ask `handle_is_live` **by value** before they
-   dereference: a dead handle answers `MIRAIDB_MISUSE` (2) in the C ABI and
-   `SQLITE_MISUSE` (21) in the facade, and the process keeps running. A second
-   `finalize` does nothing.
-2. Closing a connection finalizes the statements it still owns and forgets their
-   handles, so a statement outliving its connection is misuse rather than a
-   dangling pointer.
-3. `embed_prepare` parses eagerly: a syntax error now fails at prepare, and
-   `Embed_Parameter_Count` is known before the first bind. A bind past it is
-   `SQLITE_RANGE` (25) in the facade and `MIRAIDB_ERROR` with "parameter index N is
-   out of range: the statement binds M" in the C ABI.
-4. Column accessors on a finished statement answer NULL/0 (they never dereference),
-   and `errmsg` explains the misuse even when the handle is dead.
-
-**Acceptance, met.** `test_bind_range_and_live_handles` covers the parameter count,
-the range error and the registry; `scripts/capi_smoke.py` and
-`scripts/sqlite_abi_smoke.py` run the hostile sequences through both DLLs — step,
-bind, reset, column and finalize after `finalize`, a double finalize, a bind past
-the parameters, and a statement used after its connection closed. Every call
-answers and the script finishes, which is the property the audit measured as
-missing.
-
-What is not promised: a pointer this layer never handed out, or a stale handle
-whose address the allocator reused for a new statement (that one then names the
-new statement, as in any C library). `docs/security.md` says so.
+1. The lines the suite still prints are test-side: a test that expects an error
+   drops it. Quieting them is worth doing only if the noise starts hiding a real
+   report.
+2. A map node freed through the wrong allocator (see D34): harmless while the
+   arena outlives the map, a crash the day it does not.
+3. Error ownership: a host that receives an `Error` and drops it leaks the
+   message. Every entry point that returns one should say the message is the
+   caller's, in one sweep.
+4. `log_index_append` opens the index sidecar, seeks and writes 16 bytes on every
+   commit: the first place to look when commit latency matters.

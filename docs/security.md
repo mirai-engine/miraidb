@@ -57,10 +57,11 @@ connection only; two clients never see each other's.
   `--budget` caps the work one statement may spend, refusing it *after* the work
   is done rather than during. One statement at a time runs per database, so a
   slow query delays the others. Neither flag is on by default, and the row quota
-  (`max_rows_per_query`) is still not reachable from the server (backlog D23).
-- **Depth.** An expression nested deeply enough overflows the stack and takes the
-  process with it (backlog D23). Until that lands, treat the server as one fault
-  away from a restart.
+  (`max_rows_per_query`, `--row-quota` on the CLI) has no server flag yet.
+- **Memory.** Expression depth is bounded (100 levels, refused by the parser and
+  the evaluator), but an allocation that fails still ends the process instead of
+  failing the statement (backlog D23). Treat the server as one out-of-memory away
+  from a restart.
 - **One writer.** The server holds the directory lock; a second server on the
   same directory is refused with the owner's pid. Readers may open beside it with
   `--read-only`.

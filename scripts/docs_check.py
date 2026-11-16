@@ -13,8 +13,8 @@ This gate checks the claims that can be checked mechanically:
 - the number of CI gates matches every document that states it;
 - the CLI commands the usage text lists are the ones status.md lists;
 - every relative link in README.md and docs/*.md resolves to a file;
-- every `D<n>` a roadmap item names exists in docs/backlog.md, and every open
-  roadmap row has the five cells the table needs;
+- every `D<n>`, `R<n>` and `S<n>` the roadmap names exists in docs/backlog.md,
+  and every open roadmap row has the five cells the table needs;
 - no document is orphaned (every docs/*.md is linked from somewhere);
 - the forbidden names stay out of the tree.
 
@@ -165,10 +165,10 @@ def check_links() -> None:
 def check_roadmap() -> None:
     text = read("docs/roadmap.md")
     backlog = read("docs/backlog.md")
-    known = set(re.findall(r"^## (D[0-9]+)", backlog, re.MULTILINE))
-    for match in re.finditer(r"\bD[0-9]+[a-z]?\b", text):
+    known = set(re.findall(r"^## ([DRS][0-9]+)", backlog, re.MULTILINE))
+    for match in re.finditer(r"\b[DRS][0-9]+[a-z]?\b", text):
         item = match.group(0)
-        base = re.match(r"D[0-9]+", item).group(0)
+        base = re.match(r"[DRS][0-9]+", item).group(0)
         if base not in known:
             line = text[: match.start()].count("\n") + 1
             fail(f"docs/roadmap.md:{line} names {item}, which backlog.md does not describe")

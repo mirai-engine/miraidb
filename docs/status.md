@@ -122,8 +122,9 @@ the gaps are named rather than left to be discovered.
 ### Tooling
 
 - `python3 scripts/ci.py` runs every gate in one command and reports each one;
-  it is what "green" means. Twenty-three gates: the suite, the corpus, the
-  smokes, the measurements and the document check.
+  it is what "green" means. 26 gates (`--list` prints them): the suite, the
+  corpus, the smokes, the measurements, the SQLite surface count and the
+  document check.
 - `miraidb` has 17 commands: `create`, `sql`, `sqlite`, `import-sqlite`,
   `export-sqlite`, `repl`, `inspect`, `describe`, `bench`, `bench-read`,
   `codegen`, `export`, `call`, `subscribe`, `check`, `compact`, `snapshot`.
@@ -526,8 +527,10 @@ is in `docs/backlog.md` (D14): serve `GET /log?since=<seq>`, run
 same replay path, and test a lagging follower and a dead leader. Failover stays
 unclaimed.
 
-Everything else that is missing is **depth**, scoped in `docs/backlog.md` (D1,
-D2, D4–D12, D16); the roadmap's matrix is closed and every row has a test.
+Everything else that is missing is listed in `docs/roadmap.md`, by goal: speed
+against the reference (R1–R4), SQLite's surface (S1–S7) and depth and hardening
+(the D items), each detailed in `docs/backlog.md`. The feature matrix is closed
+and every row has a test.
 
 ## Invariants to keep when extending
 
