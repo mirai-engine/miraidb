@@ -134,8 +134,11 @@ the gaps are named rather than left to be discovered.
   and checks both).
 - `miraidb sql --json <db> <statement>` prints a result as one JSON array of
   rows, which is how `scripts/differential.py` compares answers against SQLite:
-  one schema, one set of rows and 94 queries through both engines, with 6
-  refusals and 7 intentional differences listed in the script. A row is compared
+  one schema, one set of rows and 95 queries through both engines, with 6
+  refusals and 6 intentional differences listed in the script. SQLite is asked
+  through Python's `sqlite3` module, which hands back typed values: the
+  `sqlite3 -json` shell used before prints `90.0` as `90`, and with the
+  type-aware comparison below that read as thirteen false differences. A row is compared
   position by position only when the statement's own top-level `ORDER BY` decides
   the order, and a cell is compared by type as well as by value, so a query that
   returns a real where SQLite returns an integer is a difference (the second

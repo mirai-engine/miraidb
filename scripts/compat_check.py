@@ -91,7 +91,10 @@ def run_ours(binary: str, statement: str) -> tuple[object, str]:
         [binary, "sql", ":memory:", statement, "--json"],
         cwd=ROOT,
         capture_output=True,
-        text=True,
+        # The CLI writes UTF-8; without this a Windows Python decodes it with the
+        # ANSI code page and `É` arrives as two characters.
+        encoding="utf-8",
+        errors="replace",
     )
     if done.returncode != 0:
         return None, (done.stderr or done.stdout).strip()

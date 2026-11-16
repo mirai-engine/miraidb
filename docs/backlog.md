@@ -745,7 +745,9 @@ turns the row `done`; and a `CASE` in a policy or trigger works.
 ## D20 — A differential runner against SQLite: **done**
 
 **Done.** `scripts/differential.py` is the twenty-third gate: one schema, one set
-of rows and 94 queries go through this engine and the system `sqlite3`, and the
+of rows and 95 queries go through this engine and SQLite (Python's `sqlite3`
+module, which keeps integers and reals apart where the `sqlite3 -json` shell
+does not), and the
 answers must match (as sequences when the query says `ORDER BY`, as multisets
 otherwise). Seven statements are refused here and answered there, each with the
 reason in the script, and the runner fails when a refusal stops refusing; four

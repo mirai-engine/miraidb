@@ -168,7 +168,7 @@ matches | SELECT json_type('1.0')                         | [["real"]]
 matches | SELECT typeof(1), typeof(1.0), typeof('1')      | [["integer", "real", "text"]]
 matches | SELECT round(2.5), round(-2.5)                  | [[3.0, -3.0]]
 matches | SELECT 'abc' LIKE 'A%'                          | [[1]]
-ours    | SELECT printf('%.0f', 2.5)                      | [["2"]]
+matches | SELECT printf('%.0f', 2.5)                      | [["2"]]
 ours    | SELECT upper(char(233))                         | [["É"]]
 refused | SELECT 1 = '1'                                 | invalid_type
 refused | SELECT CAST('12abc' AS INTEGER)                | invalid_type
@@ -176,9 +176,11 @@ refused | SELECT 1/0                                     | division by zero
 refused | CREATE TABLE z (a INT) WITHOUT ROWID           | WITHOUT ROWID
 ```
 
-Two of those rows correct this document: `printf('%.0f', 2.5)` answers `2` here
-and `3` in SQLite (this engine rounds half to even, SQLite rounds away from zero),
-and `upper` folds the whole of Unicode where SQLite folds ASCII only.
+One row is a real difference: `upper` folds the whole of Unicode, where SQLite
+folds ASCII only, so `upper(char(233))` is `É` here and `é` there. The
+`printf('%.0f', 2.5)` row used to be a second one (this engine rounds half to
+even and older SQLite rounded half away from zero); SQLite 3.45 answers `2` as
+well, so the row is now a match, and the gate is what noticed.
 
 ## Embedding and tooling
 

@@ -28,6 +28,7 @@ import json
 import math
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 
@@ -138,6 +139,9 @@ QUERIES = [
     "SELECT json_extract('{\"a\":[10,20]}', '$.a[1]'), json_valid('[1,2]'), json_type('{\"a\":1}')",
     "SELECT date('2020-01-02'), strftime('%Y', '2020-01-02'), date('2020-01-02', '+1 day')",
     # DML that returns rows.
+    # SQLite 3.45 formats a tie at zero digits to even, as this engine does; this
+    # row was a listed difference until the gate saw the answers converge.
+    "SELECT printf('%.0f', 2.5)",
     "INSERT INTO kv (k, v) VALUES ('c', 3) RETURNING k, v",
     "INSERT INTO kv (k, v) VALUES ('a', 99) ON CONFLICT (k) DO UPDATE SET v = excluded.v RETURNING k, v",
     "UPDATE kv SET v = 5 WHERE k = 'b' RETURNING k, v",
@@ -193,7 +197,6 @@ REFUSED = {
 DIFFERENT = {
     "SELECT upper(char(233)), lower(char(201))": "SQLite folds ASCII only; this engine applies Unicode case mapping",
     "SELECT CAST('12abc' AS INTEGER)": "a cast takes a whole number here, the numeric prefix in SQLite",
-    "SELECT printf('%.0f', 2.5)": "a tie at zero digits rounds away from zero in SQLite, to even in the formatter",
     "SELECT 1 / 0": "division by zero is an error here, NULL in SQLite",
     "SELECT CAST('abc' AS INTEGER)": "a cast that cannot hold its value is an error here, 0 in SQLite",
     "SELECT 9223372036854775807 + 1": "integer arithmetic wraps here, becomes a float in SQLite",
@@ -202,12 +205,7 @@ DIFFERENT = {
 
 
 def run(command: list[str], **kwargs) -> subprocess.CompletedProcess:
-    return subprocess.run(command, cwd=ROOT, capture_output=True, text=True, **kwargs)
-
-
-def sqlite_available() -> str:
-    path = shutil.which("sqlite3")
-    return path or ""
+    return subprocess.run(command, cwd=ROOT, capture_output=True, encoding="utf-8", errors="replace", **kwargs)
 
 
 def miraidb_query(binary: str, statement: str) -> tuple[list, str, int]:
@@ -224,25 +222,31 @@ def miraidb_query(binary: str, statement: str) -> tuple[list, str, int]:
 
 
 def sqlite_query(statement: str) -> tuple[list, str, int]:
-    done = run(["sqlite3", "-json", SQLITE_DB, statement])
-    if done.returncode != 0:
-        return [], done.stderr.strip(), done.returncode
-    text = done.stdout.strip()
-    if not text:
-        return [], "", 0
+    """Ask SQLite through Python's module, which hands back typed values.
+
+    The `sqlite3 -json` shell was used here first, and it prints a real with no
+    fraction as an integer (`90.0` comes out as `90`), so a type-aware comparison
+    reported thirteen differences that were the shell's formatting, not SQLite's
+    answer. The module keeps `int` and `float` apart, which is what the cell
+    comparison below needs.
+    """
+    connection = sqlite3.connect(os.path.join(ROOT, SQLITE_DB))
     try:
-        parsed = json.loads(text, object_pairs_hook=lambda pairs: pairs)
-    except json.JSONDecodeError:
-        return [], f"unparseable sqlite output: {text[:200]}", 1
-    # sqlite3 -json emits one object per row. object_pairs_hook keeps the select
-    # order and the duplicate names a query like `SELECT e.id, d.id` produces.
-    return [[value for _, value in row] for row in parsed], "", 0
+        rows = connection.execute(statement).fetchall()
+        # The corpus writes too (RETURNING, UPSERT): keep what it wrote, as the
+        # shell did, so the statements after it read the same rows.
+        connection.commit()
+    except sqlite3.Error as error:
+        return [], str(error), 1
+    finally:
+        connection.close()
+    return [list(row) for row in rows], "", 0
 
 
 def same_cell(left, right) -> bool:
     """Compare a cell by value and by type.
 
-    SQLite's JSON keeps 1 and 1.0 apart and so does this runner: comparing them
+    SQLite keeps 1 and 1.0 apart and so does this runner: comparing them
     as equal let a query that returned the wrong type pass, which is how a real
     type bug stayed invisible (AUDIT-10 P-B5).
     """
@@ -375,9 +379,6 @@ def main() -> int:
     if not os.path.exists(binary):
         print(f"differential: no binary at {args.bin}; build first")
         return 1
-    if not sqlite_available():
-        print("differential: sqlite3 is not on PATH")
-        return 1
 
     shutil.rmtree(os.path.join(ROOT, WORK), ignore_errors=True)
     os.makedirs(os.path.join(ROOT, WORK))
@@ -388,10 +389,14 @@ def main() -> int:
         done = run([binary, "sql", MIRAIDB_DB, statement])
         if done.returncode != 0:
             failures.append(f"setup failed in miraidb: {statement}: {done.stderr.strip()}")
-    script = ";\n".join(SETUP) + ";\n"
-    done = run(["sqlite3", SQLITE_DB], input=script)
-    if done.returncode != 0:
-        failures.append(f"setup failed in sqlite: {done.stderr.strip()}")
+    connection = sqlite3.connect(os.path.join(ROOT, SQLITE_DB))
+    try:
+        connection.executescript(";\n".join(SETUP) + ";\n")
+        connection.commit()
+    except sqlite3.Error as error:
+        failures.append(f"setup failed in sqlite: {error}")
+    finally:
+        connection.close()
 
     compared = 0
     for statement in QUERIES:
