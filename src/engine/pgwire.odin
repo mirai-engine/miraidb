@@ -1,14 +1,20 @@
 package engine
 
+import "core:crypto"
+import "core:crypto/hmac"
+import "core:crypto/pbkdf2"
+import "core:crypto/hash"
+import "core:encoding/base64"
 import "core:fmt"
 import "core:mem"
 import "core:strings"
 import "core:strconv"
 import "core:sync"
 
-// PostgreSQL wire protocol, simple-query subset. It covers the frontend
-// startup (with the SSLRequest probe), simple queries and termination; the
-// extended query protocol (Parse/Bind/Execute) is not implemented yet.
+// PostgreSQL wire protocol: the frontend startup (with the SSLRequest probe and
+// SCRAM-SHA-256 authentication), simple queries, and the extended query protocol
+// (Parse/Bind/Describe/Execute/Close/Sync), with text and binary parameters and
+// results.
 //
 // The server side of this file is transport independent: pg_handle_message
 // takes the bytes of one frontend message and returns the bytes to send back.
@@ -1231,4 +1237,258 @@ sql_split_statements :: proc(sql: string, alloc := context.allocator) -> [dynami
 		if len(piece) > 0 do append(&out, piece)
 	}
 	return out
+}
+
+// --- SCRAM-SHA-256 ---------------------------------------------------------
+//
+// PostgreSQL authenticates a password with SCRAM-SHA-256 (RFC 5802, RFC 7677):
+// the client proves it knows the password without sending it, and the server
+// proves it knows it too. Three messages carry it:
+//
+//	server  AuthenticationSASL          the mechanisms it accepts
+//	client  SASLInitialResponse         "n,,n=user,r=<client nonce>"
+//	server  AuthenticationSASLContinue  "r=<client+server nonce>,s=<salt>,i=4096"
+//	client  SASLResponse                "c=biws,r=<nonce>,p=<client proof>"
+//	server  AuthenticationSASLFinal     "v=<server signature>", then AuthenticationOk
+//
+// What travels is HMAC proofs over the transcript, so an observer on a
+// connection without TLS learns nothing that lets it authenticate or replay:
+// the proof is bound to the server's salt and nonces.
+
+PG_SCRAM_MECHANISM :: "SCRAM-SHA-256"
+PG_SCRAM_ITERATIONS :: u32(4096)
+PG_SCRAM_NONCE_BYTES :: 18
+PG_SCRAM_SALT_BYTES :: 16
+PG_SCRAM_KEY_BYTES :: 32
+
+// Pg_Scram is one authentication exchange. It holds the password, the salt it
+// issued and the transcript the proof is checked against.
+Pg_Scram :: struct {
+	password:     string,
+	salt:         []u8,
+	nonce:        string,
+	client_first: string, // client-first-message-bare, owned
+	server_first: string, // owned, kept for the transcript
+}
+
+// pg_scram_start begins an exchange with a fresh salt and nonce.
+pg_scram_start :: proc(password: string) -> Pg_Scram {
+	scram := Pg_Scram{password = password}
+	scram.salt = make([]u8, PG_SCRAM_SALT_BYTES)
+	crypto.rand_bytes(scram.salt)
+	raw_nonce := make([]u8, PG_SCRAM_NONCE_BYTES)
+	defer delete(raw_nonce)
+	crypto.rand_bytes(raw_nonce)
+	scram.nonce, _ = base64.encode(raw_nonce, allocator = context.allocator, options = {.No_Padding})
+	return scram
+}
+
+pg_scram_destroy :: proc(scram: ^Pg_Scram) {
+	if scram == nil do return
+	delete(scram.salt)
+	delete(scram.nonce)
+	delete(scram.client_first)
+	delete(scram.server_first)
+	scram^ = {}
+}
+
+// pg_scram_client_first parses "n,,n=user,r=<nonce>" and keeps the bare part,
+// which is what both sides sign. A mandatory extension is refused: this server
+// implements none, and accepting one silently would weaken the proof.
+pg_scram_client_first :: proc(scram: ^Pg_Scram, message: string) -> Error {
+	bare_start := -1
+	commas := 0
+	for i in 0 ..< len(message) {
+		if message[i] == ',' {
+			commas += 1
+			if commas == 2 {
+				bare_start = i + 1
+				break
+			}
+		}
+	}
+	if bare_start < 0 do return errf(.Invalid_Argument, "malformed SCRAM client-first message")
+	bare := message[bare_start:]
+	client_nonce := ""
+	for attribute in strings.split(bare, ",", context.temp_allocator) {
+		if strings.has_prefix(attribute, "m=") {
+			return errf(.Invalid_Argument, "SCRAM extensions are not supported")
+		}
+		if strings.has_prefix(attribute, "r=") do client_nonce = attribute[2:]
+	}
+	if len(client_nonce) == 0 {
+		return errf(.Invalid_Argument, "the SCRAM client-first message carries no nonce")
+	}
+	scram.client_first = strings.clone(bare)
+	combined, _ := strings.concatenate({client_nonce, scram.nonce}, context.allocator)
+	delete(scram.nonce)
+	scram.nonce = combined
+	return ERROR_NONE
+}
+
+// pg_scram_server_first answers the challenge: the combined nonce, the salt and
+// the iteration count. The answer is owned by the caller.
+pg_scram_server_first :: proc(scram: ^Pg_Scram) -> string {
+	salt, _ := base64.encode(scram.salt)
+	defer delete(salt)
+	scram.server_first = fmt.aprintf(
+		"r=%s,s=%s,i=%d",
+		scram.nonce,
+		salt,
+		PG_SCRAM_ITERATIONS,
+	)
+	return strings.clone(scram.server_first)
+}
+
+@(private)
+scram_keys :: proc(scram: ^Pg_Scram, auth_message: string) -> (salted: []u8, err: Error) {
+	salted = make([]u8, PG_SCRAM_KEY_BYTES)
+	pbkdf2.derive(
+		.SHA256,
+		transmute([]u8)scram.password,
+		scram.salt,
+		PG_SCRAM_ITERATIONS,
+		salted,
+	)
+	return salted, ERROR_NONE
+}
+
+@(private)
+scram_hmac :: proc(key: []u8, message: string) -> []u8 {
+	out := make([]u8, PG_SCRAM_KEY_BYTES)
+	hmac.sum(.SHA256, out, transmute([]u8)message, key)
+	return out
+}
+
+@(private)
+scram_sha256 :: proc(data: []u8) -> []u8 {
+	out := make([]u8, PG_SCRAM_KEY_BYTES)
+	hash.hash_bytes_to_buffer(.SHA256, data, out)
+	return out
+}
+
+// pg_scram_finish checks the client's proof and answers the server signature,
+// which the client verifies. The answer is owned by the caller.
+pg_scram_finish :: proc(scram: ^Pg_Scram, message: string) -> (server_final: string, err: Error) {
+	proof_at := -1
+	for i := 0; i + 2 < len(message); i += 1 {
+		if message[i] == ',' && message[i + 1] == 'p' && message[i + 2] == '=' {
+			proof_at = i + 1
+			break
+		}
+	}
+	if proof_at < 0 {
+		return "", errf(.Invalid_Argument, "the SCRAM client-final message carries no proof")
+	}
+	without_proof := message[:proof_at - 1]
+	proof_text := message[proof_at + 2:]
+	// The channel binding is base64("n,,") because this server offers no TLS: a
+	// client that asked for it was answered N, so it must say so there.
+	if !strings.contains(without_proof, "c=biws") {
+		return "", errf(.Permission_Denied, "SCRAM channel binding is not what this server offered")
+	}
+	// The nonce must be the one this exchange issued, or the transcript is not
+	// the one the server signed.
+	client_nonce := ""
+	for attribute in strings.split(without_proof, ",", context.temp_allocator) {
+		if strings.has_prefix(attribute, "r=") do client_nonce = attribute[2:]
+	}
+	if client_nonce != scram.nonce {
+		return "", errf(.Permission_Denied, "SCRAM nonce does not match the exchange")
+	}
+
+	auth_message, _ := strings.concatenate(
+		{scram.client_first, ",", scram.server_first, ",", without_proof},
+		context.allocator,
+	)
+	defer delete(auth_message)
+	salted, _ := scram_keys(scram, auth_message)
+	defer delete(salted)
+	client_key := scram_hmac(salted, "Client Key")
+	defer delete(client_key)
+	stored_key := scram_sha256(client_key)
+	defer delete(stored_key)
+	client_signature := scram_hmac(stored_key, auth_message)
+	defer delete(client_signature)
+
+	// The client sent ClientKey XOR ClientSignature. Undo the signature, hash
+	// what comes out, and check that it signs the transcript: only the password
+	// produces such a key.
+	decoded, decode_err := base64.decode(proof_text)
+	if decode_err != base64.Decode_Error.None || len(decoded) != PG_SCRAM_KEY_BYTES {
+		delete(decoded)
+		return "", errf(.Permission_Denied, "the SCRAM proof is not a base64 SHA-256 value")
+	}
+	defer delete(decoded)
+	recovered := make([]u8, PG_SCRAM_KEY_BYTES)
+	defer delete(recovered)
+	for i in 0 ..< PG_SCRAM_KEY_BYTES do recovered[i] = decoded[i] ~ client_signature[i]
+	recovered_stored := scram_sha256(recovered)
+	defer delete(recovered_stored)
+	check := scram_hmac(recovered_stored, auth_message)
+	defer delete(check)
+	difference := u8(0)
+	for i in 0 ..< PG_SCRAM_KEY_BYTES do difference |= check[i] ~ client_signature[i]
+	if difference != 0 {
+		return "", errf(.Permission_Denied, "invalid username or password")
+	}
+
+	server_key := scram_hmac(salted, "Server Key")
+	defer delete(server_key)
+	signature := scram_hmac(server_key, auth_message)
+	defer delete(signature)
+	encoded, _ := base64.encode(signature)
+	defer delete(encoded)
+	return fmt.aprintf("v=%s", encoded), ERROR_NONE
+}
+
+// --- The wire messages the exchange uses -----------------------------------
+
+// pg_authentication_sasl offers the mechanism list. An AuthenticationSASL body
+// is the type (10), the mechanisms as C strings, and an empty one to end.
+pg_authentication_sasl :: proc() -> []u8 {
+	body := make([dynamic]u8, 0, 32)
+	defer delete(body)
+	pg_put_i32(&body, 10)
+	pg_put_cstring(&body, PG_SCRAM_MECHANISM)
+	append(&body, 0)
+	return pg_message('R', body[:])
+}
+
+pg_authentication_sasl_continue :: proc(challenge: string) -> []u8 {
+	body := make([dynamic]u8, 0, len(challenge) + 8)
+	defer delete(body)
+	pg_put_i32(&body, 11)
+	append(&body, ..transmute([]u8)challenge)
+	return pg_message('R', body[:])
+}
+
+pg_authentication_sasl_final :: proc(answer: string) -> []u8 {
+	body := make([dynamic]u8, 0, len(answer) + 8)
+	defer delete(body)
+	pg_put_i32(&body, 12)
+	append(&body, ..transmute([]u8)answer)
+	return pg_message('R', body[:])
+}
+
+// pg_sasl_initial reads SASLInitialResponse: the mechanism name, then the
+// initial client message with its length.
+pg_sasl_initial :: proc(data: []u8) -> (mechanism: string, initial: string, ok: bool) {
+	if len(data) < 5 || data[0] != 'p' do return "", "", false
+	offset := 5
+	name, consumed := pg_read_cstring(data[offset:])
+	if consumed <= 0 do return "", "", false
+	offset += consumed
+	if offset + 4 > len(data) do return "", "", false
+	size := int(pg_get_i32(data, offset))
+	offset += 4
+	if size < 0 || offset + size > len(data) do return "", "", false
+	return name, string(data[offset:offset + size]), true
+}
+
+// pg_sasl_response reads the bare SASLResponse the client sends for the final
+// step: the message body is just its text.
+pg_sasl_response :: proc(data: []u8) -> (text: string, ok: bool) {
+	if len(data) < 5 || data[0] != 'p' do return "", false
+	return string(data[5:]), true
 }

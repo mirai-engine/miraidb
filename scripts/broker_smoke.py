@@ -131,6 +131,94 @@ def free_port() -> int:
         return probe.getsockname()[1]
 
 
+def read_pg_message(sock) -> bytes:
+    """One frontend/backend message: a type byte and a length that counts itself."""
+    head = sock.recv(5)
+    while len(head) < 5:
+        more = sock.recv(5 - len(head))
+        if not more:
+            raise AssertionError("the server closed during the startup")
+        head += more
+    length = struct.unpack("!i", head[1:5])[0]
+    body = b""
+    while len(body) < length - 4:
+        chunk = sock.recv(length - 4 - len(body))
+        if not chunk:
+            raise AssertionError("the server closed mid-message")
+        body += chunk
+    return head + body
+
+
+def send_pg_message(sock, kind: bytes, body: bytes) -> None:
+    sock.sendall(kind + struct.pack("!i", len(body) + 4) + body)
+
+
+def scram_login(port: int, password: str, user: str = "root") -> bytes:
+    """A SCRAM-SHA-256 client in the standard library, so the gate needs no driver.
+
+    Answers the SASLInitialResponse, checks the server's signature, and returns
+    the server-final text. Raises when the server refuses or proves a different
+    password than the one this function was given.
+    """
+    import base64
+    import hashlib
+    import hmac
+
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    startup = b"user\x00" + user.encode() + b"\x00database\x00x\x00\x00"
+    sock.sendall(struct.pack("!ii", 4 + len(startup), 196608) + startup)
+
+    greeting = read_pg_message(sock)
+    if greeting[0:1] != b"R" or struct.unpack("!i", greeting[5:9])[0] != 10:
+        sock.close()
+        raise AssertionError(f"expected AuthenticationSASL, got {greeting[:9]!r}")
+    mechanisms = greeting[9:].split(b"\x00")
+    if b"SCRAM-SHA-256" not in mechanisms:
+        sock.close()
+        raise AssertionError(f"SCRAM-SHA-256 not offered: {mechanisms}")
+
+    nonce = base64.b64encode(os.urandom(18)).decode().rstrip("=")
+    client_first_bare = f"n={user},r={nonce}"
+    initial = b"n,," + client_first_bare.encode()
+    send_pg_message(sock, b"p", b"SCRAM-SHA-256\x00" + struct.pack("!i", len(initial)) + initial)
+
+    challenge = read_pg_message(sock)
+    if challenge[0:1] != b"R" or struct.unpack("!i", challenge[5:9])[0] != 11:
+        sock.close()
+        raise AssertionError(f"expected SASLContinue, got {challenge[:9]!r}")
+    server_first = challenge[9:].decode()
+    attributes = dict(pair.split("=", 1) for pair in server_first.split(","))
+    salt = base64.b64decode(attributes["s"])
+    iterations = int(attributes["i"])
+    combined = attributes["r"]
+    if not combined.startswith(nonce):
+        sock.close()
+        raise AssertionError("the server's nonce does not extend the client's")
+
+    salted = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
+    client_key = hmac.new(salted, b"Client Key", "sha256").digest()
+    stored_key = hashlib.sha256(client_key).digest()
+    without_proof = f"c=biws,r={combined}"
+    auth_message = f"{client_first_bare},{server_first},{without_proof}".encode()
+    client_signature = hmac.new(stored_key, auth_message, "sha256").digest()
+    proof = bytes(left ^ right for left, right in zip(client_key, client_signature))
+    send_pg_message(sock, b"p", without_proof.encode() + b",p=" + base64.b64encode(proof))
+
+    final = read_pg_message(sock)
+    if final[0:1] == b"E":
+        sock.close()
+        raise AssertionError("the server refused the password")
+    if final[0:1] != b"R" or struct.unpack("!i", final[5:9])[0] != 12:
+        sock.close()
+        raise AssertionError(f"expected SASLFinal, got {final[:9]!r}")
+    server_key = hmac.new(salted, b"Server Key", "sha256").digest()
+    expected = base64.b64encode(hmac.new(server_key, auth_message, "sha256").digest()).decode()
+    if final[9:].decode() != "v=" + expected:
+        sock.close()
+        raise AssertionError("the server proved a different password")
+    return final[9:]
+
+
 def wait_healthy(port: int, process: subprocess.Popen) -> bool:
     deadline = time.time() + 20
     while time.time() < deadline:
@@ -323,6 +411,45 @@ def main() -> int:
                     break
                 seen += chunk
         check("the startup completes after the refusal", b"Z" in seen, seen[:40])
+
+        # PostgreSQL authenticates a password with SCRAM-SHA-256: the client
+        # proves it without sending it, and the server proves it too. A second
+        # server with --password is what checks the whole exchange, with the
+        # standard library as the client so no driver has to be installed.
+        auth_port = free_port()
+        auth_server = subprocess.Popen(
+            [SERVER, "_broker_tmp/auth_db", f"--port={auth_port}", "--password=s3cret"],
+            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            check("the password server owns the database", wait_healthy(auth_port, auth_server))
+            try:
+                final = scram_login(auth_port, "s3cret")
+                check("SCRAM-SHA-256 accepts the right password", final.startswith(b"v="), repr(final[:20]))
+            except AssertionError as exc:
+                check("SCRAM-SHA-256 accepts the right password", False, str(exc))
+            try:
+                scram_login(auth_port, "wrong")
+                check("SCRAM-SHA-256 refuses the wrong password", False, "it accepted")
+            except AssertionError as exc:
+                check("SCRAM-SHA-256 refuses the wrong password", "refused" in str(exc), str(exc))
+            # A plain startup, with no SASL message at all, gets an error rather
+            # than a session: the exchange is not optional once a password is set.
+            with socket.create_connection(("127.0.0.1", auth_port), timeout=5) as plain:
+                startup = b"user\x00root\x00database\x00x\x00\x00"
+                plain.sendall(struct.pack("!ii", 4 + len(startup), 196608) + startup)
+                greeting = read_pg_message(plain)
+                send_pg_message(plain, b"Q", b"SELECT 1\x00")
+                answer = read_pg_message(plain)
+            check("a query before authenticating is refused",
+                  answer[0:1] == b"E", answer[:9])
+        finally:
+            if auth_server.poll() is None:
+                auth_server.terminate()
+                try:
+                    auth_server.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    auth_server.kill()
 
         # Client A creates and writes; client B reads the same state.
         check("create through the broker", post(port, "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)")["affected"] >= 0)

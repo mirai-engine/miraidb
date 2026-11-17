@@ -17,7 +17,14 @@ USAGE :: `miraidb-server - HTTP front end for a miraidb database
 
 Usage:
   miraidb-server <database> [--port=8080] [--any] [--allow-host]
-                            [--statement-timeout-ms=N] [--budget=N]
+                            [--password=PASS] [--statement-timeout-ms=N] [--budget=N]
+
+The PostgreSQL front end authenticates with SCRAM-SHA-256 when --password is
+given (or MIRAIDB_PG_PASSWORD is in the environment): the password never crosses
+the socket, only proofs over a transcript the server salts. Without it the port
+accepts every client, which is what the HTTP front end does too; say so out loud
+when it is reachable from anywhere but this machine. A password on the command
+line is visible to whoever lists the processes: prefer the environment variable.
 
 The three statements that reach outside the database are refused to clients
 unless --allow-host is given: ATTACH reads a file path, LOAD EXTENSION runs host
@@ -52,6 +59,7 @@ main :: proc() {
 	allow_host := false
 	statement_timeout_ms := i64(0)
 	budget := u64(0)
+	password := ""
 	for arg in os.args[1:] {
 		switch {
 		case strings.has_prefix(arg, "--port="):
@@ -65,6 +73,8 @@ main :: proc() {
 			any_interface = true
 		case arg == "--allow-host":
 			allow_host = true
+		case strings.has_prefix(arg, "--password="):
+			password = arg[len("--password="):]
 		case strings.has_prefix(arg, "--statement-timeout-ms="):
 			parsed, ok := strconv.parse_int(arg[len("--statement-timeout-ms="):])
 			if !ok || parsed < 0 {
@@ -103,6 +113,10 @@ main :: proc() {
 	host := db.host_init(store)
 	defer db.host_destroy(host)
 	server := Server{host = host}
+	server.pg_password = password
+	if len(server.pg_password) == 0 {
+		server.pg_password = os.get_env("MIRAIDB_PG_PASSWORD", context.allocator)
+	}
 	server.timeout_us = statement_timeout_ms * 1000
 	server.connections = make(map[u64]^Connection)
 	defer delete(server.connections)
@@ -141,7 +155,15 @@ main :: proc() {
 Server :: struct {
 	host:        ^db.Host,
 	statements:  sync.Mutex,
+	// registry guards `connections`. It is not the statement lock: a connection
+	// has to be able to register, and to finish its startup, while another
+	// connection runs a statement or waits inside a transaction. Sharing one
+	// mutex made a new client block on a transaction it has nothing to do with.
+	registry:    sync.Mutex,
 	connections: map[u64]^Connection,
+	// pg_password is what the PostgreSQL front end verifies with SCRAM; empty
+	// means it asks for nothing.
+	pg_password: string,
 	// timeout_us is how long one statement may run before the watchdog cancels
 	// it; zero leaves it unbounded. The three fields below are the watchdog's
 	// view of the statement in flight.
@@ -226,14 +248,16 @@ serve_connection :: proc(data: rawptr) {
 // already serialises the registry walk in a commit.
 @(private)
 server_register :: proc(server: ^Server, connection: ^Connection) {
-	sync.mutex_lock(&server.statements)
+	sync.mutex_lock(&server.registry)
 	server.connections[connection.owner] = connection
-	sync.mutex_unlock(&server.statements)
+	sync.mutex_unlock(&server.registry)
 }
 
 @(private)
 server_forget :: proc(server: ^Server, connection: ^Connection) {
+	sync.mutex_lock(&server.registry)
 	delete_key(&server.connections, connection.owner)
+	sync.mutex_unlock(&server.registry)
 }
 
 // server_on_update is called from the thread that ran the commit. It finds the
@@ -244,7 +268,9 @@ server_on_update :: proc(ctx: rawptr, update: ^db.Subscription_Update) {
 	if server == nil do return
 	owner := db.host_subscription_owner(server.host, update.subscription_id)
 	if owner == 0 do return
+	sync.mutex_lock(&server.registry)
 	connection, exists := server.connections[owner]
+	sync.mutex_unlock(&server.registry)
 	if !exists do return
 	message := db.wire_encode_delta(update)
 	defer delete(message)
@@ -362,25 +388,113 @@ serve :: proc(connection: ^Connection) {
 
 // serve_frames runs the WebSocket loop: each binary or text frame carries one
 // wire message and the answer goes back in one binary frame.
+// Pg_Auth is where a PostgreSQL connection is in its startup.
+Pg_Auth :: enum {
+	// Password: the SASL initial response is expected.
+	Password,
+	// Challenge: the client's proof is expected.
+	Challenge,
+	// Ready: authenticated (or nothing was asked for), queries are handled.
+	Ready,
+	// Failed: an error was sent and the connection must close.
+	Failed,
+}
+
+// pg_ready_bytes is AuthenticationOk, the parameters every PostgreSQL server
+// reports, and ReadyForQuery, in one buffer.
+@(private)
+pg_ready_bytes :: proc() -> []u8 {
+	out := make([dynamic]u8, 0, 256)
+	hello := db.pg_authentication_ok()
+	append(&out, ..hello)
+	delete(hello)
+	// Drivers read these without checking: psycopg's C build crashed on a null
+	// `client_encoding` when only `server_version` was sent.
+	for parameter in db.PG_STARTUP_PARAMETERS {
+		status := db.pg_parameter_status(parameter[0], parameter[1])
+		append(&out, ..status)
+		delete(status)
+	}
+	ready := db.pg_ready_for_query('I')
+	append(&out, ..ready)
+	delete(ready)
+	return out[:]
+}
+
+// pg_authenticate advances the SCRAM exchange by one message and answers the
+// bytes to send. It touches no database state, so it runs without the statement
+// lock: a client must be able to authenticate while another one runs a query.
+@(private)
+pg_authenticate :: proc(
+	scram: ^db.Pg_Scram,
+	state: Pg_Auth,
+	message: []u8,
+) -> (
+	response: []u8,
+	next: Pg_Auth,
+) {
+	if len(message) == 0 || message[0] != 'p' {
+		return db.pg_error_response("expected a SASL message", "08P01"), .Failed
+	}
+	switch state {
+	case .Password:
+		mechanism, initial, parsed := db.pg_sasl_initial(message)
+		if !parsed || mechanism != db.PG_SCRAM_MECHANISM {
+			return db.pg_error_response("only SCRAM-SHA-256 is supported", "28000"), .Failed
+		}
+		if err := db.pg_scram_client_first(scram, initial); err.kind != .None {
+			return db.pg_error_response(err.message, db.pg_sqlstate(err.kind)), .Failed
+		}
+		challenge := db.pg_scram_server_first(scram)
+		defer delete(challenge)
+		return db.pg_authentication_sasl_continue(challenge), .Challenge
+	case .Challenge:
+		text, parsed := db.pg_sasl_response(message)
+		if !parsed {
+			return db.pg_error_response("malformed SASL response", "08P01"), .Failed
+		}
+		answer, err := db.pg_scram_finish(scram, text)
+		if err.kind != .None {
+			// One message for a wrong password and for a malformed proof: a
+			// client learns that it failed, not why.
+			return db.pg_error_response("invalid username or password", "28P01"), .Failed
+		}
+		defer delete(answer)
+		final := db.pg_authentication_sasl_final(answer)
+		defer delete(final)
+		ready := pg_ready_bytes()
+		defer delete(ready)
+		joined := make([dynamic]u8, 0, len(final) + len(ready))
+		append(&joined, ..final)
+		append(&joined, ..ready)
+		return joined[:], .Ready
+	case .Ready, .Failed:
+		return nil, state
+	}
+	return nil, state
+}
+
 // serve_postgres answers the startup and then handles simple-query messages.
 @(private)
 serve_postgres :: proc(connection: ^Connection) {
 	host := connection.port.host
 	client := connection.socket
-	hello := db.pg_authentication_ok()
-	_ = send(connection, hello)
-	delete(hello)
-	// The parameters every PostgreSQL server reports after authentication.
-	// Drivers read them without checking: psycopg's C build crashed (a null
-	// `client_encoding`) when only `server_version` was sent.
-	for parameter in db.PG_STARTUP_PARAMETERS {
-		status := db.pg_parameter_status(parameter[0], parameter[1])
-		_ = send(connection, status)
-		delete(status)
+	// A configured password is checked before the session exists: SCRAM proves
+	// it without sending it, and the connection is refused until it does.
+	auth := Pg_Auth.Ready
+	scram: db.Pg_Scram
+	defer db.pg_scram_destroy(&scram)
+	if len(connection.port.pg_password) > 0 {
+		scram = db.pg_scram_start(connection.port.pg_password)
+		offer := db.pg_authentication_sasl()
+		_ = send(connection, offer)
+		delete(offer)
+		auth = .Password
+	} else {
+		ready := pg_ready_bytes()
+		_ = send(connection, ready)
+		delete(ready)
 	}
-	ready := db.pg_ready_for_query('I')
-	_ = send(connection, ready)
-	delete(ready)
 	session := db.pg_session_init()
 	// A BEGIN holds the store's write lock until COMMIT or ROLLBACK, so the
 	// connection keeps the statement lock for that whole time: another
@@ -409,6 +523,19 @@ serve_postgres :: proc(connection: ^Connection) {
 			if length > PG_MAX_MESSAGE do return
 			total := length >= 4 ? 1 + length : len(pending)
 			if len(pending) < total do break
+			if auth != .Ready {
+				// Authentication runs outside the statement lock, so a client can
+				// connect and prove itself while another one is mid-transaction.
+				response, next := pg_authenticate(&scram, auth, pending[:total])
+				auth = next
+				remove_range(&pending, 0, total)
+				if len(response) > 0 {
+					_ = send(connection, response)
+					delete(response)
+				}
+				if auth == .Failed do return
+				continue
+			}
 			if holding {
 				statement_resume(connection.port)
 			} else {

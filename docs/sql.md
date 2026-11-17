@@ -560,7 +560,21 @@ pattern taken from a column of the row cannot narrow the scan (a constant or a
 
 The dialect accepts what a PostgreSQL client, an ORM or a migration tool sends
 first, so a schema written for PostgreSQL runs here unchanged in the common
-cases. Each spelling maps onto a construct the engine already has:
+cases. Each spelling maps onto a construct the engine already has.
+
+`miraidb-server` answers a PostgreSQL client on its port. With `--password` (or
+`MIRAIDB_PG_PASSWORD`) it authenticates with **SCRAM-SHA-256**: the client proves
+it knows the password without sending it, and the server proves it knows it too.
+Without a password the port accepts every client, which is worth saying out loud
+when the port is reachable from anywhere but this machine. A statement on the
+command line is visible to whoever lists the processes; the environment variable
+is the quieter way.
+
+Two connections are served at once as far as the protocol goes: a second client
+completes its startup while the first holds a transaction open. Statements still
+run one at a time, because a transaction holds the store's write lock until it
+commits; a client that needs to write while another transaction is open waits for
+it.
 
 | PostgreSQL | Here |
 |---|---|
