@@ -79,16 +79,18 @@ script lists.
 ## Functions
 
 **Implemented (the count is in [sqlite-roadmap.md](sqlite-roadmap.md),
-measured by `scripts/sqlite_gaps.py`):** `abs` and the trigonometric/logarithmic set (`acos`, `asin`,
-`atan`, `atan2`, `cos`, `sin`, `tan`, `degrees`, `radians`, `pi`, `exp`,
-`log`, `log2`, `log10`), `ceil`/`floor`/`round`/`trunc`/`sign`/`sqrt`/`pow`/
+measured by `scripts/sqlite_gaps.py`):** `abs` and the trigonometric, hyperbolic and logarithmic set (`acos`, `asin`,
+`atan`, `atan2`, `cos`, `sin`, `tan`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`,
+`atanh`, `degrees`, `radians`, `pi`, `exp`, `log`, `log2`, `log10`), `ceil`/`floor`/`round`/`trunc`/`sign`/`sqrt`/`pow`/
 `mod`, `char`, `unicode`, `hex`, `unhex`, `quote`, `format`/`printf`,
 `coalesce`, `iif`, `ifnull`, `nullif`, `length`, `octet_length`, `lower`,
 `upper`, `ltrim`, `rtrim`, `trim`, `replace`, `concat`, `concat_ws`, `instr`,
 `substr`/`substring`, `glob`, `like`, `typeof`, `min(a, b, …)`/`max(a, b, …)`
 as scalars, `trim`/`ltrim`/`rtrim` with a character set, `random`, `zeroblob`,
 `uuid` (only when the host supplies a randomness source), `randomblob`,
-`changes`, `total_changes`, `last_insert_rowid`, `sqlite_version`, `date`,
+`changes`, `total_changes`, `last_insert_rowid`, `sqlite_version`, `affinity`,
+`soundex`, `unistr`, `unistr_quote`, `timediff`, `sqlite_source_id`,
+`sqlite_compileoption_used`, `sqlite_compileoption_get`, `date`,
 `time`, `datetime`, `strftime`, `now`, eleven `json_*` scalars and the
 `json_each`/`json_tree` table functions,
 `group_concat`/`string_agg`, `rank`, `snippet`, `highlight`, `current_identity`
@@ -102,7 +104,8 @@ roadmap item in [sqlite-roadmap.md](sqlite-roadmap.md) (S4 and S5).
 
 The engine sorts the 63 names in the inventory into four classes:
 
-- **25 answer with data**: `application_id`, `cache_size`, `compile_options`,
+- **28 answer with data**: `application_id`, `cache_size`, `collation_list`,
+  `compile_options`, `legacy_file_format`, `module_list`,
   `data_version`, `database_list`, `encoding`, `foreign_key_check`,
   `foreign_key_list`, `foreign_keys`, `freelist_count`, `function_list`,
   `index_info`, `index_list`, `integrity_check`, `journal_mode`,
@@ -121,10 +124,10 @@ The engine sorts the 63 names in the inventory into four classes:
   `defer_foreign_keys`, `ignore_check_constraints`, `legacy_alter_table`,
   `locking_mode`, `query_only`, `read_uncommitted`, `recursive_triggers`,
   `reverse_unordered_selects`, `trusted_schema`, `writable_schema`.
-- **The rest are unknown** and answer an error (`collation_list`,
-  `module_list`, `incremental_vacuum`, `shrink_memory`, `legacy_file_format`,
-  `soft_heap_limit64`, `data_store_directory`, `temp_store_directory`,
-  `temp_store`).
+- **The rest are acknowledged** and answer the neutral value SQLite answers when
+  there is nothing to give back: `incremental_vacuum`, `shrink_memory`,
+  `soft_heap_limit64`, `temp_store`, `temp_store_directory`,
+  `data_store_directory`. There is no unknown pragma left in the inventory.
 
 ## Semantics that differ from SQLite
 

@@ -12,6 +12,7 @@ package engine
 // `PRAGMA name(arg)` all reach `sql_exec_pragma`.
 
 import "core:fmt"
+import "core:slice"
 import "core:strings"
 import "core:sync"
 
@@ -44,14 +45,17 @@ pragma_columns :: proc(names: ..string) -> []string {
 // freed by sql_result_destroy.
 // PRAGMA_NAMES lists the pragmas the engine answers; pragma_list reports them.
 PRAGMA_NAMES := []string{
-	"application_id", "cache_size", "compile_options", "database_list", "data_version",
+	"application_id", "cache_size", "collation_list", "compile_options",
+	"data_store_directory", "database_list", "data_version",
 	"encoding",
 	"foreign_key_list", "foreign_keys", "function_list", "index_info", "index_list",
+	"incremental_vacuum", "legacy_file_format", "module_list",
 	"foreign_key_check", "integrity_check", "journal_mode", "mmap_size", "page_size",
 	"freelist_count", "page_count", "pragma_list", "quick_check", "schema_version",
+	"shrink_memory", "soft_heap_limit64",
 	"sqlite_version", "stats",
 	"synchronous", "table_info",
-	"table_list", "table_xinfo", "temp_store", "user_version",
+	"table_list", "table_xinfo", "temp_store", "temp_store_directory", "user_version",
 }
 
 // PRAGMA_FUNCTIONS lists the built-in functions for function_list.
@@ -353,6 +357,78 @@ sql_exec_pragma :: proc(store: ^Store, body: string, locked: bool) -> (Sql_Resul
 			result.rows[i] = row
 		}
 		return result, ERROR_NONE
+	case "collation_list":
+		// The three the engine implements, then any a program registered. SQLite
+		// numbers them in registration order; this is that order.
+		builtin := [3]string{"BINARY", "NOCASE", "RTRIM"}
+		host_names := make([dynamic]string, 0, len(store.collations))
+		for host_name in store.collations do append(&host_names, host_name)
+		slice.sort_by(host_names[:], proc(a, b: string) -> bool {
+			return strings.compare(a, b) < 0
+		})
+		defer delete(host_names)
+		result := Sql_Result{kind = .Rows, commit_seq = store.commit_seq}
+		result.columns = pragma_columns("seq", "name")
+		result.rows = make([][]Value, len(builtin) + len(host_names))
+		for builtin_name, i in builtin {
+			row := make([]Value, 2)
+			row[0] = value_int(i64(i))
+			row[1] = pragma_text(builtin_name)
+			result.rows[i] = row
+		}
+		for host_name, i in host_names {
+			row := make([]Value, 2)
+			row[0] = value_int(i64(len(builtin) + i))
+			row[1] = pragma_text(host_name)
+			result.rows[len(builtin) + i] = row
+		}
+		return result, ERROR_NONE
+	case "module_list":
+		// The virtual table modules this engine implements, which is what
+		// `CREATE VIRTUAL TABLE ... USING <module>` accepts.
+		modules := [6]string{"fts4", "fts5", "json_each", "json_tree", "rtree", "rtree_i32"}
+		result := Sql_Result{kind = .Rows, commit_seq = store.commit_seq}
+		result.columns = pragma_columns("seq", "name")
+		result.rows = make([][]Value, len(modules))
+		for module, i in modules {
+			row := make([]Value, 2)
+			row[0] = value_int(i64(i))
+			row[1] = pragma_text(module)
+			result.rows[i] = row
+		}
+		return result, ERROR_NONE
+	case "legacy_file_format":
+		// This engine never writes SQLite's old file format, and its own log is
+		// not a page file at all: the answer is the one that means "no".
+		return pragma_single("legacy_file_format", value_int(0), store.commit_seq), ERROR_NONE
+	case "temp_store":
+		// There is no page cache and no temporary store to put in memory: a read
+		// answers SQLite's default (file) and a write is acknowledged.
+		if has_argument {
+			return Sql_Result{kind = .Ack, message = strings.clone("ok"), commit_seq = store.commit_seq}, ERROR_NONE
+		}
+		return pragma_single("temp_store", value_int(0), store.commit_seq), ERROR_NONE
+	case "soft_heap_limit64":
+		if has_argument {
+			// The limit a caller sets is acknowledged: the engine meters memory by
+			// rows and bytes, not by an allocator cap.
+			return Sql_Result{kind = .Ack, message = strings.clone("ok"), commit_seq = store.commit_seq}, ERROR_NONE
+		}
+		return pragma_single("soft_heap_limit64", value_int(0), store.commit_seq), ERROR_NONE
+	case "shrink_memory", "incremental_vacuum":
+		// Both ask the engine to give memory back. VACUUM compacts the log; these
+		// are the no-ops SQLite makes them when there is nothing to give back.
+		if has_argument && name != "incremental_vacuum" {
+			return Sql_Result{kind = .Ack, message = strings.clone("ok"), commit_seq = store.commit_seq}, ERROR_NONE
+		}
+		return Sql_Result{kind = .Ack, message = strings.clone("ok"), commit_seq = store.commit_seq}, ERROR_NONE
+	case "temp_store_directory", "data_store_directory":
+		// Deprecated in SQLite, and meaningless here: a read answers the empty
+		// string (no directory is set) and a write is acknowledged.
+		if has_argument {
+			return Sql_Result{kind = .Ack, message = strings.clone("ok"), commit_seq = store.commit_seq}, ERROR_NONE
+		}
+		return pragma_single(name, pragma_text(""), store.commit_seq), ERROR_NONE
 	case "compile_options":
 		result := Sql_Result{kind = .Rows, commit_seq = store.commit_seq}
 		result.columns = pragma_columns("compile_options")

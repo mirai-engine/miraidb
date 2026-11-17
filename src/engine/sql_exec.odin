@@ -5073,6 +5073,242 @@ value_cast :: proc(v: Value, target: Column_Type) -> (Value, Error) {
 	)
 }
 
+// unistr_decode reads the escapes unistr documents. An escape that names no
+// character is refused rather than dropped, as SQLite refuses it.
+@(private)
+unistr_decode :: proc(text: string) -> string {
+	out := make([dynamic]u8, 0, len(text))
+	i := 0
+	for i < len(text) {
+		c := text[i]
+		if c != '\\' {
+			append(&out, c)
+			i += 1
+			continue
+		}
+		i += 1
+		if i >= len(text) {
+			append(&out, '\\')
+			break
+		}
+		escape := text[i]
+		i += 1
+		digits := 0
+		switch escape {
+		case '\\':
+			append(&out, '\\')
+			continue
+		case 'u':
+			digits = 4
+		case '+':
+			digits = 6
+		case 'U':
+			digits = 8
+		case:
+			// No other escape: the backslash is literal, as SQLite keeps it.
+			append(&out, '\\')
+			append(&out, escape)
+			continue
+		}
+		if i + digits > len(text) {
+			append(&out, '\\')
+			append(&out, escape)
+			continue
+		}
+		code: u32
+		valid := true
+		for _ in 0 ..< digits {
+			digit := text[i]
+			i += 1
+			value: u32
+			switch {
+			case digit >= '0' && digit <= '9':
+				value = u32(digit - '0')
+			case digit >= 'a' && digit <= 'f':
+				value = u32(digit - 'a') + 10
+			case digit >= 'A' && digit <= 'F':
+				value = u32(digit - 'A') + 10
+			case:
+				valid = false
+			}
+			code = code * 16 + value
+		}
+		if !valid || code > 0x10FFFF {
+			append(&out, '\\')
+			append(&out, escape)
+			continue
+		}
+		// A UTF-16 surrogate pair says nothing on its own: it is written as the
+		// replacement character, which is what a broken escape earns.
+		if code >= 0xD800 && code <= 0xDFFF {
+			code = 0xFFFD
+		}
+		buffer, length := utf8.encode_rune(cast(rune)code)
+		append(&out, ..buffer[:length])
+	}
+	return string(out[:])
+}
+
+// unistr_quote writes a text so that unistr reads it back: the quotes SQL wants
+// and the escapes for a control character or a lone surrogate.
+@(private)
+unistr_quote :: proc(text: string) -> string {
+	out := make([dynamic]u8, 0, len(text) + 2)
+	// SQLite answers the call that would read the text back, not a bare literal.
+	append(&out, ..transmute([]u8)string("unistr('"))
+	for i := 0; i < len(text); {
+		c := text[i]
+		if c == '\'' {
+			append(&out, '\'')
+			append(&out, '\'')
+			i += 1
+			continue
+		}
+		if c < 0x20 || c == 0x7F {
+			append(&out, ..transmute([]u8)fmt.aprintf("\\u%04x", c))
+			i += 1
+			continue
+		}
+		decoded, size := utf8.decode_rune(text[i:])
+		if decoded == utf8.RUNE_ERROR && size <= 1 {
+			out_text := fmt.aprintf("\\u%04x", c)
+			append(&out, ..transmute([]u8)out_text)
+			i += 1
+			continue
+		}
+		append(&out, text[i:i + size])
+		i += size
+	}
+	append(&out, ..transmute([]u8)string("')"))
+	return string(out[:])
+}
+
+// timediff_text is `first - second` as SQLite writes it: a sign, then years,
+// months, days and the time of day.
+@(private)
+timediff_text :: proc(first, second: Db_Time) -> string {
+	negative := second.jd > first.jd
+	from := negative ? first : second
+	to := negative ? second : first
+	years, months, days, hours, minutes, seconds, millis := timediff_parts(from, to)
+	return fmt.aprintf(
+		"%s%04d-%02d-%02d %02d:%02d:%02d.%03d",
+		negative ? "-" : "+",
+		years,
+		months,
+		days,
+		hours,
+		minutes,
+		seconds,
+		millis,
+	)
+}
+
+@(private)
+timediff_parts :: proc(from, to: Db_Time) -> (years, months, days, hours, minutes, seconds, millis: int) {
+	fy, fm, fd, fh, fmin, fs := db_time_civil(from)
+	ty, tm, td, th, tmin, ts := db_time_civil(to)
+	years = ty - fy
+	months = tm - fm
+	days = td - fd
+	hours = th - fh
+	minutes = tmin - fmin
+	seconds = ts - fs
+	// Borrow the way a calendar does: a negative lower field takes one from the
+	// field above it. A month is the month before, and a day is the length of the
+	// month it lands in.
+	if seconds < 0 {
+		seconds += 60
+		minutes -= 1
+	}
+	if minutes < 0 {
+		minutes += 60
+		hours -= 1
+	}
+	if hours < 0 {
+		hours += 24
+		days -= 1
+	}
+	if days < 0 {
+		month := tm - 1
+		year := ty
+		if month < 1 {
+			month = 12
+			year -= 1
+		}
+		days += db_days_in_month(year, month)
+		months -= 1
+	}
+	if months < 0 {
+		months += 12
+		years -= 1
+	}
+	return
+}
+
+// soundex_encode is SQLite's SOUNDEX: the first letter in upper case, then one
+// digit per consonant class for three digits, zero-padded. The classes are
+// SQLite's, and a letter that repeats the class of the one before it (with only
+// vowels, h, w or y in between) counts once.
+@(private)
+soundex_encode :: proc(text: string) -> string {
+	classify :: proc(c: u8) -> u8 {
+		switch c {
+		case 'B', 'F', 'P', 'V', 'b', 'f', 'p', 'v':
+			return '1'
+		case 'C', 'G', 'J', 'K', 'Q', 'S', 'X', 'Z', 'c', 'g', 'j', 'k', 'q', 's', 'x', 'z':
+			return '2'
+		case 'D', 'T', 'd', 't':
+			return '3'
+		case 'L', 'l':
+			return '4'
+		case 'M', 'N', 'm', 'n':
+			return '5'
+		case 'R', 'r':
+			return '6'
+		}
+		return 0
+	}
+	digits := make([dynamic]u8, 0, 8)
+	previous: u8 = 0
+	first := true
+	first_letter: u8 = 0
+	for i in 0 ..< len(text) {
+		c := text[i]
+		is_letter := (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+		if !is_letter do continue
+		upper := c >= 'a' && c <= 'z' ? c - 32 : c
+		if first {
+			first_letter = upper
+			first = false
+			previous = classify(upper)
+			continue
+		}
+		code := classify(upper)
+		if code == 0 {
+			// A vowel, or h, w, y: it separates two groups but does not end them
+			// for h, w and y, which SQLite skips without resetting.
+			if upper != 'H' && upper != 'W' && upper != 'Y' do previous = 0
+			continue
+		}
+		if code == previous do continue
+		append(&digits, code)
+		previous = code
+		if len(digits) == 3 do break
+	}
+	if first_letter == 0 do return "?000"
+	out := make([dynamic]u8, 0, 4)
+	append(&out, first_letter)
+	for i in 0 ..< 3 {
+		if i < len(digits) {
+			append(&out, digits[i])
+		} else {
+			append(&out, '0')
+		}
+	}
+	return string(out[:])
+}
+
 // scalar_minmax reports a min()/max() call that takes its value from two or more
 // arguments: SQLite answers that as a scalar function, not as a group aggregate.
 @(private)
@@ -5809,6 +6045,88 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		if !ok do return {}, errf(.Invalid_Type, "sqrt() expects a number")
 		if number < 0 do return {}, errf(.Invalid_Argument, "sqrt() needs a non-negative number")
 		return value_float(math.sqrt(number)), ERROR_NONE
+	case "sinh", "cosh", "tanh", "asinh", "acosh", "atanh":
+		// The hyperbolic family, one argument. Outside its domain acosh and atanh
+		// answer NULL, as SQLite does for a number with no answer.
+		if len(args) != 1 do return {}, errf(.Invalid_Argument, "%s() takes one argument", call.name)
+		if args[0].kind == .Null do return value_null(), ERROR_NONE
+		number, ok := value_to_f64(args[0])
+		if !ok do return {}, errf(.Invalid_Type, "%s() expects a number", call.name)
+		switch dispatch {
+		case "sinh":
+			return value_float(math.sinh(number)), ERROR_NONE
+		case "cosh":
+			return value_float(math.cosh(number)), ERROR_NONE
+		case "tanh":
+			return value_float(math.tanh(number)), ERROR_NONE
+		case "asinh":
+			return value_float(math.asinh(number)), ERROR_NONE
+		case "acosh":
+			if number < 1 do return value_null(), ERROR_NONE
+			return value_float(math.acosh(number)), ERROR_NONE
+		case "atanh":
+			if number <= -1 || number >= 1 do return value_null(), ERROR_NONE
+			return value_float(math.atanh(number)), ERROR_NONE
+		}
+		return value_null(), ERROR_NONE
+	case "affinity":
+		// SQLite's affinity() names the storage class the value has.
+		if len(args) != 1 do return {}, errf(.Invalid_Argument, "affinity() takes one argument")
+		#partial switch args[0].kind {
+		case .Int:
+			return value_string(strings.clone("INTEGER", context.allocator)), ERROR_NONE
+		case .Float:
+			return value_string(strings.clone("REAL", context.allocator)), ERROR_NONE
+		case .String:
+			return value_string(strings.clone("TEXT", context.allocator)), ERROR_NONE
+		case .Bytes:
+			return value_string(strings.clone("BLOB", context.allocator)), ERROR_NONE
+		}
+		return value_string(strings.clone("BLOB", context.allocator)), ERROR_NONE
+	case "unistr":
+		// `\XXXX` is a UTF-16 code unit, `\+XXXXXX` and `\UXXXXXXXX` a code point,
+		// and a doubled backslash is one backslash: what unistr_quote writes, unistr
+		// reads.
+		if len(args) != 1 do return {}, errf(.Invalid_Argument, "unistr() takes one argument")
+		if args[0].kind == .Null do return value_null(), ERROR_NONE
+		return value_string(unistr_decode(value_to_text(args[0]))), ERROR_NONE
+	case "unistr_quote":
+		if len(args) != 1 do return {}, errf(.Invalid_Argument, "unistr_quote() takes one argument")
+		if args[0].kind == .Null do return value_string(strings.clone("NULL", context.allocator)), ERROR_NONE
+		return value_string(unistr_quote(value_to_text(args[0]))), ERROR_NONE
+	case "timediff":
+		// The difference as a signed calendar span, which is the form SQLite
+		// answers: +YYYY-MM-DD HH:MM:SS.SSS.
+		if len(args) != 2 do return {}, errf(.Invalid_Argument, "timediff() takes two times")
+		first, first_ok := db_time_parse(args[0:1])
+		second, second_ok := db_time_parse(args[1:2])
+		if !first_ok || !second_ok do return value_null(), ERROR_NONE
+		return value_string(timediff_text(first, second)), ERROR_NONE
+	case "soundex":
+		// SQLite's soundex: the first letter, then one digit per consonant group,
+		// three of them, zero-padded. Vowels and h, w, y separate groups without
+		// earning a digit of their own.
+		if len(args) != 1 do return {}, errf(.Invalid_Argument, "soundex() takes one argument")
+		if args[0].kind == .Null do return value_null(), ERROR_NONE
+		text := value_to_text(args[0])
+		return value_string(soundex_encode(text)), ERROR_NONE
+	case "sqlite_source_id":
+		if len(args) != 0 do return {}, errf(.Invalid_Argument, "sqlite_source_id() takes no arguments")
+		return value_string(strings.clone("miraidb", context.allocator)), ERROR_NONE
+	case "sqlite_compileoption_used":
+		if len(args) != 1 do return {}, errf(.Invalid_Argument, "sqlite_compileoption_used() takes one argument")
+		if args[0].kind == .Null do return value_null(), ERROR_NONE
+		option := value_to_text(args[0])
+		used := strings.equal_fold(option, "MIRAIDB") || strings.equal_fold(option, "SQLITE_ENABLE_JSON1") ? 1 : 0
+		return value_int(i64(used)), ERROR_NONE
+	case "sqlite_compileoption_get":
+		if len(args) != 1 do return {}, errf(.Invalid_Argument, "sqlite_compileoption_get() takes one argument")
+		if args[0].kind == .Null do return value_null(), ERROR_NONE
+		index, index_ok := value_to_i64(args[0])
+		if !index_ok do return {}, errf(.Invalid_Type, "sqlite_compileoption_get() expects a number")
+		// The one option there is, then nothing: a list ends the way a list ends.
+		if index == 0 do return value_string(strings.clone("MIRAIDB", context.allocator)), ERROR_NONE
+		return value_null(), ERROR_NONE
 	case "pow":
 		if len(args) != 2 do return {}, errf(.Invalid_Argument, "pow() takes two arguments")
 		base, base_ok := value_to_f64(args[0])
