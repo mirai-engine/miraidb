@@ -74,6 +74,13 @@ Database :: struct {
 	// the statement it failed reports it.
 	functions:     [dynamic]^Function,
 	function_code: c.int,
+	// The hooks a program installed, with the argument each one gets.
+	commit_hook:     Commit_Callback,
+	commit_arg:      rawptr,
+	rollback_hook:   Destroy_Callback,
+	rollback_arg:    rawptr,
+	update_hook:     Update_Callback,
+	update_arg:      rawptr,
 }
 
 Statement :: struct {

@@ -17,6 +17,7 @@ import os
 import sys
 
 import sqlite_abi_functions
+import sqlite_abi_hooks
 
 c_void_p, c_int, c_char_p, c_longlong = ctypes.c_void_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_longlong
 
@@ -95,6 +96,7 @@ def load(path: str):
         function.argtypes = args
         function.restype = result
     sqlite_abi_functions.bind(lib)
+    sqlite_abi_hooks.bind(lib)
     # Python's own SQLite is built with SQLITE_OMIT_AUTOINIT: without this call
     # its first sqlite3_open writes through a NULL pointer.
     assert lib.sqlite3_initialize() == 0
@@ -291,6 +293,7 @@ def observe(lib) -> dict[str, object]:
     lib.sqlite3_finalize(reader)
 
     sqlite_abi_functions.observe(lib, db, seen)
+    sqlite_abi_hooks.observe(lib, db, seen)
 
     seen["errstr"] = [lib.sqlite3_errstr(code) for code in (*range(0, 30), 100, 101, 516, 19 | 8 << 8, 9999)]
     assert lib.sqlite3_close(db) == 0

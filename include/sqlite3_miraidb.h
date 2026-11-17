@@ -2,9 +2,9 @@
 ** sqlite3_miraidb.h -- the subset of SQLite's C API that sqlite3_miraidb.dll
 ** implements, declared so a C program can compile against it.
 **
-** This is not sqlite3.h. It declares the 112 functions the facade exports and the
+** This is not sqlite3.h. It declares the 115 functions the facade exports and the
 ** result codes they answer; a program that uses anything else will not link, and
-** that is the honest state of the facade (112 of SQLite's 315 symbols). Look at
+** that is the honest state of the facade (115 of SQLite's 315 symbols). Look at
 ** docs/sqlite.md for what each one does here and where it differs.
 **
 ** Build the library with:
@@ -252,6 +252,26 @@ void sqlite3_result_error_nomem(sqlite3_context *ctx);
 void sqlite3_result_error_toobig(sqlite3_context *ctx);
 /* Accepted and dropped: subtypes are not carried. */
 void sqlite3_result_subtype(sqlite3_context *ctx, unsigned int subtype);
+
+/* --- Connection hooks ----------------------------------------------------
+** Each call replaces the hook and answers the argument the previous one had;
+** NULL removes it. The update hook sees every changed row of a user table
+** (not the rows a REPLACE removes); a commit hook that answers non-zero turns
+** the commit into a rollback, reported as SQLITE_CONSTRAINT_COMMITHOOK; the
+** rollback hook runs for ROLLBACK, a vetoed commit, and a statement that fails
+** in autocommit, not for a connection closed with a transaction open. */
+
+#define SQLITE_DELETE   9
+#define SQLITE_INSERT  18
+#define SQLITE_UPDATE  23
+#define SQLITE_CONSTRAINT_COMMITHOOK  (SQLITE_CONSTRAINT | (2 << 8))
+
+void *sqlite3_commit_hook(sqlite3 *db, int (*callback)(void *), void *arg);
+void *sqlite3_rollback_hook(sqlite3 *db, void (*callback)(void *), void *arg);
+void *sqlite3_update_hook(sqlite3 *db,
+                          void (*callback)(void *, int, const char *,
+                                           const char *, sqlite3_int64),
+                          void *arg);
 
 /* --- Incremental BLOB I/O ------------------------------------------------
 ** The row is named by a single-column primary key, which plays the part of

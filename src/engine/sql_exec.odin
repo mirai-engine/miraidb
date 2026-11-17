@@ -125,6 +125,9 @@ sql_run_statement :: proc(store: ^Store, statement: Statement, params: []Value) 
 				return {}, exec_err
 			}
 			tx_rollback(tx)
+			// The statement owned its transaction, so its failure rolls that
+			// transaction back, which a rollback hook hears, as in SQLite.
+			store_fire_rollback(store)
 			return {}, exec_err
 		}
 		if commit_err := tx_commit(tx); commit_err.kind != .None {
@@ -531,6 +534,9 @@ sql_exec_vacuum :: proc(store: ^Store, stmt: Vacuum_Stmt) -> (Sql_Result, Error)
 }
 
 sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sql_Result, Error) {
+	// A write statement makes the transaction a write transaction even when it
+	// changes no row, which is when SQLite calls its commit hook.
+	tx.wrote = true
 	switch stmt in statement {
 	case Reindex_Stmt:
 		// Every index is rebuilt from the log when the database opens, so there is

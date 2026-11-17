@@ -245,6 +245,7 @@ embed_run :: proc(conn: ^Embed_Conn, prepared: ^Stmt_Prepared, params: []Value) 
 			if conn.tx == nil do return {}, errf(.Sql_Not_A_Query, "cannot rollback - no transaction is active")
 			tx_rollback(conn.tx)
 			conn.tx = nil
+			store_fire_rollback(conn.store)
 			return ack(conn)
 		case Savepoint_Stmt:
 			switch stmt.kind {

@@ -222,6 +222,9 @@ Store :: struct {
 	// the applied ops (kind, name, row id and values are valid; schema and index
 	// references are borrowed). Subscriptions use it to publish deltas.
 	on_commit:     proc(ctx: rawptr, store: ^Store, ops: []Store_Op),
+	// hooks are the row-change, commit and rollback callbacks an embedding
+	// layer installs (hooks.odin).
+	hooks:         Store_Hooks,
 	on_commit_ctx: rawptr,
 	// replay_records and replay_buffer_bytes are what the last replay walked and
 	// the largest record it had to hold. They are diagnostics a test reads to

@@ -17,6 +17,9 @@ Tx :: struct {
 	store:     ^Store,
 	active:    bool,
 	read_only: bool,
+	// wrote is set when a write statement ran in the transaction, whether or
+	// not it changed a row: the commit hook runs for it.
+	wrote:     bool,
 	// locked is true when the transaction holds the store lock (write
 	// transactions and pinned reads).
 	state:     Tx_State,
@@ -1144,6 +1147,15 @@ tx_drop_table :: proc(tx: ^Tx, name: string) -> Error {
 // uniqueness and stages the row. Columns not supplied are filled with their
 // default; pass a value vector of exactly one entry per column.
 tx_insert :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error) {
+	id, err := tx_insert_row(tx, name, values)
+	if err.kind == .None && tx.store.hooks.row_change != nil {
+		hook_row_change(tx, .Insert, name, hook_rowid(tx, name, id))
+	}
+	return id, err
+}
+
+@(private)
+tx_insert_row :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error) {
 	if tx.read_only do return 0, errf(.Transaction_Read_Only, "cannot insert in a read transaction")
 	table: ^Table
 	cached := tx.insert_table != nil && len(tx.cte_tables) == 0 && tx.insert_name == name
@@ -1292,6 +1304,15 @@ INVALID_ROW_ID :: Row_Id(max(u64))
 
 // tx_update replaces the whole row. `values` must have one entry per column.
 tx_update :: proc(tx: ^Tx, name: string, id: Row_Id, values: []Value) -> Error {
+	err := tx_update_row(tx, name, id, values)
+	if err.kind == .None && tx.store.hooks.row_change != nil {
+		hook_row_change(tx, .Update, name, hook_rowid(tx, name, id))
+	}
+	return err
+}
+
+@(private)
+tx_update_row :: proc(tx: ^Tx, name: string, id: Row_Id, values: []Value) -> Error {
 	if tx.read_only do return errf(.Transaction_Read_Only, "cannot update in a read transaction")
 	table, table_err := tx_table(tx, name)
 	if table_err.kind != .None do return table_err
@@ -1402,7 +1423,12 @@ tx_update :: proc(tx: ^Tx, name: string, id: Row_Id, values: []Value) -> Error {
 }
 
 tx_delete :: proc(tx: ^Tx, name: string, id: Row_Id) -> Error {
-	return tx_delete_impl(tx, name, id, true)
+	if tx.store.hooks.row_change == nil do return tx_delete_impl(tx, name, id, true)
+	// The row's id is read before the row is gone.
+	rowid := hook_rowid(tx, name, id)
+	err := tx_delete_impl(tx, name, id, true)
+	if err.kind == .None do hook_row_change(tx, .Delete, name, rowid)
+	return err
 }
 
 // tx_delete_without_triggers stages a delete and runs no trigger program. INSERT
@@ -1719,6 +1745,15 @@ tx_commit :: proc(tx: ^Tx) -> Error {
 	started_us := now_microseconds()
 	ops := tx_build_ops(tx)
 	defer delete(ops)
+	// A commit hook may turn the commit of a transaction that changed something
+	// into a rollback, which SQLite reports as a failed constraint.
+	if (len(ops) > 0 || tx.wrote) && tx.store.hooks.commit != nil && tx.store.hooks.commit(tx.store.hooks.commit_ctx) {
+		// The discard frees the transaction, so the store is read before it.
+		store := tx.store
+		tx_discard(tx)
+		store_fire_rollback(store)
+		return errf(.Check_Violation, "constraint failed")
+	}
 	// Ephemeral operations are applied to the live store but never logged, so
 	// temporary tables and their rows vanish on reopen.
 	logged := make([dynamic]Store_Op, 0, len(ops))
