@@ -13486,9 +13486,20 @@ test_host_collations :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(having.rows), 1)
 	testing.expect_value(t, having.rows[0][0].i, i64(3))
 
-	// Where a key is folded, the statement is refused instead of misordered.
+	// ORDER BY ranks the values under the host comparison, as SQLite orders
+	// them: by length, then by bytes; DESC reverses it.
+	ordered := run(t, store, "SELECT name FROM w ORDER BY name COLLATE by_length")
+	descending := run(t, store, "SELECT name FROM w ORDER BY name COLLATE by_length DESC")
+	want := []string{"ab", "xy", "abc", "abcd"}
+	if testing.expect_value(t, len(ordered.rows), 4) && testing.expect_value(t, len(descending.rows), 4) {
+		for name, i in want {
+			testing.expect_value(t, ordered.rows[i][0].s, name)
+			testing.expect_value(t, descending.rows[3 - i][0].s, name)
+		}
+	}
+
+	// Where a key is folded, the statement is refused instead of misgrouped.
 	for statement in ([]string {
-		"SELECT name FROM w ORDER BY name COLLATE by_length",
 		"SELECT name FROM w GROUP BY name COLLATE by_length",
 		"SELECT DISTINCT name COLLATE by_length FROM w",
 		"SELECT sum(length(name)) OVER (ORDER BY name COLLATE by_length) FROM w",

@@ -654,7 +654,7 @@ capi_collation_call :: proc(a: string, b: string, user: rawptr) -> int {
 // 'x' COLLATE spanish`. The name is case-insensitive and cannot be one of the three
 // built in (BINARY, NOCASE, RTRIM), and registering the same name again replaces
 // it. A host comparison cannot fold a text into an index key, so a column
-// declaration, an index, an ORDER BY, GROUP BY or DISTINCT that names it is
+// declaration, an index, a GROUP BY or DISTINCT that names it is
 // refused with a message rather than answered in the wrong order. Registrations
 // last until the connection closes and are not part of the database.
 @(export)

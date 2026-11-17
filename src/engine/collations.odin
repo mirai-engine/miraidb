@@ -1,5 +1,6 @@
 package engine
 
+import "core:slice"
 import "core:strings"
 
 // A collation decides when two texts are equal and which one comes first. Three
@@ -231,11 +232,106 @@ select_collation_guard :: proc(tx: ^Tx, stmt: Select_Stmt) -> Error {
 		if err := collation_check_expr(store, expr, "GROUP BY", true); err.kind != .None do return err
 	}
 	if err := collation_check_expr(store, stmt.having, "HAVING", false); err.kind != .None do return err
+	// ORDER BY ranks a host collation's values instead of folding them (the
+	// slots below), so it only refuses a name nobody knows.
 	for item in stmt.order_by {
-		if err := collation_check_expr(store, item.expr, "ORDER BY", true); err.kind != .None do return err
+		if err := collation_check_expr(store, item.expr, "ORDER BY", false); err.kind != .None do return err
 	}
 	for join in stmt.joins {
 		if err := collation_check_expr(store, join.on, "JOIN", false); err.kind != .None do return err
 	}
 	return ERROR_NONE
+}
+
+// --- ORDER BY under a host collation ----------------------------------------
+//
+// An order key is compared byte by byte, and a host comparison has no bytes to
+// fold into. So the key gets a slot instead: the value's rank among every value
+// the same ORDER BY term takes in the statement, under SQLite's order (NULL,
+// then numbers, then text by the collation, then blobs). The slots are written
+// with zeros while the keys are built and filled once every row is known, just
+// before the sort. Two values the collation calls equal share a rank, so the
+// next term or the row id decides between them, as in SQLite.
+
+Host_Order_Slot :: struct {
+	key:        []u8,
+	offset:     int,
+	term:       int,
+	value:      Value,
+	collation:  string,
+	descending: bool,
+}
+
+// host_order_collation reports a term whose collation is a host one.
+@(private)
+host_order_collation :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (string, bool) {
+	if ctx == nil || ctx.tx == nil do return "", false
+	name, has := collate_name(expr)
+	if !has do name, has = column_collation(ctx, expr)
+	if !has || len(name) == 0 || collation_is_builtin(name) do return "", false
+	if _, found := store_collation(ctx.tx.store, name); !found do return "", false
+	return name, true
+}
+
+@(private = "file", thread_local)
+host_sort_store: ^Store
+
+@(private = "file")
+host_value_class :: proc(v: Value) -> int {
+	#partial switch v.kind {
+	case .Null, .Default:
+		return 0
+	case .String:
+		return 2
+	case .Bytes:
+		return 3
+	}
+	return 1
+}
+
+@(private = "file")
+host_value_compare :: proc(a, b: ^Host_Order_Slot) -> int {
+	ca, cb := host_value_class(a.value), host_value_class(b.value)
+	if ca != cb do return ca < cb ? -1 : 1
+	switch ca {
+	case 0:
+		return 0
+	case 2:
+		order, _ := collation_compare(host_sort_store, a.collation, a.value.s, b.value.s)
+		return order
+	case 3:
+		return strings.compare(string(a.value.bytes), string(b.value.bytes))
+	}
+	order, ok := value_compare(a.value, b.value)
+	if !ok do return 0
+	return int(order)
+}
+
+// host_order_resolve fills every slot with its rank.
+@(private)
+host_order_resolve :: proc(store: ^Store, slots: []Host_Order_Slot) {
+	if len(slots) == 0 do return
+	host_sort_store = store
+	defer host_sort_store = nil
+	order := make([]^Host_Order_Slot, len(slots), context.temp_allocator)
+	for &slot, i in slots do order[i] = &slot
+	slice.sort_by(order, proc(a, b: ^Host_Order_Slot) -> bool {
+		if a.term != b.term do return a.term < b.term
+		return host_value_compare(a, b) < 0
+	})
+	rank: u64 = 0
+	for slot, i in order {
+		if i > 0 {
+			previous := order[i - 1]
+			if previous.term != slot.term {
+				rank = 0
+			} else if host_value_compare(previous, slot) != 0 {
+				rank += 1
+			}
+		}
+		for b in 0 ..< 8 {
+			byte := u8(rank >> uint(56 - 8 * b))
+			slot.key[slot.offset + b] = slot.descending ? ~byte : byte
+		}
+	}
 }

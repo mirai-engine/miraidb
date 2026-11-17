@@ -1389,6 +1389,9 @@ Eval_Ctx :: struct {
 	// (a stored view, a generated column, a policy); it is here so the failure is
 	// an error instead of an overflow.
 	depth:  int,
+	// host_slots are the order key slots a host collation leaves to fill once
+	// every row is known (collations.odin).
+	host_slots: ^[dynamic]Host_Order_Slot,
 }
 
 // rowid_alias_name reports SQLite's three spellings of a rowid, none of which is
@@ -4181,6 +4184,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		return {}, ctx.order_err
 	}
 	if len(stmt.order_by) > 0 {
+		if ctx.host_slots != nil do host_order_resolve(tx.store, ctx.host_slots^[:])
 		slice.sort_by(output[:], proc(a, b: Output_Row) -> bool {
 			return string(sort_key_bytes(a.sort_key)) < string(sort_key_bytes(b.sort_key))
 		})
@@ -4374,8 +4378,30 @@ build_order_key :: proc(
 	if len(order_by) == 0 do return nil
 	w: Byte_Writer
 	bw_init(&w)
-	for item in order_by {
+	first_slot := ctx.host_slots != nil ? len(ctx.host_slots^) : 0
+	for item, term in order_by {
 		value := eval_order_value(ctx, item.expr, projections, values, names)
+		// A host collation cannot fold: the key keeps a slot for the value's rank.
+		if host, is_host := host_order_collation(ctx, item.expr); is_host {
+			if ctx.host_slots == nil {
+				ctx.host_slots = new([dynamic]Host_Order_Slot, ctx.tx.alloc)
+				ctx.host_slots^ = make([dynamic]Host_Order_Slot, 0, 16, ctx.tx.alloc)
+			}
+			if item.nulls != .Default {
+				marker: u8 = 1
+				if value.kind == .Null do marker = item.nulls == .First ? 0 : 2
+				append(&w.data, marker)
+			}
+			append(ctx.host_slots, Host_Order_Slot {
+				offset     = len(w.data),
+				term       = term,
+				value      = value_clone(value, ctx.tx.alloc),
+				collation  = host,
+				descending = item.descending,
+			})
+			for _ in 0 ..< 8 do append(&w.data, 0)
+			continue
+		}
 		// ORDER BY x COLLATE NOCASE sorts on the folded key.
 		collation, has := collate_name(item.expr)
 		if !has {
@@ -4391,6 +4417,9 @@ build_order_key :: proc(
 	out := make([]u8, len(raw))
 	copy(out, raw)
 	bw_destroy(&w)
+	if ctx.host_slots != nil {
+		for &slot in ctx.host_slots^[first_slot:] do slot.key = out
+	}
 	return out
 }
 

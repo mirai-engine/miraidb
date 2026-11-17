@@ -395,9 +395,10 @@ def main() -> int:
     assert lib.miraidb_exec(db, b"INSERT INTO coll (name) VALUES ('ab'), ('abc'), ('xy')") == OK
     assert scalar(lib, db, b"SELECT count(*) FROM coll WHERE name < 'abc' COLLATE by_length") == 2
     assert scalar(lib, db, b"SELECT count(*) FROM coll WHERE name = 'ab' COLLATE by_length") == 1
-    # A host comparison cannot be folded into a key, so the ordering is refused
-    # rather than answered in the wrong order.
-    assert lib.miraidb_exec(db, b"SELECT name FROM coll ORDER BY name COLLATE by_length") == ERROR
+    # ORDER BY ranks the values under the host comparison; GROUP BY, which needs
+    # a folded key, is refused rather than answered wrongly.
+    assert lib.miraidb_exec(db, b"SELECT name FROM coll ORDER BY name COLLATE by_length") == OK
+    assert lib.miraidb_exec(db, b"SELECT name FROM coll GROUP BY name COLLATE by_length") == ERROR
     assert "cannot order" in lib.miraidb_errmsg(db).decode(), lib.miraidb_errmsg(db)
     assert lib.miraidb_unregister_collation(db, b"by_length") == OK
     assert lib.miraidb_unregister_collation(db, b"by_length") == ERROR, "already gone"
