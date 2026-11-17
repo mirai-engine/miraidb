@@ -159,9 +159,14 @@ parse_statement :: proc(p: ^Parser) -> Statement {
 	if p_match_keyword(p, "unload") do return parse_load_extension(p, true)
 	if p_is_keyword(p, "explain") {
 		p_advance(p)
+		query_plan := false
+		if p_match_keyword(p, "query") {
+			p_expect_keyword(p, "plan")
+			query_plan = true
+		}
 		inner := new(Statement, p.alloc)
 		inner^ = parse_statement(p)
-		return Explain_Stmt{inner = inner}
+		return Explain_Stmt{inner = inner, query_plan = query_plan}
 	}
 	if p_is_keyword(p, "alter") {
 		return parse_alter_table(p)

@@ -1021,6 +1021,29 @@ sql_exec_explain :: proc(tx: ^Tx, stmt: Explain_Stmt, params: []Value) -> (Sql_R
 		append(&lines, result_own("no plan"))
 	}
 	if note := explain_staleness(store); len(note) > 0 do append(&lines, note)
+	if stmt.query_plan {
+		// EXPLAIN QUERY PLAN is SQLite's shape of the same answer: one row per
+		// step, with an id, the id of its parent, an unused column, and the step
+		// in SQLite's words, which is what a database browser prints.
+		plan := Sql_Result{kind = .Rows, commit_seq = store.commit_seq}
+		// make, not a slice literal: the result owns its columns and frees them,
+		// and a literal's backing array is not the heap.
+		plan.columns = make([]string, 4)
+		plan.columns[0] = result_own("id")
+		plan.columns[1] = result_own("parent")
+		plan.columns[2] = result_own("notused")
+		plan.columns[3] = result_own("detail")
+		plan.rows = make([][]Value, len(lines))
+		for line, i in lines {
+			row := make([]Value, 4)
+			row[0] = value_int(i64(i + 1))
+			row[1] = value_int(i == 0 ? 0 : 1)
+			row[2] = value_int(0)
+			row[3] = value_string(explain_query_plan_detail(line))
+			plan.rows[i] = row
+		}
+		return plan, ERROR_NONE
+	}
 	result := Sql_Result{kind = .Rows, commit_seq = store.commit_seq}
 	result.columns = make([]string, 1)
 	result.columns[0] = result_own("plan")
@@ -1031,6 +1054,38 @@ sql_exec_explain :: proc(tx: ^Tx, stmt: Explain_Stmt, params: []Value) -> (Sql_R
 	}
 	result.rows = rows
 	return result, ERROR_NONE
+}
+
+// explain_query_plan_detail rewrites one step of this engine's plan in the words
+// SQLite uses, so a tool that reads the detail column shows something familiar.
+@(private)
+explain_query_plan_detail :: proc(line: string) -> string {
+	if strings.has_prefix(line, "scan ") {
+		rest := line[len("scan "):]
+		// `scan emp using index by_dept (est. …)` names the index it reads.
+		if cut := strings.index(rest, " using index "); cut >= 0 {
+			table := rest[:cut]
+			index_part := rest[cut + len(" using index "):]
+			index_end := strings.index(index_part, " (")
+			index := index_end >= 0 ? index_part[:index_end] : index_part
+			return fmt.aprintf("SEARCH %s USING INDEX %s", table, index)
+		}
+		if cut := strings.index(rest, " ("); cut >= 0 do rest = rest[:cut]
+		if len(rest) == 0 do return strings.clone("SCAN CONSTANT ROW")
+		return fmt.aprintf("SCAN %s", rest)
+	}
+	if strings.has_prefix(line, "join ") {
+		rest := line[len("join "):]
+		if cut := strings.index(rest, " ("); cut >= 0 do rest = rest[:cut]
+		return fmt.aprintf("SEARCH %s", rest)
+	}
+	if strings.has_prefix(line, "order by") {
+		return strings.clone("USE TEMP B-TREE FOR ORDER BY")
+	}
+	if strings.has_prefix(line, "group by") {
+		return strings.clone("USE TEMP B-TREE FOR GROUP BY")
+	}
+	return strings.clone(line)
 }
 
 // sql_exec_analyze measures the statistics a plan reads, under the write lock so

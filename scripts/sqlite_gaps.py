@@ -158,7 +158,10 @@ def main():
     grammar = []
     for feature, statements in GRAMMAR:
         ok, error = call(args.bin, statements)
-        grammar.append((feature, ok, "" if ok else error.splitlines()[-1].replace("|", "/")))
+        # A probe that fails with no message still has to report something: this
+        # once indexed an empty list and took the gate down with it.
+        detail = "" if ok else (error.splitlines()[-1].replace("|", "/") if error.strip() else "(no message)")
+        grammar.append((feature, ok, detail))
 
     have_f = len(functions) - len(missing_functions)
     have_p = len(names["Pragmas"]) - len(missing_pragmas)

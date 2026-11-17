@@ -229,3 +229,41 @@ test_percentile_aggregates :: proc(t: ^testing.T) {
 	defer db.error_free(&bad)
 	testing.expect_value(t, bad.kind, db.Error_Kind.Invalid_Argument)
 }
+
+// EXPLAIN QUERY PLAN answers SQLite's four columns, so a tool that shows a plan
+// finds what it expects.
+@(test)
+test_explain_query_plan :: proc(t: ^testing.T) {
+	store := fresh_db(t, "query_plan")
+	if store == nil do return
+	defer cleanup_db(store, "query_plan")
+
+	run(t, store, "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept INTEGER)")
+	run(t, store, "CREATE INDEX by_dept ON emp (dept)")
+
+	plan := run(t, store, "EXPLAIN QUERY PLAN SELECT * FROM emp WHERE dept = 1 ORDER BY name")
+	defer db.sql_result_destroy(&plan)
+	testing.expect_value(t, len(plan.columns), 4)
+	testing.expect_value(t, plan.columns[0], "id")
+	testing.expect_value(t, plan.columns[1], "parent")
+	testing.expect_value(t, plan.columns[2], "notused")
+	testing.expect_value(t, plan.columns[3], "detail")
+	testing.expect(t, len(plan.rows) >= 2)
+	testing.expect_value(t, plan.rows[0][1].i, i64(0))
+	testing.expect_value(t, plan.rows[0][3].s, "SEARCH emp USING INDEX by_dept")
+	// ORDER BY comes before the note, and says what it costs.
+	found_order := false
+	for row in plan.rows {
+		if row[3].s == "USE TEMP B-TREE FOR ORDER BY" do found_order = true
+	}
+	testing.expect(t, found_order)
+
+	// A table with no index is scanned, and a query with no table at all reads
+	// the constant row SQLite names.
+	scan := run(t, store, "EXPLAIN QUERY PLAN SELECT * FROM emp WHERE name = 'x'")
+	defer db.sql_result_destroy(&scan)
+	testing.expect_value(t, scan.rows[0][3].s, "SCAN emp")
+	constant := run(t, store, "EXPLAIN QUERY PLAN SELECT 1")
+	defer db.sql_result_destroy(&constant)
+	testing.expect_value(t, constant.rows[0][3].s, "SCAN CONSTANT ROW")
+}

@@ -133,6 +133,11 @@ The engine sorts the 63 names in the inventory into four classes:
   `soft_heap_limit64`, `temp_store`, `temp_store_directory`,
   `data_store_directory`. There is no unknown pragma left in the inventory.
 
+`EXPLAIN QUERY PLAN` answers SQLite's four columns (`id`, `parent`, `notused`,
+`detail`) with the steps in SQLite's words: `SCAN <table>`,
+`SEARCH <table> USING INDEX <index>`, `SCAN CONSTANT ROW`,
+`USE TEMP B-TREE FOR ORDER BY`, and a note naming what the planner had to guess.
+
 ## Semantics that differ from SQLite
 
 These are decisions, not accidents, and a program that relies on SQLite's

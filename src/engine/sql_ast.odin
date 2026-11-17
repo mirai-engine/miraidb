@@ -546,6 +546,9 @@ Show_Stmt :: struct {
 
 Explain_Stmt :: struct {
 	inner: ^Statement,
+	// query_plan marks `EXPLAIN QUERY PLAN`, SQLite's form: the same plan as four
+	// columns a tool reads, rather than one line per step.
+	query_plan: bool,
 }
 
 Create_View_Stmt :: struct {
