@@ -263,9 +263,18 @@ Table_Ref :: struct {
 
 // Join_Clause chains one table onto the query. `left` turns the inner join into
 // a left outer join, and `on` is the join predicate (nil for a cross join).
+// Join_Kind is which rows a join keeps when nothing matches.
+Join_Kind :: enum u8 {
+	Inner,
+	Left,
+	Right,
+	Full,
+	Cross,
+}
+
 Join_Clause :: struct {
 	table: Table_Ref,
-	left:  bool,
+	kind:  Join_Kind,
 	on:    ^Expr,
 	// using_columns holds the columns of `JOIN ... USING (a, b)`. They are also
 	// turned into the equality in `on`, so the rest of the engine sees one

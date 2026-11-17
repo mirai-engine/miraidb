@@ -39,10 +39,14 @@ DELETE FROM name [WHERE expr]
 
 SELECT [DISTINCT] projection [, ...]
 FROM table [[AS] alias]
-    [[INNER | LEFT [OUTER] | CROSS] JOIN table [[AS] alias] [ON expr]]...
+    [[INNER | LEFT | RIGHT | FULL [OUTER] | CROSS] JOIN table [[AS] alias] [ON expr]]...
 
-`NATURAL`, `RIGHT` and `FULL` joins are refused by the parser, and so is
-`JOIN … USING (col)`: write the condition in `ON` instead.
+An outer join answers `NULL` for every column of the side that did not match, on
+whichever side that is: `LEFT` keeps the unmatched rows of the table before it,
+`RIGHT` those of the table after it, and `FULL` both. A `RIGHT` or `FULL` join
+does not use the index probe the others get, because it has to know which inner
+rows matched at all. `NATURAL` joins are refused by the parser, and so is
+`JOIN … USING (col)`; write the condition in `ON` instead.
 [WHERE expr]
 [GROUP BY expr [, ...]]
 [HAVING expr]

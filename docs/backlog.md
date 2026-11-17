@@ -35,7 +35,7 @@ Rules for this file:
 | R4 | a committed row is copied from the transaction arena to the table | hand the staged row over | M |
 | S1 | `ON CONFLICT` on a constraint is refused; the rest landed | the constraint resolutions | S |
 | S2 | `UPDATE OR <resolution>` is refused; the rest landed | the UPDATE resolutions | S |
-| S3 | `RIGHT`, `FULL` and `NATURAL` joins are refused | the three joins | M |
+| S3 | `NATURAL` joins are refused; `RIGHT` and `FULL` landed | the natural join | S |
 | S4 | `FILTER`, `WINDOW`, aggregate `ORDER BY`, ordered-set aggregates missing | the aggregate surface | M |
 | S5 | 39 of 121 built-in functions missing | math, JSON/JSONB, text, introspection | M |
 | S6 | eight statements and 9 pragmas missing | `EXPLAIN QUERY PLAN`, `REINDEX`, `INSTEAD OF`, `generate_series`, … | M |
@@ -206,12 +206,15 @@ the `NULL` cases (`NULL IS NULL` is true, `1 & NULL` is `NULL`).
 
 ## S3 — Joins
 
-**Now refused.** `RIGHT`, `FULL` and `NATURAL` joins, with a message that says to
-write an inner or left join (`test_unsupported_joins_are_refused`).
+**Done.** `RIGHT` and `FULL` answer: the step remembers which rows of the inner
+side matched, and the ones that did not answer with every column of the left side
+NULL (`test_right_and_full_joins`). The left side's absent columns are built from
+the tables bound so far, so an empty left table still answers the right side.
 
-**Done when.** `RIGHT` runs as a mirrored `LEFT`, `FULL` as a left join plus the
-unmatched right rows, and `NATURAL` as `USING` over the shared column names; the
-refusal test becomes an answer test.
+**Left.** `NATURAL`, which is `USING` over the shared column names. It cannot be
+desugared in the parser, because the shared names are known only when the tables
+are resolved; the executor would have to build the equality and the `USING` list
+from both schemas. Refused with a message that says to name the columns.
 
 ## S4 — Aggregates and windows
 

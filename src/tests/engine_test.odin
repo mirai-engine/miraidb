@@ -1326,13 +1326,11 @@ test_unsupported_joins_are_refused :: proc(t: ^testing.T) {
 	run(t, store, "INSERT INTO b (id) VALUES (2), (3), (4)")
 
 	// Read as an alias for the preceding table, NATURAL would become a cross
-	// join (nine rows here) and RIGHT or FULL an inner join (two): both answer a
-	// question nobody asked, so they are refused instead.
+	// join (nine rows here) and answer a question nobody asked, so it is refused
+	// with the spelling that does ask it. RIGHT and FULL are joins of their own.
 	for sql in ([]string {
 		"SELECT * FROM a NATURAL JOIN b",
-		"SELECT * FROM a RIGHT JOIN b ON a.id = b.id",
-		"SELECT * FROM a FULL JOIN b ON a.id = b.id",
-		"SELECT * FROM a FULL OUTER JOIN b ON a.id = b.id",
+		"SELECT * FROM a NATURAL LEFT JOIN b",
 	}) {
 		result, err := db.sql_execute(store, sql)
 		db.sql_result_destroy(&result)
@@ -13747,4 +13745,63 @@ test_schedule_now :: proc(t: ^testing.T) {
 	testing.expect(t, db.error_ok(tick_err))
 	testing.expect_value(t, ran, 1)
 	testing.expect_value(t, scalar(t, store, "SELECT value FROM counter WHERE id = 0").i, i64(5))
+}
+
+// A RIGHT join keeps the rows of the right side that nothing matched, and a FULL
+// join keeps both sides' unmatched rows; the side with no match answers NULL for
+// every one of its columns, as a LEFT join already did for the other side.
+@(test)
+test_right_and_full_joins :: proc(t: ^testing.T) {
+	store := fresh_db(t, "outer_joins")
+	if store == nil do return
+	defer cleanup_db(store, "outer_joins")
+
+	run(t, store, "CREATE TABLE a (id INTEGER PRIMARY KEY, x TEXT)")
+	run(t, store, "CREATE TABLE b (id INTEGER PRIMARY KEY, y TEXT)")
+	run(t, store, "INSERT INTO a VALUES (1, 'a'), (2, 'b')")
+	run(t, store, "INSERT INTO b VALUES (2, 'y'), (3, 'z')")
+
+	right := run(t, store, "SELECT a.id, a.x, b.id, b.y FROM a RIGHT JOIN b ON a.id = b.id ORDER BY b.id")
+	defer db.sql_result_destroy(&right)
+	testing.expect_value(t, len(right.rows), 2)
+	testing.expect_value(t, right.rows[0][0].i, i64(2))
+	testing.expect_value(t, right.rows[0][3].s, "y")
+	testing.expect_value(t, right.rows[1][0].kind, db.Value_Kind.Null)
+	testing.expect_value(t, right.rows[1][1].kind, db.Value_Kind.Null)
+	testing.expect_value(t, right.rows[1][2].i, i64(3))
+
+	// RIGHT OUTER is the same join, and the count is the right side's.
+	counted := run(t, store, "SELECT count(*) FROM a RIGHT OUTER JOIN b ON a.id = b.id")
+	testing.expect_value(t, counted.rows[0][0].i, i64(2))
+	db.sql_result_destroy(&counted)
+
+	full := run(t, store, "SELECT a.id, b.id FROM a FULL JOIN b ON a.id = b.id ORDER BY a.id")
+	defer db.sql_result_destroy(&full)
+	testing.expect_value(t, len(full.rows), 3)
+	// ORDER BY puts the NULL first, so the right-only row leads.
+	testing.expect_value(t, full.rows[0][0].kind, db.Value_Kind.Null)
+	testing.expect_value(t, full.rows[0][1].i, i64(3))
+	testing.expect_value(t, full.rows[1][0].i, i64(1))
+	testing.expect_value(t, full.rows[1][1].kind, db.Value_Kind.Null)
+	testing.expect_value(t, full.rows[2][0].i, i64(2))
+	testing.expect_value(t, full.rows[2][1].i, i64(2))
+
+	// A left side with no rows at all still answers every row of the right side,
+	// with every column of the left one NULL.
+	run(t, store, "DELETE FROM a")
+	empty := run(t, store, "SELECT b.id, a.x FROM a RIGHT JOIN b ON a.id = b.id ORDER BY b.id")
+	defer db.sql_result_destroy(&empty)
+	testing.expect_value(t, len(empty.rows), 2)
+	testing.expect_value(t, empty.rows[0][0].i, i64(2))
+	testing.expect_value(t, empty.rows[0][1].kind, db.Value_Kind.Null)
+
+	// Isolating the unmatched rows is what an outer join is for.
+	unmatched := run(t, store, "SELECT b.id FROM a RIGHT JOIN b ON a.id = b.id WHERE a.id IS NULL ORDER BY b.id")
+	defer db.sql_result_destroy(&unmatched)
+	testing.expect_value(t, len(unmatched.rows), 2)
+
+	// The outer half is part of the answer, so the planner leaves the order be.
+	explained := run(t, store, "EXPLAIN SELECT a.id FROM a RIGHT JOIN b ON a.id = b.id")
+	defer db.sql_result_destroy(&explained)
+	testing.expect(t, len(explained.rows) > 0)
 }

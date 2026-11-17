@@ -297,7 +297,7 @@ Plan_Step :: struct {
 	cost:      f64,    // reads this step is expected to spend
 	ref:       Table_Ref,
 	predicate: ^Expr,
-	left:      bool,   // a LEFT join keeps an unmatched outer row
+	kind:      Join_Kind, // which rows the step keeps when nothing matches
 }
 
 // Plan_Order is the execution order of a join, and the fingerprint of how
@@ -366,7 +366,7 @@ plan_join_order :: proc(
 		partials *= f64(max(relation.matches, 1))
 		if i > 0 {
 			steps[i].predicate = stmt.joins[i - 1].on
-			steps[i].left = stmt.joins[i - 1].left
+			steps[i].kind = stmt.joins[i - 1].kind
 		}
 	}
 	return Plan_Order{from = stmt.from, joins = stmt.joins, steps = steps}
@@ -1033,7 +1033,9 @@ plan_can_reorder :: proc(tx: ^Tx, stmt: Select_Stmt) -> bool {
 	if is_json_table_function(stmt.from.name) do return false
 	if _, base_table := tx.store.tables[stmt.from.name]; !base_table do return false
 	for join in stmt.joins {
-		if join.left do return false
+		// An outer join keeps rows the other side has no match for, so the order
+		// it was written in is part of the answer.
+		if join.kind != .Inner && join.kind != .Cross do return false
 		if join.table.as_of != nil do return false
 		if len(join.table.args) > 0 do return false
 		if is_json_table_function(join.table.name) do return false

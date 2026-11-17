@@ -672,6 +672,13 @@ sql_exec_explain :: proc(tx: ^Tx, stmt: Explain_Stmt, params: []Value) -> (Sql_R
 			append(&lines, strings.concatenate({"scan ", first.name}))
 		}
 		for step in order.steps[1:] {
+			// A RIGHT or FULL join scans the inner side even when an index could
+			// answer the ON clause: it has to know which inner rows matched at
+			// all, and a probe only ever sees the ones that did.
+			if step.kind == .Right || step.kind == .Full {
+				append(&lines, fmt.aprintf("join %s (nested loop, full scan, est. %d rows)", step.name, step.rows))
+				continue
+			}
 			if inner_table, inner_err := store_table(store, step.ref.name); inner_err.kind == .None {
 				probe, probed := join_index_probe(inner_table, step.ref.alias, step.predicate)
 				if probed {
@@ -2916,6 +2923,17 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 	// step carries the ON conditions that become answerable when it runs (which is
 	// what lets the planner move a relation ahead of the join it was written in).
 	join_counts_quota := !select_output_may_shrink(stmt)
+	// The tables and aliases bound so far, so a RIGHT or FULL join can build a
+	// row whose left side is NULL: every column of those sources is absent,
+	// which is what the outer side of a join means.
+	bound_tables := make([dynamic]^Table, 0, len(order.steps))
+	bound_aliases := make([dynamic]string, 0, len(order.steps))
+	defer {
+		delete(bound_tables)
+		delete(bound_aliases)
+	}
+	append(&bound_tables, base)
+	append(&bound_aliases, exec.from.alias)
 	for step, step_index in order.steps[1:] {
 		// Only the last step can stop early: the rows it drops are rows later
 		// steps would have joined.
@@ -2929,6 +2947,13 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		// collected once. The materialized tables stay in tx.temp_tables until the
 		// statement ends, because the rows the join reads point into them.
 		lateral := is_json_table_function(step.ref.name)
+		if lateral && (step.kind == .Right || step.kind == .Full) {
+			free_partials(&partials)
+			return {}, errf(
+				.Sql_Unsupported,
+				"a RIGHT or FULL join cannot take a table function that depends on the row before it",
+			)
+		}
 		table: ^Table
 		join_is_view: bool
 		rows := make([dynamic]Row)
@@ -2970,6 +2995,13 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			}
 		}
 		next := make([dynamic][]Source)
+		// A RIGHT or FULL join keeps a row of the inner side that nothing
+		// matched, so the step remembers which rows those were.
+		kept_inner: []bool
+		if step.kind == .Right || step.kind == .Full {
+			kept_inner = make([]bool, len(rows))
+		}
+		defer delete(kept_inner)
 		for partial in partials {
 			if store_cancelled(tx.store) {
 				delete(rows)
@@ -2980,7 +3012,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			lateral_rows := rows
 			probe_rows: [dynamic]Row
 			using_probe := false
-			if probe.index >= 0 {
+			if probe.index >= 0 && step.kind != .Right && step.kind != .Full {
 				if candidates, probed := join_probe_rows(
 					tx,
 					table,
@@ -3017,7 +3049,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 				table_collect(lateral_table, &lateral_rows, tx.read_seq)
 			}
 			matched := false
-			for row in lateral_rows {
+			for row, row_index in lateral_rows {
 				tx.rows_scanned += 1
 				candidate := make([]Source, len(partial) + 1)
 				copy(candidate, partial)
@@ -3039,6 +3071,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 				}
 				append(&next, candidate)
 				matched = true
+				if kept_inner != nil do kept_inner[row_index] = true
 				if stop_at_limit && len(next) >= limit_rows do break
 				if join_counts_quota && quota_reached(tx, len(next)) {
 					// A cross join materialises its intermediate before the
@@ -3057,7 +3090,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 					)
 				}
 			}
-			if step.left && !matched {
+			if (step.kind == .Left || step.kind == .Full) && !matched {
 				candidate := make([]Source, len(partial) + 1)
 				copy(candidate, partial)
 				candidate[len(partial)] = Source{table = table, row = Row{}, alias = step.ref.alias}
@@ -3067,6 +3100,32 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			if using_probe do delete(probe_rows)
 			if stop_at_limit && len(next) >= limit_rows do break
 		}
+		// The other half of an outer join: every row of the inner side that no
+		// left row matched answers with the left columns NULL.
+		if step.kind == .Right || step.kind == .Full {
+			for row, row_index in rows {
+				if kept_inner[row_index] do continue
+				candidate := make([]Source, len(bound_tables) + 1)
+				for bound, i in bound_tables {
+					candidate[i] = Source{table = bound, row = Row{}, alias = bound_aliases[i]}
+				}
+				candidate[len(bound_tables)] = Source{table = table, row = row, alias = step.ref.alias}
+				append(&next, candidate)
+				if stop_at_limit && len(next) >= limit_rows do break
+				if join_counts_quota && quota_reached(tx, len(next)) {
+					delete(rows)
+					free_partials(&partials)
+					free_partials(&next)
+					return {}, errf(
+						.Quota_Exceeded,
+						"query builds more than %d rows",
+						tx.store.max_rows_per_query,
+					)
+				}
+			}
+		}
+		append(&bound_tables, table)
+		append(&bound_aliases, step.ref.alias)
 		delete(rows)
 		free_partials(&partials)
 		partials = next

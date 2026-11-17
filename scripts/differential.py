@@ -64,6 +64,10 @@ SETUP = [
 ]
 
 QUERIES = [
+    # Outer joins on both sides: the unmatched side answers NULL, on whichever
+    # side that is.
+    "SELECT emp.id, dept.id FROM emp RIGHT JOIN dept ON emp.dept = dept.id ORDER BY dept.id, emp.id",
+    "SELECT emp.id, dept.id FROM emp FULL JOIN dept ON emp.dept = dept.id ORDER BY dept.id, emp.id",
     # Projection, ordering, NULL placement.
     "SELECT * FROM dept ORDER BY id",
     "SELECT id, name FROM emp ORDER BY name",
@@ -226,8 +230,6 @@ QUERIES = [
 # The engine refuses these and says why; SQLite answers them. A refusal that
 # starts working fails the gate, which is how the list shrinks.
 REFUSED = {
-    "SELECT emp.id FROM emp RIGHT JOIN dept ON emp.dept = dept.id": "RIGHT joins are refused, not approximated",
-    "SELECT emp.id FROM emp FULL JOIN dept ON emp.dept = dept.id": "FULL joins are refused, not approximated",
     "SELECT emp.id FROM emp NATURAL JOIN dept": "NATURAL joins are refused, not approximated",
 
     "SELECT id FROM emp WHERE EXISTS (SELECT 1 FROM dept WHERE dept.id = emp.dept)": "a correlated reference is not resolved (features.md E2)",

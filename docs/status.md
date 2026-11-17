@@ -135,7 +135,7 @@ the gaps are named rather than left to be discovered.
   and checks both).
 - `miraidb sql --json <db> <statement>` prints a result as one JSON array of
   rows, which is how `scripts/differential.py` compares answers against SQLite:
-  one schema, one set of rows and 124 queries through both engines, with 5
+  one schema, one set of rows and 126 queries through both engines, with 3
   refusals and 6 intentional differences listed in the script. SQLite is asked
   through Python's `sqlite3` module, which hands back typed values: the
   `sqlite3 -json` shell used before prints `90.0` as `90`, and with the
@@ -150,7 +150,7 @@ the gaps are named rather than left to be discovered.
   `linux_arm64` and `darwin_arm64`. The POSIX lock is the reason it is checked:
   it carried a missing `core:sys/posix` import and two wrong integer types until
   this round, so the code that a Linux build would run had never been compiled.
-- 293 integration tests covering CRUD, recovery, constraints, transactions,
+- 294 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.

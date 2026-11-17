@@ -41,7 +41,7 @@ that way.
 |---|---|---|---|---|
 | 8 | **S1 — the schema real files declare** — *done but one* | Done: `CHECK`, `CONSTRAINT` names, column `REFERENCES`, deferred foreign keys, `ASC`/`DESC` columns, `CURRENT_TIMESTAMP` and per-row defaults, partial and expression indexes, many NULLs in a UNIQUE column. Left: `ON CONFLICT` on a constraint. | S | — |
 | 9 | **S2 — statement and expression forms** — *done but one* | Done: `IS` values, `IS DISTINCT FROM`, bitwise operators, `->`/`->>`, `LIMIT a, b`, `INSERT OR IGNORE/FAIL/ROLLBACK`, `REPLACE INTO`, `INTERSECT`/`EXCEPT`, `NULLS FIRST/LAST`, derived tables and `VALUES`, row values; a failed statement is undone whole inside a transaction. Left: `UPDATE OR <resolution>`. | S | — |
-| 10 | **S3 — joins** | `RIGHT`, `FULL`, `NATURAL`. | M | — |
+| 10 | **S3 — joins** | `NATURAL` (the shared columns are known only when the tables are resolved). | S | — |
 | 11 | **S4 — aggregates and windows** | `FILTER`, the `WINDOW` clause, `ORDER BY` inside an aggregate, `median` and the percentiles, `json_group_array`/`_object`. | M | — |
 | 12 | **S5 — functions** | 39 missing: hyperbolic math, `timediff`, `soundex`, `unistr`, planner hints, introspection, the rest of JSON and the `jsonb_*` family. | M | — |
 | 13 | **S6 — statements and pragmas** | `EXPLAIN QUERY PLAN`, `REINDEX`, `INSTEAD OF` triggers, `INDEXED BY`, `generate_series`, `VACUUM`/`ATTACH` in memory, 9 pragmas. | M | — |

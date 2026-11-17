@@ -105,7 +105,7 @@ rather than hidden in this table.
 
 | ID | Feature | Status | Gap | Test |
 |---|---|---|---|---|
-| E1 | Joins | done | inner, left, cross; nested loops | test_joins |
+| E1 | Joins | done | inner, left, right, full and cross; nested loops | test_joins, test_right_and_full_joins |
 | E2 | Semijoins | done | uncorrelated `IN`/`NOT IN`, `EXISTS`/`NOT EXISTS` and scalar subqueries; correlated references are not resolved | test_semijoins |
 | E3 | Index-driven update and delete | done | both narrow the scan through an index when possible | test_indexed_dml_and_offsets |
 | E4 | Complete scalar and aggregate function set | done | text, numeric and null functions plus six aggregates | test_math_functions, test_text_and_blob_functions, test_aggregates_and_order |

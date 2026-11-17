@@ -431,30 +431,41 @@ parse_select :: proc(p: ^Parser) -> Statement {
 				append(&joins, cross)
 				continue
 			}
-			left := false
+			kind := Join_Kind.Inner
 			if p_match_keyword(p, "inner") {
 				if !p_expect_keyword(p, "join") do break
-			} else if p_is_keyword(p, "left") {
+			} else if p_is_keyword(p, "left") || p_is_keyword(p, "right") || p_is_keyword(p, "full") {
+				switch {
+				case strings.equal_fold(p.current.text, "left"):
+					kind = .Left
+				case strings.equal_fold(p.current.text, "right"):
+					kind = .Right
+				case:
+					kind = .Full
+				}
 				p_advance(p)
 				p_match_keyword(p, "outer")
-				left = true
 				if !p_expect_keyword(p, "join") do break
 			} else if p_is_keyword(p, "cross") {
 				p_advance(p)
+				kind = .Cross
 				if !p_expect_keyword(p, "join") do break
-			} else if p_is_keyword(p, "natural") || p_is_keyword(p, "right") || p_is_keyword(p, "full") {
-				// Read as an alias, these turn the join into a cross join or an
-				// inner join and answer a different question than SQLite would.
-				// Refusing is the only honest answer until they exist.
-				upper := strings.to_upper(p.current.text)
-				defer delete(upper)
-				p_fail(p, .Sql_Syntax, "%v join is not supported: write an inner or left join with an ON condition", upper)
+			} else if p_is_keyword(p, "natural") {
+				// NATURAL reads as an alias for the preceding table, so accepting
+				// it would turn an outer join into a cross join and answer a
+				// different question. Naming the columns with USING asks the one
+				// that was meant.
+				p_fail(
+					p,
+					.Sql_Syntax,
+					"NATURAL join is not supported: name the columns with USING (a, b)",
+				)
 				break
 			} else if !p_match_keyword(p, "join") {
 				break
 			}
 			join: Join_Clause
-			join.left = left
+			join.kind = kind
 			join.table = parse_table_ref(p)
 			if p_match_keyword(p, "on") {
 				join.on = parse_expression(p)
