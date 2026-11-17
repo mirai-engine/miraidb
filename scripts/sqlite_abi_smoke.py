@@ -555,7 +555,47 @@ def main() -> int:
     assert lib.sqlite3_blob_close(blob) == OK
     assert lib.sqlite3_close(done_db) == OK
 
+    # Transactions: BEGIN opens one per connection, every statement runs in it,
+    # and ROLLBACK undoes them. The facade used to answer BEGIN with an error,
+    # so every write committed on its own and ROLLBACK undid nothing.
+    tx_db = ctypes.c_void_p()
+    assert lib.sqlite3_open(b":memory:", ctypes.byref(tx_db)) == OK
+
+    def count(sql: bytes) -> int:
+        reader = ctypes.c_void_p()
+        assert lib.sqlite3_prepare_v2(tx_db, sql, -1, ctypes.byref(reader), None) == OK
+        assert lib.sqlite3_step(reader) == ROW, lib.sqlite3_errmsg(tx_db)
+        value = lib.sqlite3_column_int64(reader, 0)
+        lib.sqlite3_finalize(reader)
+        return value
+
+    assert lib.sqlite3_exec(tx_db, b"CREATE TABLE ledger (id INTEGER PRIMARY KEY, amount INTEGER)", None, None, None) == OK
+    assert lib.sqlite3_exec(tx_db, b"BEGIN; INSERT INTO ledger (amount) VALUES (10); ROLLBACK;", None, None, None) == OK, lib.sqlite3_errmsg(tx_db)
+    assert count(b"SELECT count(*) FROM ledger") == 0, "ROLLBACK undoes the insert"
+    assert lib.sqlite3_exec(tx_db, b"BEGIN; INSERT INTO ledger (amount) VALUES (10); INSERT INTO ledger (amount) VALUES (5); COMMIT;", None, None, None) == OK
+    assert count(b"SELECT sum(amount) FROM ledger") == 15
+    assert lib.sqlite3_exec(tx_db, b"BEGIN", None, None, None) == OK
+    assert lib.sqlite3_exec(tx_db, b"BEGIN", None, None, None) == ERROR
+    assert lib.sqlite3_errmsg(tx_db) == b"cannot start a transaction within a transaction", lib.sqlite3_errmsg(tx_db)
+    assert lib.sqlite3_exec(tx_db, b"ROLLBACK", None, None, None) == OK
+    assert lib.sqlite3_exec(tx_db, b"COMMIT", None, None, None) == ERROR
+    assert lib.sqlite3_errmsg(tx_db) == b"cannot commit - no transaction is active", lib.sqlite3_errmsg(tx_db)
+    # The same script against SQLite itself ends in the same rows.
+    reference = sqlite3.connect(":memory:", isolation_level=None)
+    reference.executescript(
+        "CREATE TABLE ledger (id INTEGER PRIMARY KEY, amount INTEGER);"
+        "BEGIN; INSERT INTO ledger (amount) VALUES (10); ROLLBACK;"
+        "BEGIN; INSERT INTO ledger (amount) VALUES (10); INSERT INTO ledger (amount) VALUES (5); COMMIT;"
+    )
+    assert reference.execute("SELECT sum(amount) FROM ledger").fetchone()[0] == 15
+    reference.close()
+    # Closing with a transaction open rolls it back and closes cleanly.
+    assert lib.sqlite3_exec(tx_db, b"BEGIN; INSERT INTO ledger (amount) VALUES (1);", None, None, None) == OK
+    assert lib.sqlite3_close(tx_db) == OK
+    transactions_ok = True
+
     print("rows:", rows)
+    print("transactions:", transactions_ok)
     print("error path:", message)
     print("blob io:", blobs_ok)
     print("mirror after DDL:", integrity, rows_after)

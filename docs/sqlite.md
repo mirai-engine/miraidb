@@ -43,8 +43,8 @@ script lists.
 | CREATE TYPE | done | engine extension |
 | CREATE EVENT TABLE | done | engine extension |
 | TRUNCATE | done | engine extension |
-| BEGIN/COMMIT/ROLLBACK | done | session API and CLI REPL |
-| SAVEPOINT/RELEASE/ROLLBACK TO | done | nested, inside one transaction |
+| BEGIN/COMMIT/ROLLBACK | done | session API, CLI REPL, and the embedding layer: `sqlite3_exec(db, "BEGIN")` opens one transaction per connection that every later statement runs in, until `COMMIT`/`END` or `ROLLBACK`; `BEGIN DEFERRED/IMMEDIATE/EXCLUSIVE` all open the same single-writer transaction, the errors are SQLite's words, and closing a connection rolls back what is open (`test_embed_transactions`) |
+| SAVEPOINT/RELEASE/ROLLBACK TO | done | nested, inside one transaction; through the embedding layer an outermost `SAVEPOINT` opens the transaction and releasing it commits, as in SQLite |
 | UPSERT (ON CONFLICT DO UPDATE) | done | `DO NOTHING`, `DO UPDATE`, `excluded.*`, with `RETURNING` |
 | WITH (common table expressions) | done | recursive included |
 | ATTACH/DETACH | done | attaches engine directories, and reads a `.sqlite` file |

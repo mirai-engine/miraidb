@@ -54,6 +54,15 @@ Embed_Conn :: struct {
 	// keeps one counter per connection for the same reason, so a caller can ask
 	// after an exec as well as after a step (F3).
 	changes:    int,
+	// tx is the transaction a BEGIN (or an outermost SAVEPOINT) opened. While it
+	// is set every statement of the connection runs inside it, and COMMIT,
+	// ROLLBACK and RELEASE close it: the classic embedded API keeps one open
+	// transaction per connection, and a program that writes `BEGIN; ...; COMMIT`
+	// depends on it.
+	tx:              ^Tx,
+	// savepoint_began says the open transaction started with a SAVEPOINT, so
+	// releasing the last savepoint commits it, as SQLite does.
+	savepoint_began: bool,
 }
 
 // embed_open opens the engine format, or imports a SQLite file into memory.
@@ -103,6 +112,11 @@ embed_wrap :: proc(store: ^Store) -> ^Embed_Conn {
 
 embed_close :: proc(conn: ^Embed_Conn) {
 	if conn == nil do return
+	// A transaction still open at close is rolled back, as SQLite does.
+	if conn.tx != nil {
+		tx_rollback(conn.tx)
+		conn.tx = nil
+	}
 	if conn.owns_store && conn.store != nil {
 		store_close(conn.store)
 	}
@@ -139,16 +153,67 @@ embed_succeed :: proc(conn: ^Embed_Conn) {
 
 // embed_exec runs one statement without parameters.
 embed_exec :: proc(conn: ^Embed_Conn, sql: string) -> Error {
-	if conn == nil do return errf(.Invalid_Argument, "no connection")
-	// A cancellation belongs to the statement it interrupted: the next one starts
-	// with a clean flag, so an interrupted connection is still usable (D25).
-	store_clear_cancel(conn.store)
-	result, exec_err := sql_execute(conn.store, sql)
-	if exec_err.kind != .None do return embed_fail(conn, exec_err)
-	conn.changes = result.affected
-	sql_result_destroy(&result)
-	embed_succeed(conn)
-	return ERROR_NONE
+	return embed_exec_params(conn, sql, nil)
+}
+
+// embed_in_transaction reports whether a BEGIN or a SAVEPOINT left a transaction
+// open on the connection: what sqlite3_get_autocommit answers, inverted.
+embed_in_transaction :: proc(conn: ^Embed_Conn) -> bool {
+	return conn != nil && conn.tx != nil
+}
+
+// embed_run executes a prepared statement on the connection: transaction
+// control against the connection's own transaction, anything else inside that
+// transaction when one is open and on its own otherwise. The messages are
+// SQLite's, so a caller that matches them keeps working.
+@(private)
+embed_run :: proc(conn: ^Embed_Conn, prepared: ^Stmt_Prepared, params: []Value) -> (Sql_Result, Error) {
+	ack :: proc(conn: ^Embed_Conn) -> (Sql_Result, Error) {
+		return Sql_Result{kind = .Ack, commit_seq = conn.store.commit_seq}, ERROR_NONE
+	}
+	if !prepared.is_pragma {
+		#partial switch stmt in prepared.query.statement {
+		case Begin_Stmt:
+			if conn.tx != nil do return {}, errf(.Sql_Not_A_Query, "cannot start a transaction within a transaction")
+			conn.tx = tx_begin_write(conn.store)
+			conn.savepoint_began = false
+			return ack(conn)
+		case Commit_Stmt:
+			if conn.tx == nil do return {}, errf(.Sql_Not_A_Query, "cannot commit - no transaction is active")
+			tx := conn.tx
+			conn.tx = nil
+			if err := tx_commit(tx); err.kind != .None do return {}, err
+			return ack(conn)
+		case Rollback_Stmt:
+			if conn.tx == nil do return {}, errf(.Sql_Not_A_Query, "cannot rollback - no transaction is active")
+			tx_rollback(conn.tx)
+			conn.tx = nil
+			return ack(conn)
+		case Savepoint_Stmt:
+			switch stmt.kind {
+			case .Set:
+				if conn.tx == nil {
+					conn.tx = tx_begin_write(conn.store)
+					conn.savepoint_began = true
+				}
+				if err := tx_savepoint(conn.tx, stmt.name); err.kind != .None do return {}, err
+			case .Release:
+				if conn.tx == nil do return {}, errf(.Sql_Not_A_Query, "no such savepoint: %s", stmt.name)
+				if err := tx_release_savepoint(conn.tx, stmt.name); err.kind != .None do return {}, err
+				if conn.savepoint_began && len(conn.tx.savepoints) == 0 {
+					tx := conn.tx
+					conn.tx = nil
+					if err := tx_commit(tx); err.kind != .None do return {}, err
+				}
+			case .Rollback_To:
+				if conn.tx == nil do return {}, errf(.Sql_Not_A_Query, "no such savepoint: %s", stmt.name)
+				if err := tx_rollback_to_savepoint(conn.tx, stmt.name); err.kind != .None do return {}, err
+			}
+			return ack(conn)
+		}
+	}
+	if conn.tx != nil do return prepared_execute_in_tx(conn.tx, prepared, params)
+	return prepared_execute(conn.store, prepared, params)
 }
 
 // embed_backup writes a compacted copy of the database at path. The copy is a
@@ -212,8 +277,15 @@ embed_issue_token :: proc(conn: ^Embed_Conn, identity: Identity, ttl_us: i64) ->
 // embed_exec_params runs one statement with positional parameters.
 embed_exec_params :: proc(conn: ^Embed_Conn, sql: string, params: []Value) -> Error {
 	if conn == nil do return errf(.Invalid_Argument, "no connection")
+	// A cancellation belongs to the statement it interrupted: the next one starts
+	// with a clean flag, so an interrupted connection is still usable (D25).
 	store_clear_cancel(conn.store)
-	result, exec_err := sql_execute_params(conn.store, sql, params)
+	prepared, prepare_err := sql_prepare(conn.store, sql)
+	if prepare_err.kind != .None do return embed_fail(conn, prepare_err)
+	defer stmt_prepared_destroy(prepared)
+	started := now_microseconds()
+	result, exec_err := embed_run(conn, prepared, params)
+	store_record_query_latency(conn.store, now_microseconds() - started)
 	if exec_err.kind != .None do return embed_fail(conn, exec_err)
 	conn.changes = result.affected
 	sql_result_destroy(&result)
@@ -353,7 +425,7 @@ embed_start :: proc(stmt: ^Embed_Statement) -> Error {
 		stmt.prepared = prepared
 	}
 	store_clear_cancel(stmt.conn.store)
-	result, exec_err := prepared_execute(stmt.conn.store, stmt.prepared, stmt.params[:])
+	result, exec_err := embed_run(stmt.conn, stmt.prepared, stmt.params[:])
 	if exec_err.kind != .None {
 		stmt.done = true
 		return embed_fail(stmt.conn, exec_err)

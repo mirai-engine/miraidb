@@ -298,10 +298,16 @@ parse_statement :: proc(p: ^Parser) -> Statement {
 	if p_is_keyword(p, "create") do return parse_create(p)
 	if p_is_keyword(p, "drop") do return parse_drop(p)
 	if p_match_keyword(p, "begin") {
+		// SQLite's lock modes: one writer at a time is the engine's only mode, so
+		// all three open the same transaction.
+		if !p_match_keyword(p, "deferred") && !p_match_keyword(p, "immediate") {
+			p_match_keyword(p, "exclusive")
+		}
 		p_match_keyword(p, "transaction")
 		return Begin_Stmt{}
 	}
-	if p_match_keyword(p, "commit") {
+	// END is SQLite's (and PostgreSQL's) other spelling of COMMIT.
+	if p_match_keyword(p, "commit") || p_match_keyword(p, "end") {
 		p_match_keyword(p, "transaction")
 		return Commit_Stmt{}
 	}
