@@ -88,6 +88,20 @@ Statement :: struct {
 	// param_names holds the parameter names as C strings, made on the first
 	// sqlite3_bind_parameter_name and kept until finalize.
 	param_names: []cstring,
+	// origins holds each result column's database, table, column and declared
+	// type as C strings, described on the first metadata call and kept until
+	// finalize; described says the description ran.
+	origins:   []Column_Origin_C,
+	described: bool,
+}
+
+// Column_Origin_C is one column's origin as the C strings the metadata calls
+// return: NULL where the column is an expression.
+Column_Origin_C :: struct {
+	database: cstring,
+	table:    cstring,
+	column:   cstring,
+	decltype: cstring,
 }
 
 @(private)
@@ -672,6 +686,13 @@ sqlite3_finalize :: proc "c" (handle: rawptr) -> c.int {
 	delete(stmt.sql_text)
 	for name in stmt.param_names do delete(name)
 	delete(stmt.param_names)
+	for origin in stmt.origins {
+		delete(origin.database)
+		delete(origin.table)
+		delete(origin.column)
+		delete(origin.decltype)
+	}
+	delete(stmt.origins)
 	engine.embed_finalize(stmt.stmt)
 	free(stmt)
 	return SQLITE_OK
@@ -1262,6 +1283,69 @@ sqlite3_libversion_number :: proc "c" () -> c.int {
 sqlite3_sourceid :: proc "c" () -> cstring {
 	context = runtime.default_context()
 	return "miraidb sqlite3 facade"
+}
+
+// --- Where a result column comes from ----------------------------------------
+//
+// These answer for a column that names a table's column directly, and NULL for
+// an expression, as SQLite does; see src/engine/describe.odin for what the
+// description reads. They work right after prepare.
+
+@(private)
+column_origin :: proc(stmt: ^Statement, index: c.int) -> ^Column_Origin_C {
+	if !stmt.described {
+		stmt.described = true
+		origins := engine.embed_column_origins(stmt.stmt)
+		defer engine.embed_column_origins_destroy(origins)
+		stmt.origins = make([]Column_Origin_C, len(origins))
+		for origin, i in origins {
+			if len(origin.table) == 0 do continue
+			stmt.origins[i] = Column_Origin_C {
+				database = strings.clone_to_cstring(origin.database),
+				table    = strings.clone_to_cstring(origin.table),
+				column   = strings.clone_to_cstring(origin.column),
+				decltype = strings.clone_to_cstring(origin.decltype),
+			}
+		}
+	}
+	if index < 0 || int(index) >= len(stmt.origins) do return nil
+	return &stmt.origins[index]
+}
+
+@(export)
+sqlite3_column_decltype :: proc "c" (handle: rawptr, index: c.int) -> cstring {
+	context = runtime.default_context()
+	stmt := stmt_of(handle)
+	if stmt == nil do return nil
+	origin := column_origin(stmt, index)
+	return origin == nil ? nil : origin.decltype
+}
+
+@(export)
+sqlite3_column_table_name :: proc "c" (handle: rawptr, index: c.int) -> cstring {
+	context = runtime.default_context()
+	stmt := stmt_of(handle)
+	if stmt == nil do return nil
+	origin := column_origin(stmt, index)
+	return origin == nil ? nil : origin.table
+}
+
+@(export)
+sqlite3_column_origin_name :: proc "c" (handle: rawptr, index: c.int) -> cstring {
+	context = runtime.default_context()
+	stmt := stmt_of(handle)
+	if stmt == nil do return nil
+	origin := column_origin(stmt, index)
+	return origin == nil ? nil : origin.column
+}
+
+@(export)
+sqlite3_column_database_name :: proc "c" (handle: rawptr, index: c.int) -> cstring {
+	context = runtime.default_context()
+	stmt := stmt_of(handle)
+	if stmt == nil do return nil
+	origin := column_origin(stmt, index)
+	return origin == nil ? nil : origin.database
 }
 
 // --- Parameters by number and by name --------------------------------------

@@ -2,9 +2,9 @@
 ** sqlite3_miraidb.h -- the subset of SQLite's C API that sqlite3_miraidb.dll
 ** implements, declared so a C program can compile against it.
 **
-** This is not sqlite3.h. It declares the 72 functions the facade exports and the
+** This is not sqlite3.h. It declares the 76 functions the facade exports and the
 ** result codes they answer; a program that uses anything else will not link, and
-** that is the honest state of the facade (72 of SQLite's 315 symbols). Look at
+** that is the honest state of the facade (76 of SQLite's 315 symbols). Look at
 ** docs/sqlite.md for what each one does here and where it differs.
 **
 ** Build the library with:
@@ -166,6 +166,14 @@ int          sqlite3_bind_zeroblob64(sqlite3_stmt *stmt, int index,
 int          sqlite3_column_count(sqlite3_stmt *stmt);
 /* The column count while a row is available, 0 otherwise. */
 int          sqlite3_data_count(sqlite3_stmt *stmt);
+/* Where a result column comes from, right after prepare: NULL for an
+** expression, and for every column when a source is not a table (a derived
+** table, a CTE, a view). The declared type is the engine's name for it --
+** INTEGER, REAL, TEXT or BLOB -- not the text a CREATE TABLE spelled. */
+const char  *sqlite3_column_decltype(sqlite3_stmt *stmt, int index);
+const char  *sqlite3_column_database_name(sqlite3_stmt *stmt, int index);
+const char  *sqlite3_column_table_name(sqlite3_stmt *stmt, int index);
+const char  *sqlite3_column_origin_name(sqlite3_stmt *stmt, int index);
 const char  *sqlite3_column_name(sqlite3_stmt *stmt, int index);
 int          sqlite3_column_type(sqlite3_stmt *stmt, int index);
 int          sqlite3_column_int(sqlite3_stmt *stmt, int index);

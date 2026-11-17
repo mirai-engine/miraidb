@@ -399,6 +399,41 @@ Embed_Parameter_Count :: proc(stmt: ^Embed_Statement) -> int {
 	return stmt.prepared.param_count
 }
 
+// embed_column_origins describes where each result column comes from (see
+// describe.odin), reading the catalog the connection sees: its open
+// transaction's when there is one. The slice and its strings are copied before
+// that transaction ends and belong to the caller, who frees them with
+// embed_column_origins_destroy. Nil when the statement is not one the
+// description can answer.
+embed_column_origins :: proc(stmt: ^Embed_Statement, alloc := context.allocator) -> []Column_Origin {
+	if stmt == nil || stmt.prepared == nil || stmt.prepared.is_pragma do return nil
+	tx := stmt.conn.tx
+	own := tx == nil
+	if own do tx = tx_begin_read(stmt.conn.store)
+	defer if own do tx_end(tx)
+	origins, ok := sql_describe_origins(tx, stmt.prepared.query.statement, alloc)
+	if !ok do return nil
+	for &origin in origins {
+		if len(origin.table) == 0 do continue
+		origin.database = strings.clone(origin.database, alloc)
+		origin.table = strings.clone(origin.table, alloc)
+		origin.column = strings.clone(origin.column, alloc)
+		origin.decltype = strings.clone(origin.decltype, alloc)
+	}
+	return origins
+}
+
+embed_column_origins_destroy :: proc(origins: []Column_Origin, alloc := context.allocator) {
+	for origin in origins {
+		if len(origin.table) == 0 do continue
+		delete(origin.database, alloc)
+		delete(origin.table, alloc)
+		delete(origin.column, alloc)
+		delete(origin.decltype, alloc)
+	}
+	delete(origins, alloc)
+}
+
 // embed_parameter_name is the name parameter `index` (0-based) was written with:
 // "?3", ":id", "@id", "$id", or "" for a bare `?` and for an index out of range.
 embed_parameter_name :: proc(stmt: ^Embed_Statement, index: int) -> string {

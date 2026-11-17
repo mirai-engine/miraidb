@@ -60,6 +60,10 @@ SIGNATURES = {
     "sqlite3_bind_text": ([c_void_p, c_int, c_char_p, c_int, c_void_p], c_int),
     "sqlite3_bind_blob": ([c_void_p, c_int, c_char_p, c_int, c_void_p], c_int),
     "sqlite3_column_count": ([c_void_p], c_int),
+    "sqlite3_column_decltype": ([c_void_p, c_int], c_char_p),
+    "sqlite3_column_table_name": ([c_void_p, c_int], c_char_p),
+    "sqlite3_column_origin_name": ([c_void_p, c_int], c_char_p),
+    "sqlite3_column_database_name": ([c_void_p, c_int], c_char_p),
 }
 
 # SQLITE_TRANSIENT: SQLite copies the value before the call returns.
@@ -68,10 +72,23 @@ TRANSIENT = c_void_p(-1)
 STMTSTATUS_RUN = 6
 
 
+# Symbols a SQLite build may leave out: the column metadata calls exist only
+# with SQLITE_ENABLE_COLUMN_METADATA, which Python's own Windows build does not
+# set. What a reference lacks is not compared.
+OPTIONAL = {"sqlite3_column_table_name", "sqlite3_column_origin_name", "sqlite3_column_database_name"}
+
+
 def load(path: str):
     lib = ctypes.CDLL(path)
+    lib.missing = set()
     for name, (args, result) in SIGNATURES.items():
-        function = getattr(lib, name)
+        try:
+            function = getattr(lib, name)
+        except AttributeError:
+            if name not in OPTIONAL:
+                raise
+            lib.missing.add(name)
+            continue
         function.argtypes = args
         function.restype = result
     # Python's own SQLite is built with SQLITE_OMIT_AUTOINIT: without this call
@@ -234,9 +251,53 @@ def observe(lib) -> dict[str, object]:
     bad = c_void_p()
     seen["?0 is refused"] = lib.sqlite3_prepare_v2(db, b"SELECT ?0", -1, ctypes.byref(bad), None)
 
+    # Where each result column comes from, right after prepare: a column that
+    # names a table's column directly has a database, a table, a column and a
+    # declared type, and an expression has none.
+    exec_(b"CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, score REAL, photo BLOB)")
+    exec_(b"CREATE TABLE orders (oid INTEGER PRIMARY KEY, pid INTEGER, total REAL)")
+    for sql in (
+        b"SELECT id, name, score, photo FROM people",
+        b"SELECT name AS who, score * 2, t.id, upper(name), 1 FROM people t",
+        b"SELECT p.id, o.total, pid, oid FROM people p JOIN orders o ON o.pid = p.id",
+        b"SELECT * FROM orders",
+        b"SELECT count(*), max(score) FROM people",
+    ):
+        described = prepare(sql)
+        columns = lib.sqlite3_column_count(described)
+        seen[f"decltypes of {sql!r}"] = [lib.sqlite3_column_decltype(described, i) for i in range(columns + 1)]
+        if not lib.missing:
+            seen[f"origins of {sql!r}"] = [
+                (
+                    lib.sqlite3_column_database_name(described, i),
+                    lib.sqlite3_column_table_name(described, i),
+                    lib.sqlite3_column_origin_name(described, i),
+                )
+                for i in range(columns + 1)
+            ]
+        lib.sqlite3_finalize(described)
+
     seen["errstr"] = [lib.sqlite3_errstr(code) for code in (*range(0, 30), 100, 101, 516, 19 | 8 << 8, 9999)]
     assert lib.sqlite3_close(db) == 0
     return seen
+
+
+# What SQLite answers for the column origins of the script's statements, for a
+# reference built without SQLITE_ENABLE_COLUMN_METADATA: database, table (its
+# real name, not the alias) and column, and NULL for an expression.
+M, P, O = b"main", b"people", b"orders"
+NONE3 = (None, None, None)
+EXPECTED_ORIGINS = {
+    b"SELECT id, name, score, photo FROM people":
+        [(M, P, b"id"), (M, P, b"name"), (M, P, b"score"), (M, P, b"photo"), NONE3],
+    b"SELECT name AS who, score * 2, t.id, upper(name), 1 FROM people t":
+        [(M, P, b"name"), NONE3, (M, P, b"id"), NONE3, NONE3, NONE3],
+    b"SELECT p.id, o.total, pid, oid FROM people p JOIN orders o ON o.pid = p.id":
+        [(M, P, b"id"), (M, O, b"total"), (M, O, b"pid"), (M, O, b"oid"), NONE3],
+    b"SELECT * FROM orders":
+        [(M, O, b"oid"), (M, O, b"pid"), (M, O, b"total"), NONE3],
+    b"SELECT count(*), max(score) FROM people": [NONE3, NONE3, NONE3],
+}
 
 
 def compare(facade_path: str) -> list[str]:
@@ -245,9 +306,13 @@ def compare(facade_path: str) -> list[str]:
     if reference is None:
         return ["no reference SQLite library to compare against"]
     ours = observe(load(facade_path))
-    theirs = observe(load(reference))
+    reference_lib = load(reference)
+    theirs = observe(reference_lib)
+    if reference_lib.missing:
+        for sql, origins in EXPECTED_ORIGINS.items():
+            theirs[f"origins of {sql!r}"] = origins
     return [
-        f"{key}: facade {ours[key]!r}, SQLite {theirs[key]!r}"
+        f"{key}: facade {ours.get(key)!r}, SQLite {theirs[key]!r}"
         for key in theirs
         if ours.get(key) != theirs[key]
     ]
