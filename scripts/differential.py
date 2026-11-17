@@ -158,6 +158,14 @@ QUERIES = [
     "UPDATE kv SET v = 5 WHERE k = 'b' RETURNING k, v",
     "SELECT k, v FROM kv ORDER BY k",
     "SELECT k, old_v, new_v FROM audit ORDER BY id",
+    # Common table expressions on a write (D38): in front of it, and inside an
+    # INSERT's SELECT; recursive too; seen by the WHERE of an UPDATE and a DELETE.
+    "WITH c AS (SELECT 'd' AS k, 4 AS v) INSERT INTO kv (k, v) SELECT k, v FROM c RETURNING k, v",
+    "INSERT INTO kv (k, v) WITH c AS (SELECT 'e' AS k, 5 AS v) SELECT k, v FROM c RETURNING k, v",
+    "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 3) INSERT INTO kv (k, v) SELECT 'r' || x, x FROM n RETURNING k, v",
+    "WITH c AS (SELECT 'd' AS k) UPDATE kv SET v = v * 10 WHERE k IN (SELECT k FROM c) RETURNING k, v",
+    "WITH c AS (SELECT 'e' AS k) DELETE FROM kv WHERE k IN (SELECT k FROM c) RETURNING k, v",
+    "SELECT k, v FROM kv ORDER BY k",
     # Edge cases the second audit pass measured. A text is a number where truth
     # is asked, a position is a character, and a real keeps its type.
     "SELECT substr('abcdef', -3), substr('abcdef', 2, -2), substr('abcdef', 0, 3)",

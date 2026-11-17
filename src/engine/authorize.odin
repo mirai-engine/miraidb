@@ -213,11 +213,15 @@ auth_statement :: proc(walk: ^Auth_Walk, statement: ^Statement) {
 	case Explain_Stmt:
 		if s.inner != nil do auth_statement(walk, s.inner)
 	case Insert_Stmt:
+		base := auth_push_ctes(walk, s.ctes)
+		defer resize(&walk.ctes, base)
 		auth_action(walk, {action = .Insert, arg1 = s.table, database = MAIN})
 		for row in s.rows do for &expr in row do auth_expr(walk, &expr)
 		if s.has_select do auth_select(walk, &s.select_stmt)
 		auth_triggers(walk, s.table, "insert")
 	case Update_Stmt:
+		base := auth_push_ctes(walk, s.ctes)
+		defer resize(&walk.ctes, base)
 		table := tx_table_probe(walk.tx, s.table)
 		auth_push_table(walk, table)
 		kept := make([dynamic]Assignment, 0, len(s.assignments), walk.alloc)
@@ -238,6 +242,8 @@ auth_statement :: proc(walk: ^Auth_Walk, statement: ^Statement) {
 	case Delete_Stmt:
 		// An Ignore on a DELETE lets it run, as in SQLite, where it only turns off
 		// the truncate optimization.
+		base := auth_push_ctes(walk, s.ctes)
+		defer resize(&walk.ctes, base)
 		_ = auth_ask(walk, {action = .Delete, arg1 = s.table, database = MAIN})
 		table := tx_table_probe(walk.tx, s.table)
 		auth_push_table(walk, table)
@@ -308,10 +314,18 @@ auth_statement :: proc(walk: ^Auth_Walk, statement: ^Statement) {
 auth_with :: proc(walk: ^Auth_Walk, with: ^With_Stmt, names: ^[dynamic]string = nil) -> bool {
 	base := len(walk.ctes)
 	defer resize(&walk.ctes, base)
-	for &cte in with.ctes {
+	auth_push_ctes(walk, with.ctes)
+	return auth_select(walk, &with.select_stmt, names)
+}
+
+// auth_push_ctes puts CTEs in scope and returns the scope's size before them.
+@(private)
+auth_push_ctes :: proc(walk: ^Auth_Walk, ctes: []Cte) -> int {
+	base := len(walk.ctes)
+	for &cte in ctes {
 		append(&walk.ctes, Auth_Cte{name = cte.name, columns = cte.columns, known = len(cte.columns) > 0, body = &cte.select_stmt})
 	}
-	return auth_select(walk, &with.select_stmt, names)
+	return base
 }
 
 // auth_cte walks the body of CTE `index` the first time a query reads it.

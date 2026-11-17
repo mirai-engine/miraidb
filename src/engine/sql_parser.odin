@@ -275,30 +275,11 @@ parse_statement :: proc(p: ^Parser) -> Statement {
 	if p_is_keyword(p, "select") do return parse_select(p)
 	if p_match_keyword(p, "with") {
 		with: With_Stmt
-		if p_match_keyword(p, "recursive") do with.recursive = true
-		ctes := make([dynamic]Cte, 0, 2, p.alloc)
-		for {
-			cte: Cte
-			cte.name = p_ident(p)
-			if p_match_punct(p, "(") {
-				names := make([dynamic]string, 0, 2, p.alloc)
-				for {
-					append(&names, p_ident(p))
-					if !p_match_punct(p, ",") do break
-				}
-				p_expect_punct(p, ")")
-				cte.columns = names[:]
-			}
-			p_expect_keyword(p, "as")
-			p_expect_punct(p, "(")
-			if select_stmt, ok := parse_select(p).(Select_Stmt); ok {
-				cte.select_stmt = select_stmt
-			}
-			p_expect_punct(p, ")")
-			append(&ctes, cte)
-			if !p_match_punct(p, ",") do break
+		with.ctes, with.recursive = parse_with_ctes(p)
+		// WITH in front of a write: the CTEs belong to the write, as in SQLite.
+		if p_is_keyword(p, "insert") || p_is_keyword(p, "replace") || p_is_keyword(p, "update") || p_is_keyword(p, "delete") {
+			return parse_write_with(p, with.ctes, with.recursive)
 		}
-		with.ctes = ctes[:]
 		if select_stmt, ok := parse_select(p).(Select_Stmt); ok {
 			with.select_stmt = select_stmt
 		}
@@ -1351,6 +1332,67 @@ parse_frame_bound :: proc(p: ^Parser) -> Frame_Bound {
 	return {}
 }
 
+// parse_with_ctes reads the common table expressions after WITH, up to the
+// statement they belong to.
+@(private)
+parse_with_ctes :: proc(p: ^Parser) -> (ctes: []Cte, recursive: bool) {
+	if p_match_keyword(p, "recursive") do recursive = true
+	list := make([dynamic]Cte, 0, 2, p.alloc)
+	for {
+		cte: Cte
+		cte.name = p_ident(p)
+		if p_match_punct(p, "(") {
+			names := make([dynamic]string, 0, 2, p.alloc)
+			for {
+				append(&names, p_ident(p))
+				if !p_match_punct(p, ",") do break
+			}
+			p_expect_punct(p, ")")
+			cte.columns = names[:]
+		}
+		p_expect_keyword(p, "as")
+		p_expect_punct(p, "(")
+		if select_stmt, ok := parse_select(p).(Select_Stmt); ok {
+			cte.select_stmt = select_stmt
+		}
+		p_expect_punct(p, ")")
+		append(&list, cte)
+		if !p_match_punct(p, ",") || p.err.kind != .None do break
+	}
+	return list[:], recursive
+}
+
+// parse_write_with reads the INSERT, UPDATE or DELETE a WITH prefixes and
+// gives it the CTEs. An INSERT whose SELECT has a WITH of its own sees both,
+// the outer ones first.
+@(private)
+parse_write_with :: proc(p: ^Parser, ctes: []Cte, recursive: bool) -> Statement {
+	statement: Statement
+	if p_is_keyword(p, "update") {
+		statement = parse_update(p)
+	} else if p_is_keyword(p, "delete") {
+		statement = parse_delete(p)
+	} else {
+		statement = parse_insert(p)
+	}
+	#partial switch &s in statement {
+	case Insert_Stmt:
+		inner := s.ctes
+		joined := make([]Cte, len(ctes) + len(inner), p.alloc)
+		copy(joined, ctes)
+		copy(joined[len(ctes):], inner)
+		s.ctes = joined
+		s.ctes_recursive = s.ctes_recursive || recursive
+	case Update_Stmt:
+		s.ctes = ctes
+		s.ctes_recursive = recursive
+	case Delete_Stmt:
+		s.ctes = ctes
+		s.ctes_recursive = recursive
+	}
+	return statement
+}
+
 @(private)
 parse_insert :: proc(p: ^Parser) -> Statement {
 	insert: Insert_Stmt
@@ -1394,6 +1436,15 @@ parse_insert :: proc(p: ^Parser) -> Statement {
 		p_expect_punct(p, ")")
 	}
 	insert.columns = columns[:]
+	// INSERT INTO t WITH c AS (...) SELECT ...: the query has CTEs, which the
+	// statement materializes before it writes.
+	if p_match_keyword(p, "with") {
+		insert.ctes, insert.ctes_recursive = parse_with_ctes(p)
+		if !p_is_keyword(p, "select") && !p_is_keyword(p, "values") {
+			p_fail(p, .Sql_Syntax, "expected SELECT after WITH, found %s", p.current.text)
+			return insert
+		}
+	}
 	// INSERT INTO t (cols) SELECT ...: the rows come from a query.
 	if p_is_keyword(p, "select") {
 		if select_stmt, ok := parse_select(p).(Select_Stmt); ok {

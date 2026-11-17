@@ -349,6 +349,10 @@ Insert_Stmt :: struct {
 	conflict_ignore:   bool,
 	conflict_fail:     bool,
 	conflict_rollback: bool,
+	// ctes are the common table expressions of `WITH ... INSERT|UPDATE|DELETE`
+	// (and of `INSERT INTO t WITH ... SELECT`), materialized before the write.
+	ctes:           []Cte,
+	ctes_recursive: bool,
 }
 
 // Returning lists the rows a mutation reports back: every column with `*`, or
@@ -371,6 +375,10 @@ Update_Stmt :: struct {
 	// the assignments.
 	from:         Table_Ref,
 	returning:    ^Returning,
+	// ctes are the common table expressions of `WITH ... INSERT|UPDATE|DELETE`
+	// (and of `INSERT INTO t WITH ... SELECT`), materialized before the write.
+	ctes:           []Cte,
+	ctes_recursive: bool,
 }
 
 // Merge_When_Kind is what one WHEN clause of a MERGE does.
@@ -408,6 +416,10 @@ Delete_Stmt :: struct {
 	// using is the DELETE ... USING source, joined to the target for the WHERE.
 	using_ref:    Table_Ref,
 	returning:    ^Returning,
+	// ctes are the common table expressions of `WITH ... INSERT|UPDATE|DELETE`
+	// (and of `INSERT INTO t WITH ... SELECT`), materialized before the write.
+	ctes:           []Cte,
+	ctes_recursive: bool,
 }
 
 Column_Def :: struct {

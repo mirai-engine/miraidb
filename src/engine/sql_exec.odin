@@ -229,6 +229,39 @@ sql_execute_in_tx_params :: proc(tx: ^Tx, sql: string, params: []Value) -> (Sql_
 
 // statement_fails_partially reports INSERT OR FAIL, the one resolution that
 // keeps a statement's rows before the one that failed.
+// statement_ctes are the CTEs a write carries.
+@(private)
+statement_ctes :: proc(statement: Statement) -> (ctes: []Cte, recursive: bool) {
+	#partial switch s in statement {
+	case Insert_Stmt:
+		return s.ctes, s.ctes_recursive
+	case Update_Stmt:
+		return s.ctes, s.ctes_recursive
+	case Delete_Stmt:
+		return s.ctes, s.ctes_recursive
+	}
+	return nil, false
+}
+
+@(private)
+statement_without_ctes :: proc(statement: Statement) -> Statement {
+	#partial switch s in statement {
+	case Insert_Stmt:
+		inner := s
+		inner.ctes = nil
+		return inner
+	case Update_Stmt:
+		inner := s
+		inner.ctes = nil
+		return inner
+	case Delete_Stmt:
+		inner := s
+		inner.ctes = nil
+		return inner
+	}
+	return statement
+}
+
 @(private)
 statement_fails_partially :: proc(statement: Statement) -> bool {
 	insert, ok := statement.(Insert_Stmt)
@@ -537,6 +570,18 @@ sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sq
 	// A write statement makes the transaction a write transaction even when it
 	// changes no row, which is when SQLite calls its commit hook.
 	tx.wrote = true
+	// A write with CTEs materializes them for its own life, then runs as a
+	// plain write that reads them by name.
+	if ctes, recursive := statement_ctes(statement); len(ctes) > 0 {
+		scope := cte_scope_begin(tx)
+		defer cte_scope_end(tx, &scope)
+		for cte in ctes {
+			table, cte_err := tx_materialize_cte(tx, cte, params, recursive)
+			if cte_err.kind != .None do return {}, cte_err
+			cte_scope_bind(tx, &scope, cte.name, table)
+		}
+		return sql_exec_mutation(tx, statement_without_ctes(statement), params)
+	}
 	switch stmt in statement {
 	case Reindex_Stmt:
 		// Every index is rebuilt from the log when the database opens, so there is
