@@ -4690,6 +4690,15 @@ test_named_types :: proc(t: ^testing.T) {
 	}
 	testing.expect(t, found_text)
 
+	// A8: the catalog keeps the name the column was declared with next to the
+	// type it resolved to, so a client can rebuild the schema it was written as.
+	named := run(t, store, "SELECT named FROM _columns WHERE table = 'users' AND name = 'address'")
+	found_named := false
+	for row in named.rows {
+		if row[0].s == "email" do found_named = true
+	}
+	testing.expect(t, found_named)
+
 	shown := run(t, store, "SHOW types")
 	testing.expect_value(t, len(shown.rows), 1)
 	testing.expect_value(t, shown.rows[0][0].s, "email")
@@ -13598,4 +13607,144 @@ test_rowid_spellings :: proc(t: ^testing.T) {
 	defer db.sql_result_destroy(&both)
 	testing.expect_value(t, len(both.rows), 4)
 	testing.expect_value(t, len(both.rows[0]), 2)
+}
+
+// C7: an update rewrites the row it names. The stored row keeps its id, so a
+// reader holding a row id, a subscription delta or a rowid finds the same row
+// before and after: it is not a delete followed by an insert.
+@(test)
+test_update_keeps_the_row_in_place :: proc(t: ^testing.T) {
+	store := fresh_db(t, "update_in_place")
+	if store == nil do return
+	defer cleanup_db(store, "update_in_place")
+
+	run(t, store, "CREATE TABLE t (v INTEGER, note TEXT)")
+	run(t, store, "INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+
+	before := run(t, store, "SELECT rowid, v, note FROM t ORDER BY rowid")
+	testing.expect_value(t, len(before.rows), 2)
+	first_id := before.row_ids[0]
+	second_id := before.row_ids[1]
+	second_rowid := before.rows[1][0].i
+	db.sql_result_destroy(&before)
+
+	run(t, store, "UPDATE t SET note = 'z' WHERE v = 2")
+
+	after := run(t, store, "SELECT rowid, v, note FROM t ORDER BY rowid")
+	defer db.sql_result_destroy(&after)
+	testing.expect_value(t, len(after.rows), 2)
+	testing.expect_value(t, after.rows[1][2].s, "z")
+	testing.expect_value(t, after.row_ids[1], second_id)
+	testing.expect_value(t, after.rows[1][0].i, second_rowid)
+	testing.expect(t, after.row_ids[0] == first_id)
+	testing.expect(t, after.row_ids[1] != after.row_ids[0])
+
+	// No row was added or removed: the update rewrote two values in place.
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t").i, i64(2))
+}
+
+// D3: a log whose format this build does not read is refused by name, before a
+// single record is interpreted. A newer file may hold records this build would
+// misread; an older one no longer has the layout it expects.
+@(test)
+test_log_format_is_negotiated :: proc(t: ^testing.T) {
+	path := "_test_log_version"
+	os.remove_all(path)
+	defer os.remove_all(path)
+
+	store, err := db.store_open(path, {persistent = true, create = true, durable = false})
+	if !testing.expectf(t, db.error_ok(err), "open: %s", err.message) do return
+	run(t, store, "CREATE TABLE t (v INTEGER)")
+	run(t, store, "INSERT INTO t VALUES (1)")
+	db.store_close(store)
+
+	log_path := fmt.aprintf("%s/log", path)
+	defer delete(log_path)
+
+	patch_u32_le(t, log_path, 8, db.LOG_VERSION + 1)
+	newer, newer_err := db.store_open(path, {persistent = true, create = false, durable = false})
+	testing.expect(t, !db.error_ok(newer_err))
+	testing.expect_value(t, newer_err.kind, db.Error_Kind.Format_Too_New)
+	if db.error_ok(newer_err) do db.store_close(newer)
+
+	patch_u32_le(t, log_path, 8, db.LOG_VERSION - 1)
+	older, older_err := db.store_open(path, {persistent = true, create = false, durable = false})
+	testing.expect(t, !db.error_ok(older_err))
+	testing.expect_value(t, older_err.kind, db.Error_Kind.Corrupt_Log)
+	if db.error_ok(older_err) do db.store_close(older)
+}
+
+@(private)
+patch_u32_le :: proc(t: ^testing.T, path: string, offset: int, value: u32) {
+	file, open_err := os.open(path, {.Read, .Write})
+	if !testing.expectf(t, open_err == nil, "open %s: %v", path, open_err) do return
+	defer os.close(file)
+	if _, seek_err := os.seek(file, i64(offset), .Start); !testing.expectf(t, seek_err == nil, "seek: %v", seek_err) do return
+	bytes := [4]u8{u8(value), u8(value >> 8), u8(value >> 16), u8(value >> 24)}
+	if _, write_err := os.write(file, bytes[:]); !testing.expectf(t, write_err == nil, "write: %v", write_err) do return
+}
+
+// F6: a procedure is called through the same wire endpoint as a reducer, and an
+// unknown name answers an error rather than an empty result.
+@(test)
+test_procedure_over_the_wire :: proc(t: ^testing.T) {
+	store := fresh_db(t, "wire_procedure")
+	if store == nil do return
+	host := db.host_init(store)
+	defer db.host_destroy(host)
+	defer cleanup_db(store, "wire_procedure")
+
+	run(t, store, "CREATE TABLE log (v INTEGER NOT NULL)")
+
+	step :: proc(ctx: ^db.Procedure_Ctx, args: []db.Value) -> db.Error {
+		_, err := db.sql_execute_in_tx(ctx.tx, "INSERT INTO log (v) VALUES (7)")
+		return err
+	}
+	testing.expect(t, db.error_ok(db.host_register_procedure(host, "step", nil, step)))
+
+	response := db.wire_request(host, db.wire_encode_call_procedure("step", nil))
+	defer delete(response)
+	testing.expect_value(t, wire_kind(response), db.WIRE_RESULT)
+	result, decode_err := db.wire_decode_result(response, context.allocator)
+	testing.expect(t, db.error_ok(decode_err))
+	db.sql_result_destroy(&result)
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM log").i, i64(1))
+
+	unknown := db.wire_request(host, db.wire_encode_call_procedure("nope", nil))
+	defer delete(unknown)
+	testing.expect_value(t, wire_kind(unknown), db.WIRE_ERROR)
+}
+
+// G4: an immediate schedule is due at the current host time, so the next tick
+// runs it without waiting for a clock to advance.
+@(test)
+test_schedule_now :: proc(t: ^testing.T) {
+	store := fresh_db(t, "schedule_now")
+	if store == nil do return
+	host := db.host_init(store)
+	defer db.host_destroy(host)
+	defer cleanup_db(store, "schedule_now")
+
+	run(t, store, "CREATE TABLE counter (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)")
+	run(t, store, "INSERT INTO counter (id, value) VALUES (0, 0)")
+
+	bump :: proc(ctx: ^db.Reducer_Ctx, args: []db.Value) -> db.Error {
+		amount, _ := db.value_to_i64(args[0])
+		statement := fmt.tprintf("UPDATE counter SET value = value + %d WHERE id = 0", amount)
+		_, err := db.sql_execute_in_tx(ctx.tx, statement)
+		return err
+	}
+	testing.expect(t, db.error_ok(db.host_register(host, "bump", []db.Column_Type{db.type_int}, bump)))
+
+	now := i64(1_700_000_000_000_000)
+	host.now_us = now
+	id, schedule_err := db.host_schedule_now(host, "bump", []db.Value{db.value_int(5)})
+	testing.expect(t, db.error_ok(schedule_err))
+	testing.expect(t, id != 0)
+
+	// No clock advance: the schedule is already due.
+	ran, tick_err := db.host_tick(host, now)
+	testing.expect(t, db.error_ok(tick_err))
+	testing.expect_value(t, ran, 1)
+	testing.expect_value(t, scalar(t, store, "SELECT value FROM counter WHERE id = 0").i, i64(5))
 }

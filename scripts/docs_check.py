@@ -74,6 +74,52 @@ def test_count() -> int:
     return count
 
 
+def test_names() -> set[str]:
+    """Every test the suite defines, by name."""
+    names: set[str] = set()
+    for name in os.listdir(os.path.join(ROOT, "src", "tests")):
+        if not name.endswith(".odin"):
+            continue
+        text = read(os.path.join("src", "tests", name))
+        names.update(re.findall(r"^@\(test\)\s*\n(test_[a-z0-9_]+)", text, re.MULTILINE))
+    return names
+
+
+# feature_tests matches one row of the feature matrix, in any of its tables.
+feature_tests = re.compile(
+    r"^\| ([A-H][0-9]+) \| .+? \| (?:done|partial|todo) \| .*? \| (.*?) \|$",
+    re.MULTILINE,
+)
+
+
+def check_features() -> None:
+    """Every row of the matrix names the test or the gate that covers it.
+
+    The matrix used to say "each with a test" and nothing could tell whether that
+    was true: none of the 94 identifiers appeared in a test file, and the count
+    only proved that there were 94 rows. The names are now in the table, and this
+    checks that each one exists -- an Odin test in src/tests, or a script.
+    """
+    text = read("docs/features.md")
+    tests = test_names()
+    rows = 0
+    for match in feature_tests.finditer(text):
+        identifier, names = match.group(1), match.group(2)
+        rows += 1
+        entries = [entry.strip() for entry in names.split(",") if entry.strip()]
+        if not entries:
+            fail(f"docs/features.md: {identifier} names no test")
+            continue
+        for entry in entries:
+            if entry.startswith("scripts/"):
+                if not os.path.exists(os.path.join(ROOT, entry)):
+                    fail(f"docs/features.md: {identifier} names {entry}, which is not in the tree")
+            elif entry not in tests:
+                fail(f"docs/features.md: {identifier} names {entry}, which is not a test in src/tests")
+    if rows != 94:
+        fail(f"docs/features.md: {rows} feature rows, expected 94")
+
+
 def check_tests() -> None:
     actual = test_count()
     status = read("docs/status.md")
@@ -219,6 +265,7 @@ def main() -> int:
     checks = [
         ("version", check_version),
         ("tests", check_tests),
+        ("feature tests", check_features),
         ("gates", check_gates),
         ("commands", check_commands),
         ("links", check_links),

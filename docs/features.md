@@ -1,8 +1,11 @@
 # Feature matrix
 
 The record of the feature set this engine targets. Each row is one capability,
-with its status in this tree and the evidence that closed it. IDs are stable.
-The matrix is closed: 94 rows, all `done`, each with a test. [closing-plan.md](closing-plan.md)
+with its status in this tree, the evidence that closed it, and the test or gate
+that covers it. IDs are stable. The matrix is closed: 94 rows, all `done`, and
+every row names its test; `scripts/docs_check.py` fails if a name stops existing,
+so "each with a test" is a claim the gate checks rather than a sentence.
+[closing-plan.md](closing-plan.md)
 records how each row was closed, [roadmap.md](roadmap.md) is the list of what is
 left and [backlog.md](backlog.md) its detail. Parity of interface is closed;
 parity of speed is not (roadmap track A).
@@ -34,137 +37,137 @@ rather than hidden in this table.
 
 ## A. Data model and types
 
-| ID | Feature | Status | Gap |
-|---|---|---|---|
-| A1 | 8/16/32-bit integers with range checks | done | `TINYINT`/`SMALLINT`/`INT4`, unsigned variants, range enforced on store |
-| A2 | 128-bit integers | done | `INT128`/`UINT128`, arithmetic, aggregates, index keys |
-| A3 | `F32` distinct from `F64` | done | `FLOAT4` rounds to single precision on store |
-| A4 | `Unit`, `Option`, `Result` as types | done | `UNIT`, `OPTION(T)` and `RESULT(T, E)` parse, coerce (one Result side), reflect and replay |
-| A5 | Arrays and products as column values | done | `ARRAY(T)` and `PRODUCT(T1, ..., Tn)` are column types: parser, element-wise coercion, codec, reflection |
-| A6 | Named types and references | done | `CREATE TYPE name AS base`, resolved from `_type` when a table is created; `SHOW types` |
-| A7 | Domains: identity, connection, timestamp, duration, uuid | done | `DURATION`, `IDENTITY`, `CONNECTION` added; timestamps and uuid already existed |
-| A8 | Stable serialization with resolved references | done | a column keeps its catalog name next to the resolved type; both are encoded, replayed and exposed as `_columns.named` |
-| A9 | Hash, order and equality for every type | done | `value_compare`, `value_equal` and `value_hash` tested for all 19 kinds, including numeric cross-kind equality |
-| A10 | Type reflection for clients | done | `host_schema_text` and `GET /schema` render tables, columns and indexes |
+| ID | Feature | Status | Gap | Test |
+|---|---|---|---|---|
+| A1 | 8/16/32-bit integers with range checks | done | `TINYINT`/`SMALLINT`/`INT4`, unsigned variants, range enforced on store | test_integer_widths |
+| A2 | 128-bit integers | done | `INT128`/`UINT128`, arithmetic, aggregates, index keys | test_128_bit_integers |
+| A3 | `F32` distinct from `F64` | done | `FLOAT4` rounds to single precision on store | test_integer_widths |
+| A4 | `Unit`, `Option`, `Result` as types | done | `UNIT`, `OPTION(T)` and `RESULT(T, E)` parse, coerce (one Result side), reflect and replay | test_structural_types |
+| A5 | Arrays and products as column values | done | `ARRAY(T)` and `PRODUCT(T1, ..., Tn)` are column types: parser, element-wise coercion, codec, reflection | test_array_and_product_types, test_product_arity |
+| A6 | Named types and references | done | `CREATE TYPE name AS base`, resolved from `_type` when a table is created; `SHOW types` | test_named_types, test_named_type_references |
+| A7 | Domains: identity, connection, timestamp, duration, uuid | done | `DURATION`, `IDENTITY`, `CONNECTION` added; timestamps and uuid already existed | test_domain_types |
+| A8 | Stable serialization with resolved references | done | a column keeps its catalog name next to the resolved type; both are encoded, replayed and exposed as `_columns.named` | test_named_types |
+| A9 | Hash, order and equality for every type | done | `value_compare`, `value_equal` and `value_hash` tested for all 19 kinds, including numeric cross-kind equality | test_value_order_and_hash |
+| A10 | Type reflection for clients | done | `host_schema_text` and `GET /schema` render tables, columns and indexes | test_schema_reflection |
 
 ## B. Schema and catalog
 
-| ID | Feature | Status | Gap |
-|---|---|---|---|
-| B1 | Composite primary key | done | inline or `PRIMARY KEY (a, b)`; one unique index over the tuple |
-| B2 | Named, multi-column unique constraints | done | `[CONSTRAINT name] UNIQUE (a, b)` creates a named index |
-| B3 | Index algorithms: btree, hash, direct | done | btree by default; `USING HASH` for equality on any columns and `USING DIRECT` for a unique key that names one row |
-| B4 | Independent sequences | done | per-column start/increment/min/max, independent of the row id |
-| B5 | Views with parameters | done | positional `?` parameters bound by `FROM v(...)`, plus `OR REPLACE` and materialization |
-| B6 | Persisted reducer catalog | done | `_reducer` stores name, kind and parameter types |
-| B7 | Procedures with their own transaction phase | done | commit between phases, open the next one, sleep |
-| B8 | Event tables and outbox | done | `CREATE EVENT TABLE` is append-only; `events_read` reads from a cursor and `SHOW events` lists them |
-| B9 | Full schedule (instant and interval) | done | one-shot, immediate and interval rows; cancellation by deleting the row |
-| B10 | Row-level security | done | `USING`/`CHECK` policies in `_policy`, combined with AND |
-| B11 | Session and module variables | done | `SET`/`SHOW` for the session, `_var` and `host_set_module_variable` for the module |
-| B12 | Client and credential tables | done | `_client` catalogs identities (name, creation time); credentials live in `_token` |
-| B13 | Module metadata and schema versioning | done | `_meta` with a `schema_version` row |
-| B14 | Automatic schema migration | done | `host_migrate` applies ordered steps, each atomic with its version bump |
-| B15 | Table, column and index accessors | done | `SHOW tables` and `DESCRIBE` cover tables, columns and indexes |
-| B16 | Full schema validation rules | done | table/index names, duplicate columns, NOT NULL with a NULL default, primary key and index column reuse |
+| ID | Feature | Status | Gap | Test |
+|---|---|---|---|---|
+| B1 | Composite primary key | done | inline or `PRIMARY KEY (a, b)`; one unique index over the tuple | test_composite_primary_key |
+| B2 | Named, multi-column unique constraints | done | `[CONSTRAINT name] UNIQUE (a, b)` creates a named index | test_named_unique_constraints |
+| B3 | Index algorithms: btree, hash, direct | done | btree by default; `USING HASH` for equality on any columns and `USING DIRECT` for a unique key that names one row | test_hash_and_direct_indexes |
+| B4 | Independent sequences | done | per-column start/increment/min/max, independent of the row id | test_sequences |
+| B5 | Views with parameters | done | positional `?` parameters bound by `FROM v(...)`, plus `OR REPLACE` and materialization | test_view_parameters |
+| B6 | Persisted reducer catalog | done | `_reducer` stores name, kind and parameter types | test_reducer_catalog |
+| B7 | Procedures with their own transaction phase | done | commit between phases, open the next one, sleep | test_procedures |
+| B8 | Event tables and outbox | done | `CREATE EVENT TABLE` is append-only; `events_read` reads from a cursor and `SHOW events` lists them | test_event_tables |
+| B9 | Full schedule (instant and interval) | done | one-shot, immediate and interval rows; cancellation by deleting the row | test_scheduler, test_schedule_interval |
+| B10 | Row-level security | done | `USING`/`CHECK` policies in `_policy`, combined with AND | test_policies |
+| B11 | Session and module variables | done | `SET`/`SHOW` for the session, `_var` and `host_set_module_variable` for the module | test_set_and_show, test_module_variables |
+| B12 | Client and credential tables | done | `_client` catalogs identities (name, creation time); credentials live in `_token` | test_client_registry, test_tokens |
+| B13 | Module metadata and schema versioning | done | `_meta` with a `schema_version` row | test_schema_migrations |
+| B14 | Automatic schema migration | done | `host_migrate` applies ordered steps, each atomic with its version bump | test_schema_migrations |
+| B15 | Table, column and index accessors | done | `SHOW tables` and `DESCRIBE` cover tables, columns and indexes | test_show_tables, test_describe, test_show_indexes |
+| B16 | Full schema validation rules | done | table/index names, duplicate columns, NOT NULL with a NULL default, primary key and index column reuse | test_schema_validation |
 
 ## C. Datastore and transactions
 
-| ID | Feature | Status | Gap |
-|---|---|---|---|
-| C1 | MVCC with persistent structures | done | rows keep version chains visible at a read sequence; `tx_begin_read_at`, pruning, and replay rebuilds history |
-| C2 | Read snapshots without blocking the writer | done | a read transaction copies its tables at begin and runs lock-free, so a commit never waits for a reader |
-| C3 | Transaction offsets and read sets | done | `tx_read_seq` (start offset) and `tx_read_tables` (touched tables) |
-| C4 | Transaction time fixed at commit | done | the commit stamps `last_commit_us` when it lands; `store_last_commit_us` reads it |
-| C5 | Truncate with table-level tombstones | done | `TRUNCATE` stages one table-level op |
-| C6 | Range scans through an index | done | the SQL planner and executor use them; there is no public Odin call for a range scan yet |
-| C7 | Update in place | done | — |
-| C8 | Ephemeral tables | done | `CREATE TEMPORARY TABLE`: applied in the session, never logged, gone on reopen |
-| C9 | Per-table memory accounting | done | `store_table_memory`, shown by `inspect` |
-| C10 | Snapshot files | done | `<database>/snapshot`, atomic replace |
-| C11 | Replay from snapshot plus log | done | snapshot applied first, later records only |
+| ID | Feature | Status | Gap | Test |
+|---|---|---|---|---|
+| C1 | MVCC with persistent structures | done | rows keep version chains visible at a read sequence; `tx_begin_read_at`, pruning, and replay rebuilds history | test_row_versions |
+| C2 | Read snapshots without blocking the writer | done | a read transaction copies its tables at begin and runs lock-free, so a commit never waits for a reader | test_snapshot_reads_do_not_block_writers |
+| C3 | Transaction offsets and read sets | done | `tx_read_seq` (start offset) and `tx_read_tables` (touched tables) | test_transaction_read_set |
+| C4 | Transaction time fixed at commit | done | the commit stamps `last_commit_us` when it lands; `store_last_commit_us` reads it | test_commit_time |
+| C5 | Truncate with table-level tombstones | done | `TRUNCATE` stages one table-level op | test_sql_functions_and_truncate |
+| C6 | Range scans through an index | done | the SQL planner and executor use them; there is no public Odin call for a range scan yet | test_index_ddl_and_ranges, test_ordered_index_scan_bounds |
+| C7 | Update in place | done | — | test_update_keeps_the_row_in_place |
+| C8 | Ephemeral tables | done | `CREATE TEMPORARY TABLE`: applied in the session, never logged, gone on reopen | test_ephemeral_tables |
+| C9 | Per-table memory accounting | done | `store_table_memory`, shown by `inspect` | test_table_memory |
+| C10 | Snapshot files | done | `<database>/snapshot`, atomic replace | test_snapshot_restore |
+| C11 | Replay from snapshot plus log | done | snapshot applied first, later records only | test_snapshot_restore |
 
 ## D. Commit log and durability
 
-| ID | Feature | Status | Gap |
-|---|---|---|---|
-| D1 | Segments with a maximum size | done | 256 KiB segments, header per segment, rotation on append |
-| D2 | Offset index per segment | done | `log.index` sidecar, validated lookup, rebuilt on demand |
-| D3 | Negotiated format version | done | strict version check |
-| D4 | Pluggable checksum algorithm | done | header records the algorithm: CRC32C (default) or none |
-| D5 | Durability modes | done | Full, Batched (every 64) and None |
-| D6 | Prepared, pipelined transactions | done | `tx_prepare` then `store_commit_prepared`: many records, one fsync |
-| D7 | Streaming reader and writer | done | `log_reader_open/next/close` walks a file record by record and stops at a torn tail |
-| D8 | Corruption, bit-flip and partial-record tests | done | torn tail plus a bit-flip that CRC rejects and replay repairs |
-| D9 | In-memory log for simulation | done | `in_memory_log` buffer, same append path, no files |
+| ID | Feature | Status | Gap | Test |
+|---|---|---|---|---|
+| D1 | Segments with a maximum size | done | 256 KiB segments, header per segment, rotation on append | test_log_segments |
+| D2 | Offset index per segment | done | `log.index` sidecar, validated lookup, rebuilt on demand | test_log_offset_index |
+| D3 | Negotiated format version | done | strict version check | test_log_format_is_negotiated |
+| D4 | Pluggable checksum algorithm | done | header records the algorithm: CRC32C (default) or none | test_checksum_modes |
+| D5 | Durability modes | done | Full, Batched (every 64) and None | test_durability_modes |
+| D6 | Prepared, pipelined transactions | done | `tx_prepare` then `store_commit_prepared`: many records, one fsync | test_prepared_commit_group |
+| D7 | Streaming reader and writer | done | `log_reader_open/next/close` walks a file record by record and stops at a torn tail | test_log_stream_reader |
+| D8 | Corruption, bit-flip and partial-record tests | done | torn tail plus a bit-flip that CRC rejects and replay repairs | test_torn_log_tail, test_log_bit_flip |
+| D9 | In-memory log for simulation | done | `in_memory_log` buffer, same append path, no files | test_in_memory_log |
 
 ## E. Queries and SQL
 
-| ID | Feature | Status | Gap |
-|---|---|---|---|
-| E1 | Joins | done | inner, left, cross; nested loops |
-| E2 | Semijoins | done | uncorrelated `IN`/`NOT IN`, `EXISTS`/`NOT EXISTS` and scalar subqueries; correlated references are not resolved |
-| E3 | Index-driven update and delete | done | both narrow the scan through an index when possible |
-| E4 | Complete scalar and aggregate function set | done | text, numeric and null functions plus six aggregates |
-| E5 | `SET` and `SHOW` | done | session variables through the engine API; a server connection keeps its own identity and variables |
-| E6 | `EXPLAIN` | done | scan/index choice, joins and post-processing steps |
-| E7 | Row-level security in queries | done | policies filter reads and validate writes; subscriptions inherit them |
-| E8 | Multi-query subscription sets | done | `host_subscribe_many`; one row set and one delta per query |
-| E9 | Incremental subscription evaluation | done | a commit projects only the changed rows and diffs them against the cache; joins and aggregates have their own incremental paths, and ordering, `DISTINCT`, policies or DDL fall back to a full re-evaluation |
-| E10 | Confirmed-read offsets in responses | done | every result carries `commit_seq`; F10 exposes it on the wire |
-| E11 | `LIKE` escapes, casts between all types | done | `ESCAPE` supported; casts cover numbers, text, bool, timestamp, uuid, identity |
-| E12 | Views as query sources | done | materialized per reference inside the transaction |
-| E13 | System tables | done | `_tables`, `_columns` and `_indexes` synthesized from the catalog with full WHERE/ORDER BY support |
-| E14 | Complete statement surface | done | `ALTER TABLE ADD COLUMN`, `CREATE OR REPLACE VIEW` and `FOREIGN KEY` with RESTRICT/CASCADE on delete and update, enforced on insert, update and delete |
+| ID | Feature | Status | Gap | Test |
+|---|---|---|---|---|
+| E1 | Joins | done | inner, left, cross; nested loops | test_joins |
+| E2 | Semijoins | done | uncorrelated `IN`/`NOT IN`, `EXISTS`/`NOT EXISTS` and scalar subqueries; correlated references are not resolved | test_semijoins |
+| E3 | Index-driven update and delete | done | both narrow the scan through an index when possible | test_indexed_dml_and_offsets |
+| E4 | Complete scalar and aggregate function set | done | text, numeric and null functions plus six aggregates | test_math_functions, test_text_and_blob_functions, test_aggregates_and_order |
+| E5 | `SET` and `SHOW` | done | session variables through the engine API; a server connection keeps its own identity and variables | test_set_and_show |
+| E6 | `EXPLAIN` | done | scan/index choice, joins and post-processing steps | test_explain |
+| E7 | Row-level security in queries | done | policies filter reads and validate writes; subscriptions inherit them | test_policies |
+| E8 | Multi-query subscription sets | done | `host_subscribe_many`; one row set and one delta per query | test_subscription_set |
+| E9 | Incremental subscription evaluation | done | a commit projects only the changed rows and diffs them against the cache; joins and aggregates have their own incremental paths, and ordering, `DISTINCT`, policies or DDL fall back to a full re-evaluation | test_incremental_subscriptions, test_incremental_join_subscription, test_incremental_aggregate_subscription |
+| E10 | Confirmed-read offsets in responses | done | every result carries `commit_seq`; F10 exposes it on the wire | test_wire_messages |
+| E11 | `LIKE` escapes, casts between all types | done | `ESCAPE` supported; casts cover numbers, text, bool, timestamp, uuid, identity | test_like_escape, test_cast_to_narrow_types |
+| E12 | Views as query sources | done | materialized per reference inside the transaction | test_views |
+| E13 | System tables | done | `_tables`, `_columns` and `_indexes` synthesized from the catalog with full WHERE/ORDER BY support | test_system_tables |
+| E14 | Complete statement surface | done | `ALTER TABLE ADD COLUMN`, `CREATE OR REPLACE VIEW` and `FOREIGN KEY` with RESTRICT/CASCADE on delete and update, enforced on insert, update and delete | test_create_or_replace_view, test_foreign_key_enforcement, test_alter_table_add_column |
 
 ## F. Server and protocol
 
-| ID | Feature | Status | Gap |
-|---|---|---|---|
-| F1 | HTTP server | done | `miraidb-server` accept loop, HTTP routing, `/health`; verified end to end |
-| F2 | WebSocket protocol with JSON and binary formats | done | RFC 6455 handshake and binary frames carrying wire messages |
-| F3 | Reducer call over the wire with a request id | done | `WIRE_CALL_REDUCER` + request id over HTTP/WebSocket |
-| F4 | One-off query | done | `WIRE_QUERY` over the same endpoints |
-| F5 | Subscribe, subscribe-single, subscribe-multi, unsubscribe | done | `WIRE_SUBSCRIBE`/`WIRE_UNSUBSCRIBE`, sets and owner cleanup |
-| F6 | Procedure call | done | `WIRE_CALL_PROCEDURE` through the same server endpoints |
-| F7 | Identity, tokens and JWT validation | done | CSPRNG tokens hashed with HMAC-SHA256; HS256 JWTs with `sub`/`exp` validation and tamper rejection |
-| F8 | Energy metering and quotas | done | per-statement work (rows + payload) with a per-call budget, a cumulative total and the row quota |
-| F9 | Client lifecycle and cancellation | done | registry, connection limit, cancellation, owned subscriptions, byte accounting, and a bounded outbox that drops a message and closes the connection on overflow |
-| F10 | Confirmed reads | done | every result carries `commit_seq`, so the client confirms its read |
-| F11 | Compression and row-size hints | done | deflate encoder (fixed Huffman + LZ77) in `deflate.odin`, HTTP zlib negotiation, `row_bytes` hints |
-| F12 | Connection limits and backpressure | done | connection cap with 503, 4 MiB request limit, per-client byte accounting |
-| F13 | Metrics endpoint | done | `GET /metrics` with requests, errors, commit sequence and subscriptions |
-| F14 | PostgreSQL wire protocol | done | startup with the standard ParameterStatus set, SSLRequest, simple query with several statements, extended query framed per message (several to a packet), `Describe` that announces the types `Execute` encodes, skip-to-`Sync` after an error, text and binary parameters/results, transactions across messages with the aborted state, PostgreSQL command tags and SQLSTATE codes, `DEALLOCATE`/`DISCARD`; the dialect spellings are in `docs/sql.md` (PostgreSQL spellings) |
+| ID | Feature | Status | Gap | Test |
+|---|---|---|---|---|
+| F1 | HTTP server | done | `miraidb-server` accept loop, HTTP routing, `/health`; verified end to end | test_http_layer |
+| F2 | WebSocket protocol with JSON and binary formats | done | RFC 6455 handshake and binary frames carrying wire messages | test_websocket |
+| F3 | Reducer call over the wire with a request id | done | `WIRE_CALL_REDUCER` + request id over HTTP/WebSocket | test_wire_messages |
+| F4 | One-off query | done | `WIRE_QUERY` over the same endpoints | test_wire_messages |
+| F5 | Subscribe, subscribe-single, subscribe-multi, unsubscribe | done | `WIRE_SUBSCRIBE`/`WIRE_UNSUBSCRIBE`, sets and owner cleanup | test_subscriptions, test_subscription_set |
+| F6 | Procedure call | done | `WIRE_CALL_PROCEDURE` through the same server endpoints | test_procedure_over_the_wire |
+| F7 | Identity, tokens and JWT validation | done | CSPRNG tokens hashed with HMAC-SHA256; HS256 JWTs with `sub`/`exp` validation and tamper rejection | test_jwt_tokens, test_tokens |
+| F8 | Energy metering and quotas | done | per-statement work (rows + payload) with a per-call budget, a cumulative total and the row quota | test_work_budget, test_statement_work_budget, test_row_quota |
+| F9 | Client lifecycle and cancellation | done | registry, connection limit, cancellation, owned subscriptions, byte accounting, and a bounded outbox that drops a message and closes the connection on overflow | test_cancellation, test_transport_caps |
+| F10 | Confirmed reads | done | every result carries `commit_seq`, so the client confirms its read | test_wire_messages |
+| F11 | Compression and row-size hints | done | deflate encoder (fixed Huffman + LZ77) in `deflate.odin`, HTTP zlib negotiation, `row_bytes` hints | test_http_compression, test_deflate_roundtrip, test_row_size_hint |
+| F12 | Connection limits and backpressure | done | connection cap with 503, 4 MiB request limit, per-client byte accounting | test_transport_caps, test_wire_request_limit |
+| F13 | Metrics endpoint | done | `GET /metrics` with requests, errors, commit sequence and subscriptions | test_meta_and_metrics |
+| F14 | PostgreSQL wire protocol | done | startup with the standard ParameterStatus set, SSLRequest, simple query with several statements, extended query framed per message (several to a packet), `Describe` that announces the types `Execute` encodes, skip-to-`Sync` after an error, text and binary parameters/results, transactions across messages with the aborted state, PostgreSQL command tags and SQLSTATE codes, `DEALLOCATE`/`DISCARD`; the dialect spellings are in `docs/sql.md` (PostgreSQL spellings) | test_postgres_wire, test_postgres_extended_query |
 
 ## G. Modules and ABI
 
-| ID | Feature | Status | Gap |
-|---|---|---|---|
-| G1 | Sandboxed module host with ABI v1/v2 | done | ABI v1 and v2; a v2 module runs with a bounded arena and a row quota (cooperative, in-process boundary; no dynamic loading or OS isolation) |
-| G2 | Table and index scans with iterators | done | `module_scan_begin`/`_next`/`_end` over a read transaction |
-| G3 | Insert, update, delete, delete-by-range from a module | done | `module_insert`/`_update`/`_delete`/`_delete_range` each commit one transaction |
-| G4 | Immediate scheduled call | done | `host_schedule_now` queues at the current host time |
-| G5 | Console log and timers | done | `procedure_log` messages returned with the call and `procedure_now_us` |
-| G6 | Identity and JWT inside a module | done | `module_identity` and `module_authenticate` |
-| G7 | HTTP requests from procedures | done | `http_get`/`http_get_via` with a pluggable transport and a TCP transport |
-| G8 | Procedure transaction control and sleep | done | `procedure_commit` and `procedure_sleep` |
-| G9 | Bytes sources and sinks | done | `bytes_source_*` / `bytes_sink_*` cursors for framed module I/O |
-| G10 | Native Odin module registration | done | `host_register_module` with ABI validation and name dispatch |
+| ID | Feature | Status | Gap | Test |
+|---|---|---|---|---|
+| G1 | Sandboxed module host with ABI v1/v2 | done | ABI v1 and v2; a v2 module runs with a bounded arena and a row quota (cooperative, in-process boundary; no dynamic loading or OS isolation) | test_module_abi, test_module_abi_v2 |
+| G2 | Table and index scans with iterators | done | `module_scan_begin`/`_next`/`_end` over a read transaction | test_module_data_access |
+| G3 | Insert, update, delete, delete-by-range from a module | done | `module_insert`/`_update`/`_delete`/`_delete_range` each commit one transaction | test_module_data_access |
+| G4 | Immediate scheduled call | done | `host_schedule_now` queues at the current host time | test_schedule_now |
+| G5 | Console log and timers | done | `procedure_log` messages returned with the call and `procedure_now_us` | test_procedure_logs_and_timers |
+| G6 | Identity and JWT inside a module | done | `module_identity` and `module_authenticate` | test_module_identity |
+| G7 | HTTP requests from procedures | done | `http_get`/`http_get_via` with a pluggable transport and a TCP transport | test_http_client |
+| G8 | Procedure transaction control and sleep | done | `procedure_commit` and `procedure_sleep` | test_procedures |
+| G9 | Bytes sources and sinks | done | `bytes_source_*` / `bytes_sink_*` cursors for framed module I/O | test_byte_cursors |
+| G10 | Native Odin module registration | done | `host_register_module` with ABI validation and name dispatch | test_module_abi |
 
 ## H. Tooling, SDK and operations
 
-| ID | Feature | Status | Gap |
-|---|---|---|---|
-| H1 | Full CLI | done | `call` and `subscribe` join the tooling commands; subscribe prints a snapshot and then the inserts/deletes it polls from the server |
-| H2 | Code generation | done | `miraidb codegen` and `codegen_odin`: one Odin struct per table, typed from `DESCRIBE` |
-| H3 | Client SDKs | done | Odin SDK in `src/client`: query, call, auth and subscribe over an injected transport |
-| H4 | SQL conformance runner | done | `scripts/conformance.py` runs a 20-case corpus through the CLI |
-| H5 | Deterministic simulation testing | done | `Simulation` drives an explicit clock and `host_tick`; a script produces identical state on every run |
-| H6 | Typed metrics | done | `/metrics` emits `# TYPE` counters and gauges |
-| H7 | Per-database memory reporting | done | `store_memory` and the `inspect` footer sum every table |
-| H8 | Module hot swap | done | `host_swap_module` runs the old shutdown, the new init and then swaps handlers |
-| H9 | Test fixtures and harness | done | `fresh_host`/`destroy_host` and `run_params` fixtures |
-| H10 | Benchmarks | done | `miraidb bench <db> [rows]` times inserts in one transaction |
+| ID | Feature | Status | Gap | Test |
+|---|---|---|---|---|
+| H1 | Full CLI | done | `call` and `subscribe` join the tooling commands; subscribe prints a snapshot and then the inserts/deletes it polls from the server | scripts/shell_smoke.py, scripts/broker_smoke.py |
+| H2 | Code generation | done | `miraidb codegen` and `codegen_odin`: one Odin struct per table, typed from `DESCRIBE` | test_codegen |
+| H3 | Client SDKs | done | Odin SDK in `src/client`: query, call, auth and subscribe over an injected transport | test_client_sdk |
+| H4 | SQL conformance runner | done | `scripts/conformance.py` runs a 20-case corpus through the CLI | scripts/conformance.py |
+| H5 | Deterministic simulation testing | done | `Simulation` drives an explicit clock and `host_tick`; a script produces identical state on every run | test_deterministic_simulation |
+| H6 | Typed metrics | done | `/metrics` emits `# TYPE` counters and gauges | test_meta_and_metrics |
+| H7 | Per-database memory reporting | done | `store_memory` and the `inspect` footer sum every table | test_store_memory |
+| H8 | Module hot swap | done | `host_swap_module` runs the old shutdown, the new init and then swaps handlers | test_module_hot_swap |
+| H9 | Test fixtures and harness | done | `fresh_host`/`destroy_host` and `run_params` fixtures | test_fixture_helpers |
+| H10 | Benchmarks | done | `miraidb bench <db> [rows]` times inserts in one transaction | scripts/bench.py |
 
 ## Order the work followed
 
