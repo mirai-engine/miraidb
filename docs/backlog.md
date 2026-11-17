@@ -57,6 +57,7 @@ Rules for this file:
 | D34 | the threaded suite is green on Linux and Windows; the sanitizer covers the Windows CLI, not the suite | run the suite sanitized on every platform, in CI | S |
 | D36 | a query never reads a partial or expression index | match a query's predicate to the index | M |
 | D37 | a column name is resolved row by row, so a misspelled one on an empty table answers 0 rows | resolve every name against the catalog before running | L |
+| D38 | `WITH` before `INSERT`/`UPDATE`/`DELETE`, and `INSERT ... WITH ... SELECT`, do not parse | common table expressions on a write, as SQLite reads them | M |
 | D35 | diagnostics: test-side leak lines; a file open per commit for the log index | quiet the lines if they hide a report; keep the index file open | S |
 
 ---
@@ -472,6 +473,17 @@ sanitizer as a gate (it is the CLI only today).
 
 **Done when.** A CI job runs the threaded suite on Linux and macOS with
 `-sanitize:address`, and the Windows suite runs under the sanitizer as a gate.
+
+## D38 — Common table expressions on a write
+
+**Now.** `WITH c AS (...) INSERT INTO t SELECT ... FROM c` fails with
+"expected select, found INSERT", and `INSERT INTO t WITH c AS (...) SELECT ...`
+with "expected values, found WITH". SQLite accepts both, and the same `WITH` in
+front of `UPDATE` and `DELETE`; a loader that generates rows with a recursive
+CTE writes exactly this. Found writing the progress-handler comparison.
+
+**Done when.** The four forms parse and run, the CTE is visible to the write's
+`SELECT`, `WHERE` and `RETURNING`, and the differential corpus gains them.
 
 ## D37 — Names are resolved before a statement runs
 
