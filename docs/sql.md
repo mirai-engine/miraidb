@@ -54,9 +54,15 @@ rows matched at all. `NATURAL` joins are refused by the parser, and so is
 [LIMIT expr] [OFFSET expr]
 ```
 
-Placeholders are `?`, numbered left to right. Pass the values to
+Placeholders are SQLite's: `?` takes one past the largest number used so far
+(so a run of them is numbered left to right), `?NNN` binds the n-th value and
+may repeat (1 to 32766), and `:name`, `@name` and `$name` take the next number
+the first time a name appears and the same number every time after. `$1`, `$2`,
+… are PostgreSQL's numbered form. Pass the values by position to
 `sql_execute_params` / `sql_execute_in_tx_params`; the plain entry points reject
-a statement that has placeholders.
+a statement that has placeholders. The names are the query's `param_names`, and
+`sqlite3_bind_parameter_name` / `_index` read them
+(`test_numbered_and_named_parameters`).
 
 Views store their SELECT body and are materialized per reference: `SELECT` over a
 view runs the body in the same transaction and then treats the result as a

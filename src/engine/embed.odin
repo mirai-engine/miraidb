@@ -399,6 +399,32 @@ Embed_Parameter_Count :: proc(stmt: ^Embed_Statement) -> int {
 	return stmt.prepared.param_count
 }
 
+// embed_parameter_name is the name parameter `index` (0-based) was written with:
+// "?3", ":id", "@id", "$id", or "" for a bare `?` and for an index out of range.
+embed_parameter_name :: proc(stmt: ^Embed_Statement, index: int) -> string {
+	if stmt == nil || stmt.prepared == nil || stmt.prepared.is_pragma do return ""
+	names := stmt.prepared.query.param_names
+	if index < 0 || index >= len(names) do return ""
+	return names[index]
+}
+
+// embed_parameter_index finds the parameter written as `name` (with its prefix)
+// and answers its 0-based index, or -1.
+embed_parameter_index :: proc(stmt: ^Embed_Statement, name: string) -> int {
+	if stmt == nil || stmt.prepared == nil || stmt.prepared.is_pragma || len(name) == 0 do return -1
+	for candidate, index in stmt.prepared.query.param_names {
+		if candidate == name do return index
+	}
+	return -1
+}
+
+// embed_parameter_value is what parameter `index` (0-based) is bound to now;
+// NULL when nothing is.
+embed_parameter_value :: proc(stmt: ^Embed_Statement, index: int) -> Value {
+	if stmt == nil || index < 0 || index >= len(stmt.params) do return value_null()
+	return stmt.params[index]
+}
+
 embed_bind :: proc(stmt: ^Embed_Statement, index: int, value: Value) -> Error {
 	if stmt == nil do return errf(.Invalid_Argument, "no statement")
 	if index < 0 do return errf(.Invalid_Argument, "parameter index cannot be negative")

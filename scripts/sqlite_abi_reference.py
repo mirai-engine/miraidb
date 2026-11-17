@@ -51,7 +51,19 @@ SIGNATURES = {
     "sqlite3_realloc": ([c_void_p, c_int], c_void_p),
     "sqlite3_msize": ([c_void_p], ctypes.c_uint64),
     "sqlite3_free": ([c_void_p], None),
+    "sqlite3_bind_parameter_count": ([c_void_p], c_int),
+    "sqlite3_bind_parameter_name": ([c_void_p, c_int], c_char_p),
+    "sqlite3_bind_parameter_index": ([c_void_p, c_char_p], c_int),
+    "sqlite3_expanded_sql": ([c_void_p], c_void_p),
+    "sqlite3_bind_int64": ([c_void_p, c_int, c_longlong], c_int),
+    "sqlite3_bind_double": ([c_void_p, c_int, ctypes.c_double], c_int),
+    "sqlite3_bind_text": ([c_void_p, c_int, c_char_p, c_int, c_void_p], c_int),
+    "sqlite3_bind_blob": ([c_void_p, c_int, c_char_p, c_int, c_void_p], c_int),
+    "sqlite3_column_count": ([c_void_p], c_int),
 }
+
+# SQLITE_TRANSIENT: SQLite copies the value before the call returns.
+TRANSIENT = c_void_p(-1)
 
 STMTSTATUS_RUN = 6
 
@@ -194,6 +206,33 @@ def observe(lib) -> dict[str, object]:
     seen["realloc'd block grows"] = lib.sqlite3_msize(block) >= 100
     lib.sqlite3_free(block)
     lib.sqlite3_free(None)
+
+    # Parameters by number and by name: the slots they take, their names, and
+    # the text with their values in place.
+    text = b"SELECT ?1, :a, @b, $c, ?, :a, ?7, '?' /* :a */"
+    params = prepare(text)
+    count = lib.sqlite3_bind_parameter_count(params)
+    seen["parameter count"] = count
+    seen["parameter names"] = [lib.sqlite3_bind_parameter_name(params, i) for i in range(0, count + 2)]
+    seen["parameter indexes"] = [
+        lib.sqlite3_bind_parameter_index(params, name) for name in (b":a", b"@b", b"$c", b"?7", b"?1", b"a", b":nope")
+    ]
+    seen["expanded before binding"] = ctypes.string_at(lib.sqlite3_expanded_sql(params))
+    lib.sqlite3_bind_int64(params, 1, 42)
+    lib.sqlite3_bind_text(params, 2, b"it's", -1, TRANSIENT)
+    lib.sqlite3_bind_blob(params, 3, bytes([1, 255]), 2, TRANSIENT)
+    lib.sqlite3_bind_double(params, 4, 2.5)
+    lib.sqlite3_bind_int64(params, 7, -1)
+    expanded = lib.sqlite3_expanded_sql(params)
+    seen["expanded"] = ctypes.string_at(expanded)
+    lib.sqlite3_free(expanded)
+    assert lib.sqlite3_step(params) == 100, lib.sqlite3_errmsg(db)
+    seen["values read back"] = [
+        lib.sqlite3_column_text(params, i) for i in range(lib.sqlite3_column_count(params))
+    ]
+    lib.sqlite3_finalize(params)
+    bad = c_void_p()
+    seen["?0 is refused"] = lib.sqlite3_prepare_v2(db, b"SELECT ?0", -1, ctypes.byref(bad), None)
 
     seen["errstr"] = [lib.sqlite3_errstr(code) for code in (*range(0, 30), 100, 101, 516, 19 | 8 << 8, 9999)]
     assert lib.sqlite3_close(db) == 0

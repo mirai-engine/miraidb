@@ -190,6 +190,19 @@ lexer_next :: proc(l: ^Lexer) -> Token {
 
 	lexer_advance(l)
 	switch c {
+	case '?':
+		// `?NNN` is SQLite's numbered parameter: the n-th value, by number.
+		if l.pos < len(l.src) && is_digit(lexer_peek(l)) {
+			for l.pos < len(l.src) && is_digit(lexer_peek(l)) do lexer_advance(l)
+			return Token{kind = .Punct, text = l.src[start:l.pos], line = line, column = column}
+		}
+	case '$':
+		// `$name` is one of SQLite's named parameters (`$1` is PostgreSQL's
+		// numbered one, read above).
+		if l.pos < len(l.src) && is_ident_start(lexer_peek(l)) {
+			for l.pos < len(l.src) && is_ident_char(lexer_peek(l)) do lexer_advance(l)
+			return Token{kind = .Punct, text = l.src[start:l.pos], line = line, column = column}
+		}
 	case '=':
 		if lexer_peek(l) == '=' {
 			lexer_advance(l)
@@ -241,6 +254,11 @@ lexer_next :: proc(l: ^Lexer) -> Token {
 			lexer_advance(l)
 			return Token{kind = .Punct, text = "@>", line = line, column = column}
 		}
+		// `@name` is one of SQLite's named parameters.
+		if l.pos < len(l.src) && is_ident_start(lexer_peek(l)) {
+			for l.pos < len(l.src) && is_ident_char(lexer_peek(l)) do lexer_advance(l)
+			return Token{kind = .Punct, text = l.src[start:l.pos], line = line, column = column}
+		}
 	case '&':
 		// `&&` is PostgreSQL's "overlaps".
 		if lexer_peek(l) == '&' {
@@ -262,6 +280,11 @@ lexer_next :: proc(l: ^Lexer) -> Token {
 		if lexer_peek(l) == ':' {
 			lexer_advance(l)
 			return Token{kind = .Punct, text = "::", line = line, column = column}
+		}
+		// `:name` is one of SQLite's named parameters.
+		if l.pos < len(l.src) && is_ident_start(lexer_peek(l)) {
+			for l.pos < len(l.src) && is_ident_char(lexer_peek(l)) do lexer_advance(l)
+			return Token{kind = .Punct, text = l.src[start:l.pos], line = line, column = column}
 		}
 	}
 

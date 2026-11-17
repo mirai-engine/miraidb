@@ -815,6 +815,9 @@ Query :: struct {
 	// the order they appear. It is what the embedding layers check an index
 	// against, so a bind of 99 is a range error instead of a growth (D29).
 	param_count: int,
+	// param_names has one entry per parameter: its name as written ("?3", ":id",
+	// "@id", "$id") or "" for a bare `?`. It lives in the query's arena.
+	param_names: []string,
 }
 
 query_destroy :: proc(q: ^Query) {

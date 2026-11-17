@@ -2,9 +2,9 @@
 ** sqlite3_miraidb.h -- the subset of SQLite's C API that sqlite3_miraidb.dll
 ** implements, declared so a C program can compile against it.
 **
-** This is not sqlite3.h. It declares the 68 functions the facade exports and the
+** This is not sqlite3.h. It declares the 72 functions the facade exports and the
 ** result codes they answer; a program that uses anything else will not link, and
-** that is the honest state of the facade (68 of SQLite's 315 symbols). Look at
+** that is the honest state of the facade (72 of SQLite's 315 symbols). Look at
 ** docs/sqlite.md for what each one does here and where it differs.
 **
 ** Build the library with:
@@ -153,6 +153,13 @@ int          sqlite3_bind_text(sqlite3_stmt *stmt, int index, const char *value,
 int          sqlite3_bind_blob(sqlite3_stmt *stmt, int index, const void *data,
                                int length, void *destructor);
 int          sqlite3_bind_zeroblob(sqlite3_stmt *stmt, int index, int n);
+/* Parameters are ?, ?NNN, :name, @name and $name, numbered as SQLite numbers
+** them; a name includes its prefix, and a bare ? has no name (NULL). */
+int          sqlite3_bind_parameter_count(sqlite3_stmt *stmt);
+const char  *sqlite3_bind_parameter_name(sqlite3_stmt *stmt, int index);
+int          sqlite3_bind_parameter_index(sqlite3_stmt *stmt, const char *name);
+/* The text with the bound values in place; free it with sqlite3_free. */
+char        *sqlite3_expanded_sql(sqlite3_stmt *stmt);
 int          sqlite3_bind_zeroblob64(sqlite3_stmt *stmt, int index,
                                      sqlite3_uint64 n);
 

@@ -85,6 +85,9 @@ Statement :: struct {
 	// sql_text is the statement's own text as a C string, for sqlite3_sql: it
 	// lives until finalize, unlike the column answers in text_cache.
 	sql_text: cstring,
+	// param_names holds the parameter names as C strings, made on the first
+	// sqlite3_bind_parameter_name and kept until finalize.
+	param_names: []cstring,
 }
 
 @(private)
@@ -667,6 +670,8 @@ sqlite3_finalize :: proc "c" (handle: rawptr) -> c.int {
 	stmt_clear_text_cache(stmt)
 	delete(stmt.text_cache)
 	delete(stmt.sql_text)
+	for name in stmt.param_names do delete(name)
+	delete(stmt.param_names)
 	engine.embed_finalize(stmt.stmt)
 	free(stmt)
 	return SQLITE_OK
@@ -1257,6 +1262,168 @@ sqlite3_libversion_number :: proc "c" () -> c.int {
 sqlite3_sourceid :: proc "c" () -> cstring {
 	context = runtime.default_context()
 	return "miraidb sqlite3 facade"
+}
+
+// --- Parameters by number and by name --------------------------------------
+
+@(export)
+sqlite3_bind_parameter_count :: proc "c" (handle: rawptr) -> c.int {
+	context = runtime.default_context()
+	stmt := stmt_of(handle)
+	if stmt == nil do return 0
+	return c.int(engine.Embed_Parameter_Count(stmt.stmt))
+}
+
+// sqlite3_bind_parameter_name is the parameter's name as written, prefix
+// included (":id", "@id", "$id", "?3"), and NULL for a bare `?` or an index out
+// of range. The string lives until the statement is finalized.
+@(export)
+sqlite3_bind_parameter_name :: proc "c" (handle: rawptr, index: c.int) -> cstring {
+	context = runtime.default_context()
+	stmt := stmt_of(handle)
+	if stmt == nil do return nil
+	count := engine.Embed_Parameter_Count(stmt.stmt)
+	if int(index) < 1 || int(index) > count do return nil
+	if stmt.param_names == nil {
+		stmt.param_names = make([]cstring, count)
+		for i in 0 ..< count {
+			name := engine.embed_parameter_name(stmt.stmt, i)
+			if len(name) > 0 do stmt.param_names[i] = strings.clone_to_cstring(name)
+		}
+	}
+	return stmt.param_names[int(index) - 1]
+}
+
+// sqlite3_bind_parameter_index finds a parameter by its name, prefix included,
+// and answers its 1-based index, or 0.
+@(export)
+sqlite3_bind_parameter_index :: proc "c" (handle: rawptr, name: cstring) -> c.int {
+	context = runtime.default_context()
+	stmt := stmt_of(handle)
+	if stmt == nil || name == nil do return 0
+	return c.int(engine.embed_parameter_index(stmt.stmt, string(name)) + 1)
+}
+
+// sql_literal writes a bound value the way SQLite's expanded SQL spells it:
+// NULL, a number in its text form, a quoted string with its quotes doubled, a
+// blob as x'..' in lower-case hex.
+@(private)
+sql_literal :: proc(b: ^strings.Builder, value: engine.Value) {
+	#partial switch value.kind {
+	case .Null, .Default:
+		strings.write_string(b, "NULL")
+	case .String:
+		strings.write_byte(b, '\'')
+		for i in 0 ..< len(value.s) {
+			if value.s[i] == '\'' do strings.write_byte(b, '\'')
+			strings.write_byte(b, value.s[i])
+		}
+		strings.write_byte(b, '\'')
+	case .Bytes:
+		strings.write_string(b, "x'")
+		hex := "0123456789abcdef"
+		for byte_value in value.bytes {
+			strings.write_byte(b, hex[byte_value >> 4])
+			strings.write_byte(b, hex[byte_value & 0xf])
+		}
+		strings.write_byte(b, '\'')
+	case:
+		rendered := engine.sqlite_value_text(value, context.allocator)
+		defer delete(rendered)
+		strings.write_string(b, rendered)
+	}
+}
+
+@(private)
+expand_is_ident_start :: proc(ch: u8) -> bool {
+	return ch == '_' || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch >= 0x80
+}
+
+@(private)
+expand_is_ident_char :: proc(ch: u8) -> bool {
+	return expand_is_ident_start(ch) || (ch >= '0' && ch <= '9') || ch == '$'
+}
+
+// expand_sql is the statement's text with every parameter replaced by the value
+// bound to it now. Strings, quoted names, comments and identifiers are copied
+// as they are, so a `?` or a `:x` inside one is left alone.
+@(private)
+expand_sql :: proc(stmt: ^Statement) -> string {
+	text := string(stmt.sql_text)
+	b := strings.builder_make()
+	next := 0 // the index a bare `?` takes: one past the largest seen so far
+	i := 0
+	for i < len(text) {
+		ch := text[i]
+		start := i
+		switch {
+		case ch == '\'' || ch == '"' || ch == '`':
+			i += 1
+			for i < len(text) {
+				if text[i] == ch {
+					if i + 1 < len(text) && text[i + 1] == ch {
+						i += 2
+						continue
+					}
+					i += 1
+					break
+				}
+				i += 1
+			}
+			strings.write_string(&b, text[start:i])
+		case ch == '[':
+			for i < len(text) && text[i] != ']' do i += 1
+			if i < len(text) do i += 1
+			strings.write_string(&b, text[start:i])
+		case ch == '-' && i + 1 < len(text) && text[i + 1] == '-':
+			for i < len(text) && text[i] != '\n' do i += 1
+			strings.write_string(&b, text[start:i])
+		case ch == '/' && i + 1 < len(text) && text[i + 1] == '*':
+			i += 2
+			for i + 1 < len(text) && !(text[i] == '*' && text[i + 1] == '/') do i += 1
+			i = min(i + 2, len(text))
+			strings.write_string(&b, text[start:i])
+		case expand_is_ident_start(ch):
+			for i < len(text) && expand_is_ident_char(text[i]) do i += 1
+			strings.write_string(&b, text[start:i])
+		case ch == '?':
+			i += 1
+			for i < len(text) && text[i] >= '0' && text[i] <= '9' do i += 1
+			index := next
+			if i > start + 1 {
+				number, _ := strconv.parse_int(text[start + 1:i], 10)
+				index = number - 1
+			}
+			next = max(next, index + 1)
+			sql_literal(&b, engine.embed_parameter_value(stmt.stmt, index))
+		case (ch == ':' || ch == '@' || ch == '$') && i + 1 < len(text) && (expand_is_ident_start(text[i + 1]) || (ch == '$' && text[i + 1] >= '0' && text[i + 1] <= '9')) && !(ch == ':' && i > 0 && text[i - 1] == ':'):
+			i += 1
+			for i < len(text) && expand_is_ident_char(text[i]) do i += 1
+			index := engine.embed_parameter_index(stmt.stmt, text[start:i])
+			if index < 0 {
+				strings.write_string(&b, text[start:i])
+			} else {
+				next = max(next, index + 1)
+				sql_literal(&b, engine.embed_parameter_value(stmt.stmt, index))
+			}
+		case:
+			i += 1
+			strings.write_byte(&b, ch)
+		}
+	}
+	return strings.to_string(b)
+}
+
+// sqlite3_expanded_sql is the statement's text with its bound values in place
+// of its parameters, allocated with sqlite3_malloc for the caller to free.
+@(export)
+sqlite3_expanded_sql :: proc "c" (handle: rawptr) -> cstring {
+	context = runtime.default_context()
+	stmt := stmt_of(handle)
+	if stmt == nil do return nil
+	expanded := expand_sql(stmt)
+	defer delete(expanded)
+	return sqlite_strdup(expanded)
 }
 
 // --- Incremental BLOB I/O --------------------------------------------------

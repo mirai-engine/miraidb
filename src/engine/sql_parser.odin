@@ -13,6 +13,9 @@ Parser :: struct {
 	query:       ^Query,
 	err:         Error,
 	param_count: int,
+	// param_names names each parameter slot: "?3", ":id", "@id", "$id", or ""
+	// for a bare `?`. It lives in the query's arena.
+	param_names: [dynamic]string,
 	// expression_depth is how many expressions are open right now. It is one
 	// counter for the whole parser, not one per rule, because every nesting that
 	// costs stack goes through parse_expression.
@@ -31,9 +34,10 @@ sql_parse :: proc(source: string) -> (Query, Error) {
 	q.alloc = virtual.arena_allocator(&q.arena)
 	q.source = strings.clone(source, q.alloc)
 	p := Parser {
-		lexer   = lexer_init(source, q.alloc),
-		alloc   = q.alloc,
-		query   = &q,
+		lexer       = lexer_init(source, q.alloc),
+		alloc       = q.alloc,
+		query       = &q,
+		param_names = make([dynamic]string, q.alloc),
 	}
 	p.current = lexer_next(&p.lexer)
 	statement := parse_statement(&p)
@@ -52,10 +56,25 @@ sql_parse :: proc(source: string) -> (Query, Error) {
 	}
 	q.statement = statement
 	q.param_count = p.param_count
+	for len(p.param_names) < p.param_count do append(&p.param_names, "")
+	q.param_names = p.param_names[:]
 	return q, ERROR_NONE
 }
 
 // --- Token helpers ---------------------------------------------------------
+
+// SQL_MAX_PARAMETER is the highest `?NNN` a statement may name: SQLite's default
+// SQLITE_MAX_VARIABLE_NUMBER.
+SQL_MAX_PARAMETER :: 32766
+
+// p_param_slot records that the statement binds parameter `index` (0-based),
+// under `name` when it has one, and grows the count to cover it.
+@(private)
+p_param_slot :: proc(p: ^Parser, index: int, name: string) {
+	for len(p.param_names) <= index do append(&p.param_names, "")
+	if len(name) > 0 do p.param_names[index] = strings.clone(name, p.alloc)
+	if index + 1 > p.param_count do p.param_count = index + 1
+}
 
 @(private)
 p_fail :: proc(p: ^Parser, kind: Error_Kind, format: string, args: ..any) -> Error {
@@ -2969,7 +2988,7 @@ parse_primary :: proc(p: ^Parser) -> ^Expr {
 				p_advance(p)
 				e := new(Expr, p.alloc)
 				e^ = Param_Expr{index = number - 1}
-				if number > p.param_count do p.param_count = number
+				p_param_slot(p, number - 1, token.text)
 				return e
 			}
 		}
@@ -3175,7 +3194,37 @@ parse_primary :: proc(p: ^Parser) -> ^Expr {
 			p_advance(p)
 			e := new(Expr, p.alloc)
 			e^ = Param_Expr{index = p.param_count}
-			p.param_count += 1
+			p_param_slot(p, p.param_count, "")
+			return e
+		}
+		// `?NNN` binds the n-th value; it may repeat, and a bare `?` after it
+		// takes the next number, as in SQLite.
+		if len(token.text) > 1 && token.text[0] == '?' {
+			number, number_ok := strconv.parse_int(token.text[1:], 10)
+			if !number_ok || number < 1 || number > SQL_MAX_PARAMETER {
+				p_fail(p, .Sql_Syntax, "variable number must be between ?1 and ?%d", SQL_MAX_PARAMETER)
+				return nil
+			}
+			p_advance(p)
+			e := new(Expr, p.alloc)
+			e^ = Param_Expr{index = number - 1}
+			p_param_slot(p, number - 1, token.text)
+			return e
+		}
+		// `:name`, `@name` and `$name` take the next number the first time a name
+		// appears and the same number every time after.
+		if len(token.text) > 1 && (token.text[0] == ':' || token.text[0] == '@' || token.text[0] == '$') {
+			p_advance(p)
+			index := p.param_count
+			for name, slot in p.param_names {
+				if name == token.text {
+					index = slot
+					break
+				}
+			}
+			e := new(Expr, p.alloc)
+			e^ = Param_Expr{index = index}
+			p_param_slot(p, index, token.text)
 			return e
 		}
 		if token.text == "*" {
