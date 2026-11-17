@@ -15,11 +15,13 @@ c_void_p, c_int, c_char_p, c_longlong = ctypes.c_void_p, ctypes.c_int, ctypes.c_
 COMMIT = ctypes.CFUNCTYPE(c_int, c_void_p)
 ROLLBACK = ctypes.CFUNCTYPE(None, c_void_p)
 UPDATE = ctypes.CFUNCTYPE(None, c_void_p, c_int, c_char_p, c_char_p, c_longlong)
+PROGRESS = ctypes.CFUNCTYPE(c_int, c_void_p)
 
 SIGNATURES = {
     "sqlite3_commit_hook": ([c_void_p, c_void_p, c_void_p], c_void_p),
     "sqlite3_rollback_hook": ([c_void_p, c_void_p, c_void_p], c_void_p),
     "sqlite3_update_hook": ([c_void_p, c_void_p, c_void_p], c_void_p),
+    "sqlite3_progress_handler": ([c_void_p, c_int, c_void_p, c_void_p], None),
 }
 
 
@@ -94,3 +96,33 @@ def observe(lib, db, seen: dict) -> None:
         lib.sqlite3_update_hook(db, None, None),
     )
     run("no hook left", b"BEGIN; INSERT INTO h (v) VALUES (1); ROLLBACK;")
+
+    # The progress handler: called while a statement runs, a zero answer lets it
+    # finish and a non-zero one interrupts it. How often it is called is not
+    # compared: SQLite counts bytecode instructions, this engine rows.
+    calls = [0]
+    stop = [0]
+
+    def on_progress(arg):
+        calls[0] += 1
+        return stop[0]
+
+    progress = PROGRESS(on_progress)
+    lib._progress_callback = progress
+    lib.sqlite3_exec(db, b"CREATE TABLE p (x INTEGER)", None, None, None)
+    values = b", ".join(b"(%d)" % i for i in range(1, 201))
+    assert lib.sqlite3_exec(db, b"INSERT INTO p (x) VALUES " + values, None, None, None) == 0
+    lib.sqlite3_progress_handler(db, 1, ctypes.cast(progress, c_void_p), None)
+    code = lib.sqlite3_exec(db, b"SELECT count(*) FROM p WHERE x % 3 = 0", None, None, None)
+    seen["progress: a handler that answers 0"] = (code, calls[0] > 0)
+    stop[0] = 1
+    calls[0] = 0
+    code = lib.sqlite3_exec(db, b"SELECT count(*) FROM p WHERE x % 3 = 0", None, None, None)
+    seen["progress: a handler that answers 1"] = (code, lib.sqlite3_errmsg(db), calls[0] > 0)
+    stop[0] = 0
+    code = lib.sqlite3_exec(db, b"SELECT count(*) FROM p", None, None, None)
+    seen["progress: the next statement runs"] = code
+    lib.sqlite3_progress_handler(db, 0, None, None)
+    calls[0] = 0
+    lib.sqlite3_exec(db, b"SELECT count(*) FROM p WHERE x % 3 = 0", None, None, None)
+    seen["progress: removed"] = calls[0]

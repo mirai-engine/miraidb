@@ -95,3 +95,30 @@ sqlite3_update_hook :: proc "c" (handle: rawptr, callback: Update_Callback, arg:
 	hooks.row_change_ctx = rawptr(db)
 	return previous
 }
+
+Progress_Callback :: #type proc "c" (arg: rawptr) -> c.int
+
+@(private)
+hook_progress :: proc(ctx: rawptr) -> bool {
+	db := (^Database)(ctx)
+	return db.progress_hook != nil && db.progress_hook(db.progress_arg) != 0
+}
+
+// sqlite3_progress_handler calls `callback` every `every` steps of a running
+// statement, and a non-zero answer interrupts it (SQLITE_INTERRUPT). A step
+// here is a row the statement visits, where SQLite counts bytecode
+// instructions, so a statement that visits no row never calls it. A NULL
+// callback or a count under 1 removes it.
+@(export)
+sqlite3_progress_handler :: proc "c" (handle: rawptr, every: c.int, callback: Progress_Callback, arg: rawptr) {
+	context = runtime.default_context()
+	db := db_of(handle)
+	if db == nil do return
+	db.progress_hook = callback
+	db.progress_arg = arg
+	if callback == nil || every < 1 {
+		engine.store_set_progress(db.conn.store, 0, nil, nil)
+		return
+	}
+	engine.store_set_progress(db.conn.store, int(every), hook_progress, rawptr(db))
+}

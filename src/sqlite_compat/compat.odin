@@ -81,6 +81,8 @@ Database :: struct {
 	rollback_arg:    rawptr,
 	update_hook:     Update_Callback,
 	update_arg:      rawptr,
+	progress_hook:   Progress_Callback,
+	progress_arg:    rawptr,
 }
 
 Statement :: struct {
@@ -371,7 +373,8 @@ fail :: proc(db: ^Database, err: engine.Error) -> c.int {
 		dropped := err
 		engine.error_free(&dropped)
 	}
-	set_error(db, err.message)
+	// An interrupted statement says so in SQLite's word.
+	set_error(db, err.kind == .Cancelled ? "interrupted" : err.message)
 	code := sqlite_code(err)
 	extended := sqlite_extended_code(err)
 	// A function that failed with its own code (sqlite3_result_error_code) is

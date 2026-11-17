@@ -2,9 +2,9 @@
 ** sqlite3_miraidb.h -- the subset of SQLite's C API that sqlite3_miraidb.dll
 ** implements, declared so a C program can compile against it.
 **
-** This is not sqlite3.h. It declares the 115 functions the facade exports and the
+** This is not sqlite3.h. It declares the 116 functions the facade exports and the
 ** result codes they answer; a program that uses anything else will not link, and
-** that is the honest state of the facade (115 of SQLite's 315 symbols). Look at
+** that is the honest state of the facade (116 of SQLite's 315 symbols). Look at
 ** docs/sqlite.md for what each one does here and where it differs.
 **
 ** Build the library with:
@@ -268,6 +268,10 @@ void sqlite3_result_subtype(sqlite3_context *ctx, unsigned int subtype);
 
 void *sqlite3_commit_hook(sqlite3 *db, int (*callback)(void *), void *arg);
 void *sqlite3_rollback_hook(sqlite3 *db, void (*callback)(void *), void *arg);
+/* The progress handler runs every n rows a statement visits (SQLite counts
+** bytecode instructions); a non-zero answer interrupts the statement. */
+void  sqlite3_progress_handler(sqlite3 *db, int n, int (*callback)(void *),
+                               void *arg);
 void *sqlite3_update_hook(sqlite3 *db,
                           void (*callback)(void *, int, const char *,
                                            const char *, sqlite3_int64),

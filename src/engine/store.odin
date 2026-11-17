@@ -225,6 +225,11 @@ Store :: struct {
 	// hooks are the row-change, commit and rollback callbacks an embedding
 	// layer installs (hooks.odin).
 	hooks:         Store_Hooks,
+	// progress is the handler store_cancelled calls every progress_every rows.
+	progress:       proc(ctx: rawptr) -> bool,
+	progress_ctx:   rawptr,
+	progress_every: int,
+	progress_count: int,
 	on_commit_ctx: rawptr,
 	// replay_records and replay_buffer_bytes are what the last replay walked and
 	// the largest record it had to hold. They are diagnostics a test reads to
@@ -854,8 +859,34 @@ store_clear_cancel :: proc(store: ^Store) {
 	sync.atomic_store(&store.cancelled, false)
 }
 
+// store_cancelled is asked once per row by the loops that read and write rows,
+// which makes it the place a progress handler is called: every
+// `progress_every` questions, and a true answer cancels the statement, which is
+// what sqlite3_progress_handler promises.
 store_cancelled :: proc(store: ^Store) -> bool {
+	if store.progress != nil {
+		store.progress_count += 1
+		if store.progress_count >= store.progress_every {
+			store.progress_count = 0
+			if store.progress(store.progress_ctx) do store_cancel(store)
+		}
+	}
 	return sync.atomic_load(&store.cancelled)
+}
+
+// store_set_progress installs a handler called every `every` rows a statement
+// visits; a nil handler or a count under 1 removes it.
+store_set_progress :: proc(store: ^Store, every: int, handler: proc(ctx: rawptr) -> bool, ctx: rawptr) {
+	if handler == nil || every < 1 {
+		store.progress = nil
+		store.progress_ctx = nil
+		store.progress_every = 0
+		return
+	}
+	store.progress = handler
+	store.progress_ctx = ctx
+	store.progress_every = every
+	store.progress_count = 0
 }
 
 // --- Identity --------------------------------------------------------------
