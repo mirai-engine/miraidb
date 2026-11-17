@@ -215,6 +215,19 @@ def observe(lib) -> dict[str, object]:
     lib.sqlite3_free(message)
     seen["errmsg after success"] = (exec_(b"SELECT 1"), lib.sqlite3_errmsg(db))
 
+    # changes() counts the last INSERT, UPDATE or DELETE: a query or DDL after it
+    # leaves the count, and a write that fails sets it to 0.
+    exec_(b"CREATE TABLE counted (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)")
+    exec_(b"INSERT INTO counted (n) VALUES (1), (2), (3)")
+    counts = [lib.sqlite3_changes(db)]
+    exec_(b"SELECT * FROM counted")
+    counts.append(lib.sqlite3_changes(db))
+    exec_(b"CREATE TABLE counted_too (x INTEGER)")
+    counts.append(lib.sqlite3_changes(db))
+    exec_(b"INSERT INTO counted (n) VALUES (NULL)")
+    counts.append(lib.sqlite3_changes(db))
+    seen["changes after a query, DDL and a failed write"] = counts
+
     # A name that is not there fails the prepare, with SQLite's code and words,
     # whatever the table holds (D37).
     for sql in (b"SELECT * FROM missing", b"SELECT nope FROM people", b"SELECT p.nope FROM people AS p",

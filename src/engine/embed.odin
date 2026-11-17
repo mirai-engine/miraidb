@@ -209,6 +209,19 @@ embed_explain_mode :: proc(stmt: ^Embed_Statement) -> int {
 // embed_read_only reports a statement that cannot change the database file.
 // Transaction control counts as read-only, as SQLite documents for
 // sqlite3_stmt_readonly; a pragma is read-only unless it assigns a value.
+// prepared_counts_changes reports a statement whose rows sqlite3_changes
+// counts: INSERT, UPDATE, DELETE and MERGE. A query or DDL leaves the count
+// where the last write put it, as in SQLite.
+@(private)
+prepared_counts_changes :: proc(prepared: ^Stmt_Prepared) -> bool {
+	if prepared == nil || prepared.is_pragma do return false
+	#partial switch _ in prepared.query.statement {
+	case Insert_Stmt, Update_Stmt, Delete_Stmt, Merge_Stmt:
+		return true
+	}
+	return false
+}
+
 embed_read_only :: proc(stmt: ^Embed_Statement) -> bool {
 	if stmt == nil || stmt.prepared == nil do return true
 	if stmt.prepared.is_pragma do return !strings.contains(stmt.prepared.pragma_body, "=")
@@ -385,8 +398,12 @@ embed_exec_params :: proc(conn: ^Embed_Conn, sql: string, params: []Value) -> Er
 	started := now_microseconds()
 	result, exec_err := embed_run(conn, prepared, params)
 	store_record_query_latency(conn.store, now_microseconds() - started)
-	if exec_err.kind != .None do return embed_fail(conn, exec_err)
-	conn.changes = result.affected
+	counts := prepared_counts_changes(prepared)
+	if exec_err.kind != .None {
+		if counts do conn.changes = 0
+		return embed_fail(conn, exec_err)
+	}
+	if counts do conn.changes = result.affected
 	sql_result_destroy(&result)
 	embed_succeed(conn)
 	return ERROR_NONE
@@ -613,17 +630,17 @@ embed_step :: proc(stmt: ^Embed_Statement) -> (has_row: bool, err: Error) {
 	if stmt == nil do return false, errf(.Invalid_Argument, "no statement")
 	stmt.steps += 1
 	if stmt.done do return false, ERROR_NONE
+	counts := prepared_counts_changes(stmt.prepared)
 	if !stmt.started {
-		if start_err := embed_start(stmt); start_err.kind != .None do return false, start_err
+		if start_err := embed_start(stmt); start_err.kind != .None {
+			// A write that failed changed nothing, as SQLite counts it.
+			if counts do stmt.conn.changes = 0
+			return false, start_err
+		}
 	}
-	if stmt.result.kind != .Rows {
+	if stmt.result.kind != .Rows || stmt.row >= len(stmt.result.rows) {
 		stmt.done = true
-		stmt.conn.changes = stmt.result.affected
-		return false, ERROR_NONE
-	}
-	if stmt.row >= len(stmt.result.rows) {
-		stmt.done = true
-		stmt.conn.changes = stmt.result.affected
+		if counts do stmt.conn.changes = stmt.result.affected
 		return false, ERROR_NONE
 	}
 	stmt.row += 1
