@@ -668,6 +668,13 @@ Stmt_Prepared :: struct {
 	// ignored is set when the authorizer answered Ignore to the statement's own
 	// action: it prepares, and running it does nothing.
 	ignored: bool,
+	// views holds the queries of views a statement reads through a column the
+	// authorizer ignored: the reference became a derived table over the
+	// rewritten query, which lives as long as the statement.
+	views:   [dynamic]^Query,
+	// trigger_ignores are the Ignore answers given about the bodies of the
+	// triggers it fires, given again when they fire (authorize.odin).
+	trigger_ignores: [dynamic]Auth_Key,
 }
 
 sql_prepare :: proc(store: ^Store, sql: string) -> (^Stmt_Prepared, Error) {
@@ -694,6 +701,12 @@ stmt_prepared_destroy :: proc(prepared: ^Stmt_Prepared) {
 	} else {
 		query_destroy(&prepared.query)
 	}
+	for view in prepared.views {
+		query_destroy(view)
+		free(view)
+	}
+	delete(prepared.views)
+	delete(prepared.trigger_ignores)
 	free(prepared)
 }
 

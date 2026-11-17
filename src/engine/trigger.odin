@@ -183,7 +183,7 @@ trigger_fire :: proc(
 	}
 	result, query_err := sql_execute_in_tx_params(
 		tx,
-		"SELECT body, when_text FROM _triggers WHERE table_name = ? AND event = ? AND timing = ? ORDER BY name",
+		"SELECT body, when_text, name FROM _triggers WHERE table_name = ? AND event = ? AND timing = ? ORDER BY name",
 		[]Value {
 			value_string(table_name),
 			value_string(event_name),
@@ -195,6 +195,11 @@ trigger_fire :: proc(
 	if len(result.rows) == 0 do return ERROR_NONE
 	for row in result.rows {
 		if len(row) == 0 || row[0].kind != .String do continue
+		name := ""
+		if len(row) > 2 && row[2].kind == .String do name = row[2].s
+		// An authorizer may have answered Ignore about this body when the
+		// statement firing it was prepared (authorize.odin).
+		replayed := auth_replay_concerns(name)
 		saved_active := tx.trigger_active
 		saved_schema := tx.trigger_schema
 		saved_new := tx.trigger_new
@@ -219,6 +224,7 @@ trigger_fire :: proc(
 				trigger_restore(tx, saved_active, saved_schema, saved_new, saved_old, saved_new_present, saved_old_present, saved_depth)
 				return condition_err
 			}
+			if replayed do auth_replay_condition(tx, name, &condition, &condition_expr)
 			eval_ctx := Eval_Ctx{tx = tx}
 			value, value_err := eval_expr(&eval_ctx, condition_expr)
 			query_destroy(&condition)
@@ -236,7 +242,12 @@ trigger_fire :: proc(
 		for statement in statements {
 			text := strings.trim_space(statement)
 			if len(text) == 0 do continue
-			_, exec_err := sql_execute_in_tx(tx, text)
+			exec_err: Error
+			if replayed {
+				exec_err = auth_replay_statement(tx, name, text)
+			} else {
+				_, exec_err = sql_execute_in_tx(tx, text)
+			}
 			if exec_err.kind != .None {
 				body_err = exec_err
 				break

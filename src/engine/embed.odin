@@ -292,6 +292,9 @@ embed_run :: proc(conn: ^Embed_Conn, prepared: ^Stmt_Prepared, params: []Value) 
 			return ack(conn)
 		}
 	}
+	// The triggers it fires give again the Ignore answers kept about them.
+	saved := auth_replay_begin(prepared)
+	defer auth_replay_end(saved)
 	if conn.tx != nil do return prepared_execute_in_tx(conn.tx, prepared, params)
 	return prepared_execute(conn.store, prepared, params)
 }
