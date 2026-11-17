@@ -1,5 +1,6 @@
 package engine
 
+import "base:runtime"
 import "core:fmt"
 import "core:os"
 import "core:path/filepath"
@@ -58,11 +59,21 @@ Db_Lock :: struct {
 @(private)
 lock_registry_mutex: sync.Mutex
 
+// One entry per lock file this process holds: whether a writer has it, and how
+// many handles (the writer included) hold the reader byte.
 @(private)
-lock_registry_writers: map[string]bool
+Lock_Registry_Entry :: struct {
+	writer:  bool,
+	readers: int,
+}
 
+// The registry outlives every allocator a caller may install (a test runner
+// tracks one per test and tears it down), and the caller's key lives in a
+// temporary allocator. So the map and its keys live on the process heap: the
+// map is made with the heap allocator, and each key is a heap copy that the
+// registry frees when the last holder of that path lets go.
 @(private)
-lock_registry_readers: map[string]int
+lock_registry: map[string]Lock_Registry_Entry
 
 // The registry is only needed where the kernel would hand a second lock of the
 // same file to the same process. POSIX fcntl locks are per process; Windows
@@ -104,20 +115,18 @@ db_lock_acquire :: proc(directory: string, role: Db_Lock_Role = .Writer) -> (Db_
 	}
 
 	registry := lock_registry_needed()
+	// The mutex covers the whole acquire, from the check to the insert: a `defer`
+	// inside the `if` below would run at the end of that block and let two threads
+	// pass the check for the same path and write the map at once.
+	if registry do sync.lock(&lock_registry_mutex)
+	defer if registry do sync.unlock(&lock_registry_mutex)
 	if registry {
-		sync.lock(&lock_registry_mutex)
-		defer if registry {
-			sync.unlock(&lock_registry_mutex)
-		}
-		if lock_registry_writers == nil {
-			lock_registry_writers = make(map[string]bool)
-		}
-		if lock_registry_readers == nil {
-			lock_registry_readers = make(map[string]int)
+		if lock_registry == nil {
+			lock_registry = make(map[string]Lock_Registry_Entry, runtime.heap_allocator())
 		}
 		// A writer is exclusive against another writer. A reader joins whoever is
 		// there: that is the whole point of the role.
-		if role == .Writer && key in lock_registry_writers {
+		if role == .Writer && lock_registry[key].writer {
 			return {}, lock_refusal(directory, path)
 		}
 	}
@@ -139,12 +148,16 @@ db_lock_acquire :: proc(directory: string, role: Db_Lock_Role = .Writer) -> (Db_
 	}
 	if role == .Writer {
 		lock_write_owner(path)
-		if registry {
-			lock_registry_writers[key] = true
-		}
 	}
 	if registry {
-		lock_registry_readers[key] += 1
+		entry, found := lock_registry[key]
+		entry.readers += 1
+		if role == .Writer do entry.writer = true
+		if found {
+			lock_registry[key] = entry
+		} else {
+			lock_registry[strings.clone(key, runtime.heap_allocator())] = entry
+		}
 	}
 	return Db_Lock {
 		handle = handle,
@@ -191,15 +204,17 @@ db_lock_release :: proc(lock: ^Db_Lock) {
 	if lock.reader_held do lock_os_release(lock.handle, LOCK_READER_OFFSET)
 	if lock.role == .Writer do lock_os_release(lock.handle, LOCK_WRITER_OFFSET)
 	lock_os_close(lock.handle)
-	if lock_registry_readers != nil {
+	if lock_registry_needed() {
 		sync.lock(&lock_registry_mutex)
-		if lock_registry_readers[lock.key] > 1 {
-			lock_registry_readers[lock.key] -= 1
-		} else {
-			delete_key(&lock_registry_readers, lock.key)
-		}
-		if lock.role == .Writer && lock_registry_writers != nil {
-			delete_key(&lock_registry_writers, lock.key)
+		if entry, found := lock_registry[lock.key]; found {
+			entry.readers -= 1
+			if lock.role == .Writer do entry.writer = false
+			if entry.readers > 0 || entry.writer {
+				lock_registry[lock.key] = entry
+			} else {
+				stored, _ := delete_key(&lock_registry, lock.key)
+				delete(stored, runtime.heap_allocator())
+			}
 		}
 		sync.unlock(&lock_registry_mutex)
 	}

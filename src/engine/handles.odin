@@ -1,5 +1,6 @@
 package engine
 
+import "base:runtime"
 import "core:sync"
 
 // --- Live handles -----------------------------------------------------------
@@ -24,7 +25,9 @@ handle_register :: proc(handle: rawptr) {
 	if handle == nil do return
 	sync.lock(&handles_mutex)
 	defer sync.unlock(&handles_mutex)
-	if live_handles == nil do live_handles = make(map[rawptr]bool)
+	// The set outlives every allocator a caller may install (a test runner tracks
+	// one per test and tears it down), so it grows on the process heap.
+	if live_handles == nil do live_handles = make(map[rawptr]bool, runtime.heap_allocator())
 	live_handles[handle] = true
 }
 
