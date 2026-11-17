@@ -514,7 +514,7 @@ sqlite3_exec :: proc "c" (handle: rawptr, sql: cstring, callback: rawptr, arg: r
 		if !only_space_or_comments(statement) {
 			code: c.int
 			if callback != nil {
-				code = exec_with_callback(db, statement, transmute(Exec_Callback)callback, arg)
+				code = exec_with_callback(db, statement, cast(Exec_Callback)callback, arg)
 			} else if err := engine.embed_exec(db.conn, statement); err.kind != .None {
 				code = fail(db, err)
 			}
