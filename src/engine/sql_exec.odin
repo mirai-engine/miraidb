@@ -159,6 +159,12 @@ sql_run_statement :: proc(store: ^Store, statement: Statement, params: []Value) 
 			"%s only makes sense in a session that keeps a transaction open",
 			statement_name(stmt),
 		)
+	case Declare_Cursor_Stmt, Fetch_Stmt, Close_Cursor_Stmt:
+		return {}, errf(
+			.Sql_Not_A_Query,
+			"%s belongs to a session: open a transaction, or use the wire protocol",
+			statement_name(stmt),
+		)
 	}
 	return {}, errf(.Sql_Unsupported, "unsupported statement")
 }
@@ -236,6 +242,12 @@ sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value) 
 		return result, err
 	case Create_Table_Stmt, Alter_Table_Stmt, Create_Type_Stmt, Drop_Table_Stmt, Create_Index_Stmt, Drop_Index_Stmt, Create_View_Stmt, Drop_View_Stmt, Create_Policy_Stmt, Drop_Policy_Stmt, Truncate_Stmt, Create_Trigger_Stmt, Drop_Trigger_Stmt, Grant_Stmt, Create_Virtual_Table_Stmt, Load_Extension_Stmt:
 		return sql_exec_mutation(tx, stmt, params)
+	case Declare_Cursor_Stmt:
+		return sql_exec_declare_cursor(tx, stmt, params)
+	case Fetch_Stmt:
+		return sql_exec_fetch(tx, stmt)
+	case Close_Cursor_Stmt:
+		return sql_exec_close_cursor(tx, stmt)
 	case Set_Stmt:
 		return sql_exec_set(tx.store, stmt, params, tx.locked)
 	case Show_Stmt:
@@ -258,6 +270,147 @@ sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value) 
 		)
 	}
 	return {}, errf(.Sql_Unsupported, "unsupported statement")
+}
+
+// sql_exec_declare_cursor materializes the query and keeps it under its name for
+// the rest of the transaction. The rows are the statement's answer at the moment
+// it was declared, which is what a non-hold cursor is: the transaction sees one
+// state anyway.
+@(private)
+sql_exec_declare_cursor :: proc(tx: ^Tx, stmt: Declare_Cursor_Stmt, params: []Value) -> (Sql_Result, Error) {
+	if stmt.hold {
+		return {}, errf(
+			.Sql_Unsupported,
+			"DECLARE ... WITH HOLD is not supported: a cursor here lives as long as its transaction",
+		)
+	}
+	if _, exists := tx.cursors[stmt.name]; exists {
+		return {}, errf(
+			.Duplicate_Primary_Key,
+			"cursor %s already exists in this transaction",
+			stmt.name,
+		)
+	}
+	result, exec_err := sql_exec_select(tx, stmt.query, params)
+	if exec_err.kind != .None do return {}, exec_err
+	cursor := new(Cursor, tx.alloc)
+	cursor.columns = make([]string, len(result.columns), tx.alloc)
+	for column, i in result.columns do cursor.columns[i] = strings.clone(column, tx.alloc)
+	cursor.rows = make([][]Value, len(result.rows), tx.alloc)
+	for row, i in result.rows {
+		values := make([]Value, len(row), tx.alloc)
+		for value, v in row do values[v] = value_clone(value, tx.alloc)
+		cursor.rows[i] = values
+	}
+	tx.cursors[strings.clone(stmt.name, tx.alloc)] = cursor
+	sql_result_destroy(&result)
+	return Sql_Result{kind = .Ack, commit_seq = tx.store.commit_seq}, ERROR_NONE
+}
+
+// sql_exec_fetch hands out the rows a direction names and leaves the cursor after
+// them. FETCH answers the rows; MOVE moves and answers only the count.
+@(private)
+sql_exec_fetch :: proc(tx: ^Tx, stmt: Fetch_Stmt) -> (Sql_Result, Error) {
+	cursor, found := tx.cursors[stmt.name]
+	if !found do return {}, errf(.Table_Not_Found, "cursor %s does not exist", stmt.name)
+	total := len(cursor.rows)
+	// start and count are the slice the direction names; position is where the
+	// cursor sits afterwards, counted in rows handed out.
+	start := 0
+	count := 0
+	position := cursor.position
+	switch stmt.direction {
+	case .Next:
+		start = position
+		count = 1
+		position = min(position + 1, total)
+	case .Prior:
+		start = max(position - 1, 0) - 1
+		if position <= 0 {
+			start = 0
+			count = 0
+			position = 0
+		} else {
+			start = position - 1
+			count = 1
+			position = position - 1
+		}
+	case .First:
+		start = 0
+		count = total > 0 ? 1 : 0
+		position = count
+	case .Last:
+		start = max(total - 1, 0)
+		count = total > 0 ? 1 : 0
+		position = total
+	case .Absolute:
+		target := stmt.count > 0 ? stmt.count - 1 : total + stmt.count
+		if target < 0 || target >= total {
+			position = target < 0 ? 0 : total
+			count = 0
+		} else {
+			start = target
+			count = 1
+			position = target + 1
+		}
+	case .Relative:
+		target := stmt.count > 0 ? position + stmt.count - 1 : position - 1 + stmt.count
+		if target < 0 || target >= total {
+			position = target < 0 ? 0 : total
+			count = 0
+		} else {
+			start = target
+			count = 1
+			position = target + 1
+		}
+	case .Forward:
+		start = min(position, total)
+		wanted := stmt.count == 0 ? total - start : stmt.count
+		count = clamp(wanted, 0, total - start)
+		position = start + count
+	case .Backward:
+		end := min(position, total)
+		wanted := stmt.count == 0 ? end : stmt.count
+		count = clamp(wanted, 0, end)
+		start = end - count
+		position = start
+	case .All:
+		start = min(position, total)
+		count = total - start
+		position = total
+	}
+	cursor.position = position
+	result := Sql_Result {
+		kind       = .Rows,
+		affected   = count,
+		commit_seq = tx.store.commit_seq,
+	}
+	if !stmt.move {
+		result.columns = make([]string, len(cursor.columns))
+		for column, i in cursor.columns do result.columns[i] = strings.clone(column)
+		result.rows = make([][]Value, count)
+		for row, i in cursor.rows[start:][:count] {
+			values := make([]Value, len(row))
+			for value, v in row do values[v] = value_clone(value, context.allocator)
+			result.rows[i] = values
+		}
+	}
+	return result, ERROR_NONE
+}
+
+@(private)
+sql_exec_close_cursor :: proc(tx: ^Tx, stmt: Close_Cursor_Stmt) -> (Sql_Result, Error) {
+	if stmt.all {
+		// CLOSE ALL drops every cursor of the transaction. The rows live in its
+		// arena, so the map is all there is to drop.
+		clear(&tx.cursors)
+		return Sql_Result{kind = .Ack, commit_seq = tx.store.commit_seq}, ERROR_NONE
+	}
+	if _, found := tx.cursors[stmt.name]; !found {
+		return {}, errf(.Table_Not_Found, "cursor %s does not exist", stmt.name)
+	}
+	map_erase(&tx.cursors, stmt.name)
+	return Sql_Result{kind = .Ack, commit_seq = tx.store.commit_seq}, ERROR_NONE
 }
 
 // sql_exec_copy moves rows between a table and the text or CSV form. A file is
@@ -324,6 +477,10 @@ sql_exec_vacuum :: proc(store: ^Store, stmt: Vacuum_Stmt) -> (Sql_Result, Error)
 
 sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sql_Result, Error) {
 	switch stmt in statement {
+	case Declare_Cursor_Stmt, Fetch_Stmt, Close_Cursor_Stmt:
+		// A cursor needs the transaction object, which the caller of this switch
+		// already has: the in-transaction dispatch answers these.
+		return {}, errf(.Internal, "%s is answered by the transaction", statement_name(stmt))
 	case Analyze_Stmt:
 		// ANALYZE needs the tables, not the transaction: it belongs to the store.
 		return {}, errf(.Sql_Not_A_Query, "ANALYZE does not run inside a transaction")
@@ -701,6 +858,8 @@ sql_exec_explain :: proc(tx: ^Tx, stmt: Explain_Stmt, params: []Value) -> (Sql_R
 		return {}, errf(.Sql_Not_A_Query, "EXPLAIN does not apply to COPY")
 	case Merge_Stmt:
 		return {}, errf(.Sql_Not_A_Query, "EXPLAIN does not apply to MERGE")
+	case Declare_Cursor_Stmt, Fetch_Stmt, Close_Cursor_Stmt:
+		return {}, errf(.Sql_Not_A_Query, "EXPLAIN does not apply to a cursor statement")
 	case Select_Stmt:
 		order := plan_join_order(store, tx, inner, params)
 		first := order.steps[0]

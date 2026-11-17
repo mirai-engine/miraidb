@@ -33,6 +33,10 @@ Tx :: struct {
 	// outer is the stack of frames a subquery evaluates inside: a correlated
 	// reference reads the row of the statement it is written in from here.
 	outer:       ^Outer_Frame,
+	// cursors are the queries this transaction declared and the client reads a few
+	// rows at a time. They belong to the transaction, as PostgreSQL's do: a commit
+	// or a rollback closes them.
+	cursors:     map[string]^Cursor,
 	read_tables: map[string]bool,
 	// A read transaction shares every table instead of copying it: it holds one
 	// reference per table and does not hold the store lock; `locked` records
@@ -452,6 +456,7 @@ tx_begin_write :: proc(store: ^Store) -> ^Tx {
 	tx.read_seq = store.commit_seq
 	tx.read_tables = make(map[string]bool)
 	tx.cte_tables = make(map[string]^Table)
+	tx.cursors = make(map[string]^Cursor)
 	tx.state.writes = make(map[string]^Table_Writes)
 	tx.state.created = make(map[string]^Table)
 	tx.state.altered = make(map[string]^Table)
@@ -471,6 +476,7 @@ tx_begin_read :: proc(store: ^Store) -> ^Tx {
 	tx.alloc = virtual.arena_allocator(&tx.arena)
 	tx.read_tables = make(map[string]bool)
 	tx.cte_tables = make(map[string]^Table)
+	tx.cursors = make(map[string]^Cursor)
 	tx.use_frozen = true
 	// The lock is held only while the snapshot is taken or borrowed; the
 	// statement then runs without it, so a long read never blocks a commit.
@@ -541,6 +547,9 @@ tx_rollback :: proc(tx: ^Tx) {
 @(private)
 tx_discard :: proc(tx: ^Tx) {
 	tx.active = false
+	// Cursors, their rows and their column names live in the transaction's arena:
+	// dropping the map is the whole cleanup.
+	delete(tx.cursors)
 	for table in tx.temp_tables {
 		table_destroy(table)
 	}

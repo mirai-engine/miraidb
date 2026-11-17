@@ -160,6 +160,33 @@ column of the inner statement wins over one of the same name outside it. A later
 step cannot be the inner side of a `RIGHT` or `FULL` join, because that side is
 kept when nothing matched and a lateral row only exists once an outer row does.
 
+## Cursors
+
+A cursor holds a query's rows and hands them out a few at a time, which is how a
+client walks a result too large to hold in one answer.
+
+```sql
+BEGIN;
+DECLARE c CURSOR FOR SELECT id, v FROM t ORDER BY id;
+FETCH 2 FROM c;              -- two rows, the cursor now after them
+FETCH NEXT FROM c;           -- one more
+FETCH PRIOR FROM c;          -- the one before it
+FETCH FIRST FROM c;          -- the first row
+FETCH LAST FROM c;           -- the last row
+FETCH ABSOLUTE 3 FROM c;     -- the third row
+FETCH RELATIVE -1 FROM c;    -- the one before the current one
+FETCH FORWARD ALL FROM c;    -- everything left
+MOVE BACKWARD 2 FROM c;      -- move without handing rows out
+CLOSE c;
+COMMIT;
+```
+
+A cursor belongs to the transaction that declared it: a commit or a rollback closes
+it, and a statement outside a transaction refuses it with that reason. `WITH HOLD`
+(a cursor that outlives its transaction) is refused with words. `SCROLL` and
+`NO SCROLL` are accepted and mean nothing here, because the cursor always can move
+both ways: its rows are already the statement's answer.
+
 ## MERGE
 
 `MERGE` loads a set of rows into a table in one statement: the rows that are

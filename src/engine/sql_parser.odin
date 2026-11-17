@@ -275,6 +275,9 @@ parse_statement :: proc(p: ^Parser) -> Statement {
 	if p_is_keyword(p, "update") do return parse_update(p)
 	if p_is_keyword(p, "delete") do return parse_delete(p)
 	if p_is_keyword(p, "merge") do return parse_merge(p)
+	if p_is_keyword(p, "declare") do return parse_declare_cursor(p)
+	if p_is_keyword(p, "fetch") || p_is_keyword(p, "move") do return parse_fetch(p)
+	if p_is_keyword(p, "close") do return parse_close_cursor(p)
 	if p_is_keyword(p, "grant") do return parse_grant(p, false)
 	if p_is_keyword(p, "revoke") do return parse_grant(p, true)
 	if p_is_keyword(p, "create") do return parse_create(p)
@@ -443,6 +446,136 @@ parse_copy :: proc(p: ^Parser) -> Statement {
 		// format after another one was read.
 		stmt.null_text = stmt.format == .Csv ? "" : "\\N"
 	}
+	return stmt
+}
+
+// parse_declare_cursor reads `DECLARE name [[NO] SCROLL] CURSOR [WITH HOLD] FOR
+// query`. The modes PostgreSQL allows (BINARY, INSENSITIVE, WITH HOLD) are read
+// and refused, except SCROLL and NO SCROLL, which only say how the client may
+// move the cursor and are both answered (the cursor always can).
+@(private)
+parse_declare_cursor :: proc(p: ^Parser) -> Statement {
+	p_expect_keyword(p, "declare")
+	stmt: Declare_Cursor_Stmt
+	stmt.name = p_ident(p)
+	for {
+		if p_match_keyword(p, "scroll") {
+			stmt.scroll = true
+			continue
+		}
+		if p_match_keyword(p, "no") {
+			if p_expect_keyword(p, "scroll") == false do return stmt
+			stmt.no_scroll = true
+			continue
+		}
+		if p_match_keyword(p, "binary") {
+			p_fail(p, .Sql_Unsupported, "a BINARY cursor is not supported")
+			return stmt
+		}
+		if p_match_keyword(p, "insensitive") {
+			continue
+		}
+		break
+	}
+	if p_expect_keyword(p, "cursor") == false do return stmt
+	if p_match_keyword(p, "with") {
+		if p_expect_keyword(p, "hold") == false do return stmt
+		stmt.hold = true
+	}
+	if p_match_keyword(p, "without") {
+		if p_expect_keyword(p, "hold") == false do return stmt
+	}
+	if p_expect_keyword(p, "for") == false do return stmt
+	if select_stmt, ok := parse_select(p).(Select_Stmt); ok {
+		stmt.query = select_stmt
+	}
+	return stmt
+}
+
+// parse_fetch reads `FETCH [direction] [FROM|IN] name` and its MOVE twin.
+@(private)
+parse_fetch :: proc(p: ^Parser) -> Statement {
+	stmt: Fetch_Stmt
+	stmt.move = p_is_keyword(p, "move")
+	p_advance(p)
+	stmt.direction = .Next
+	// The direction is optional; `FETCH FROM c` is one row.
+	if p_is_keyword(p, "next") {
+		p_advance(p)
+		stmt.direction = .Next
+	} else if p_is_keyword(p, "prior") {
+		p_advance(p)
+		stmt.direction = .Prior
+	} else if p_is_keyword(p, "first") {
+		p_advance(p)
+		stmt.direction = .First
+	} else if p_is_keyword(p, "last") {
+		p_advance(p)
+		stmt.direction = .Last
+	} else if p_is_keyword(p, "absolute") {
+		p_advance(p)
+		stmt.direction = .Absolute
+		stmt.count = parse_fetch_count(p)
+	} else if p_is_keyword(p, "relative") {
+		p_advance(p)
+		stmt.direction = .Relative
+		stmt.count = parse_fetch_count(p)
+	} else if p_is_keyword(p, "forward") || p_is_keyword(p, "backward") {
+		stmt.direction = p_is_keyword(p, "forward") ? .Forward : .Backward
+		p_advance(p)
+		if p_match_keyword(p, "all") do stmt.count = 0
+		else do stmt.count = parse_fetch_count(p, false)
+	} else if p_match_keyword(p, "all") {
+		stmt.direction = .All
+	} else if p.current.kind == .Number {
+		// `FETCH 10 FROM c` is FORWARD 10.
+		stmt.direction = .Forward
+		stmt.count = parse_fetch_count(p)
+	}
+	p_match_keyword(p, "from")
+	p_match_keyword(p, "in")
+	stmt.name = p_ident(p)
+	return stmt
+}
+
+// parse_fetch_count reads the number a direction or a position takes. A negative
+// position is legal (`FETCH ABSOLUTE -1`); `required` is false for FORWARD and
+// BACKWARD, where the number may be left out.
+@(private)
+parse_fetch_count :: proc(p: ^Parser, required := true) -> int {
+	if p.current.kind != .Number {
+		if required {
+			p_fail(p, .Sql_Syntax, "expected a number, found %q", p.current.text)
+		}
+		return 0
+	}
+	text := p.current.text
+	p_advance(p)
+	value: i64
+	negative := false
+	if len(text) > 0 && text[0] == '-' {
+		negative = true
+		text = text[1:]
+	}
+	for c in text {
+		if c < '0' || c > '9' {
+			p_fail(p, .Sql_Syntax, "%q is not a row count", p.current.text)
+			return 0
+		}
+		value = value * 10 + i64(c - '0')
+	}
+	return int(negative ? -value : value)
+}
+
+@(private)
+parse_close_cursor :: proc(p: ^Parser) -> Statement {
+	p_expect_keyword(p, "close")
+	stmt: Close_Cursor_Stmt
+	if p_match_keyword(p, "all") {
+		stmt.all = true
+		return stmt
+	}
+	stmt.name = p_ident(p)
 	return stmt
 }
 

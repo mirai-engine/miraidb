@@ -576,6 +576,52 @@ Describe_Stmt :: struct {
 	name: string,
 }
 
+// Cursor is a query a session reads a few rows at a time. It belongs to the
+// transaction that declared it, as PostgreSQL's cursors do: a commit closes them.
+Cursor :: struct {
+	columns: []string,
+	rows:    [][]Value,
+	// position is how many rows have been handed out: the cursor sits before
+	// `rows[position]`.
+	position: int,
+}
+
+// Fetch_Direction is where a FETCH starts reading and which way it goes.
+Fetch_Direction :: enum u8 {
+	Next,
+	Prior,
+	First,
+	Last,
+	Absolute,
+	Relative,
+	Forward,
+	Backward,
+	All,
+}
+
+Declare_Cursor_Stmt :: struct {
+	name:     string,
+	query:    Select_Stmt,
+	hold:     bool,
+	scroll:   bool,
+	no_scroll: bool,
+}
+
+Fetch_Stmt :: struct {
+	name:      string,
+	direction: Fetch_Direction,
+	// count is the row count of ABSOLUTE, RELATIVE, FORWARD and BACKWARD; zero with
+	// Forward or Backward means ALL.
+	count:     int,
+	// move is MOVE: the cursor moves and no rows come back.
+	move:      bool,
+}
+
+Close_Cursor_Stmt :: struct {
+	name: string,
+	all:  bool,
+}
+
 Truncate_Stmt :: struct {
 	name: string,
 }
@@ -642,6 +688,9 @@ Statement :: union {
 	Drop_Policy_Stmt,
 	Describe_Stmt,
 	Truncate_Stmt,
+	Declare_Cursor_Stmt,
+	Fetch_Stmt,
+	Close_Cursor_Stmt,
 	Copy_Stmt,
 	Analyze_Stmt,
 	Vacuum_Stmt,
@@ -793,6 +842,12 @@ statement_name :: proc(statement: Statement) -> string {
 		return "TRUNCATE"
 	case Copy_Stmt:
 		return "COPY"
+	case Declare_Cursor_Stmt:
+		return "DECLARE CURSOR"
+	case Fetch_Stmt:
+		return "FETCH"
+	case Close_Cursor_Stmt:
+		return "CLOSE"
 	case Analyze_Stmt:
 		return "ANALYZE"
 	case Vacuum_Stmt:
