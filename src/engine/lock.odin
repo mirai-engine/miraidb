@@ -63,8 +63,11 @@ lock_registry_mutex: sync.Mutex
 // many handles (the writer included) hold the reader byte.
 @(private)
 Lock_Registry_Entry :: struct {
-	writer:  bool,
-	readers: int,
+	writer:    bool,
+	readers:   int,
+	// rewriting mirrors the exclusive reader byte of a log rewrite, which the
+	// kernel would grant to a second handle of this same process.
+	rewriting: bool,
 }
 
 // The registry outlives every allocator a caller may install (a test runner
@@ -129,6 +132,9 @@ db_lock_acquire :: proc(directory: string, role: Db_Lock_Role = .Writer) -> (Db_
 		if role == .Writer && lock_registry[key].writer {
 			return {}, lock_refusal(directory, path)
 		}
+		if lock_registry[key].rewriting {
+			return {}, errf(.Locked, "database %s is being rewritten", directory)
+		}
 	}
 
 	handle, open_err := lock_os_open(path)
@@ -176,24 +182,53 @@ db_lock_rewriting :: proc(lock: ^Db_Lock, wanted: bool) -> bool {
 	if lock == nil || !lock.held || lock.role != .Writer do return false
 	if wanted {
 		if lock.compacting do return true
-		if lock.reader_held {
-			lock_os_release(lock.handle, LOCK_READER_OFFSET)
-			lock.reader_held = false
+		// POSIX locks are per process: a reader opened by this same process does
+		// not stop the exclusive byte below, so the registry's count does. The
+		// writer's own handle is one of the readers.
+		if lock_registry_needed() {
+			sync.lock(&lock_registry_mutex)
+			defer sync.unlock(&lock_registry_mutex)
+			entry, found := lock_registry[lock.key]
+			if found && entry.readers > 1 do return false
+			if !lock_rewriting_os(lock) do return false
+			if found {
+				entry.rewriting = true
+				lock_registry[lock.key] = entry
+			}
+			return true
 		}
-		if !lock_os_acquire(lock.handle, LOCK_READER_OFFSET, true) {
-			// Put the shared hold back; if that fails too the writer simply keeps
-			// being refused for rewrites, which is the safe side.
-			lock.reader_held = lock_os_acquire(lock.handle, LOCK_READER_OFFSET, false)
-			return false
-		}
-		lock.compacting = true
-		return true
+		return lock_rewriting_os(lock)
 	}
 	if !lock.compacting do return true
+	if lock_registry_needed() {
+		sync.lock(&lock_registry_mutex)
+		if entry, found := lock_registry[lock.key]; found {
+			entry.rewriting = false
+			lock_registry[lock.key] = entry
+		}
+		sync.unlock(&lock_registry_mutex)
+	}
 	lock_os_release(lock.handle, LOCK_READER_OFFSET)
 	lock.compacting = false
 	lock.reader_held = lock_os_acquire(lock.handle, LOCK_READER_OFFSET, false)
 	return lock.reader_held
+}
+
+// lock_rewriting_os upgrades the reader byte to exclusive at the OS level.
+@(private)
+lock_rewriting_os :: proc(lock: ^Db_Lock) -> bool {
+	if lock.reader_held {
+		lock_os_release(lock.handle, LOCK_READER_OFFSET)
+		lock.reader_held = false
+	}
+	if !lock_os_acquire(lock.handle, LOCK_READER_OFFSET, true) {
+		// Put the shared hold back; if that fails too the writer simply keeps
+		// being refused for rewrites, which is the safe side.
+		lock.reader_held = lock_os_acquire(lock.handle, LOCK_READER_OFFSET, false)
+		return false
+	}
+	lock.compacting = true
+	return true
 }
 
 // db_lock_release gives the directory back. It is safe on a zero lock, so close
@@ -209,6 +244,7 @@ db_lock_release :: proc(lock: ^Db_Lock) {
 		if entry, found := lock_registry[lock.key]; found {
 			entry.readers -= 1
 			if lock.role == .Writer do entry.writer = false
+			if lock.compacting do entry.rewriting = false
 			if entry.readers > 0 || entry.writer {
 				lock_registry[lock.key] = entry
 			} else {
