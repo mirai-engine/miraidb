@@ -98,6 +98,10 @@ Database :: struct {
 	collation_needed:     Collation_Needed_Callback,
 	collation_needed16:   Collation_Needed16_Callback,
 	collation_needed_arg: rawptr,
+	// pending_declaration is what sqlite3_declare_vtab received during the
+	// xCreate or xConnect running now (vtab.odin).
+	pending_declaration:  string,
+	in_vtab_constructor:  bool,
 }
 
 Statement :: struct {
@@ -448,6 +452,9 @@ sqlite3_close :: proc "c" (handle: rawptr) -> c.int {
 	trace_close(db)
 	functions_close(db)
 	collations_close(db)
+	// Every virtual table disconnects while the connection can still be named.
+	engine.store_vtab_close(db.conn.store)
+	delete(db.pending_declaration)
 	engine.embed_close(db.conn)
 	delete(db.last_error)
 	delete(db.last_error16)

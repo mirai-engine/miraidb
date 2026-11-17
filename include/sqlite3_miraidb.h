@@ -339,6 +339,121 @@ int sqlite3_collation_needed(sqlite3 *db, void *pArg,
 int sqlite3_collation_needed16(sqlite3 *db, void *pArg,
                                void (*callback)(void *, sqlite3 *, int, const void *));
 
+/* --- Virtual table modules -------------------------------------------------
+** A module's table is read whole each time a statement names it: xBestIndex
+** is offered the arguments written after the name (`FROM t(1, 2)`, as
+** equality constraints on the HIDDEN columns in order) and the WHERE terms
+** `column op constant`, xFilter receives the ones it numbered, and the rows
+** come from xOpen/xEof/xColumn/xRowid/xNext; the WHERE is applied to them
+** afterwards whatever the module did. INSERT, UPDATE and DELETE call xUpdate
+** with SQLite's arguments. xBegin, xSync, xCommit, xRollback, the savepoint
+** methods, xRename, xFindFunction, xShadowName and xIntegrity are not called. */
+
+typedef struct sqlite3_vtab sqlite3_vtab;
+typedef struct sqlite3_index_info sqlite3_index_info;
+typedef struct sqlite3_vtab_cursor sqlite3_vtab_cursor;
+typedef struct sqlite3_module sqlite3_module;
+
+struct sqlite3_module {
+  int iVersion;
+  int (*xCreate)(sqlite3 *, void *pAux, int argc, const char *const *argv,
+                 sqlite3_vtab **ppVTab, char **pzErr);
+  int (*xConnect)(sqlite3 *, void *pAux, int argc, const char *const *argv,
+                  sqlite3_vtab **ppVTab, char **pzErr);
+  int (*xBestIndex)(sqlite3_vtab *pVTab, sqlite3_index_info *);
+  int (*xDisconnect)(sqlite3_vtab *pVTab);
+  int (*xDestroy)(sqlite3_vtab *pVTab);
+  int (*xOpen)(sqlite3_vtab *pVTab, sqlite3_vtab_cursor **ppCursor);
+  int (*xClose)(sqlite3_vtab_cursor *);
+  int (*xFilter)(sqlite3_vtab_cursor *, int idxNum, const char *idxStr,
+                 int argc, sqlite3_value **argv);
+  int (*xNext)(sqlite3_vtab_cursor *);
+  int (*xEof)(sqlite3_vtab_cursor *);
+  int (*xColumn)(sqlite3_vtab_cursor *, sqlite3_context *, int);
+  int (*xRowid)(sqlite3_vtab_cursor *, sqlite3_int64 *pRowid);
+  int (*xUpdate)(sqlite3_vtab *, int, sqlite3_value **, sqlite3_int64 *);
+  int (*xBegin)(sqlite3_vtab *pVTab);
+  int (*xSync)(sqlite3_vtab *pVTab);
+  int (*xCommit)(sqlite3_vtab *pVTab);
+  int (*xRollback)(sqlite3_vtab *pVTab);
+  int (*xFindFunction)(sqlite3_vtab *pVtab, int nArg, const char *zName,
+                       void (**pxFunc)(sqlite3_context *, int, sqlite3_value **),
+                       void **ppArg);
+  int (*xRename)(sqlite3_vtab *pVtab, const char *zNew);
+  int (*xSavepoint)(sqlite3_vtab *pVTab, int);
+  int (*xRelease)(sqlite3_vtab *pVTab, int);
+  int (*xRollbackTo)(sqlite3_vtab *pVTab, int);
+  int (*xShadowName)(const char *);
+  int (*xIntegrity)(sqlite3_vtab *pVTab, const char *zSchema,
+                    const char *zTabName, int mFlags, char **pzErr);
+};
+
+struct sqlite3_index_info {
+  int nConstraint;
+  struct sqlite3_index_constraint {
+    int iColumn;
+    unsigned char op;
+    unsigned char usable;
+    int iTermOffset;
+  } *aConstraint;
+  int nOrderBy;
+  struct sqlite3_index_orderby {
+    int iColumn;
+    unsigned char desc;
+  } *aOrderBy;
+  struct sqlite3_index_constraint_usage {
+    int argvIndex;
+    unsigned char omit;
+  } *aConstraintUsage;
+  int idxNum;
+  char *idxStr;
+  int needToFreeIdxStr;
+  int orderByConsumed;
+  double estimatedCost;
+  sqlite3_int64 estimatedRows;
+  int idxFlags;
+  sqlite3_uint64 colUsed;
+};
+
+struct sqlite3_vtab {
+  const sqlite3_module *pModule;
+  int nRef;
+  char *zErrMsg;
+};
+
+struct sqlite3_vtab_cursor {
+  sqlite3_vtab *pVtab;
+};
+
+#define SQLITE_INDEX_CONSTRAINT_EQ  2
+#define SQLITE_INDEX_CONSTRAINT_GT  4
+#define SQLITE_INDEX_CONSTRAINT_LE  8
+#define SQLITE_INDEX_CONSTRAINT_LT 16
+#define SQLITE_INDEX_CONSTRAINT_GE 32
+
+int sqlite3_create_module(sqlite3 *db, const char *zName, const sqlite3_module *p,
+                          void *pClientData);
+int sqlite3_create_module_v2(sqlite3 *db, const char *zName,
+                             const sqlite3_module *p, void *pClientData,
+                             void (*xDestroy)(void *));
+/* Drops every module not named in the NULL-terminated list (all when NULL). */
+int sqlite3_drop_modules(sqlite3 *db, const char **azKeep);
+int sqlite3_declare_vtab(sqlite3 *db, const char *zSQL);
+/* Accepted from inside xCreate or xConnect; changes nothing here. */
+int sqlite3_vtab_config(sqlite3 *db, int op, ...);
+/* SQLITE_ABORT: the only conflict mode a module write sees here. */
+int sqlite3_vtab_on_conflict(sqlite3 *db);
+/* Always 0 / "BINARY" / 0 / 0 here: no column is left unchanged, constraints
+** compare in BINARY, DISTINCT is not passed, IN is offered value by value. */
+int sqlite3_vtab_nochange(sqlite3_context *ctx);
+const char *sqlite3_vtab_collation(sqlite3_index_info *info, int iCons);
+int sqlite3_vtab_distinct(sqlite3_index_info *info);
+int sqlite3_vtab_in(sqlite3_index_info *info, int iCons, int bHandle);
+int sqlite3_vtab_in_first(sqlite3_value *pVal, sqlite3_value **ppOut);
+int sqlite3_vtab_in_next(sqlite3_value *pVal, sqlite3_value **ppOut);
+/* The constant of a constraint, while xBestIndex runs. */
+int sqlite3_vtab_rhs_value(sqlite3_index_info *info, int iCons, sqlite3_value **ppVal);
+
 /* --- Connection hooks ----------------------------------------------------
 ** Each call replaces the hook and answers the argument the previous one had;
 ** NULL removes it. The update hook sees every changed row of a user table
