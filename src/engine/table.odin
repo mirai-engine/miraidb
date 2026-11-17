@@ -345,7 +345,10 @@ table_create :: proc(schema: ^Table_Schema) -> (^Table, Error) {
 	t.store = new(Row_Store)
 	t.store.refs = 1
 	t.rows = make(map[Row_Id]Row)
-	t.next_row_id = 0
+	// Row ids start at one, as SQLite's rowid does: a program that names a row by
+	// its rowid -- sqlite3_blob_open's iRow, or ORDER BY rowid with a literal --
+	// then finds the same row here as it did there.
+	t.next_row_id = 1
 	if t.schema.auto_increment_column != NO_COLUMN {
 		t.next_sequence = t.schema.columns[t.schema.auto_increment_column].sequence.start
 	}

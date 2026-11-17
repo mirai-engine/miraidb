@@ -261,7 +261,7 @@ nothing about them is written to the database.
   column with that name. A table whose primary key is one INTEGER column answers
   that column, which is what SQLite calls a rowid alias and what
   `last_insert_rowid()` already reports; any other table answers the engine's row
-  id, and those start at zero where SQLite starts at one. Two tables in one query
+  id, which starts at one. Two tables in one query
   make an unqualified `rowid` ambiguous, so it has to be qualified. A row that is
   not a stored one (a join's second side, an aggregate, `SELECT` without `FROM`)
   has no rowid.

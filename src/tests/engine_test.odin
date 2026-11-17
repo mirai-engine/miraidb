@@ -5604,14 +5604,15 @@ test_result_row_ids :: proc(t: ^testing.T) {
 
 	result := run(t, store, "SELECT label FROM r ORDER BY id")
 	testing.expect_value(t, len(result.row_ids), 2)
-	testing.expect_value(t, u64(result.row_ids[0]), u64(0))
-	testing.expect_value(t, u64(result.row_ids[1]), u64(1))
+	// Row ids start at one, as SQLite's rowid does.
+	testing.expect_value(t, u64(result.row_ids[0]), u64(1))
+	testing.expect_value(t, u64(result.row_ids[1]), u64(2))
 	db.sql_result_destroy(&result)
 
 	run(t, store, "DELETE FROM r WHERE id = 10")
 	after := run(t, store, "SELECT label FROM r")
 	testing.expect_value(t, len(after.row_ids), 1)
-	testing.expect_value(t, u64(after.row_ids[0]), u64(1))
+	testing.expect_value(t, u64(after.row_ids[0]), u64(2))
 	db.sql_result_destroy(&after)
 
 	// Aggregates and joins have no single source row.
@@ -13573,11 +13574,11 @@ test_rowid_spellings :: proc(t: ^testing.T) {
 	rows := run(t, store, "SELECT rowid, a FROM plain ORDER BY rowid")
 	defer db.sql_result_destroy(&rows)
 	testing.expect_value(t, len(rows.rows), 2)
-	testing.expect_value(t, rows.rows[0][0].i, i64(0))
-	testing.expect_value(t, rows.rows[1][0].i, i64(1))
-	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM plain WHERE rowid = 1").i, i64(1))
-	testing.expect_value(t, scalar(t, store, "SELECT _rowid_ FROM plain WHERE a = 10").i, i64(0))
-	testing.expect_value(t, scalar(t, store, "SELECT oid FROM plain WHERE rowid = 1").i, i64(1))
+	testing.expect_value(t, rows.rows[0][0].i, i64(1))
+	testing.expect_value(t, rows.rows[1][0].i, i64(2))
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM plain WHERE rowid = 2").i, i64(1))
+	testing.expect_value(t, scalar(t, store, "SELECT _rowid_ FROM plain WHERE a = 10").i, i64(1))
+	testing.expect_value(t, scalar(t, store, "SELECT oid FROM plain WHERE rowid = 2").i, i64(2))
 
 	// The INTEGER PRIMARY KEY is the rowid, and last_insert_rowid agrees.
 	run(t, store, "CREATE TABLE keyed (id INTEGER PRIMARY KEY, v TEXT)")
