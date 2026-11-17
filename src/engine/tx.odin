@@ -69,6 +69,11 @@ Tx :: struct {
 	// size of the index.
 	fts_new_docs: map[string]map[Row_Id]bool,
 	cte_tables:  map[string]^Table,
+	// vtab_where and vtab_params are the WHERE of the query whose sources are
+	// being read, so a program's virtual table is offered its terms
+	// (vtab_materialize).
+	vtab_where:  ^Expr,
+	vtab_params: []Value,
 	// savepoints is the open savepoint stack, innermost last.
 	savepoints:  [dynamic]Savepoint,
 	// Views materialize into temporary tables owned by the transaction.

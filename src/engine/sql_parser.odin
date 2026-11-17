@@ -2098,17 +2098,35 @@ parse_create_virtual_table :: proc(p: ^Parser) -> Statement {
 	stmt.name = p_ident(p)
 	p_expect_keyword(p, "using")
 	stmt.module = p_ident(p)
-	if !p_expect_punct(p, "(") do return stmt
+	// Without arguments the module gets none.
+	if !p_match_punct(p, "(") do return stmt
 	columns := make([dynamic]string, 0, 2, p.alloc)
-	for {
-		append(&columns, p_ident(p))
-		// Options after a column (tokenize=..., prefix=...) are accepted and
-		// ignored: this implementation has one tokenizer.
+	arguments := make([dynamic]string, 0, 2, p.alloc)
+	// An argument is any text up to a comma outside parentheses, as SQLite
+	// passes it; its first word is a column for fts5 and rtree. Options there
+	// (tokenize=..., prefix=...) are accepted and ignored: one tokenizer.
+	for p.err.kind == .None && p.current.kind != .EOF {
+		start := p.prev_end
+		depth := 0
+		for p.current.kind != .EOF {
+			if depth == 0 && (p_is_punct(p, ",") || p_is_punct(p, ")")) do break
+			if p_is_punct(p, "(") do depth += 1
+			if p_is_punct(p, ")") do depth -= 1
+			p_advance(p)
+		}
+		argument := p_text_since(p, start)
+		if len(argument) > 0 {
+			append(&arguments, argument)
+			first := argument
+			if space := strings.index_any(first, " \t\n\r="); space >= 0 do first = first[:space]
+			append(&columns, strings.trim(first, "\"`[]'"))
+		}
 		if p_match_punct(p, ",") do continue
 		break
 	}
 	p_expect_punct(p, ")")
 	stmt.columns = columns[:]
+	stmt.arguments = arguments[:]
 	return stmt
 }
 

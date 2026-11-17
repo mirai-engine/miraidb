@@ -302,6 +302,9 @@ Column :: struct {
 	// default_sql is a DEFAULT that has to be evaluated for every row, such as
 	// CURRENT_TIMESTAMP; a constant default is default_value instead.
 	default_sql:    string,
+	// hidden marks a column `SELECT *` leaves out: a virtual table's HIDDEN
+	// columns (vtab.odin). It is never stored.
+	hidden:         bool,
 }
 
 // Index_Algorithm selects how an index answers equality lookups. Btree keeps

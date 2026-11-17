@@ -120,6 +120,11 @@ Store :: struct {
 	// collations holds the host comparisons a program registered. It is process
 	// state, not database state: nothing about it is logged.
 	collations:    map[string]Collation_Def,
+	// vtab_modules are the virtual table modules a program registered, and
+	// vtabs the tables connected through them (vtab.odin). Process state, like
+	// the collations.
+	vtab_modules:  map[string]Vtab_Module,
+	vtabs:         [dynamic]^Vtab,
 	// cancelled asks the next row loop to stop. It is cooperative: a running
 	// statement checks it between rows, so the caller still owns the outcome.
 	cancelled:     bool,
@@ -445,6 +450,7 @@ store_log_path :: proc(directory: string) -> string {
 
 store_close :: proc(store: ^Store) {
 	if store == nil do return
+	store_vtab_close(store)
 	store_stop_background_compaction(store)
 	// A paged table is flushed before it is closed so a clean shutdown leaves the
 	// page files current; a crash leaves them stale, which the next open rebuilds.

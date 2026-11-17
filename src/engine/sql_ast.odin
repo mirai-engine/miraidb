@@ -760,6 +760,9 @@ Create_Virtual_Table_Stmt :: struct {
 	name:          string,
 	module:        string,
 	columns:       []string,
+	// arguments are the module arguments as written, which a program's module
+	// receives; columns are their first words, which fts5 and rtree read.
+	arguments:     []string,
 	if_not_exists: bool,
 }
 

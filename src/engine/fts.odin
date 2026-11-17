@@ -104,7 +104,7 @@ fts_create :: proc(tx: ^Tx, name: string, module: string, columns: []string) -> 
 		return rtree_create(tx, name, module, columns)
 	}
 	if !strings.equal_fold(module, "fts5") && !strings.equal_fold(module, "fts4") {
-		return errf(.Sql_Unsupported, "virtual table module %s is not supported", module)
+		return errf(.Sql_Unsupported, "no such module: %s", module)
 	}
 	if err := fts_ensure(tx); err.kind != .None do return err
 	if existing, found := fts_virtual_lookup(tx, name); found {

@@ -134,6 +134,12 @@ tx_source_table :: proc(
 		return resolved, false, ERROR_NONE
 	}
 	if table_err.kind != .Table_Not_Found do return nil, false, table_err
+	// A table a program's module serves is read like a view.
+	if vtab, is_vtab, vtab_err := vtab_find(tx, name); vtab_err.kind != .None || is_vtab {
+		if vtab_err.kind != .None do return nil, false, vtab_err
+		materialized, materialize_err := vtab_materialize(tx, vtab, args)
+		return materialized, true, materialize_err
+	}
 	sql, found := view_sql(tx, name)
 	if !found {
 		return nil, false, table_err

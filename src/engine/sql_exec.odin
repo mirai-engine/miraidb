@@ -588,6 +588,21 @@ sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sq
 		}
 		return sql_exec_mutation(tx, statement_without_ctes(statement), params)
 	}
+	// A write to a table a program's module serves goes to the module.
+	target := ""
+	#partial switch s in statement {
+	case Insert_Stmt:
+		target = s.table
+	case Update_Stmt:
+		target = s.table
+	case Delete_Stmt:
+		target = s.table
+	}
+	if len(target) > 0 && tx_table_probe(tx, target) == nil {
+		vtab, is_vtab, vtab_err := vtab_find(tx, target)
+		if vtab_err.kind != .None do return {}, vtab_err
+		if is_vtab do return vtab_write(tx, vtab, statement, params)
+	}
 	switch stmt in statement {
 	case Reindex_Stmt:
 		// Every index is rebuilt from the log when the database opens, so there is
@@ -690,6 +705,10 @@ sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sq
 	case Grant_Stmt:
 		return sql_exec_grant(tx, stmt)
 	case Create_Virtual_Table_Stmt:
+		if handled, vtab_err := vtab_create(tx, stmt); handled {
+			if vtab_err.kind != .None do return {}, vtab_err
+			return Sql_Result{kind = .Ack, commit_seq = tx.store.commit_seq}, ERROR_NONE
+		}
 		if stmt.if_not_exists {
 			if _, found := fts_virtual_lookup(tx, stmt.name); found {
 				return Sql_Result{kind = .Ack, commit_seq = tx.store.commit_seq}, ERROR_NONE
@@ -3220,6 +3239,10 @@ sql_exec_stream_select :: proc(
 }
 
 sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Result, Error) {
+	// A virtual table a program implements is offered this query's WHERE.
+	saved_where, saved_params := tx.vtab_where, tx.vtab_params
+	tx.vtab_where, tx.vtab_params = stmt.where_clause, params
+	defer tx.vtab_where, tx.vtab_params = saved_where, saved_params
 	// Derived tables are materialized first, under their names, for this select.
 	if stmt.from.subquery != nil || select_has_derived_join(stmt) {
 		scope := cte_scope_begin(tx)
@@ -4319,7 +4342,7 @@ expand_projections :: proc(
 					merged = joins[index - 1].using_columns
 				}
 				for column in source.table.schema.columns {
-					if column_in_names(column.name, merged) do continue
+					if column.hidden || column_in_names(column.name, merged) do continue
 					expr := new(Expr, alloc)
 					expr^ = Column_Expr{table = qualifier, name = column.name}
 					append(&expanded, expr)
@@ -8594,6 +8617,11 @@ sql_exec_create_table :: proc(tx: ^Tx, stmt: Create_Table_Stmt, params: []Value)
 }
 
 sql_exec_drop_table :: proc(tx: ^Tx, stmt: Drop_Table_Stmt) -> (Sql_Result, Error) {
+	// A program's module destroys its own table.
+	if handled, vtab_err := vtab_drop(tx, stmt.name); handled {
+		if vtab_err.kind != .None do return {}, vtab_err
+		return Sql_Result{kind = .Ack}, ERROR_NONE
+	}
 	// A virtual table owns a shadow table and a catalog row: dropping it drops all
 	// three, so nothing is left behind to be reindexed later.
 	if virtual, virtual_err := fts_drop_if_virtual(tx, stmt.name, stmt.if_exists); virtual {

@@ -169,6 +169,9 @@ res_write_target :: proc(walk: ^Res_Walk, name: string) -> (Res_Source, bool) {
 	if _, is_view := view_sql(walk.tx, name); is_view || is_system_table(name) || res_internal(name) {
 		return Res_Source{name = name}, true
 	}
+	if vtab, is_vtab, _ := vtab_find(walk.tx, name); is_vtab {
+		return res_vtab_source(vtab, ""), true
+	}
 	res_no_table(walk, name)
 	return {}, false
 }
@@ -185,6 +188,15 @@ res_table_source :: proc(table: ^Table, alias: string) -> Res_Source {
 	columns := make([]string, len(table.schema.columns), context.temp_allocator)
 	for column, i in table.schema.columns do columns[i] = column.name
 	return Res_Source{name = table.schema.name, alias = alias, columns = columns, known = true, table = true}
+}
+
+// res_vtab_source is a program's virtual table: its declared columns, hidden
+// ones included, and its row id.
+@(private)
+res_vtab_source :: proc(vtab: ^Vtab, alias: string) -> Res_Source {
+	columns := make([]string, len(vtab.columns), context.temp_allocator)
+	for column, i in vtab.columns do columns[i] = column.name
+	return Res_Source{name = vtab.name, alias = alias, columns = columns, known = true, table = true}
 }
 
 @(private)
@@ -260,13 +272,24 @@ res_ref :: proc(walk: ^Res_Walk, scope: ^Res_Scope, ref: ^Table_Ref) {
 		source.known = cte.known
 		return
 	}
-	if len(ref.schema) > 0 || len(ref.args) > 0 || is_json_table_function(ref.name) || is_system_table(ref.name) do return
+	if len(ref.schema) > 0 || is_json_table_function(ref.name) || is_system_table(ref.name) do return
 	if table := tx_table_probe(walk.tx, ref.name); table != nil {
+		// A table given arguments is refused by the executor, in its words.
+		if len(ref.args) > 0 do return
 		source = res_table_source(table, ref.alias)
 		return
 	}
+	if vtab, is_vtab, vtab_err := vtab_find(walk.tx, ref.name); is_vtab || vtab_err.kind != .None {
+		if vtab_err.kind != .None {
+			walk.err = vtab_err
+			return
+		}
+		source = res_vtab_source(vtab, ref.alias)
+		return
+	}
 	if sql, found := view_sql(walk.tx, ref.name); found {
-		source.columns, source.known = res_view_columns(walk, sql)
+		// A view with parameters is read with them; its columns are left unknown.
+		if len(ref.args) == 0 do source.columns, source.known = res_view_columns(walk, sql)
 		return
 	}
 	if res_internal(ref.name) do return
