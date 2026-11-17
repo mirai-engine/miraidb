@@ -768,10 +768,20 @@ sqlite3_column_bytes :: proc "c" (handle: rawptr, index: c.int) -> c.int {
 	stmt := stmt_of(handle)
 	if stmt == nil do return 0
 	// SQLite answers the size of the text or blob form of the value, which for a
-	// number is the length of its rendering, not zero.
-	text, is_null := column_text(stmt, int(index))
-	if is_null do return 0
-	return c.int(len(string(text)))
+	// number is the length of its rendering, not zero. The value is measured
+	// before it becomes a C string: `len(string(cstring))` stops at an embedded
+	// NUL, which is exactly the case a byte count exists for.
+	value, ok := engine.embed_column_value(stmt.stmt, int(index))
+	if !ok || value.kind == .Null do return 0
+	#partial switch value.kind {
+	case .String:
+		return c.int(len(value.s))
+	case .Bytes:
+		return c.int(len(value.bytes))
+	}
+	rendered := engine.sqlite_value_text(value, context.allocator)
+	defer delete(rendered)
+	return c.int(len(rendered))
 }
 
 @(export)
