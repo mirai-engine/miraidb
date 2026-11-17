@@ -4570,6 +4570,13 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 		if ctx.grouped && grouping_column_missing(ctx, e.name, e.table) {
 			return value_null(), ERROR_NONE
 		}
+		// An aggregate over no row still answers one row (count 0, sum NULL), and
+		// a bare column in it has no row to come from: it is NULL, as in SQLite,
+		// unless it names a column of an enclosing query.
+		if ctx.grouped && len(ctx.group) == 0 && len(ctx.sources) == 0 {
+			if value, ok := outer_column(ctx, e.name, e.table); ok do return value, ERROR_NONE
+			return value_null(), ERROR_NONE
+		}
 		if len(e.table) > 0 {
 			// Inside a trigger body NEW and OLD name the rows of the event.
 			if ctx.tx != nil && ctx.tx.trigger_active {

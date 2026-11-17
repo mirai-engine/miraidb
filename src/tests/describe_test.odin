@@ -49,3 +49,27 @@ test_result_column_origins :: proc(t: ^testing.T) {
 	}
 	testing.expect(t, db.error_drop(db.embed_exec(conn, "ROLLBACK")))
 }
+
+@(test)
+test_empty_aggregate_bare_column :: proc(t: ^testing.T) {
+	store := fresh_db(t, "empty_aggregate")
+	if store == nil do return
+	defer cleanup_db(store, "empty_aggregate")
+	run(t, store, "CREATE TABLE p (id INTEGER PRIMARY KEY, score REAL)")
+
+	// An aggregate over no row answers one row, and a bare column in it is
+	// NULL: it used to fail with "column id does not exist" until the table had
+	// a row.
+	result, err := db.sql_execute(store, "SELECT count(*), id * 2, p.score FROM p")
+	defer db.sql_result_destroy(&result)
+	if testing.expectf(t, db.error_ok(err), "empty aggregate: %s", err.message) && testing.expect_value(t, len(result.rows), 1) {
+		testing.expect_value(t, result.rows[0][0].i, i64(0))
+		testing.expect_value(t, result.rows[0][1].kind, db.Value_Kind.Null)
+		testing.expect_value(t, result.rows[0][2].kind, db.Value_Kind.Null)
+	}
+	grouped, grouped_err := db.sql_execute(store, "SELECT count(*) FROM p GROUP BY score")
+	defer db.sql_result_destroy(&grouped)
+	testing.expect(t, db.error_ok(grouped_err))
+	testing.expect_value(t, len(grouped.rows), 0)
+}
+
