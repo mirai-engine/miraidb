@@ -2903,6 +2903,12 @@ Stream_Scan_Ctx :: struct {
 stream_row_visit :: proc(raw: rawptr, row: Row) -> bool {
 	scan := cast(^Stream_Scan_Ctx)raw
 	if scan.err.kind != .None do return false
+	// A streamed scan is a loop over rows like any other, so it answers an
+	// interrupt (and a progress handler) between rows; it used to run to the end.
+	if store_cancelled(scan.tx.store) {
+		scan.err = errf(.Cancelled, "query cancelled")
+		return false
+	}
 	// The slice lives on this frame: one allocation per row in the transaction
 	// arena would make a streamed scan cost the table again in memory.
 	one: [1]Source
