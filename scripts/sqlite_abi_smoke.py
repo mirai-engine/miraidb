@@ -526,7 +526,9 @@ def main() -> int:
         stopped.append(values[0])
         return 1
 
-    assert lib.sqlite3_exec(exec_db, b"SELECT a FROM ex", ctypes.cast(stop, ctypes.c_void_p), None, None) == OK
+    # A callback that answers non-zero stops the statement and exec answers
+    # SQLITE_ABORT, as SQLite does; it used to answer SQLITE_OK.
+    assert lib.sqlite3_exec(exec_db, b"SELECT a FROM ex", ctypes.cast(stop, ctypes.c_void_p), None, None) == 4
     assert stopped == [b"1"], stopped
     assert lib.sqlite3_close(exec_db) == OK
 

@@ -75,6 +75,7 @@ SIGNATURES = {
 TRANSIENT = c_void_p(-1)
 
 STMTSTATUS_RUN = 6
+EXEC_CALLBACK = ctypes.CFUNCTYPE(c_int, c_void_p, c_int, ctypes.POINTER(c_char_p), ctypes.POINTER(c_char_p))
 
 
 # Symbols a SQLite build may leave out: the column metadata calls exist only
@@ -305,6 +306,22 @@ def observe(lib) -> dict[str, object]:
             lib.sqlite3_column_name(named, i) for i in range(lib.sqlite3_column_count(named))
         ]
         lib.sqlite3_finalize(named)
+
+    # exec hands each row to its callback and stops when the callback says so.
+    rows_seen = []
+
+    @EXEC_CALLBACK
+    def take_two(arg, count, values, names):
+        rows_seen.append((values[0], names[0]))
+        return 1 if len(rows_seen) == 2 else 0
+
+    message = c_void_p()
+    code = lib.sqlite3_exec(db, b"SELECT id AS n FROM people; SELECT 1", ctypes.cast(take_two, c_void_p), None, ctypes.byref(message))
+    seen["exec stopped by its callback"] = (code, ctypes.string_at(message.value) if message.value else None, rows_seen, lib.sqlite3_errcode(db))
+    lib.sqlite3_free(message)
+    rows_seen.clear()
+    code = lib.sqlite3_exec(db, b"  ; SELECT 7 AS x; -- end", ctypes.cast(take_two, c_void_p), None, None)
+    seen["exec of a text with empty statements"] = (code, rows_seen)
 
     sqlite_abi_functions.observe(lib, db, seen)
     sqlite_abi_hooks.observe(lib, db, seen)
