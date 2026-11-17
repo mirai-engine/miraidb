@@ -225,10 +225,25 @@ embed_in_transaction :: proc(conn: ^Embed_Conn) -> bool {
 	return conn != nil && conn.tx != nil
 }
 
-// embed_authorize asks the store's authorizer about a statement just prepared,
-// reading the catalog the connection sees.
+// embed_authorize checks the names a statement just prepared uses (D37) and
+// asks the store's authorizer about it, reading the catalog the connection
+// sees.
 @(private)
 embed_authorize :: proc(conn: ^Embed_Conn, prepared: ^Stmt_Prepared) -> Error {
+	if prepared.is_pragma do return embed_authorize_only(conn, prepared)
+	tx := conn.tx
+	own := tx == nil
+	if own do tx = tx_begin_read(conn.store)
+	defer if own do tx_end(tx)
+	if resolve_err := sql_resolve_names(tx, &prepared.query.statement); resolve_err.kind != .None do return resolve_err
+	if conn.store.hooks.authorizer == nil do return ERROR_NONE
+	ignored, err := sql_authorize(conn.store, tx, prepared)
+	prepared.ignored = ignored
+	return err
+}
+
+@(private)
+embed_authorize_only :: proc(conn: ^Embed_Conn, prepared: ^Stmt_Prepared) -> Error {
 	if conn.store.hooks.authorizer == nil do return ERROR_NONE
 	tx := conn.tx
 	own := tx == nil

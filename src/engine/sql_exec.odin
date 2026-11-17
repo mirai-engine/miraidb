@@ -570,6 +570,12 @@ sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sq
 	// A write statement makes the transaction a write transaction even when it
 	// changes no row, which is when SQLite calls its commit hook.
 	tx.wrote = true
+	#partial switch _ in statement {
+	case Insert_Stmt, Update_Stmt, Delete_Stmt:
+		// A name that is not there is refused before a row is written (D37).
+		statement := statement
+		if resolve_err := sql_resolve_names(tx, &statement); resolve_err.kind != .None do return {}, resolve_err
+	}
 	// A write with CTEs materializes them for its own life, then runs as a
 	// plain write that reads them by name.
 	if ctes, recursive := statement_ctes(statement); len(ctes) > 0 {
@@ -1427,6 +1433,9 @@ free_partials :: proc(items: ^[dynamic][]Source) {
 // sql_run_query executes a plain query or one prefixed with common table
 // expressions, which are materialized for the life of the statement.
 sql_run_query :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sql_Result, Error) {
+	// A name that is not there is refused before a row is read (D37).
+	statement := statement
+	if resolve_err := sql_resolve_names(tx, &statement); resolve_err.kind != .None do return {}, resolve_err
 	if select_stmt, ok := statement.(Select_Stmt); ok {
 		return sql_exec_select(tx, select_stmt, params)
 	}

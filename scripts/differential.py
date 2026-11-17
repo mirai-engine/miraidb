@@ -17,6 +17,8 @@ Three lists keep it honest:
   the engine grows.
 - `DIFFERENT` must answer *differently* on purpose; if the answers converge the
   entry is stale and fails the gate.
+- `REJECTED` must fail in both engines: a statement that names something that
+  is not there is refused before it runs, whatever the table holds.
 
 Usage: python3 scripts/differential.py [--bin ./bin/miraidb.exe] [--verbose]
 """
@@ -63,6 +65,7 @@ SETUP = [
     "INSERT INTO kv (k, v) VALUES ('a', 1), ('b', 2)",
     "CREATE TABLE audit (id INTEGER PRIMARY KEY, k TEXT, old_v INTEGER, new_v INTEGER)",
     "CREATE TRIGGER kv_audit AFTER UPDATE ON kv BEGIN INSERT INTO audit (k, old_v, new_v) VALUES (OLD.k, OLD.v, NEW.v); END",
+    "CREATE TABLE empty_t (a INTEGER, b TEXT)",
 ]
 
 QUERIES = [
@@ -247,6 +250,21 @@ REFUSED = {
 
     "SELECT sum(n) FILTER (WHERE n > 1) FROM nums": "an aggregate FILTER is not implemented; windows accept one",
 
+}
+
+# Both engines refuse these. A name that is not there is refused before the
+# statement runs, so an empty table does not hide it (D37).
+REJECTED = {
+    "SELECT nope FROM empty_t": "a misspelled column in the projection",
+    "SELECT a FROM empty_t WHERE nope = 1": "a misspelled column in WHERE",
+    "SELECT a FROM empty_t ORDER BY nope": "a misspelled column in ORDER BY",
+    "SELECT a FROM empty_t GROUP BY nope": "a misspelled column in GROUP BY",
+    "SELECT * FROM missing_t": "a table that does not exist",
+    "SELECT e.nope FROM empty_t AS e": "a qualified column that does not exist",
+    "SELECT a FROM empty_t WHERE a IN (SELECT nope FROM empty_t)": "a misspelled column in a subquery",
+    "UPDATE empty_t SET nope = 1": "an assigned column that does not exist",
+    "DELETE FROM empty_t WHERE nope = 1": "a misspelled column in a DELETE",
+    "INSERT INTO empty_t (nope) VALUES (1)": "an inserted column that does not exist",
 }
 
 # Both engines answer, differently, on purpose. These are the decisions listed
@@ -484,6 +502,18 @@ def main() -> int:
             continue
         refused += 1
 
+    rejected = 0
+    for statement, reason in REJECTED.items():
+        mine, my_error, my_status = miraidb_query(binary, statement)
+        theirs, their_error, their_status = sqlite_query(statement)
+        if their_status == 0:
+            failures.append(f"REJECTED lists a statement SQLite accepts: {statement} ({reason})")
+            continue
+        if my_status == 0:
+            failures.append(f"miraidb accepted a statement both should refuse: {statement} ({reason})")
+            continue
+        rejected += 1
+
     different = 0
     for statement, reason in DIFFERENT.items():
         mine, my_error, my_status = miraidb_query(binary, statement)
@@ -506,7 +536,7 @@ def main() -> int:
         return 1
     print(
         f"differential: {compared} queries agree, {refused} refusals as documented, "
-        f"{different} intentional differences"
+        f"{rejected} rejected by both, {different} intentional differences"
     )
     return 0
 

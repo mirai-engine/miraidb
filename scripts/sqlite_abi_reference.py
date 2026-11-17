@@ -214,6 +214,16 @@ def observe(lib) -> dict[str, object]:
     lib.sqlite3_free(message)
     seen["errmsg after success"] = (exec_(b"SELECT 1"), lib.sqlite3_errmsg(db))
 
+    # A name that is not there fails the prepare, with SQLite's code and words,
+    # whatever the table holds (D37).
+    for sql in (b"SELECT * FROM missing", b"SELECT nope FROM people", b"SELECT p.nope FROM people AS p",
+                b"SELECT id FROM people ORDER BY nope", b"INSERT INTO people (nope) VALUES (1)",
+                b"UPDATE people SET nope = 1", b"DELETE FROM people WHERE nope = 1"):
+        failed = c_void_p()
+        code = lib.sqlite3_prepare_v2(db, sql, -1, ctypes.byref(failed), None)
+        seen[f"prepare of {sql!r}"] = (code, failed.value is None, lib.sqlite3_errmsg(db))
+        lib.sqlite3_finalize(failed)
+
     # A prepare that fails says where: at the token it stopped on, or -1 when
     # the text simply ended (SQLite's "incomplete input"). The two grammars stop
     # on the same token for these; a misspelled keyword after a valid prefix is

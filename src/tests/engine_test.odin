@@ -8178,6 +8178,8 @@ test_bind_range_and_live_handles :: proc(t: ^testing.T) {
 	conn, open_err := db.embed_open(":memory:")
 	if !testing.expectf(t, db.error_ok(open_err), "open failed: %s", open_err.message) do return
 	defer db.embed_close(conn)
+	// A prepare reads the catalog, so the table exists first (D37).
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "CREATE TABLE t (a INTEGER, b INTEGER)")))
 
 	stmt := db.embed_prepare(conn, "INSERT INTO t (a, b) VALUES (?, ?)")
 	if !testing.expect(t, stmt != nil) do return
