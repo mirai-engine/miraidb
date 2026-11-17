@@ -160,6 +160,26 @@ column of the inner statement wins over one of the same name outside it. A later
 step cannot be the inner side of a `RIGHT` or `FULL` join, because that side is
 kept when nothing matched and a lateral row only exists once an outer row does.
 
+## LISTEN and NOTIFY
+
+A connection can listen on a channel, and another one can notify it. Over the
+PostgreSQL wire the listener receives the protocol's NotificationResponse on its
+own, without having asked for anything.
+
+```sql
+LISTEN orders;                       -- this connection hears the channel
+NOTIFY orders;                       -- no payload
+NOTIFY orders, 'created: 42';        -- with a payload
+UNLISTEN orders;                     -- stop hearing this one
+UNLISTEN *;                          -- stop hearing every channel
+```
+
+The channel registry belongs to the database, so two connections of the same
+server share it, and a notification is delivered to every listener but the
+connection that sent it, as PostgreSQL delivers it. `NOTIFY` is delivered while the
+statement runs rather than at `COMMIT`, which is the one difference worth knowing:
+a transaction that rolls back after notifying has already been heard.
+
 ## Cursors
 
 A cursor holds a query's rows and hands them out a few at a time, which is how a

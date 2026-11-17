@@ -2,7 +2,7 @@
 
 The record of the feature set this engine targets. Each row is one capability,
 with its status in this tree, the evidence that closed it, and the test or gate
-that covers it. IDs are stable. The matrix is closed: 100 rows, all `done`, and
+that covers it. IDs are stable. The matrix is closed: 101 rows, all `done`, and
 every row names its test; `scripts/docs_check.py` fails if a name stops existing,
 so "each with a test" is a claim the gate checks rather than a sentence.
 [closing-plan.md](closing-plan.md)
@@ -24,13 +24,13 @@ Effort: **S** small, **M** medium, **L** large.
 | B. Schema and catalog | 16 | 0 | 0 | 16 |
 | C. Datastore and transactions | 11 | 0 | 0 | 11 |
 | D. Commit log and durability | 9 | 0 | 0 | 9 |
-| E. Queries and SQL | 20 | 0 | 0 | 20 |
+| E. Queries and SQL | 21 | 0 | 0 | 21 |
 | F. Server and protocol | 14 | 0 | 0 | 14 |
 | G. Modules and ABI | 10 | 0 | 0 | 10 |
 | H. Tooling, SDK and operations | 10 | 0 | 0 | 10 |
-| **Total (100)** | **100** | **0** | **0** | **100** |
+| **Total (101)** | **101** | **0** | **0** | **101** |
 
-**100 done (100 %)**: 0 partial, 0 todo, and every row is covered by a test.
+**101 done (100 %)**: 0 partial, 0 todo, and every row is covered by a test.
 Parity is interface-level by definition; where the implementation is shallower
 than a mature engine, the gap is named with its cost in [backlog.md](backlog.md)
 rather than hidden in this table.
@@ -118,6 +118,7 @@ rather than hidden in this table.
 | E11 | `LIKE` escapes, casts between all types | done | `ESCAPE` supported; casts cover numbers, text, bool, timestamp, uuid, identity | test_like_escape, test_cast_to_narrow_types |
 | E12 | Views as query sources | done | materialized per reference inside the transaction | test_views |
 | E13 | System tables | done | `_tables`, `_columns` and `_indexes` synthesized from the catalog with full WHERE/ORDER BY support | test_system_tables |
+| E21 | `LISTEN` and `NOTIFY` | done | `LISTEN channel`, `UNLISTEN channel`/`UNLISTEN *` and `NOTIFY channel [, payload]`; the listener receives the protocol's NotificationResponse on its own connection, a sender does not hear itself, and the registry belongs to the database | test_listen_registry, scripts/pg_notify_smoke.py |
 | E20 | The SQLite function and pragma surface | done | the hyperbolic family, `soundex`, `unistr`/`unistr_quote`, `timediff`, `affinity`, `sqlite_source_id`, `sqlite_compileoption_*` and every pragma in the inventory (`collation_list`, `module_list`, `shrink_memory`, `soft_heap_limit64`, `temp_store*`, `data_store_directory`, `incremental_vacuum`, `legacy_file_format`); the counts are in `scripts/sqlite_gaps.py` (96/121 functions, 63/63 pragmas) | test_sqlite_scalar_gaps, test_sqlite_pragma_gaps, scripts/sqlite_gaps.py |
 | E19 | Cursors | done | `DECLARE name CURSOR FOR query`, `FETCH` (NEXT, PRIOR, FIRST, LAST, ABSOLUTE, RELATIVE, FORWARD, BACKWARD, ALL), `MOVE` and `CLOSE [ALL]`; a cursor lives in the transaction that declared it and a `WITH HOLD` one is refused with words | test_cursors |
 | E18 | `LATERAL` | done | `FROM a, LATERAL (SELECT ...)` and `JOIN LATERAL (...) ON ...`: the derived table is evaluated once per row of the sources to its left, so its aggregates and filters read that row; a RIGHT or FULL join of a lateral step is refused | test_lateral_subqueries |
@@ -177,7 +178,7 @@ rather than hidden in this table.
 
 ## Order the work followed
 
-This section used to list the dependency order for the rows still open. All 100
+This section used to list the dependency order for the rows still open. All 101
 are closed, so the order is history: the last engine rows landed in this order
 (E9, F7/F9, G1–G3, G5–G7/G9/G10, H2/H6, then the L rows). What is left is not
 parity: it is depth, and `docs/roadmap.md` orders it.

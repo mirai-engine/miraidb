@@ -131,6 +131,11 @@ def build_gates(args: argparse.Namespace) -> list[Gate]:
             gates.append(
                 Gate("COPY over the wire", [args.windows_python, "scripts/pg_copy_smoke.py"])
             )
+            # LISTEN and NOTIFY need two connections: one hears what the other
+            # says, and the server pushes it without being asked.
+            gates.append(
+                Gate("LISTEN/NOTIFY over the wire", [args.windows_python, "scripts/pg_notify_smoke.py"])
+            )
         else:
             print(f"ci: no Windows Python at {args.windows_python}; skipping the DLL smokes")
     for package in PACKAGES:

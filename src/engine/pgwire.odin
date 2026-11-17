@@ -122,6 +122,17 @@ pg_parameter_status :: proc(name, value: string) -> []u8 {
 	return pg_message('S', body[:])
 }
 
+// pg_notification_response is PostgreSQL's NotificationResponse: the sender's pid,
+// the channel and the payload. The sender is nobody here, which is what the
+// protocol allows a server to say.
+pg_notification_response :: proc(channel, payload: string) -> []u8 {
+	body: [dynamic]u8
+	pg_put_i32(&body, 0)
+	pg_put_cstring(&body, channel)
+	pg_put_cstring(&body, payload)
+	return pg_message('A', body[:])
+}
+
 pg_ready_for_query :: proc(status: u8) -> []u8 {
 	body: [dynamic]u8
 	append(&body, status)
@@ -389,6 +400,9 @@ Pg_Session :: struct {
 	// skip is the extended protocol's error rule: after an ErrorResponse every
 	// message is discarded until the next Sync, which answers ReadyForQuery.
 	skip:       bool,
+	// owner is the identity the server gave this connection: LISTEN records it and
+	// NOTIFY delivers to it.
+	owner:      u64,
 	// copy is a COPY FROM STDIN waiting for its CopyDone. The parsed statement
 	// keeps its own arena, because the rows arrive after the Query message is
 	// gone.

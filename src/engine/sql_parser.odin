@@ -278,6 +278,9 @@ parse_statement :: proc(p: ^Parser) -> Statement {
 	if p_is_keyword(p, "declare") do return parse_declare_cursor(p)
 	if p_is_keyword(p, "fetch") || p_is_keyword(p, "move") do return parse_fetch(p)
 	if p_is_keyword(p, "close") do return parse_close_cursor(p)
+	if p_is_keyword(p, "listen") do return parse_listen(p)
+	if p_is_keyword(p, "unlisten") do return parse_unlisten(p)
+	if p_is_keyword(p, "notify") do return parse_notify(p)
 	if p_is_keyword(p, "grant") do return parse_grant(p, false)
 	if p_is_keyword(p, "revoke") do return parse_grant(p, true)
 	if p_is_keyword(p, "create") do return parse_create(p)
@@ -565,6 +568,45 @@ parse_fetch_count :: proc(p: ^Parser, required := true) -> int {
 		value = value * 10 + i64(c - '0')
 	}
 	return int(negative ? -value : value)
+}
+
+// parse_listen and its two neighbours read the channel and its payload. A channel
+// is an identifier or a text literal, as PostgreSQL accepts both.
+@(private)
+parse_channel :: proc(p: ^Parser) -> string {
+	if p.current.kind == .String {
+		text := strings.clone(p.current.text, p.alloc)
+		p_advance(p)
+		return text
+	}
+	return p_ident(p)
+}
+
+@(private)
+parse_listen :: proc(p: ^Parser) -> Statement {
+	p_expect_keyword(p, "listen")
+	return Listen_Stmt{channel = parse_channel(p)}
+}
+
+@(private)
+parse_unlisten :: proc(p: ^Parser) -> Statement {
+	p_expect_keyword(p, "unlisten")
+	if p_match_punct(p, "*") do return Unlisten_Stmt{all = true}
+	return Unlisten_Stmt{channel = parse_channel(p)}
+}
+
+@(private)
+parse_notify :: proc(p: ^Parser) -> Statement {
+	p_expect_keyword(p, "notify")
+	stmt: Notify_Stmt
+	stmt.channel = parse_channel(p)
+	if p_match_punct(p, ",") {
+		if p.current.kind == .String {
+			stmt.payload = strings.clone(p.current.text, p.alloc)
+			p_advance(p)
+		}
+	}
+	return stmt
 }
 
 @(private)

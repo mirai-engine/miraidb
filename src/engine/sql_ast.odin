@@ -576,6 +576,23 @@ Describe_Stmt :: struct {
 	name: string,
 }
 
+// Listen_Stmt is `LISTEN channel`: this connection hears every NOTIFY on it.
+Listen_Stmt :: struct {
+	channel: string,
+}
+
+// Unlisten_Stmt is `UNLISTEN channel` or `UNLISTEN *`.
+Unlisten_Stmt :: struct {
+	channel: string,
+	all:     bool,
+}
+
+// Notify_Stmt is `NOTIFY channel [, payload]`.
+Notify_Stmt :: struct {
+	channel: string,
+	payload: string,
+}
+
 // Cursor is a query a session reads a few rows at a time. It belongs to the
 // transaction that declared it, as PostgreSQL's cursors do: a commit closes them.
 Cursor :: struct {
@@ -691,6 +708,9 @@ Statement :: union {
 	Declare_Cursor_Stmt,
 	Fetch_Stmt,
 	Close_Cursor_Stmt,
+	Listen_Stmt,
+	Unlisten_Stmt,
+	Notify_Stmt,
 	Copy_Stmt,
 	Analyze_Stmt,
 	Vacuum_Stmt,
@@ -848,6 +868,12 @@ statement_name :: proc(statement: Statement) -> string {
 		return "FETCH"
 	case Close_Cursor_Stmt:
 		return "CLOSE"
+	case Listen_Stmt:
+		return "LISTEN"
+	case Unlisten_Stmt:
+		return "UNLISTEN"
+	case Notify_Stmt:
+		return "NOTIFY"
 	case Analyze_Stmt:
 		return "ANALYZE"
 	case Vacuum_Stmt:

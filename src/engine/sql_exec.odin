@@ -165,6 +165,18 @@ sql_run_statement :: proc(store: ^Store, statement: Statement, params: []Value) 
 			"%s belongs to a session: open a transaction, or use the wire protocol",
 			statement_name(stmt),
 		)
+	case Listen_Stmt, Unlisten_Stmt, Notify_Stmt:
+		// These belong to the database, not to a transaction: an embedded call
+		// with no connection identity is the only listener it can have.
+		tx := tx_begin_write(store)
+		result, exec_err := sql_exec_mutation(tx, stmt, params)
+		if exec_err.kind != .None {
+			tx_rollback(tx)
+			return {}, exec_err
+		}
+		if commit_err := tx_commit(tx); commit_err.kind != .None do return {}, commit_err
+		result.commit_seq = store.commit_seq
+		return result, ERROR_NONE
 	}
 	return {}, errf(.Sql_Unsupported, "unsupported statement")
 }
@@ -242,6 +254,15 @@ sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value) 
 		return result, err
 	case Create_Table_Stmt, Alter_Table_Stmt, Create_Type_Stmt, Drop_Table_Stmt, Create_Index_Stmt, Drop_Index_Stmt, Create_View_Stmt, Drop_View_Stmt, Create_Policy_Stmt, Drop_Policy_Stmt, Truncate_Stmt, Create_Trigger_Stmt, Drop_Trigger_Stmt, Grant_Stmt, Create_Virtual_Table_Stmt, Load_Extension_Stmt:
 		return sql_exec_mutation(tx, stmt, params)
+	case Listen_Stmt:
+		store_listen(tx.store, tx.store.session_owner, stmt.channel)
+		return Sql_Result{kind = .Ack, commit_seq = tx.store.commit_seq}, ERROR_NONE
+	case Unlisten_Stmt:
+		store_unlisten(tx.store, tx.store.session_owner, stmt.channel, stmt.all)
+		return Sql_Result{kind = .Ack, commit_seq = tx.store.commit_seq}, ERROR_NONE
+	case Notify_Stmt:
+		store_notify(tx.store, tx.store.session_owner, stmt.channel, stmt.payload)
+		return Sql_Result{kind = .Ack, commit_seq = tx.store.commit_seq}, ERROR_NONE
 	case Declare_Cursor_Stmt:
 		return sql_exec_declare_cursor(tx, stmt, params)
 	case Fetch_Stmt:
@@ -481,6 +502,15 @@ sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sq
 		// A cursor needs the transaction object, which the caller of this switch
 		// already has: the in-transaction dispatch answers these.
 		return {}, errf(.Internal, "%s is answered by the transaction", statement_name(stmt))
+	case Listen_Stmt:
+		store_listen(tx.store, tx.store.session_owner, stmt.channel)
+		return Sql_Result{kind = .Ack, commit_seq = tx.store.commit_seq}, ERROR_NONE
+	case Unlisten_Stmt:
+		store_unlisten(tx.store, tx.store.session_owner, stmt.channel, stmt.all)
+		return Sql_Result{kind = .Ack, commit_seq = tx.store.commit_seq}, ERROR_NONE
+	case Notify_Stmt:
+		store_notify(tx.store, tx.store.session_owner, stmt.channel, stmt.payload)
+		return Sql_Result{kind = .Ack, commit_seq = tx.store.commit_seq}, ERROR_NONE
 	case Analyze_Stmt:
 		// ANALYZE needs the tables, not the transaction: it belongs to the store.
 		return {}, errf(.Sql_Not_A_Query, "ANALYZE does not run inside a transaction")
@@ -860,6 +890,8 @@ sql_exec_explain :: proc(tx: ^Tx, stmt: Explain_Stmt, params: []Value) -> (Sql_R
 		return {}, errf(.Sql_Not_A_Query, "EXPLAIN does not apply to MERGE")
 	case Declare_Cursor_Stmt, Fetch_Stmt, Close_Cursor_Stmt:
 		return {}, errf(.Sql_Not_A_Query, "EXPLAIN does not apply to a cursor statement")
+	case Listen_Stmt, Unlisten_Stmt, Notify_Stmt:
+		return {}, errf(.Sql_Not_A_Query, "EXPLAIN does not apply to LISTEN or NOTIFY")
 	case Select_Stmt:
 		order := plan_join_order(store, tx, inner, params)
 		first := order.steps[0]

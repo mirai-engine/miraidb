@@ -118,6 +118,10 @@ main :: proc() {
 		server.pg_password = os.get_env("MIRAIDB_PG_PASSWORD", context.allocator)
 	}
 	server.timeout_us = statement_timeout_ms * 1000
+	// NOTIFY reaches a listener through the connection the server registered under
+	// the owner the statement carried.
+	host.store.on_notify = server_deliver_notification
+	host.store.on_notify_ctx = &server
 	server.connections = make(map[u64]^Connection)
 	defer delete(server.connections)
 	host.on_update = server_on_update
@@ -474,6 +478,24 @@ pg_authenticate :: proc(
 	return nil, state
 }
 
+// server_deliver_notification writes one NOTIFY to the connection that listens for
+// it, as the asynchronous message the protocol defines.
+@(private)
+server_deliver_notification :: proc(ctx: rawptr, owner: u64, channel, payload: string) {
+	server := (^Server)(ctx)
+	fmt.eprintfln("DBG deliver to owner=%d", owner)
+	sync.mutex_lock(&server.registry)
+	connection, found := server.connections[owner]
+	sync.mutex_unlock(&server.registry)
+	if !found do return
+	fmt.eprintfln("DBG deliver found=%v", found)
+	message := db.pg_notification_response(channel, payload)
+	defer delete(message)
+	// A notification is not the answer to a message; it goes out on its own, under
+	// the send lock the connection already takes for every write.
+	_ = send(connection, message)
+}
+
 // serve_postgres answers the startup and then handles simple-query messages.
 @(private)
 serve_postgres :: proc(connection: ^Connection) {
@@ -496,6 +518,7 @@ serve_postgres :: proc(connection: ^Connection) {
 		delete(ready)
 	}
 	session := db.pg_session_init()
+	session.owner = connection.owner
 	// A BEGIN holds the store's write lock until COMMIT or ROLLBACK, so the
 	// connection keeps the statement lock for that whole time: another
 	// connection waits for the transaction instead of taking the statement lock
@@ -541,6 +564,9 @@ serve_postgres :: proc(connection: ^Connection) {
 			} else {
 				statement_begin(connection.port)
 			}
+			// The statement runs on behalf of this connection: LISTEN and NOTIFY
+			// read the identity from the store while the statement lock is held.
+			host.store.session_owner = connection.owner
 			response, close := db.pg_handle_session_message(host, session, pending[:total])
 			holding = db.pg_session_in_transaction(session)
 			if holding {

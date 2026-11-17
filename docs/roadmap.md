@@ -8,7 +8,7 @@ The project has two goals, and the open work is split by them, plus the
 hardening a release needs:
 
 - **A. The reference model, equalled or beaten.** The feature matrix is closed
-  ([features.md](features.md), 100/100), so what is left on this axis is speed and
+  ([features.md](features.md), 101/101), so what is left on this axis is speed and
   depth: the reference's own benchmark suite still puts this engine behind on
   every workload but the empty transaction.
 - **B. SQLite's features.** Measured by `scripts/sqlite_gaps.py` over every
@@ -114,4 +114,4 @@ the CI gate checks; they are not a comparison with the reference.
 Every row of this table is met today and gated by `scripts/bench.py`, the read
 and commit numbers by `bench-read`, and the subscription row by
 `test_join_subscription_probes_the_join_key`. The engineering gates are listed in
-`docs/status.md` and run by `scripts/ci.py` (29 gates).
+`docs/status.md` and run by `scripts/ci.py` (30 gates).

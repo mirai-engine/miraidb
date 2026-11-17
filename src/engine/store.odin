@@ -152,6 +152,20 @@ Store :: struct {
 	// unlimited. work_used accumulates what the store spent so far.
 	max_work_per_call: u64,
 	work_used:         u64,
+	// listeners is who asked to hear about a channel: LISTEN adds an owner,
+	// UNLISTEN takes it away, and NOTIFY delivers to everyone but the sender. One
+	// map of pairs, not a map of maps: a map stored in another map is a copy here
+	// and a write to it is lost.
+	listeners: map[Listener_Key]bool,
+	// on_notify delivers one notification to one listener. The server installs it
+	// and turns it into the wire's NotificationResponse; an embedded session has
+	// none and the delivery is dropped.
+	on_notify:     Notification_Deliver,
+	on_notify_ctx: rawptr,
+	// session_owner is the connection making the call that is running. Statements
+	// run one at a time under the statement lock, so one field is enough and
+	// LISTEN knows who is listening.
+	session_owner: u64,
 	// rows_scanned is how many rows every scan visited since the last reset. It is
 	// what proves a predicate narrows a scan instead of being checked per row.
 	rows_scanned: u64,
@@ -450,6 +464,8 @@ store_close :: proc(store: ^Store) {
 	delete(store.functions)
 	for name, _ in store.collations do delete(name)
 	delete(store.collations)
+	for key in store.listeners do delete(key.channel)
+	delete(store.listeners)
 	delete(store.pinned_reads)
 	for &arena in store.arenas do virtual.arena_destroy(&arena)
 	delete(store.arenas)
@@ -1533,6 +1549,68 @@ store_host_access :: proc(store: ^Store) -> bool {
 // host_access_refusal is the one message the three statements give when the
 // store was opened without host access, so a caller learns what to ask for.
 @(private)
+	// Listener_Key is one listener: a connection and the channel it hears.
+Listener_Key :: struct {
+	channel: string,
+	owner:   u64,
+}
+
+// Notification_Deliver sends one NOTIFY to one listener. The owner identifies the
+// connection that listened; the server maps it to a socket.
+Notification_Deliver :: proc(ctx: rawptr, owner: u64, channel, payload: string)
+
+// store_listen adds an owner to a channel. A channel is one name however it is
+// spelled, as a table name is, so the key reuses the spelling already there. The
+// first time, the name is cloned: the statement's arena goes away with the
+// statement, and the key outlives it.
+store_listen :: proc(store: ^Store, owner: u64, channel: string) {
+	if store.listeners == nil do store.listeners = make(map[Listener_Key]bool)
+	name, found := store_listener_channel(store, channel)
+	if !found do name = strings.clone(channel)
+	store.listeners[Listener_Key{channel = name, owner = owner}] = true
+}
+
+// store_listener_channel is the spelling a channel is stored under, and whether
+// there is one.
+@(private)
+store_listener_channel :: proc(store: ^Store, channel: string) -> (string, bool) {
+	for key in store.listeners {
+		if strings.equal_fold(key.channel, channel) do return key.channel, true
+	}
+	return channel, false
+}
+
+// store_unlisten takes an owner off one channel, or off every channel it listens
+// to. It reports whether there was anything to take it off.
+store_unlisten :: proc(store: ^Store, owner: u64, channel: string, all: bool) -> bool {
+	removed := false
+	dropped := make([dynamic]Listener_Key, 0, len(store.listeners), context.temp_allocator)
+	for key in store.listeners {
+		if key.owner != owner do continue
+		if all || strings.equal_fold(key.channel, channel) {
+			append(&dropped, key)
+			removed = true
+		}
+	}
+	for key in dropped do delete_key(&store.listeners, key)
+	return removed
+}
+
+// store_notify delivers one NOTIFY to every listener of the channel but the
+// sender, which is what PostgreSQL does, and answers how many heard it.
+store_notify :: proc(store: ^Store, from: u64, channel, payload: string) -> int {
+	delivered := 0
+	for key in store.listeners {
+		if key.owner == from do continue
+		if !strings.equal_fold(key.channel, channel) do continue
+		if store.on_notify != nil {
+			store.on_notify(store.on_notify_ctx, key.owner, channel, payload)
+		}
+		delivered += 1
+	}
+	return delivered
+}
+
 host_access_refusal :: proc(statement: string) -> Error {
 	return errf(
 		.Permission_Denied,
