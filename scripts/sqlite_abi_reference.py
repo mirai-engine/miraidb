@@ -16,6 +16,8 @@ import ctypes.util
 import os
 import sys
 
+import sqlite_abi_functions
+
 c_void_p, c_int, c_char_p, c_longlong = ctypes.c_void_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_longlong
 
 SIGNATURES = {
@@ -31,6 +33,7 @@ SIGNATURES = {
     "sqlite3_reset": ([c_void_p], c_int),
     "sqlite3_finalize": ([c_void_p], c_int),
     "sqlite3_column_int64": ([c_void_p, c_int], c_longlong),
+    "sqlite3_column_double": ([c_void_p, c_int], ctypes.c_double),
     "sqlite3_column_text": ([c_void_p, c_int], c_char_p),
     "sqlite3_bind_zeroblob": ([c_void_p, c_int, c_int], c_int),
     "sqlite3_last_insert_rowid": ([c_void_p], c_longlong),
@@ -91,6 +94,7 @@ def load(path: str):
             continue
         function.argtypes = args
         function.restype = result
+    sqlite_abi_functions.bind(lib)
     # Python's own SQLite is built with SQLITE_OMIT_AUTOINIT: without this call
     # its first sqlite3_open writes through a NULL pointer.
     assert lib.sqlite3_initialize() == 0
@@ -276,6 +280,17 @@ def observe(lib) -> dict[str, object]:
                 for i in range(columns + 1)
             ]
         lib.sqlite3_finalize(described)
+
+    # A column read as a number follows SQLite's conversions: text is read for
+    # its leading integer by column_int64 and its number by column_double.
+    reader = prepare(b"SELECT '42', ' 12.9x', 4.7, '1e3', 'abc', NULL, x'3739'")
+    lib.sqlite3_step(reader)
+    seen["column_int64 and column_double of each kind"] = [
+        (lib.sqlite3_column_int64(reader, i), lib.sqlite3_column_double(reader, i)) for i in range(7)
+    ]
+    lib.sqlite3_finalize(reader)
+
+    sqlite_abi_functions.observe(lib, db, seen)
 
     seen["errstr"] = [lib.sqlite3_errstr(code) for code in (*range(0, 30), 100, 101, 516, 19 | 8 << 8, 9999)]
     assert lib.sqlite3_close(db) == 0

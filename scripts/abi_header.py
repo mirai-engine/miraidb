@@ -25,17 +25,23 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# Each package, every .odin file in it, against its header.
 PAIRS = [
-    ("src/sqlite_compat/compat.odin", "include/sqlite3_miraidb.h", "sqlite3_"),
-    ("src/capi/capi.odin", "include/miraidb.h", "miraidb_"),
+    ("src/sqlite_compat", "include/sqlite3_miraidb.h", "sqlite3_"),
+    ("src/capi", "include/miraidb.h", "miraidb_"),
 ]
 
 COMMENT = re.compile(r"/\*.*?\*/", re.S)
 
 
-def exported(source_path: str, prefix: str) -> set[str]:
-    """Names a package exports: `@(export)` then `name :: proc "c"`."""
-    text = open(os.path.join(ROOT, source_path), encoding="utf-8").read()
+def exported(package: str, prefix: str) -> set[str]:
+    """Names a package exports: `@(export)` then `name :: proc "c"`, in any file."""
+    directory = os.path.join(ROOT, package)
+    text = "".join(
+        open(os.path.join(directory, name), encoding="utf-8").read()
+        for name in sorted(os.listdir(directory))
+        if name.endswith(".odin")
+    )
     names = set()
     for match in re.finditer(r"@\(export\)\s*\n\s*([a-z0-9_]+)\s*::\s*proc", text):
         name = match.group(1)

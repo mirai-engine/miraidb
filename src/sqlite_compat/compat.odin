@@ -69,6 +69,11 @@ Database :: struct {
 	// statements is what this connection handed out and has not finalized, so a
 	// close can make them misuse rather than leave them dangling (D29).
 	statements: map[rawptr]^Statement,
+	// functions are the application-defined functions registered on this
+	// connection; function_code is the code the last failing one answered, so
+	// the statement it failed reports it.
+	functions:     [dynamic]^Function,
+	function_code: c.int,
 }
 
 Statement :: struct {
@@ -361,9 +366,17 @@ fail :: proc(db: ^Database, err: engine.Error) -> c.int {
 	}
 	set_error(db, err.message)
 	code := sqlite_code(err)
+	extended := sqlite_extended_code(err)
+	// A function that failed with its own code (sqlite3_result_error_code) is
+	// the statement's answer, as in SQLite.
+	if db != nil && db.function_code != 0 {
+		code = db.function_code & 0xff
+		extended = db.function_code
+		db.function_code = 0
+	}
 	if db != nil {
 		db.last_code = code
-		db.last_extended = sqlite_extended_code(err)
+		db.last_extended = extended
 	}
 	// A caller in extended mode reads the narrow code from the return value as
 	// well, so the check it wrote next to sqlite3_step keeps working.
@@ -430,6 +443,7 @@ sqlite3_close :: proc "c" (handle: rawptr) -> c.int {
 	delete(db.statements)
 	delete(keys)
 	engine.handle_forget(rawptr(db))
+	functions_close(db)
 	engine.embed_close(db.conn)
 	delete(db.last_error)
 	free(db)
@@ -862,7 +876,10 @@ sqlite3_column_int64 :: proc "c" (handle: rawptr, index: c.int) -> c.longlong {
 	context = runtime.default_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return 0
-	return c.longlong(engine.embed_column_int(stmt.stmt, int(index)))
+	// SQLite's conversion: text is read for its numeric prefix ('42' is 42).
+	value, ok := engine.embed_column_value(stmt.stmt, int(index))
+	if !ok do return 0
+	return c.longlong(sqlite_to_i64(value))
 }
 
 @(export)
@@ -870,7 +887,9 @@ sqlite3_column_double :: proc "c" (handle: rawptr, index: c.int) -> c.double {
 	context = runtime.default_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return 0
-	return c.double(engine.embed_column_float(stmt.stmt, int(index)))
+	value, ok := engine.embed_column_value(stmt.stmt, int(index))
+	if !ok do return 0
+	return c.double(sqlite_to_f64(value))
 }
 
 @(export)

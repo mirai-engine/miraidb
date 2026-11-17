@@ -2,9 +2,9 @@
 ** sqlite3_miraidb.h -- the subset of SQLite's C API that sqlite3_miraidb.dll
 ** implements, declared so a C program can compile against it.
 **
-** This is not sqlite3.h. It declares the 76 functions the facade exports and the
+** This is not sqlite3.h. It declares the 112 functions the facade exports and the
 ** result codes they answer; a program that uses anything else will not link, and
-** that is the honest state of the facade (76 of SQLite's 315 symbols). Look at
+** that is the honest state of the facade (112 of SQLite's 315 symbols). Look at
 ** docs/sqlite.md for what each one does here and where it differs.
 **
 ** Build the library with:
@@ -34,6 +34,8 @@ typedef uint64_t sqlite3_uint64;
 typedef struct sqlite3 sqlite3;
 typedef struct sqlite3_stmt sqlite3_stmt;
 typedef struct sqlite3_blob sqlite3_blob;
+typedef struct sqlite3_context sqlite3_context;
+typedef struct sqlite3_value sqlite3_value;
 
 /* Result codes, SQLite's numbers. */
 #define SQLITE_OK           0
@@ -183,6 +185,73 @@ const char  *sqlite3_column_text(sqlite3_stmt *stmt, int index);
 const void  *sqlite3_column_blob(sqlite3_stmt *stmt, int index);
 int          sqlite3_column_bytes(sqlite3_stmt *stmt, int index);
 int          sqlite3_column_bytes16(sqlite3_stmt *stmt, int index);
+
+/* --- Application-defined functions ----------------------------------------
+** A scalar function gives xFunc; an aggregate gives xStep and xFinal and keeps
+** its accumulator in sqlite3_aggregate_context memory. A function with a
+** builtin's name replaces it, except an aggregate builtin (count, sum, ...),
+** which keeps its name: registering one answers SQLITE_ERROR. Values arrive as
+** UTF-8 whatever eTextRep says. Auxiliary data lives for one call. */
+
+#define SQLITE_UTF8           1
+#define SQLITE_DETERMINISTIC  0x000000800
+
+int  sqlite3_create_function(sqlite3 *db, const char *name, int nArg,
+                             int eTextRep, void *pApp,
+                             void (*xFunc)(sqlite3_context *, int, sqlite3_value **),
+                             void (*xStep)(sqlite3_context *, int, sqlite3_value **),
+                             void (*xFinal)(sqlite3_context *));
+int  sqlite3_create_function_v2(sqlite3 *db, const char *name, int nArg,
+                                int eTextRep, void *pApp,
+                                void (*xFunc)(sqlite3_context *, int, sqlite3_value **),
+                                void (*xStep)(sqlite3_context *, int, sqlite3_value **),
+                                void (*xFinal)(sqlite3_context *),
+                                void (*xDestroy)(void *));
+
+void        *sqlite3_user_data(sqlite3_context *ctx);
+sqlite3     *sqlite3_context_db_handle(sqlite3_context *ctx);
+void        *sqlite3_aggregate_context(sqlite3_context *ctx, int nBytes);
+void        *sqlite3_get_auxdata(sqlite3_context *ctx, int n);
+void         sqlite3_set_auxdata(sqlite3_context *ctx, int n, void *data,
+                                 void (*destructor)(void *));
+
+int                  sqlite3_value_type(sqlite3_value *value);
+int                  sqlite3_value_numeric_type(sqlite3_value *value);
+int                  sqlite3_value_int(sqlite3_value *value);
+sqlite3_int64        sqlite3_value_int64(sqlite3_value *value);
+double               sqlite3_value_double(sqlite3_value *value);
+const unsigned char *sqlite3_value_text(sqlite3_value *value);
+const void          *sqlite3_value_blob(sqlite3_value *value);
+int                  sqlite3_value_bytes(sqlite3_value *value);
+sqlite3_value       *sqlite3_value_dup(const sqlite3_value *value);
+void                 sqlite3_value_free(sqlite3_value *value);
+/* A value never carries a subtype, a no-change mark or a bind origin here. */
+unsigned int         sqlite3_value_subtype(sqlite3_value *value);
+int                  sqlite3_value_nochange(sqlite3_value *value);
+int                  sqlite3_value_frombind(sqlite3_value *value);
+
+void sqlite3_result_null(sqlite3_context *ctx);
+void sqlite3_result_int(sqlite3_context *ctx, int value);
+void sqlite3_result_int64(sqlite3_context *ctx, sqlite3_int64 value);
+void sqlite3_result_double(sqlite3_context *ctx, double value);
+void sqlite3_result_text(sqlite3_context *ctx, const char *text, int n,
+                         void (*destructor)(void *));
+void sqlite3_result_text64(sqlite3_context *ctx, const char *text,
+                           sqlite3_uint64 n, void (*destructor)(void *),
+                           unsigned char encoding);
+void sqlite3_result_blob(sqlite3_context *ctx, const void *data, int n,
+                         void (*destructor)(void *));
+void sqlite3_result_blob64(sqlite3_context *ctx, const void *data,
+                           sqlite3_uint64 n, void (*destructor)(void *));
+void sqlite3_result_zeroblob(sqlite3_context *ctx, int n);
+int  sqlite3_result_zeroblob64(sqlite3_context *ctx, sqlite3_uint64 n);
+void sqlite3_result_value(sqlite3_context *ctx, sqlite3_value *value);
+void sqlite3_result_error(sqlite3_context *ctx, const char *message, int n);
+void sqlite3_result_error_code(sqlite3_context *ctx, int code);
+void sqlite3_result_error_nomem(sqlite3_context *ctx);
+void sqlite3_result_error_toobig(sqlite3_context *ctx);
+/* Accepted and dropped: subtypes are not carried. */
+void sqlite3_result_subtype(sqlite3_context *ctx, unsigned int subtype);
 
 /* --- Incremental BLOB I/O ------------------------------------------------
 ** The row is named by a single-column primary key, which plays the part of
