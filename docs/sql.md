@@ -132,7 +132,12 @@ CREATE INDEX by_id ON t (id);                        -- btree, the default
 
 ## Schema changes
 
+A table may be dropped and created again in one transaction — the shape a
+migration uses to replace one — and the commit applies the drop before the
+create. A table created and dropped inside one transaction never reaches the log.
+
 ```sql
+DROP TABLE t; CREATE TABLE t (id INTEGER PRIMARY KEY, note TEXT);
 ALTER TABLE t RENAME TO t2;
 ALTER TABLE t ADD COLUMN note TEXT NOT NULL DEFAULT '';
 ALTER TABLE t DROP COLUMN note;

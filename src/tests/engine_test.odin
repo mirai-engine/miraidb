@@ -13946,3 +13946,80 @@ test_array_text_form :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t WHERE tags && '{b,c}'").i, i64(1))
 	testing.expect_value(t, scalar(t, store, "SELECT '{a,b}' = tags FROM t").b, true)
 }
+
+// A migration drops a table and creates it again, usually in one transaction.
+// The commit used to apply the create first and meet the table it was meant to
+// replace ("table t already exists", with the old schema left in place), and
+// dropping a table created in the same transaction freed the map's own key.
+@(test)
+test_drop_and_create_in_one_transaction :: proc(t: ^testing.T) {
+	path := "_test_drop_create"
+	os.remove_all(path)
+	defer os.remove_all(path)
+	store, open_err := db.store_open(path, {persistent = true, create = true, durable = false})
+	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
+
+	run(t, store, "CREATE TABLE t (a INTEGER)")
+	run(t, store, "INSERT INTO t VALUES (1)")
+
+	// Drop, recreate with another shape, write, and commit in one transaction.
+	tx := db.tx_begin_write(store)
+	defer if tx != nil do db.tx_rollback(tx)
+	for statement in ([]string {
+		"DROP TABLE t",
+		"CREATE TABLE t (a INTEGER, b TEXT)",
+		"INSERT INTO t VALUES (5, 'x')",
+	}) {
+		_, err := db.sql_execute_in_tx(tx, statement)
+		testing.expectf(t, db.error_ok(err), "%s failed: %s", statement, err.message)
+	}
+	// Inside the transaction the new table is the visible one, and the row that
+	// was in the old one is gone.
+	inside, inside_err := db.sql_execute_in_tx(tx, "SELECT a, b FROM t")
+	testing.expect(t, db.error_ok(inside_err))
+	testing.expect_value(t, len(inside.rows), 1)
+	testing.expect_value(t, inside.rows[0][0].i, i64(5))
+	testing.expect_value(t, inside.rows[0][1].s, "x")
+	db.sql_result_destroy(&inside)
+	testing.expect(t, db.error_ok(db.tx_commit(tx)))
+	tx = nil
+
+	// The commit applied the drop before the create: the new shape is what the
+	// store has, and the log replays to the same place.
+	db.store_close(store)
+	reopened, reopen_err := db.store_open(path, {persistent = true, create = false, durable = false})
+	if !testing.expectf(t, db.error_ok(reopen_err), "reopen: %s", reopen_err.message) do return
+	defer db.store_close(reopened)
+	rows := run(t, reopened, "SELECT a, b FROM t")
+	defer db.sql_result_destroy(&rows)
+	testing.expect_value(t, len(rows.rows), 1)
+	testing.expect_value(t, rows.rows[0][1].s, "x")
+
+	// A table created and dropped inside one transaction never reaches the log.
+	tx2 := db.tx_begin_write(reopened)
+	defer if tx2 != nil do db.tx_rollback(tx2)
+	for statement in ([]string {"CREATE TABLE gone (a INTEGER)", "DROP TABLE gone"}) {
+		_, err := db.sql_execute_in_tx(tx2, statement)
+		testing.expectf(t, db.error_ok(err), "%s failed: %s", statement, err.message)
+	}
+	testing.expect(t, db.error_ok(db.tx_commit(tx2)))
+	tx2 = nil
+	missing := run_error(t, reopened, "SELECT a FROM gone")
+	testing.expect_value(t, missing.kind, db.Error_Kind.Table_Not_Found)
+
+	// Create, drop and create again inside one transaction: the last one wins.
+	tx3 := db.tx_begin_write(reopened)
+	defer if tx3 != nil do db.tx_rollback(tx3)
+	for statement in ([]string {
+		"CREATE TABLE again (a INTEGER)",
+		"DROP TABLE again",
+		"CREATE TABLE again (b TEXT)",
+		"INSERT INTO again VALUES ('y')",
+	}) {
+		_, err := db.sql_execute_in_tx(tx3, statement)
+		testing.expectf(t, db.error_ok(err), "%s failed: %s", statement, err.message)
+	}
+	testing.expect(t, db.error_ok(db.tx_commit(tx3)))
+	tx3 = nil
+	testing.expect_value(t, scalar(t, reopened, "SELECT b FROM again").s, "y")
+}

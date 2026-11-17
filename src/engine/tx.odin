@@ -1037,7 +1037,9 @@ tx_scan_trampoline :: proc(ctx: rawptr, row: Row) -> bool {
 // collect path runs instead, because the overlay has to be merged and that
 // materializes.
 tx_scan_visit :: proc(tx: ^Tx, name: string, ctx: rawptr, visit: Tx_Scan_Visitor) -> Error {
-	if tx.state.dropped[name] do return ERROR_NONE
+	// A table the transaction dropped and created again is here, not gone: its
+	// rows are the ones it staged.
+	if tx.state.dropped[name] && tx.state.created[name] == nil do return ERROR_NONE
 	table, table_err := tx_table(tx, name)
 	if table_err.kind != .None do return table_err
 	overlay := false
@@ -1088,7 +1090,11 @@ tx_create_table :: proc(tx: ^Tx, schema: ^Table_Schema) -> Error {
 	// The table arena owns its schema name; use that as the map key so the entry
 	// stays valid for the whole transaction.
 	tx.state.created[table.schema.name] = table
-	map_erase(&tx.state.dropped, schema.name)
+	// The drop of the old table stays recorded: the commit has to apply it
+	// before the create, or the create meets the table it was meant to replace
+	// (`DROP TABLE t; CREATE TABLE t (...)` is what every migration does). The
+	// lookups ask `created` before `dropped`, so the new table is the one a
+	// statement sees.
 	return ERROR_NONE
 }
 
@@ -1096,8 +1102,12 @@ tx_drop_table :: proc(tx: ^Tx, name: string) -> Error {
 	tx_forget_catalog_cache(tx)
 	if tx.read_only do return errf(.Transaction_Read_Only, "cannot drop a table in a read transaction")
 	if created, ok := tx.state.created[name]; ok {
-		table_destroy(created)
+		// Erase before destroying: the map's key is the name in the table's own
+		// arena, so a destroy first leaves the map comparing against freed
+		// memory (a crash with no message, which a release build reports as heap
+		// corruption).
 		map_erase(&tx.state.created, name)
+		table_destroy(created)
 		// Rows staged for a table created in this transaction disappear with it.
 		if writes, has_writes := tx.state.writes[name]; has_writes {
 			delete(writes.inserts)
@@ -1809,6 +1819,11 @@ tx_free_ops :: proc(ops: []Store_Op) {
 @(private)
 tx_build_ops :: proc(tx: ^Tx) -> []Store_Op {
 	ops := make([dynamic]Store_Op)
+	// Drops go first: a table this transaction dropped and created again is
+	// applied in that order, on replay and at commit alike.
+	for name in tx.state.dropped {
+		append(&ops, Store_Op{kind = .Drop_Table, name = name})
+	}
 	for name in tx.state.created {
 		append(
 			&ops,
@@ -1868,9 +1883,6 @@ tx_build_ops :: proc(tx: ^Tx) -> []Store_Op {
 		} else {
 			append(&ops, Store_Op{kind = .Create_Index, name = op.table, index = op.index})
 		}
-	}
-	for name in tx.state.dropped {
-		append(&ops, Store_Op{kind = .Drop_Table, name = name})
 	}
 	out := make([]Store_Op, len(ops))
 	copy(out, ops[:])
