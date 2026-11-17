@@ -361,8 +361,9 @@ def main() -> int:
     assert lib.miraidb_column_text(stmt, 0) == b"A"
     lib.miraidb_finalize(stmt)
     assert lib.miraidb_exec(db, b"SELECT twice(1, 2)") == ERROR, "the arity is checked before the callback"
-    assert "takes 1" in lib.miraidb_errmsg(db).decode()
-    # Re-registering the same name with a different arity replaces it.
+    assert "wrong number of arguments to function twice()" in lib.miraidb_errmsg(db).decode()
+    # A name is registered per arity, as in SQLite: twice/-1 takes the counts
+    # twice/1 does not.
     assert lib.miraidb_create_function(db, b"twice", -1, twice, None) == OK
     assert lib.miraidb_exec(db, b"SELECT twice(1, 2)") == OK, lib.miraidb_errmsg(db)
 

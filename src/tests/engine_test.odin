@@ -13278,7 +13278,7 @@ test_host_functions :: proc(t: ^testing.T) {
 	// The arity is the statement's error, and the handler's own error travels.
 	bad_arity := run_error(t, store, "SELECT twice(1, 2)")
 	testing.expect_value(t, bad_arity.kind, db.Error_Kind.Invalid_Argument)
-	testing.expect(t, strings_contains(bad_arity.message, "twice() takes 1"))
+	testing.expect(t, strings_contains(bad_arity.message, "wrong number of arguments to function twice()"))
 	handled := run_error(t, store, "SELECT refuse(1, 2, 3)")
 	testing.expect_value(t, handled.kind, db.Error_Kind.Invalid_Argument)
 	testing.expect(t, strings_contains(handled.message, "refuse() was called with 3"))

@@ -98,6 +98,8 @@ sql_execute_priced :: proc(store: ^Store, sql: string, params: []Value) -> (Sql_
 // reuse it to avoid parsing on every execution.
 @(private)
 sql_run_statement :: proc(store: ^Store, statement: Statement, params: []Value) -> (Sql_Result, Error) {
+	previous := aggregate_scope_enter(store)
+	defer aggregate_scope_leave(previous)
 	switch stmt in statement {
 	case Select_Stmt, With_Stmt:
 		tx := tx_begin_read(store)
@@ -245,6 +247,8 @@ conflict_skippable :: proc(kind: Error_Kind) -> bool {
 // transaction.
 @(private)
 sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sql_Result, Error) {
+	previous := aggregate_scope_enter(tx.store)
+	defer aggregate_scope_leave(previous)
 	switch stmt in statement {
 	case Select_Stmt, With_Stmt:
 		return sql_run_query(tx, stmt, params)
@@ -2266,6 +2270,7 @@ window_aggregate_over :: proc(
 eval_aggregate_values :: proc(ctx: ^Eval_Ctx, call: Call_Expr, values: []Value) -> (Value, Error) {
 	name := strings.to_lower(call.name)
 	defer delete(name)
+	if !builtin_aggregate_name(name) do return eval_host_aggregate_values(ctx, call, values)
 	if name == "count" {
 		if call.star || len(call.args) == 0 do return value_int(i64(len(values))), ERROR_NONE
 		count := 0
@@ -3004,7 +3009,7 @@ sql_exec_stream_select :: proc(
 		if _, is_window := expr^.(Window_Expr); is_window do return {}, false, ERROR_NONE
 		if !expr_is_aggregate(expr) do continue
 		call, direct := expr^.(Call_Expr)
-		if !direct || !is_aggregate_name(call.name) || call.is_distinct {
+		if !direct || !builtin_aggregate_name(call.name) || call.is_distinct {
 			return {}, false, ERROR_NONE
 		}
 		if len(call.args) > 2 {
@@ -5776,12 +5781,94 @@ sq_truthy :: proc(value: Value) -> (bool, Error) {
 	return true, ERROR_NONE
 }
 
+// is_aggregate_name reports a call that aggregates: one of the engine's own, or
+// a host aggregate of the store the running statement belongs to.
 @(private)
 is_aggregate_name :: proc(name: string) -> bool {
+	return builtin_aggregate_name(name) || host_aggregate_name(name)
+}
+
+// builtin_aggregate_name reports one of the engine's own aggregates.
+builtin_aggregate_name :: proc(name: string) -> bool {
 	for candidate in ([]string{"count", "sum", "avg", "min", "max", "total", "group_concat", "string_agg", "array_agg", "json_group_array", "json_group_object", "median", "percentile", "percentile_cont", "percentile_disc"}) {
 		if strings.equal_fold(name, candidate) do return true
 	}
 	return false
+}
+
+// eval_host_aggregate_values runs a host aggregate over a frame of values that
+// are already evaluated, one argument per row: a host aggregate used as a window
+// function, which SQLite allows for every aggregate.
+@(private)
+eval_host_aggregate_values :: proc(ctx: ^Eval_Ctx, call: Call_Expr, values: []Value) -> (Value, Error) {
+	def, found := store_aggregate(ctx.tx.store, call.name, len(call.args))
+	if !found do return {}, errf(.Invalid_Argument, "wrong number of arguments to function %s()", call.name)
+	if len(call.args) > 1 {
+		return {}, errf(.Sql_Unsupported, "%s() takes more than one argument and cannot be a window function here", call.name)
+	}
+	group := Aggregate_Group{user = def.user}
+	failure: Error
+	for value in values {
+		args := [1]Value{value}
+		if step_err := def.step(&group, args[:len(call.args)]); step_err.kind != .None {
+			failure = step_err
+			break
+		}
+	}
+	answer, final_err := def.final(&group)
+	if failure.kind != .None {
+		error_free(&final_err)
+		value_deep_free(answer, context.allocator)
+		return {}, failure
+	}
+	return answer, final_err
+}
+
+// eval_host_aggregate runs a host aggregate over the rows of a group: the
+// arguments of each row go to its step, and its final answers. The final runs
+// once whatever happens, so the host can always release its state.
+@(private)
+eval_host_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr, rows: [][]Source) -> (Value, Error) {
+	def, found := store_aggregate(ctx.tx.store, call.name, len(call.args))
+	if !found do return {}, errf(.Invalid_Argument, "wrong number of arguments to function %s()", call.name)
+	group := Aggregate_Group{user = def.user}
+	keys: map[string]bool
+	if call.is_distinct do keys = make(map[string]bool)
+	defer agg_distinct_destroy(&keys)
+	args := make([]Value, len(call.args))
+	defer delete(args)
+	failure: Error
+	rows_loop: for sources in rows {
+		sub := ctx^
+		sub.sources = sources
+		for arg, i in call.args {
+			value, arg_err := eval_expr(&sub, arg)
+			if arg_err.kind != .None {
+				failure = arg_err
+				break rows_loop
+			}
+			args[i] = value
+		}
+		if call.is_distinct && len(args) > 0 {
+			key := agg_distinct_key(args[0])
+			if key in keys {
+				delete(key)
+				continue
+			}
+			keys[key] = true
+		}
+		if step_err := def.step(&group, args); step_err.kind != .None {
+			failure = step_err
+			break
+		}
+	}
+	value, final_err := def.final(&group)
+	if failure.kind != .None {
+		error_free(&final_err)
+		value_deep_free(value, context.allocator)
+		return {}, failure
+	}
+	return value, final_err
 }
 
 // eval_case is CASE [operand] WHEN ... THEN ... [ELSE ...] END. With an operand
@@ -5913,6 +6000,13 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		value, arg_err := eval_expr(ctx, arg)
 		if arg_err.kind != .None do return {}, arg_err
 		append(&args, value)
+	}
+	// A host function registered to override a builtin answers before it, which
+	// is how SQLite treats an application-defined function with a builtin's name.
+	if ctx.tx != nil && ctx.tx.store != nil && len(ctx.tx.store.functions) > 0 {
+		if def, found, _ := store_function(ctx.tx.store, call.name, len(args)); found && def.overrides {
+			return def.handler(args[:], def.user)
+		}
 	}
 
 	// JSON functions parse the document in json.odin.
@@ -6532,21 +6626,13 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		if args[0].kind != .String do return {}, errf(.Invalid_Type, "format() expects a text pattern")
 		return value_string(sq_format(args[0].s, args[1:])), ERROR_NONE
 	}
-	// A host function answers last, so the builtins keep their names. The count is
-	// checked here rather than in the handler: a wrong number of arguments is the
-	// caller's mistake, and every handler would have to write the same check.
+	// A host function answers last, so the builtins keep their names. The count
+	// picks the function, as in SQLite: a name registered with other counts is
+	// the caller's mistake, in SQLite's words.
 	if ctx.tx != nil && ctx.tx.store != nil {
-		if def, found := store_function(ctx.tx.store, call.name); found {
-			if def.arity >= 0 && len(args) != def.arity {
-				return {}, errf(
-					.Invalid_Argument,
-					"%s() takes %d arguments",
-					call.name,
-					def.arity,
-				)
-			}
-			return def.handler(args[:], def.user)
-		}
+		def, found, named := store_function(ctx.tx.store, call.name, len(args))
+		if found do return def.handler(args[:], def.user)
+		if named do return {}, errf(.Invalid_Argument, "wrong number of arguments to function %s()", call.name)
 	}
 	return {}, errf(.Sql_Unsupported, "unknown function %s", call.name)
 }
@@ -6713,6 +6799,7 @@ eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		single_rows[0] = ctx.sources
 		rows = single_rows[:]
 	}
+	if !builtin_aggregate_name(name) do return eval_host_aggregate(ctx, call, rows)
 
 	if name == "count" {
 		if call.star || len(call.args) == 0 {

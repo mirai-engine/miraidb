@@ -910,9 +910,18 @@ SELECT twice(count(*)) FROM t GROUP BY k;
 ```
 
 - The registry is consulted **last**: a builtin keeps its name, so a registration
-  cannot quietly replace `upper()`.
-- `arity` is exact, or `-1` for any number; the count is checked before the handler
-  runs, and a mismatch is the statement's error.
+  cannot quietly replace `upper()`. The `sqlite3_*` facade registers with
+  `overrides`, because SQLite lets an application redefine a builtin.
+- A function is registered under its name **and** its number of arguments, as in
+  SQLite: `f/1` and `f/2` are two functions, `-1` takes any count that has no
+  function of its own, and a count nobody registered is "wrong number of
+  arguments to function f()".
+- An engine host can also register an **aggregate** (`store_register_aggregate`): a
+  step per row of the group and a final per group, which runs once even for an
+  empty group or after a failed step, so its state is always released. It works
+  with `GROUP BY`, `DISTINCT` and as a window function over one argument; an
+  aggregate builtin (`count`, `sum`, ...) keeps its name
+  (`test_host_aggregates_and_arities`).
 - The arguments are evaluated before the call, so a host function works per row, in
   `WHERE`, and as the argument of an aggregate (where it sees the group).
 - A handler receives values as `miraidb_value`: a tag, an integer, a real and a
