@@ -225,6 +225,9 @@ Store :: struct {
 	// hooks are the row-change, commit and rollback callbacks an embedding
 	// layer installs (hooks.odin).
 	hooks:         Store_Hooks,
+	// sqlite_names names an unaliased expression column by its text, as SQLite
+	// does, instead of PostgreSQL's ?column?. The sqlite3_* facade sets it.
+	sqlite_names:  bool,
 	// progress is the handler store_cancelled calls every progress_every rows.
 	progress:       proc(ctx: rawptr) -> bool,
 	progress_ctx:   rawptr,

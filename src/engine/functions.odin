@@ -235,6 +235,11 @@ aggregate_scope_leave :: proc(previous: ^Store) {
 	aggregate_scope = previous
 }
 
+// statement_store is the store whose statement this thread is running, or nil.
+statement_store :: proc() -> ^Store {
+	return aggregate_scope
+}
+
 // host_aggregate_name reports a call name that is a host aggregate of the
 // store the running statement belongs to.
 host_aggregate_name :: proc(name: string) -> bool {

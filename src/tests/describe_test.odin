@@ -73,3 +73,24 @@ test_empty_aggregate_bare_column :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(grouped.rows), 0)
 }
 
+@(test)
+test_expression_column_names :: proc(t: ^testing.T) {
+	store := fresh_db(t, "expression_names")
+	if store == nil do return
+	defer cleanup_db(store, "expression_names")
+	run(t, store, "CREATE TABLE p (id INTEGER PRIMARY KEY, score REAL)")
+
+	// An unaliased expression is ?column? by default, and named by its text
+	// when the store asks for SQLite's names.
+	named, _ := db.sql_execute(store, "SELECT count(*), 1+2, id AS k FROM p")
+	defer db.sql_result_destroy(&named)
+	testing.expect_value(t, named.columns[0], "?column?")
+	store.sqlite_names = true
+	sqlite_named, _ := db.sql_execute(store, "SELECT count(*), 1+2, id AS k FROM p")
+	defer db.sql_result_destroy(&sqlite_named)
+	if testing.expect_value(t, len(sqlite_named.columns), 3) {
+		testing.expect_value(t, sqlite_named.columns[0], "count(*)")
+		testing.expect_value(t, sqlite_named.columns[1], "1+2")
+		testing.expect_value(t, sqlite_named.columns[2], "k")
+	}
+}

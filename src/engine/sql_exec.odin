@@ -4278,6 +4278,11 @@ projection_name :: proc(item: Select_Item) -> string {
 			return strings.clone(column.name)
 		}
 	}
+	// SQLite names an expression by its text; PostgreSQL, which the engine
+	// follows unless the store asks otherwise, calls it ?column?.
+	if store := statement_store(); store != nil && store.sqlite_names && len(item.text) > 0 {
+		return strings.clone(item.text)
+	}
 	return result_own("?column?")
 }
 

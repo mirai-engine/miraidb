@@ -64,6 +64,7 @@ SIGNATURES = {
     "sqlite3_bind_text": ([c_void_p, c_int, c_char_p, c_int, c_void_p], c_int),
     "sqlite3_bind_blob": ([c_void_p, c_int, c_char_p, c_int, c_void_p], c_int),
     "sqlite3_column_count": ([c_void_p], c_int),
+    "sqlite3_column_name": ([c_void_p, c_int], c_char_p),
     "sqlite3_column_decltype": ([c_void_p, c_int], c_char_p),
     "sqlite3_column_table_name": ([c_void_p, c_int], c_char_p),
     "sqlite3_column_origin_name": ([c_void_p, c_int], c_char_p),
@@ -291,6 +292,19 @@ def observe(lib) -> dict[str, object]:
         (lib.sqlite3_column_int64(reader, i), lib.sqlite3_column_double(reader, i)) for i in range(7)
     ]
     lib.sqlite3_finalize(reader)
+
+    # The names of the result columns: an alias, a column's own name, and for an
+    # expression the text it was written with.
+    for sql in (
+        b"SELECT count(*), 1+2, id * 2, upper( name ) AS loud, p.score, max(score) FROM people p",
+        b"SELECT *, pid FROM orders",
+        b"SELECT 'a' || 'b', CAST(1 AS TEXT), (SELECT 1), -id FROM people",
+    ):
+        named = prepare(sql)
+        seen[f"column names of {sql!r}"] = [
+            lib.sqlite3_column_name(named, i) for i in range(lib.sqlite3_column_count(named))
+        ]
+        lib.sqlite3_finalize(named)
 
     sqlite_abi_functions.observe(lib, db, seen)
     sqlite_abi_hooks.observe(lib, db, seen)

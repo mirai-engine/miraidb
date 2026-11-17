@@ -20,6 +20,9 @@ Token :: struct {
 	text: string,
 	line: int,
 	column: int,
+	// end is the offset in the source just past the token, so the parser can
+	// take the text a construct was written with.
+	end: int,
 }
 
 Lexer :: struct {
@@ -85,6 +88,13 @@ is_ident_char :: proc(c: u8) -> bool {
 // lexer_next returns the next token. Unterminated strings and comments return a
 // Punct token with empty text, which the parser rejects with a position.
 lexer_next :: proc(l: ^Lexer) -> Token {
+	token := lexer_scan(l)
+	token.end = l.pos
+	return token
+}
+
+@(private)
+lexer_scan :: proc(l: ^Lexer) -> Token {
 	for {
 		if l.pos >= len(l.src) {
 			return Token{kind = .EOF, line = l.line, column = l.column}

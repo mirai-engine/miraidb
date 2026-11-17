@@ -413,6 +413,8 @@ sqlite3_open :: proc "c" (filename: cstring, ppDb: ^rawptr) -> c.int {
 	db := new(Database)
 	db.conn = conn
 	db.error_offset = -1
+	// An expression column is named by its text, as SQLite names it.
+	conn.store.sqlite_names = true
 	db.in_memory = in_memory
 	db.statements = make(map[rawptr]^Statement)
 	engine.handle_register(rawptr(db))

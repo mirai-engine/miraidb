@@ -16,6 +16,9 @@ Parser :: struct {
 	// param_names names each parameter slot: "?3", ":id", "@id", "$id", or ""
 	// for a bare `?`. It lives in the query's arena.
 	param_names: [dynamic]string,
+	// prev_end is where the token before the current one ended: the end of the
+	// text a construct that just finished was written with.
+	prev_end: int,
 	// expression_depth is how many expressions are open right now. It is one
 	// counter for the whole parser, not one per rule, because every nesting that
 	// costs stack goes through parse_expression.
@@ -98,7 +101,19 @@ p_is_clause_keyword :: proc(p: ^Parser) -> bool {
 
 @(private)
 p_advance :: proc(p: ^Parser) {
+	p.prev_end = p.current.end
 	p.current = lexer_next(&p.lexer)
+}
+
+// p_text_since is the source text from `start` to the end of the last token
+// consumed, with the spaces in front of it skipped, kept in the query's arena.
+@(private)
+p_text_since :: proc(p: ^Parser, start: int) -> string {
+	src := p.lexer.src
+	begin := start
+	for begin < p.prev_end && (src[begin] == ' ' || src[begin] == '\t' || src[begin] == '\n' || src[begin] == '\r') do begin += 1
+	if begin >= p.prev_end || p.prev_end > len(src) do return ""
+	return strings.clone(src[begin:p.prev_end], p.alloc)
 }
 
 @(private)
@@ -897,7 +912,9 @@ parse_select :: proc(p: ^Parser) -> Statement {
 			p_advance(p)
 			item.star = true
 		} else {
+			start := p.prev_end
 			item.expr = parse_expression(p)
+			item.text = p_text_since(p, start)
 		}
 		if p_match_keyword(p, "as") {
 			item.alias = p_ident(p)

@@ -230,6 +230,9 @@ Select_Item :: struct {
 	expr:  ^Expr,
 	alias: string,
 	star:  bool,
+	// text is the expression as the statement wrote it, which is what SQLite
+	// names an unaliased expression column.
+	text:  string,
 }
 
 // Nulls_Order is an explicit NULLS FIRST / NULLS LAST. Without one NULL sorts as
