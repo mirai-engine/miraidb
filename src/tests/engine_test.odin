@@ -11919,9 +11919,9 @@ test_window_range_and_groups_frames :: proc(t: ^testing.T) {
 	// ROWS counts rows, GROUPS counts peer groups, and RANGE counts the ORDER BY
 	// value. Every expected number below is what sqlite3 answers for the same rows,
 	// including the descending frame.
-	store := fresh_db(t, "window_frames")
+	store := fresh_db(t, "window_frames_offsets")
 	if store == nil do return
-	defer cleanup_db(store, "window_frames")
+	defer cleanup_db(store, "window_frames_offsets")
 	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT, n INTEGER, v REAL)")
 	run(t, store, `
 		INSERT INTO t (id, g, n, v) VALUES
@@ -12895,9 +12895,9 @@ test_expression_depth_is_bounded :: proc(t: ^testing.T) {
 // projection runs, which is the join's own work and is capped by the work budget.
 @(test)
 test_row_quota_refuses_while_producing :: proc(t: ^testing.T) {
-	store := fresh_db(t, "quota")
+	store := fresh_db(t, "quota_work")
 	if store == nil do return
-	defer cleanup_db(store, "quota")
+	defer cleanup_db(store, "quota_work")
 
 	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
 	builder := strings.builder_make()
