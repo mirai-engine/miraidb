@@ -389,6 +389,160 @@ Pg_Session :: struct {
 	// skip is the extended protocol's error rule: after an ErrorResponse every
 	// message is discarded until the next Sync, which answers ReadyForQuery.
 	skip:       bool,
+	// copy is a COPY FROM STDIN waiting for its CopyDone. The parsed statement
+	// keeps its own arena, because the rows arrive after the Query message is
+	// gone.
+	copy:       ^Pg_Copy,
+}
+
+// Pg_Copy is a COPY ... FROM STDIN in progress: the statement that started it and
+// the bytes the client has sent so far.
+Pg_Copy :: struct {
+	query:  Query,
+	stmt:   Copy_Stmt,
+	buffer: [dynamic]u8,
+}
+
+@(private)
+pg_copy_destroy :: proc(copy: ^Pg_Copy) {
+	if copy == nil do return
+	query_destroy(&copy.query)
+	delete(copy.buffer)
+	free(copy)
+}
+
+// pg_copy_message answers the messages that belong to a COPY FROM STDIN: the
+// client sends CopyData until CopyDone, and CopyFail to give up.
+@(private)
+pg_copy_message :: proc(host: ^Host, session: ^Pg_Session, data: []u8) -> []u8 {
+	kind := data[0]
+	length := int(pg_get_i32(data, 1))
+	if length < 4 || 1 + length > len(data) do return pg_error_response("bad COPY message")
+	body := data[5:1 + length]
+	switch kind {
+	case 'd':
+		append(&session.copy.buffer, ..body)
+		return nil
+	case 'f':
+		// CopyFail carries a reason, and the statement is over: the transaction
+		// it ran in is aborted, as PostgreSQL aborts it.
+		reason, _ := pg_read_cstring(body)
+		pg_copy_destroy(session.copy)
+		session.copy = nil
+		if session.tx != nil do session.failed = true
+		out := make([dynamic]u8, 0, 128)
+		append(&out, ..pg_error_response(fmt.tprintf("COPY from stdin failed: %s", reason), "57014"))
+		append(&out, ..pg_ready_for_query(pg_session_status(session)))
+		return out[:]
+	case 'c':
+		out := make([dynamic]u8, 0, 128)
+		tx, own := pg_copy_tx(host, session)
+		count, insert_err := copy_insert(tx, session.copy.stmt, string(session.copy.buffer[:]))
+		pg_copy_destroy(session.copy)
+		session.copy = nil
+		if insert_err.kind != .None {
+			if session.tx != nil do session.failed = true
+			if own do tx_rollback(tx)
+			append(&out, ..pg_error_from(insert_err))
+			error_free(&insert_err)
+			append(&out, ..pg_ready_for_query(pg_session_status(session)))
+			return out[:]
+		}
+		if own {
+			if commit_err := tx_commit(tx); commit_err.kind != .None {
+				append(&out, ..pg_error_from(commit_err))
+				error_free(&commit_err)
+				append(&out, ..pg_ready_for_query(pg_session_status(session)))
+				return out[:]
+			}
+		}
+		append(&out, ..pg_command_complete(fmt.tprintf("COPY %d", count)))
+		append(&out, ..pg_ready_for_query(pg_session_status(session)))
+		return out[:]
+	}
+	return pg_error_response("unexpected message during COPY FROM STDIN")
+}
+
+// pg_copy_tx is the transaction a COPY runs in: the session's own, or one opened
+// for the statement (the second answer says it belongs to COPY and must commit).
+@(private)
+pg_copy_tx :: proc(host: ^Host, session: ^Pg_Session) -> (^Tx, bool) {
+	if session != nil && session.tx != nil do return session.tx, false
+	return tx_begin_write(host.store), true
+}
+
+// pg_copy_parse parses a statement and keeps its query alive when it is a COPY:
+// the statement's names live in the query's own arena.
+@(private)
+pg_copy_parse :: proc(sql: string) -> (Copy_Stmt, Query, bool) {
+	query, parse_err := sql_parse(sql)
+	if parse_err.kind != .None {
+		error_free(&parse_err)
+		return {}, {}, false
+	}
+	if stmt, is_copy := query.statement.(Copy_Stmt); is_copy do return stmt, query, true
+	query_destroy(&query)
+	return {}, {}, false
+}
+
+// pg_copy_start answers a COPY that a client drives: CopyInResponse for FROM
+// STDIN (the rows follow as CopyData) and the whole copy for TO STDOUT. It
+// answers false for any other statement, which runs the usual way.
+@(private)
+pg_copy_start :: proc(host: ^Host, session: ^Pg_Session, out: ^[dynamic]u8, sql: string) -> bool {
+	// Only a COPY statement can be one: the check is a prefix so a SELECT never
+	// pays for a second parse.
+	trimmed := strings.trim_left_space(sql)
+	if len(trimmed) < 4 || !strings.equal_fold(trimmed[:4], "copy") do return false
+	stmt, query, is_copy := pg_copy_parse(sql)
+	if !is_copy do return false
+	if stmt.target == .File {
+		// A file is the server's business: the statement runs as any other.
+		query_destroy(&query)
+		return false
+	}
+	if stmt.from {
+		if session.tx != nil && session.failed {
+			query_destroy(&query)
+			append(out, ..pg_error_response(PG_ABORTED, "25P02"))
+			return true
+		}
+		tx, own := pg_copy_tx(host, session)
+		columns := copy_column_count(tx, stmt)
+		if own do tx_end(tx)
+		append(out, ..pg_copy_response('G', columns))
+		session.copy = new(Pg_Copy)
+		session.copy.query = query
+		session.copy.stmt = stmt
+		return true
+	}
+	// COPY ... TO STDOUT: the rows go out as CopyData.
+	tx, own := pg_copy_tx(host, session)
+	text, count, copy_err := copy_rows_to_text(tx, stmt, context.temp_allocator)
+	columns := copy_column_count(tx, stmt)
+	if own do tx_end(tx)
+	query_destroy(&query)
+	if copy_err.kind != .None {
+		append(out, ..pg_error_from(copy_err))
+		error_free(&copy_err)
+		return true
+	}
+	append(out, ..pg_copy_response('H', columns))
+	append(out, ..pg_message('d', transmute([]u8)text))
+	append(out, ..pg_message('c', nil))
+	append(out, ..pg_command_complete(fmt.tprintf("COPY %d", count)))
+	return true
+}
+
+@(private)
+pg_copy_response :: proc(kind: u8, columns: int) -> []u8 {
+	body := make([dynamic]u8, 0, 2 + 2 + 2 * columns)
+	pg_put_i16(&body, 0) // every column is text
+	pg_put_i16(&body, i16(columns))
+	for _ in 0 ..< columns do pg_put_i16(&body, 0)
+	out := pg_message(kind, body[:])
+	delete(body)
+	return out
 }
 
 // pg_session_in_transaction reports whether a BEGIN is open on this connection.
@@ -414,6 +568,10 @@ pg_session_init :: proc() -> ^Pg_Session {
 pg_session_destroy :: proc(session: ^Pg_Session) {
 	if session == nil do return
 	// A connection that goes away inside a transaction loses it, as in PostgreSQL.
+	if session.copy != nil {
+		pg_copy_destroy(session.copy)
+		session.copy = nil
+	}
 	if session.tx != nil {
 		tx_rollback(session.tx)
 		session.tx = nil
@@ -780,6 +938,7 @@ pg_handle_session_message :: proc(
 	data: []u8,
 ) -> (response: []u8, close: bool) {
 	if len(data) < 5 do return pg_error_response("short message"), true
+	if session.copy != nil do return pg_copy_message(host, session, data), false
 	if data[0] == 'Q' {
 		length := int(pg_get_i32(data, 1))
 		if length < 4 || 1 + length > len(data) {
@@ -1110,6 +1269,12 @@ pg_session_simple_query :: proc(host: ^Host, session: ^Pg_Session, sql: string) 
 			append(&out, ..pg_error_response(PG_ABORTED, "25P02"))
 			break
 		}
+		if pg_copy_start(host, session, &out, statement) {
+			// A COPY FROM STDIN leaves the exchange open: the client sends the
+			// rows next and gets its ReadyForQuery with the CopyDone.
+			if session.copy != nil do return out[:]
+			continue
+		}
 		result, exec_err := pg_run(host, session, statement, nil)
 		if exec_err.kind != .None {
 			if session.tx != nil do session.failed = true
@@ -1129,7 +1294,7 @@ pg_session_simple_query :: proc(host: ^Host, session: ^Pg_Session, sql: string) 
 		append(&out, ..pg_command_complete(pg_command_tag(statement, &result)))
 		sql_result_destroy(&result)
 	}
-	append(&out, ..pg_ready_for_query(pg_session_status(session)))
+	if session.copy == nil do append(&out, ..pg_ready_for_query(pg_session_status(session)))
 	return out[:]
 }
 
@@ -1244,6 +1409,8 @@ pg_command_tag :: proc(sql: string, result: ^Sql_Result) -> string {
 		return verb
 	case "TRUNCATE":
 		return "TRUNCATE TABLE"
+	case "COPY":
+		return fmt.tprintf("COPY %d", count)
 	}
 	return verb
 }

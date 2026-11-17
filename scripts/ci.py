@@ -126,6 +126,11 @@ def build_gates(args: argparse.Namespace) -> list[Gate]:
             gates.append(
                 Gate("broker (two processes)", [args.windows_python, "scripts/broker_smoke.py"])
             )
+            # COPY moves rows through the wire's own messages; the gate speaks
+            # them, so it needs no driver installed.
+            gates.append(
+                Gate("COPY over the wire", [args.windows_python, "scripts/pg_copy_smoke.py"])
+            )
         else:
             print(f"ci: no Windows Python at {args.windows_python}; skipping the DLL smokes")
     for package in PACKAGES:

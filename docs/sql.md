@@ -400,6 +400,33 @@ Every failure carries an `Error_Kind`:
 The parser reports `line L, column C` in the message. Engine errors do not
 include positions; they refer to the table and column by name.
 
+## COPY
+
+`COPY` moves rows between a table and a file, or a client, in the two text forms
+PostgreSQL uses. The text format separates fields with a tab, writes NULL as
+`\N`, and escapes the separator, a newline, a carriage return and the backslash;
+CSV separates with a comma, quotes a field that holds the separator, a quote or a
+newline, and reads an unquoted empty field as NULL where a quoted one is the
+empty string.
+
+```sql
+COPY t TO '/tmp/t.txt';                             -- text, tab separated
+COPY t (id, name) TO STDOUT WITH (FORMAT csv);      -- CSV to the client
+COPY t FROM '/tmp/t.csv' (FORMAT csv, HEADER);      -- the first row names the columns
+COPY t FROM '/tmp/t.csv' (FORMAT csv, DELIMITER ';', NULL 'NA');
+COPY t (id) FROM '/tmp/ids.txt';                    -- the other columns take their defaults
+```
+
+Each field is read against the type of its column, so `7` reaches an INTEGER
+column as 7, `t`/`f` as a bool, and a byte that is not the type is refused with
+the row and the column in the message. A COPY is one statement: a row that breaks
+a constraint writes none of the rows before it.
+
+`STDIN` and `STDOUT` belong to a client: over the PostgreSQL wire the server
+answers `COPY ... FROM STDIN` with CopyInResponse, takes CopyData until CopyDone,
+and answers `COPY ... TO STDOUT` with CopyOutResponse, CopyData and CopyDone. The
+CLI has no stream to fill, so `FROM STDIN` there says to use a file.
+
 ## Maintenance statements
 
 `VACUUM` rewrites the live log as one snapshot record: startup becomes O(state)

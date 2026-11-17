@@ -2,7 +2,7 @@
 
 The record of the feature set this engine targets. Each row is one capability,
 with its status in this tree, the evidence that closed it, and the test or gate
-that covers it. IDs are stable. The matrix is closed: 94 rows, all `done`, and
+that covers it. IDs are stable. The matrix is closed: 95 rows, all `done`, and
 every row names its test; `scripts/docs_check.py` fails if a name stops existing,
 so "each with a test" is a claim the gate checks rather than a sentence.
 [closing-plan.md](closing-plan.md)
@@ -24,13 +24,13 @@ Effort: **S** small, **M** medium, **L** large.
 | B. Schema and catalog | 16 | 0 | 0 | 16 |
 | C. Datastore and transactions | 11 | 0 | 0 | 11 |
 | D. Commit log and durability | 9 | 0 | 0 | 9 |
-| E. Queries and SQL | 14 | 0 | 0 | 14 |
+| E. Queries and SQL | 15 | 0 | 0 | 15 |
 | F. Server and protocol | 14 | 0 | 0 | 14 |
 | G. Modules and ABI | 10 | 0 | 0 | 10 |
 | H. Tooling, SDK and operations | 10 | 0 | 0 | 10 |
-| **Total (94)** | **94** | **0** | **0** | **94** |
+| **Total (95)** | **95** | **0** | **0** | **95** |
 
-**94 done (100 %)**: 0 partial, 0 todo, and every row is covered by a test.
+**95 done (100 %)**: 0 partial, 0 todo, and every row is covered by a test.
 Parity is interface-level by definition; where the implementation is shallower
 than a mature engine, the gap is named with its cost in [backlog.md](backlog.md)
 rather than hidden in this table.
@@ -118,6 +118,7 @@ rather than hidden in this table.
 | E11 | `LIKE` escapes, casts between all types | done | `ESCAPE` supported; casts cover numbers, text, bool, timestamp, uuid, identity | test_like_escape, test_cast_to_narrow_types |
 | E12 | Views as query sources | done | materialized per reference inside the transaction | test_views |
 | E13 | System tables | done | `_tables`, `_columns` and `_indexes` synthesized from the catalog with full WHERE/ORDER BY support | test_system_tables |
+| E15 | `COPY` in and out | done | `COPY t [(cols)] FROM`/`TO` a file, `STDIN` or `STDOUT`, in the text format (tab separated, `\N`, backslash escapes) and CSV (`HEADER`, `DELIMITER`, `NULL`); each field is parsed against its column's type and a row that fails writes none of the rows; `test_copy_text_and_csv_roundtrip`, `test_copy_options_and_column_lists`, `test_copy_refuses_a_bad_row` | test_copy_text_and_csv_roundtrip, test_copy_options_and_column_lists, test_copy_refuses_a_bad_row |
 | E14 | Complete statement surface | done | `ALTER TABLE ADD COLUMN`, `CREATE OR REPLACE VIEW` and `FOREIGN KEY` with RESTRICT/CASCADE on delete and update, enforced on insert, update and delete | test_create_or_replace_view, test_foreign_key_enforcement, test_alter_table_add_column |
 
 ## F. Server and protocol
@@ -137,7 +138,7 @@ rather than hidden in this table.
 | F11 | Compression and row-size hints | done | deflate encoder (fixed Huffman + LZ77) in `deflate.odin`, HTTP zlib negotiation, `row_bytes` hints | test_http_compression, test_deflate_roundtrip, test_row_size_hint |
 | F12 | Connection limits and backpressure | done | connection cap with 503, 4 MiB request limit, per-client byte accounting | test_transport_caps, test_wire_request_limit |
 | F13 | Metrics endpoint | done | `GET /metrics` with requests, errors, commit sequence and subscriptions | test_meta_and_metrics |
-| F14 | PostgreSQL wire protocol | done | startup with the standard ParameterStatus set, SSLRequest answered with one byte, SCRAM-SHA-256 authentication when the server is given a password, simple query with several statements, extended query framed per message (several to a packet), `Describe` that announces the types `Execute` encodes, skip-to-`Sync` after an error, text and binary parameters/results, transactions across messages with the aborted state, PostgreSQL command tags and SQLSTATE codes, `DEALLOCATE`/`DISCARD`; the dialect spellings are in `docs/sql.md` (PostgreSQL spellings) | test_postgres_wire, test_postgres_extended_query |
+| F14 | PostgreSQL wire protocol | done | startup with the standard ParameterStatus set, SSLRequest answered with one byte, SCRAM-SHA-256 authentication when the server is given a password, simple query with several statements, extended query framed per message (several to a packet), `Describe` that announces the types `Execute` encodes, skip-to-`Sync` after an error, text and binary parameters/results, transactions across messages with the aborted state, PostgreSQL command tags and SQLSTATE codes, `DEALLOCATE`/`DISCARD`; `COPY` driven by the client (CopyInResponse/CopyData/CopyDone and CopyFail in, CopyOutResponse/CopyData/CopyDone out); the dialect spellings are in `docs/sql.md` (PostgreSQL spellings) | test_postgres_wire, test_postgres_extended_query, scripts/pg_copy_smoke.py |
 
 ## G. Modules and ABI
 
@@ -171,7 +172,7 @@ rather than hidden in this table.
 
 ## Order the work followed
 
-This section used to list the dependency order for the rows still open. All 94
+This section used to list the dependency order for the rows still open. All 95
 are closed, so the order is history: the last engine rows landed in this order
 (E9, F7/F9, G1–G3, G5–G7/G9/G10, H2/H6, then the L rows). What is left is not
 parity: it is depth, and `docs/roadmap.md` orders it.

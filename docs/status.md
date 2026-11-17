@@ -122,7 +122,7 @@ the gaps are named rather than left to be discovered.
 ### Tooling
 
 - `python3 scripts/ci.py` runs every gate in one command and reports each one;
-  it is what "green" means. 28 gates (`--list` prints them): the suite, the
+  it is what "green" means. 29 gates (`--list` prints them): the suite, the
   corpus, the smokes, the measurements, the SQLite surface count, the
   heap sanitizer and the document check.
 - `miraidb` has 17 commands: `create`, `sql`, `sqlite`, `import-sqlite`,
@@ -150,7 +150,7 @@ the gaps are named rather than left to be discovered.
   `linux_arm64` and `darwin_arm64`. The POSIX lock is the reason it is checked:
   it carried a missing `core:sys/posix` import and two wrong integer types until
   this round, so the code that a Linux build would run had never been compiled.
-- 297 integration tests covering CRUD, recovery, constraints, transactions,
+- 300 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.

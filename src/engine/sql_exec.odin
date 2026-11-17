@@ -105,7 +105,7 @@ sql_run_statement :: proc(store: ^Store, statement: Statement, params: []Value) 
 		tx_end(tx)
 		result.commit_seq = store.commit_seq
 		return result, exec_err
-	case Insert_Stmt, Update_Stmt, Delete_Stmt, Create_Table_Stmt, Alter_Table_Stmt, Create_Type_Stmt, Drop_Table_Stmt, Create_Index_Stmt, Drop_Index_Stmt, Create_View_Stmt, Drop_View_Stmt, Create_Policy_Stmt, Drop_Policy_Stmt, Truncate_Stmt, Create_Trigger_Stmt, Drop_Trigger_Stmt, Grant_Stmt, Create_Virtual_Table_Stmt, Load_Extension_Stmt:
+	case Insert_Stmt, Update_Stmt, Delete_Stmt, Copy_Stmt, Create_Table_Stmt, Alter_Table_Stmt, Create_Type_Stmt, Drop_Table_Stmt, Create_Index_Stmt, Drop_Index_Stmt, Create_View_Stmt, Drop_View_Stmt, Create_Policy_Stmt, Drop_Policy_Stmt, Truncate_Stmt, Create_Trigger_Stmt, Drop_Trigger_Stmt, Grant_Stmt, Create_Virtual_Table_Stmt, Load_Extension_Stmt:
 		tx := tx_begin_write(store)
 		// OR FAIL undoes the failing row alone, which needs the statement journal
 		// even here, where a plain failure simply discards the transaction.
@@ -220,7 +220,7 @@ sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value) 
 	switch stmt in statement {
 	case Select_Stmt, With_Stmt:
 		return sql_run_query(tx, stmt, params)
-	case Insert_Stmt, Update_Stmt, Delete_Stmt:
+	case Insert_Stmt, Update_Stmt, Delete_Stmt, Copy_Stmt:
 		if insert, is_insert := stmt.(Insert_Stmt); is_insert && insert.conflict_rollback {
 			return {}, errf(
 				.Sql_Unsupported,
@@ -258,6 +258,50 @@ sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value) 
 		)
 	}
 	return {}, errf(.Sql_Unsupported, "unsupported statement")
+}
+
+// sql_exec_copy moves rows between a table and the text or CSV form. A file is
+// read or written here; STDIN and STDOUT belong to a client, so the wire front
+// end answers those before the statement gets this far (only the standalone CLI
+// lands in the STDOUT branch, which hands the text back for printing).
+@(private)
+sql_exec_copy :: proc(tx: ^Tx, stmt: Copy_Stmt) -> (Sql_Result, Error) {
+	if stmt.from && stmt.target == .Stdin {
+		return {}, errf(
+			.Sql_Unsupported,
+			"COPY ... FROM STDIN needs a client that speaks the wire protocol; COPY ... FROM 'file' works here",
+		)
+	}
+	if !stmt.from && stmt.target == .Stdout {
+		text, count, text_err := copy_rows_to_text(tx, stmt, context.allocator)
+		if text_err.kind != .None do return {}, text_err
+		return Sql_Result {
+				kind = .Ack,
+				message = text,
+				affected = count,
+				commit_seq = tx.store.commit_seq,
+			},
+			ERROR_NONE
+	}
+	if !tx.store.host_access do return {}, host_access_refusal("COPY")
+	if stmt.from {
+		count, copy_err := copy_file_insert(tx, stmt)
+		if copy_err.kind != .None do return {}, copy_err
+		return Sql_Result {
+				kind = .Affected,
+				affected = count,
+				commit_seq = tx.store.commit_seq,
+			},
+			ERROR_NONE
+	}
+	count, copy_err := copy_file_write(tx, stmt)
+	if copy_err.kind != .None do return {}, copy_err
+	return Sql_Result {
+			kind = .Affected,
+			affected = count,
+			commit_seq = tx.store.commit_seq,
+		},
+		ERROR_NONE
 }
 
 // sql_exec_vacuum compacts the live log, or writes a compacted copy.
@@ -299,6 +343,8 @@ sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sq
 		return Sql_Result{kind = .Ack, commit_seq = tx.store.commit_seq}, ERROR_NONE
 	case Insert_Stmt:
 		return sql_exec_insert(tx, stmt, params)
+	case Copy_Stmt:
+		return sql_exec_copy(tx, stmt)
 	case Update_Stmt:
 		return sql_exec_update(tx, stmt, params)
 	case Delete_Stmt:
@@ -649,6 +695,8 @@ sql_exec_explain :: proc(tx: ^Tx, stmt: Explain_Stmt, params: []Value) -> (Sql_R
 	lines := make([dynamic]string)
 	defer delete(lines)
 	switch inner in stmt.inner^ {
+	case Copy_Stmt:
+		return {}, errf(.Sql_Not_A_Query, "EXPLAIN does not apply to COPY")
 	case Select_Stmt:
 		order := plan_join_order(store, tx, inner, params)
 		first := order.steps[0]
@@ -4710,8 +4758,14 @@ value_cast :: proc(v: Value, target: Column_Type) -> (Value, Error) {
 			return value_coerce(parsed, target)
 		}
 		if target.kind == .Bool {
-			if strings.equal_fold(v.s, "true") || v.s == "1" do return value_bool(true), ERROR_NONE
-			if strings.equal_fold(v.s, "false") || v.s == "0" do return value_bool(false), ERROR_NONE
+			// `t` and `f` are how PostgreSQL writes a bool in its text formats,
+			// which COPY reads back; the words and the digits are the SQL forms.
+			if strings.equal_fold(v.s, "true") || v.s == "1" || strings.equal_fold(v.s, "t") {
+				return value_bool(true), ERROR_NONE
+			}
+			if strings.equal_fold(v.s, "false") || v.s == "0" || strings.equal_fold(v.s, "f") {
+				return value_bool(false), ERROR_NONE
+			}
 		}
 	}
 	return {}, errf(

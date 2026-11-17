@@ -270,6 +270,7 @@ parse_statement :: proc(p: ^Parser) -> Statement {
 		// ORDER BY and LIMIT may follow, as after any query.
 		return values
 	}
+	if p_is_keyword(p, "copy") do return parse_copy(p)
 	if p_is_keyword(p, "insert") || p_is_keyword(p, "replace") do return parse_insert(p)
 	if p_is_keyword(p, "update") do return parse_update(p)
 	if p_is_keyword(p, "delete") do return parse_delete(p)
@@ -302,6 +303,146 @@ parse_statement :: proc(p: ^Parser) -> Statement {
 	}
 	p_fail(p, .Sql_Syntax, "unknown statement %q", p.current.text)
 	return nil
+}
+
+// COPY_OPTION is one option a COPY statement accepts.
+@(private)
+Copy_Option :: enum {
+	Format,
+	Header,
+	Delimiter,
+	Null,
+}
+
+@(private)
+copy_option_from_name :: proc(name: string) -> (Copy_Option, bool) {
+	switch {
+	case strings.equal_fold(name, "format"):
+		return .Format, true
+	case strings.equal_fold(name, "header"):
+		return .Header, true
+	case strings.equal_fold(name, "delimiter"):
+		return .Delimiter, true
+	case strings.equal_fold(name, "null"):
+		return .Null, true
+	}
+	return .Format, false
+}
+
+// parse_copy reads `COPY table [(cols)] {FROM|TO} {STDIN|STDOUT|'path'} [(opts)]`.
+// PostgreSQL's old option syntax (`CSV HEADER`, `DELIMITER ','`) is accepted next
+// to the parenthesized one, because both are in the field.
+@(private)
+parse_copy :: proc(p: ^Parser) -> Statement {
+	p_expect_keyword(p, "copy")
+	stmt: Copy_Stmt
+	if p.current.kind == .Punct && p.current.text == "(" {
+		p_fail(
+			p,
+			.Sql_Unsupported,
+			"COPY of a query is not supported: copy a table, or run a SELECT and write its rows",
+		)
+		return stmt
+	}
+	stmt.table = p_ident(p)
+	if p_match_punct(p, "(") {
+		names := make([dynamic]string, 0, 4, p.alloc)
+		for {
+			append(&names, p_ident(p))
+			if !p_match_punct(p, ",") do break
+		}
+		p_expect_punct(p, ")")
+		stmt.columns = names[:]
+	}
+	if p_match_keyword(p, "from") {
+		stmt.from = true
+	} else if p_match_keyword(p, "to") {
+		stmt.from = false
+	} else {
+		p_fail(p, .Sql_Syntax, "COPY needs FROM or TO")
+		return stmt
+	}
+	if p_match_keyword(p, "stdin") {
+		stmt.target = .Stdin
+	} else if p_match_keyword(p, "stdout") {
+		stmt.target = .Stdout
+	} else if p.current.kind == .String {
+		stmt.target = .File
+		stmt.path = strings.clone(p.current.text, p.alloc)
+		p_advance(p)
+	} else {
+		p_fail(p, .Sql_Syntax, "COPY needs STDIN, STDOUT or a file path")
+		return stmt
+	}
+	if stmt.from && stmt.target == .Stdout {
+		p_fail(p, .Sql_Syntax, "COPY ... FROM cannot read STDOUT")
+		return stmt
+	}
+	if !stmt.from && stmt.target == .Stdin {
+		p_fail(p, .Sql_Syntax, "COPY ... TO cannot write STDIN")
+		return stmt
+	}
+	p_match_keyword(p, "with")
+	parenthesized := p_match_punct(p, "(")
+	has_null := false
+	for {
+		if p.current.kind != .Ident && p.current.kind != .Quoted_Ident do break
+		option, known := copy_option_from_name(p.current.text)
+		if !known do break
+		p_advance(p)
+		#partial switch option {
+		case .Format:
+			format := p_ident_or_keyword(p)
+			switch {
+			case strings.equal_fold(format, "text"):
+				stmt.format = .Text
+			case strings.equal_fold(format, "csv"):
+				stmt.format = .Csv
+			case:
+				p_fail(p, .Sql_Unsupported, "COPY format %q is not supported: text or csv", format)
+				return stmt
+			}
+		case .Header:
+			// `HEADER` alone means true; `HEADER true` and `HEADER false` are the
+			// explicit forms.
+			stmt.header = true
+			if p_is_keyword(p, "true") || p_is_keyword(p, "on") || p_is_keyword(p, "1") {
+				p_advance(p)
+			} else if p_is_keyword(p, "false") || p_is_keyword(p, "off") || p_is_keyword(p, "0") {
+				stmt.header = false
+				p_advance(p)
+			}
+		case .Delimiter:
+			p_match_keyword(p, "as")
+			if p.current.kind != .String {
+				p_fail(p, .Sql_Syntax, "DELIMITER needs a string")
+				return stmt
+			}
+			if len(p.current.text) != 1 {
+				p_fail(p, .Sql_Syntax, "DELIMITER must be one byte, found %q", p.current.text)
+				return stmt
+			}
+			stmt.delimiter = p.current.text[0]
+			p_advance(p)
+		case .Null:
+			p_match_keyword(p, "as")
+			if p.current.kind != .String {
+				p_fail(p, .Sql_Syntax, "NULL needs a string")
+				return stmt
+			}
+			stmt.null_text = strings.clone(p.current.text, p.alloc)
+			has_null = true
+			p_advance(p)
+		}
+		if parenthesized && !p_match_punct(p, ",") do break
+	}
+	if parenthesized do p_expect_punct(p, ")")
+	if !has_null {
+		// The format decides the default, and an option could have changed the
+		// format after another one was read.
+		stmt.null_text = stmt.format == .Csv ? "" : "\\N"
+	}
+	return stmt
 }
 
 @(private)

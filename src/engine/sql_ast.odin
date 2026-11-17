@@ -544,6 +544,36 @@ Truncate_Stmt :: struct {
 	name: string,
 }
 
+// Copy_Target says where a COPY's bytes come from or go to: a file on the
+// server's machine, or one of the client's streams.
+Copy_Target :: enum u8 {
+	File,
+	Stdin,
+	Stdout,
+}
+
+// Copy_Format is the two text formats PostgreSQL defines.
+Copy_Format :: enum u8 {
+	Text,
+	Csv,
+}
+
+// Copy_Stmt is `COPY table [(columns)] {FROM|TO} {STDIN|STDOUT|'path'} [(opts)]`.
+// `from` is the direction; `target` says where the bytes come from or go.
+Copy_Stmt :: struct {
+	table:     string,
+	columns:   []string,
+	from:      bool,
+	target:    Copy_Target,
+	path:      string,
+	format:    Copy_Format,
+	delimiter: u8,
+	header:    bool,
+	// null_text is resolved when the statement is parsed: the formats default to
+	// `\N` and to an empty unquoted field.
+	null_text: string,
+}
+
 // Analyze_Stmt measures the statistics a plan reads. An empty table means every
 // table.
 Analyze_Stmt :: struct {
@@ -575,6 +605,7 @@ Statement :: union {
 	Drop_Policy_Stmt,
 	Describe_Stmt,
 	Truncate_Stmt,
+	Copy_Stmt,
 	Analyze_Stmt,
 	Vacuum_Stmt,
 	Create_Trigger_Stmt,
@@ -721,6 +752,8 @@ statement_name :: proc(statement: Statement) -> string {
 		return "DESCRIBE"
 	case Truncate_Stmt:
 		return "TRUNCATE"
+	case Copy_Stmt:
+		return "COPY"
 	case Analyze_Stmt:
 		return "ANALYZE"
 	case Vacuum_Stmt:
