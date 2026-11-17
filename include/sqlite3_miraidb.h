@@ -191,6 +191,37 @@ const void  *sqlite3_column_blob(sqlite3_stmt *stmt, int index);
 int          sqlite3_column_bytes(sqlite3_stmt *stmt, int index);
 int          sqlite3_column_bytes16(sqlite3_stmt *stmt, int index);
 
+/* --- UTF-16 ----------------------------------------------------------------
+** The UTF-16 face of the calls above, converted at the boundary: "16" is the
+** machine's byte order, LE and BE name one. A column's text lives until the
+** statement moves, a column's name or origin until finalize, a value's text as
+** long as the value, the error message until the next call that changes it. */
+
+#define SQLITE_UTF16LE        2
+#define SQLITE_UTF16BE        3
+#define SQLITE_UTF16          4
+
+int          sqlite3_open16(const void *filename, sqlite3 **db);
+const void  *sqlite3_errmsg16(sqlite3 *db);
+int          sqlite3_prepare16(sqlite3 *db, const void *sql, int nByte,
+                               sqlite3_stmt **stmt, const void **tail);
+int          sqlite3_prepare16_v2(sqlite3 *db, const void *sql, int nByte,
+                                  sqlite3_stmt **stmt, const void **tail);
+int          sqlite3_prepare16_v3(sqlite3 *db, const void *sql, int nByte,
+                                  unsigned int flags, sqlite3_stmt **stmt,
+                                  const void **tail);
+int          sqlite3_bind_text16(sqlite3_stmt *stmt, int index, const void *value,
+                                 int nBytes, void *destructor);
+/* encoding is SQLITE_UTF8, SQLITE_UTF16LE, SQLITE_UTF16BE or SQLITE_UTF16. */
+int          sqlite3_bind_text64(sqlite3_stmt *stmt, int index, const char *value,
+                                 sqlite3_uint64 nBytes, void *destructor,
+                                 unsigned char encoding);
+const void  *sqlite3_column_text16(sqlite3_stmt *stmt, int index);
+const void  *sqlite3_column_name16(sqlite3_stmt *stmt, int index);
+const void  *sqlite3_column_decltype16(sqlite3_stmt *stmt, int index);
+const void  *sqlite3_column_database_name16(sqlite3_stmt *stmt, int index);
+const void  *sqlite3_column_table_name16(sqlite3_stmt *stmt, int index);
+const void  *sqlite3_column_origin_name16(sqlite3_stmt *stmt, int index);
 
 /* --- Application-defined functions ----------------------------------------
 ** A scalar function gives xFunc; an aggregate gives xStep and xFinal and keeps
@@ -231,6 +262,10 @@ const void          *sqlite3_value_blob(sqlite3_value *value);
 int                  sqlite3_value_bytes(sqlite3_value *value);
 sqlite3_value       *sqlite3_value_dup(const sqlite3_value *value);
 void                 sqlite3_value_free(sqlite3_value *value);
+const void          *sqlite3_value_text16(sqlite3_value *value);
+const void          *sqlite3_value_text16le(sqlite3_value *value);
+const void          *sqlite3_value_text16be(sqlite3_value *value);
+int                  sqlite3_value_bytes16(sqlite3_value *value);
 /* The pointer a value carries when it was bound or returned with the same
 ** type name; NULL otherwise. To SQL such a value is NULL, and a copy made with
 ** sqlite3_value_dup or a row that stores it holds a plain NULL. */
@@ -262,9 +297,21 @@ void sqlite3_result_error_nomem(sqlite3_context *ctx);
 void sqlite3_result_error_toobig(sqlite3_context *ctx);
 /* Accepted and dropped: subtypes are not carried. */
 void sqlite3_result_subtype(sqlite3_context *ctx, unsigned int subtype);
+void sqlite3_result_text16(sqlite3_context *ctx, const void *text, int nBytes,
+                           void (*destructor)(void *));
+void sqlite3_result_text16le(sqlite3_context *ctx, const void *text, int nBytes,
+                             void (*destructor)(void *));
+void sqlite3_result_text16be(sqlite3_context *ctx, const void *text, int nBytes,
+                             void (*destructor)(void *));
+void sqlite3_result_error16(sqlite3_context *ctx, const void *message, int nBytes);
 /* The destructor runs when the step that made the value ends. */
 void sqlite3_result_pointer(sqlite3_context *ctx, void *pointer, const char *type,
                             void (*destructor)(void *));
+int  sqlite3_create_function16(sqlite3 *db, const void *name, int nArg,
+                               int eTextRep, void *pApp,
+                               void (*xFunc)(sqlite3_context *, int, sqlite3_value **),
+                               void (*xStep)(sqlite3_context *, int, sqlite3_value **),
+                               void (*xFinal)(sqlite3_context *));
 
 /* --- Connection hooks ----------------------------------------------------
 ** Each call replaces the hook and answers the argument the previous one had;

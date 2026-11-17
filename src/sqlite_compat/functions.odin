@@ -60,6 +60,10 @@ Value_Box :: struct {
 	text:  cstring,
 	// owned is set for a box sqlite3_value_dup made: it owns a deep copy.
 	owned: bool,
+	// text16 is the UTF-16 form last asked for, in the byte order text16_big
+	// says (text16.odin).
+	text16:     []u16,
+	text16_big: bool,
 }
 
 // Aggregate_Memory is the zeroed block sqlite3_aggregate_context hands out,
@@ -351,7 +355,10 @@ call_callback :: proc(ctx: ^Context, callback: Function_Callback, args: []engine
 		pointers[i] = rawptr(&boxes[i])
 	}
 	callback(rawptr(ctx), c.int(len(args)), raw_data(pointers))
-	for box in boxes do delete(box.text)
+	for box in boxes {
+		delete(box.text)
+		delete(box.text16)
+	}
 }
 
 @(private)
@@ -600,6 +607,7 @@ sqlite3_value_free :: proc "c" (handle: rawptr) {
 	if box == nil || !box.owned do return
 	engine.value_deep_free(box.value, context.allocator)
 	delete(box.text)
+	delete(box.text16)
 	free(box)
 }
 
@@ -680,7 +688,12 @@ sqlite3_result_text :: proc "c" (handle: rawptr, text: cstring, n: c.int, destru
 @(export)
 sqlite3_result_text64 :: proc "c" (handle: rawptr, text: cstring, n: u64, destructor: rawptr, encoding: u8) {
 	context = runtime.default_context()
-	result_text(handle, text, n > u64(max(i64)) ? -1 : i64(n), destructor)
+	length := n > u64(max(i64)) ? -1 : i64(n)
+	if is_utf16, big_endian := text_encoding_order(c.int(encoding)); is_utf16 {
+		result_text16(handle, rawptr(text), length, destructor, big_endian)
+		return
+	}
+	result_text(handle, text, length, destructor)
 }
 
 @(private)

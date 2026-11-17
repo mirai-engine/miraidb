@@ -90,6 +90,8 @@ Database :: struct {
 	trace_arg:       rawptr,
 	authorizer:      Authorizer_Callback,
 	authorizer_arg:  rawptr,
+	// last_error16 is the message sqlite3_errmsg16 handed out last.
+	last_error16:    []u16,
 }
 
 Statement :: struct {
@@ -120,6 +122,10 @@ Statement :: struct {
 	started: i64,
 	// pointers are the parameters bound with sqlite3_bind_pointer (pointer.odin).
 	pointers: [dynamic]Pointer_Binding,
+	// wide_cache holds the UTF-16 column texts, freed with text_cache;
+	// wide_names the UTF-16 names and origins, kept until finalize.
+	wide_cache: [dynamic][]u16,
+	wide_names: [dynamic][]u16,
 }
 
 // Column_Origin_C is one column's origin as the C strings the metadata calls
@@ -209,6 +215,8 @@ stmt_clear_text_cache :: proc(stmt: ^Statement) {
 	if stmt == nil do return
 	for text in stmt.text_cache do delete(text)
 	clear(&stmt.text_cache)
+	for units in stmt.wide_cache do delete(units)
+	clear(&stmt.wide_cache)
 }
 
 // column_text renders a column as the C string SQLite would hand out: every
@@ -435,6 +443,7 @@ sqlite3_close :: proc "c" (handle: rawptr) -> c.int {
 	functions_close(db)
 	engine.embed_close(db.conn)
 	delete(db.last_error)
+	delete(db.last_error16)
 	free(db)
 	return SQLITE_OK
 }
@@ -673,6 +682,9 @@ sqlite3_finalize :: proc "c" (handle: rawptr) -> c.int {
 	engine.handle_forget(handle)
 	stmt_clear_text_cache(stmt)
 	delete(stmt.text_cache)
+	delete(stmt.wide_cache)
+	for units in stmt.wide_names do delete(units)
+	delete(stmt.wide_names)
 	delete(stmt.sql_text)
 	for name in stmt.param_names do delete(name)
 	delete(stmt.param_names)
@@ -826,12 +838,6 @@ sqlite3_step :: proc "c" (handle: rawptr) -> c.int {
 	stmt.finished = true
 	trace_end(stmt)
 	return SQLITE_DONE
-}
-
-@(export)
-sqlite3_column_bytes16 :: proc "c" (handle: rawptr, index: c.int) -> c.int {
-	context = runtime.default_context()
-	return sqlite3_column_bytes(handle, index)
 }
 
 @(export)
