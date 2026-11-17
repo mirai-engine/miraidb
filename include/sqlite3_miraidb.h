@@ -313,6 +313,32 @@ int  sqlite3_create_function16(sqlite3 *db, const void *name, int nArg,
                                void (*xStep)(sqlite3_context *, int, sqlite3_value **),
                                void (*xFinal)(sqlite3_context *));
 
+/* --- Collations -----------------------------------------------------------
+** A comparison SQL names with COLLATE: it answers in WHERE, ON, CASE, IN and
+** BETWEEN, and ORDER BY ranks the values under it. GROUP BY, DISTINCT, a
+** window's keys, an index and a column declaration need a key folded from the
+** text and refuse it with a message. BINARY, NOCASE and RTRIM cannot be
+** replaced here. A NULL comparison deletes the collation; the destructor runs
+** on replace, delete and close. A UTF-16 text representation hands the
+** comparison UTF-16 bytes. */
+
+int sqlite3_create_collation(sqlite3 *db, const char *name, int eTextRep,
+                             void *pArg,
+                             int (*xCompare)(void *, int, const void *, int, const void *));
+int sqlite3_create_collation_v2(sqlite3 *db, const char *name, int eTextRep,
+                                void *pArg,
+                                int (*xCompare)(void *, int, const void *, int, const void *),
+                                void (*xDestroy)(void *));
+int sqlite3_create_collation16(sqlite3 *db, const void *name, int eTextRep,
+                               void *pArg,
+                               int (*xCompare)(void *, int, const void *, int, const void *));
+/* Called when a statement names a collation nobody registered; the callback may
+** register it then. */
+int sqlite3_collation_needed(sqlite3 *db, void *pArg,
+                             void (*callback)(void *, sqlite3 *, int, const char *));
+int sqlite3_collation_needed16(sqlite3 *db, void *pArg,
+                               void (*callback)(void *, sqlite3 *, int, const void *));
+
 /* --- Connection hooks ----------------------------------------------------
 ** Each call replaces the hook and answers the argument the previous one had;
 ** NULL removes it. The update hook sees every changed row of a user table

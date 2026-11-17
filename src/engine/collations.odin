@@ -93,6 +93,13 @@ store_collation :: proc(store: ^Store, name: string) -> (Collation_Def, bool) {
 	for stored, def in store.collations {
 		if strings.equal_fold(stored, name) do return def, true
 	}
+	// A program may register a collation when a statement first needs it.
+	if hook := store.hooks.collation_needed; hook != nil && !collation_is_builtin(name) {
+		hook(store.hooks.collation_needed_ctx, name)
+		for stored, def in store.collations {
+			if strings.equal_fold(stored, name) do return def, true
+		}
+	}
 	return {}, false
 }
 

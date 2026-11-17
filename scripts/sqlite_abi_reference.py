@@ -18,6 +18,7 @@ import sys
 
 import sqlite_abi_functions
 import sqlite_abi_authorizer
+import sqlite_abi_collations
 import sqlite_abi_hooks
 import sqlite_abi_values
 
@@ -339,6 +340,7 @@ def observe(lib) -> dict[str, object]:
     sqlite_abi_hooks.observe(lib, db, seen)
     sqlite_abi_hooks.observe_trace(lib, db, seen)
     sqlite_abi_authorizer.observe(lib, seen)
+    sqlite_abi_collations.observe(lib, seen)
     # Last: it gives bind_text and bind_blob the argument types it needs.
     sqlite_abi_values.observe(lib, seen)
 

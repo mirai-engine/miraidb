@@ -43,7 +43,13 @@ Store_Hooks :: struct {
 	// prepared (authorize.odin).
 	authorizer:     Authorizer,
 	authorizer_ctx: rawptr,
+	// collation_needed runs when a statement names a collation nobody
+	// registered, so the program can register it then (sqlite3_collation_needed).
+	collation_needed:     Collation_Needed_Hook,
+	collation_needed_ctx: rawptr,
 }
+
+Collation_Needed_Hook :: #type proc(ctx: rawptr, name: string)
 
 // catalog_table_name reports a table the engine keeps for itself, whose
 // changes are not the program's.

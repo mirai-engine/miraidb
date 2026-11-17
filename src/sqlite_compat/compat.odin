@@ -92,6 +92,12 @@ Database :: struct {
 	authorizer_arg:  rawptr,
 	// last_error16 is the message sqlite3_errmsg16 handed out last.
 	last_error16:    []u16,
+	// collations are the comparisons registered on this connection
+	// (collation.odin), and collation_needed the callback that may add one.
+	collations:           [dynamic]^Collation,
+	collation_needed:     Collation_Needed_Callback,
+	collation_needed16:   Collation_Needed16_Callback,
+	collation_needed_arg: rawptr,
 }
 
 Statement :: struct {
@@ -441,6 +447,7 @@ sqlite3_close :: proc "c" (handle: rawptr) -> c.int {
 	engine.handle_forget(rawptr(db))
 	trace_close(db)
 	functions_close(db)
+	collations_close(db)
 	engine.embed_close(db.conn)
 	delete(db.last_error)
 	delete(db.last_error16)

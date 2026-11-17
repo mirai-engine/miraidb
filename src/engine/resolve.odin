@@ -453,6 +453,17 @@ res_expr :: proc(walk: ^Res_Walk, expr: ^Expr) {
 		res_expr(walk, e.operand)
 	case Collate_Expr:
 		res_expr(walk, e.operand)
+		// A collation nobody knows is refused at prepare, as in SQLite; a
+		// program may register it then (collation_needed).
+		if len(e.name) > 0 && !collation_is_builtin(e.name) {
+			if _, found := store_collation(walk.tx.store, e.name); !found && walk.err.kind == .None {
+				if walk.tx.store != nil && walk.tx.store.sqlite_names {
+					walk.err = errf(.Invalid_Argument, "no such collation sequence: %s", e.name)
+				} else {
+					walk.err = errf(.Invalid_Argument, "no such collation: %s", e.name)
+				}
+			}
+		}
 	case Subquery_Expr:
 		if e.select != nil do res_select(walk, e.select)
 	case Case_Expr:
