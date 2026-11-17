@@ -56,6 +56,7 @@ Rules for this file:
 | D24 | an index the engine cannot express is dropped on import | a counted skip, and a mirror fuzz pass | S |
 | D34 | the threaded suite is green on Linux and Windows; the sanitizer covers the Windows CLI, not the suite | run the suite sanitized on every platform, in CI | S |
 | D36 | a query never reads a partial or expression index | match a query's predicate to the index | M |
+| D37 | a column name is resolved row by row, so a misspelled one on an empty table answers 0 rows | resolve every name against the catalog before running | L |
 | D35 | diagnostics: test-side leak lines; a file open per commit for the log index | quiet the lines if they hide a report; keep the index file open | S |
 
 ---
@@ -471,6 +472,27 @@ sanitizer as a gate (it is the CLI only today).
 
 **Done when.** A CI job runs the threaded suite on Linux and macOS with
 `-sanitize:address`, and the Windows suite runs under the sanitizer as a gate.
+
+## D37 — Names are resolved before a statement runs
+
+**Now.** A column reference is resolved when an expression is evaluated against
+a row (`eval_expr`, through `ctx.sources` and the outer frames). With no row
+there is no resolution: `SELECT nope FROM t`, `... WHERE nope = 1`,
+`... ORDER BY nope` and `... GROUP BY nope` answer "0 rows" on an empty table
+and fail only once the table has a row. SQLite refuses all four at prepare
+("no such column: nope"), and a prepare that succeeds is the promise a program
+relies on: the same statement against an empty table during tests passes and
+fails in production. The facade inherits it: `sqlite3_prepare_v2` of
+`SELECT * FROM missing` succeeds where SQLite answers SQLITE_ERROR.
+
+**Done when.** A binding pass resolves every table and column name of a
+statement against the catalog before it runs, with the scopes the executor
+uses (joins and `USING`, correlated subqueries, CTEs and derived tables,
+projection aliases in `ORDER BY` and `GROUP BY`, `NEW`/`OLD`, `excluded`, the
+hidden `rowid` and `rank`), `sql_prepare` and the plain entry points run it,
+and the differential corpus gains the four statements above on an empty
+table. The column-origin description (`describe.odin`) is the first piece of
+it: base tables only, and it never refuses.
 
 ## D36 — The planner and partial or expression indexes
 
