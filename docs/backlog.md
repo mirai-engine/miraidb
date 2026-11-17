@@ -56,7 +56,7 @@ Rules for this file:
 | D24 | an index the engine cannot express is dropped on import | a counted skip, and a mirror fuzz pass | S |
 | D34 | the threaded suite is green on Linux and Windows; the sanitizer covers the Windows CLI, not the suite | run the suite sanitized on every platform, in CI | S |
 | D36 | a query never reads a partial or expression index | match a query's predicate to the index | M |
-| D35 | diagnostics: test-side leak lines, map nodes freed through the wrong allocator, error ownership | one sweep | M |
+| D35 | diagnostics: test-side leak lines; a file open per commit for the log index | quiet the lines if they hide a report; keep the index file open | S |
 
 ---
 
@@ -498,8 +498,13 @@ a flat count for writes; `scripts/leaks.py` is a CI gate.
    it was the process-wide maps (the lock registry and the live-handle set)
    growing through whatever allocator their first caller had; they grow on the
    process heap now.
-3. Error ownership: a host that receives an `Error` and drops it leaks the
-   message. Every entry point that returns one should say the message is the
-   caller's, in one sweep.
+3. ~~Error ownership.~~ Closed: every `Error` an entry point returns is the
+   caller's. The embedding layer used to hand back the message it also kept as
+   the connection's last error, so a caller that freed it freed it twice and one
+   that dropped a `bind` or `open` error leaked it; it now keeps a copy of its
+   own. The C ABI and the `sqlite3_*` facade free every error they receive
+   (`error_drop` for a yes or no), a store that notes a failure frees the one it
+   replaces and its last on close (`store_note_error`), and `tools/leakcheck`
+   fails on a leak or a double free of the error path.
 4. `log_index_append` opens the index sidecar, seeks and writes 16 bytes on every
    commit: the first place to look when commit latency matters.

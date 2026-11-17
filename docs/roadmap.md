@@ -62,7 +62,7 @@ that way.
 | 23 | **D11 — triggers and policies in a transaction** | Order them against the rows of the same transaction. | S | — |
 | 24 | **D2 — spatial tree** | Node pages and a descent instead of a scan over box columns. | M | — |
 | 25 | **D10 — precision and time** | Decimal scale, `TIMESTAMPTZ`, streaming blobs. | M | — |
-| 26 | **D35 — diagnostics** | Error ownership across the API, a file open per commit for the log index. | M | 19 |
+| 26 | **D35 — diagnostics** | A file open per commit for the log index, and the test-side leak lines if they start hiding a report. | S | 19 |
 | 27 | **D15 — network hardening** | TLS, HTTP/2, backpressure, per-route timeouts, a load test. | M | — |
 | 28 | **D14 — replication** | `GET /log?since=<seq>` and a follower applying through replay. | XL | 27 |
 | 29 | **Auth review** | Rate limits, token lifetime, adversarial tests over subscriptions and budgets; tokens travel in clear until TLS; **grants are opt-in**, so a database with no grant rows accepts every statement from every client. | S | — |
