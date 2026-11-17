@@ -133,6 +133,11 @@ The engine sorts the 63 names in the inventory into four classes:
   `soft_heap_limit64`, `temp_store`, `temp_store_directory`,
   `data_store_directory`. There is no unknown pragma left in the inventory.
 
+`REINDEX` is accepted and answers `ok`: every index is rebuilt from the log when
+the database opens, so there is never one that is out of date. `INDEXED BY name`
+and `NOT INDEXED` are read as the hints they are -- the plan is priced by the
+planner, and the answer is the same with or without them.
+
 `EXPLAIN QUERY PLAN` answers SQLite's four columns (`id`, `parent`, `notused`,
 `detail`) with the steps in SQLite's words: `SCAN <table>`,
 `SEARCH <table> USING INDEX <index>`, `SCAN CONSTANT ROW`,

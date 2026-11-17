@@ -165,6 +165,16 @@ sql_run_statement :: proc(store: ^Store, statement: Statement, params: []Value) 
 			"%s belongs to a session: open a transaction, or use the wire protocol",
 			statement_name(stmt),
 		)
+	case Reindex_Stmt:
+		tx := tx_begin_write(store)
+		result, reindex_err := sql_exec_mutation(tx, stmt, params)
+		if reindex_err.kind != .None {
+			tx_rollback(tx)
+			return {}, reindex_err
+		}
+		if commit_err := tx_commit(tx); commit_err.kind != .None do return {}, commit_err
+		result.commit_seq = store.commit_seq
+		return result, ERROR_NONE
 	case Listen_Stmt, Unlisten_Stmt, Notify_Stmt:
 		// These belong to the database, not to a transaction: an embedded call
 		// with no connection identity is the only listener it can have.
@@ -262,6 +272,26 @@ sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value) 
 		return Sql_Result{kind = .Ack, commit_seq = tx.store.commit_seq}, ERROR_NONE
 	case Notify_Stmt:
 		store_notify(tx.store, tx.store.session_owner, stmt.channel, stmt.payload)
+		return Sql_Result{kind = .Ack, commit_seq = tx.store.commit_seq}, ERROR_NONE
+	case Reindex_Stmt:
+		// The indexes are rebuilt from the log when the database opens, so there is
+		// never one that is stale; the name is checked so a typo is not accepted.
+		if len(stmt.name) > 0 {
+			named := false
+			if _, is_table := tx.store.tables[stmt.name]; is_table do named = true
+			for _, table in tx.store.tables {
+				for index in table.schema.indexes {
+					if strings.equal_fold(index.name, stmt.name) {
+						named = true
+						break
+					}
+				}
+				if named do break
+			}
+			if !named {
+				return {}, errf(.Index_Not_Found, "no such index: %s", stmt.name)
+			}
+		}
 		return Sql_Result{kind = .Ack, commit_seq = tx.store.commit_seq}, ERROR_NONE
 	case Declare_Cursor_Stmt:
 		return sql_exec_declare_cursor(tx, stmt, params)
@@ -498,6 +528,29 @@ sql_exec_vacuum :: proc(store: ^Store, stmt: Vacuum_Stmt) -> (Sql_Result, Error)
 
 sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sql_Result, Error) {
 	switch stmt in statement {
+	case Reindex_Stmt:
+		// Every index is rebuilt from the log when the database opens, so there is
+		// nothing out of date to rebuild. The name, when there is one, is checked
+		// so a typo is not silently accepted.
+		if len(stmt.name) > 0 {
+			named := false
+			if _, is_table := tx.store.tables[stmt.name]; is_table {
+				named = true
+			}
+			for _, table in tx.store.tables {
+				for index in table.schema.indexes {
+					if strings.equal_fold(index.name, stmt.name) {
+						named = true
+						break
+					}
+				}
+				if named do break
+			}
+			if !named {
+				return {}, errf(.Index_Not_Found, "no such index: %s", stmt.name)
+			}
+		}
+		return Sql_Result{kind = .Ack, commit_seq = tx.store.commit_seq}, ERROR_NONE
 	case Declare_Cursor_Stmt, Fetch_Stmt, Close_Cursor_Stmt:
 		// A cursor needs the transaction object, which the caller of this switch
 		// already has: the in-transaction dispatch answers these.
@@ -888,6 +941,8 @@ sql_exec_explain :: proc(tx: ^Tx, stmt: Explain_Stmt, params: []Value) -> (Sql_R
 		return {}, errf(.Sql_Not_A_Query, "EXPLAIN does not apply to COPY")
 	case Merge_Stmt:
 		return {}, errf(.Sql_Not_A_Query, "EXPLAIN does not apply to MERGE")
+	case Reindex_Stmt:
+		return {}, errf(.Sql_Not_A_Query, "EXPLAIN does not apply to REINDEX")
 	case Declare_Cursor_Stmt, Fetch_Stmt, Close_Cursor_Stmt:
 		return {}, errf(.Sql_Not_A_Query, "EXPLAIN does not apply to a cursor statement")
 	case Listen_Stmt, Unlisten_Stmt, Notify_Stmt:

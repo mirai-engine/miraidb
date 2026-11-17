@@ -267,3 +267,37 @@ test_explain_query_plan :: proc(t: ^testing.T) {
 	defer db.sql_result_destroy(&constant)
 	testing.expect_value(t, constant.rows[0][3].s, "SCAN CONSTANT ROW")
 }
+
+// The maintenance statements and hints a SQLite tool sends.
+@(test)
+test_reindex_and_index_hints :: proc(t: ^testing.T) {
+	store := fresh_db(t, "reindex")
+	if store == nil do return
+	defer cleanup_db(store, "reindex")
+
+	run(t, store, "CREATE TABLE t (a INTEGER, b TEXT)")
+	run(t, store, "INSERT INTO t VALUES (1, 'x'), (2, 'y')")
+	run(t, store, "CREATE INDEX by_a ON t (a)")
+
+	// REINDEX is accepted: every index is rebuilt from the log when the database
+	// opens, so nothing here is out of date. A name it cannot find is refused.
+	for statement in ([]string{"REINDEX", "REINDEX t", "REINDEX by_a"}) {
+		result := run(t, store, statement)
+		testing.expect_value(t, result.kind, db.Sql_Result_Kind.Ack)
+		db.sql_result_destroy(&result)
+	}
+	missing := run_error(t, store, "REINDEX nope")
+	defer db.error_free(&missing)
+	testing.expect_value(t, missing.kind, db.Error_Kind.Index_Not_Found)
+
+	// INDEXED BY and NOT INDEXED are hints: the answer is the same, and the
+	// planner keeps pricing the step.
+	hinted := run(t, store, "SELECT a FROM t INDEXED BY by_a WHERE a = 2")
+	testing.expect_value(t, len(hinted.rows), 1)
+	testing.expect_value(t, hinted.rows[0][0].i, i64(2))
+	db.sql_result_destroy(&hinted)
+	plain := run(t, store, "SELECT a FROM t NOT INDEXED WHERE a = 2")
+	testing.expect_value(t, len(plain.rows), 1)
+	testing.expect_value(t, plain.rows[0][0].i, i64(2))
+	db.sql_result_destroy(&plain)
+}

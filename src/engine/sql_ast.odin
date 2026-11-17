@@ -262,6 +262,11 @@ Table_Ref :: struct {
 	// subquery is a derived table, `FROM (SELECT …) AS name` or `FROM (VALUES …)`:
 	// it is materialized under `name` before the statement reads it.
 	subquery: ^Select_Stmt,
+	// indexed_by is SQLite's `INDEXED BY name` hint, and no_index its `NOT
+	// INDEXED`: the name is checked against the table's indexes and the plan is
+	// left to the planner, which already prices every step.
+	indexed_by: string,
+	no_index:   bool,
 }
 
 // Join_Clause chains one table onto the query. `left` turns the inner join into
@@ -642,6 +647,13 @@ Close_Cursor_Stmt :: struct {
 	all:  bool,
 }
 
+// Reindex_Stmt is `REINDEX [name]`. Every index is rebuilt from the log when the
+// database opens, so there is never one that is out of date here; the statement is
+// accepted so a maintenance script runs unchanged.
+Reindex_Stmt :: struct {
+	name: string,
+}
+
 Truncate_Stmt :: struct {
 	name: string,
 }
@@ -708,6 +720,7 @@ Statement :: union {
 	Drop_Policy_Stmt,
 	Describe_Stmt,
 	Truncate_Stmt,
+	Reindex_Stmt,
 	Declare_Cursor_Stmt,
 	Fetch_Stmt,
 	Close_Cursor_Stmt,
@@ -863,6 +876,8 @@ statement_name :: proc(statement: Statement) -> string {
 		return "DESCRIBE"
 	case Truncate_Stmt:
 		return "TRUNCATE"
+	case Reindex_Stmt:
+		return "REINDEX"
 	case Copy_Stmt:
 		return "COPY"
 	case Declare_Cursor_Stmt:

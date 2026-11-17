@@ -280,6 +280,13 @@ parse_statement :: proc(p: ^Parser) -> Statement {
 	if p_is_keyword(p, "update") do return parse_update(p)
 	if p_is_keyword(p, "delete") do return parse_delete(p)
 	if p_is_keyword(p, "merge") do return parse_merge(p)
+	if p_match_keyword(p, "reindex") {
+		stmt: Reindex_Stmt
+		if p.current.kind == .Ident || p.current.kind == .Quoted_Ident {
+			stmt.name = p_ident(p)
+		}
+		return stmt
+	}
 	if p_is_keyword(p, "declare") do return parse_declare_cursor(p)
 	if p_is_keyword(p, "fetch") || p_is_keyword(p, "move") do return parse_fetch(p)
 	if p_is_keyword(p, "close") do return parse_close_cursor(p)
@@ -1229,6 +1236,16 @@ parse_table_ref :: proc(p: ^Parser) -> Table_Ref {
 		return ref
 	}
 	ref.name = p_ident(p)
+	if p_match_keyword(p, "not") {
+		if p_expect_keyword(p, "indexed") == false do return ref
+		ref.no_index = true
+		return ref
+	}
+	if p_match_keyword(p, "indexed") {
+		if p_expect_keyword(p, "by") == false do return ref
+		ref.indexed_by = p_ident(p)
+		return ref
+	}
 	if p_match_punct(p, ".") {
 		// schema.table: keep the qualifier, `name` is the table.
 		ref.schema = ref.name
