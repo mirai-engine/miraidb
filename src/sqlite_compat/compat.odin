@@ -13,6 +13,7 @@ package sqlite_compat
 
 import "base:runtime"
 import "core:c"
+import "core:strconv"
 import "core:strings"
 
 import engine "../engine"
@@ -61,6 +62,9 @@ Database :: struct {
 	// answers the extended code too, the way SQLite does.
 	extended:     bool,
 	last_error:   string, // owned, NUL-terminated
+	// error_offset is the byte offset in the SQL text of the last prepare error,
+	// or -1: what sqlite3_error_offset answers.
+	error_offset: c.int,
 	in_memory:    bool,
 	// statements is what this connection handed out and has not finalized, so a
 	// close can make them misuse rather than leave them dangling (D29).
@@ -78,6 +82,9 @@ Statement :: struct {
 	// until the next step, reset or finalize, and the engine's own strings are
 	// not NUL-terminated, so each answer is cloned here and freed then.
 	text_cache: [dynamic]cstring,
+	// sql_text is the statement's own text as a C string, for sqlite3_sql: it
+	// lives until finalize, unlike the column answers in text_cache.
+	sql_text: cstring,
 }
 
 @(private)
@@ -248,8 +255,13 @@ blob_key_column :: proc(db: ^Database, table_name: string) -> (column: string, o
 @(private)
 set_error :: proc(db: ^Database, text: string) {
 	if db == nil do return
+	copy := strings.clone(text)
 	delete(db.last_error)
-	db.last_error = strings.clone(text)
+	db.last_error = copy
+	// sqlite3_errmsg reads the connection, so a refusal this layer makes on its
+	// own (a busy close, a spent statement) has to land there too, or errmsg
+	// answers the message of an older failure.
+	engine.embed_note_error(db.conn, .Invalid_Argument, text)
 }
 
 // set_error_from records an engine error's message and frees the error, which
@@ -360,6 +372,7 @@ sqlite3_open :: proc "c" (filename: cstring, ppDb: ^rawptr) -> c.int {
 	}
 	db := new(Database)
 	db.conn = conn
+	db.error_offset = -1
 	db.in_memory = in_memory
 	db.statements = make(map[rawptr]^Statement)
 	engine.handle_register(rawptr(db))
@@ -414,7 +427,8 @@ sqlite3_errmsg :: proc "c" (handle: rawptr) -> cstring {
 	if db == nil do return "no connection"
 	delete(db.last_error)
 	db.last_error = strings.clone(engine.embed_error(db.conn))
-	if len(db.last_error) == 0 do return ""
+	// SQLite names success too: errmsg after a call that worked is "not an error".
+	if len(db.last_error) == 0 do return "not an error"
 	return cstring(raw_data(db.last_error))
 }
 
@@ -465,7 +479,7 @@ sqlite3_changes :: proc "c" (handle: rawptr) -> c.int {
 @(export)
 sqlite3_total_changes :: proc "c" (handle: rawptr) -> c.int {
 	context = runtime.default_context()
-	return sqlite3_changes(handle)
+	return c.int(sqlite3_total_changes64(handle))
 }
 
 // Exec_Callback is the function sqlite3_exec calls once per row: the values in
@@ -541,7 +555,8 @@ sqlite3_exec :: proc "c" (handle: rawptr, sql: cstring, callback: rawptr, arg: r
 				code = fail(db, err)
 			}
 			if code != SQLITE_OK {
-				if errmsg != nil && len(db.last_error) > 0 do errmsg^ = cstring(raw_data(db.last_error))
+				// The message is the caller's, freed with sqlite3_free as in SQLite.
+				if errmsg != nil && len(db.last_error) > 0 do errmsg^ = sqlite_strdup(db.last_error)
 				return code
 			}
 			db.last_code = SQLITE_OK
@@ -554,6 +569,55 @@ sqlite3_exec :: proc "c" (handle: rawptr, sql: cstring, callback: rawptr, arg: r
 @(export)
 sqlite3_prepare_v2 :: proc "c" (handle: rawptr, sql: cstring, nByte: c.int, ppStmt: ^rawptr, pzTail: ^cstring) -> c.int {
 	context = runtime.default_context()
+	return prepare(handle, sql, nByte, ppStmt, pzTail)
+}
+
+// sqlite3_prepare_v3 takes flags that are hints to SQLite's own cache
+// (PERSISTENT, NORMALIZE, NO_VTAB); a statement here is prepared the same way
+// whichever is set.
+@(export)
+sqlite3_prepare_v3 :: proc "c" (handle: rawptr, sql: cstring, nByte: c.int, flags: c.uint, ppStmt: ^rawptr, pzTail: ^cstring) -> c.int {
+	context = runtime.default_context()
+	_ = flags
+	return prepare(handle, sql, nByte, ppStmt, pzTail)
+}
+
+// sqlite3_prepare is the legacy entry point. SQLite's version re-prepares less
+// eagerly after a schema change; this engine never needs to.
+@(export)
+sqlite3_prepare :: proc "c" (handle: rawptr, sql: cstring, nByte: c.int, ppStmt: ^rawptr, pzTail: ^cstring) -> c.int {
+	context = runtime.default_context()
+	return prepare(handle, sql, nByte, ppStmt, pzTail)
+}
+
+// error_offset_of reads "line L, column C" from a parse error and turns it into a
+// byte offset in `text`, or -1 when the message carries no position.
+@(private)
+error_offset_of :: proc(message: string, text: string) -> c.int {
+	at := strings.index(message, "line ")
+	if at < 0 do return -1
+	rest := message[at + 5:]
+	comma := strings.index(rest, ", column ")
+	if comma < 0 do return -1
+	line, line_ok := strconv.parse_int(rest[:comma], 10)
+	tail := rest[comma + 9:]
+	end := strings.index_any(tail, ":, ")
+	if end < 0 do end = len(tail)
+	column, column_ok := strconv.parse_int(tail[:end], 10)
+	if !line_ok || !column_ok || line < 1 || column < 1 do return -1
+	offset := 0
+	for current := 1; current < line; current += 1 {
+		newline := strings.index_byte(text[offset:], '\n')
+		if newline < 0 do return -1
+		offset += newline + 1
+	}
+	offset += column - 1
+	if offset > len(text) do return -1
+	return c.int(offset)
+}
+
+@(private)
+prepare :: proc(handle: rawptr, sql: cstring, nByte: c.int, ppStmt: ^rawptr, pzTail: ^cstring) -> c.int {
 	if pzTail != nil do pzTail^ = nil
 	if ppStmt != nil do ppStmt^ = nil
 	db := db_of(handle)
@@ -567,14 +631,26 @@ sqlite3_prepare_v2 :: proc "c" (handle: rawptr, sql: cstring, nByte: c.int, ppSt
 		pzTail^ = transmute(cstring)(base + uintptr(end))
 	}
 	head := strings.trim_space(text[:end])
+	db.error_offset = -1
 	// Whitespace, semicolons or a comment and nothing else is not an error in
 	// SQLite: there is no statement to prepare, and *ppStmt stays NULL.
 	if only_space_or_comments(text[:end]) do return SQLITE_OK
 	statement := engine.embed_prepare(db.conn, head)
-	if statement == nil do return fail_connection(db)
+	if statement == nil {
+		// The engine reports where in `head` it stopped; SQLite reports where in
+		// the caller's text, so the leading whitespace trimmed off counts.
+		leading := strings.index(text, head)
+		// An error at the very end is SQLite's "incomplete input", which carries no
+		// offset.
+		if offset := error_offset_of(engine.embed_error(db.conn), head); offset >= 0 && int(offset) < len(head) && leading >= 0 {
+			db.error_offset = offset + c.int(leading)
+		}
+		return fail_connection(db)
+	}
 	stmt := new(Statement)
 	stmt.db = db
 	stmt.stmt = statement
+	stmt.sql_text = strings.clone_to_cstring(text[:end])
 	db.statements[rawptr(stmt)] = stmt
 	engine.handle_register(rawptr(stmt))
 	ppStmt^ = rawptr(stmt)
@@ -590,6 +666,7 @@ sqlite3_finalize :: proc "c" (handle: rawptr) -> c.int {
 	engine.handle_forget(handle)
 	stmt_clear_text_cache(stmt)
 	delete(stmt.text_cache)
+	delete(stmt.sql_text)
 	engine.embed_finalize(stmt.stmt)
 	free(stmt)
 	return SQLITE_OK
@@ -818,10 +895,89 @@ sqlite3_column_bytes16 :: proc "c" (handle: rawptr, index: c.int) -> c.int {
 	return sqlite3_column_bytes(handle, index)
 }
 
+// --- Memory ----------------------------------------------------------------
+//
+// What the library hands a caller to free (an exec error message, an expanded
+// statement) comes from sqlite3_malloc and goes back through sqlite3_free, as in
+// SQLite. Each block carries its size in a header in front of it, which is what
+// sqlite3_msize and sqlite3_realloc read.
+
+SQLITE_ALLOC_HEADER :: 16
+
+@(private)
+sqlite_alloc :: proc(size: int) -> rawptr {
+	if size <= 0 do return nil
+	block, err := runtime.mem_alloc(size + SQLITE_ALLOC_HEADER, SQLITE_ALLOC_HEADER, runtime.heap_allocator())
+	if err != nil || block == nil do return nil
+	(^int)(raw_data(block))^ = size
+	return rawptr(uintptr(raw_data(block)) + SQLITE_ALLOC_HEADER)
+}
+
+@(private)
+sqlite_alloc_size :: proc(pointer: rawptr) -> int {
+	if pointer == nil do return 0
+	return (^int)(rawptr(uintptr(pointer) - SQLITE_ALLOC_HEADER))^
+}
+
+@(private)
+sqlite_strdup :: proc(text: string) -> cstring {
+	block := sqlite_alloc(len(text) + 1)
+	if block == nil do return nil
+	bytes := ([^]u8)(block)
+	for i in 0 ..< len(text) do bytes[i] = text[i]
+	bytes[len(text)] = 0
+	return cstring(block)
+}
+
+@(export)
+sqlite3_malloc :: proc "c" (size: c.int) -> rawptr {
+	context = runtime.default_context()
+	return sqlite_alloc(int(size))
+}
+
+@(export)
+sqlite3_malloc64 :: proc "c" (size: u64) -> rawptr {
+	context = runtime.default_context()
+	if size > u64(max(int) - SQLITE_ALLOC_HEADER) do return nil
+	return sqlite_alloc(int(size))
+}
+
+@(export)
+sqlite3_realloc :: proc "c" (pointer: rawptr, size: c.int) -> rawptr {
+	context = runtime.default_context()
+	return sqlite3_realloc64(pointer, u64(max(size, 0)))
+}
+
+// sqlite3_realloc64 follows SQLite: a NULL pointer allocates, a zero size frees
+// and answers NULL, and anything else keeps the bytes that fit.
+@(export)
+sqlite3_realloc64 :: proc "c" (pointer: rawptr, size: u64) -> rawptr {
+	context = runtime.default_context()
+	if pointer == nil do return sqlite3_malloc64(size)
+	if size == 0 {
+		sqlite3_free(pointer)
+		return nil
+	}
+	grown := sqlite3_malloc64(size)
+	if grown == nil do return nil
+	keep := min(sqlite_alloc_size(pointer), int(size))
+	runtime.mem_copy(grown, pointer, keep)
+	sqlite3_free(pointer)
+	return grown
+}
+
+@(export)
+sqlite3_msize :: proc "c" (pointer: rawptr) -> u64 {
+	context = runtime.default_context()
+	return u64(sqlite_alloc_size(pointer))
+}
+
 @(export)
 sqlite3_free :: proc "c" (pointer: rawptr) {
 	context = runtime.default_context()
-	_ = pointer
+	if pointer == nil do return
+	block := rawptr(uintptr(pointer) - SQLITE_ALLOC_HEADER)
+	runtime.mem_free(block, runtime.heap_allocator())
 }
 
 @(export)
@@ -862,6 +1018,246 @@ sqlite3_extended_result_codes :: proc "c" (handle: rawptr, onoff: c.int) -> c.in
 	return SQLITE_OK
 }
 
+
+// --- What a query asks about its connection and statement -----------------
+
+@(export)
+sqlite3_last_insert_rowid :: proc "c" (handle: rawptr) -> c.longlong {
+	context = runtime.default_context()
+	db := db_of(handle)
+	if db == nil do return 0
+	return c.longlong(db.conn.store.last_row_id)
+}
+
+@(export)
+sqlite3_set_last_insert_rowid :: proc "c" (handle: rawptr, rowid: c.longlong) {
+	context = runtime.default_context()
+	db := db_of(handle)
+	if db == nil do return
+	db.conn.store.last_row_id = i64(rowid)
+}
+
+@(export)
+sqlite3_changes64 :: proc "c" (handle: rawptr) -> c.longlong {
+	context = runtime.default_context()
+	db := db_of(handle)
+	if db == nil do return 0
+	return c.longlong(engine.embed_last_changes(db.conn))
+}
+
+// sqlite3_total_changes64 counts every row INSERT, UPDATE and DELETE changed
+// since the connection opened; it used to answer the last statement's count.
+@(export)
+sqlite3_total_changes64 :: proc "c" (handle: rawptr) -> c.longlong {
+	context = runtime.default_context()
+	db := db_of(handle)
+	if db == nil do return 0
+	return c.longlong(db.conn.store.total_changes)
+}
+
+// sqlite3_get_autocommit is 0 while a BEGIN or a SAVEPOINT holds a transaction
+// open on the connection, and 1 otherwise.
+@(export)
+sqlite3_get_autocommit :: proc "c" (handle: rawptr) -> c.int {
+	context = runtime.default_context()
+	db := db_of(handle)
+	if db == nil do return 1
+	return engine.embed_in_transaction(db.conn) ? 0 : 1
+}
+
+@(export)
+sqlite3_db_handle :: proc "c" (handle: rawptr) -> rawptr {
+	context = runtime.default_context()
+	stmt := stmt_of(handle)
+	if stmt == nil do return nil
+	return rawptr(stmt.db)
+}
+
+// sqlite3_errstr is SQLite's English text for a result code. The codes this
+// library never answers keep SQLite's text as well, so a caller that prints one
+// reads the same words.
+@(export)
+sqlite3_errstr :: proc "c" (code: c.int) -> cstring {
+	context = runtime.default_context()
+	switch code {
+	case 516:
+		return "abort due to ROLLBACK"
+	case SQLITE_ROW:
+		return "another row available"
+	case SQLITE_DONE:
+		return "no more rows available"
+	}
+	switch code & 0xff {
+	case 0:
+		return "not an error"
+	case 1:
+		return "SQL logic error"
+	case 3:
+		return "access permission denied"
+	case 4:
+		return "query aborted"
+	case 5:
+		return "database is locked"
+	case 6:
+		return "database table is locked"
+	case 7:
+		return "out of memory"
+	case 8:
+		return "attempt to write a readonly database"
+	case 9:
+		return "interrupted"
+	case 10:
+		return "disk I/O error"
+	case 11:
+		return "database disk image is malformed"
+	case 12:
+		return "unknown operation"
+	case 13:
+		return "database or disk is full"
+	case 14:
+		return "unable to open database file"
+	case 15:
+		return "locking protocol"
+	case 17:
+		return "database schema has changed"
+	case 18:
+		return "string or blob too big"
+	case 19:
+		return "constraint failed"
+	case 20:
+		return "datatype mismatch"
+	case 21:
+		return "bad parameter or other API misuse"
+	case 23:
+		return "authorization denied"
+	case 25:
+		return "column index out of range"
+	case 26:
+		return "file is not a database"
+	case 27:
+		return "notification message"
+	case 28:
+		return "warning message"
+	}
+	return "unknown error"
+}
+
+// sqlite3_error_offset is the byte offset in the SQL text where the last
+// prepare stopped, or -1 when the last error carries no position.
+@(export)
+sqlite3_error_offset :: proc "c" (handle: rawptr) -> c.int {
+	context = runtime.default_context()
+	db := db_of(handle)
+	if db == nil do return -1
+	return db.error_offset
+}
+
+// sqlite3_sql is the text the statement was prepared from, as the caller wrote
+// it, up to the end of the statement.
+@(export)
+sqlite3_sql :: proc "c" (handle: rawptr) -> cstring {
+	context = runtime.default_context()
+	stmt := stmt_of(handle)
+	if stmt == nil do return nil
+	return stmt.sql_text
+}
+
+@(export)
+sqlite3_stmt_readonly :: proc "c" (handle: rawptr) -> c.int {
+	context = runtime.default_context()
+	stmt := stmt_of(handle)
+	if stmt == nil do return 0
+	return engine.embed_read_only(stmt.stmt) ? 1 : 0
+}
+
+// sqlite3_stmt_busy is 1 between the first step and the end of the statement
+// (or a reset).
+@(export)
+sqlite3_stmt_busy :: proc "c" (handle: rawptr) -> c.int {
+	context = runtime.default_context()
+	stmt := stmt_of(handle)
+	if stmt == nil do return 0
+	return engine.embed_busy(stmt.stmt) && !stmt.finished ? 1 : 0
+}
+
+@(export)
+sqlite3_stmt_isexplain :: proc "c" (handle: rawptr) -> c.int {
+	context = runtime.default_context()
+	stmt := stmt_of(handle)
+	if stmt == nil do return 0
+	return c.int(engine.embed_explain_mode(stmt.stmt))
+}
+
+// sqlite3_data_count is the column count while a row is available and 0
+// otherwise: before the first step, after the last, and for a statement that
+// returns no rows.
+@(export)
+sqlite3_data_count :: proc "c" (handle: rawptr) -> c.int {
+	context = runtime.default_context()
+	stmt := stmt_of(handle)
+	if stmt == nil || !engine.embed_has_row(stmt.stmt) do return 0
+	return c.int(engine.embed_column_count(stmt.stmt))
+}
+
+SQLITE_STMTSTATUS_VM_STEP :: c.int(4)
+SQLITE_STMTSTATUS_RUN :: c.int(6)
+
+// sqlite3_stmt_status answers RUN (executions since prepare) and VM_STEP (one
+// per step here, where SQLite counts bytecode instructions). The counters of a
+// bytecode engine (full-scan steps, sorts, automatic indexes, bloom filters,
+// re-prepares) have no meaning in this engine and answer 0.
+@(export)
+sqlite3_stmt_status :: proc "c" (handle: rawptr, op: c.int, reset: c.int) -> c.int {
+	context = runtime.default_context()
+	stmt := stmt_of(handle)
+	if stmt == nil do return 0
+	value := 0
+	switch op {
+	case SQLITE_STMTSTATUS_RUN:
+		value = stmt.stmt.runs
+		if reset != 0 do stmt.stmt.runs = 0
+	case SQLITE_STMTSTATUS_VM_STEP:
+		value = stmt.stmt.steps
+		if reset != 0 do stmt.stmt.steps = 0
+	}
+	return c.int(value)
+}
+
+// sqlite3_bind_zeroblob binds a blob of n zero bytes, the placeholder a program
+// fills afterwards with incremental blob I/O.
+@(export)
+sqlite3_bind_zeroblob :: proc "c" (handle: rawptr, index: c.int, n: c.int) -> c.int {
+	context = runtime.default_context()
+	return sqlite3_bind_zeroblob64(handle, index, u64(max(n, 0)))
+}
+
+@(export)
+sqlite3_bind_zeroblob64 :: proc "c" (handle: rawptr, index: c.int, n: u64) -> c.int {
+	context = runtime.default_context()
+	stmt := stmt_of(handle)
+	if stmt == nil do return SQLITE_MISUSE
+	if int(index) < 1 || int(index) > engine.Embed_Parameter_Count(stmt.stmt) do return SQLITE_RANGE
+	if n > 1 << 30 do return SQLITE_TOOBIG
+	zeros := make([]u8, int(n))
+	defer delete(zeros)
+	if engine.error_drop(engine.embed_bind_blob(stmt.stmt, int(index) - 1, zeros)) do return SQLITE_OK
+	return SQLITE_ERROR
+}
+
+// sqlite3_libversion_number is the SQLite release this facade answers as,
+// 3.45.0, in SQLite's encoding: a program that checks it at start-up (Python's
+// sqlite3 module does) reads the version libversion names.
+@(export)
+sqlite3_libversion_number :: proc "c" () -> c.int {
+	context = runtime.default_context()
+	return 3045000
+}
+
+@(export)
+sqlite3_sourceid :: proc "c" () -> cstring {
+	context = runtime.default_context()
+	return "miraidb sqlite3 facade"
+}
 
 // --- Incremental BLOB I/O --------------------------------------------------
 

@@ -217,7 +217,7 @@ SQLite and `integer overflow` here. The refusal is the same for `+`, `-`, `*`,
 | Feature | Status | Notes |
 |---|---|---|
 | Odin embedding API | done | `src/engine/embed.odin` |
-| C ABI and header | done | `src/capi`, `include/miraidb.h`; the `sqlite3_*` facade has its own `include/sqlite3_miraidb.h` with the 43 symbols it exports, and `scripts/abi_header.py` keeps each header equal to its exports |
+| C ABI and header | done | `src/capi`, `include/miraidb.h`; the `sqlite3_*` facade has its own `include/sqlite3_miraidb.h` with the 68 symbols it exports, and `scripts/abi_header.py` keeps each header equal to its exports; `scripts/sqlite_abi_reference.py` runs one script against the facade and against SQLite itself and fails on any answer that differs |
 | CLI `.dbinfo`, `.tables`, `.schema` on SQLite files | done | `miraidb sqlite` |
 | Import/export | done | `import-sqlite`, `export-sqlite`, auto-detect on open |
 | Extension loading | done | `LOAD EXTENSION <name> AT 'host:port'` runs it out of process; the ABI is v1/v2 |

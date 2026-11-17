@@ -396,7 +396,9 @@ def main() -> int:
     assert lib.sqlite3_exec(changes_db, b"INSERT INTO ch VALUES (2)", None, None, None) == OK
     assert lib.sqlite3_exec(changes_db, b"UPDATE ch SET a = a + 10", None, None, None) == OK
     assert lib.sqlite3_changes(changes_db) == 2, "exec leaves the row count"
-    assert lib.sqlite3_total_changes(changes_db) == 2
+    # total_changes counts every row since the connection opened (1 + 1 + 2), as
+    # SQLite does; it used to repeat the last statement's count.
+    assert lib.sqlite3_total_changes(changes_db) == 4, lib.sqlite3_total_changes(changes_db)
     change_stmt = ctypes.c_void_p()
     assert lib.sqlite3_prepare_v2(changes_db, b"DELETE FROM ch", -1, ctypes.byref(change_stmt), None) == OK
     assert lib.sqlite3_step(change_stmt) == DONE
@@ -594,8 +596,17 @@ def main() -> int:
     assert lib.sqlite3_close(tx_db) == OK
     transactions_ok = True
 
+    # The same script against SQLite itself: every answer the facade gives has
+    # to be the one SQLite gives (scripts/sqlite_abi_reference.py).
+    import sqlite_abi_reference
+    differences = sqlite_abi_reference.compare(path)
+    for line in differences:
+        print("differs from SQLite:", line)
+    assert not differences, f"{len(differences)} difference(s) from SQLite"
+
     print("rows:", rows)
     print("transactions:", transactions_ok)
+    print("answers SQLite gives:", "all")
     print("error path:", message)
     print("blob io:", blobs_ok)
     print("mirror after DDL:", integrity, rows_after)

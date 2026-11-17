@@ -2,9 +2,9 @@
 ** sqlite3_miraidb.h -- the subset of SQLite's C API that sqlite3_miraidb.dll
 ** implements, declared so a C program can compile against it.
 **
-** This is not sqlite3.h. It declares the 43 functions the facade exports and the
+** This is not sqlite3.h. It declares the 68 functions the facade exports and the
 ** result codes they answer; a program that uses anything else will not link, and
-** that is the honest state of the facade (43 of SQLite's 315 symbols). Look at
+** that is the honest state of the facade (68 of SQLite's 315 symbols). Look at
 ** docs/sqlite.md for what each one does here and where it differs.
 **
 ** Build the library with:
@@ -107,15 +107,42 @@ int         sqlite3_busy_timeout(sqlite3 *db, int milliseconds);
 int         sqlite3_extended_result_codes(sqlite3 *db, int onoff);
 int         sqlite3_exec(sqlite3 *db, const char *sql, sqlite3_callback callback,
                          void *arg, char **errmsg);
+const char *sqlite3_errstr(int code);
+int         sqlite3_error_offset(sqlite3 *db);
+sqlite3_int64 sqlite3_last_insert_rowid(sqlite3 *db);
+void        sqlite3_set_last_insert_rowid(sqlite3 *db, sqlite3_int64 rowid);
+sqlite3_int64 sqlite3_changes64(sqlite3 *db);
+sqlite3_int64 sqlite3_total_changes64(sqlite3 *db);
+/* 0 while a BEGIN or a SAVEPOINT holds a transaction open, 1 otherwise. */
+int         sqlite3_get_autocommit(sqlite3 *db);
 
 /* --- Statements ---------------------------------------------------------- */
 
 int          sqlite3_prepare_v2(sqlite3 *db, const char *sql, int nByte,
                                 sqlite3_stmt **stmt, const char **tail);
+/* The flags are hints to SQLite's own cache and change nothing here. */
+int          sqlite3_prepare_v3(sqlite3 *db, const char *sql, int nByte,
+                                unsigned int flags, sqlite3_stmt **stmt,
+                                const char **tail);
+int          sqlite3_prepare(sqlite3 *db, const char *sql, int nByte,
+                             sqlite3_stmt **stmt, const char **tail);
 int          sqlite3_step(sqlite3_stmt *stmt);
 int          sqlite3_reset(sqlite3_stmt *stmt);
 int          sqlite3_clear_bindings(sqlite3_stmt *stmt);
 int          sqlite3_finalize(sqlite3_stmt *stmt);
+sqlite3     *sqlite3_db_handle(sqlite3_stmt *stmt);
+const char  *sqlite3_sql(sqlite3_stmt *stmt);
+int          sqlite3_stmt_readonly(sqlite3_stmt *stmt);
+int          sqlite3_stmt_busy(sqlite3_stmt *stmt);
+int          sqlite3_stmt_isexplain(sqlite3_stmt *stmt);
+/* RUN and VM_STEP (one per step here) answer; the bytecode counters answer 0. */
+#define SQLITE_STMTSTATUS_FULLSCAN_STEP  1
+#define SQLITE_STMTSTATUS_SORT           2
+#define SQLITE_STMTSTATUS_AUTOINDEX      3
+#define SQLITE_STMTSTATUS_VM_STEP        4
+#define SQLITE_STMTSTATUS_REPREPARE      5
+#define SQLITE_STMTSTATUS_RUN            6
+int          sqlite3_stmt_status(sqlite3_stmt *stmt, int op, int reset);
 
 int          sqlite3_bind_null(sqlite3_stmt *stmt, int index);
 int          sqlite3_bind_int(sqlite3_stmt *stmt, int index, int value);
@@ -125,8 +152,13 @@ int          sqlite3_bind_text(sqlite3_stmt *stmt, int index, const char *value,
                                int length, void *destructor);
 int          sqlite3_bind_blob(sqlite3_stmt *stmt, int index, const void *data,
                                int length, void *destructor);
+int          sqlite3_bind_zeroblob(sqlite3_stmt *stmt, int index, int n);
+int          sqlite3_bind_zeroblob64(sqlite3_stmt *stmt, int index,
+                                     sqlite3_uint64 n);
 
 int          sqlite3_column_count(sqlite3_stmt *stmt);
+/* The column count while a row is available, 0 otherwise. */
+int          sqlite3_data_count(sqlite3_stmt *stmt);
 const char  *sqlite3_column_name(sqlite3_stmt *stmt, int index);
 int          sqlite3_column_type(sqlite3_stmt *stmt, int index);
 int          sqlite3_column_int(sqlite3_stmt *stmt, int index);
@@ -154,9 +186,19 @@ int  sqlite3_blob_close(sqlite3_blob *blob);
 /* --- Library ------------------------------------------------------------- */
 
 const char *sqlite3_libversion(void);
+int         sqlite3_libversion_number(void);
+const char *sqlite3_sourceid(void);
 int         sqlite3_initialize(void);
 int         sqlite3_shutdown(void);
-void        sqlite3_free(void *pointer);
+
+/* What the library hands over to be freed (an exec error message) comes from
+** this allocator and goes back through sqlite3_free. */
+void         *sqlite3_malloc(int size);
+void         *sqlite3_malloc64(sqlite3_uint64 size);
+void         *sqlite3_realloc(void *pointer, int size);
+void         *sqlite3_realloc64(void *pointer, sqlite3_uint64 size);
+sqlite3_uint64 sqlite3_msize(void *pointer);
+void          sqlite3_free(void *pointer);
 
 #ifdef __cplusplus
 }

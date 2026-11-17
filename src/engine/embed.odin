@@ -43,6 +43,10 @@ Embed_Statement :: struct {
 	started: bool,
 	done:    bool,
 	row:     int,
+	// runs and steps count the executions and the step calls since prepare: what
+	// sqlite3_stmt_status answers for RUN and VM_STEP.
+	runs:  int,
+	steps: int,
 }
 
 Embed_Conn :: struct {
@@ -154,6 +158,59 @@ embed_succeed :: proc(conn: ^Embed_Conn) {
 // embed_exec runs one statement without parameters.
 embed_exec :: proc(conn: ^Embed_Conn, sql: string) -> Error {
 	return embed_exec_params(conn, sql, nil)
+}
+
+// embed_note_error records a failure the embedding layer found on its own (a
+// misuse, a refused close), so embed_error answers it like an engine error.
+embed_note_error :: proc(conn: ^Embed_Conn, kind: Error_Kind, message: string) {
+	if conn == nil do return
+	// `message` may be the connection's own message (a caller that re-records
+	// what embed_error answered), so the copy is made before the old one goes.
+	copy := strings.clone(message)
+	delete(conn.last_error.message)
+	conn.last_error = Error{kind = kind, message = copy}
+}
+
+// embed_sql is the text the statement was prepared from.
+embed_sql :: proc(stmt: ^Embed_Statement) -> string {
+	if stmt == nil do return ""
+	return stmt.sql
+}
+
+// embed_busy reports a statement that has started and not reached its end: the
+// state sqlite3_stmt_busy names.
+embed_busy :: proc(stmt: ^Embed_Statement) -> bool {
+	return stmt != nil && stmt.started && !stmt.done
+}
+
+// embed_has_row reports whether the last step produced a row the column calls
+// can read.
+embed_has_row :: proc(stmt: ^Embed_Statement) -> bool {
+	if stmt == nil || !stmt.started || stmt.done do return false
+	return stmt.result.kind == .Rows && stmt.row > 0 && stmt.row <= len(stmt.result.rows)
+}
+
+// embed_explain_mode is 0 for an ordinary statement, 1 for EXPLAIN and 2 for
+// EXPLAIN QUERY PLAN, the numbers sqlite3_stmt_isexplain answers.
+embed_explain_mode :: proc(stmt: ^Embed_Statement) -> int {
+	if stmt == nil || stmt.prepared == nil || stmt.prepared.is_pragma do return 0
+	if explain, is_explain := stmt.prepared.query.statement.(Explain_Stmt); is_explain {
+		return explain.query_plan ? 2 : 1
+	}
+	return 0
+}
+
+// embed_read_only reports a statement that cannot change the database file.
+// Transaction control counts as read-only, as SQLite documents for
+// sqlite3_stmt_readonly; a pragma is read-only unless it assigns a value.
+embed_read_only :: proc(stmt: ^Embed_Statement) -> bool {
+	if stmt == nil || stmt.prepared == nil do return true
+	if stmt.prepared.is_pragma do return !strings.contains(stmt.prepared.pragma_body, "=")
+	#partial switch _ in stmt.prepared.query.statement {
+	case Select_Stmt, With_Stmt, Explain_Stmt, Show_Stmt, Describe_Stmt, Begin_Stmt, Commit_Stmt, Rollback_Stmt, Savepoint_Stmt, Attach_Stmt, Detach_Stmt:
+		return true
+	}
+	return false
 }
 
 // embed_in_transaction reports whether a BEGIN or a SAVEPOINT left a transaction
@@ -307,6 +364,9 @@ embed_prepare :: proc(conn: ^Embed_Conn, sql: string) -> ^Embed_Statement {
 	stmt.conn = conn
 	stmt.sql = strings.clone(sql)
 	stmt.prepared = prepared
+	// A prepare that works clears the last error, as SQLite's does: errmsg after
+	// it must not repeat an older failure.
+	embed_succeed(conn)
 	return stmt
 }
 
@@ -432,6 +492,7 @@ embed_start :: proc(stmt: ^Embed_Statement) -> Error {
 	}
 	stmt.result = result
 	stmt.started = true
+	stmt.runs += 1
 	stmt.row = 0
 	embed_succeed(stmt.conn)
 	return ERROR_NONE
@@ -441,6 +502,7 @@ embed_start :: proc(stmt: ^Embed_Statement) -> Error {
 // true while a row is available.
 embed_step :: proc(stmt: ^Embed_Statement) -> (has_row: bool, err: Error) {
 	if stmt == nil do return false, errf(.Invalid_Argument, "no statement")
+	stmt.steps += 1
 	if stmt.done do return false, ERROR_NONE
 	if !stmt.started {
 		if start_err := embed_start(stmt); start_err.kind != .None do return false, start_err

@@ -43,7 +43,7 @@ The detail of each item is in [backlog.md](backlog.md); the order is in
 
 | Area | Where it stands | Why |
 |---|---|---|
-| `sqlite3_*` C ABI | **done** as a facade: `bin/sqlite3_miraidb.dll`, 43 exports with SQLite's result codes | — |
+| `sqlite3_*` C ABI | **done** as a facade: `bin/sqlite3_miraidb.dll`, 68 exports with SQLite's result codes | — |
 | `load_extension`, C functions | extensions run **out of process** (`LOAD EXTENSION … AT 'host:port'`); host functions and collations are registered from C | an in-process native plugin would share the engine's memory |
 | VFS | `Vfs` with an OS, an in-memory and a fault-injecting implementation | — |
 | WAL as the journal mode | a `-wal` or hot journal is **read** on import; the mirror writes a rollback journal in SQLite's format | durability is the commit log; WAL as the engine's own mode would be a second storage path |
