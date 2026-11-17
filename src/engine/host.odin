@@ -19,7 +19,8 @@ Reducer_Ctx :: struct {
 	now_us: i64,
 	// result is what the reducer returns to its caller. It is recorded with the
 	// request, so a retry answers with the same value instead of running again.
-	// The handler sets it; the slice lives as long as the transaction does.
+	// The handler sets it, and the slice must live as long as the transaction
+	// does: allocate it from `ctx.tx.alloc`, never as a literal in the handler.
 	result: []Value,
 }
 
@@ -2502,8 +2503,9 @@ host_call_at :: proc(
 		)
 	}
 
-	// The handler may hand back a slice that lived only in its own frame, so the
-	// values are copied before the response is encoded.
+	// The values are copied before the response is encoded. A slice that lived in
+	// the handler's own frame is already gone here, which is why `result` must
+	// live as long as the transaction (`ctx.tx.alloc`).
 	result_values := make([]Value, len(ctx.result))
 	defer delete(result_values)
 	copy(result_values, ctx.result)

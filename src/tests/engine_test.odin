@@ -9990,8 +9990,12 @@ test_idempotent_result :: proc(t: ^testing.T) {
 		if _, err := db.sql_execute_in_tx(ctx.tx, statement); !db.error_ok(err) do return err
 		_, read_err := db.sql_execute_in_tx(ctx.tx, "SELECT value FROM counter WHERE id = 0")
 		if !db.error_ok(read_err) do return read_err
-		// The reducer names its result; it is recorded with the request.
-		ctx.result = []db.Value{db.value_int(amount * 10)}
+		// The reducer names its result; it is recorded with the request. The slice
+		// lives in the transaction: a literal would live in this frame, which is
+		// gone by the time the host reads it.
+		result := make([]db.Value, 1, ctx.tx.alloc)
+		result[0] = db.value_int(amount * 10)
+		ctx.result = result
 		return db.Error{}
 	}
 	testing.expect(t, db.error_ok(db.host_register(host, "tally", []db.Column_Type{db.type_int}, tally)))
