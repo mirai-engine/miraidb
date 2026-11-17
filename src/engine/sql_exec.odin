@@ -2908,7 +2908,11 @@ sql_exec_stream_select :: proc(
 			}
 		}
 		if strings.equal_fold(call.name, "json_group_array") ||
-		   strings.equal_fold(call.name, "json_group_object") {
+		   strings.equal_fold(call.name, "json_group_object") ||
+		   strings.equal_fold(call.name, "median") ||
+		   strings.equal_fold(call.name, "percentile") ||
+		   strings.equal_fold(call.name, "percentile_cont") ||
+		   strings.equal_fold(call.name, "percentile_disc") {
 			// The streaming path folds one value per row; these build a document
 			// from the whole group, so the materializing path answers them.
 			return {}, false, ERROR_NONE
@@ -5664,7 +5668,7 @@ sq_truthy :: proc(value: Value) -> (bool, Error) {
 
 @(private)
 is_aggregate_name :: proc(name: string) -> bool {
-	for candidate in ([]string{"count", "sum", "avg", "min", "max", "total", "group_concat", "string_agg", "array_agg", "json_group_array", "json_group_object"}) {
+	for candidate in ([]string{"count", "sum", "avg", "min", "max", "total", "group_concat", "string_agg", "array_agg", "json_group_array", "json_group_object", "median", "percentile", "percentile_cont", "percentile_disc"}) {
 		if strings.equal_fold(name, candidate) do return true
 	}
 	return false
@@ -6645,6 +6649,55 @@ eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		text := json_write(Json_Value{kind = .Array, items = items[:]}, context.allocator)
 		return value_string(text), ERROR_NONE
 	}
+	if name == "median" || name == "percentile" || name == "percentile_cont" ||
+	   name == "percentile_disc" {
+		// The ordered aggregates SQLite 3.51 added: median(Y) is the 0.5
+		// percentile, percentile_cont interpolates between two values and
+		// percentile_disc takes one, and percentile() reads its argument as a
+		// percentage where the other two read a fraction.
+		if call.star || len(call.args) < 1 || len(call.args) > 2 {
+			return {}, errf(.Invalid_Argument, "%s() takes a value and a fraction", name)
+		}
+		fraction := 0.5
+		if len(call.args) == 2 {
+			value, value_err := eval_expr(ctx, call.args[1])
+			if value_err.kind != .None do return {}, value_err
+			number, ok := value_to_f64(value)
+			if !ok do return {}, errf(.Invalid_Type, "%s() expects a number as its fraction", name)
+			fraction = strings.equal_fold(name, "percentile") ? number / 100 : number
+			if fraction < 0 || fraction > 1 {
+				return {}, errf(
+					.Invalid_Argument,
+					"the fraction argument to %s() is not between 0.0 and 1.0",
+					name,
+				)
+			}
+		}
+		numbers := make([dynamic]f64, 0, len(rows))
+		defer delete(numbers)
+		for sources in rows {
+			sub := ctx^
+			sub.sources = sources
+			value, value_err := eval_expr(&sub, call.args[0])
+			if value_err.kind != .None do return {}, value_err
+			if value.kind == .Null do continue
+			number, ok := value_to_f64(value)
+			if !ok do return {}, errf(.Invalid_Type, "%s() expects numbers", name)
+			append(&numbers, number)
+		}
+		if len(numbers) == 0 do return value_null(), ERROR_NONE
+		slice.sort(numbers[:])
+		if strings.equal_fold(name, "percentile_disc") {
+			index := int(math.floor(fraction * f64(len(numbers) - 1)))
+			return value_float(numbers[index]), ERROR_NONE
+		}
+		position := fraction * f64(len(numbers) - 1)
+		low := int(math.floor(position))
+		high := int(math.ceil(position))
+		if low == high do return value_float(numbers[low]), ERROR_NONE
+		weight := position - f64(low)
+		return value_float(numbers[low] * (1 - weight) + numbers[high] * weight), ERROR_NONE
+	}
 	if name == "json_group_object" {
 		if len(call.args) != 2 {
 			return {}, errf(.Invalid_Argument, "json_group_object() takes a key and a value")
@@ -6666,6 +6719,55 @@ eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		}
 		text := json_write(Json_Value{kind = .Object, keys = keys[:], values = items[:]}, context.allocator)
 		return value_string(text), ERROR_NONE
+	}
+	if name == "median" || name == "percentile" || name == "percentile_cont" ||
+	   name == "percentile_disc" {
+		// The ordered aggregates SQLite 3.51 added: median(Y) is the 0.5
+		// percentile, percentile_cont interpolates between two values and
+		// percentile_disc takes one, and percentile() reads its argument as a
+		// percentage where the other two read a fraction.
+		if call.star || len(call.args) < 1 || len(call.args) > 2 {
+			return {}, errf(.Invalid_Argument, "%s() takes a value and a fraction", name)
+		}
+		fraction := 0.5
+		if len(call.args) == 2 {
+			value, value_err := eval_expr(ctx, call.args[1])
+			if value_err.kind != .None do return {}, value_err
+			number, ok := value_to_f64(value)
+			if !ok do return {}, errf(.Invalid_Type, "%s() expects a number as its fraction", name)
+			fraction = strings.equal_fold(name, "percentile") ? number / 100 : number
+			if fraction < 0 || fraction > 1 {
+				return {}, errf(
+					.Invalid_Argument,
+					"the fraction argument to %s() is not between 0.0 and 1.0",
+					name,
+				)
+			}
+		}
+		numbers := make([dynamic]f64, 0, len(rows))
+		defer delete(numbers)
+		for sources in rows {
+			sub := ctx^
+			sub.sources = sources
+			value, value_err := eval_expr(&sub, call.args[0])
+			if value_err.kind != .None do return {}, value_err
+			if value.kind == .Null do continue
+			number, ok := value_to_f64(value)
+			if !ok do return {}, errf(.Invalid_Type, "%s() expects numbers", name)
+			append(&numbers, number)
+		}
+		if len(numbers) == 0 do return value_null(), ERROR_NONE
+		slice.sort(numbers[:])
+		if strings.equal_fold(name, "percentile_disc") {
+			index := int(math.floor(fraction * f64(len(numbers) - 1)))
+			return value_float(numbers[index]), ERROR_NONE
+		}
+		position := fraction * f64(len(numbers) - 1)
+		low := int(math.floor(position))
+		high := int(math.ceil(position))
+		if low == high do return value_float(numbers[low]), ERROR_NONE
+		weight := position - f64(low)
+		return value_float(numbers[low] * (1 - weight) + numbers[high] * weight), ERROR_NONE
 	}
 	if name == "json_group_object" {
 		// One document from the group: the first argument is the key, the second

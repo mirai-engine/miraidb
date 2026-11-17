@@ -186,3 +186,46 @@ test_json_mutators_and_aggregates :: proc(t: ^testing.T) {
 	testing.expect_value(t, grouped.rows[1][1].s, "[2]")
 	db.sql_result_destroy(&grouped)
 }
+
+// The ordered aggregates SQLite 3.51 added. median(Y) is the 0.5 percentile,
+// percentile_cont interpolates, percentile_disc takes a value, and percentile()
+// reads its argument as a percentage.
+@(test)
+test_percentile_aggregates :: proc(t: ^testing.T) {
+	store := fresh_db(t, "percentile")
+	if store == nil do return
+	defer cleanup_db(store, "percentile")
+
+	run(t, store, "CREATE TABLE t (v REAL)")
+	run(t, store, "INSERT INTO t VALUES (1), (2), (3), (4), (10)")
+
+	rows := run(
+		t,
+		store,
+		"SELECT median(v), percentile(v, 0.5), percentile_cont(v, 0.25), percentile_disc(v, 0.25), percentile_cont(v, 0.9), percentile_disc(v, 0.9) FROM t",
+	)
+	defer db.sql_result_destroy(&rows)
+	testing.expect_value(t, rows.rows[0][0].f, f64(3))
+	// percentile() takes a percentage: 0.5% of four steps is 0.02 of the way
+	// from 1 to 2.
+	testing.expect_value(t, rows.rows[0][1].f, 1.02)
+	testing.expect_value(t, rows.rows[0][2].f, f64(2))
+	testing.expect_value(t, rows.rows[0][3].f, f64(2))
+	testing.expect_value(t, rows.rows[0][4].f, 7.6000000000000005)
+	testing.expect_value(t, rows.rows[0][5].f, f64(4))
+
+	// An even count interpolates for the median and takes a value for the
+	// discrete form; an empty group is NULL.
+	two := run(t, store, "SELECT median(v), percentile_disc(v, 0.5) FROM t WHERE v < 3")
+	testing.expect_value(t, two.rows[0][0].f, 1.5)
+	testing.expect_value(t, two.rows[0][1].f, f64(1))
+	db.sql_result_destroy(&two)
+	empty := run(t, store, "SELECT median(v) FROM t WHERE v > 100")
+	testing.expect_value(t, empty.rows[0][0].kind, db.Value_Kind.Null)
+	db.sql_result_destroy(&empty)
+
+	// A fraction outside [0, 1] is refused with SQLite's words.
+	bad := run_error(t, store, "SELECT percentile_cont(v, 1.5) FROM t")
+	defer db.error_free(&bad)
+	testing.expect_value(t, bad.kind, db.Error_Kind.Invalid_Argument)
+}
