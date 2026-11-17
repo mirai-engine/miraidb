@@ -13557,3 +13557,44 @@ test_window_inside_an_expression_is_one_column :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(both.rows[0]), 2)
 	testing.expect_value(t, both.rows[0][1].i, i64(14))
 }
+
+// SQLite names the row itself `rowid`, `_rowid_` and `oid`, unless the table
+// declares a column with that name. A single-column INTEGER PRIMARY KEY is the
+// rowid, which is what `last_insert_rowid` already answers; any other table
+// answers the engine's row id, which starts at zero where SQLite starts at one.
+@(test)
+test_rowid_spellings :: proc(t: ^testing.T) {
+	store := fresh_db(t, "rowid_spellings")
+	if store == nil do return
+	defer cleanup_db(store, "rowid_spellings")
+
+	run(t, store, "CREATE TABLE plain (a INTEGER)")
+	run(t, store, "INSERT INTO plain VALUES (10), (20)")
+	rows := run(t, store, "SELECT rowid, a FROM plain ORDER BY rowid")
+	defer db.sql_result_destroy(&rows)
+	testing.expect_value(t, len(rows.rows), 2)
+	testing.expect_value(t, rows.rows[0][0].i, i64(0))
+	testing.expect_value(t, rows.rows[1][0].i, i64(1))
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM plain WHERE rowid = 1").i, i64(1))
+	testing.expect_value(t, scalar(t, store, "SELECT _rowid_ FROM plain WHERE a = 10").i, i64(0))
+	testing.expect_value(t, scalar(t, store, "SELECT oid FROM plain WHERE rowid = 1").i, i64(1))
+
+	// The INTEGER PRIMARY KEY is the rowid, and last_insert_rowid agrees.
+	run(t, store, "CREATE TABLE keyed (id INTEGER PRIMARY KEY, v TEXT)")
+	run(t, store, "INSERT INTO keyed VALUES (7, 'a')")
+	testing.expect_value(t, scalar(t, store, "SELECT rowid FROM keyed").i, i64(7))
+	testing.expect_value(t, scalar(t, store, "SELECT last_insert_rowid()").i, i64(7))
+
+	// A column with that name wins over the alias.
+	run(t, store, "CREATE TABLE shadow (rowid TEXT, a INTEGER)")
+	run(t, store, "INSERT INTO shadow VALUES ('x', 1)")
+	testing.expect_value(t, scalar(t, store, "SELECT rowid FROM shadow").s, "x")
+
+	// Two tables make an unqualified rowid ambiguous, and qualifying answers.
+	err := run_error(t, store, "SELECT rowid FROM plain p, plain q")
+	testing.expect_value(t, err.kind, db.Error_Kind.Column_Not_Found)
+	both := run(t, store, "SELECT p.rowid, q.rowid FROM plain p, plain q")
+	defer db.sql_result_destroy(&both)
+	testing.expect_value(t, len(both.rows), 4)
+	testing.expect_value(t, len(both.rows[0]), 2)
+}

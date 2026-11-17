@@ -181,6 +181,12 @@ folds ASCII only, so `upper(char(233))` is `É` here and `é` there. The
 even and older SQLite rounded half away from zero); SQLite 3.45 answers `2` as
 well, so the row is now a match, and the gate is what noticed.
 
+`rowid` names the stored row (`rowid`, `_rowid_` and `oid`), and a table whose
+primary key is one INTEGER column answers that column. For any other table the
+engine's row ids start at **0** where SQLite's start at 1, so a program that
+compares a rowid against a literal from another database sees a different number;
+`ORDER BY rowid` and `WHERE rowid = ?` behave the same.
+
 Integer arithmetic that does not fit is refused, as PostgreSQL refuses it, where
 SQLite promotes the result to a real: `2 * 9223372036854775807` is a real in
 SQLite and `integer overflow` here. The refusal is the same for `+`, `-`, `*`,

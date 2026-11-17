@@ -938,6 +938,39 @@ Eval_Ctx :: struct {
 	depth:  int,
 }
 
+// rowid_alias_name reports SQLite's three spellings of a rowid, none of which is
+// a column of the table unless the schema says so.
+@(private)
+rowid_alias_name :: proc(name: string) -> bool {
+	return strings.equal_fold(name, "rowid") ||
+		strings.equal_fold(name, "_rowid_") ||
+		strings.equal_fold(name, "oid")
+}
+
+// rowid_value answers a rowid alias for one source. A single-column INTEGER
+// PRIMARY KEY is the rowid in SQLite, and `last_insert_rowid` already makes that
+// choice here, so `rowid` answers that column's value when there is one.
+// Otherwise it is the engine's row id, which starts at zero where SQLite starts
+// at one (docs/sqlite.md declares the difference). A source with no stored row
+// behind it -- a join, an aggregate, SELECT without FROM -- has no rowid.
+@(private)
+rowid_value :: proc(source: Source) -> (Value, bool) {
+	if source.table == nil do return {}, false
+	if source.row.id == NO_ROW_ID do return {}, false
+	schema := &source.table.schema
+	if len(schema.primary_key) == 1 {
+		key := schema.primary_key[0]
+		if key >= 0 && key < len(schema.columns) && schema.columns[key].type.kind == .Int {
+			if key < len(source.row.values) {
+				if key_value, ok := value_to_i64(source.row.values[key]); ok {
+					return value_int(key_value), true
+				}
+			}
+		}
+	}
+	return value_int(i64(source.row.id)), true
+}
+
 @(private)
 free_partials :: proc(items: ^[dynamic][]Source) {
 	for item in items do delete(item)
@@ -3967,6 +4000,14 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 							return value_float(score), ERROR_NONE
 						}
 					}
+					// rowid, _rowid_ and oid name the row itself, unless the
+					// table declares a column with that name (the lookup above
+					// already won in that case).
+					if rowid_alias_name(e.name) {
+						if rowid, has_rowid := rowid_value(source); has_rowid {
+							return rowid, ERROR_NONE
+						}
+					}
 					return {}, errf(
 						.Column_Not_Found,
 						"column %s does not exist in %s",
@@ -4001,6 +4042,23 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 				if score, scored := fts_rank_value(ctx.tx, source.table.schema.name, source.row.id); scored {
 					return value_float(score), ERROR_NONE
 				}
+			}
+		}
+		if !found && rowid_alias_name(e.name) {
+			// One reachable table with a rowid answers; two make the name
+			// ambiguous, as they do in SQLite.
+			rowid: Value
+			reachable := 0
+			for source in ctx.sources {
+				if source.table == nil || source.hidden_unqualified do continue
+				candidate, has_rowid := rowid_value(source)
+				if !has_rowid do continue
+				rowid = candidate
+				reachable += 1
+			}
+			if reachable == 1 do return rowid, ERROR_NONE
+			if reachable > 1 {
+				return {}, errf(.Column_Not_Found, "column %s is ambiguous; qualify it with a table", e.name)
 			}
 		}
 		if !found {
