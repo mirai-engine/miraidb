@@ -160,6 +160,12 @@ embed_exec :: proc(conn: ^Embed_Conn, sql: string) -> Error {
 	return embed_exec_params(conn, sql, nil)
 }
 
+// embed_error_kind is the kind of the connection's last error.
+embed_error_kind :: proc(conn: ^Embed_Conn) -> Error_Kind {
+	if conn == nil do return .Invalid_Argument
+	return conn.last_error.kind
+}
+
 // embed_note_error records a failure the embedding layer found on its own (a
 // misuse, a refused close), so embed_error answers it like an engine error.
 embed_note_error :: proc(conn: ^Embed_Conn, kind: Error_Kind, message: string) {
@@ -219,6 +225,20 @@ embed_in_transaction :: proc(conn: ^Embed_Conn) -> bool {
 	return conn != nil && conn.tx != nil
 }
 
+// embed_authorize asks the store's authorizer about a statement just prepared,
+// reading the catalog the connection sees.
+@(private)
+embed_authorize :: proc(conn: ^Embed_Conn, prepared: ^Stmt_Prepared) -> Error {
+	if conn.store.hooks.authorizer == nil do return ERROR_NONE
+	tx := conn.tx
+	own := tx == nil
+	if own do tx = tx_begin_read(conn.store)
+	defer if own do tx_end(tx)
+	ignored, err := sql_authorize(conn.store, tx, prepared)
+	prepared.ignored = ignored
+	return err
+}
+
 // embed_run executes a prepared statement on the connection: transaction
 // control against the connection's own transaction, anything else inside that
 // transaction when one is open and on its own otherwise. The messages are
@@ -228,6 +248,8 @@ embed_run :: proc(conn: ^Embed_Conn, prepared: ^Stmt_Prepared, params: []Value) 
 	ack :: proc(conn: ^Embed_Conn) -> (Sql_Result, Error) {
 		return Sql_Result{kind = .Ack, commit_seq = conn.store.commit_seq}, ERROR_NONE
 	}
+	// A statement the authorizer told to ignore prepares and does nothing.
+	if prepared.ignored do return ack(conn)
 	if !prepared.is_pragma {
 		#partial switch stmt in prepared.query.statement {
 		case Begin_Stmt:
@@ -341,6 +363,7 @@ embed_exec_params :: proc(conn: ^Embed_Conn, sql: string, params: []Value) -> Er
 	prepared, prepare_err := sql_prepare(conn.store, sql)
 	if prepare_err.kind != .None do return embed_fail(conn, prepare_err)
 	defer stmt_prepared_destroy(prepared)
+	if auth_err := embed_authorize(conn, prepared); auth_err.kind != .None do return embed_fail(conn, auth_err)
 	started := now_microseconds()
 	result, exec_err := embed_run(conn, prepared, params)
 	store_record_query_latency(conn.store, now_microseconds() - started)
@@ -359,6 +382,12 @@ embed_prepare :: proc(conn: ^Embed_Conn, sql: string) -> ^Embed_Statement {
 	prepared, prepare_err := sql_prepare(conn.store, sql)
 	if prepare_err.kind != .None {
 		embed_fail(conn, prepare_err)
+		return nil
+	}
+	if auth_err := embed_authorize(conn, prepared); auth_err.kind != .None {
+		stmt_prepared_destroy(prepared)
+		embed_fail(conn, auth_err)
+		error_free(&auth_err)
 		return nil
 	}
 	stmt := new(Embed_Statement)

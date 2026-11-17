@@ -181,3 +181,56 @@ trace_end :: proc(stmt: ^Statement) {
 trace_close :: proc(db: ^Database) {
 	if db.trace_mask & SQLITE_TRACE_CLOSE != 0 do db.trace_hook(SQLITE_TRACE_CLOSE, db.trace_arg, rawptr(db), nil)
 }
+
+// --- Authorizer ----------------------------------------------------------------
+
+SQLITE_DENY :: c.int(1)
+SQLITE_IGNORE :: c.int(2)
+
+Authorizer_Callback :: #type proc "c" (arg: rawptr, action: c.int, arg1: cstring, arg2: cstring, database: cstring, inner: cstring) -> c.int
+
+@(private)
+optional_cstring :: proc(text: Maybe(string)) -> cstring {
+	value, present := text.?
+	if !present do return nil
+	return strings.clone_to_cstring(value, context.temp_allocator)
+}
+
+@(private)
+hook_authorize :: proc(ctx: rawptr, request: engine.Auth_Request) -> engine.Auth_Answer {
+	db := (^Database)(ctx)
+	answer := db.authorizer(
+		db.authorizer_arg,
+		c.int(request.action),
+		optional_cstring(request.arg1),
+		optional_cstring(request.arg2),
+		optional_cstring(request.database),
+		optional_cstring(request.inner),
+	)
+	switch answer {
+	case SQLITE_OK:
+		return .Allow
+	case SQLITE_IGNORE:
+		return .Ignore
+	}
+	// SQLITE_DENY, and any answer SQLite does not define, refuse.
+	return .Deny
+}
+
+// sqlite3_set_authorizer installs a callback the engine asks, while a
+// statement is prepared, about each thing it will do: SQLITE_OK allows it,
+// SQLITE_DENY fails the prepare with SQLITE_AUTH, and SQLITE_IGNORE reads a
+// column as NULL, leaves an assigned column alone, or makes the statement do
+// nothing. A NULL callback removes it.
+@(export)
+sqlite3_set_authorizer :: proc "c" (handle: rawptr, callback: Authorizer_Callback, arg: rawptr) -> c.int {
+	context = runtime.default_context()
+	db := db_of(handle)
+	if db == nil do return SQLITE_MISUSE
+	db.authorizer = callback
+	db.authorizer_arg = arg
+	hooks := &db.conn.store.hooks
+	hooks.authorizer = callback == nil ? nil : hook_authorize
+	hooks.authorizer_ctx = rawptr(db)
+	return SQLITE_OK
+}

@@ -665,6 +665,9 @@ Stmt_Prepared :: struct {
 	// param_count is how many positional parameters the statement binds, so a
 	// caller can refuse an index before it becomes a silent growth (D29).
 	param_count: int,
+	// ignored is set when the authorizer answered Ignore to the statement's own
+	// action: it prepares, and running it does nothing.
+	ignored: bool,
 }
 
 sql_prepare :: proc(store: ^Store, sql: string) -> (^Stmt_Prepared, Error) {

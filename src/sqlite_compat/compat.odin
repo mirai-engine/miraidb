@@ -88,6 +88,8 @@ Database :: struct {
 	trace_mask:      c.uint,
 	trace_hook:      Trace_Callback,
 	trace_arg:       rawptr,
+	authorizer:      Authorizer_Callback,
+	authorizer_arg:  rawptr,
 }
 
 Statement :: struct {
@@ -231,10 +233,13 @@ c_text :: proc(sql: cstring, nByte: c.int) -> string {
 @(private)
 fail_connection :: proc(db: ^Database) -> c.int {
 	if db == nil do return SQLITE_ERROR
+	// The code follows the kind, so a prepare the authorizer refused answers
+	// SQLITE_AUTH, as in SQLite.
+	code := sqlite_code(engine.Error{kind = engine.embed_error_kind(db.conn)})
 	set_error(db, engine.embed_error(db.conn))
-	db.last_code = SQLITE_ERROR
-	db.last_extended = SQLITE_ERROR
-	return SQLITE_ERROR
+	db.last_code = code
+	db.last_extended = code
+	return code
 }
 
 @(private)

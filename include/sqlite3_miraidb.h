@@ -2,9 +2,9 @@
 ** sqlite3_miraidb.h -- the subset of SQLite's C API that sqlite3_miraidb.dll
 ** implements, declared so a C program can compile against it.
 **
-** This is not sqlite3.h. It declares the 118 functions the facade exports and the
+** This is not sqlite3.h. It declares the 119 functions the facade exports and the
 ** result codes they answer; a program that uses anything else will not link, and
-** that is the honest state of the facade (118 of SQLite's 315 symbols). Look at
+** that is the honest state of the facade (119 of SQLite's 315 symbols). Look at
 ** docs/sqlite.md for what each one does here and where it differs.
 **
 ** Build the library with:
@@ -276,6 +276,44 @@ void *sqlite3_update_hook(sqlite3 *db,
                           void (*callback)(void *, int, const char *,
                                            const char *, sqlite3_int64),
                           void *arg);
+
+/* --- Authorizer ------------------------------------------------------------
+** Asked while a statement is prepared, with SQLite's action codes and
+** arguments: SQLITE_OK allows, SQLITE_DENY fails the prepare (SQLITE_AUTH),
+** SQLITE_IGNORE reads a column as NULL, leaves an assigned column alone, or
+** makes the statement do nothing. The order of the questions is not SQLite's;
+** the questions are, except those about SQLite's own sqlite_* tables, which
+** this engine does not have. The sixth argument (trigger or view) is NULL. */
+
+#define SQLITE_DENY    1
+#define SQLITE_IGNORE  2
+
+#define SQLITE_CREATE_INDEX        1
+#define SQLITE_CREATE_TABLE        2
+#define SQLITE_CREATE_TEMP_TABLE   4
+#define SQLITE_CREATE_TRIGGER      7
+#define SQLITE_CREATE_VIEW         8
+#define SQLITE_DROP_INDEX         10
+#define SQLITE_DROP_TABLE         11
+#define SQLITE_DROP_TRIGGER       16
+#define SQLITE_DROP_VIEW          17
+#define SQLITE_PRAGMA             19
+#define SQLITE_READ               20
+#define SQLITE_SELECT             21
+#define SQLITE_TRANSACTION        22
+#define SQLITE_ATTACH             24
+#define SQLITE_DETACH             25
+#define SQLITE_ALTER_TABLE        26
+#define SQLITE_REINDEX            27
+#define SQLITE_ANALYZE            28
+#define SQLITE_FUNCTION           31
+#define SQLITE_SAVEPOINT          32
+
+int sqlite3_set_authorizer(sqlite3 *db,
+                           int (*callback)(void *, int, const char *,
+                                           const char *, const char *,
+                                           const char *),
+                           void *arg);
 
 /* --- Trace -----------------------------------------------------------------
 ** STMT when a statement starts running (X is its text), ROW for each row,

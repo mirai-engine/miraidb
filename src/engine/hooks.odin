@@ -39,6 +39,10 @@ Store_Hooks :: struct {
 	commit_ctx:     rawptr,
 	rollback:       Rollback_Hook,
 	rollback_ctx:   rawptr,
+	// authorizer is asked about every action of a statement while it is
+	// prepared (authorize.odin).
+	authorizer:     Authorizer,
+	authorizer_ctx: rawptr,
 }
 
 // catalog_table_name reports a table the engine keeps for itself, whose
