@@ -93,6 +93,20 @@ def main() -> int:
         assert lib.sqlite3_close(memory) == OK
     assert not os.path.exists(":memory:"), "the :memory: spelling made a directory"
 
+    # A trigger body holds semicolons that do not end the CREATE TRIGGER:
+    # sqlite3_exec used to cut it at the first one and fail with "needs END".
+    memory = ctypes.c_void_p()
+    assert lib.sqlite3_open(b":memory:", ctypes.byref(memory)) == OK
+    script = (b"CREATE TABLE m (id INTEGER); CREATE TABLE seen (id INTEGER);"
+              b"CREATE TRIGGER mt AFTER INSERT ON m BEGIN INSERT INTO seen VALUES (new.id); "
+              b"INSERT INTO seen VALUES (new.id + 1); END; INSERT INTO m VALUES (1)")
+    assert lib.sqlite3_exec(memory, script, None, None, None) == OK, lib.sqlite3_errmsg(memory)
+    check = ctypes.c_void_p()
+    assert lib.sqlite3_prepare_v2(memory, b"SELECT count(*) FROM seen", -1, ctypes.byref(check), None) == OK
+    assert lib.sqlite3_step(check) == ROW and lib.sqlite3_column_int64(check, 0) == 2
+    lib.sqlite3_finalize(check)
+    assert lib.sqlite3_close(memory) == OK
+
     db = ctypes.c_void_p()
     assert lib.sqlite3_open(db_path.encode(), ctypes.byref(db)) == OK, "open"
     assert lib.sqlite3_exec(db, b"CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)", None, None, None) == OK

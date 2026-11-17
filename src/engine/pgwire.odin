@@ -1429,24 +1429,40 @@ pg_command_tag :: proc(sql: string, result: ^Sql_Result) -> string {
 	return verb
 }
 
-// sql_split_statements cuts a script into statements at the `;` that end them.
-// A `;` inside a quoted string, a quoted name, a comment or a trigger body
-// (`CREATE TRIGGER … BEGIN …; …; END`) does not end anything. Empty statements
-// are dropped; the slices point into `sql`.
+// sql_split_statements cuts a script into statements at the `;` that end them
+// (sql_statement_end). Empty statements are dropped; the slices point into
+// `sql`.
 sql_split_statements :: proc(sql: string, alloc := context.allocator) -> [dynamic]string {
 	out := make([dynamic]string, 0, 2, alloc)
+	rest := sql
+	for len(rest) > 0 {
+		end := sql_statement_end(rest)
+		piece := rest[:end]
+		if end > 0 && rest[end - 1] == ';' do piece = rest[:end - 1]
+		piece = strings.trim_space(piece)
+		if len(piece) > 0 do append(&out, piece)
+		rest = rest[end:]
+	}
+	return out
+}
+
+// sql_statement_end returns the index just past the first statement of `sql`:
+// past the `;` that ends it, or the end of the text. A `;` inside a quoted
+// string, a quoted name (`"…"`, `` `…` ``, `[…]`), a comment or a trigger body
+// (`CREATE TRIGGER … BEGIN …; …; END`) does not end anything. SQLite reports
+// the same boundary through pzTail.
+sql_statement_end :: proc(sql: string) -> int {
 	text := transmute([]u8)sql
-	start := 0
 	depth := 0 // BEGIN/CASE … END nesting inside a trigger body
 	trigger := false
 	word_start := -1
 	i := 0
-	flush_word :: proc(sql: string, word_start: int, end: int, start: int, trigger: ^bool, depth: ^int) {
+	flush_word :: proc(sql: string, word_start: int, end: int, trigger: ^bool, depth: ^int) {
 		if word_start < 0 do return
 		word := sql[word_start:end]
 		if !trigger^ && strings.equal_fold(word, "trigger") {
 			// Only a trigger that this statement creates has a body.
-			head := strings.to_upper(strings.trim_space(sql[start:word_start]), context.temp_allocator)
+			head := strings.to_upper(strings.trim_space(sql[:word_start]), context.temp_allocator)
 			if strings.has_prefix(head, "CREATE") do trigger^ = true
 			return
 		}
@@ -1465,7 +1481,7 @@ sql_split_statements :: proc(sql: string, alloc := context.allocator) -> [dynami
 			i += 1
 			continue
 		}
-		flush_word(sql, word_start, i, start, &trigger, &depth)
+		flush_word(sql, word_start, i, &trigger, &depth)
 		word_start = -1
 		switch {
 		case c == '\'' || c == '"' || c == '`':
@@ -1482,6 +1498,9 @@ sql_split_statements :: proc(sql: string, alloc := context.allocator) -> [dynami
 				i += 1
 			}
 			i += 1
+		case c == '[':
+			for i < len(text) && text[i] != ']' do i += 1
+			i += 1
 		case c == '-' && i + 1 < len(text) && text[i + 1] == '-':
 			for i < len(text) && text[i] != '\n' do i += 1
 		case c == '/' && i + 1 < len(text) && text[i + 1] == '*':
@@ -1489,21 +1508,12 @@ sql_split_statements :: proc(sql: string, alloc := context.allocator) -> [dynami
 			for i + 1 < len(text) && !(text[i] == '*' && text[i + 1] == '/') do i += 1
 			i += 2
 		case c == ';' && depth == 0:
-			piece := strings.trim_space(sql[start:i])
-			if len(piece) > 0 do append(&out, piece)
-			start = i + 1
-			trigger = false
-			i += 1
+			return i + 1
 		case:
 			i += 1
 		}
 	}
-	flush_word(sql, word_start, min(i, len(text)), start, &trigger, &depth)
-	if start < len(text) {
-		piece := strings.trim_space(sql[start:])
-		if len(piece) > 0 do append(&out, piece)
-	}
-	return out
+	return len(text)
 }
 
 // --- SCRAM-SHA-256 ---------------------------------------------------------

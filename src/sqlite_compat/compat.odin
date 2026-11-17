@@ -142,52 +142,12 @@ stmt_of :: proc(handle: rawptr) -> ^Statement {
 }
 
 // statement_end returns the index just past the first statement: its terminating
-// semicolon, or the end of the text. Quotes, comments and blob literals are
-// walked, so a semicolon inside one does not end a statement. SQLite exposes the
-// same boundary through pzTail (F5).
+// semicolon, or the end of the text, as the engine cuts a script (a `;` inside
+// a quote, a comment or a trigger body ends nothing). SQLite exposes the same
+// boundary through pzTail (F5).
 @(private)
 statement_end :: proc(sql: string) -> int {
-	i := 0
-	for i < len(sql) {
-		ch := sql[i]
-		if ch == '\'' || ch == '"' || ch == '`' {
-			quote := ch
-			i += 1
-			for i < len(sql) {
-				if sql[i] == quote {
-					if i + 1 < len(sql) && sql[i + 1] == quote {
-						i += 2
-						continue
-					}
-					i += 1
-					break
-				}
-				i += 1
-			}
-			continue
-		}
-		if ch == '[' {
-			i += 1
-			for i < len(sql) && sql[i] != ']' do i += 1
-			if i < len(sql) do i += 1
-			continue
-		}
-		if ch == '-' && i + 1 < len(sql) && sql[i + 1] == '-' {
-			i += 2
-			for i < len(sql) && sql[i] != '\n' do i += 1
-			continue
-		}
-		if ch == '/' && i + 1 < len(sql) && sql[i + 1] == '*' {
-			i += 2
-			for i + 1 < len(sql) && !(sql[i] == '*' && sql[i + 1] == '/') do i += 1
-			if i + 1 < len(sql) do i += 2
-			else do i = len(sql)
-			continue
-		}
-		if ch == ';' do return i + 1
-		i += 1
-	}
-	return len(sql)
+	return min(engine.sql_statement_end(sql), len(sql))
 }
 
 // only_space_or_comments reports text that holds no statement: whitespace,

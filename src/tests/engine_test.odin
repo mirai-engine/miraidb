@@ -5204,6 +5204,12 @@ test_postgres_dialect :: proc(t: ^testing.T) {
 		testing.expect(t, strings_contains(pieces[2], "SELECT 2; END"))
 		testing.expect_value(t, pieces[3], "SELECT 3")
 	}
+	// sql_statement_end is the same boundary for the first statement: the tail
+	// sqlite3_prepare reports and sqlite3_exec goes on from.
+	trigger := "CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES (new.a); END; SELECT 1"
+	testing.expect_value(t, trigger[:db.sql_statement_end(trigger)], "CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES (new.a); END;")
+	bracket := "SELECT [a;b] FROM t; SELECT 2"
+	testing.expect_value(t, bracket[:db.sql_statement_end(bracket)], "SELECT [a;b] FROM t;")
 }
 
 @(test)
