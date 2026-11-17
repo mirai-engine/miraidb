@@ -70,6 +70,9 @@ Database :: struct {
 Statement :: struct {
 	db:   ^Database,
 	stmt: ^engine.Embed_Statement,
+	// finished is set when step answered SQLITE_DONE, so stepping again is
+	// SQLITE_MISUSE until reset, which is SQLite's contract (F7).
+	finished: bool,
 	// text_cache owns every C string this statement handed to the caller:
 	// sqlite3_column_text and sqlite3_column_name return a pointer that is valid
 	// until the next step, reset or finalize, and the engine's own strings are
@@ -364,8 +367,13 @@ sqlite3_close :: proc "c" (handle: rawptr) -> c.int {
 	context = runtime.default_context()
 	db := db_of(handle)
 	if db == nil do return SQLITE_OK
-	// Statements this connection handed out are finalized here, so a later call
-	// through one of them answers misuse instead of touching freed memory.
+	// SQLite answers SQLITE_BUSY while a statement is not finalized, and frees
+	// nothing: the caller finalizes and closes again (F6). Freeing them here, as
+	// this used to, told a caller that checked for BUSY that everything was gone.
+	if len(db.statements) > 0 {
+		set_error(db, "the connection has statements that are not finalized")
+		return SQLITE_BUSY
+	}
 	keys := make([dynamic]rawptr, 0, len(db.statements))
 	for key, _ in db.statements do append(&keys, key)
 	for key in keys {
@@ -579,6 +587,7 @@ sqlite3_reset :: proc "c" (handle: rawptr) -> c.int {
 	stmt := stmt_of(handle)
 	if stmt == nil do return SQLITE_MISUSE
 	stmt_clear_text_cache(stmt)
+	stmt.finished = false
 	engine.embed_reset(stmt.stmt)
 	return SQLITE_OK
 }
@@ -674,12 +683,17 @@ sqlite3_step :: proc "c" (handle: rawptr) -> c.int {
 	context = runtime.default_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return SQLITE_MISUSE
+	if stmt.finished {
+		set_error(stmt.db, "the statement already returned SQLITE_DONE; reset it first")
+		return SQLITE_MISUSE
+	}
 	stmt_clear_text_cache(stmt)
 	has_row, err := engine.embed_step(stmt.stmt)
 	if err.kind != .None {
 		return fail(stmt.db, err)
 	}
 	if has_row do return SQLITE_ROW
+	stmt.finished = true
 	return SQLITE_DONE
 }
 
@@ -853,11 +867,10 @@ sqlite3_blob_open :: proc "c" (
 	ppBlob^ = nil
 	table_name := string(zTable)
 	column_name := string(zColumn)
+	// A single-column integer primary key is the rowid, so it names the row; any
+	// other table is named by its rowid, which every stored row has (F8).
 	key_column, key_ok := blob_key_column(db, table_name)
-	if !key_ok {
-		set_error(db, "sqlite3_blob_open needs a table with a single-column primary key")
-		return SQLITE_ERROR
-	}
+	if !key_ok do key_column = "rowid"
 	query := strings.concatenate({"SELECT ", column_name, " FROM ", table_name, " WHERE ", key_column, " = ?"})
 	defer delete(query)
 	stmt := engine.embed_prepare(db.conn, query)

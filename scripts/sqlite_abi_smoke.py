@@ -7,7 +7,7 @@ Run with a Python that can load the platform library:
 from __future__ import annotations
 import ctypes, os, shutil, sqlite3, sys
 
-OK, ERROR, CONSTRAINT, MISUSE, ROW, DONE, RANGE = 0, 1, 19, 21, 100, 101, 25
+OK, ERROR, CONSTRAINT, MISUSE, ROW, DONE, RANGE, BUSY = 0, 1, 19, 21, 100, 101, 25, 5
 
 
 def load(path):
@@ -37,6 +37,16 @@ def load(path):
     lib.sqlite3_errmsg.restype = ctypes.c_char_p
     lib.sqlite3_changes.argtypes = [ctypes.c_void_p]
     lib.sqlite3_changes.restype = ctypes.c_int
+    lib.sqlite3_blob_open.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
+                                      ctypes.c_char_p, ctypes.c_longlong, ctypes.c_int,
+                                      ctypes.POINTER(ctypes.c_void_p)]
+    lib.sqlite3_blob_open.restype = ctypes.c_int
+    lib.sqlite3_blob_bytes.argtypes = [ctypes.c_void_p]
+    lib.sqlite3_blob_bytes.restype = ctypes.c_int
+    lib.sqlite3_blob_read.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+    lib.sqlite3_blob_read.restype = ctypes.c_int
+    lib.sqlite3_blob_close.argtypes = [ctypes.c_void_p]
+    lib.sqlite3_blob_close.restype = ctypes.c_int
     lib.sqlite3_reset.argtypes = [ctypes.c_void_p]
     lib.sqlite3_reset.restype = ctypes.c_int
     lib.sqlite3_clear_bindings.argtypes = [ctypes.c_void_p]
@@ -338,13 +348,16 @@ def main() -> int:
     assert lib.sqlite3_bind_text(gone, 1, b"b", -1, None) == MISUSE
     assert lib.sqlite3_finalize(gone) == MISUSE
 
+    # F6: close answers SQLITE_BUSY while a statement is not finalized and frees
+    # nothing; the caller finalizes and closes again.
     owner = ctypes.c_void_p()
     assert lib.sqlite3_open(b":memory:", ctypes.byref(owner)) == OK
     orphan = ctypes.c_void_p()
     assert lib.sqlite3_prepare_v2(owner, b"SELECT 1", -1, ctypes.byref(orphan), None) == OK
-    assert lib.sqlite3_close(owner) == OK
-    assert lib.sqlite3_step(orphan) == MISUSE, "a statement of a closed connection is misuse"
-    lib.sqlite3_finalize(orphan)
+    assert lib.sqlite3_close(owner) == BUSY, "close with a live statement is BUSY"
+    assert lib.sqlite3_step(orphan) == ROW, "the connection is still open after BUSY"
+    assert lib.sqlite3_finalize(orphan) == OK
+    assert lib.sqlite3_close(owner) == OK, "close succeeds once every statement is finalized"
     lib.sqlite3_close(ghost)
 
     # F2: sqlite3_reset keeps the bound values; dropping them is what
@@ -514,6 +527,33 @@ def main() -> int:
     assert lib.sqlite3_exec(exec_db, b"SELECT a FROM ex", ctypes.cast(stop, ctypes.c_void_p), None, None) == OK
     assert stopped == [b"1"], stopped
     assert lib.sqlite3_close(exec_db) == OK
+
+    # F7: a statement that answered DONE is SQLITE_MISUSE until it is reset,
+    # which is how SQLite tells a caller its loop already ended.
+    done_db = ctypes.c_void_p()
+    assert lib.sqlite3_open(b":memory:", ctypes.byref(done_db)) == OK
+    done_stmt = ctypes.c_void_p()
+    assert lib.sqlite3_prepare_v2(done_db, b"SELECT 1", -1, ctypes.byref(done_stmt), None) == OK
+    assert lib.sqlite3_step(done_stmt) == ROW
+    assert lib.sqlite3_step(done_stmt) == DONE
+    assert lib.sqlite3_step(done_stmt) == MISUSE, "a spent statement is misuse"
+    assert lib.sqlite3_reset(done_stmt) == OK
+    assert lib.sqlite3_step(done_stmt) == ROW, "reset makes it steppable again"
+    lib.sqlite3_finalize(done_stmt)
+
+    # F8: incremental blob I/O names the row by its rowid, so a table with no
+    # primary key works; it used to answer SQLITE_ERROR.
+    assert lib.sqlite3_exec(done_db, b"CREATE TABLE plain_blob (v BLOB)", None, None, None) == OK
+    assert lib.sqlite3_exec(done_db, b"INSERT INTO plain_blob VALUES (x'68656c6c6f')", None, None, None) == OK
+    blob = ctypes.c_void_p()
+    code = lib.sqlite3_blob_open(done_db, b"main", b"plain_blob", b"v", 1, 0, ctypes.byref(blob))
+    assert code == OK, (code, lib.sqlite3_errmsg(done_db))
+    size = lib.sqlite3_blob_bytes(blob)
+    buffer = ctypes.create_string_buffer(size)
+    assert lib.sqlite3_blob_read(blob, buffer, size, 0) == OK
+    assert size == 5 and buffer.raw[:5] == b"hello", (size, buffer.raw[:5])
+    assert lib.sqlite3_blob_close(blob) == OK
+    assert lib.sqlite3_close(done_db) == OK
 
     print("rows:", rows)
     print("error path:", message)

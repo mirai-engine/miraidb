@@ -289,8 +289,10 @@ on our own export is therefore always 0.
 
 ## Incremental BLOB I/O
 
-`sqlite3_blob_open` addresses a row by its single-column primary key, which is
-what SQLite calls a rowid alias. The handle copies the column, `sqlite3_blob_read`
+`sqlite3_blob_open` addresses a row by its rowid: a single-column integer primary
+key when the table has one (SQLite's rowid alias), and the table's rowid
+otherwise, so a table with no primary key works. The handle copies the column,
+`sqlite3_blob_read`
 and `sqlite3_blob_write` work inside that copy (a write cannot grow it, as in
 SQLite), and `sqlite3_blob_close` writes a dirty handle back with one `UPDATE`.
 `sqlite3_blob_reopen` reloads the handle against another row of the same column.
