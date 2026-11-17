@@ -130,6 +130,36 @@ CREATE UNIQUE INDEX by_code ON t USING DIRECT (code); -- unique, one row per key
 CREATE INDEX by_id ON t (id);                        -- btree, the default
 ```
 
+## Correlated subqueries and LATERAL
+
+A subquery may read a column of the statement it is written in. The column it
+does not find in its own `FROM` is looked for in the row of the statement that
+holds it, and so on outwards, so the reference works at any depth.
+
+```sql
+SELECT name FROM emp e
+ WHERE salary > (SELECT avg(salary) FROM emp WHERE dept = e.dept);
+SELECT name FROM emp e
+ WHERE EXISTS (SELECT 1 FROM emp x WHERE x.dept = e.dept AND x.salary > 180);
+```
+
+`LATERAL` says the same thing for a derived table: it is evaluated once per row of
+the sources to its left, not once for the statement, so its aggregates and its
+`WHERE` see that row.
+
+```sql
+SELECT d.name, x.top
+  FROM dept d, LATERAL (SELECT max(salary) AS top FROM emp WHERE dept = d.id) x;
+SELECT d.name, x.top
+  FROM dept d LEFT JOIN LATERAL (SELECT max(salary) AS top FROM emp WHERE dept = d.id) x
+    ON true;
+```
+
+A derived table without `LATERAL` is still evaluated once, and an unqualified
+column of the inner statement wins over one of the same name outside it. A lateral
+step cannot be the inner side of a `RIGHT` or `FULL` join, because that side is
+kept when nothing matched and a lateral row only exists once an outer row does.
+
 ## MERGE
 
 `MERGE` loads a set of rows into a table in one statement: the rows that are

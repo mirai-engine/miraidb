@@ -225,14 +225,15 @@ QUERIES = [
     # A NULL argument gives NULL, not an error.
     "SELECT lower(NULL), upper(NULL), replace(NULL, 'a', 'b'), instr(NULL, 'a'), sign(NULL), sqrt(NULL), printf(NULL), hex(char(NULL))",    # SQLite's other spellings and its planner hints.
     "SELECT ceiling(1.2), power(2, 10), ln(1), ln(0), likely(5), unlikely(NULL), likelihood(3, 0.5)",
+    # A correlated reference reads the row of the statement it is written in.
+    "SELECT id FROM emp WHERE EXISTS (SELECT 1 FROM dept WHERE dept.id = emp.dept)",
+    "SELECT name FROM emp WHERE salary > (SELECT avg(salary) FROM emp WHERE dept = emp.dept)",
 ]
 
 # The engine refuses these and says why; SQLite answers them. A refusal that
 # starts working fails the gate, which is how the list shrinks.
 REFUSED = {
     "SELECT emp.id FROM emp NATURAL JOIN dept": "NATURAL joins are refused, not approximated",
-
-    "SELECT id FROM emp WHERE EXISTS (SELECT 1 FROM dept WHERE dept.id = emp.dept)": "a correlated reference is not resolved (features.md E2)",
 
     "SELECT sum(n) FILTER (WHERE n > 1) FROM nums": "an aggregate FILTER is not implemented; windows accept one",
 

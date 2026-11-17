@@ -247,6 +247,9 @@ Order_Item :: struct {
 }
 
 Table_Ref :: struct {
+	// lateral marks a derived table that may read the row before it: it is
+	// evaluated once per row of the sources to its left, not once per statement.
+	lateral:   bool,
 	name:  string,
 	// schema is the qualifier of `schema.table`: an attached database name.
 	schema: string,

@@ -1029,6 +1029,7 @@ plan_expr_qualifiers :: proc(expr: ^Expr, out: ^map[string]bool) -> bool {
 @(private)
 plan_can_reorder :: proc(tx: ^Tx, stmt: Select_Stmt) -> bool {
 	if stmt.from.as_of != nil do return false
+	if stmt.from.lateral do return false
 	if len(stmt.from.args) > 0 do return false
 	if is_json_table_function(stmt.from.name) do return false
 	if _, base_table := tx.store.tables[stmt.from.name]; !base_table do return false
@@ -1037,6 +1038,7 @@ plan_can_reorder :: proc(tx: ^Tx, stmt: Select_Stmt) -> bool {
 		// it was written in is part of the answer.
 		if join.kind != .Inner && join.kind != .Cross do return false
 		if join.table.as_of != nil do return false
+		if join.table.lateral do return false
 		if len(join.table.args) > 0 do return false
 		if is_json_table_function(join.table.name) do return false
 		if _, table := tx.store.tables[join.table.name]; !table do return false

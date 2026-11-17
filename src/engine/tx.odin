@@ -30,6 +30,9 @@ Tx :: struct {
 	// ends.
 	pinned:      bool,
 	pinned_seq:  u64,
+	// outer is the stack of frames a subquery evaluates inside: a correlated
+	// reference reads the row of the statement it is written in from here.
+	outer:       ^Outer_Frame,
 	read_tables: map[string]bool,
 	// A read transaction shares every table instead of copying it: it holds one
 	// reference per table and does not hold the store lock; `locked` records

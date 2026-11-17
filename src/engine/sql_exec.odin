@@ -970,6 +970,14 @@ select_output_may_shrink :: proc(stmt: Select_Stmt) -> bool {
 	return false
 }
 
+// Outer_Frame is one level of a query written inside another: the sources of the
+// statement the subquery belongs to. A correlated subquery, and a LATERAL
+// subquery, read a column there when its own sources do not have it.
+Outer_Frame :: struct {
+	sources: []Source,
+	next:    ^Outer_Frame,
+}
+
 Eval_Ctx :: struct {
 	// order_err is the first error an ORDER BY expression raised while the sort
 	// keys were built; the statement returns it instead of sorting.
@@ -996,6 +1004,8 @@ Eval_Ctx :: struct {
 	// refusing. Both are nil everywhere else.
 	window_values: []Value,
 	window_slots:  map[^Expr]int,
+	// outer is the stack of frames the query is written inside, innermost first.
+	outer: ^Outer_Frame,
 	// depth is how deep the evaluation is. The parser refuses a tree deeper than
 	// MAX_EXPRESSION_DEPTH, so this only fires for a tree that arrived another way
 	// (a stored view, a generated column, a policy); it is here so the failure is
@@ -1064,7 +1074,9 @@ sql_run_query :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sql_Re
 
 @(private)
 select_has_derived_join :: proc(stmt: Select_Stmt) -> bool {
-	for join in stmt.joins do if join.table.subquery != nil do return true
+	for join in stmt.joins {
+		if join.table.subquery != nil && !join.table.lateral do return true
+	}
 	return false
 }
 
@@ -1109,17 +1121,29 @@ tx_materialize_cte :: proc(tx: ^Tx, cte: Cte, params: []Value, recursive: bool) 
 	result, exec_err := sql_exec_select(tx, cte.select_stmt, params)
 	if exec_err.kind != .None do return nil, exec_err
 	defer sql_result_destroy(&result)
+	return materialize_result_table(tx, cte.name, cte.columns, &result)
+}
+
+// materialize_result_table turns a query result into a temporary table the rest of
+// the statement can read, with the column names the statement gave it.
+@(private)
+materialize_result_table :: proc(
+	tx: ^Tx,
+	name: string,
+	override: []string,
+	result: ^Sql_Result,
+) -> (^Table, Error) {
 	columns := make([]Column, len(result.columns), tx.alloc)
 	for column_name, i in result.columns {
-		name := column_name
-		if i < len(cte.columns) do name = cte.columns[i]
+		column := column_name
+		if i < len(override) do column = override[i]
 		columns[i] = Column {
-			name = strings.clone(name, tx.alloc),
+			name = strings.clone(column, tx.alloc),
 			type = view_column_type(result.rows, i),
 		}
 	}
 	schema := Table_Schema {
-		name    = strings.clone(cte.name, tx.alloc),
+		name    = strings.clone(name, tx.alloc),
 		columns = columns,
 	}
 	table, table_err := table_create(&schema)
@@ -1132,6 +1156,25 @@ tx_materialize_cte :: proc(tx: ^Tx, cte: Cte, params: []Value, recursive: bool) 
 	}
 	append(&tx.temp_tables, table)
 	return table, ERROR_NONE
+}
+
+// tx_materialize_lateral runs a LATERAL subquery with one row of the sources to
+// its left bound, and answers it as a table.
+@(private)
+tx_materialize_lateral :: proc(
+	tx: ^Tx,
+	ref: Table_Ref,
+	params: []Value,
+	partial: []Source,
+) -> (^Table, Error) {
+	frame := Outer_Frame{sources = partial, next = tx.outer}
+	saved := tx.outer
+	tx.outer = &frame
+	result, exec_err := sql_exec_select(tx, ref.subquery^, params)
+	tx.outer = saved
+	if exec_err.kind != .None do return nil, exec_err
+	defer sql_result_destroy(&result)
+	return materialize_result_table(tx, ref.name, nil, &result)
 }
 
 // clone_row_values copies a row onto the caller's allocator.
@@ -2784,7 +2827,9 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		append(&refs, stmt.from)
 		for join in stmt.joins do append(&refs, join.table)
 		for ref in refs {
-			if ref.subquery == nil do continue
+			// A LATERAL derived table is not materialized here: it is evaluated
+			// once per row of the sources to its left, in the join loop.
+			if ref.subquery == nil || ref.lateral do continue
 			table, derived_err := tx_materialize_cte(tx, Cte{name = ref.name, select_stmt = ref.subquery^}, params, false)
 			if derived_err.kind != .None do return {}, derived_err
 			cte_scope_bind(tx, &scope, ref.name, table)
@@ -2836,6 +2881,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		tx     = tx,
 		params = params,
 		now_us = now_microseconds(),
+		outer  = tx.outer,
 	}
 
 	// A page-backed table can answer a simple single-table query without ever
@@ -3039,7 +3085,8 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		// is materialized once per outer row (a lateral join). Everything else is
 		// collected once. The materialized tables stay in tx.temp_tables until the
 		// statement ends, because the rows the join reads point into them.
-		lateral := is_json_table_function(step.ref.name)
+		lateral := is_json_table_function(step.ref.name) ||
+			(step.ref.lateral && step.ref.subquery != nil)
 		if lateral && (step.kind == .Right || step.kind == .Full) {
 			free_partials(&partials)
 			return {}, errf(
@@ -3119,7 +3166,17 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 					using_probe = true
 				}
 			}
-			if lateral {
+			if lateral && step.ref.subquery != nil {
+				lateral_table, lateral_err := tx_materialize_lateral(tx, step.ref, params, partial)
+				if lateral_err.kind != .None {
+					free_partials(&partials)
+					free_partials(&next)
+					return {}, lateral_err
+				}
+				table = lateral_table
+				lateral_rows = make([dynamic]Row)
+				table_collect(lateral_table, &lateral_rows, tx.read_seq)
+			} else if lateral {
 				lateral_args, lateral_args_err := view_args(tx, step.ref, params, partial)
 				if lateral_args_err.kind != .None {
 					free_partials(&partials)
@@ -4107,6 +4164,55 @@ group_by_expressions :: proc(
 	return out
 }
 
+// outer_column answers a column the inner sources do not have, by looking in the
+// frames of the statement the query is written inside. The nearest frame wins, as
+// SQL scoping says.
+@(private)
+outer_column :: proc(ctx: ^Eval_Ctx, name, table: string) -> (Value, bool) {
+	frame := ctx.outer
+	for frame != nil {
+		found_value: Value
+		found := false
+		for source in frame.sources {
+			if source.table == nil do continue
+			if len(table) > 0 {
+				matches := strings.equal_fold(table, source.table.schema.name) ||
+					(len(source.alias) > 0 && strings.equal_fold(table, source.alias))
+				if !matches do continue
+			} else if source.hidden_unqualified {
+				continue
+			}
+			index, exists := schema_column_index(&source.table.schema, name)
+			if !exists do continue
+			if found {
+				// Ambiguous in this frame: the caller answers with its own error.
+				return {}, false
+			}
+			found = true
+			if index < len(source.row.values) {
+				found_value = source.row.values[index]
+			} else {
+				found_value = value_null()
+			}
+		}
+		if found do return found_value, true
+		frame = frame.next
+	}
+	return {}, false
+}
+
+// subquery_run runs a subquery with the caller's row as an outer frame.
+@(private)
+subquery_run :: proc(ctx: ^Eval_Ctx, stmt: Select_Stmt) -> (Sql_Result, Error) {
+	if ctx.tx == nil do return {}, errf(.Sql_Unsupported, "subqueries need a transaction")
+	frame := Outer_Frame{sources = ctx.sources, next = ctx.outer}
+	saved := ctx.tx.outer
+	ctx.tx.outer = &frame
+	result, err := sql_exec_select(ctx.tx, stmt, ctx.params)
+	ctx.tx.outer = saved
+	return result, err
+}
+
 // --- Expressions -----------------------------------------------------------
 
 eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
@@ -4190,6 +4296,7 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 				if index >= len(source.row.values) do return value_null(), ERROR_NONE
 				return source.row.values[index], ERROR_NONE
 			}
+			if value, ok := outer_column(ctx, e.name, e.table); ok do return value, ERROR_NONE
 			return {}, errf(.Column_Not_Found, "table %s is not in the query", e.table)
 		}
 		found_value: Value
@@ -4234,6 +4341,7 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 			}
 		}
 		if !found {
+			if value, ok := outer_column(ctx, e.name, ""); ok do return value, ERROR_NONE
 			return {}, errf(.Column_Not_Found, "column %s does not exist", e.name)
 		}
 		return found_value, ERROR_NONE
@@ -4286,7 +4394,7 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 	case Subquery_Expr:
 		if ctx.tx == nil do return {}, errf(.Sql_Unsupported, "subqueries need a transaction")
 		if e.select == nil do return value_null(), ERROR_NONE
-		sub, sub_err := sql_exec_select(ctx.tx, e.select^, ctx.params)
+		sub, sub_err := subquery_run(ctx, e.select^)
 		if sub_err.kind != .None do return {}, sub_err
 		defer sql_result_destroy(&sub)
 		if e.exists do return value_bool(len(sub.rows) > 0), ERROR_NONE
@@ -4302,7 +4410,7 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 		if operand.kind == .Null do return value_null(), ERROR_NONE
 		if e.subquery != nil {
 			if ctx.tx == nil do return {}, errf(.Sql_Unsupported, "subqueries need a transaction")
-			sub, sub_err := sql_exec_select(ctx.tx, e.subquery^, ctx.params)
+			sub, sub_err := subquery_run(ctx, e.subquery^)
 			if sub_err.kind != .None do return {}, sub_err
 			defer sql_result_destroy(&sub)
 			found := false
@@ -4396,7 +4504,7 @@ eval_row_in_subquery :: proc(ctx: ^Eval_Ctx, row: []^Expr, subquery: ^Select_Stm
 		if err.kind != .None do return {}, err
 		tuple[i] = value
 	}
-	sub, sub_err := sql_exec_select(ctx.tx, subquery^, ctx.params)
+	sub, sub_err := subquery_run(ctx, subquery^)
 	if sub_err.kind != .None do return {}, sub_err
 	defer sql_result_destroy(&sub)
 	if len(sub.columns) != len(tuple) {

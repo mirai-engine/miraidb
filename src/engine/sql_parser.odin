@@ -1025,6 +1025,9 @@ column_expr :: proc(p: ^Parser, table: string, column: string) -> ^Expr {
 
 parse_table_ref :: proc(p: ^Parser) -> Table_Ref {
 	ref: Table_Ref
+	// `LATERAL` may precede a derived table, in the FROM list or after a join: the
+	// subquery then reads the rows before it, one evaluation per row.
+	if p_match_keyword(p, "lateral") do ref.lateral = true
 	// A derived table: `(SELECT …) [AS] name` or `(VALUES …) [AS] name`. SQLite
 	// names an unaliased one itself, and so does this.
 	if p_match_punct(p, "(") {
