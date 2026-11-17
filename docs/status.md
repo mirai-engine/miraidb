@@ -135,7 +135,7 @@ the gaps are named rather than left to be discovered.
   and checks both).
 - `miraidb sql --json <db> <statement>` prints a result as one JSON array of
   rows, which is how `scripts/differential.py` compares answers against SQLite:
-  one schema, one set of rows and 125 queries through both engines, with 5
+  one schema, one set of rows and 124 queries through both engines, with 5
   refusals and 6 intentional differences listed in the script. SQLite is asked
   through Python's `sqlite3` module, which hands back typed values: the
   `sqlite3 -json` shell used before prints `90.0` as `90`, and with the

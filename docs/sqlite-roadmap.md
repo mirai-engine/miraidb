@@ -19,7 +19,7 @@ are not the measured ones: a regression fails, and so does a feature that lands
 without this file saying so.
 
 Every gap is **refused with a message**, never answered differently.
-`scripts/differential.py` (125 queries against SQLite) and the executed claims of
+`scripts/differential.py` (124 queries against SQLite) and the executed claims of
 [sqlite.md](sqlite.md) keep that true.
 
 ## What is missing, by roadmap item

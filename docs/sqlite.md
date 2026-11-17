@@ -166,7 +166,8 @@ matches | SELECT json_type('1.0')                         | [["real"]]
 matches | SELECT typeof(1), typeof(1.0), typeof('1')      | [["integer", "real", "text"]]
 matches | SELECT round(2.5), round(-2.5)                  | [[3.0, -3.0]]
 matches | SELECT 'abc' LIKE 'A%'                          | [[1]]
-matches | SELECT printf('%.0f', 2.5)                      | [["2"]]
+matches@<3.50 | SELECT printf('%.0f', 2.5)                 | [["2"]]
+ours@>=3.50 | SELECT printf('%.0f', 2.5)                    | [["2"]]
 ours    | SELECT upper(char(233))                         | [["É"]]
 refused | SELECT 1 = '1'                                 | invalid_type
 refused | SELECT CAST('12abc' AS INTEGER)                | invalid_type
@@ -177,9 +178,12 @@ refused | SELECT 2 * 9223372036854775807                 | integer overflow
 
 One row is a real difference: `upper` folds the whole of Unicode, where SQLite
 folds ASCII only, so `upper(char(233))` is `É` here and `é` there. The
-`printf('%.0f', 2.5)` row used to be a second one (this engine rounds half to
-even and older SQLite rounded half away from zero); SQLite 3.45 answers `2` as
-well, so the row is now a match, and the gate is what noticed.
+`printf('%.0f', 2.5)` row is version-scoped, and it is why the table carries the
+versions it holds for. This engine rounds a tie at zero digits to even, so it
+answers `2`; SQLite 3.45.1 also answers `2`, and SQLite 3.53.4 answers `3`
+because it changed to rounding away from zero in between. The claim is a match
+below 3.50 and a declared difference from 3.50 on, and a row outside its window
+is reported as skipped with the version that skipped it, never silently passed.
 
 `rowid` names the stored row (`rowid`, `_rowid_` and `oid`), and a table whose
 primary key is one INTEGER column answers that column, so a program that pages

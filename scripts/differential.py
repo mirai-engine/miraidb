@@ -143,9 +143,10 @@ QUERIES = [
     "SELECT json_extract('{\"a\":[10,20]}', '$.a[1]'), json_valid('[1,2]'), json_type('{\"a\":1}')",
     "SELECT date('2020-01-02'), strftime('%Y', '2020-01-02'), date('2020-01-02', '+1 day')",
     # DML that returns rows.
-    # SQLite 3.45 formats a tie at zero digits to even, as this engine does; this
-    # row was a listed difference until the gate saw the answers converge.
-    "SELECT printf('%.0f', 2.5)",
+    # printf('%.0f', 2.5) is not here: SQLite rounds a tie at zero digits to even
+    # in 3.45 and away from zero in 3.53, so the answer depends on which SQLite
+    # runs the corpus. docs/sqlite.md declares the claim with the versions it
+    # holds for, and scripts/compat_check.py runs it against the one installed.
     "INSERT INTO kv (k, v) VALUES ('c', 3) RETURNING k, v",
     "INSERT INTO kv (k, v) VALUES ('a', 99) ON CONFLICT (k) DO UPDATE SET v = excluded.v RETURNING k, v",
     "UPDATE kv SET v = 5 WHERE k = 'b' RETURNING k, v",
