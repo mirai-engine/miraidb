@@ -7,6 +7,8 @@
 /*.db/
 /*.miraidb/
 /_test_*/
+# scratch databases the audit harnesses and manual probes leave at the root
+/_*/
 /tmpdb/
 /todo.db/
 *.srctrldb
