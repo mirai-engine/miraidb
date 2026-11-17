@@ -2907,6 +2907,12 @@ sql_exec_stream_select :: proc(
 				return {}, false, ERROR_NONE
 			}
 		}
+		if strings.equal_fold(call.name, "json_group_array") ||
+		   strings.equal_fold(call.name, "json_group_object") {
+			// The streaming path folds one value per row; these build a document
+			// from the whole group, so the materializing path answers them.
+			return {}, false, ERROR_NONE
+		}
 		aggregate = true
 		acc := Agg_Acc{call = call, name = strings.to_lower(call.name), fold_distinct = call.is_distinct}
 		if acc.fold_distinct do acc.keys = make(map[string]bool)
@@ -5658,7 +5664,7 @@ sq_truthy :: proc(value: Value) -> (bool, Error) {
 
 @(private)
 is_aggregate_name :: proc(name: string) -> bool {
-	for candidate in ([]string{"count", "sum", "avg", "min", "max", "total", "group_concat", "string_agg", "array_agg"}) {
+	for candidate in ([]string{"count", "sum", "avg", "min", "max", "total", "group_concat", "string_agg", "array_agg", "json_group_array", "json_group_object"}) {
 		if strings.equal_fold(name, candidate) do return true
 	}
 	return false
@@ -6621,6 +6627,69 @@ eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 			count += 1
 		}
 		return value_int(i64(count)), ERROR_NONE
+	}
+
+	if name == "json_group_array" {
+		if call.star || len(call.args) != 1 {
+			return {}, errf(.Invalid_Argument, "json_group_array() takes one argument")
+		}
+		items := make([dynamic]Json_Value, 0, len(rows))
+		defer delete(items)
+		for sources in rows {
+			sub := ctx^
+			sub.sources = sources
+			value, value_err := eval_expr(&sub, call.args[0])
+			if value_err.kind != .None do return {}, value_err
+			append(&items, json_from_value(value, context.temp_allocator))
+		}
+		text := json_write(Json_Value{kind = .Array, items = items[:]}, context.allocator)
+		return value_string(text), ERROR_NONE
+	}
+	if name == "json_group_object" {
+		if len(call.args) != 2 {
+			return {}, errf(.Invalid_Argument, "json_group_object() takes a key and a value")
+		}
+		keys := make([dynamic]string, 0, len(rows))
+		defer delete(keys)
+		items := make([dynamic]Json_Value, 0, len(rows))
+		defer delete(items)
+		for sources in rows {
+			sub := ctx^
+			sub.sources = sources
+			key, key_err := eval_expr(&sub, call.args[0])
+			if key_err.kind != .None do return {}, key_err
+			if key.kind == .Null do continue
+			value, value_err := eval_expr(&sub, call.args[1])
+			if value_err.kind != .None do return {}, value_err
+			append(&keys, value_to_text(key))
+			append(&items, json_from_value(value, context.temp_allocator))
+		}
+		text := json_write(Json_Value{kind = .Object, keys = keys[:], values = items[:]}, context.allocator)
+		return value_string(text), ERROR_NONE
+	}
+	if name == "json_group_object" {
+		// One document from the group: the first argument is the key, the second
+		// the value, and a NULL key is skipped as SQLite skips it.
+		if len(call.args) != 2 {
+			return {}, errf(.Invalid_Argument, "json_group_object() takes a key and a value")
+		}
+		keys := make([dynamic]string, 0, len(rows))
+		defer delete(keys)
+		items := make([dynamic]Json_Value, 0, len(rows))
+		defer delete(items)
+		for sources in rows {
+			sub := ctx^
+			sub.sources = sources
+			key, key_err := eval_expr(&sub, call.args[0])
+			if key_err.kind != .None do return {}, key_err
+			if key.kind == .Null do continue
+			value, value_err := eval_expr(&sub, call.args[1])
+			if value_err.kind != .None do return {}, value_err
+			append(&keys, value_to_text(key))
+			append(&items, json_from_value(value, context.temp_allocator))
+		}
+		text := json_write(Json_Value{kind = .Object, keys = keys[:], values = items[:]}, context.allocator)
+		return value_string(text), ERROR_NONE
 	}
 
 	if name == "group_concat" || name == "string_agg" {

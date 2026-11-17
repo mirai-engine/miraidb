@@ -53,6 +53,20 @@ json_parse :: proc(text: string, alloc: mem.Allocator) -> (Json_Value, bool) {
 	return value, true
 }
 
+// json_parse_result is json_parse with the byte position the parse stopped at,
+// which is what json_error_position reports (1-based, as SQLite does).
+json_parse_result :: proc(text: string, alloc: mem.Allocator) -> (value: Json_Value, ok: bool, position: int) {
+	parser := Json_Parser{text = text, alloc = alloc}
+	json_skip_space(&parser)
+	value = json_parse_value(&parser, 0)
+	json_skip_space(&parser)
+	if parser.failed || parser.at != len(parser.text) {
+		json_destroy(value, alloc)
+		return {}, false, parser.at + 1
+	}
+	return value, true, 0
+}
+
 @(private)
 json_skip_space :: proc(p: ^Json_Parser) {
 	for p.at < len(p.text) {
@@ -572,8 +586,36 @@ json_type_name :: proc(value: Json_Value) -> string {
 // json_call runs a JSON function. It reports false when the name is not one of
 // them, and returns a NULL value for invalid input or a missing path.
 json_call :: proc(name: string, args: []Value) -> (Value, bool, Error) {
-	if strings.equal_fold(name, "json_set") || strings.equal_fold(name, "json_replace") || strings.equal_fold(name, "json_remove") {
+	if strings.equal_fold(name, "json_set") || strings.equal_fold(name, "json_replace") ||
+	   strings.equal_fold(name, "json_remove") || strings.equal_fold(name, "json_insert") {
 		return json_mutation(name, args)
+	}
+	if strings.equal_fold(name, "json_patch") {
+		return json_patch_call(args)
+	}
+	if strings.equal_fold(name, "json_pretty") {
+		if len(args) < 1 || len(args) > 2 do return {}, true, errf(.Invalid_Argument, "json_pretty() takes one or two arguments")
+		if args[0].kind != .String do return value_null(), true, ERROR_NONE
+		doc, ok := json_parse(args[0].s, context.temp_allocator)
+		if !ok do return {}, true, errf(.Invalid_Argument, "malformed JSON")
+		defer json_destroy(doc, context.temp_allocator)
+		indent := "    "
+		if len(args) == 2 {
+			if args[1].kind == .String do indent = args[1].s
+		}
+		builder := strings.builder_make(context.allocator)
+		json_pretty_write(&builder, doc, indent, 0)
+		return value_string(strings.clone(strings.to_string(builder), context.allocator)), true, ERROR_NONE
+	}
+	if strings.equal_fold(name, "json_error_position") {
+		if len(args) != 1 do return {}, true, errf(.Invalid_Argument, "json_error_position() takes one argument")
+		if args[0].kind != .String do return value_int(0), true, ERROR_NONE
+		doc, ok, position := json_parse_result(args[0].s, context.temp_allocator)
+		if ok {
+			json_destroy(doc, context.temp_allocator)
+			return value_int(0), true, ERROR_NONE
+		}
+		return value_int(i64(position)), true, ERROR_NONE
 	}
 	if len(args) > 0 && args[0].kind == .Null && !strings.equal_fold(name, "json_array") &&
 	   !strings.equal_fold(name, "json_object") && !strings.equal_fold(name, "json_quote") {
@@ -694,7 +736,7 @@ json_call :: proc(name: string, args: []Value) -> (Value, bool, Error) {
 
 // json_call_name reports whether a function name belongs to the JSON family.
 json_call_name :: proc(name: string) -> bool {
-	for candidate in ([]string{"json", "json_arrow", "json_arrow_value", "json_valid", "json_type", "json_extract", "json_array", "json_object", "json_quote", "json_array_length", "json_set", "json_replace", "json_remove"}) {
+	for candidate in ([]string{"json", "json_arrow", "json_arrow_value", "json_valid", "json_type", "json_extract", "json_array", "json_object", "json_quote", "json_array_length", "json_set", "json_replace", "json_remove", "json_insert", "json_patch", "json_pretty", "json_error_position"}) {
 		if strings.equal_fold(name, candidate) do return true
 	}
 	return false
@@ -790,7 +832,23 @@ json_path_find_ptr :: proc(root: ^Json_Value, path: string) -> (^Json_Value, boo
 
 // json_set_path writes a value at a path. With replace_only, a missing path is
 // an error unless it already exists (json_replace).
-json_set_path :: proc(root: ^Json_Value, path: string, new_value: Json_Value, replace_only: bool, alloc: mem.Allocator) -> bool {
+// Json_Set_Mode is what a mutator does when the path is already there.
+Json_Set_Mode :: enum u8 {
+	// Set replaces an existing value and appends one that is not there.
+	Set,
+	// Replace_Only leaves a path that is not there alone.
+	Replace_Only,
+	// Insert_Only leaves a path that is there alone.
+	Insert_Only,
+}
+
+json_set_path :: proc(
+	root: ^Json_Value,
+	path: string,
+	new_value: Json_Value,
+	mode: Json_Set_Mode,
+	alloc: mem.Allocator,
+) -> bool {
 	parent_path, last, split_ok := json_path_split(path)
 	if !split_ok do return false
 	parent, parent_ok := json_path_find_ptr(root, parent_path)
@@ -798,11 +856,12 @@ json_set_path :: proc(root: ^Json_Value, path: string, new_value: Json_Value, re
 	if last.is_index {
 		if parent.kind != .Array do return false
 		if last.index < len(parent.items) {
+			if mode == .Insert_Only do return false
 			json_destroy(parent.items[last.index], alloc)
 			parent.items[last.index] = new_value
 			return true
 		}
-		if replace_only do return false
+		if mode == .Replace_Only do return false
 		grown := make([]Json_Value, len(parent.items) + 1, alloc)
 		copy(grown, parent.items)
 		grown[len(parent.items)] = new_value
@@ -813,11 +872,12 @@ json_set_path :: proc(root: ^Json_Value, path: string, new_value: Json_Value, re
 	if parent.kind != .Object do return false
 	for key, i in parent.keys {
 		if !strings.equal_fold(key, last.name) do continue
+		if mode == .Insert_Only do return false
 		json_destroy(parent.values[i], alloc)
 		parent.values[i] = new_value
 		return true
 	}
-	if replace_only do return false
+	if mode == .Replace_Only do return false
 	keys := make([]string, len(parent.keys) + 1, alloc)
 	copy(keys, parent.keys)
 	keys[len(parent.keys)] = strings.clone(last.name, alloc)
@@ -876,14 +936,18 @@ json_mutation :: proc(name: string, args: []Value) -> (Value, bool, Error) {
 			json_destroy(doc, context.allocator)
 			return {}, true, errf(.Invalid_Argument, "%s() takes path/value pairs", name)
 		}
-		replace_only := strings.equal_fold(name, "json_replace")
+		mode: Json_Set_Mode = .Set
+		if strings.equal_fold(name, "json_replace") do mode = .Replace_Only
+		if strings.equal_fold(name, "json_insert") do mode = .Insert_Only
 		for i := 1; i + 1 < len(args); i += 2 {
 			path := args[i]
 			if path.kind != .String do break
 			proposed := json_from_value(args[i + 1], context.allocator)
-			if !json_set_path(&doc, path.s, proposed, replace_only, context.allocator) {
+			if !json_set_path(&doc, path.s, proposed, mode, context.allocator) {
 				json_destroy(proposed, context.allocator)
-				if replace_only do continue
+				// Reaching nothing is what replace and insert are for: a path that
+				// is already there (insert) or is not (replace) is left alone.
+				if mode != .Set do continue
 				json_destroy(doc, context.allocator)
 				return {}, true, errf(.Invalid_Argument, "json_set() could not reach the path")
 			}
@@ -892,4 +956,119 @@ json_mutation :: proc(name: string, args: []Value) -> (Value, bool, Error) {
 	text := json_write(doc, context.allocator)
 	json_destroy(doc, context.allocator)
 	return value_string(text), true, ERROR_NONE
+}
+
+// json_patch_call runs RFC 7396's merge patch: an object in the patch is merged
+// into the target, a null removes the key, and anything else replaces the value.
+json_patch_call :: proc(args: []Value) -> (Value, bool, Error) {
+	if len(args) != 2 do return {}, true, errf(.Invalid_Argument, "json_patch() takes two documents")
+	if args[0].kind != .String || args[1].kind != .String {
+		return value_null(), true, ERROR_NONE
+	}
+	target, target_ok := json_parse(args[0].s, context.allocator)
+	if !target_ok do return {}, true, errf(.Invalid_Argument, "malformed JSON")
+	patch, patch_ok := json_parse(args[1].s, context.allocator)
+	if !patch_ok {
+		json_destroy(target, context.allocator)
+		return {}, true, errf(.Invalid_Argument, "malformed JSON")
+	}
+	json_merge_patch(&target, patch, context.allocator)
+	text := json_write(target, context.allocator)
+	json_destroy(target, context.allocator)
+	return value_string(text), true, ERROR_NONE
+}
+
+// json_merge_patch applies `patch` to `target` in place and takes ownership of
+// it: a patch that is not an object replaces the target whole.
+json_merge_patch :: proc(target: ^Json_Value, patch: Json_Value, alloc: mem.Allocator) {
+	if patch.kind != .Object {
+		json_destroy(target^, alloc)
+		target^ = patch
+		return
+	}
+	if target.kind != .Object {
+		json_destroy(target^, alloc)
+		target^ = Json_Value{kind = .Object}
+	}
+	for key, i in patch.keys {
+		value := patch.values[i]
+		position := -1
+		for existing, j in target.keys {
+			if strings.equal_fold(existing, key) {
+				position = j
+				break
+			}
+		}
+		if value.kind == .Null {
+			if position >= 0 {
+				delete(target.keys[position], alloc)
+				json_destroy(target.values[position], alloc)
+				for k in position ..< len(target.values) - 1 {
+					target.keys[k] = target.keys[k + 1]
+					target.values[k] = target.values[k + 1]
+				}
+				target.keys = target.keys[:len(target.keys) - 1]
+				target.values = target.values[:len(target.values) - 1]
+			}
+			continue
+		}
+		if position < 0 {
+			grown_keys := make([]string, len(target.keys) + 1, alloc)
+			copy(grown_keys, target.keys)
+			grown_keys[len(target.keys)] = strings.clone(key, alloc)
+			grown_values := make([]Json_Value, len(target.values) + 1, alloc)
+			copy(grown_values, target.values)
+			grown_values[len(target.values)] = value
+			delete(target.keys, alloc)
+			delete(target.values, alloc)
+			target.keys = grown_keys
+			target.values = grown_values
+			continue
+		}
+		json_merge_patch(&target.values[position], value, alloc)
+	}
+}
+
+// json_pretty_write writes a document with one member per line, indented by
+// `indent` per level, which is the form SQLite's json_pretty answers.
+json_pretty_write :: proc(builder: ^strings.Builder, value: Json_Value, indent: string, depth: int) {
+	#partial switch value.kind {
+	case .Array:
+		if len(value.items) == 0 {
+			strings.write_string(builder, "[]")
+			return
+		}
+		strings.write_string(builder, "[\n")
+		for item, i in value.items {
+			json_pretty_indent(builder, indent, depth + 1)
+			json_pretty_write(builder, item, indent, depth + 1)
+			if i + 1 < len(value.items) do strings.write_byte(builder, ',')
+			strings.write_byte(builder, '\n')
+		}
+		json_pretty_indent(builder, indent, depth)
+		strings.write_byte(builder, ']')
+	case .Object:
+		if len(value.keys) == 0 {
+			strings.write_string(builder, "{}")
+			return
+		}
+		strings.write_string(builder, "{\n")
+		for key, i in value.keys {
+			json_pretty_indent(builder, indent, depth + 1)
+			json_write_string(builder, key)
+			strings.write_string(builder, ": ")
+			json_pretty_write(builder, value.values[i], indent, depth + 1)
+			if i + 1 < len(value.keys) do strings.write_byte(builder, ',')
+			strings.write_byte(builder, '\n')
+		}
+			json_pretty_indent(builder, indent, depth)
+		strings.write_byte(builder, '}')
+	case .Null, .Bool, .Number, .String:
+		strings.write_string(builder, json_write(value, context.temp_allocator))
+	}
+}
+
+@(private)
+json_pretty_indent :: proc(builder: ^strings.Builder, indent: string, depth: int) {
+	for _ in 0 ..< depth do strings.write_string(builder, indent)
 }

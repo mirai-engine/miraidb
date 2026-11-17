@@ -128,3 +128,61 @@ test_sqlite_pragma_gaps :: proc(t: ^testing.T) {
 	defer db.sql_result_destroy(&empty)
 	testing.expect_value(t, empty.rows[0][0].s, "")
 }
+
+// The JSON mutators and aggregates, compared against SQLite's answers.
+@(test)
+test_json_mutators_and_aggregates :: proc(t: ^testing.T) {
+	store := fresh_db(t, "json_functions")
+	if store == nil do return
+	defer cleanup_db(store, "json_functions")
+
+	// json_insert adds what is not there and leaves what is; json_set replaces
+	// and json_replace only replaces.
+	inserted := run(
+		t,
+		store,
+		`SELECT json_insert('{"a":1}', '$.b', 2), json_insert('{"a":1}', '$.a', 9), json_insert('[1,2]', '$[2]', 3)`,
+	)
+	testing.expect_value(t, inserted.rows[0][0].s, `{"a":1,"b":2}`)
+	testing.expect_value(t, inserted.rows[0][1].s, `{"a":1}`)
+	testing.expect_value(t, inserted.rows[0][2].s, `[1,2,3]`)
+	db.sql_result_destroy(&inserted)
+
+	// A merge patch: null removes a member, anything else replaces or adds it.
+	patched := run(t, store, `SELECT json_patch('{"a":1,"b":2}', '{"b":null,"c":3}')`)
+	testing.expect_value(t, patched.rows[0][0].s, `{"a":1,"c":3}`)
+	db.sql_result_destroy(&patched)
+	nested := run(t, store, `SELECT json_patch('{"a":{"x":1}}', '{"a":{"y":2}}')`)
+	testing.expect_value(t, nested.rows[0][0].s, `{"a":{"x":1,"y":2}}`)
+	db.sql_result_destroy(&nested)
+
+	// json_pretty indents four spaces by default, the format SQLite writes.
+	pretty := run(t, store, `SELECT json_pretty('{"a":[1,2],"b":{}}')`)
+	testing.expect_value(t, pretty.rows[0][0].s, "{\n    \"a\": [\n        1,\n        2\n    ],\n    \"b\": {}\n}")
+	db.sql_result_destroy(&pretty)
+
+	// json_error_position is 0 for a document that parses and the byte position
+	// otherwise.
+	position := run(t, store, `SELECT json_error_position('{"a":}'), json_error_position('[1,2]')`)
+	testing.expect_value(t, position.rows[0][0].i, i64(6))
+	testing.expect_value(t, position.rows[0][1].i, i64(0))
+	db.sql_result_destroy(&position)
+
+	// The aggregates build one document from the group, and an empty group is
+	// NULL, as SQLite answers it.
+	run(t, store, "CREATE TABLE t (k TEXT, v INTEGER)")
+	run(t, store, "INSERT INTO t VALUES ('a', 1), ('b', 2), ('c', 3)")
+	array := run(t, store, "SELECT json_group_array(v) FROM t")
+	testing.expect_value(t, array.rows[0][0].s, "[1,2,3]")
+	db.sql_result_destroy(&array)
+	object := run(t, store, "SELECT json_group_object(k, v) FROM t")
+	testing.expect_value(t, object.rows[0][0].s, `{"a":1,"b":2,"c":3}`)
+	db.sql_result_destroy(&object)
+	empty := run(t, store, "SELECT json_group_array(v) FROM t WHERE v > 100")
+	testing.expect_value(t, empty.rows[0][0].s, "[]")
+	db.sql_result_destroy(&empty)
+	grouped := run(t, store, "SELECT k, json_group_array(v) FROM t GROUP BY k ORDER BY k")
+	testing.expect_value(t, len(grouped.rows), 3)
+	testing.expect_value(t, grouped.rows[1][1].s, "[2]")
+	db.sql_result_destroy(&grouped)
+}

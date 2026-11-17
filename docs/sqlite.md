@@ -91,7 +91,10 @@ as scalars, `trim`/`ltrim`/`rtrim` with a character set, `random`, `zeroblob`,
 `changes`, `total_changes`, `last_insert_rowid`, `sqlite_version`, `affinity`,
 `soundex`, `unistr`, `unistr_quote`, `timediff`, `sqlite_source_id`,
 `sqlite_compileoption_used`, `sqlite_compileoption_get`, `date`,
-`time`, `datetime`, `strftime`, `now`, eleven `json_*` scalars and the
+`time`, `datetime`, `strftime`, `now`, sixteen `json_*` scalars
+(`json_set`, `json_replace`, `json_insert`, `json_remove`, `json_patch`,
+`json_pretty`, `json_error_position` and the readers), the
+`json_group_array`/`json_group_object` aggregates and the
 `json_each`/`json_tree` table functions,
 `group_concat`/`string_agg`, `rank`, `snippet`, `highlight`, `current_identity`
 and `has_role` (engine extensions), plus `count`, `sum`, `avg`, `min`, `max`,
