@@ -274,6 +274,7 @@ parse_statement :: proc(p: ^Parser) -> Statement {
 	if p_is_keyword(p, "insert") || p_is_keyword(p, "replace") do return parse_insert(p)
 	if p_is_keyword(p, "update") do return parse_update(p)
 	if p_is_keyword(p, "delete") do return parse_delete(p)
+	if p_is_keyword(p, "merge") do return parse_merge(p)
 	if p_is_keyword(p, "grant") do return parse_grant(p, false)
 	if p_is_keyword(p, "revoke") do return parse_grant(p, true)
 	if p_is_keyword(p, "create") do return parse_create(p)
@@ -1252,6 +1253,92 @@ parse_update :: proc(p: ^Parser) -> Statement {
 	}
 	update.returning = parse_returning(p)
 	return update
+}
+
+// parse_merge reads `MERGE INTO target [AS t] USING source [AS s] ON condition
+// WHEN [MATCHED | NOT MATCHED] [AND condition] THEN ...`. The clauses a MERGE
+// accepts here are UPDATE, DELETE for a matched row and INSERT for a source row
+// that matched nothing.
+@(private)
+parse_merge :: proc(p: ^Parser) -> Statement {
+	p_expect_keyword(p, "merge")
+	stmt: Merge_Stmt
+	p_match_keyword(p, "into")
+	stmt.target = p_ident(p)
+	if p_match_keyword(p, "as") do stmt.target_alias = p_ident(p)
+	if p_expect_keyword(p, "using") == false do return stmt
+	stmt.source = p_ident(p)
+	if p_match_keyword(p, "as") do stmt.source_alias = p_ident(p)
+	if p_expect_keyword(p, "on") == false do return stmt
+	stmt.on = parse_expression(p)
+	clauses := make([dynamic]Merge_When, 0, 2, p.alloc)
+	for p_match_keyword(p, "when") {
+		clause: Merge_When
+		if p_match_keyword(p, "matched") {
+			if p_match_keyword(p, "and") do clause.condition = parse_expression(p)
+			p_expect_keyword(p, "then")
+			if p_match_keyword(p, "update") {
+				clause.kind = .Matched_Update
+				p_expect_keyword(p, "set")
+				assignments := make([dynamic]Assignment, 0, 4, p.alloc)
+				for {
+					assignment: Assignment
+					assignment.column = p_ident(p)
+					p_expect_punct(p, "=")
+					assignment.value = parse_expression(p)
+					append(&assignments, assignment)
+					if !p_match_punct(p, ",") do break
+				}
+				clause.assignments = assignments[:]
+			} else if p_match_keyword(p, "delete") {
+				clause.kind = .Matched_Delete
+			} else {
+				p_fail(p, .Sql_Syntax, "a matched MERGE row is updated or deleted")
+				return stmt
+			}
+		} else if p_match_keyword(p, "not") {
+			if p_expect_keyword(p, "matched") == false do return stmt
+			if p_match_keyword(p, "by") {
+				p_fail(
+					p,
+					.Sql_Unsupported,
+					"MERGE ... WHEN NOT MATCHED BY SOURCE is not supported",
+				)
+				return stmt
+			}
+			clause.kind = .Not_Matched_Insert
+			if p_match_keyword(p, "and") do clause.condition = parse_expression(p)
+			p_expect_keyword(p, "then")
+			p_expect_keyword(p, "insert")
+			if p_match_punct(p, "(") {
+				columns := make([dynamic]string, 0, 4, p.alloc)
+				for {
+					append(&columns, p_ident(p))
+					if !p_match_punct(p, ",") do break
+				}
+				p_expect_punct(p, ")")
+				clause.columns = columns[:]
+			}
+			p_expect_keyword(p, "values")
+			p_expect_punct(p, "(")
+			values := make([dynamic]^Expr, 0, 4, p.alloc)
+			for {
+				append(&values, parse_expression(p))
+				if !p_match_punct(p, ",") do break
+			}
+			p_expect_punct(p, ")")
+			clause.values = values[:]
+		} else {
+			p_fail(p, .Sql_Syntax, "MERGE needs WHEN MATCHED or WHEN NOT MATCHED")
+			return stmt
+		}
+		append(&clauses, clause)
+	}
+	if len(clauses) == 0 {
+		p_fail(p, .Sql_Syntax, "MERGE needs at least one WHEN clause")
+	}
+	stmt.clauses = clauses[:]
+	return stmt
 }
 
 @(private)

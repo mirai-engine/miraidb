@@ -96,8 +96,8 @@ def check_features() -> None:
     """Every row of the matrix names the test or the gate that covers it.
 
     The matrix used to say "each with a test" and nothing could tell whether that
-    was true: none of the 96 identifiers appeared in a test file, and the count
-    only proved that there were 96 rows. The names are now in the table, and this
+    was true: none of the 97 identifiers appeared in a test file, and the count
+    only proved that there were 97 rows. The names are now in the table, and this
     checks that each one exists -- an Odin test in src/tests, or a script.
     """
     text = read("docs/features.md")
@@ -116,8 +116,8 @@ def check_features() -> None:
                     fail(f"docs/features.md: {identifier} names {entry}, which is not in the tree")
             elif entry not in tests:
                 fail(f"docs/features.md: {identifier} names {entry}, which is not a test in src/tests")
-    if rows != 96:
-        fail(f"docs/features.md: {rows} feature rows, expected 96")
+    if rows != 97:
+        fail(f"docs/features.md: {rows} feature rows, expected 97")
 
 
 def check_tests() -> None:

@@ -130,6 +130,29 @@ CREATE UNIQUE INDEX by_code ON t USING DIRECT (code); -- unique, one row per key
 CREATE INDEX by_id ON t (id);                        -- btree, the default
 ```
 
+## MERGE
+
+`MERGE` loads a set of rows into a table in one statement: the rows that are
+already there are updated (or deleted), and the ones that are not are inserted.
+
+```sql
+MERGE INTO stock AS s USING feed AS f ON s.id = f.id
+  WHEN MATCHED AND f.qty = 0 THEN DELETE
+  WHEN MATCHED THEN UPDATE SET qty = f.qty
+  WHEN NOT MATCHED THEN INSERT (id, qty) VALUES (f.id, f.qty);
+```
+
+The two rows are bound under the names the statement gives them, so a clause
+condition reads either side. The clauses are tried in the order written and the
+first one whose condition holds is the one that runs. A source row that matched no
+target reaches the `WHEN NOT MATCHED` clauses alone, and an `INSERT` with a column
+list leaves the other columns to their defaults.
+
+A target row that two source rows would change is refused ("MERGE cannot affect
+row N twice"), as PostgreSQL refuses it, and nothing of the statement is written.
+`WHEN NOT MATCHED BY SOURCE` (delete what the source does not mention) is
+refused with a message that says it is not supported.
+
 ## Schema changes
 
 A table may be dropped and created again in one transaction — the shape a

@@ -105,7 +105,7 @@ sql_run_statement :: proc(store: ^Store, statement: Statement, params: []Value) 
 		tx_end(tx)
 		result.commit_seq = store.commit_seq
 		return result, exec_err
-	case Insert_Stmt, Update_Stmt, Delete_Stmt, Copy_Stmt, Create_Table_Stmt, Alter_Table_Stmt, Create_Type_Stmt, Drop_Table_Stmt, Create_Index_Stmt, Drop_Index_Stmt, Create_View_Stmt, Drop_View_Stmt, Create_Policy_Stmt, Drop_Policy_Stmt, Truncate_Stmt, Create_Trigger_Stmt, Drop_Trigger_Stmt, Grant_Stmt, Create_Virtual_Table_Stmt, Load_Extension_Stmt:
+	case Insert_Stmt, Update_Stmt, Delete_Stmt, Merge_Stmt, Copy_Stmt, Create_Table_Stmt, Alter_Table_Stmt, Create_Type_Stmt, Drop_Table_Stmt, Create_Index_Stmt, Drop_Index_Stmt, Create_View_Stmt, Drop_View_Stmt, Create_Policy_Stmt, Drop_Policy_Stmt, Truncate_Stmt, Create_Trigger_Stmt, Drop_Trigger_Stmt, Grant_Stmt, Create_Virtual_Table_Stmt, Load_Extension_Stmt:
 		tx := tx_begin_write(store)
 		// OR FAIL undoes the failing row alone, which needs the statement journal
 		// even here, where a plain failure simply discards the transaction.
@@ -220,7 +220,7 @@ sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value) 
 	switch stmt in statement {
 	case Select_Stmt, With_Stmt:
 		return sql_run_query(tx, stmt, params)
-	case Insert_Stmt, Update_Stmt, Delete_Stmt, Copy_Stmt:
+	case Insert_Stmt, Update_Stmt, Delete_Stmt, Merge_Stmt, Copy_Stmt:
 		if insert, is_insert := stmt.(Insert_Stmt); is_insert && insert.conflict_rollback {
 			return {}, errf(
 				.Sql_Unsupported,
@@ -349,6 +349,8 @@ sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sq
 		return sql_exec_update(tx, stmt, params)
 	case Delete_Stmt:
 		return sql_exec_delete(tx, stmt, params)
+	case Merge_Stmt:
+		return sql_exec_merge(tx, stmt, params)
 	case Create_Table_Stmt:
 		return sql_exec_create_table(tx, stmt, params)
 	case Alter_Table_Stmt:
@@ -697,6 +699,8 @@ sql_exec_explain :: proc(tx: ^Tx, stmt: Explain_Stmt, params: []Value) -> (Sql_R
 	switch inner in stmt.inner^ {
 	case Copy_Stmt:
 		return {}, errf(.Sql_Not_A_Query, "EXPLAIN does not apply to COPY")
+	case Merge_Stmt:
+		return {}, errf(.Sql_Not_A_Query, "EXPLAIN does not apply to MERGE")
 	case Select_Stmt:
 		order := plan_join_order(store, tx, inner, params)
 		first := order.steps[0]
@@ -6649,6 +6653,237 @@ sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Res
 	tx.store.last_changes = i64(result.affected)
 	tx.store.total_changes += i64(result.affected)
 	return result, ERROR_NONE
+}
+
+// Merge_Change is one row a MERGE will write, kept until the scan is done: a
+// mutation during the scan would move the rows the scan is reading.
+@(private)
+Merge_Change :: struct {
+	delete: bool,
+	id:     Row_Id,
+	values: []Value,
+}
+
+// sql_exec_merge runs a MERGE: one row per target that the source matches (the
+// first WHEN MATCHED clause whose condition holds updates or deletes it) and one
+// per source row that matches no target (the first WHEN NOT MATCHED clause
+// inserts it). A target row that two source rows would change is refused, as
+// PostgreSQL refuses it: the same row cannot be affected twice by one statement.
+@(private)
+sql_exec_merge :: proc(tx: ^Tx, stmt: Merge_Stmt, params: []Value) -> (Sql_Result, Error) {
+	target, target_err := tx_table(tx, stmt.target)
+	if target_err.kind != .None do return {}, target_err
+	source_table, source_is_view, source_err := tx_source_table(tx, stmt.source, nil)
+	if source_err.kind != .None do return {}, source_err
+	target_rows := make([dynamic]Row)
+	defer delete(target_rows)
+	if collect_err := tx_collect(tx, stmt.target, &target_rows); collect_err.kind != .None {
+		return {}, collect_err
+	}
+	source_rows := make([dynamic]Row)
+	defer delete(source_rows)
+	if source_is_view {
+		table_collect(source_table, &source_rows, tx.read_seq)
+	} else if collect_err := tx_collect(tx, stmt.source, &source_rows); collect_err.kind != .None {
+		return {}, collect_err
+	}
+	ctx := Eval_Ctx {
+		tx     = tx,
+		params = params,
+		now_us = now_microseconds(),
+	}
+	policies, policy_err := policy_load(tx, stmt.target)
+	if policy_err.kind != .None do return {}, policy_err
+	defer policy_set_destroy(&policies)
+	generated, generated_err := generated_plan_make(tx, target)
+	if generated_err.kind != .None do return {}, generated_err
+	defer generated_plan_destroy(&generated)
+	// The two rows are bound under the names the statement gave them.
+	target_source := Source{table = target, alias = stmt.target_alias}
+	source_source := Source{table = source_table, alias = stmt.source_alias}
+	pair: [2]Source
+	source_matched := make([]bool, len(source_rows), tx.alloc)
+	changes := make([dynamic]Merge_Change, 0, len(target_rows), tx.alloc)
+	inserts := make([dynamic][]Value, 0, len(source_rows), tx.alloc)
+	affected := 0
+	touched := make(map[Row_Id]bool, len(target_rows), tx.alloc)
+	for target_row in target_rows {
+		if store_cancelled(tx.store) do return {}, errf(.Cancelled, "statement cancelled")
+		pair[0] = target_source
+		pair[0].row = target_row
+		for source_row, source_index in source_rows {
+			pair[1] = source_source
+			pair[1].row = source_row
+			ctx.sources = pair[:]
+			matches, match_err := eval_expr(&ctx, stmt.on)
+			if match_err.kind != .None do return {}, match_err
+			if !value_is_truthy(matches) do continue
+			source_matched[source_index] = true
+			for clause in stmt.clauses {
+				if clause.kind == .Not_Matched_Insert do continue
+				if clause.condition != nil {
+					holds, holds_err := eval_expr(&ctx, clause.condition)
+					if holds_err.kind != .None do return {}, holds_err
+					if !value_is_truthy(holds) do continue
+				}
+				if clause.kind == .Matched_Delete {
+					allowed, allow_err := policy_allows(&policies, &ctx, false)
+					if allow_err.kind != .None do return {}, allow_err
+					if !allowed {
+						return {}, errf(.Permission_Denied, "delete from %s violates a policy", stmt.target)
+					}
+					if touched[target_row.id] {
+						return {}, errf(
+							.Invalid_Argument,
+							"MERGE cannot affect row %d twice",
+							target_row.id,
+						)
+					}
+					touched[target_row.id] = true
+					append(&changes, Merge_Change{delete = true, id = target_row.id})
+					break
+				}
+				new_values := make([]Value, len(target.schema.columns), tx.alloc)
+				for _, i in target.schema.columns do new_values[i] = target_row.values[i]
+				for assignment in clause.assignments {
+					index, found := schema_column_index(&target.schema, assignment.column)
+					if !found {
+						return {}, errf(
+							.Column_Not_Found,
+							"column %s does not exist in %s",
+							assignment.column,
+							stmt.target,
+						)
+					}
+					value, value_err := eval_expr(&ctx, assignment.value)
+					if value_err.kind != .None do return {}, value_err
+					coerced, coerce_err := value_coerce(value, target.schema.columns[index].type)
+					if coerce_err.kind != .None do return {}, coerce_err
+					new_values[index] = coerced
+				}
+				if apply_err := generated_plan_apply(&ctx, &generated, target, new_values); apply_err.kind != .None {
+					return {}, apply_err
+				}
+				checked: [1]Source
+				checked[0] = Source{table = target, row = Row{values = new_values}}
+				ctx.sources = checked[:]
+				allowed, allow_err := policy_allows(&policies, &ctx, true)
+				ctx.sources = pair[:]
+				if allow_err.kind != .None do return {}, allow_err
+				if !allowed {
+					return {}, errf(.Permission_Denied, "update of %s violates a policy", stmt.target)
+				}
+				if touched[target_row.id] {
+					return {}, errf(
+						.Invalid_Argument,
+						"MERGE cannot affect row %d twice",
+						target_row.id,
+					)
+				}
+				touched[target_row.id] = true
+				append(&changes, Merge_Change{id = target_row.id, values = new_values})
+				break
+			}
+		}
+	}
+	for source_row, source_index in source_rows {
+		if source_matched[source_index] do continue
+		// No target matched this source row: the NOT MATCHED clauses see it alone.
+		pair[0] = Source{}
+		pair[1] = source_source
+		pair[1].row = source_row
+		ctx.sources = pair[1:]
+		for clause in stmt.clauses {
+			if clause.kind != .Not_Matched_Insert do continue
+			if clause.condition != nil {
+				holds, holds_err := eval_expr(&ctx, clause.condition)
+				if holds_err.kind != .None do return {}, holds_err
+				if !value_is_truthy(holds) do continue
+			}
+			values := make([]Value, len(target.schema.columns), tx.alloc)
+			for _, i in target.schema.columns do values[i] = value_default()
+			if len(clause.columns) == 0 {
+				if len(clause.values) != len(target.schema.columns) {
+					return {}, errf(
+						.Invalid_Argument,
+						"MERGE inserts %d values into %s, which has %d columns",
+						len(clause.values),
+						stmt.target,
+						len(target.schema.columns),
+					)
+				}
+				for expression, i in clause.values {
+					value, value_err := eval_expr(&ctx, expression)
+					if value_err.kind != .None do return {}, value_err
+					coerced, coerce_err := value_coerce(value, target.schema.columns[i].type)
+					if coerce_err.kind != .None do return {}, coerce_err
+					values[i] = coerced
+				}
+			} else {
+				if len(clause.columns) != len(clause.values) {
+					return {}, errf(
+						.Invalid_Argument,
+						"MERGE INSERT names %d columns but gives %d values",
+						len(clause.columns),
+						len(clause.values),
+					)
+				}
+				for column, i in clause.columns {
+					index, found := schema_column_index(&target.schema, column)
+					if !found {
+						return {}, errf(
+							.Column_Not_Found,
+							"column %s does not exist in %s",
+							column,
+							stmt.target,
+						)
+					}
+					value, value_err := eval_expr(&ctx, clause.values[i])
+					if value_err.kind != .None do return {}, value_err
+					coerced, coerce_err := value_coerce(value, target.schema.columns[index].type)
+					if coerce_err.kind != .None do return {}, coerce_err
+					values[index] = coerced
+				}
+			}
+			checked: [1]Source
+			checked[0] = Source{table = target, row = Row{values = values}}
+			ctx.sources = checked[:]
+			allowed, allow_err := policy_allows(&policies, &ctx, true)
+			ctx.sources = pair[1:]
+			if allow_err.kind != .None do return {}, allow_err
+			if !allowed {
+				return {}, errf(.Permission_Denied, "insert into %s violates a policy", stmt.target)
+			}
+			append(&inserts, values)
+			break
+		}
+	}
+	// The changes land now, with the table no longer being scanned.
+	for change in changes {
+		if change.delete {
+			if delete_err := tx_delete(tx, stmt.target, change.id); delete_err.kind != .None {
+				return {}, delete_err
+			}
+			affected += 1
+			continue
+		}
+		if update_err := tx_update(tx, stmt.target, change.id, change.values); update_err.kind != .None {
+			return {}, update_err
+		}
+		if fts_err := fts_index_if_virtual(tx, stmt.target, change.id, change.values, false); fts_err.kind != .None {
+			return {}, fts_err
+		}
+		affected += 1
+	}
+	for values in inserts {
+		if _, insert_err := tx_insert(tx, stmt.target, values); insert_err.kind != .None {
+			return {}, insert_err
+		}
+		affected += 1
+	}
+	tx.store.last_changes = i64(affected)
+	tx.store.total_changes += i64(affected)
+	return Sql_Result{kind = .Affected, affected = affected, commit_seq = tx.store.commit_seq}, ERROR_NONE
 }
 
 sql_exec_update :: proc(tx: ^Tx, stmt: Update_Stmt, params: []Value) -> (Sql_Result, Error) {

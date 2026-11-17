@@ -362,6 +362,35 @@ Update_Stmt :: struct {
 	returning:    ^Returning,
 }
 
+// Merge_When_Kind is what one WHEN clause of a MERGE does.
+Merge_When_Kind :: enum u8 {
+	Matched_Update,
+	Matched_Delete,
+	Not_Matched_Insert,
+}
+
+// Merge_When is one WHEN clause: an optional condition over the two rows, and the
+// work it does.
+Merge_When :: struct {
+	kind:        Merge_When_Kind,
+	condition:   ^Expr,
+	assignments: []Assignment,
+	columns:     []string,
+	values:      []^Expr,
+}
+
+// Merge_Stmt is `MERGE INTO target AS t USING source AS s ON ... WHEN ...`: one row
+// per target that matches the source (updated or deleted) and one per source that
+// matches nothing (inserted).
+Merge_Stmt :: struct {
+	target:       string,
+	target_alias: string,
+	source:       string,
+	source_alias: string,
+	on:           ^Expr,
+	clauses:      []Merge_When,
+}
+
 Delete_Stmt :: struct {
 	table:        string,
 	where_clause: ^Expr,
@@ -589,6 +618,7 @@ Statement :: union {
 	Insert_Stmt,
 	Update_Stmt,
 	Delete_Stmt,
+	Merge_Stmt,
 	Create_Table_Stmt,
 	Alter_Table_Stmt,
 	Create_Type_Stmt,
@@ -716,6 +746,8 @@ statement_name :: proc(statement: Statement) -> string {
 		return "UPDATE"
 	case Delete_Stmt:
 		return "DELETE"
+	case Merge_Stmt:
+		return "MERGE"
 	case Create_Table_Stmt:
 		return "CREATE TABLE"
 	case Alter_Table_Stmt:
