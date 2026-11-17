@@ -24,8 +24,10 @@ import subprocess
 import sys
 import tempfile
 
+from binpath import binary_path
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_BIN = os.path.join(ROOT, "bin", "miraidb.exe")
+DEFAULT_BIN = binary_path("miraidb")
 
 # The fixture: 400 events with two kinds and 400 distinct amounts, ten parents and
 # a thousand children with ten codes.

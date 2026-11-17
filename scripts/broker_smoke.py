@@ -33,8 +33,10 @@ import subprocess
 import sys
 import time
 
+from binpath import binary_path
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SERVER = os.path.join(ROOT, "bin", "miraidb-server.exe")
+SERVER = binary_path("miraidb-server")
 
 WIRE_QUERY = 2
 WIRE_SUBSCRIBE = 3

@@ -15,6 +15,8 @@ import shutil
 import subprocess
 import sys
 
+from binpath import binary_path
+
 CASES = [
     ("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)", ["ok"]),
     ("INSERT INTO t (name) VALUES ('a')", ["affected"]),
@@ -46,7 +48,7 @@ def run(binary, database, statement):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--bin", default="bin/miraidb.exe")
+    parser.add_argument("--bin", default=binary_path("miraidb"))
     options = parser.parse_args()
     binary = options.bin
     if not os.path.exists(binary) and os.path.exists("bin/miraidb"):

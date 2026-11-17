@@ -22,6 +22,8 @@ import re
 import shutil
 import sys
 
+from binpath import binary_path
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORK = os.path.join(ROOT, "_page_rss")
 PAGE_SIZE = 4096
@@ -78,7 +80,7 @@ def measure(binary: str, rows: int) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bin", default=os.path.join(ROOT, "bin", "miraidb.exe"))
+    parser.add_argument("--bin", default=binary_path("miraidb"))
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
     if not os.path.exists(args.bin):

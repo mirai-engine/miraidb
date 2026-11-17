@@ -20,6 +20,8 @@ import shutil
 import sys
 import time
 
+from binpath import binary_path
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # The compiler comes from $ODIN, then from PATH. Pass --odin when neither finds
 # it, so nothing here depends on one machine's layout.
@@ -59,37 +61,39 @@ def tail(text: str, lines: int = 6) -> str:
 def build_gates(args: argparse.Namespace) -> list[Gate]:
     """The gates, in the order they run. `--list` prints them; docs_check.py counts them."""
     odin_env = {"ODIN": args.odin}
+    # The CLI's name follows the compiler, as scripts/build.py writes it.
+    cli = binary_path("miraidb", args.odin)
     gates: list[Gate] = []
     if not args.skip_build:
         gates.append(Gate("build (binaries + suite)", [sys.executable, "scripts/build.py"], odin_env))
     gates.append(Gate("unit tests", [args.odin, "test", "src/tests"]))
     gates.append(
-        Gate("conformance (20 cases)", [sys.executable, "scripts/conformance.py", "--bin", "./bin/miraidb.exe"])
+        Gate("conformance (20 cases)", [sys.executable, "scripts/conformance.py", "--bin", cli])
     )
     gates.append(Gate("shell smoke", [sys.executable, "scripts/shell_smoke.py"]))
     gates.append(Gate("performance baseline", [sys.executable, "scripts/bench.py", "--check"]))
     gates.append(Gate("package manifest", [sys.executable, "scripts/package.py", "--check"]))
     gates.append(
-        Gate("page memory", [sys.executable, "scripts/page_rss.py", "--check", "--bin", "./bin/miraidb.exe"])
+        Gate("page memory", [sys.executable, "scripts/page_rss.py", "--check", "--bin", cli])
     )
     gates.append(
-        Gate("plan regression", [sys.executable, "scripts/plan_check.py", "--bin", "./bin/miraidb.exe"])
+        Gate("plan regression", [sys.executable, "scripts/plan_check.py", "--bin", cli])
     )
     gates.append(
-        Gate("differential vs sqlite3", [sys.executable, "scripts/differential.py", "--bin", "./bin/miraidb.exe"])
+        Gate("differential vs sqlite3", [sys.executable, "scripts/differential.py", "--bin", cli])
     )
     # The compatibility matrix is a table this runs: a claim in docs/sqlite.md that
     # stops being true fails here, which is what keeps the document honest (D26).
     gates.append(
         Gate(
             "documented compatibility",
-            [sys.executable, "scripts/compat_check.py", "--bin", "./bin/miraidb.exe"],
+            [sys.executable, "scripts/compat_check.py", "--bin", cli],
         )
     )
     # How much of SQLite's function, pragma and grammar surface answers; the
     # counts docs/sqlite-roadmap.md states have to be the measured ones.
     gates.append(
-        Gate("SQLite surface", [sys.executable, "scripts/sqlite_gaps.py", "--check", "--bin", "./bin/miraidb.exe"])
+        Gate("SQLite surface", [sys.executable, "scripts/sqlite_gaps.py", "--check", "--bin", cli])
     )
     # The CLI under AddressSanitizer with the Windows heap hooked: a use-after-free
     # of heap memory is invisible to it otherwise, and one shipped that way.

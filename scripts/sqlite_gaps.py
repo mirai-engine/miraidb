@@ -21,6 +21,8 @@ import re
 import subprocess
 import sys
 
+from binpath import binary_path
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ROADMAP = os.path.join(ROOT, "docs", "sqlite-roadmap.md")
 # The sentence in the roadmap that carries the counts --check compares.
@@ -146,7 +148,7 @@ def pragma_present(binary, name):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--bin", default=os.path.join(ROOT, "bin", "miraidb.exe"))
+    parser.add_argument("--bin", default=binary_path("miraidb"))
     parser.add_argument("--missing", action="store_true", help="print only what is missing")
     parser.add_argument("--check", action="store_true", help="fail unless docs/sqlite-roadmap.md states these counts")
     args = parser.parse_args()

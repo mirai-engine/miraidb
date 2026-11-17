@@ -21,8 +21,10 @@ import tempfile
 import time
 import shutil
 
+from binpath import binary_path
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = os.path.join(ROOT, "bin", "miraidb.exe")
+BIN = binary_path("miraidb")
 sys.path.insert(0, os.path.join(ROOT, "sdk", "python"))
 
 import miraidb  # noqa: E402

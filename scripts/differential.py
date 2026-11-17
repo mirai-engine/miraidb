@@ -32,6 +32,8 @@ import sqlite3
 import subprocess
 import sys
 
+from binpath import binary_path
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # The binaries run with cwd=ROOT: the Windows miraidb.exe cannot read a /mnt/...
 # path, so every path it is given is relative to the repository.
@@ -418,7 +420,7 @@ def compare(statement: str, mine: list, theirs: list) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bin", default=os.path.join("bin", "miraidb.exe"))
+    parser.add_argument("--bin", default=binary_path("miraidb"))
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 

@@ -37,6 +37,8 @@ import sys
 import tempfile
 import time
 
+from binpath import binary_path
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASELINE = os.path.join(ROOT, "benchmarks", "baseline.json")
 
@@ -246,7 +248,7 @@ def compare_halves(first: dict, second: dict) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bin", default=os.path.join(ROOT, "bin", "miraidb.exe"))
+    parser.add_argument("--bin", default=binary_path("miraidb"))
     parser.add_argument("--rows", type=int, default=20000)
     parser.add_argument("--iterations", type=int, default=2000)
     parser.add_argument("--quick", action="store_true", help="smaller workload for CI")
