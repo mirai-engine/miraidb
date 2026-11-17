@@ -72,6 +72,15 @@ error_free :: proc(err: ^Error) {
 	err^ = {}
 }
 
+// error_drop answers whether `err` is no error and frees its message: the call
+// for a caller that only needs the yes or no.
+error_drop :: proc(err: Error) -> bool {
+	dropped := err
+	ok := dropped.kind == .None
+	error_free(&dropped)
+	return ok
+}
+
 // error_kind_name is the stable, machine friendly name of a kind. It is used by
 // tests and by the CLI's error output.
 error_kind_name :: proc(kind: Error_Kind) -> string {

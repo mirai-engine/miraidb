@@ -238,7 +238,7 @@ blob_key_column :: proc(db: ^Database, table_name: string) -> (column: string, o
 	tx := engine.tx_begin_read(store)
 	defer engine.tx_end(tx)
 	table, table_err := engine.tx_table(tx, table_name)
-	if table_err.kind != .None do return "", false
+	if !engine.error_drop(table_err) do return "", false
 	if len(table.schema.primary_key) != 1 do return "", false
 	position := table.schema.primary_key[0]
 	if position < 0 || position >= len(table.schema.columns) do return "", false
@@ -250,6 +250,15 @@ set_error :: proc(db: ^Database, text: string) {
 	if db == nil do return
 	delete(db.last_error)
 	db.last_error = strings.clone(text)
+}
+
+// set_error_from records an engine error's message and frees the error, which
+// the engine handed over to this layer.
+@(private)
+set_error_from :: proc(db: ^Database, err: engine.Error) {
+	set_error(db, err.message)
+	dropped := err
+	engine.error_free(&dropped)
 }
 
 // sqlite_code names an engine error with the result code SQLite reports for the
@@ -313,9 +322,14 @@ sqlite_extended_code :: proc(err: engine.Error) -> c.int {
 }
 
 // fail records the message and the code together, so sqlite3_errcode answers
-// what the last step or exec returned.
+// what the last step or exec returned. The error is this layer's: its message
+// is copied and the error is freed.
 @(private)
 fail :: proc(db: ^Database, err: engine.Error) -> c.int {
+	defer {
+		dropped := err
+		engine.error_free(&dropped)
+	}
 	set_error(db, err.message)
 	code := sqlite_code(err)
 	if db != nil {
@@ -340,7 +354,7 @@ sqlite3_open :: proc "c" (filename: cstring, ppDb: ^rawptr) -> c.int {
 	path := string(filename)
 	in_memory := engine.sqlite_is_file(path)
 	conn, err := engine.embed_open(path)
-	if err.kind != .None {
+	if !engine.error_drop(err) {
 		ppDb^ = nil
 		return SQLITE_ERROR
 	}
@@ -607,7 +621,7 @@ sqlite3_bind_null :: proc "c" (handle: rawptr, index: c.int) -> c.int {
 	stmt := stmt_of(handle)
 	if stmt == nil do return SQLITE_MISUSE
 	if int(index) < 1 || int(index) > engine.Embed_Parameter_Count(stmt.stmt) do return SQLITE_RANGE
-	if engine.embed_bind_null(stmt.stmt, int(index) - 1).kind == .None do return SQLITE_OK
+	if engine.error_drop(engine.embed_bind_null(stmt.stmt, int(index) - 1)) do return SQLITE_OK
 	return SQLITE_ERROR
 }
 
@@ -623,7 +637,7 @@ sqlite3_bind_int64 :: proc "c" (handle: rawptr, index: c.int, value: c.longlong)
 	stmt := stmt_of(handle)
 	if stmt == nil do return SQLITE_MISUSE
 	if int(index) < 1 || int(index) > engine.Embed_Parameter_Count(stmt.stmt) do return SQLITE_RANGE
-	if engine.embed_bind_int(stmt.stmt, int(index) - 1, i64(value)).kind == .None do return SQLITE_OK
+	if engine.error_drop(engine.embed_bind_int(stmt.stmt, int(index) - 1, i64(value))) do return SQLITE_OK
 	return SQLITE_ERROR
 }
 
@@ -633,7 +647,7 @@ sqlite3_bind_double :: proc "c" (handle: rawptr, index: c.int, value: c.double) 
 	stmt := stmt_of(handle)
 	if stmt == nil do return SQLITE_MISUSE
 	if int(index) < 1 || int(index) > engine.Embed_Parameter_Count(stmt.stmt) do return SQLITE_RANGE
-	if engine.embed_bind_float(stmt.stmt, int(index) - 1, f64(value)).kind == .None do return SQLITE_OK
+	if engine.error_drop(engine.embed_bind_float(stmt.stmt, int(index) - 1, f64(value))) do return SQLITE_OK
 	return SQLITE_ERROR
 }
 
@@ -654,7 +668,7 @@ sqlite3_bind_text :: proc "c" (handle: rawptr, index: c.int, value: cstring, len
 	} else {
 		text = string(value)
 	}
-	if engine.embed_bind_text(stmt.stmt, int(index) - 1, text).kind == .None do return SQLITE_OK
+	if engine.error_drop(engine.embed_bind_text(stmt.stmt, int(index) - 1, text)) do return SQLITE_OK
 	return SQLITE_ERROR
 }
 
@@ -666,7 +680,7 @@ sqlite3_bind_blob :: proc "c" (handle: rawptr, index: c.int, data: rawptr, lengt
 	stmt := stmt_of(handle)
 	if stmt == nil do return SQLITE_MISUSE
 	if data == nil || length <= 0 {
-		if engine.embed_bind_null(stmt.stmt, int(index) - 1).kind == .None do return SQLITE_OK
+		if engine.error_drop(engine.embed_bind_null(stmt.stmt, int(index) - 1)) do return SQLITE_OK
 		return SQLITE_ERROR
 	}
 	bytes := make([]u8, int(length))
@@ -674,7 +688,7 @@ sqlite3_bind_blob :: proc "c" (handle: rawptr, index: c.int, data: rawptr, lengt
 	source := ([^]u8)(data)
 	for i in 0 ..< int(length) do bytes[i] = source[i]
 	if int(index) < 1 || int(index) > engine.Embed_Parameter_Count(stmt.stmt) do return SQLITE_RANGE
-	if engine.embed_bind_blob(stmt.stmt, int(index) - 1, bytes).kind == .None do return SQLITE_OK
+	if engine.error_drop(engine.embed_bind_blob(stmt.stmt, int(index) - 1, bytes)) do return SQLITE_OK
 	return SQLITE_ERROR
 }
 
@@ -877,12 +891,12 @@ sqlite3_blob_open :: proc "c" (
 	if stmt == nil do return SQLITE_ERROR
 	defer engine.embed_finalize(stmt)
 	if err := engine.embed_bind_int(stmt, 0, i64(iRow)); err.kind != .None {
-		set_error(db, err.message)
+		set_error_from(db, err)
 		return SQLITE_ERROR
 	}
 	has_row, step_err := engine.embed_step(stmt)
 	if step_err.kind != .None {
-		set_error(db, step_err.message)
+		set_error_from(db, step_err)
 		return SQLITE_ERROR
 	}
 	if !has_row {
@@ -965,10 +979,10 @@ sqlite3_blob_close :: proc "c" (handle: rawptr) -> c.int {
 			result = SQLITE_ERROR
 		} else {
 			defer engine.embed_finalize(stmt)
-			_ = engine.embed_bind_blob(stmt, 0, blob.data)
-			_ = engine.embed_bind_int(stmt, 1, blob.row_id)
+			_ = engine.error_drop(engine.embed_bind_blob(stmt, 0, blob.data))
+			_ = engine.error_drop(engine.embed_bind_int(stmt, 1, blob.row_id))
 			if _, step_err := engine.embed_step(stmt); step_err.kind != .None {
-				set_error(blob.db, step_err.message)
+				set_error_from(blob.db, step_err)
 				result = SQLITE_ERROR
 			}
 		}
@@ -991,10 +1005,10 @@ sqlite3_blob_reopen :: proc "c" (handle: rawptr, iRow: c.longlong) -> c.int {
 	stmt := engine.embed_prepare(blob.db.conn, query)
 	if stmt == nil do return SQLITE_ERROR
 	defer engine.embed_finalize(stmt)
-	_ = engine.embed_bind_int(stmt, 0, i64(iRow))
+	_ = engine.error_drop(engine.embed_bind_int(stmt, 0, i64(iRow)))
 	has_row, step_err := engine.embed_step(stmt)
 	if step_err.kind != .None || !has_row {
-		if step_err.kind != .None do set_error(blob.db, step_err.message)
+		if step_err.kind != .None do set_error_from(blob.db, step_err)
 		return SQLITE_ERROR
 	}
 	value, column_ok := engine.embed_column_value(stmt, 0)

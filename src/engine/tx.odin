@@ -1792,7 +1792,7 @@ tx_commit :: proc(tx: ^Tx) -> Error {
 	// reading it with any SQLite driver sees the commit. O(state) per commit, by
 	// design: the file is a materialized export, the log is the truth.
 	if mirror_err := store_sqlite_mirror_flush(store, notify_ops); mirror_err.kind != .None {
-		store.last_error = mirror_err
+		store_note_error(store, mirror_err)
 	}
 	if notify != nil {
 		notify(notify_ctx, store, notify_ops)

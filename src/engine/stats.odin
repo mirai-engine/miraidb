@@ -115,7 +115,7 @@ stats_analyze :: proc(store: ^Store, only: string) -> (count: int, err: Error) {
 	store.stats_seq = store.commit_seq
 	count = len(store.stats)
 	if save_err := stats_save(store); save_err.kind != .None {
-		store.last_error = save_err
+		store_note_error(store, save_err)
 	}
 	return count, ERROR_NONE
 }

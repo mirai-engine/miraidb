@@ -41,6 +41,77 @@ leakcheck_bad_free :: proc(t: ^mem.Tracking_Allocator, memory: rawptr, location:
 	bad_frees += 1
 }
 
+// error_ownership checks the rule docs/backlog.md D35 asks for: an Error the
+// engine returns is the caller's, whichever entry point returned it. A failing
+// embed_exec is freed by its caller every time, which must leave nothing behind
+// and free nothing twice (the connection keeps a copy of its own for
+// embed_error), and a store that notes a failure N times keeps only the last
+// message. It returns the number of checks that failed.
+@(private)
+error_ownership :: proc(track: ^mem.Tracking_Allocator, store: ^db.Store, repeat: int) -> int {
+	failed := 0
+	conn, open_err := db.embed_open(":memory:")
+	if open_err.kind != .None {
+		fmt.eprintfln("leakcheck: cannot open an embedded connection: %s", open_err.message)
+		os.exit(2)
+	}
+	statement := "SELECT * FROM no_such_table"
+	// The first failure builds the parse caches a statement keeps; what is
+	// measured is every failure after it.
+	first := db.embed_exec(conn, statement)
+	db.error_free(&first)
+	// A success clears the connection's copy, so the measurement does not start
+	// with a block the tracker never saw allocated.
+	clean := db.embed_exec(conn, "SELECT 1")
+	db.error_free(&clean)
+	mem.tracking_allocator_clear(track)
+	bad_before := bad_frees
+	readable := true
+	for _ in 0 ..< repeat {
+		err := db.embed_exec(conn, statement)
+		if err.kind == .None {
+			fmt.eprintfln("leakcheck: %s did not fail", statement)
+			os.exit(2)
+		}
+		db.error_free(&err)
+		// The connection's copy outlives the caller's: freeing one is not
+		// freeing the other.
+		if len(db.embed_error(conn)) == 0 do readable = false
+	}
+	// A success clears the connection's copy, so nothing of the failures stays.
+	ok := db.embed_exec(conn, "SELECT 1")
+	db.error_free(&ok)
+	live := len(track.allocation_map)
+	double := bad_frees - bad_before
+	verdict := "ok"
+	if live > 0 || double > 0 || !readable {
+		verdict = "OVER"
+		failed += 1
+	}
+	fmt.printfln(
+		"%-8s live=%d allowed=0 bad-frees=%d message-kept=%v embed_exec failing %d times, caller frees",
+		verdict,
+		live,
+		double,
+		readable,
+		repeat,
+	)
+
+	mem.tracking_allocator_clear(track)
+	for i in 0 ..< repeat {
+		db.store_note_error(store, db.errf(.Io, "noted failure %d", i))
+	}
+	live = len(track.allocation_map)
+	verdict = "ok"
+	if live > 1 {
+		verdict = "OVER"
+		failed += 1
+	}
+	fmt.printfln("%-8s live=%d allowed=1 store_note_error %d times keeps the last", verdict, live, repeat)
+	db.store_note_error(store, db.ERROR_NONE)
+	return failed
+}
+
 main :: proc() {
 	repeat := 200
 	verbose := false
@@ -175,6 +246,8 @@ main :: proc() {
 			free_all(context.temp_allocator)
 		}
 	}
+	failed += error_ownership(&track, store, repeat)
+
 	// The store is not closed here. A row is allocated and freed with whichever
 	// allocator `context.allocator` is when each happens, not with the store's, so a
 	// close after this swap frees arena memory through the tracker: the tracker

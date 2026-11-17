@@ -157,8 +157,9 @@ miraidb_open_ex :: proc "c" (path: cstring, flags: c.int) -> rawptr {
 	conn, err := engine.embed_open(string(path), options)
 	if err.kind != .None {
 		if conn != nil do engine.embed_close(conn)
+		// The message moves into last_open_error: the error is ours to keep.
 		delete(last_open_error)
-		last_open_error = strings.clone(err.message)
+		last_open_error = err.message
 		return nil
 	}
 	delete(last_open_error)
@@ -247,6 +248,7 @@ miraidb_exec :: proc "c" (handle: rawptr, sql: cstring) -> c.int {
 	if conn == nil do return MIRAIDB_MISUSE
 	if sql == nil do return MIRAIDB_ERROR
 	err := engine.embed_exec(conn.embed, string(sql))
+	defer engine.error_free(&err)
 	if err.kind != .None do return MIRAIDB_ERROR
 	return MIRAIDB_OK
 }
@@ -258,6 +260,7 @@ miraidb_backup :: proc "c" (handle: rawptr, path: cstring) -> c.int {
 	if conn == nil do return MIRAIDB_MISUSE
 	if path == nil do return MIRAIDB_ERROR
 	err := engine.embed_backup(conn.embed, string(path))
+	defer engine.error_free(&err)
 	if err.kind != .None do return MIRAIDB_ERROR
 	return MIRAIDB_OK
 }
@@ -313,7 +316,7 @@ miraidb_bind_null :: proc "c" (handle: rawptr, index: c.int) -> c.int {
 	context = runtime.default_context()
 	stmt := capi_stmt(handle)
 	if stmt == nil do return MIRAIDB_MISUSE
-	if engine.embed_bind_null(stmt.embed, int(index)).kind != .None do return MIRAIDB_ERROR
+	if !engine.error_drop(engine.embed_bind_null(stmt.embed, int(index))) do return MIRAIDB_ERROR
 	return MIRAIDB_OK
 }
 
@@ -322,7 +325,7 @@ miraidb_bind_int :: proc "c" (handle: rawptr, index: c.int, value: c.longlong) -
 	context = runtime.default_context()
 	stmt := capi_stmt(handle)
 	if stmt == nil do return MIRAIDB_MISUSE
-	if engine.embed_bind_int(stmt.embed, int(index), i64(value)).kind != .None do return MIRAIDB_ERROR
+	if !engine.error_drop(engine.embed_bind_int(stmt.embed, int(index), i64(value))) do return MIRAIDB_ERROR
 	return MIRAIDB_OK
 }
 
@@ -331,7 +334,7 @@ miraidb_bind_double :: proc "c" (handle: rawptr, index: c.int, value: c.double) 
 	context = runtime.default_context()
 	stmt := capi_stmt(handle)
 	if stmt == nil do return MIRAIDB_MISUSE
-	if engine.embed_bind_float(stmt.embed, int(index), f64(value)).kind != .None do return MIRAIDB_ERROR
+	if !engine.error_drop(engine.embed_bind_float(stmt.embed, int(index), f64(value))) do return MIRAIDB_ERROR
 	return MIRAIDB_OK
 }
 
@@ -341,7 +344,7 @@ miraidb_bind_text :: proc "c" (handle: rawptr, index: c.int, value: cstring) -> 
 	stmt := capi_stmt(handle)
 	if stmt == nil do return MIRAIDB_MISUSE
 	if value == nil do return MIRAIDB_ERROR
-	if engine.embed_bind_text(stmt.embed, int(index), string(value)).kind != .None do return MIRAIDB_ERROR
+	if !engine.error_drop(engine.embed_bind_text(stmt.embed, int(index), string(value))) do return MIRAIDB_ERROR
 	return MIRAIDB_OK
 }
 
@@ -357,7 +360,7 @@ miraidb_bind_blob :: proc "c" (handle: rawptr, index: c.int, data: rawptr, lengt
 		source := ([^]u8)(data)
 		for i in 0 ..< int(length) do bytes[i] = source[i]
 	}
-	if engine.embed_bind_blob(stmt.embed, int(index), bytes).kind != .None do return MIRAIDB_ERROR
+	if !engine.error_drop(engine.embed_bind_blob(stmt.embed, int(index), bytes)) do return MIRAIDB_ERROR
 	return MIRAIDB_OK
 }
 
@@ -367,6 +370,7 @@ miraidb_step :: proc "c" (handle: rawptr) -> c.int {
 	stmt := capi_stmt(handle)
 	if stmt == nil do return MIRAIDB_MISUSE
 	has_row, err := engine.embed_step(stmt.embed)
+	defer engine.error_free(&err)
 	if err.kind != .None do return MIRAIDB_ERROR
 	return has_row ? MIRAIDB_ROW : MIRAIDB_DONE
 }
@@ -614,6 +618,7 @@ miraidb_create_function :: proc "c" (
 		capi_function_call,
 		rawptr(entry),
 	)
+	defer engine.error_free(&err)
 	if err.kind != .None {
 		free(entry)
 		return MIRAIDB_ERROR
@@ -668,6 +673,7 @@ miraidb_create_collation :: proc "c" (
 	entry.user = user
 	entry.name = strings.clone(string(name))
 	err := engine.store_register_collation(conn.embed.store, string(name), capi_collation_call, rawptr(entry))
+	defer engine.error_free(&err)
 	if err.kind != .None {
 		free(entry)
 		return MIRAIDB_ERROR
@@ -739,6 +745,7 @@ miraidb_authenticate :: proc "c" (handle: rawptr, token: cstring) -> c.int {
 	if conn == nil do return MIRAIDB_MISUSE
 	if token == nil do return MIRAIDB_ERROR
 	err := engine.embed_authenticate(conn.embed, string(token))
+	defer engine.error_free(&err)
 	if err.kind == .Permission_Denied do return MIRAIDB_DENIED
 	if err.kind != .None do return MIRAIDB_ERROR
 	return MIRAIDB_OK
@@ -757,6 +764,7 @@ miraidb_issue_token :: proc "c" (handle: rawptr, identity: rawptr, ttl_us: c.lon
 	bytes := cast(^[32]u8)identity
 	token, err := engine.embed_issue_token(conn.embed, engine.Identity(bytes^), i64(ttl_us))
 	defer delete(token)
+	defer engine.error_free(&err)
 	if err.kind != .None do return MIRAIDB_ERROR
 	needed := u64(len(token)) + 1
 	if out_len < needed do return -1

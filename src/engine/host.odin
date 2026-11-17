@@ -238,7 +238,7 @@ host_init :: proc(store: ^Store) -> ^Host {
 	host.module_memory_limit = MODULE_DEFAULT_MEMORY
 	if meta_err := host_ensure_meta(host); meta_err.kind != .None {
 		// The host can still serve, but the catalog is missing; keep the reason.
-		host.store.last_error = meta_err
+		store_note_error(host.store, meta_err)
 	}
 	// Extensions are processes: registering them opens nothing yet, so a database
 	// with an extension that is down still starts.
@@ -2323,7 +2323,7 @@ host_drop_schedule_row :: proc(host: ^Host, id: i64) {
 		return
 	}
 	if commit_err := tx_commit(tx); commit_err.kind != .None {
-		host.store.last_error = commit_err
+		store_note_error(host.store, commit_err)
 	}
 }
 
@@ -2341,7 +2341,7 @@ host_reschedule_or_drop :: proc(host: ^Host, id: i64, at_us, interval_us, now_us
 		return
 	}
 	if commit_err := tx_commit(tx); commit_err.kind != .None {
-		host.store.last_error = commit_err
+		store_note_error(host.store, commit_err)
 	}
 }
 

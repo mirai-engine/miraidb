@@ -412,14 +412,14 @@ store_open :: proc(path: string, options: Store_Options) -> (^Store, Error) {
 	// Databases ATTACH recorded come back with the principal; a path that no
 	// longer opens is reported, never fatal.
 	if attach_err := store_attach_restore(store); attach_err.kind != .None {
-		store.last_error = attach_err
+		store_note_error(store, attach_err)
 	}
 	if settings.compact_after_bytes > 0 {
 		// A database opened with the option always gets the worker; if the
 		// thread cannot start, compaction stays available through the explicit
 		// call and the failure is reported, not hidden.
 		if !store_start_background_compaction(store, settings.compact_after_bytes) {
-			store.last_error = errf(.Internal, "cannot start the background compactor")
+			store_note_error(store, errf(.Internal, "cannot start the background compactor"))
 		}
 	}
 	return store, ERROR_NONE
@@ -436,7 +436,7 @@ store_close :: proc(store: ^Store) {
 	// page files current; a crash leaves them stale, which the next open rebuilds.
 	if !store.read_only {
 		if flush_err := store_flush_pages(store, store.commit_seq); flush_err.kind != .None {
-			store.last_error = flush_err
+			store_note_error(store, flush_err)
 		}
 	}
 	// A table a read transaction still holds outlives the store: the reference
@@ -478,7 +478,17 @@ store_close :: proc(store: ^Store) {
 	stats_destroy(store)
 	log_close(&store.log)
 	db_lock_release(&store.lock)
+	error_free(&store.last_error)
 	free(store)
+}
+
+// store_note_error records a failure the store reports instead of returning: a
+// cache that could not be written, a database ATTACH could not restore. The store
+// owns `err` from here on, and the message it replaces is freed.
+store_note_error :: proc(store: ^Store, err: Error) {
+	if store == nil do return
+	error_free(&store.last_error)
+	store.last_error = err
 }
 
 // Mirror_Kept is one catalog entry as the imported file spelled it. `signature`
@@ -756,7 +766,7 @@ store_background_compact_step :: proc(store: ^Store) -> bool {
 	if before < store.compact_bytes do return false
 	if store.compact_floor > 0 && before < store.compact_floor * 2 do return false
 	if compact_err := store_compact(store); compact_err.kind != .None {
-		store.last_error = compact_err
+		store_note_error(store, compact_err)
 		return false
 	}
 	store.compact_floor = store_log_bytes(store)
@@ -1186,7 +1196,7 @@ store_flush_pages :: proc(store: ^Store, seq: u64) -> Error {
 	// read the schemas instead of replaying to find them. It is a cache: a failed
 	// write costs a replay, never the commit.
 	if catalog_err := catalog_write(store, seq); catalog_err.kind != .None {
-		store.last_error = catalog_err
+		store_note_error(store, catalog_err)
 	}
 	return ERROR_NONE
 }
@@ -1822,7 +1832,7 @@ store_commit_prepared :: proc(store: ^Store, prepared: []^Prepared_Tx) -> (int, 
 		// A page-flush failure is not a commit failure: the log holds the change
 		// and the pages are a cache, so it is recorded and the commit stands.
 		if page_err := store_flush_pages(store, seq); page_err.kind != .None {
-			store.last_error = page_err
+			store_note_error(store, page_err)
 		}
 	}
 	notify := store.on_commit

@@ -21,6 +21,11 @@ package engine
 //
 // A connection owns its store. Opening a .sqlite/.db file imports it into an
 // in-memory store, so statements answer against the file without converting it.
+//
+// Every Error an embed_* procedure returns is the caller's, like every other
+// Error the engine returns: free it with error_free or pass it on. The
+// connection keeps its own copy for embed_error, so a caller that frees the
+// returned error can still ask the connection what went wrong.
 
 import "core:strings"
 import "core:time"
@@ -101,6 +106,7 @@ embed_close :: proc(conn: ^Embed_Conn) {
 	if conn.owns_store && conn.store != nil {
 		store_close(conn.store)
 	}
+	error_free(&conn.last_error)
 	free(conn)
 }
 
@@ -110,11 +116,16 @@ embed_error :: proc(conn: ^Embed_Conn) -> string {
 	return conn.last_error.message
 }
 
+// embed_fail records a copy of `err` as the connection's last error and returns
+// `err` itself, which stays the caller's.
 @(private)
 embed_fail :: proc(conn: ^Embed_Conn, err: Error) -> Error {
 	if conn != nil {
 		delete(conn.last_error.message)
-		conn.last_error = err
+		conn.last_error = Error {
+			kind    = err.kind,
+			message = strings.clone(err.message),
+		}
 	}
 	return err
 }
