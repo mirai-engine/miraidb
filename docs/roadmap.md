@@ -55,14 +55,14 @@ that way.
 | # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
 | 18 | **D23 — allocation failure** | A failed allocation is a crash, not `.Out_Of_Memory`; start with an allocator that fails the nth call. | M | — |
-| 19 | **D34 — Linux suite and heap sanitizer** | The threaded suite crashes on Linux; then CI on Linux and macOS with `-sanitize:address`, the suite sanitized as a gate (the CLI already is, on Windows), and scripts that find a binary without `.exe`. | M | — |
+| 19 | **D34 — Linux suite and heap sanitizer** | The threaded suite is green on Linux and every script finds its binary; left is CI on Linux and macOS with `-sanitize:address` and the suite sanitized as a gate (the CLI already is, on Windows). | S | — |
 | 20 | **D8 — fault injection beyond the log** | Snapshot, rotation, the mirror, a kill during a page flush. | S | — |
 | 21 | **D3 — version retention** | Automatic retention tied to the oldest reader; `AS OF` on a join. | M | — |
 | 22 | **D5 — the rest of the page store** | Leaf merge, versions on paged tables, a read without the shared lock for its whole life; with D18, a reader that trusts the pages. | L | — |
 | 23 | **D11 — triggers and policies in a transaction** | Order them against the rows of the same transaction. | S | — |
 | 24 | **D2 — spatial tree** | Node pages and a descent instead of a scan over box columns. | M | — |
 | 25 | **D10 — precision and time** | Decimal scale, `TIMESTAMPTZ`, streaming blobs. | M | — |
-| 26 | **D35 — diagnostics** | Map nodes freed through the wrong allocator, error ownership across the API, a file open per commit for the log index. | M | 19 |
+| 26 | **D35 — diagnostics** | Error ownership across the API, a file open per commit for the log index. | M | 19 |
 | 27 | **D15 — network hardening** | TLS, HTTP/2, backpressure, per-route timeouts, a load test. | M | — |
 | 28 | **D14 — replication** | `GET /log?since=<seq>` and a follower applying through replay. | XL | 27 |
 | 29 | **Auth review** | Rate limits, token lifetime, adversarial tests over subscriptions and budgets; tokens travel in clear until TLS; **grants are opt-in**, so a database with no grant rows accepts every statement from every client. | S | — |
@@ -80,8 +80,8 @@ with peer-to-peer sync; its networked phases build on items 27 and 28.
    parity gate (item 5) landing alongside so the gain cannot slip back.
 3. **D36**: let the planner read partial and expression indexes, which are
    enforced today but never read.
-4. **D23 and D34**: the two remaining ways the process can die instead of
-   answering.
+4. **D23**: the remaining way the process can die instead of answering; **D34**
+   still owes the sanitized suite in CI.
 5. **S3 to S6**, then **R3/R4**: the rest of the visible surface and the smaller
    speed items.
 6. **S7**, **D4/D24**, and the depth items of track C.

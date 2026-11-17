@@ -54,7 +54,7 @@ Rules for this file:
 | D18 | a read-only open replays | a reader that trusts the pages of a quiescent writer | M |
 | D23 | depth, row quota and budget are bounded | an allocation failure is a crash, not an error | M |
 | D24 | an index the engine cannot express is dropped on import | a counted skip, and a mirror fuzz pass | S |
-| D34 | the Linux suite crashes under the threaded runner; the sanitizer covers the Windows CLI, not the suite | find the corruption, run the suite sanitized on every platform | M |
+| D34 | the threaded suite is green on Linux and Windows; the sanitizer covers the Windows CLI, not the suite | run the suite sanitized on every platform, in CI | S |
 | D36 | a query never reads a partial or expression index | match a query's predicate to the index | M |
 | D35 | diagnostics: test-side leak lines, map nodes freed through the wrong allocator, error ownership | one sweep | M |
 
@@ -444,23 +444,33 @@ pass of its own (random DDL and DML, integrity after each chunk).
 
 ## D34 — The Linux suite and the heap sanitizer
 
-**Now.** Every package passes `odin check` for linux_amd64, linux_arm64 and
-darwin_arm64, and the CLI runs on Linux. `odin test src/tests` under the default
-two-thread runner dies in `test_aggregates_and_order` with a map panic and a
-segmentation fault, while the test alone passes: memory corruption, most likely
-a map built in a transaction arena whose nodes are freed through another
-allocator (`Tx_Snapshot`'s maps). On Windows the heap half works after all:
-Odin's allocator calls `HeapAlloc`, which AddressSanitizer intercepts only with
+**Now.** `odin test src/tests` is green on Linux under the default two-thread
+runner (312 tests, about 14 s on x86_64) as on Windows. The crash was not the
+threads: the in-process lock registry, which only exists on POSIX, was made
+with the first test's tracking allocator, and the next test to insert after
+that allocator was torn down corrupted the heap. The registry and the
+live-handle set now grow on the process heap, the registry owns its keys and
+holds its mutex across the whole acquire, and a reader of the same process
+stops a log rewrite as a second process's reader does. Two test-side defects
+showed up behind it: a reducer result written as a slice literal (a dead frame
+by the time the host read it) and a listener thread joined while blocked in
+`accept`, which a close does not wake on Linux. Every script finds its binary
+through `scripts/binpath.py`, so none hardcodes `.exe`.
+
+On Windows the heap half of the sanitizer works: Odin's allocator calls
+`HeapAlloc`, which AddressSanitizer intercepts with
 `ASAN_OPTIONS=windows_hook_rtl_allocators=true`. With it, the CLI runs under the
 `heap sanitizer` gate (`scripts/asan_smoke.py`) and the suite runs clean except
 `test_expression_depth_is_bounded`, whose 100 levels overflow the larger frames
 a sanitized build uses.
 
-**Done when.** The threaded suite is green on Linux, a CI job runs it on Linux and
-macOS with `-sanitize:address`, the Windows suite runs under the sanitizer as a
-gate (it is the CLI only today), and the scripts that hardcode a
-`.exe` (`ci.py`, `page_rss.py`, `plan_check.py`, `bench.py`, `lock_smoke.py`,
-`broker_smoke.py`) find the binary on every platform.
+**Left.** The suite under `-sanitize:address` on Linux and macOS: a musl
+toolchain ships no sanitizer runtime, so it needs a glibc or macOS host, and the
+project has no CI job yet to run it there. The Windows suite under the
+sanitizer as a gate (it is the CLI only today).
+
+**Done when.** A CI job runs the threaded suite on Linux and macOS with
+`-sanitize:address`, and the Windows suite runs under the sanitizer as a gate.
 
 ## D36 — The planner and partial or expression indexes
 
@@ -484,8 +494,10 @@ a flat count for writes; `scripts/leaks.py` is a CI gate.
 1. The lines the suite still prints are test-side: a test that expects an error
    drops it. Quieting them is worth doing only if the noise starts hiding a real
    report.
-2. A map node freed through the wrong allocator (see D34): harmless while the
-   arena outlives the map, a crash the day it does not.
+2. ~~A map node freed through the wrong allocator.~~ Closed with D34's crash:
+   it was the process-wide maps (the lock registry and the live-handle set)
+   growing through whatever allocator their first caller had; they grow on the
+   process heap now.
 3. Error ownership: a host that receives an `Error` and drops it leaks the
    message. Every entry point that returns one should say the message is the
    caller's, in one sweep.
