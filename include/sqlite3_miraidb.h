@@ -2,9 +2,9 @@
 ** sqlite3_miraidb.h -- the subset of SQLite's C API that sqlite3_miraidb.dll
 ** implements, declared so a C program can compile against it.
 **
-** This is not sqlite3.h. It declares the 116 functions the facade exports and the
+** This is not sqlite3.h. It declares the 118 functions the facade exports and the
 ** result codes they answer; a program that uses anything else will not link, and
-** that is the honest state of the facade (116 of SQLite's 315 symbols). Look at
+** that is the honest state of the facade (118 of SQLite's 315 symbols). Look at
 ** docs/sqlite.md for what each one does here and where it differs.
 **
 ** Build the library with:
@@ -276,6 +276,24 @@ void *sqlite3_update_hook(sqlite3 *db,
                           void (*callback)(void *, int, const char *,
                                            const char *, sqlite3_int64),
                           void *arg);
+
+/* --- Trace -----------------------------------------------------------------
+** STMT when a statement starts running (X is its text), ROW for each row,
+** PROFILE when it ends (X points at the nanoseconds it ran), CLOSE when the
+** connection closes (P is the connection). */
+
+#define SQLITE_TRACE_STMT     0x01
+#define SQLITE_TRACE_PROFILE  0x02
+#define SQLITE_TRACE_ROW      0x04
+#define SQLITE_TRACE_CLOSE    0x08
+
+int sqlite3_trace_v2(sqlite3 *db, unsigned int mask,
+                     int (*callback)(unsigned int, void *, void *, void *),
+                     void *ctx);
+
+/* A placeholder for name/nArg that fails with "unable to use function ... in
+** the requested context", unless this connection registered one. */
+int sqlite3_overload_function(sqlite3 *db, const char *name, int nArg);
 
 /* --- Incremental BLOB I/O ------------------------------------------------
 ** The row is named by a single-column primary key, which plays the part of

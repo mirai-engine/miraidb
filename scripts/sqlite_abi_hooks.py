@@ -126,3 +126,72 @@ def observe(lib, db, seen: dict) -> None:
     calls[0] = 0
     lib.sqlite3_exec(db, b"SELECT count(*) FROM p WHERE x % 3 = 0", None, None, None)
     seen["progress: removed"] = calls[0]
+
+
+TRACE = ctypes.CFUNCTYPE(c_int, ctypes.c_uint, c_void_p, c_void_p, c_void_p)
+
+
+def observe_trace(lib, db, seen: dict) -> None:
+    """The events sqlite3_trace_v2 reports, and sqlite3_overload_function."""
+    lib.sqlite3_trace_v2.argtypes = [c_void_p, ctypes.c_uint, c_void_p, c_void_p]
+    lib.sqlite3_trace_v2.restype = c_int
+    lib.sqlite3_overload_function.argtypes = [c_void_p, c_char_p, c_int]
+    lib.sqlite3_overload_function.restype = c_int
+    events: list = []
+    current = [None]
+
+    def on_trace(event, ctx, p, x):
+        if event == 1:
+            events.append(("stmt", p == current[0], ctypes.string_at(x)))
+        elif event == 2:
+            events.append(("profile", p == current[0], ctypes.cast(x, ctypes.POINTER(c_longlong))[0] >= 0))
+        elif event == 4:
+            events.append(("row", p == current[0]))
+        elif event == 8:
+            events.append(("close", p == current[0]))
+        return 0
+
+    callback = TRACE(on_trace)
+    lib._trace_callback = callback
+    assert lib.sqlite3_trace_v2(db, 0x0F, ctypes.cast(callback, c_void_p), None) == 0
+    stmt = c_void_p()
+    lib.sqlite3_exec(db, b"CREATE TABLE tr (x INTEGER); INSERT INTO tr VALUES (1), (2)", None, None, None)
+    events.clear()
+    lib.sqlite3_prepare_v2(db, b"SELECT x FROM tr ORDER BY x", -1, ctypes.byref(stmt), None)
+    current[0] = stmt.value
+    while lib.sqlite3_step(stmt) == 100:
+        pass
+    lib.sqlite3_reset(stmt)
+    lib.sqlite3_step(stmt)
+    lib.sqlite3_reset(stmt)
+    lib.sqlite3_finalize(stmt)
+    seen["trace: a statement stepped, reset, stepped once"] = list(events)
+    events.clear()
+    current[0] = None
+    lib.sqlite3_exec(db, b"INSERT INTO tr VALUES (3)", None, None, None)
+    seen["trace: exec"] = [event[0] if event[0] != "stmt" else (event[0], event[2]) for event in events]
+    lib.sqlite3_trace_v2(db, 0, None, None)
+    events.clear()
+    lib.sqlite3_exec(db, b"SELECT 1", None, None, None)
+    seen["trace: off"] = list(events)
+
+    other = c_void_p()
+    lib.sqlite3_open(b":memory:", ctypes.byref(other))
+    lib.sqlite3_trace_v2(other, 0x08, ctypes.cast(callback, c_void_p), None)
+    current[0] = other.value
+    events.clear()
+    lib.sqlite3_close(other)
+    seen["trace: close"] = list(events)
+
+    seen["overload a missing function"] = lib.sqlite3_overload_function(db, b"ovl", 1)
+    reader = c_void_p()
+    code = lib.sqlite3_prepare_v2(db, b"SELECT ovl(1)", -1, ctypes.byref(reader), None)
+    if code == 0:
+        code = lib.sqlite3_step(reader)
+    seen["calling it"] = (code, lib.sqlite3_errmsg(db))
+    lib.sqlite3_finalize(reader)
+    seen["overload a builtin"] = lib.sqlite3_overload_function(db, b"upper", 1)
+    lib.sqlite3_prepare_v2(db, b"SELECT upper('a')", -1, ctypes.byref(reader), None)
+    lib.sqlite3_step(reader)
+    seen["the builtin is hidden by the placeholder"] = lib.sqlite3_column_text(reader, 0)
+    lib.sqlite3_finalize(reader)

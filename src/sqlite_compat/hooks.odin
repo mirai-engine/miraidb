@@ -10,6 +10,7 @@ package sqlite_compat
 import "base:runtime"
 import "core:c"
 import "core:strings"
+import "core:time"
 
 import engine "../engine"
 
@@ -121,4 +122,62 @@ sqlite3_progress_handler :: proc "c" (handle: rawptr, every: c.int, callback: Pr
 		return
 	}
 	engine.store_set_progress(db.conn.store, int(every), hook_progress, rawptr(db))
+}
+
+// --- Trace -------------------------------------------------------------------
+
+SQLITE_TRACE_STMT :: c.uint(0x01)
+SQLITE_TRACE_PROFILE :: c.uint(0x02)
+SQLITE_TRACE_ROW :: c.uint(0x04)
+SQLITE_TRACE_CLOSE :: c.uint(0x08)
+
+Trace_Callback :: #type proc "c" (event: c.uint, ctx: rawptr, p: rawptr, x: rawptr) -> c.int
+
+// sqlite3_trace_v2 reports the events `mask` names: STMT when a statement
+// starts running (with its text), ROW for each row, PROFILE when it ends (with
+// the nanoseconds it ran) and CLOSE when the connection closes. A zero mask or
+// a NULL callback turns it off.
+@(export)
+sqlite3_trace_v2 :: proc "c" (handle: rawptr, mask: c.uint, callback: Trace_Callback, ctx: rawptr) -> c.int {
+	context = runtime.default_context()
+	db := db_of(handle)
+	if db == nil do return SQLITE_MISUSE
+	if callback == nil do db.trace_mask = 0
+	else do db.trace_mask = mask
+	db.trace_hook = callback
+	db.trace_arg = ctx
+	return SQLITE_OK
+}
+
+@(private)
+trace_start :: proc(stmt: ^Statement) {
+	db := stmt.db
+	if db.trace_mask == 0 || stmt.traced do return
+	stmt.traced = true
+	stmt.started = time.now()._nsec
+	if db.trace_mask & SQLITE_TRACE_STMT != 0 {
+		db.trace_hook(SQLITE_TRACE_STMT, db.trace_arg, rawptr(stmt), rawptr(stmt.sql_text))
+	}
+}
+
+@(private)
+trace_row :: proc(stmt: ^Statement) {
+	db := stmt.db
+	if db.trace_mask & SQLITE_TRACE_ROW != 0 do db.trace_hook(SQLITE_TRACE_ROW, db.trace_arg, rawptr(stmt), nil)
+}
+
+@(private)
+trace_end :: proc(stmt: ^Statement) {
+	db := stmt.db
+	if !stmt.traced do return
+	stmt.traced = false
+	if db.trace_mask & SQLITE_TRACE_PROFILE != 0 {
+		elapsed := i64(time.now()._nsec - stmt.started)
+		db.trace_hook(SQLITE_TRACE_PROFILE, db.trace_arg, rawptr(stmt), rawptr(&elapsed))
+	}
+}
+
+@(private)
+trace_close :: proc(db: ^Database) {
+	if db.trace_mask & SQLITE_TRACE_CLOSE != 0 do db.trace_hook(SQLITE_TRACE_CLOSE, db.trace_arg, rawptr(db), nil)
 }

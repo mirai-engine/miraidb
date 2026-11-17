@@ -804,3 +804,33 @@ sqlite3_result_error_toobig :: proc "c" (handle: rawptr) {
 sqlite3_result_subtype :: proc "c" (handle: rawptr, subtype: c.uint) {
 	context = runtime.default_context()
 }
+
+// sqlite3_overload_function makes sure a call to `name` with `arity`
+// arguments prepares even when nothing is registered for it yet (a virtual
+// table that overloads it is the use): when this connection has no function of
+// that name and arity, it registers one that fails with SQLite's message. Like
+// SQLite's, the placeholder hides a builtin of the same name.
+@(export)
+sqlite3_overload_function :: proc "c" (handle: rawptr, name: cstring, arity: c.int) -> c.int {
+	context = runtime.default_context()
+	db := db_of(handle)
+	if db == nil || name == nil || arity < -1 do return SQLITE_MISUSE
+	for fn in db.functions {
+		if fn.arity == int(arity) && strings.equal_fold(fn.name, string(name)) do return SQLITE_OK
+	}
+	fn := new(Function)
+	fn^ = Function{db = db, name = strings.clone(string(name)), arity = int(arity)}
+	if err := engine.store_register_function(db.conn.store, fn.name, fn.arity, overloaded_placeholder, fn, true); err.kind != .None {
+		code := fail(db, err)
+		function_destroy(fn)
+		return code
+	}
+	append(&db.functions, fn)
+	return SQLITE_OK
+}
+
+@(private)
+overloaded_placeholder :: proc(args: []engine.Value, user: rawptr) -> (engine.Value, engine.Error) {
+	fn := (^Function)(user)
+	return {}, engine.errf(.Invalid_Argument, "unable to use function %s in the requested context", fn.name)
+}

@@ -325,6 +325,7 @@ def observe(lib) -> dict[str, object]:
 
     sqlite_abi_functions.observe(lib, db, seen)
     sqlite_abi_hooks.observe(lib, db, seen)
+    sqlite_abi_hooks.observe_trace(lib, db, seen)
 
     seen["errstr"] = [lib.sqlite3_errstr(code) for code in (*range(0, 30), 100, 101, 516, 19 | 8 << 8, 9999)]
     assert lib.sqlite3_close(db) == 0

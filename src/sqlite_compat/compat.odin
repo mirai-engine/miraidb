@@ -84,6 +84,10 @@ Database :: struct {
 	update_arg:      rawptr,
 	progress_hook:   Progress_Callback,
 	progress_arg:    rawptr,
+	// trace_mask is which events sqlite3_trace_v2 asked for.
+	trace_mask:      c.uint,
+	trace_hook:      Trace_Callback,
+	trace_arg:       rawptr,
 }
 
 Statement :: struct {
@@ -108,6 +112,10 @@ Statement :: struct {
 	// finalize; described says the description ran.
 	origins:   []Column_Origin_C,
 	described: bool,
+	// traced is set when the trace saw the statement start and has not yet
+	// seen it end; started is when, in nanoseconds.
+	traced:  bool,
+	started: i64,
 }
 
 // Column_Origin_C is one column's origin as the C strings the metadata calls
@@ -456,6 +464,7 @@ sqlite3_close :: proc "c" (handle: rawptr) -> c.int {
 	delete(db.statements)
 	delete(keys)
 	engine.handle_forget(rawptr(db))
+	trace_close(db)
 	functions_close(db)
 	engine.embed_close(db.conn)
 	delete(db.last_error)
@@ -718,6 +727,7 @@ sqlite3_reset :: proc "c" (handle: rawptr) -> c.int {
 	stmt := stmt_of(handle)
 	if stmt == nil do return SQLITE_MISUSE
 	stmt_clear_text_cache(stmt)
+	trace_end(stmt)
 	stmt.finished = false
 	engine.embed_reset(stmt.stmt)
 	return SQLITE_OK
@@ -819,12 +829,19 @@ sqlite3_step :: proc "c" (handle: rawptr) -> c.int {
 		return SQLITE_MISUSE
 	}
 	stmt_clear_text_cache(stmt)
+	trace_start(stmt)
 	has_row, err := engine.embed_step(stmt.stmt)
 	if err.kind != .None {
-		return fail(stmt.db, err)
+		code := fail(stmt.db, err)
+		trace_end(stmt)
+		return code
 	}
-	if has_row do return SQLITE_ROW
+	if has_row {
+		trace_row(stmt)
+		return SQLITE_ROW
+	}
 	stmt.finished = true
+	trace_end(stmt)
 	return SQLITE_DONE
 }
 
