@@ -445,6 +445,144 @@ parse_copy :: proc(p: ^Parser) -> Statement {
 	return stmt
 }
 
+// p_next_is reports whether the token after the current one is `keyword`. The
+// parser keeps one token, and the lexer is a value, so two tokens of lookahead
+// cost nothing: `GROUPING` may start `GROUPING SETS` or a function call.
+@(private)
+p_next_is :: proc(p: ^Parser, keyword: string) -> bool {
+	saved_lexer := p.lexer
+	saved := p.current
+	p_advance(p)
+	matched := p_is_keyword(p, keyword)
+	p.lexer = saved_lexer
+	p.current = saved
+	return matched
+}
+
+// group_expression_add appends an expression to the GROUP BY list unless an
+// equal one is already there, and answers its position. The sets index into that
+// list, so the same column in two sets has to be one entry: two entries would
+// make the projection look up the wrong one.
+@(private)
+group_expression_add :: proc(p: ^Parser, groups: ^[dynamic]^Expr, expr: ^Expr) -> int {
+	if column, is_column := expr^.(Column_Expr); is_column {
+		for other, index in groups^ {
+			other_column, other_is_column := other^.(Column_Expr)
+			if !other_is_column do continue
+			if !strings.equal_fold(other_column.name, column.name) do continue
+			if !strings.equal_fold(other_column.table, column.table) do continue
+			return index
+		}
+	}
+	append(groups, expr)
+	return len(groups) - 1
+}
+
+// parse_group_by reads the GROUP BY list. A plain list is one set of every
+// expression; `ROLLUP`, `CUBE` and `GROUPING SETS` add their own sets, and
+// anything beside them multiplies them: `GROUP BY a, ROLLUP(b, c)` groups by
+// (a, b, c), (a, b) and (a).
+@(private)
+parse_group_by :: proc(p: ^Parser, select: ^Select_Stmt) {
+	groups := make([dynamic]^Expr, 0, 2, p.alloc)
+	// current is the list of sets built so far; it starts as the one empty set.
+	current := make([dynamic][dynamic]int, 0, 8, p.alloc)
+	append(&current, make([dynamic]int, 0, 4, p.alloc))
+	grouping := false
+	for {
+		if p_is_keyword(p, "rollup") || p_is_keyword(p, "cube") {
+			grouping = true
+			cube := p_is_keyword(p, "cube")
+			p_advance(p)
+			p_expect_punct(p, "(")
+			positions := make([dynamic]int, 0, 2, p.alloc)
+			for {
+				append(&positions, group_expression_add(p, &groups, parse_expression(p)))
+				if !p_match_punct(p, ",") do break
+			}
+			p_expect_punct(p, ")")
+			produced := make([dynamic][dynamic]int, 0, len(positions) + 1, p.alloc)
+			if cube {
+				// Every subset, smallest first, which is the order PostgreSQL
+				// answers them: () first, then each single column, then the pairs.
+				for mask in 0 ..< 1 << uint(len(positions)) {
+					set := make([dynamic]int, 0, len(positions), p.alloc)
+					for position, bit in positions {
+						if mask & (1 << uint(bit)) != 0 do append(&set, position)
+					}
+					append(&produced, set)
+				}
+			} else {
+				// The prefixes, from every expression down to none.
+				for size := len(positions); size >= 0; size -= 1 {
+					set := make([dynamic]int, 0, size, p.alloc)
+					append(&set, ..positions[:size])
+					append(&produced, set)
+				}
+			}
+			current = group_sets_multiply(current, produced, p.alloc)
+			if !p_match_punct(p, ",") do break
+			continue
+		}
+		if p_is_keyword(p, "grouping") && p_next_is(p, "sets") {
+			grouping = true
+			p_advance(p)
+			p_advance(p)
+			p_expect_punct(p, "(")
+			produced := make([dynamic][dynamic]int, 0, 4, p.alloc)
+			for {
+				set := make([dynamic]int, 0, 2, p.alloc)
+				if p_match_punct(p, "(") {
+					// `(a, b)` is one set; `()` is the empty one.
+					if !p_match_punct(p, ")") {
+						for {
+							append(&set, group_expression_add(p, &groups, parse_expression(p)))
+							if !p_match_punct(p, ",") do break
+						}
+						p_expect_punct(p, ")")
+					}
+				} else {
+					append(&set, group_expression_add(p, &groups, parse_expression(p)))
+				}
+				append(&produced, set)
+				if !p_match_punct(p, ",") do break
+			}
+			p_expect_punct(p, ")")
+			current = group_sets_multiply(current, produced, p.alloc)
+			if !p_match_punct(p, ",") do break
+			continue
+		}
+		index := group_expression_add(p, &groups, parse_expression(p))
+		for k in 0 ..< len(current) do append(&current[k], index)
+		if !p_match_punct(p, ",") do break
+	}
+	select.group_by = groups[:]
+	if !grouping do return
+	sets := make([][]int, len(current), p.alloc)
+	for set, k in current do sets[k] = set[:]
+	select.group_sets = sets
+}
+
+// group_sets_multiply crosses the sets gathered so far with the ones a construct
+// produced.
+@(private)
+group_sets_multiply :: proc(
+	current: [dynamic][dynamic]int,
+	produced: [dynamic][dynamic]int,
+	alloc: mem.Allocator,
+) -> [dynamic][dynamic]int {
+	out := make([dynamic][dynamic]int, 0, len(current) * len(produced), alloc)
+	for left in current {
+		for right in produced {
+			merged := make([dynamic]int, 0, len(left) + len(right), alloc)
+			append(&merged, ..left[:])
+			append(&merged, ..right[:])
+			append(&out, merged)
+		}
+	}
+	return out
+}
+
 @(private)
 parse_alter_table :: proc(p: ^Parser) -> Statement {
 	p_expect_keyword(p, "alter")
@@ -624,12 +762,7 @@ parse_select :: proc(p: ^Parser) -> Statement {
 	}
 	if p_match_keyword(p, "group") {
 		p_expect_keyword(p, "by")
-		groups := make([dynamic]^Expr, 0, 2, p.alloc)
-		for {
-			append(&groups, parse_expression(p))
-			if !p_match_punct(p, ",") do break
-		}
-		select.group_by = groups[:]
+		parse_group_by(p, &select)
 	}
 	if p_match_keyword(p, "having") {
 		select.having = parse_expression(p)

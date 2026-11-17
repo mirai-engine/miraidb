@@ -159,3 +159,98 @@ test_copy_refuses_a_bad_row :: proc(t: ^testing.T) {
 	defer db.error_free(&missing_column)
 	testing.expect_value(t, missing_column.kind, db.Error_Kind.Column_Not_Found)
 }
+
+// GROUPING SETS, ROLLUP and CUBE answer one row per group of every set. Before
+// this, `GROUP BY ROLLUP(a, b)` parsed and then failed at execution with "GROUP BY
+// expression failed", which is worse than refusing it.
+@(test)
+test_grouping_sets :: proc(t: ^testing.T) {
+	store := fresh_db(t, "grouping")
+	if store == nil do return
+	defer cleanup_db(store, "grouping")
+
+	run(t, store, "CREATE TABLE sales (region TEXT, product TEXT, amount INTEGER)")
+	run(
+		t,
+		store,
+		"INSERT INTO sales VALUES ('north', 'a', 10), ('north', 'b', 20), ('south', 'a', 5)",
+	)
+
+	// ROLLUP: the detail rows, then one per region, then the total.
+	rows := run(
+		t,
+		store,
+		"SELECT region, product, sum(amount), grouping(region), grouping(product) FROM sales GROUP BY ROLLUP(region, product)",
+	)
+	testing.expect_value(t, len(rows.rows), 6)
+	testing.expect_value(t, rows.rows[0][0].s, "north")
+	testing.expect_value(t, rows.rows[0][1].s, "a")
+	testing.expect_value(t, rows.rows[0][2].i, i64(10))
+	testing.expect_value(t, rows.rows[0][3].i, i64(0))
+	testing.expect_value(t, rows.rows[3][0].s, "north")
+	testing.expect_value(t, rows.rows[3][1].kind, db.Value_Kind.Null)
+	testing.expect_value(t, rows.rows[3][2].i, i64(30))
+	testing.expect_value(t, rows.rows[3][4].i, i64(1))
+	testing.expect_value(t, rows.rows[5][0].kind, db.Value_Kind.Null)
+	testing.expect_value(t, rows.rows[5][2].i, i64(35))
+	// Both columns rolled up: the mask has one bit per argument.
+	testing.expect_value(t, rows.rows[5][3].i, i64(1))
+	testing.expect_value(t, rows.rows[5][4].i, i64(1))
+	db.sql_result_destroy(&rows)
+
+	// CUBE: every subset, the total first.
+	cube := run(
+		t,
+		store,
+		"SELECT region, product, sum(amount) FROM sales GROUP BY CUBE(region, product)",
+	)
+	testing.expect_value(t, len(cube.rows), 8)
+	testing.expect_value(t, cube.rows[0][0].kind, db.Value_Kind.Null)
+	testing.expect_value(t, cube.rows[0][1].kind, db.Value_Kind.Null)
+	testing.expect_value(t, cube.rows[0][2].i, i64(35))
+	db.sql_result_destroy(&cube)
+
+	// GROUPING SETS names the sets one by one, including the empty one.
+	sets := run(
+		t,
+		store,
+		"SELECT region, product, sum(amount), grouping(region, product) FROM sales GROUP BY GROUPING SETS ((region, product), (region), ())",
+	)
+	testing.expect_value(t, len(sets.rows), 6)
+	testing.expect_value(t, sets.rows[0][0].s, "north")
+	testing.expect_value(t, sets.rows[0][3].i, i64(0))
+	testing.expect_value(t, sets.rows[3][1].kind, db.Value_Kind.Null)
+	testing.expect_value(t, sets.rows[3][3].i, i64(1)) // (region) leaves product out: mask 01
+	testing.expect_value(t, sets.rows[5][3].i, i64(3)) // () leaves both out
+	db.sql_result_destroy(&sets)
+
+	// A plain expression beside a construct multiplies the sets.
+	mixed := run(
+		t,
+		store,
+		"SELECT region, product, sum(amount) FROM sales GROUP BY region, ROLLUP(product)",
+	)
+	testing.expect_value(t, len(mixed.rows), 5)
+	db.sql_result_destroy(&mixed)
+
+	// A plain GROUP BY is one set with every expression: unchanged.
+	plain := run(t, store, "SELECT region, sum(amount) FROM sales GROUP BY region ORDER BY region")
+	testing.expect_value(t, len(plain.rows), 2)
+	db.sql_result_destroy(&plain)
+
+	// HAVING reads the rolled-up row, and ORDER BY orders the rows of every set.
+	having := run(
+		t,
+		store,
+		"SELECT region, sum(amount) FROM sales GROUP BY ROLLUP(region) HAVING sum(amount) >= 5 ORDER BY sum(amount)",
+	)
+	testing.expect_value(t, len(having.rows), 3)
+	testing.expect_value(t, having.rows[2][0].kind, db.Value_Kind.Null)
+	testing.expect_value(t, having.rows[2][1].i, i64(35))
+	db.sql_result_destroy(&having)
+
+	// GROUPING() outside a grouping clause says so instead of answering 0.
+	refused := run_error(t, store, "SELECT grouping(region) FROM sales")
+	defer db.error_free(&refused)
+	testing.expect_value(t, refused.kind, db.Error_Kind.Invalid_Argument)
+}

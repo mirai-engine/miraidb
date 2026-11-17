@@ -353,6 +353,12 @@ is `NULL`, and `DISTINCT` keeps one of each.
   is a column of a source still means the column, so aliasing `salary` to `dept`
   does not regroup anything. Without `GROUP BY`, an aggregate query produces
   exactly one row, even when the table is empty.
+- `GROUP BY ROLLUP(a, b)`, `CUBE(a, b)` and `GROUPING SETS ((a, b), (a), ())`
+  answer one row per set: the prefixes of the list for `ROLLUP`, every subset for
+  `CUBE`. A column the set leaves out reads NULL, `GROUPING(a, b)` answers one bit
+  per argument (1 when the set left it out), and a plain expression beside a
+  construct multiplies the sets, so `GROUP BY x, ROLLUP(y)` groups by (x, y) and
+  (x).
 - `LIMIT`/`OFFSET` take constant non-negative integers (SQLite reads `LIMIT -1` as
   "no limit"; this engine refuses it).
 - Text positions are characters, not bytes: `length('héllo')` is 5,

@@ -290,6 +290,10 @@ Select_Stmt :: struct {
 	joins:       []Join_Clause,
 	where_clause: ^Expr,
 	group_by:    []^Expr,
+	// group_sets is what a ROLLUP, CUBE or GROUPING SETS asks for: one entry per
+	// set, each listing the positions in `group_by` it groups by. Empty means the
+	// clause was a plain list, which is one set with every expression.
+	group_sets:  [][]int,
 	having:      ^Expr,
 	order_by:    []Order_Item,
 	limit:       ^Expr,

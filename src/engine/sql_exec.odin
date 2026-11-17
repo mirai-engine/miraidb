@@ -974,6 +974,12 @@ Eval_Ctx :: struct {
 	sources: []Source,
 	group:   [][]Source,
 	grouped: bool,
+	// grouping_missing marks the GROUP BY entries the current grouping set left
+	// out, in the order of `group_by`, and grouping_exprs are those entries. A
+	// projection column that is one of them reads NULL, and GROUPING() answers the
+	// mask; both are empty outside a grouped row.
+	grouping_missing: []bool,
+	grouping_exprs:   []^Expr,
 	params:  []Value,
 	now_us:  i64,
 	// stream is set only while a streaming scan evaluates its final projection:
@@ -3392,56 +3398,70 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 	output := make([dynamic]Output_Row, 0, len(filtered))
 	if aggregate {
 		groups := make([dynamic][dynamic][]Source)
+		// group_set_of says which set each group came from, so its row knows which
+		// columns the set left out.
+		group_set_of := make([dynamic]int)
+		sets := select_group_sets(stmt, tx.alloc)
 		if len(stmt.group_by) == 0 {
 			group := make([dynamic][]Source, 0, len(filtered))
 			for partial in filtered do append(&group, partial)
 			append(&groups, group)
+			append(&group_set_of, -1)
 		} else {
-			buckets := make(map[string][dynamic][]Source)
-			keys := make([dynamic]string)
-			// `SELECT dept AS d ... GROUP BY d` groups by what the projection
-			// names; a name that is a column of a source still means the column.
-			for partial in filtered {
-				ctx.sources = partial
-				w: Byte_Writer
-				bw_init(&w)
-				group_ok := true
-				for expr in group_exprs {
-					value, eval_err := eval_expr(&ctx, expr)
-					if eval_err.kind != .None {
-						bw_destroy(&w)
-						group_ok = false
-						break
+			for set, set_index in sets {
+				buckets := make(map[string][dynamic][]Source)
+				keys := make([dynamic]string)
+				// `SELECT dept AS d ... GROUP BY d` groups by what the projection
+				// names; a name that is a column of a source still means the column.
+				for partial in filtered {
+					ctx.sources = partial
+					w: Byte_Writer
+					bw_init(&w)
+					group_ok := true
+					for expr_index in set {
+						value, eval_err := eval_expr(&ctx, group_exprs[expr_index])
+						if eval_err.kind != .None {
+							bw_destroy(&w)
+							group_ok = false
+							break
+						}
+						value_encode_key(&w, value)
 					}
-					value_encode_key(&w, value)
+					if !group_ok {
+						for key in keys do delete(key)
+						delete(keys)
+						delete(buckets)
+						free_partials(&filtered)
+						return {}, errf(.Invalid_Type, "GROUP BY expression failed")
+					}
+					key := strings.clone(string(bw_bytes(&w)))
+					bw_destroy(&w)
+					bucket, exists := buckets[key]
+					if !exists do append(&keys, key)
+					append(&bucket, partial)
+					buckets[key] = bucket
 				}
-				if !group_ok {
-					for key in keys do delete(key)
-					delete(keys)
-					delete(buckets)
-					free_partials(&filtered)
-					return {}, errf(.Invalid_Type, "GROUP BY expression failed")
+				slice.sort_by(keys[:], proc(a, b: string) -> bool {
+					return strings.compare(a, b) < 0
+				})
+				for key in keys {
+					append(&groups, buckets[key])
+					append(&group_set_of, set_index)
+					delete(key)
 				}
-				key := strings.clone(string(bw_bytes(&w)))
-				bw_destroy(&w)
-				bucket, exists := buckets[key]
-				if !exists do append(&keys, key)
-				append(&bucket, partial)
-				buckets[key] = bucket
+				delete(keys)
+				delete(buckets)
 			}
-			slice.sort_by(keys[:], proc(a, b: string) -> bool {
-				return strings.compare(a, b) < 0
-			})
-			for key in keys {
-				append(&groups, buckets[key])
-				delete(key)
-			}
-			delete(keys)
-			delete(buckets)
 		}
-		for group in groups {
+		for group, group_number in groups {
 			ctx.group = group[:]
 			ctx.grouped = true
+			ctx.grouping_exprs = group_exprs
+			if set_index := group_set_of[group_number]; set_index >= 0 {
+				ctx.grouping_missing = grouping_missing_for(sets[set_index], len(stmt.group_by), tx.alloc)
+			} else {
+				ctx.grouping_missing = nil
+			}
 			if len(group) > 0 {
 				ctx.sources = group[0]
 			} else {
@@ -3517,6 +3537,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			}
 		}
 		delete(groups)
+		delete(group_set_of)
 		ctx.group = nil
 		// A pending window owns its partials: they are freed with the group below.
 		if !has_windows {
@@ -4106,6 +4127,11 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 	case Literal_Expr:
 		return e.value, ERROR_NONE
 	case Column_Expr:
+		// A column the grouping set leaves out is NULL in its row, which is what
+		// ROLLUP and CUBE show for a level that was rolled up.
+		if ctx.grouped && grouping_column_missing(ctx, e.name, e.table) {
+			return value_null(), ERROR_NONE
+		}
 		if len(e.table) > 0 {
 			// Inside a trigger body NEW and OLD name the rows of the event.
 			if ctx.tx != nil && ctx.tx.trigger_active {
@@ -5128,12 +5154,96 @@ eval_case :: proc(ctx: ^Eval_Ctx, e: Case_Expr) -> (Value, Error) {
 	return value_null(), ERROR_NONE
 }
 
+// grouping_column_missing reports whether `name` is a GROUP BY entry the current
+// set left out. Matching is by name, with a table when both sides name one, which
+// is how a projection finds the entry it groups by.
+@(private)
+grouping_column_missing :: proc(ctx: ^Eval_Ctx, name, table: string) -> bool {
+	for expr, index in ctx.grouping_exprs {
+		if index >= len(ctx.grouping_missing) || !ctx.grouping_missing[index] do continue
+		column, is_column := expr^.(Column_Expr)
+		if !is_column || !strings.equal_fold(column.name, name) do continue
+		if len(table) > 0 && len(column.table) > 0 && !strings.equal_fold(column.table, table) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// eval_grouping answers GROUPING(a, b): one bit per argument, most significant
+// first, 1 when the set left that column out. GROUPING_ID is the same function
+// under its other name.
+@(private)
+eval_grouping :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
+	if !ctx.grouped || len(ctx.grouping_exprs) == 0 {
+		return {}, errf(.Invalid_Argument, "GROUPING() needs GROUP BY with ROLLUP, CUBE or GROUPING SETS")
+	}
+	mask: i64
+	for arg in call.args {
+		column, is_column := arg^.(Column_Expr)
+		if !is_column {
+			return {}, errf(.Invalid_Argument, "GROUPING() takes a column of the GROUP BY list")
+		}
+		missing := false
+		found := false
+		for expr, index in ctx.grouping_exprs {
+			other, other_is_column := expr^.(Column_Expr)
+			if !other_is_column || !strings.equal_fold(other.name, column.name) do continue
+			if len(column.table) > 0 && len(other.table) > 0 &&
+			   !strings.equal_fold(column.table, other.table) {
+				continue
+			}
+			found = true
+			missing = index < len(ctx.grouping_missing) && ctx.grouping_missing[index]
+			break
+		}
+		if !found {
+			return {}, errf(
+				.Invalid_Argument,
+				"GROUPING() takes a column of the GROUP BY list, not %s",
+				column.name,
+			)
+		}
+		mask = mask << 1
+		if missing do mask |= 1
+	}
+	return value_int(mask), ERROR_NONE
+}
+
+// select_group_sets is the sets a statement groups by: the ones a construct asked
+// for, or the single set of the whole GROUP BY list.
+@(private)
+select_group_sets :: proc(stmt: Select_Stmt, alloc: mem.Allocator) -> [][]int {
+	if len(stmt.group_sets) > 0 do return stmt.group_sets
+	if len(stmt.group_by) == 0 do return nil
+	one := make([]int, len(stmt.group_by), alloc)
+	for i in 0 ..< len(stmt.group_by) do one[i] = i
+	sets := make([][]int, 1, alloc)
+	sets[0] = one
+	return sets
+}
+
+// grouping_missing_for marks the GROUP BY entries one set leaves out.
+@(private)
+grouping_missing_for :: proc(set: []int, count: int, alloc: mem.Allocator) -> []bool {
+	missing := make([]bool, count, alloc)
+	for i in 0 ..< count do missing[i] = true
+	for index in set {
+		if index >= 0 && index < count do missing[index] = false
+	}
+	return missing
+}
+
 eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 	// A row value is taken apart by the comparison that holds it; reaching it
 	// here means it stands alone, which SQLite refuses with the same words.
 	if call.name == ROW_VALUE_CALL do return {}, errf(.Sql_Syntax, "row value misused")
 	if scalar_minmax(call) {
 		return eval_scalar_minmax(ctx, call)
+	}
+	if strings.equal_fold(call.name, "grouping") || strings.equal_fold(call.name, "grouping_id") {
+		return eval_grouping(ctx, call)
 	}
 	if is_aggregate_name(call.name) {
 		return eval_aggregate(ctx, call)

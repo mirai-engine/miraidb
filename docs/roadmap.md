@@ -8,7 +8,7 @@ The project has two goals, and the open work is split by them, plus the
 hardening a release needs:
 
 - **A. The reference model, equalled or beaten.** The feature matrix is closed
-  ([features.md](features.md), 95/95), so what is left on this axis is speed and
+  ([features.md](features.md), 96/96), so what is left on this axis is speed and
   depth: the reference's own benchmark suite still puts this engine behind on
   every workload but the empty transaction.
 - **B. SQLite's features.** Measured by `scripts/sqlite_gaps.py` over every
