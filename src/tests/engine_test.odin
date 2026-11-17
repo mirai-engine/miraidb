@@ -6793,6 +6793,21 @@ remote_read_exact :: proc(socket: net.TCP_Socket, buffer: []u8) -> bool {
 	return true
 }
 
+// remote_listener_stop ends the listening thread and waits for it. Closing the
+// socket is not enough: on Linux a thread blocked in `accept` is not woken by a
+// close of the listening socket, and the join then waits forever. One connection
+// to the port wakes it on every platform: it reads nothing from that connection,
+// drops it, and sees `stop` on the next turn of its loop.
+@(private)
+remote_listener_stop :: proc(state: ^Remote_Listener, port: int, worker: ^thread.Thread) {
+	sync.atomic_store(&state.stop, true)
+	if wake, wake_err := net.dial_tcp(net.Endpoint{address = net.IP4_Loopback, port = port}); wake_err == nil {
+		net.close(wake)
+	}
+	thread.destroy(worker)
+	net.close(state.listener)
+}
+
 @(private)
 remote_listen_proc :: proc(data: rawptr) {
 	context = runtime.default_context()
@@ -6895,9 +6910,7 @@ test_remote_module :: proc(t: ^testing.T) {
 	testing.expect_value(t, dead.kind, db.Error_Kind.Io)
 
 	db.host_destroy(host)
-	sync.atomic_store(&state.stop, true)
-	net.close(listener)
-	thread.destroy(worker)
+	remote_listener_stop(&state, bound.port, worker)
 	os.remove_all("_test_remote_mod")
 }
 
@@ -7043,9 +7056,7 @@ test_extension_load :: proc(t: ^testing.T) {
 
 	db.host_destroy(host)
 	db.store_close(store)
-	sync.atomic_store(&state.stop, true)
-	net.close(listener)
-	thread.destroy(worker)
+	remote_listener_stop(&state, bound.port, worker)
 }
 
 @(test)
