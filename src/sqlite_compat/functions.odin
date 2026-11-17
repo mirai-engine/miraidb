@@ -588,6 +588,8 @@ sqlite3_value_dup :: proc "c" (handle: rawptr) -> rawptr {
 	if box == nil do return nil
 	copy := new(Value_Box)
 	copy^ = Value_Box{value = engine.value_clone(box.value, context.allocator), owned = true}
+	// A pointer value's copy is a plain NULL, as in SQLite (pointer.odin).
+	if copy.value.kind == .Null do copy.value = engine.value_null()
 	return rawptr(copy)
 }
 

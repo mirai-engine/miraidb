@@ -19,6 +19,7 @@ import sys
 import sqlite_abi_functions
 import sqlite_abi_authorizer
 import sqlite_abi_hooks
+import sqlite_abi_values
 
 c_void_p, c_int, c_char_p, c_longlong = ctypes.c_void_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_longlong
 
@@ -328,6 +329,8 @@ def observe(lib) -> dict[str, object]:
     sqlite_abi_hooks.observe(lib, db, seen)
     sqlite_abi_hooks.observe_trace(lib, db, seen)
     sqlite_abi_authorizer.observe(lib, seen)
+    # Last: it gives bind_text and bind_blob the argument types it needs.
+    sqlite_abi_values.observe(lib, seen)
 
     seen["errstr"] = [lib.sqlite3_errstr(code) for code in (*range(0, 30), 100, 101, 516, 19 | 8 << 8, 9999)]
     assert lib.sqlite3_close(db) == 0

@@ -164,6 +164,11 @@ int          sqlite3_bind_parameter_index(sqlite3_stmt *stmt, const char *name);
 char        *sqlite3_expanded_sql(sqlite3_stmt *stmt);
 int          sqlite3_bind_zeroblob64(sqlite3_stmt *stmt, int index,
                                      sqlite3_uint64 n);
+/* Binds a NULL that carries `pointer` for sqlite3_value_pointer(v, type); the
+** destructor runs when the parameter is bound again, the bindings are cleared
+** or the statement is finalized. */
+int          sqlite3_bind_pointer(sqlite3_stmt *stmt, int index, void *pointer,
+                                  const char *type, void (*destructor)(void *));
 
 int          sqlite3_column_count(sqlite3_stmt *stmt);
 /* The column count while a row is available, 0 otherwise. */
@@ -185,6 +190,7 @@ const char  *sqlite3_column_text(sqlite3_stmt *stmt, int index);
 const void  *sqlite3_column_blob(sqlite3_stmt *stmt, int index);
 int          sqlite3_column_bytes(sqlite3_stmt *stmt, int index);
 int          sqlite3_column_bytes16(sqlite3_stmt *stmt, int index);
+
 
 /* --- Application-defined functions ----------------------------------------
 ** A scalar function gives xFunc; an aggregate gives xStep and xFinal and keeps
@@ -225,6 +231,10 @@ const void          *sqlite3_value_blob(sqlite3_value *value);
 int                  sqlite3_value_bytes(sqlite3_value *value);
 sqlite3_value       *sqlite3_value_dup(const sqlite3_value *value);
 void                 sqlite3_value_free(sqlite3_value *value);
+/* The pointer a value carries when it was bound or returned with the same
+** type name; NULL otherwise. To SQL such a value is NULL, and a copy made with
+** sqlite3_value_dup or a row that stores it holds a plain NULL. */
+void                *sqlite3_value_pointer(sqlite3_value *value, const char *type);
 /* A value never carries a subtype, a no-change mark or a bind origin here. */
 unsigned int         sqlite3_value_subtype(sqlite3_value *value);
 int                  sqlite3_value_nochange(sqlite3_value *value);
@@ -252,6 +262,9 @@ void sqlite3_result_error_nomem(sqlite3_context *ctx);
 void sqlite3_result_error_toobig(sqlite3_context *ctx);
 /* Accepted and dropped: subtypes are not carried. */
 void sqlite3_result_subtype(sqlite3_context *ctx, unsigned int subtype);
+/* The destructor runs when the step that made the value ends. */
+void sqlite3_result_pointer(sqlite3_context *ctx, void *pointer, const char *type,
+                            void (*destructor)(void *));
 
 /* --- Connection hooks ----------------------------------------------------
 ** Each call replaces the hook and answers the argument the previous one had;

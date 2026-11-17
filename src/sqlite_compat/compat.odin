@@ -118,6 +118,8 @@ Statement :: struct {
 	// seen it end; started is when, in nanoseconds.
 	traced:  bool,
 	started: i64,
+	// pointers are the parameters bound with sqlite3_bind_pointer (pointer.odin).
+	pointers: [dynamic]Pointer_Binding,
 }
 
 // Column_Origin_C is one column's origin as the C strings the metadata calls
@@ -682,6 +684,9 @@ sqlite3_finalize :: proc "c" (handle: rawptr) -> c.int {
 	}
 	delete(stmt.origins)
 	engine.embed_finalize(stmt.stmt)
+	// The pointers go after the statement that could still read them.
+	stmt_pointers_release(stmt)
+	delete(stmt.pointers)
 	free(stmt)
 	return SQLITE_OK
 }
@@ -704,6 +709,7 @@ sqlite3_clear_bindings :: proc "c" (handle: rawptr) -> c.int {
 	stmt := stmt_of(handle)
 	if stmt == nil do return SQLITE_MISUSE
 	engine.embed_clear_bindings(stmt.stmt)
+	stmt_pointers_release(stmt)
 	return SQLITE_OK
 }
 
@@ -713,6 +719,7 @@ sqlite3_bind_null :: proc "c" (handle: rawptr, index: c.int) -> c.int {
 	stmt := stmt_of(handle)
 	if stmt == nil do return SQLITE_MISUSE
 	if int(index) < 1 || int(index) > engine.Embed_Parameter_Count(stmt.stmt) do return SQLITE_RANGE
+	stmt_pointer_drop(stmt, int(index) - 1)
 	if engine.error_drop(engine.embed_bind_null(stmt.stmt, int(index) - 1)) do return SQLITE_OK
 	return SQLITE_ERROR
 }
@@ -729,6 +736,7 @@ sqlite3_bind_int64 :: proc "c" (handle: rawptr, index: c.int, value: c.longlong)
 	stmt := stmt_of(handle)
 	if stmt == nil do return SQLITE_MISUSE
 	if int(index) < 1 || int(index) > engine.Embed_Parameter_Count(stmt.stmt) do return SQLITE_RANGE
+	stmt_pointer_drop(stmt, int(index) - 1)
 	if engine.error_drop(engine.embed_bind_int(stmt.stmt, int(index) - 1, i64(value))) do return SQLITE_OK
 	return SQLITE_ERROR
 }
@@ -739,6 +747,7 @@ sqlite3_bind_double :: proc "c" (handle: rawptr, index: c.int, value: c.double) 
 	stmt := stmt_of(handle)
 	if stmt == nil do return SQLITE_MISUSE
 	if int(index) < 1 || int(index) > engine.Embed_Parameter_Count(stmt.stmt) do return SQLITE_RANGE
+	stmt_pointer_drop(stmt, int(index) - 1)
 	if engine.error_drop(engine.embed_bind_float(stmt.stmt, int(index) - 1, f64(value))) do return SQLITE_OK
 	return SQLITE_ERROR
 }
@@ -746,10 +755,18 @@ sqlite3_bind_double :: proc "c" (handle: rawptr, index: c.int, value: c.double) 
 @(export)
 sqlite3_bind_text :: proc "c" (handle: rawptr, index: c.int, value: cstring, length: c.int, destructor: rawptr) -> c.int {
 	context = runtime.default_context()
-	_ = destructor
+	// SQLite runs the destructor once it no longer needs the text: the text is
+	// copied, so that is when this returns, whatever the answer.
+	defer release_with(rawptr(value), destructor)
 	stmt := stmt_of(handle)
-	if stmt == nil || value == nil do return SQLITE_MISUSE
+	if stmt == nil do return SQLITE_MISUSE
 	if int(index) < 1 || int(index) > engine.Embed_Parameter_Count(stmt.stmt) do return SQLITE_RANGE
+	stmt_pointer_drop(stmt, int(index) - 1)
+	// A NULL text binds NULL, as in SQLite.
+	if value == nil {
+		if engine.error_drop(engine.embed_bind_null(stmt.stmt, int(index) - 1)) do return SQLITE_OK
+		return SQLITE_ERROR
+	}
 	// SQLite's contract: a non-negative length is the byte count, and only a
 	// negative one means "up to the terminator". `string(value)` always stops at
 	// the first NUL, so a text with one embedded used to arrive as zero bytes.
@@ -767,19 +784,18 @@ sqlite3_bind_text :: proc "c" (handle: rawptr, index: c.int, value: cstring, len
 @(export)
 sqlite3_bind_blob :: proc "c" (handle: rawptr, index: c.int, data: rawptr, length: c.int, destructor: rawptr) -> c.int {
 	context = runtime.default_context()
-	context = runtime.default_context()
-	_ = destructor
+	defer release_with(data, destructor)
 	stmt := stmt_of(handle)
 	if stmt == nil do return SQLITE_MISUSE
-	if data == nil || length <= 0 {
+	if int(index) < 1 || int(index) > engine.Embed_Parameter_Count(stmt.stmt) do return SQLITE_RANGE
+	stmt_pointer_drop(stmt, int(index) - 1)
+	// A NULL pointer binds NULL; any other pointer binds a blob, an empty one
+	// when the length is 0, as in SQLite.
+	if data == nil {
 		if engine.error_drop(engine.embed_bind_null(stmt.stmt, int(index) - 1)) do return SQLITE_OK
 		return SQLITE_ERROR
 	}
-	bytes := make([]u8, int(length))
-	defer delete(bytes)
-	source := ([^]u8)(data)
-	for i in 0 ..< int(length) do bytes[i] = source[i]
-	if int(index) < 1 || int(index) > engine.Embed_Parameter_Count(stmt.stmt) do return SQLITE_RANGE
+	bytes := ([^]u8)(data)[:max(int(length), 0)]
 	if engine.error_drop(engine.embed_bind_blob(stmt.stmt, int(index) - 1, bytes)) do return SQLITE_OK
 	return SQLITE_ERROR
 }
@@ -795,7 +811,9 @@ sqlite3_step :: proc "c" (handle: rawptr) -> c.int {
 	}
 	stmt_clear_text_cache(stmt)
 	trace_start(stmt)
+	mark := step_pointers_mark()
 	has_row, err := engine.embed_step(stmt.stmt)
+	step_pointers_end(mark)
 	if err.kind != .None {
 		code := fail(stmt.db, err)
 		trace_end(stmt)
@@ -808,6 +826,12 @@ sqlite3_step :: proc "c" (handle: rawptr) -> c.int {
 	stmt.finished = true
 	trace_end(stmt)
 	return SQLITE_DONE
+}
+
+@(export)
+sqlite3_column_bytes16 :: proc "c" (handle: rawptr, index: c.int) -> c.int {
+	context = runtime.default_context()
+	return sqlite3_column_bytes(handle, index)
 }
 
 @(export)
@@ -914,12 +938,6 @@ sqlite3_column_bytes :: proc "c" (handle: rawptr, index: c.int) -> c.int {
 	rendered := engine.sqlite_value_text(value, context.allocator)
 	defer delete(rendered)
 	return c.int(len(rendered))
-}
-
-@(export)
-sqlite3_column_bytes16 :: proc "c" (handle: rawptr, index: c.int) -> c.int {
-	context = runtime.default_context()
-	return sqlite3_column_bytes(handle, index)
 }
 
 // --- Memory ----------------------------------------------------------------
@@ -1265,6 +1283,7 @@ sqlite3_bind_zeroblob64 :: proc "c" (handle: rawptr, index: c.int, n: u64) -> c.
 	if stmt == nil do return SQLITE_MISUSE
 	if int(index) < 1 || int(index) > engine.Embed_Parameter_Count(stmt.stmt) do return SQLITE_RANGE
 	if n > 1 << 30 do return SQLITE_TOOBIG
+	stmt_pointer_drop(stmt, int(index) - 1)
 	zeros := make([]u8, int(n))
 	defer delete(zeros)
 	if engine.error_drop(engine.embed_bind_blob(stmt.stmt, int(index) - 1, zeros)) do return SQLITE_OK
