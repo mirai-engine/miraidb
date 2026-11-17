@@ -733,6 +733,15 @@ auth_function :: proc(walk: ^Auth_Walk, name: string) {
 // nested in it.
 @(private)
 auth_expr :: proc(walk: ^Auth_Walk, slot: ^^Expr) {
+	// A left-deep chain of binary operators is walked in a loop (resolve.odin
+	// says why).
+	slot := slot
+	for slot^ != nil && walk.err.kind == .None {
+		binary, is_binary := &slot^^.(Binary_Expr)
+		if !is_binary do break
+		auth_expr(walk, &binary.right)
+		slot = &binary.left
+	}
 	expr := slot^
 	if expr == nil || walk.err.kind != .None do return
 	switch &e in expr^ {
