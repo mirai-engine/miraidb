@@ -13901,3 +13901,48 @@ test_array_syntax_and_operators :: proc(t: ^testing.T) {
 	db.value_deep_free(one_of_each, context.allocator)
 	testing.expect_value(t, scalar(t, store, "SELECT cardinality(array_agg(v)) FROM g").i, i64(4))
 }
+
+// A driver that does not know a parameter's type sends an array as PostgreSQL
+// writes one: `{a,b}` as text. PostgreSQL parses it against the target type; here
+// the array on the other side of the comparison says what the elements are, and
+// a text value stored into an array column is parsed the same way.
+@(test)
+test_array_text_form :: proc(t: ^testing.T) {
+	store := fresh_db(t, "array_text")
+	if store == nil do return
+	defer cleanup_db(store, "array_text")
+
+	casted := scalar(t, store, "SELECT '{1,2,3}'::INT[]")
+	testing.expect_value(t, casted.kind, db.Value_Kind.Array)
+	testing.expect_value(t, len(casted.list), 3)
+	testing.expect_value(t, casted.list[0].i, i64(1))
+	db.value_deep_free(casted, context.allocator)
+
+	empty := scalar(t, store, "SELECT '{}'::TEXT[]")
+	testing.expect_value(t, len(empty.list), 0)
+	db.value_deep_free(empty, context.allocator)
+
+	// Quoted elements keep their separators, an unquoted NULL is the null
+	// element, and a quoted "NULL" is the word.
+	quoted := scalar(t, store, "SELECT '{\"a,b\",\"c d\",NULL,\"NULL\"}'::TEXT[]")
+	testing.expect_value(t, len(quoted.list), 4)
+	testing.expect_value(t, quoted.list[0].s, "a,b")
+	testing.expect_value(t, quoted.list[1].s, "c d")
+	testing.expect_value(t, quoted.list[2].kind, db.Value_Kind.Null)
+	testing.expect_value(t, quoted.list[3].s, "NULL")
+	db.value_deep_free(quoted, context.allocator)
+
+	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, tags TEXT[])")
+	run(t, store, "INSERT INTO t VALUES (1, '{a,b}')")
+	stored := run(t, store, "SELECT tags FROM t WHERE id = 1")
+	defer db.sql_result_destroy(&stored)
+	testing.expect_value(t, len(stored.rows[0][0].list), 2)
+	testing.expect_value(t, stored.rows[0][0].list[1].s, "b")
+
+	// The text form compares with the array column, which is how a parameter
+	// whose type the driver did not know arrives.
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t WHERE tags = '{a,b}'").i, i64(1))
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t WHERE tags @> '{a}'").i, i64(1))
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t WHERE tags && '{b,c}'").i, i64(1))
+	testing.expect_value(t, scalar(t, store, "SELECT '{a,b}' = tags FROM t").b, true)
+}

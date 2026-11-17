@@ -268,6 +268,12 @@ nothing about them is written to the database.
   value), `<@` (contained by) and `&&` (overlaps); `x = ANY(a)` and `x <> ALL(a)`
   are the quantified comparisons. An array of arrays is refused: the column type
   holds one element kind.
+
+  PostgreSQL's text form, `{a,b,"c d",NULL}`, is accepted wherever an array is:
+  `'{1,2}'::INT[]`, a value stored into an array column, and an operand compared
+  with an array column. That is what a driver sends when it does not know a
+  parameter's type, and a result travels back the same way, with the array's own
+  type OID (`_int4`, `_text`, …) in the row description.
 - `rowid`, `_rowid_` and `oid` name the stored row, when the table declares no
   column with that name. A table whose primary key is one INTEGER column answers
   that column, which is what SQLite calls a rowid alias and what

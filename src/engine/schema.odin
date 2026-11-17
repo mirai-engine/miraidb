@@ -719,6 +719,64 @@ type_parse_text :: proc(text: string) -> (Column_Type, bool) {
 // value_coerce converts a value to the column type with SQL-like rules. It is
 // the single place where the engine decides what fits a column, so inserts, SQL
 // literals and index keys all agree.
+// array_parse_text reads PostgreSQL's array input, `{a,b,"c d",NULL}`, and
+// coerces each element to `inner`. It is the text form a client sends for an
+// array and the form `::TEXT[]` accepts; an empty `{}` is an empty array, and an
+// unquoted NULL is the null element.
+array_parse_text :: proc(text: string, inner: Column_Type) -> (Value, Error) {
+	trimmed := strings.trim_space(text)
+	if len(trimmed) < 2 || trimmed[0] != '{' || trimmed[len(trimmed) - 1] != '}' {
+		return {}, errf(.Invalid_Type, "an array literal must be written {a,b}")
+	}
+	body := trimmed[1 : len(trimmed) - 1]
+	items := make([dynamic]Value, 0, 4, context.temp_allocator)
+	defer delete(items)
+	i := 0
+	for i < len(body) {
+		// Skip the separator and the space around it.
+		for i < len(body) && (body[i] == ',' || body[i] == ' ') do i += 1
+		if i >= len(body) do break
+		element: string
+		quoted := body[i] == '"'
+		if quoted {
+			builder := strings.builder_make(context.temp_allocator)
+			i += 1
+			for i < len(body) {
+				if body[i] == '"' {
+					i += 1
+					if i < len(body) && body[i] == '"' {
+						strings.write_byte(&builder, '"')
+						i += 1
+						continue
+					}
+					break
+				}
+				strings.write_byte(&builder, body[i])
+				i += 1
+			}
+			element = strings.to_string(builder)
+			for i < len(body) && body[i] != ',' do i += 1
+		} else {
+			start := i
+			for i < len(body) && body[i] != ',' do i += 1
+			element = strings.trim_space(body[start:i])
+		}
+		// Only an unquoted NULL is the null element: `"NULL"` is the word.
+		if !quoted && strings.equal_fold(element, "null") {
+			append(&items, value_null())
+			continue
+		}
+		// An element arrives as text, so this is a cast: `{1,2}` gives integers
+		// for an integer array and `{true,false}` gives booleans.
+		coerced, coerce_err := value_cast(value_string(element), inner)
+		if coerce_err.kind != .None do return {}, coerce_err
+		append(&items, coerced)
+	}
+	list := make([]Value, len(items))
+	copy(list, items[:])
+	return Value{kind = .Array, list = list}, ERROR_NONE
+}
+
 value_coerce :: proc(v: Value, t: Column_Type) -> (Value, Error) {
 	if t.kind == .Unit {
 		if v.kind == .Null do return value_null(), ERROR_NONE
@@ -730,6 +788,14 @@ value_coerce :: proc(v: Value, t: Column_Type) -> (Value, Error) {
 	}
 	if t.kind == .Array {
 		if v.kind == .Null do return value_null(), ERROR_NONE
+		// PostgreSQL writes an array as `{a,b}`, and that is what a driver sends
+		// for a parameter whose type it did not know. Parsing it here means a
+		// text value stored into an array column arrives as one.
+		if v.kind == .String {
+			parsed, parse_err := array_parse_text(v.s, type_inner(t))
+			if parse_err.kind != .None do return {}, parse_err
+			return parsed, ERROR_NONE
+		}
 		if v.kind != .Array {
 			return {}, errf(.Invalid_Type, "%s needs an array", column_type_name(t))
 		}

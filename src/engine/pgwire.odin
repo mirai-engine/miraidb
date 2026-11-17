@@ -242,6 +242,42 @@ pg_row_description :: proc(columns: []string) -> []u8 {
 // (psycopg reads anything else as false).
 pg_text_value :: proc(value: Value, alloc: mem.Allocator) -> string {
 	if value.kind == .Bool do return value.b ? "t" : "f"
+	// PostgreSQL writes an array between braces, quoting an element that holds a
+	// separator, a brace, a quote or a space, or that would read as NULL.
+	if value.kind == .Array {
+		builder := strings.builder_make(alloc)
+		strings.write_byte(&builder, '{')
+		for item, i in value.list {
+			if i > 0 do strings.write_byte(&builder, ',')
+			if item.kind == .Null {
+				strings.write_string(&builder, "NULL")
+				continue
+			}
+			// The text lives in `alloc`, which is the caller's arena and is
+			// released as a whole: freeing an element here would hand the arena
+			// memory it does not own back, which corrupted the heap.
+			text := pg_text_value(item, alloc)
+			quote := len(text) == 0 || strings.equal_fold(text, "null")
+			for c in text {
+				if c == ',' || c == '{' || c == '}' || c == '"' || c == ' ' || c == '\n' || c == '\t' {
+					quote = true
+					break
+				}
+			}
+			if quote {
+				strings.write_byte(&builder, '"')
+				for c in text {
+					if c == '"' || c == '\\' do strings.write_byte(&builder, '\\')
+					strings.write_byte(&builder, u8(c))
+				}
+				strings.write_byte(&builder, '"')
+			} else {
+				strings.write_string(&builder, text)
+			}
+		}
+		strings.write_byte(&builder, '}')
+		return strings.to_string(builder)
+	}
 	return value_format(value, alloc)
 }
 
@@ -476,6 +512,48 @@ pg_decode_param :: proc(data: []u8, binary: bool, oid: u32) -> (Value, bool) {
 }
 
 // pg_type_oid is the PostgreSQL type OID advertised for a value kind.
+// pg_array_oid is the array type of an element type, as PostgreSQL numbers them
+// (`_int4` is 1007). A driver uses it to decide how to read the column.
+pg_array_oid :: proc(element: u32) -> u32 {
+	switch element {
+	case 16:
+		return 1000 // _bool
+	case 17:
+		return 1001 // _bytea
+	case 21:
+		return 1005 // _int2
+	case 23:
+		return 1007 // _int4
+	case 20:
+		return 1016 // _int8
+	case 700:
+		return 1021 // _float4
+	case 701:
+		return 1022 // _float8
+	case 25:
+		return 1009 // _text
+	case 1043:
+		return 1015 // _varchar
+	case 1042:
+		return 1014 // _bpchar
+	case 1231:
+		return 1231 // _numeric
+	case 2950:
+		return 2951 // _uuid
+	case 1114:
+		return 1115 // _timestamp
+	case 1184:
+		return 1185 // _timestamptz
+	case 1082:
+		return 1182 // _date
+	case 1083:
+		return 1183 // _time
+	case 1186:
+		return 1187 // _interval
+	}
+	return 1009
+}
+
 pg_type_oid :: proc(v: Value) -> u32 {
 	switch v.kind {
 	case .Bool:
@@ -496,7 +574,15 @@ pg_type_oid :: proc(v: Value) -> u32 {
 		return 1114
 	case .Duration:
 		return 1186
-	case .Null, .Default, .Array, .Product, .Int128, .Uint128, .Identity, .Connection:
+	case .Array:
+		// The array's own type: PostgreSQL numbers one per element type, and a
+		// driver reads the elements according to it. An empty array is text[].
+		for item in v.list {
+			oid := pg_type_oid(item)
+			if oid != 25 do return pg_array_oid(oid)
+		}
+		return 1009
+	case .Null, .Default, .Product, .Int128, .Uint128, .Identity, .Connection:
 		return 25
 	}
 	return 25

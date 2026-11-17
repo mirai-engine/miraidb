@@ -412,6 +412,30 @@ def main() -> int:
                 seen += chunk
         check("the startup completes after the refusal", b"Z" in seen, seen[:40])
 
+        # An array travels in PostgreSQL's own form: the column names the array
+        # type (1009 is text[]) and the value is `{a,b}`. A driver decodes it with
+        # the type, so both have to be right.
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as session:
+            startup = b"user\x00root\x00database\x00x\x00\x00"
+            session.sendall(struct.pack("!ii", 4 + len(startup), 196608) + startup)
+            greeting = b""
+            while b"Z" not in greeting:
+                chunk = session.recv(4096)
+                if not chunk:
+                    raise AssertionError("the server closed during the startup")
+                greeting += chunk
+            send_pg_message(session, b"Q", b"SELECT ARRAY['a','b'] AS tags\x00")
+            answer = b""
+            deadline = time.time() + 5
+            while b"Z" not in answer and time.time() < deadline:
+                chunk = session.recv(4096)
+                if not chunk:
+                    break
+                answer += chunk
+        check("an array column reports the array type", b"\x00\x00\x03\xf1" in answer,
+              answer[:48].hex())
+        check("an array value travels as {a,b}", b"{a,b}" in answer, answer[-60:])
+
         # PostgreSQL authenticates a password with SCRAM-SHA-256: the client
         # proves it without sending it, and the server proves it too. A second
         # server with --password is what checks the whole exchange, with the

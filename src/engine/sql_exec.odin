@@ -4386,7 +4386,11 @@ eval_binary :: proc(
 	}
 	switch op {
 	case .Eq, .Ne, .Lt, .Le, .Gt, .Ge:
-		order, ok := value_compare_collated(left, right, collation, store)
+		// A driver that did not know a parameter's type sends an array as text,
+		// `{a,b}`. PostgreSQL parses it against the column's type; here the array
+		// on the other side says what the elements are.
+		compared_left, compared_right := arrays_from_text(left, right)
+		order, ok := value_compare_collated(compared_left, compared_right, collation, store)
 		if !ok {
 			return {}, errf(
 				.Invalid_Type,
@@ -5649,6 +5653,49 @@ abs_f64 :: proc(f: f64) -> f64 {
 
 // eval_scalar_minmax is min(a, b, ...) as SQLite answers it: NULL if any
 // argument is NULL, otherwise the smallest or largest of them.
+// arrays_from_text turns a text operand into an array when the other side is
+// one and the text is written as PostgreSQL's array input. Anything else is left
+// alone, so a text column compared with text still compares as text.
+@(private)
+arrays_from_text :: proc(left, right: Value) -> (Value, Value) {
+	if left.kind == .Array && right.kind == .String {
+		if parsed, err := array_parse_text(right.s, array_element_type(left)); err.kind == .None {
+			return left, parsed
+		}
+	}
+	if right.kind == .Array && left.kind == .String {
+		if parsed, err := array_parse_text(left.s, array_element_type(right)); err.kind == .None {
+			return parsed, right
+		}
+	}
+	return left, right
+}
+
+// array_element_type is the type of an array's elements, read from the elements
+// themselves: the engine stores kinds, not a declared element type.
+@(private)
+array_element_type :: proc(array: Value) -> Column_Type {
+	for item in array.list {
+		#partial switch item.kind {
+		case .Null:
+			continue
+		case .Int:
+			return Column_Type{kind = .Int, width = 8}
+		case .Uint:
+			return Column_Type{kind = .Uint, width = 8}
+		case .Float:
+			return Column_Type{kind = .Float, width = 8}
+		case .Bool:
+			return Column_Type{kind = .Bool}
+		case .Bytes:
+			return Column_Type{kind = .Bytes}
+		case:
+			return Column_Type{kind = .String}
+		}
+	}
+	return Column_Type{kind = .String}
+}
+
 // array_concat implements `||` when either side is an array: two arrays join
 // their elements, and a single value is appended or prepended.
 @(private)
@@ -5672,8 +5719,21 @@ array_concat :: proc(left, right: Value) -> (Value, Error) {
 eval_array_relation :: proc(name: string, args: []Value) -> (Value, Error) {
 	if len(args) != 2 do return {}, errf(.Invalid_Argument, "%s takes two arrays", name)
 	if args[0].kind == .Null || args[1].kind == .Null do return value_null(), ERROR_NONE
-	container := args[0]
-	needle := args[1]
+	// A driver that did not know the parameter's type sends `{b}` as text; the
+	// array on the other side says what its elements are.
+	first, second := args[0], args[1]
+	if first.kind == .Array && second.kind == .String {
+		if parsed, err := array_parse_text(second.s, array_element_type(first)); err.kind == .None {
+			second = parsed
+		}
+	}
+	if second.kind == .Array && first.kind == .String {
+		if parsed, err := array_parse_text(first.s, array_element_type(second)); err.kind == .None {
+			first = parsed
+		}
+	}
+	container := first
+	needle := second
 	if name == "array_contained" {
 		container = args[1]
 		needle = args[0]
@@ -5684,11 +5744,11 @@ eval_array_relation :: proc(name: string, args: []Value) -> (Value, Error) {
 		}
 	}
 	if name == "array_overlap" {
-		if args[0].kind != .Array || args[1].kind != .Array {
+		if first.kind != .Array || second.kind != .Array {
 			return {}, errf(.Invalid_Type, "&& needs an array on both sides")
 		}
-		for one in args[0].list {
-			for other in args[1].list {
+		for one in first.list {
+			for other in second.list {
 				if value_equal(one, other) do return value_bool(true), ERROR_NONE
 			}
 		}
