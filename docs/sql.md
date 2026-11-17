@@ -261,6 +261,13 @@ nothing about them is written to the database.
   first match wins, a `NULL` condition or operand never matches, no `ELSE` gives
   `NULL`, and only the chosen branch is evaluated.
 - Column references (`name`, `table.name`).
+- Arrays, with PostgreSQL's spelling: `ARRAY[expr, ...]` builds one, `TEXT[]` or
+  `ARRAY(TEXT)` declares a column of them, `x[i]` reads an element (one-based,
+  `NULL` outside the array), and `||` joins two arrays or appends and prepends a
+  single value. The set operators are `@>` (contains, also against a single
+  value), `<@` (contained by) and `&&` (overlaps); `x = ANY(a)` and `x <> ALL(a)`
+  are the quantified comparisons. An array of arrays is refused: the column type
+  holds one element kind.
 - `rowid`, `_rowid_` and `oid` name the stored row, when the table declares no
   column with that name. A table whose primary key is one INTEGER column answers
   that column, which is what SQLite calls a rowid alias and what
@@ -295,6 +302,10 @@ Aggregates: `count(*)`, `count(expr)`, `sum`, `avg`, `min`, `max`, `total`.
 
 Scalar: `lower`, `upper`, `length`, `abs`, `coalesce`/`ifnull`, `now()`,
 `min(a, b, …)`/`max(a, b, …)`, and `trim(s[, chars])` with its two variants.
+
+Arrays: `array_length(a[, dim])` and `cardinality(a)` report a size, and
+`array_agg(x)` folds a group into one array — NULLs are elements, an empty group
+is `NULL`, and `DISTINCT` keeps one of each.
 
 ## Behaviour worth knowing
 

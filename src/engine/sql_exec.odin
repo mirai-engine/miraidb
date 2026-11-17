@@ -1910,6 +1910,29 @@ eval_aggregate_values :: proc(ctx: ^Eval_Ctx, call: Call_Expr, values: []Value) 
 		if seen == 0 do return value_null(), ERROR_NONE
 		return value_string(strings.clone(strings.to_string(builder), context.allocator)), ERROR_NONE
 	}
+	if name == "array_agg" {
+		keys: map[string]bool
+		if call.is_distinct do keys = make(map[string]bool)
+		defer agg_distinct_destroy(&keys)
+		list := make([dynamic]Value, 0, len(values))
+		defer delete(list)
+		for value in values {
+			if call.is_distinct {
+				key := agg_distinct_key(value)
+				_, repeated := keys[key]
+				if repeated {
+					delete(key)
+					continue
+				}
+				keys[key] = true
+			}
+			append(&list, value_clone(value, context.allocator))
+		}
+		if len(list) == 0 do return value_null(), ERROR_NONE
+		items := make([]Value, len(list))
+		copy(items, list[:])
+		return Value{kind = .Array, list = items}, ERROR_NONE
+	}
 	if name != "min" && name != "max" && name != "sum" && name != "total" && name != "avg" {
 		return {}, errf(.Internal, "unknown aggregate %s", name)
 	}
@@ -2281,6 +2304,7 @@ Agg_Acc :: struct {
 	uses_float: bool,
 	uses_128:   bool,
 	builder:    strings.Builder,
+	list:       [dynamic]Value,
 	has_text:   bool,
 	separator:  string,
 	sep_owned:  bool,
@@ -2305,6 +2329,8 @@ Agg_Stream :: struct {
 agg_stream_destroy :: proc(stream: ^Agg_Stream) {
 	for &acc in stream.accs {
 		value_deep_free(acc.best, context.allocator)
+		for item in acc.list do value_deep_free(item, context.allocator)
+		delete(acc.list)
 		if acc.builder.buf != nil do strings.builder_destroy(&acc.builder)
 		if acc.sep_owned do delete(acc.separator)
 		agg_distinct_destroy(&acc.keys)
@@ -2336,7 +2362,9 @@ agg_stream_add :: proc(row_ctx: ^Eval_Ctx, stream: ^Agg_Stream) -> Error {
 		}
 		value, value_err := eval_expr(row_ctx, acc.call.args[0])
 		if value_err.kind != .None do return value_err
-		if value.kind == .Null do continue
+		// array_agg keeps NULLs: they are elements of the array, as in
+		// PostgreSQL. Every other aggregate skips them.
+		if value.kind == .Null && acc.name != "array_agg" do continue
 		if acc.fold_distinct {
 			key := agg_distinct_key(value)
 			_, repeated := acc.keys[key]
@@ -2386,6 +2414,8 @@ agg_stream_add :: proc(row_ctx: ^Eval_Ctx, stream: ^Agg_Stream) -> Error {
 				number, _ := value_to_i64(value)
 				acc.sum_int += number
 			}
+		case "array_agg":
+			append(&acc.list, value_clone(value, context.allocator))
 		case "group_concat", "string_agg":
 			if !acc.has_text {
 				if acc.builder.buf == nil do strings.builder_init(&acc.builder, context.allocator)
@@ -2429,6 +2459,11 @@ agg_stream_value :: proc(acc: ^Agg_Acc) -> (Value, Error) {
 	case "group_concat", "string_agg":
 		if !acc.has_text do return value_null(), ERROR_NONE
 		return value_string(strings.clone(strings.to_string(acc.builder))), ERROR_NONE
+	case "array_agg":
+		if len(acc.list) == 0 do return value_null(), ERROR_NONE
+		items := make([]Value, len(acc.list))
+		for item, i in acc.list do items[i] = value_clone(item, context.allocator)
+		return Value{kind = .Array, list = items}, ERROR_NONE
 	}
 	return {}, errf(.Internal, "unknown aggregate %s", acc.name)
 }
@@ -4377,6 +4412,11 @@ eval_binary :: proc(
 		}
 		return value_bool(result), ERROR_NONE
 	case .Concat:
+		// PostgreSQL's `||` concatenates arrays as well as text, and appends or
+		// prepends a single element when only one side is an array.
+		if left.kind == .Array || right.kind == .Array {
+			return array_concat(left, right)
+		}
 		left_text := value_to_text(left)
 		right_text := value_to_text(right)
 		return value_string(strings.concatenate({left_text, right_text})), ERROR_NONE
@@ -4995,7 +5035,7 @@ sq_truthy :: proc(value: Value) -> (bool, Error) {
 
 @(private)
 is_aggregate_name :: proc(name: string) -> bool {
-	for candidate in ([]string{"count", "sum", "avg", "min", "max", "total", "group_concat", "string_agg"}) {
+	for candidate in ([]string{"count", "sum", "avg", "min", "max", "total", "group_concat", "string_agg", "array_agg"}) {
 		if strings.equal_fold(name, candidate) do return true
 	}
 	return false
@@ -5095,6 +5135,65 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		// Planner hints in SQLite: the value passes through unchanged.
 		if len(args) < 1 do return {}, errf(.Invalid_Argument, "%s() needs an argument", call.name)
 		return args[0], ERROR_NONE
+	case "array_make":
+		// ARRAY[...] in PostgreSQL: the elements keep their own kinds, and a
+		// column of ARRAY(T) coerces them when the value is stored.
+		items := make([]Value, len(args))
+		for arg, i in args do items[i] = value_clone(arg, context.allocator)
+		return Value{kind = .Array, list = items}, ERROR_NONE
+	case "array_get":
+		if len(args) != 2 do return {}, errf(.Invalid_Argument, "[] takes an array and an index")
+		if args[0].kind == .Null || args[1].kind == .Null do return value_null(), ERROR_NONE
+		if args[0].kind != .Array do return {}, errf(.Invalid_Type, "[] needs an array, got %s", value_kind_name(args[0].kind))
+		index, index_ok := value_to_i64(args[1])
+		if !index_ok do return {}, errf(.Invalid_Type, "[] needs an integer index")
+		// One-based, as in PostgreSQL; an index outside the array is NULL rather
+		// than an error, which is what a query with a computed index expects.
+		if index < 1 || index > i64(len(args[0].list)) do return value_null(), ERROR_NONE
+		return value_clone(args[0].list[int(index) - 1], context.allocator), ERROR_NONE
+	case "array_length":
+		if len(args) < 1 || len(args) > 2 {
+			return {}, errf(.Invalid_Argument, "array_length takes an array and an optional dimension")
+		}
+		if args[0].kind == .Null do return value_null(), ERROR_NONE
+		if args[0].kind != .Array {
+			return {}, errf(.Invalid_Type, "array_length needs an array, got %s", value_kind_name(args[0].kind))
+		}
+		if len(args) == 2 {
+			// Only one dimension exists here, so asking for another is NULL, as
+			// PostgreSQL answers for a dimension the array does not have.
+			if args[1].kind == .Null do return value_null(), ERROR_NONE
+			dimension, dimension_ok := value_to_i64(args[1])
+			if !dimension_ok do return {}, errf(.Invalid_Type, "array_length needs an integer dimension")
+			if dimension != 1 do return value_null(), ERROR_NONE
+		}
+		return value_int(i64(len(args[0].list))), ERROR_NONE
+	case "cardinality":
+		if len(args) != 1 do return {}, errf(.Invalid_Argument, "cardinality takes one array")
+		if args[0].kind == .Null do return value_null(), ERROR_NONE
+		if args[0].kind != .Array {
+			return {}, errf(.Invalid_Type, "cardinality needs an array, got %s", value_kind_name(args[0].kind))
+		}
+		return value_int(i64(len(args[0].list))), ERROR_NONE
+	case "array_contains", "array_contained", "array_overlap":
+		return eval_array_relation(call.name, args[:])
+	case "array_append", "array_prepend":
+		if len(args) != 2 do return {}, errf(.Invalid_Argument, "%s takes an array and a value", call.name)
+		if args[0].kind == .Null do return value_null(), ERROR_NONE
+		if args[0].kind != .Array {
+			return {}, errf(.Invalid_Type, "%s needs an array", call.name)
+		}
+		items := make([]Value, len(args[0].list) + 1)
+		offset := 0
+		if call.name == "array_prepend" {
+			items[0] = value_clone(args[1], context.allocator)
+			offset = 1
+		}
+		for item, i in args[0].list do items[i + offset] = value_clone(item, context.allocator)
+		if call.name == "array_append" {
+			items[len(args[0].list)] = value_clone(args[1], context.allocator)
+		}
+		return Value{kind = .Array, list = items}, ERROR_NONE
 	case "snippet", "highlight":
 		if len(args) != 2 {
 			return {}, errf(.Invalid_Argument, "%s() takes text and a pattern", call.name)
@@ -5550,6 +5649,66 @@ abs_f64 :: proc(f: f64) -> f64 {
 
 // eval_scalar_minmax is min(a, b, ...) as SQLite answers it: NULL if any
 // argument is NULL, otherwise the smallest or largest of them.
+// array_concat implements `||` when either side is an array: two arrays join
+// their elements, and a single value is appended or prepended.
+@(private)
+array_concat :: proc(left, right: Value) -> (Value, Error) {
+	if left.kind == .Null || right.kind == .Null do return value_null(), ERROR_NONE
+	if left.kind != .Array && right.kind != .Array {
+		return {}, errf(.Invalid_Type, "|| needs text or an array")
+	}
+	left_items := left.kind == .Array ? left.list : ([]Value{left})
+	right_items := right.kind == .Array ? right.list : ([]Value{right})
+	items := make([]Value, len(left_items) + len(right_items))
+	for item, i in left_items do items[i] = value_clone(item, context.allocator)
+	for item, i in right_items do items[i + len(left_items)] = value_clone(item, context.allocator)
+	return Value{kind = .Array, list = items}, ERROR_NONE
+}
+
+// array_relation answers PostgreSQL's set operators: `@>` contains, `<@` is
+// contained by, `&&` overlaps. One function for all three, because the only
+// difference is which side is searched.
+@(private)
+eval_array_relation :: proc(name: string, args: []Value) -> (Value, Error) {
+	if len(args) != 2 do return {}, errf(.Invalid_Argument, "%s takes two arrays", name)
+	if args[0].kind == .Null || args[1].kind == .Null do return value_null(), ERROR_NONE
+	container := args[0]
+	needle := args[1]
+	if name == "array_contained" {
+		container = args[1]
+		needle = args[0]
+	}
+	if container.kind != .Array || (needle.kind != .Array && needle.kind == .Null) {
+		if container.kind != .Array {
+			return {}, errf(.Invalid_Type, "%s needs an array on both sides", name)
+		}
+	}
+	if name == "array_overlap" {
+		if args[0].kind != .Array || args[1].kind != .Array {
+			return {}, errf(.Invalid_Type, "&& needs an array on both sides")
+		}
+		for one in args[0].list {
+			for other in args[1].list {
+				if value_equal(one, other) do return value_bool(true), ERROR_NONE
+			}
+		}
+		return value_bool(false), ERROR_NONE
+	}
+	// `a @> b` is b a subset of a, and `a @> scalar` is a holding that value.
+	candidates := needle.kind == .Array ? needle.list : ([]Value{needle})
+	for candidate in candidates {
+		found := false
+		for element in container.list {
+			if value_equal(element, candidate) {
+				found = true
+				break
+			}
+		}
+		if !found do return value_bool(false), ERROR_NONE
+	}
+	return value_bool(true), ERROR_NONE
+}
+
 @(private)
 eval_scalar_minmax :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 	want_min := strings.equal_fold(call.name, "min")
@@ -5664,6 +5823,44 @@ eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		}
 		if !seen_any do return value_null(), ERROR_NONE
 		return value_string(strings.clone(strings.to_string(builder))), ERROR_NONE
+	}
+
+	if name == "array_agg" {
+		// The same aggregate over sources: every row's value, NULLs included,
+		// and NULL for an empty set.
+		keys: map[string]bool
+		if call.is_distinct do keys = make(map[string]bool)
+		defer agg_distinct_destroy(&keys)
+		list := make([dynamic]Value, 0, len(rows))
+		defer {
+			for item in list do value_deep_free(item, context.allocator)
+			delete(list)
+		}
+		for sources in rows {
+			sub := ctx^
+			sub.sources = sources
+			if len(call.args) != 1 {
+				return {}, errf(.Invalid_Argument, "%s() takes exactly one argument", name)
+			}
+			value, eval_err := eval_expr(&sub, call.args[0])
+			if eval_err.kind != .None do return {}, eval_err
+			if call.is_distinct {
+				key := agg_distinct_key(value)
+				_, repeated := keys[key]
+				if repeated {
+					delete(key)
+					continue
+				}
+				keys[key] = true
+			}
+			append(&list, value_clone(value, context.allocator))
+		}
+		if len(list) == 0 do return value_null(), ERROR_NONE
+		items := make([]Value, len(list))
+		for item, i in list do items[i] = item
+		// The list's buffer is freed above; the values moved into `items`.
+		clear(&list)
+		return Value{kind = .Array, list = items}, ERROR_NONE
 	}
 
 	accumulator: Value = value_null()

@@ -43,7 +43,7 @@ rather than hidden in this table.
 | A2 | 128-bit integers | done | `INT128`/`UINT128`, arithmetic, aggregates, index keys | test_128_bit_integers |
 | A3 | `F32` distinct from `F64` | done | `FLOAT4` rounds to single precision on store | test_integer_widths |
 | A4 | `Unit`, `Option`, `Result` as types | done | `UNIT`, `OPTION(T)` and `RESULT(T, E)` parse, coerce (one Result side), reflect and replay | test_structural_types |
-| A5 | Arrays and products as column values | done | `ARRAY(T)` and `PRODUCT(T1, ..., Tn)` are column types: parser, element-wise coercion, codec, reflection | test_array_and_product_types, test_product_arity |
+| A5 | Arrays and products as column values | done | `ARRAY(T)` and `PRODUCT(T1, ..., Tn)` are column types: parser, element-wise coercion, codec, reflection; PostgreSQL's spellings (`TEXT[]`, `ARRAY[...]`, `x[i]`, `@>`, `<@`, `&&`, `||`, `= ANY`, `array_agg`, `array_length`, `cardinality`) are in `docs/sql.md` | test_array_and_product_types, test_array_syntax_and_operators |
 | A6 | Named types and references | done | `CREATE TYPE name AS base`, resolved from `_type` when a table is created; `SHOW types` | test_named_types, test_named_type_references |
 | A7 | Domains: identity, connection, timestamp, duration, uuid | done | `DURATION`, `IDENTITY`, `CONNECTION` added; timestamps and uuid already existed | test_domain_types |
 | A8 | Stable serialization with resolved references | done | a column keeps its catalog name next to the resolved type; both are encoded, replayed and exposed as `_columns.named` | test_named_types |

@@ -209,6 +209,11 @@ lexer_next :: proc(l: ^Lexer) -> Token {
 			lexer_advance(l)
 			return Token{kind = .Punct, text = "<<", line = line, column = column}
 		}
+		// PostgreSQL's array operators: `<@` is "contained by".
+		if lexer_peek(l) == '@' {
+			lexer_advance(l)
+			return Token{kind = .Punct, text = "<@", line = line, column = column}
+		}
 		return Token{kind = .Punct, text = "<", line = line, column = column}
 	case '>':
 		if lexer_peek(l) == '=' {
@@ -229,6 +234,18 @@ lexer_next :: proc(l: ^Lexer) -> Token {
 				return Token{kind = .Punct, text = "->>", line = line, column = column}
 			}
 			return Token{kind = .Punct, text = "->", line = line, column = column}
+		}
+	case '@':
+		// `@>` is PostgreSQL's "contains".
+		if lexer_peek(l) == '>' {
+			lexer_advance(l)
+			return Token{kind = .Punct, text = "@>", line = line, column = column}
+		}
+	case '&':
+		// `&&` is PostgreSQL's "overlaps".
+		if lexer_peek(l) == '&' {
+			lexer_advance(l)
+			return Token{kind = .Punct, text = "&&", line = line, column = column}
 		}
 	case '!':
 		if lexer_peek(l) == '=' {

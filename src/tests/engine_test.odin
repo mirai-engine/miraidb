@@ -13805,3 +13805,99 @@ test_right_and_full_joins :: proc(t: ^testing.T) {
 	defer db.sql_result_destroy(&explained)
 	testing.expect(t, len(explained.rows) > 0)
 }
+
+// PostgreSQL's array surface: the `ARRAY[...]` constructor, the `T[]` type
+// spelling, the element accessor, the set operators and the two functions that
+// report a size. The container itself existed (`ARRAY(T)` as a column type); what
+// was missing was every way a client spells one.
+@(test)
+test_array_syntax_and_operators :: proc(t: ^testing.T) {
+	store := fresh_db(t, "array_syntax")
+	if store == nil do return
+	defer cleanup_db(store, "array_syntax")
+
+	literal := scalar(t, store, "SELECT ARRAY[1, 2, 3]")
+	testing.expect_value(t, literal.kind, db.Value_Kind.Array)
+	testing.expect_value(t, len(literal.list), 3)
+	testing.expect_value(t, literal.list[2].i, i64(3))
+	db.value_deep_free(literal, context.allocator)
+
+	empty := scalar(t, store, "SELECT ARRAY[]")
+	testing.expect_value(t, empty.kind, db.Value_Kind.Array)
+	testing.expect_value(t, len(empty.list), 0)
+	db.value_deep_free(empty, context.allocator)
+
+	// One-based, as in PostgreSQL, and out of range is NULL rather than an error.
+	testing.expect_value(t, scalar(t, store, "SELECT (ARRAY[10, 20, 30])[2]").i, i64(20))
+	testing.expect_value(t, scalar(t, store, "SELECT (ARRAY[10, 20])[9]").kind, db.Value_Kind.Null)
+
+	testing.expect_value(t, scalar(t, store, "SELECT array_length(ARRAY[1,2,3], 1)").i, i64(3))
+	testing.expect_value(t, scalar(t, store, "SELECT cardinality(ARRAY[1,2])").i, i64(2))
+
+	// `||` joins two arrays, or an array and one element on either side.
+	joined := scalar(t, store, "SELECT ARRAY[1,2] || ARRAY[3]")
+	testing.expect_value(t, len(joined.list), 3)
+	testing.expect_value(t, joined.list[2].i, i64(3))
+	db.value_deep_free(joined, context.allocator)
+	appended := scalar(t, store, "SELECT ARRAY[1,2] || 3")
+	testing.expect_value(t, len(appended.list), 3)
+	db.value_deep_free(appended, context.allocator)
+	prepended := scalar(t, store, "SELECT 0 || ARRAY[1]")
+	testing.expect_value(t, prepended.list[0].i, i64(0))
+	db.value_deep_free(prepended, context.allocator)
+
+	// The set operators, and SQL's two quantified comparisons.
+	testing.expect_value(t, scalar(t, store, "SELECT ARRAY[1,2,3] @> ARRAY[2]").b, true)
+	testing.expect_value(t, scalar(t, store, "SELECT ARRAY[1,2,3] @> ARRAY[9]").b, false)
+	testing.expect_value(t, scalar(t, store, "SELECT ARRAY[1,2,3] @> 3").b, true)
+	testing.expect_value(t, scalar(t, store, "SELECT ARRAY[1] <@ ARRAY[1,2]").b, true)
+	testing.expect_value(t, scalar(t, store, "SELECT ARRAY[1,2] && ARRAY[2]").b, true)
+	testing.expect_value(t, scalar(t, store, "SELECT ARRAY[1,2] && ARRAY[9]").b, false)
+	testing.expect_value(t, scalar(t, store, "SELECT 1 = ANY(ARRAY[1,2])").b, true)
+	testing.expect_value(t, scalar(t, store, "SELECT 5 = ANY(ARRAY[1,2])").b, false)
+	testing.expect_value(t, scalar(t, store, "SELECT 5 <> ALL(ARRAY[1,2])").b, true)
+	testing.expect_value(t, scalar(t, store, "SELECT 1 <> ALL(ARRAY[1,2])").b, false)
+
+	// A column declared with the PostgreSQL spelling stores and answers one.
+	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, tags TEXT[])")
+	run(t, store, "INSERT INTO t VALUES (1, ARRAY['a','b']), (2, ARRAY[])")
+	stored := run(t, store, "SELECT id, tags, cardinality(tags) FROM t ORDER BY id")
+	defer db.sql_result_destroy(&stored)
+	testing.expect_value(t, stored.rows[0][1].kind, db.Value_Kind.Array)
+	testing.expect_value(t, len(stored.rows[0][1].list), 2)
+	testing.expect_value(t, stored.rows[0][1].list[1].s, "b")
+	testing.expect_value(t, stored.rows[0][2].i, i64(2))
+	testing.expect_value(t, stored.rows[1][2].i, i64(0))
+
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t WHERE tags @> ARRAY['a']").i, i64(1))
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t WHERE 'b' = ANY(tags)").i, i64(1))
+	testing.expect_value(t, scalar(t, store, "SELECT tags[1] FROM t WHERE id = 1").s, "a")
+
+	// The cast spelling, and the refusal that keeps an array of arrays out.
+	casted := scalar(t, store, "SELECT ARRAY['x']::TEXT[]")
+	testing.expect_value(t, casted.kind, db.Value_Kind.Array)
+	db.value_deep_free(casted, context.allocator)
+	refused := run_error(t, store, "CREATE TABLE deep (a INT[][])")
+	testing.expect_value(t, refused.kind, db.Error_Kind.Sql_Unsupported)
+
+	// `array` is still a column name: the bracket is what makes it a constructor.
+	run(t, store, "CREATE TABLE named (array INTEGER)")
+	run(t, store, "INSERT INTO named VALUES (7)")
+	testing.expect_value(t, scalar(t, store, "SELECT array FROM named").i, i64(7))
+
+	// array_agg is how a query builds one: NULLs are elements, an empty group is
+	// NULL, and DISTINCT keeps one of each.
+	run(t, store, "CREATE TABLE g (k TEXT, v INTEGER)")
+	run(t, store, "INSERT INTO g VALUES ('a', 1), ('a', 2), ('b', 3), ('b', NULL)")
+	grouped := run(t, store, "SELECT k, array_agg(v) FROM g GROUP BY k ORDER BY k")
+	defer db.sql_result_destroy(&grouped)
+	testing.expect_value(t, len(grouped.rows), 2)
+	testing.expect_value(t, len(grouped.rows[0][1].list), 2)
+	testing.expect_value(t, grouped.rows[1][1].list[1].kind, db.Value_Kind.Null)
+
+	testing.expect_value(t, scalar(t, store, "SELECT array_agg(v) FROM g WHERE k = 'z'").kind, db.Value_Kind.Null)
+	one_of_each := scalar(t, store, "SELECT array_agg(DISTINCT k) FROM g")
+	testing.expect_value(t, len(one_of_each.list), 2)
+	db.value_deep_free(one_of_each, context.allocator)
+	testing.expect_value(t, scalar(t, store, "SELECT cardinality(array_agg(v)) FROM g").i, i64(4))
+}

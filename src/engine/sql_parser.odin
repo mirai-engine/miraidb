@@ -1199,10 +1199,40 @@ parse_create_trigger :: proc(p: ^Parser) -> Statement {
 	return stmt
 }
 
+// p_mark and p_reset remember one token, so a word that is a keyword in one
+// place and a column name in another can be tried and put back.
+@(private)
+p_mark :: proc(p: ^Parser) -> (Lexer, Token) {
+	return p.lexer, p.current
+}
+
+@(private)
+p_reset :: proc(p: ^Parser, lexer: Lexer, token: Token) {
+	p.lexer = lexer
+	p.current = token
+}
+
 // parse_type_ref reads a column type. `builtin` is false when the name is
 // unknown, in which case the caller defers to the type catalog.
 @(private)
 parse_type_ref :: proc(p: ^Parser) -> (t: Column_Type, builtin: bool, name: string) {
+	t, builtin, name = parse_type_base(p)
+	if !builtin do return
+	// `TEXT[]` is ARRAY(TEXT). One level: the type record holds one element kind,
+	// so an array of arrays is refused rather than stored as something else.
+	for p_match_punct(p, "[") {
+		p_expect_punct(p, "]")
+		if t.kind == .Array {
+			p_fail(p, .Sql_Unsupported, "an array of arrays is not supported")
+			return
+		}
+		t = Column_Type{kind = .Array, inner_kind = t.kind, inner_width = t.width}
+	}
+	return
+}
+
+@(private)
+parse_type_base :: proc(p: ^Parser) -> (t: Column_Type, builtin: bool, name: string) {
 	name = p_ident_or_keyword(p)
 	upper := strings.to_upper(name)
 	if upper == "OPTION" {
@@ -1330,7 +1360,17 @@ parse_cast_target :: proc(p: ^Parser) -> (Column_Type, bool) {
 		for !p_is_punct(p, ")") && p.current.kind != .EOF do p_advance(p)
 		p_expect_punct(p, ")")
 	}
-	return Column_Type{kind = kind, width = width}, true
+	target := Column_Type{kind = kind, width = width}
+	// `::TEXT[]` is a cast to an array, the same spelling a column uses.
+	for p_match_punct(p, "[") {
+		p_expect_punct(p, "]")
+		if target.kind == .Array {
+			p_fail(p, .Sql_Unsupported, "an array of arrays is not supported")
+			return {}, false
+		}
+		target = Column_Type{kind = .Array, inner_kind = target.kind, inner_width = target.width}
+	}
+	return target, true
 }
 
 @(private)
@@ -1978,6 +2018,45 @@ parse_not :: proc(p: ^Parser) -> ^Expr {
 	return parse_comparison(p)
 }
 
+// p_call2 builds a two-argument call, which is what the array operators parse to.
+@(private)
+p_call2 :: proc(p: ^Parser, name: string, first, second: ^Expr) -> ^Expr {
+	args := make([]^Expr, 2, p.alloc)
+	args[0] = first
+	args[1] = second
+	e := new(Expr, p.alloc)
+	e^ = Call_Expr{name = name, args = args}
+	return e
+}
+
+// p_quantified reads `ANY|SOME|ALL (array)` after a comparison. `x = ANY (a)` is
+// "x is one of the elements"; `x <> ALL (a)` is "x is none of them".
+@(private)
+p_quantified :: proc(p: ^Parser, left: ^Expr, op: Binary_Op) -> ^Expr {
+	every := p_is_keyword(p, "all")
+	if op == .Eq && every {
+		p_fail(p, .Sql_Unsupported, "x = ALL (array) is not supported: write NOT (x <> ANY (array))")
+		p_advance(p)
+		return left
+	}
+	if op == .Ne && !every {
+		p_fail(p, .Sql_Unsupported, "x <> ANY (array) is not supported: write NOT (x = ALL (array))")
+		p_advance(p)
+		return left
+	}
+	p_advance(p)
+	p_expect_punct(p, "(")
+	operand := parse_expression(p)
+	p_expect_punct(p, ")")
+	call := p_call2(p, "array_contains", operand, left)
+	if every {
+		e := new(Expr, p.alloc)
+		e^ = Unary_Expr{op = .Not, operand = call}
+		return e
+	}
+	return call
+}
+
 // parse_operand parses an additive expression and any COLLATE that follows it.
 @(private)
 parse_operand :: proc(p: ^Parser) -> ^Expr {
@@ -1994,11 +2073,37 @@ parse_operand :: proc(p: ^Parser) -> ^Expr {
 parse_comparison :: proc(p: ^Parser) -> ^Expr {
 	left := parse_operand(p)
 	for {
+		// PostgreSQL's array operators are set relations: contains, is contained
+		// by, overlaps. They parse to calls so the expression tree keeps its
+		// shape, and so a NULL operand answers NULL like every other operator.
+		if p_match_punct(p, "@>") {
+			left = p_call2(p, "array_contains", left, parse_operand(p))
+			continue
+		}
+		if p_match_punct(p, "<@") {
+			left = p_call2(p, "array_contained", left, parse_operand(p))
+			continue
+		}
+		if p_match_punct(p, "&&") {
+			left = p_call2(p, "array_overlap", left, parse_operand(p))
+			continue
+		}
 		if p_match_punct(p, "=") || p_match_punct(p, "==") {
+			// `x = ANY (array)` is the quantified comparison; other operators
+			// would need a matrix of them, so they are refused with the spelling
+			// that works.
+			if p_is_keyword(p, "any") || p_is_keyword(p, "some") || p_is_keyword(p, "all") {
+				left = p_quantified(p, left, .Eq)
+				continue
+			}
 			left = p_compare(p, .Eq, left, parse_operand(p))
 			continue
 		}
 		if p_match_punct(p, "!=") || p_match_punct(p, "<>") {
+			if p_is_keyword(p, "all") {
+				left = p_quantified(p, left, .Ne)
+				continue
+			}
 			left = p_compare(p, .Ne, left, parse_operand(p))
 			continue
 		}
@@ -2211,6 +2316,18 @@ parse_unary :: proc(p: ^Parser) -> ^Expr {
 		return expr_unary(p, .Bit_Not, parse_unary(p))
 	}
 	expr := parse_primary(p)
+	// `x[i]` is PostgreSQL's array element, one-based as in PostgreSQL. It binds
+	// like a cast, tighter than any operator.
+	for expr != nil && p_match_punct(p, "[") {
+		index := parse_expression(p)
+		p_expect_punct(p, "]")
+		args := make([]^Expr, 2, p.alloc)
+		args[0] = expr
+		args[1] = index
+		e := new(Expr, p.alloc)
+		e^ = Call_Expr{name = "array_get", args = args}
+		expr = e
+	}
 	// `x::type` is PostgreSQL's cast. It binds tighter than any operator, so
 	// `-1::text` is `-(1::text)` and `a::int + 1` casts `a` alone.
 	for expr != nil && p_match_punct(p, "::") {
@@ -2313,6 +2430,27 @@ parse_primary :: proc(p: ^Parser) -> ^Expr {
 			e := new(Expr, p.alloc)
 			e^ = Call_Expr{name = name}
 			return e
+		}
+		// `ARRAY[...]` builds an array from its elements. `array` is also a
+		// perfectly good column name, so the bracket decides: without one the
+		// token is put back and read as a name.
+		if p_is_keyword(p, "array") {
+			lexer, saved := p_mark(p)
+			p_advance(p)
+			if p_match_punct(p, "[") {
+				items := make([dynamic]^Expr, 0, 2, p.alloc)
+				if !p_is_punct(p, "]") {
+					for {
+						append(&items, parse_expression(p))
+						if !p_match_punct(p, ",") do break
+					}
+				}
+				p_expect_punct(p, "]")
+				e := new(Expr, p.alloc)
+				e^ = Call_Expr{name = "array_make", args = items[:]}
+				return e
+			}
+			p_reset(p, lexer, saved)
 		}
 		if p_is_keyword(p, "cast") {
 			p_advance(p)
