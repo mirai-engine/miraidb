@@ -36,9 +36,9 @@ Rules for this file:
 | S1 | `ON CONFLICT` on a constraint is refused; the rest landed | the constraint resolutions | S |
 | S2 | `UPDATE OR <resolution>` is refused; the rest landed | the UPDATE resolutions | S |
 | S3 | `NATURAL` joins are refused; `RIGHT` and `FULL` landed | the natural join | S |
-| S4 | `FILTER`, `WINDOW`, aggregate `ORDER BY`, ordered-set aggregates missing | the aggregate surface | M |
-| S5 | 39 of 121 built-in functions missing | math, JSON/JSONB, text, introspection | M |
-| S6 | eight statements and 9 pragmas missing | `EXPLAIN QUERY PLAN`, `REINDEX`, `INSTEAD OF`, `generate_series`, … | M |
+| S4 | `FILTER`, named `WINDOW` and aggregate `ORDER BY` missing; the ordered-set aggregates and `json_group_*` landed | the rest of the aggregate surface | S |
+| S5 | 15 of 121 built-in functions missing | the `jsonb_*` family, `json_parse`, `json_array_insert`, `sqlite_offset` | M |
+| S6 | six statements missing; all 63 pragmas answer | `INSTEAD OF`, `generate_series`, `ATTACH ':memory:'`, `VACUUM` in memory | S |
 | S7 | `ANY` columns exist; an untyped column, affinity and cross-class comparison do not; `WITHOUT ROWID` cannot be written | SQLite's typing rules | L |
 | D2 | overlap on an `rtree` table is a scan | node pages and a descent | M |
 | D3 | versions stay until `store_prune_versions` is called | automatic retention, `AS OF` on a join | M |
@@ -219,47 +219,50 @@ from both schemas. Refused with a message that says to name the columns.
 ## S4 — Aggregates and windows
 
 **Now refused.** `FILTER (WHERE …)` on an aggregate or a window, a named `WINDOW`
-clause, `ORDER BY` inside an aggregate's arguments (`group_concat(x ORDER BY x)`),
-and the ordered-set aggregates `median`, `percentile`, `percentile_cont`,
-`percentile_disc`; `json_group_array` and `json_group_object` are missing.
+clause, and `ORDER BY` inside an aggregate's arguments
+(`group_concat(x ORDER BY x)`).
 
-**Done when.** Each runs and matches SQLite.
+**Done since.** The ordered-set aggregates `median`, `percentile`,
+`percentile_cont` and `percentile_disc` (SQLite 3.51's, with its percentage for
+`percentile()` and its error for a fraction outside [0, 1]), and the JSON
+aggregates `json_group_array` and `json_group_object`.
+
+**Done when.** The three refusals above run and match SQLite.
 
 ## S5 — Built-in functions
 
-**Missing (39 of 121).** `if`, `ceiling`, `power`, `ln` and the planner hints landed.
+**Missing (15 of 121).** Math (the hyperbolic family, `ln`), the aliases
+`if`/`ceiling`/`power`, `soundex`, `unistr`/`unistr_quote`, `affinity`,
+`timediff`, the planner hints, `sqlite_source_id`, `sqlite_compileoption_*`, the
+JSON mutators and the ordered-set aggregates all landed.
 
-- Math: `acosh`, `asinh`, `atanh`, `cosh`, `sinh`, `tanh`, `ln`, and the aliases
-  `ceiling`, `power`.
-- Text and logic: `if` (an alias of `iif`), `soundex`, `unistr`, `unistr_quote`,
-  `affinity`.
-- Date: `timediff`, and `current_date` / `current_time` as functions (S1 covers
-  the keywords).
-- Planner hints: `likely`, `unlikely`, `likelihood` (identity functions).
-- Introspection: `sqlite_source_id`, `sqlite_compileoption_get`,
-  `sqlite_compileoption_used`, `sqlite_offset`.
-- JSON: `json_insert`, `json_patch`, `json_pretty`, `json_parse`,
-  `json_error_position`, `json_array_insert`, and the whole `jsonb_*` family
-  (13 functions: SQLite's binary JSON; a first version can store it as text and
-  answer the same values).
+- `json_parse` and `json_array_insert`: SQLite 3.51's, over the JSON text this
+  engine already parses.
+- `sqlite_offset`: SQLite's storage offset of a row's record; this engine is a log,
+  so it has no such number and the honest answer is a refusal or a row `refused`.
+- The `jsonb_*` family (13 names): SQLite's binary JSON. A first version can keep
+  the text form and answer the same values, which is a decision to write down.
 
 **Done when.** `sqlite_gaps.py` lists none of them, and each family has
 differential queries.
 
 ## S6 — Statements and pragmas
 
-**Missing statements.** `EXPLAIN QUERY PLAN` (`EXPLAIN` exists), `REINDEX`,
-`INSTEAD OF` triggers on a view, `INDEXED BY` / `NOT INDEXED`, the
-`generate_series` table function, `VACUUM` and `ATTACH ':memory:'` on an
-in-memory database (SQLite accepts both; here the first is refused as "nothing to
-compact" and the second as a missing file).
+**Missing statements.** `INSTEAD OF` triggers on a view, the `generate_series`
+table function, `VACUUM` and `ATTACH ':memory:'` on an in-memory database (SQLite
+accepts both; here the first is refused as "nothing to compact" and the second as
+a missing file).
 
-**Missing pragmas (9 of 63).** `collation_list`, `module_list`, `temp_store`,
-`incremental_vacuum`, `shrink_memory`, `soft_heap_limit64`,
-`temp_store_directory`, `data_store_directory`, `legacy_file_format`. The last
-three are deprecated in SQLite; answering them is enough.
+**Done since.** `EXPLAIN QUERY PLAN` (SQLite's four columns and its words),
+`REINDEX` (every index is rebuilt from the log at open, so it answers ok and
+checks the name) and the `INDEXED BY` / `NOT INDEXED` hints.
 
-**Done when.** `sqlite_gaps.py` lists none of them.
+**Pragmas.** All 63 answer: the nine that were unknown (`collation_list`,
+`module_list`, `temp_store`, `incremental_vacuum`, `shrink_memory`,
+`soft_heap_limit64`, `temp_store_directory`, `data_store_directory`,
+`legacy_file_format`) report what they mean here.
+
+**Done when.** `sqlite_gaps.py` lists none of the remaining statements.
 
 ## S7 — Affinity, untyped columns and `WITHOUT ROWID`
 
