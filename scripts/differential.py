@@ -161,6 +161,9 @@ QUERIES = [
     "UPDATE kv SET v = 5 WHERE k = 'b' RETURNING k, v",
     "SELECT k, v FROM kv ORDER BY k",
     "SELECT k, old_v, new_v FROM audit ORDER BY id",
+    # IN and BETWEEN compare under the left operand's collation.
+    "SELECT id FROM emp WHERE name COLLATE NOCASE IN ('ANA', 'Zoe') ORDER BY id",
+    "SELECT id FROM emp WHERE name COLLATE NOCASE BETWEEN 'L' AND 'MARIA' ORDER BY id",
     # Common table expressions on a write (D38): in front of it, and inside an
     # INSERT's SELECT; recursive too; seen by the WHERE of an UPDATE and a DELETE.
     "WITH c AS (SELECT 'd' AS k, 4 AS v) INSERT INTO kv (k, v) SELECT k, v FROM c RETURNING k, v",
