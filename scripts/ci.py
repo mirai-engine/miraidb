@@ -30,6 +30,9 @@ DEFAULT_ODIN = os.environ.get("ODIN") or shutil.which("odin") or "odin"
 # (or --windows-python) to the interpreter that can load the DLL. Without it the
 # DLL smokes are skipped with a message.
 DEFAULT_WINDOWS_PYTHON = os.environ.get("MIRAIDB_WINDOWS_PYTHON", "")
+# A gate that runs longer than this is stopped and fails: a hang (a test that
+# spins under a lock) used to keep the whole run waiting with no report.
+GATE_TIMEOUT_SECONDS = 1800
 PACKAGES = ["src/engine", "src/cli", "src/capi", "src/sqlite_compat", "src/server", "src/tests"]
 
 
@@ -40,6 +43,7 @@ class Gate:
         command: list[str],
         env: dict[str, str] | None = None,
         refuse: str | None = None,
+        timeout: float = GATE_TIMEOUT_SECONDS,
     ):
         self.name = name
         self.command = command
@@ -47,17 +51,27 @@ class Gate:
         # A line the output must not hold even when the command exits 0: the
         # test runner reports a bad free and still passes the test.
         self.refuse = refuse
+        self.timeout = timeout
 
     def run(self) -> tuple[bool, str, float]:
         started = time.time()
         environment = {**os.environ, **self.env}
-        done = subprocess.run(
-            self.command,
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
+        try:
+            done = subprocess.run(
+                self.command,
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=self.timeout,
+            )
+        except subprocess.TimeoutExpired as expired:
+            elapsed = time.time() - started
+            partial = expired.stdout or ""
+            if isinstance(partial, bytes):
+                partial = partial.decode(errors="replace")
+            report = [partial.strip(), f"stopped after {self.timeout:.0f}s: the gate hung"]
+            return False, "\n".join(line for line in report if line), elapsed
         elapsed = time.time() - started
         output = (done.stdout + done.stderr).strip()
         if self.refuse is not None:
@@ -80,7 +94,7 @@ def build_gates(args: argparse.Namespace) -> list[Gate]:
     gates: list[Gate] = []
     if not args.skip_build:
         gates.append(Gate("build (binaries + suite)", [sys.executable, "scripts/build.py"], odin_env))
-    gates.append(Gate("unit tests", [args.odin, "test", "src/tests"], refuse="+++ bad free"))
+    gates.append(Gate("unit tests", [args.odin, "test", "src/tests"], refuse="+++ bad free", timeout=900))
     gates.append(
         Gate("conformance (20 cases)", [sys.executable, "scripts/conformance.py", "--bin", cli])
     )
