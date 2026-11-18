@@ -806,29 +806,43 @@ tx_drop_column :: proc(tx: ^Tx, name, column_name: string) -> Error {
 	if current_err.kind != .None do return current_err
 	index, found := schema_column_index(&current.schema, column_name)
 	if !found do return errf(.Column_Not_Found, "column %s does not exist in %s", column_name, name)
-	if checks_use_column(&current.schema, column_name, skip_own = true) {
-		return errf(.Sql_Unsupported, "cannot drop column %s: a CHECK constraint of %s uses it", column_name, name)
+	// SQLite's rules, in its words: a key column stays, and so does one a
+	// table CHECK or an index reads.
+	for key in current.schema.primary_key {
+		if key == index do return errf(.Sql_Unsupported, "cannot drop PRIMARY KEY column: \"%s\"", column_name)
 	}
 	if current.schema.columns[index].unique || current.schema.columns[index].auto_increment {
-		return errf(.Sql_Unsupported, "cannot drop the key column %s", column_name)
+		return errf(.Sql_Unsupported, "cannot drop UNIQUE column: \"%s\"", column_name)
 	}
-	for key in current.schema.primary_key {
-		if key == index do return errf(.Sql_Unsupported, "cannot drop the key column %s", column_name)
+	if checks_use_column(&current.schema, column_name, skip_own = true) {
+		return errf(.Sql_Unsupported, "error in table %s after drop column: no such column: %s", name, column_name)
 	}
-	// An index stores column positions; removing a column would shift them, so a
-	// table with secondary indexes must lose them first.
-	for index_def in current.schema.indexes {
-		if !index_def.implicit {
-			return errf(
-				.Sql_Unsupported,
-				"cannot drop %s while %s has secondary indexes",
-				column_name,
-				name,
-			)
+	// The other indexes keep working: their positions after the column shift.
+	shifted_indexes := make([]Index_Schema, len(current.schema.indexes), tx.alloc)
+	for index_def, n in current.schema.indexes {
+		positions := make([]int, len(index_def.columns), tx.alloc)
+		for position, k in index_def.columns {
+			if position == index {
+				if index_def.implicit {
+					return errf(.Sql_Unsupported, "cannot drop UNIQUE column: \"%s\"", column_name)
+				}
+				return errf(.Sql_Unsupported, "error in index %s after drop column: no such column: %s", index_def.name, column_name)
+			}
+			positions[k] = position > index ? position - 1 : position
 		}
-		for position in index_def.columns {
-			if position > index {
-				return errf(.Sql_Unsupported, "cannot drop %s before an indexed column", column_name)
+		shifted_indexes[n] = index_def
+		shifted_indexes[n].columns = positions
+	}
+	// A table whose columns another table's key names by position keeps them.
+	for other_name in tx_table_names(tx, context.temp_allocator) {
+		other := tx_table_probe(tx, other_name)
+		if other == nil || other_name == name do continue
+		for key_def in other.schema.foreign_keys {
+			if !strings.equal_fold(key_def.ref_table, name) do continue
+			for position in key_def.ref_columns {
+				if position >= index {
+					return errf(.Sql_Unsupported, "cannot drop column %s: the foreign key of %s names the columns of %s after it", column_name, other_name, name)
+				}
 			}
 		}
 	}
@@ -847,6 +861,16 @@ tx_drop_column :: proc(tx: ^Tx, name, column_name: string) -> Error {
 	}
 	next_schema := current.schema
 	next_schema.columns = columns[:]
+	next_schema.indexes = shifted_indexes
+	// The table's own keys name positions too.
+	shifted_keys := make([]Foreign_Key, len(current.schema.foreign_keys), tx.alloc)
+	for key_def, n in current.schema.foreign_keys {
+		positions := make([]int, len(key_def.columns), tx.alloc)
+		for position, k in key_def.columns do positions[k] = position > index ? position - 1 : position
+		shifted_keys[n] = key_def
+		shifted_keys[n].columns = positions
+	}
+	next_schema.foreign_keys = shifted_keys
 	// The primary key and auto-increment positions shift after the removed slot.
 	keys := make([dynamic]int, 0, len(current.schema.primary_key), tx.alloc)
 	for key in current.schema.primary_key {
@@ -953,11 +977,6 @@ tx_rename_column :: proc(tx: ^Tx, table_name, from, to: string) -> Error {
 	current, current_err := tx_table(tx, table_name)
 	if current_err.kind != .None do return current_err
 	if strings.equal_fold(from, to) do return ERROR_NONE
-	if checks_use_column(&current.schema, from) {
-		// SQLite rewrites the CHECK's text; this engine does not rewrite SQL text
-		// yet, and a CHECK naming a missing column would refuse every later write.
-		return errf(.Sql_Unsupported, "cannot rename column %s: a CHECK constraint of %s uses it", from, table_name)
-	}
 	for existing in current.schema.columns {
 		if strings.equal_fold(existing.name, to) {
 			return errf(.Invalid_Argument, "column %s already exists in %s", to, table_name)
@@ -973,8 +992,25 @@ tx_rename_column :: proc(tx: ^Tx, table_name, from, to: string) -> Error {
 		}
 	}
 	if !found do return errf(.Column_Not_Found, "column %s does not exist in %s", from, table_name)
+	// The CHECK constraints and generated columns that name it are rewritten,
+	// as SQLite rewrites them (alter_follow.odin).
+	for &column in columns {
+		if len(column.generated_sql) > 0 {
+			column.generated_sql = sql_rename_column_refs(tx, column.generated_sql, table_name, from, to, true, tx.alloc)
+		}
+		if len(column.default_sql) > 0 {
+			column.default_sql = sql_rename_column_refs(tx, column.default_sql, table_name, from, to, true, tx.alloc)
+		}
+	}
+	checks := make([]Check_Constraint, len(current.schema.checks), tx.alloc)
+	for check, i in current.schema.checks {
+		checks[i] = check
+		checks[i].sql = sql_rename_column_refs(tx, check.sql, table_name, from, to, true, tx.alloc)
+		if strings.equal_fold(check.column, from) do checks[i].column = strings.clone(to, tx.alloc)
+	}
 	next_schema := current.schema
 	next_schema.columns = columns
+	next_schema.checks = checks
 	if validate_err := schema_validate(&next_schema); validate_err.kind != .None {
 		return validate_err
 	}

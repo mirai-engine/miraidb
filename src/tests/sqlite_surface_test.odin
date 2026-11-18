@@ -340,12 +340,13 @@ test_check_constraints :: proc(t: ^testing.T) {
 	run(t, reopened, "INSERT INTO p VALUES (10, 'zz', 1)")
 
 	// A column's own CHECK goes with the column; one that names it from the
-	// table blocks the drop, and a rename is refused rather than left dangling.
+	// table blocks the drop, and a rename rewrites the CHECK, as in SQLite.
 	run(t, reopened, "CREATE TABLE d (id INTEGER PRIMARY KEY, q INTEGER CHECK (q > 0), r INTEGER, CHECK (r < 10))")
 	run(t, reopened, "ALTER TABLE d DROP COLUMN q")
 	testing.expect_value(t, run_error(t, reopened, "ALTER TABLE d DROP COLUMN r").kind, db.Error_Kind.Sql_Unsupported)
-	testing.expect_value(t, run_error(t, reopened, "ALTER TABLE d RENAME COLUMN r TO s").kind, db.Error_Kind.Sql_Unsupported)
+	run(t, reopened, "ALTER TABLE d RENAME COLUMN r TO s")
 	testing.expect_value(t, run_error(t, reopened, "INSERT INTO d VALUES (1, 50)").kind, db.Error_Kind.Check_Violation)
+	run(t, reopened, "INSERT INTO d (id, s) VALUES (2, 5)")
 }
 
 @(test)

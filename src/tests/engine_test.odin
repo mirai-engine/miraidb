@@ -8885,11 +8885,16 @@ test_alter_table_drop_column :: proc(t: ^testing.T) {
 	// Key and unique columns cannot be dropped.
 	_, key_err := db.sql_execute(store, "ALTER TABLE t DROP COLUMN id")
 	testing.expect_value(t, key_err.kind, db.Error_Kind.Sql_Unsupported)
-	// An index that stores column positions blocks a drop until it is removed.
+	// An index on other columns stays, as in SQLite; one on the column blocks
+	// the drop.
 	run(t, store, "CREATE TABLE indexed (id INTEGER PRIMARY KEY, a TEXT, b TEXT)")
 	run(t, store, "CREATE UNIQUE INDEX indexed_a ON indexed (a)")
+	run(t, store, "INSERT INTO indexed (id, a, b) VALUES (1, 'x', 'y')")
 	_, indexed_err := db.sql_execute(store, "ALTER TABLE indexed DROP COLUMN b")
-	testing.expect_value(t, indexed_err.kind, db.Error_Kind.Sql_Unsupported)
+	testing.expect_value(t, indexed_err.kind, db.Error_Kind.None)
+	testing.expect_value(t, run_error(t, store, "INSERT INTO indexed (id, a) VALUES (2, 'x')").kind, db.Error_Kind.Duplicate_Unique)
+	_, on_index := db.sql_execute(store, "ALTER TABLE indexed DROP COLUMN a")
+	testing.expect_value(t, on_index.kind, db.Error_Kind.Sql_Unsupported)
 	_, missing := db.sql_execute(store, "ALTER TABLE t DROP COLUMN nope")
 	testing.expect_value(t, missing.kind, db.Error_Kind.Column_Not_Found)
 

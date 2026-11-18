@@ -562,3 +562,63 @@ test_create_text_is_kept :: proc(t: ^testing.T) {
 	defer cleanup_db(reopened, "create_text")
 	check(t, reopened, want)
 }
+
+@(test)
+test_alter_table_follows :: proc(t: ^testing.T) {
+	// ALTER TABLE carries along what names the table or the column, as
+	// SQLite does; the texts and answers expected are SQLite's.
+	store := fresh_db(t, "alter_follows")
+	if store == nil do return
+	defer cleanup_db(store, "alter_follows")
+	exec :: proc(t: ^testing.T, store: ^db.Store, statements: ..string) {
+		for sql in statements {
+			result := run(t, store, sql)
+			db.sql_result_destroy(&result)
+		}
+	}
+	text :: proc(t: ^testing.T, store: ^db.Store, name: string) -> string {
+		return scalar(t, store, strings.concatenate({"SELECT sql FROM sqlite_master WHERE name = '", name, "'"}, context.temp_allocator)).s
+	}
+	// RENAME TO: the trigger moves with its table and keeps firing; the view
+	// and the trigger body read the new name.
+	exec(t, store,
+		"create table t(a, b)", "create table t2(a, b)", "create view v as select b from t",
+		"create trigger tr after insert on t begin insert into t2 select * from t; end",
+		"alter table t rename to tt", "insert into tt values (1, 2)")
+	testing.expect_value(t, scalar(t, store, "SELECT b FROM t2").i, i64(2))
+	testing.expect_value(t, scalar(t, store, "SELECT b FROM v").i, i64(2))
+	testing.expect_value(t, text(t, store, "v"), `CREATE VIEW v as select b from "tt"`)
+	testing.expect_value(t, text(t, store, "tr"), `CREATE TRIGGER tr after insert on "tt" begin insert into t2 select * from "tt"; end`)
+
+	// RENAME COLUMN: a CHECK, UPDATE OF, NEW and OLD, and a qualified mention
+	// follow; the same name in another table does not.
+	exec(t, store,
+		"create table c(a, b, c, check (b > a))", "alter table c rename column b to bb",
+		"create table p(a, b)", "create table u(b)", "create view pv as select p.b, u.b as ub from p, u",
+		"create trigger pt after update of b on p begin update u set b = new.b where b = old.b; end",
+		"alter table p rename column b to bb", "insert into p values (1, 5)", "insert into u values (5)", "update p set bb = 6")
+	testing.expect_value(t, text(t, store, "c"), `CREATE TABLE c(a, bb, c, check (bb > a))`)
+	_ = run_error(t, store, "insert into c values (1, 0, 0)")
+	testing.expect_value(t, scalar(t, store, "SELECT b FROM u").i, i64(6))
+	testing.expect_value(t, scalar(t, store, "SELECT bb || ',' || ub FROM pv").s, "6,6")
+	testing.expect_value(t, text(t, store, "pv"), `CREATE VIEW pv as select p.bb, u.b as ub from p, u`)
+	testing.expect_value(t, text(t, store, "pt"), `CREATE TRIGGER pt after update of bb on p begin update u set b = new.bb where b = old.bb; end`)
+
+	// DROP COLUMN: the other indexes stay and are used; a column an index,
+	// a key or a table CHECK reads stays, in SQLite's words.
+	exec(t, store, "create table d(a, b, c)", "create index da on d(a)", "create index dc on d(c)",
+		"insert into d values (1, 2, 3)", "alter table d drop column b")
+	testing.expect_value(t, scalar(t, store, "SELECT a FROM d WHERE c = 3").i, i64(1))
+	testing.expect_value(t, text(t, store, "d"), "CREATE TABLE d(a, c)")
+	refusals := [][2]string {
+		{"alter table d drop column c", "error in index dc after drop column: no such column: c"},
+		{"alter table c drop column bb", "error in table c after drop column: no such column: bb"},
+	}
+	exec(t, store, "create table k(a integer primary key, b unique)")
+	for refusal in refusals {
+		err := run_error(t, store, refusal[0])
+		testing.expectf(t, err.message == refusal[1], "%s: %s", refusal[0], err.message)
+	}
+	testing.expect_value(t, run_error(t, store, "alter table k drop column a").message, `cannot drop PRIMARY KEY column: "a"`)
+	testing.expect_value(t, run_error(t, store, "alter table k drop column b").message, `cannot drop UNIQUE column: "b"`)
+}

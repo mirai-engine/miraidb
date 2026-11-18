@@ -150,7 +150,7 @@ the gaps are named rather than left to be discovered.
   `linux_arm64` and `darwin_arm64`. The POSIX lock is the reason it is checked:
   it carried a missing `core:sys/posix` import and two wrong integer types until
   this round, so the code that a Linux build would run had never been compiled.
-- 340 integration tests covering CRUD, recovery, constraints, transactions,
+- 341 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
@@ -313,11 +313,13 @@ than 1000 bytes cannot be indexed and the insert says so.
   `scripts/soak.py` does not measure the working set, so nothing would notice if
   they were real.
 - **Schema changes.** `ALTER TABLE` renames the table, adds and drops columns,
-  and renames a column (keeping the rows and the indexes); text that names a
-  column is not rewritten.
+  and renames a column (keeping the rows and the indexes); the CHECK
+  constraints, views, trigger bodies and `UPDATE OF` lists that name the table
+  or the column are rewritten, as SQLite rewrites them.
 - **Triggers.** `BEFORE` and `AFTER` for `INSERT`, `UPDATE` and `DELETE`, with
   `WHEN`, `NEW` and `OLD`; a `BEFORE` body that fails stops the write. A
-  column-specific (`OF`) trigger is refused.
+  column-specific (`UPDATE OF`) trigger fires when the `SET` names one of its
+  columns.
 - **Window frames.** `ROWS`, `RANGE` and `GROUPS` work for aggregates and value
   functions, with offsets measured in the ordering value where the unit says so.
   A window beside `GROUP BY` is refused, and so is `FILTER (WHERE …)`.

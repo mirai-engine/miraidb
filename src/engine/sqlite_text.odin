@@ -305,6 +305,18 @@ sql_text_on_alter :: proc(tx: ^Tx, stmt: Alter_Table_Stmt, indexes: []string) ->
 				if err := sql_text_set(tx, index, sql_text_rename_column(text, stmt.rename_column, stmt.rename_to, context.temp_allocator)); err.kind != .None do return err
 			}
 		}
+		// The views and the triggers that name the column.
+		trigger_tables := make(map[string]string, 8, context.temp_allocator)
+		for trigger in tx_triggers(tx, context.temp_allocator) do trigger_tables[trigger.name] = trigger.table
+		for view in tx_views(tx, context.temp_allocator) do trigger_tables[view[0]] = ""
+		for name, text in texts {
+			trigger_table, is_object := trigger_tables[name]
+			if !is_object do continue
+			own := strings.equal_fold(trigger_table, stmt.table)
+			renamed := sql_rename_column_refs(tx, text, stmt.table, stmt.rename_column, stmt.rename_to, own, context.temp_allocator)
+			if renamed == text do continue
+			if err := sql_text_set(tx, name, renamed); err.kind != .None do return err
+		}
 	case len(stmt.rename_to) > 0:
 		if has_text {
 			if err := sql_text_forget(tx, stmt.table); err.kind != .None do return err
@@ -312,7 +324,7 @@ sql_text_on_alter :: proc(tx: ^Tx, stmt: Alter_Table_Stmt, indexes: []string) ->
 		}
 		for name, text in texts {
 			if name == stmt.table do continue
-			renamed := sql_text_rename_object(text, stmt.table, stmt.rename_to, context.temp_allocator)
+			renamed := sql_rename_table_refs(text, stmt.table, stmt.rename_to, context.temp_allocator)
 			if renamed == text do continue
 			if err := sql_text_set(tx, name, renamed); err.kind != .None do return err
 		}
