@@ -1593,8 +1593,10 @@ mirror_apply_commit :: proc(store: ^Store, m: ^Sqlite_Mirror, ops: []Store_Op) -
 // sqlite_mirror_validate reads a mirrored file and checks the invariants a
 // b-tree reader relies on: every leaf's rowids increase, every leaf's largest
 // rowid is not above the separator its parent stores for it, and the leaves
-// appear in key order. It is the assertion the mirror tests make after a
-// commit; SQLite's own `PRAGMA integrity_check` is the same check by another
+// appear in key order; every index (and WITHOUT ROWID table) holds its
+// entries in increasing order, and an index that is not partial holds one
+// entry per row of its table. It is the assertion the mirror tests make after
+// a commit; SQLite's own `PRAGMA integrity_check` is the same check by another
 // implementation.
 sqlite_mirror_validate :: proc(path: string, alloc := context.allocator) -> (ok: bool, reason: string) {
 	file, open_err := sqlite_file_open(path, alloc, true)
@@ -1603,13 +1605,76 @@ sqlite_mirror_validate :: proc(path: string, alloc := context.allocator) -> (ok:
 		return false, "cannot open"
 	}
 	defer sqlite_file_destroy(&file)
+	rows := make(map[string]int, len(file.tables), context.temp_allocator)
 	for &table in file.tables {
+		if table.without_rowid {
+			count, sorted := mirror_index_entries(&file, table.root_page)
+			if !sorted do return false, fmt.aprintf("table %s is not in key order", table.name, allocator = alloc)
+			rows[table.name] = count
+			continue
+		}
 		check := Mirror_Check{file = &file, alloc = alloc, ok = true}
 		mirror_check_page(&check, table.root_page, 0, false)
 		if !check.ok do return false, check.reason
 		delete(check.reason, alloc)
+		count := 0
+		counter := proc(user: rawptr, rowid: i64, payload: []u8) -> bool {
+			(cast(^int)user)^ += 1
+			return true
+		}
+		if !sqlite_walk(&file, table.root_page, true, counter, &count, 0) do return false, "malformed table"
+		rows[table.name] = count
+	}
+	for tree in file.index_trees {
+		count, sorted := mirror_index_entries(&file, tree.root)
+		if !sorted do return false, fmt.aprintf("index %s is not in key order", tree.name, allocator = alloc)
+		if !tree.partial && count != rows[tree.table] {
+			return false, fmt.aprintf("wrong # of entries in index %s", tree.name, allocator = alloc)
+		}
 	}
 	return true, ""
+}
+
+// mirror_index_entries counts an index b-tree's entries, interior cells
+// included, and answers whether each is greater than the one before.
+@(private)
+mirror_index_entries :: proc(file: ^Sqlite_File, root: u32) -> (count: int, sorted: bool) {
+	Ctx :: struct {
+		count:    int,
+		sorted:   bool,
+		previous: []Value,
+	}
+	ctx := Ctx{sorted = true}
+	defer if ctx.previous != nil {
+		for value in ctx.previous do value_deep_free(value, context.temp_allocator)
+		delete(ctx.previous, context.temp_allocator)
+	}
+	visit := proc(user: rawptr, rowid: i64, payload: []u8) -> bool {
+		ctx := cast(^Ctx)user
+		values, ok := sqlite_record(payload, context.temp_allocator)
+		if !ok {
+			ctx.sorted = false
+			return false
+		}
+		if ctx.previous != nil {
+			order := slice.Ordering.Equal
+			for i in 0 ..< min(len(values), len(ctx.previous)) {
+				compared, comparable := value_compare(ctx.previous[i], values[i])
+				if comparable && compared != .Equal {
+					order = compared
+					break
+				}
+			}
+			if order != .Less do ctx.sorted = false
+			for value in ctx.previous do value_deep_free(value, context.temp_allocator)
+			delete(ctx.previous, context.temp_allocator)
+		}
+		ctx.previous = values
+		ctx.count += 1
+		return true
+	}
+	if !sqlite_walk(file, root, false, visit, &ctx, 0) do return ctx.count, false
+	return ctx.count, ctx.sorted
 }
 
 @(private)

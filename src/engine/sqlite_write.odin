@@ -431,14 +431,7 @@ sqlite_index_cell :: proc(w: ^Sqlite_Writer, payload: []u8) -> []u8 {
 	return result
 }
 
-// sqlite_write_index_tree writes one index as a b-tree: leaf pages of type 10
-// and interior pages of type 2 whose cells carry the largest key of the child.
-@(private)
-Sqlite_Index_Node :: struct {
-	page:         int,
-	last_payload: []u8,
-}
-
+// sqlite_write_index_tree writes one index as a b-tree (sqlite_index_btree).
 @(private)
 sqlite_write_index_tree :: proc(
 	w: ^Sqlite_Writer,
@@ -484,109 +477,126 @@ sqlite_write_index_tree :: proc(
 		return a[len(a) - 1].i < b[len(b) - 1].i
 	})
 
-	nodes := make([dynamic]Sqlite_Index_Node, 0, 8, alloc)
-	defer delete(nodes)
-	owned := make([dynamic][]u8, 0, 8, alloc)
+	payloads := make([][]u8, len(keys), alloc)
 	defer {
-		for payload in owned do delete(payload, alloc)
-		delete(owned)
+		for payload in payloads do delete(payload, alloc)
+		delete(payloads, alloc)
 	}
+	for values, i in keys do payloads[i] = sqlite_encode_record(values, -1, alloc)
+	if len(payloads) == 0 do return 0
+	return sqlite_index_btree(w, payloads, alloc)
+}
 
-	page_no := 0
-	page: []u8
-	content := 0
-	count := 0
-	last: []u8
-	finish_leaf := proc(w: ^Sqlite_Writer, page: []u8, count: int, content: int) {
-		page[0] = 10
-		page[3] = u8(count >> 8)
-		page[4] = u8(count)
-		page[5] = u8(content >> 8)
-		page[6] = u8(content)
+// sqlite_index_btree writes sorted index records as a b-tree: leaf pages of
+// type 10 and interior pages of type 2. Every entry is stored once: the entry
+// where a page ends is not on any leaf, it is the interior cell that separates
+// that page from the next one, as in SQLite's own index b-trees.
+@(private)
+sqlite_index_btree :: proc(w: ^Sqlite_Writer, payloads: [][]u8, alloc: mem.Allocator) -> int {
+	cell_size := proc(w: ^Sqlite_Writer, payload: []u8) -> int {
+		local := sqlite_local_size(len(payload), w.usable, false)
+		return varint_size(i64(len(payload))) + local + (local < len(payload) ? 4 : 0)
 	}
-	for values in keys {
-		payload := sqlite_encode_record(values, -1, alloc)
-		cell := sqlite_index_cell(w, payload)
-		defer delete(cell)
-		if page_no == 0 {
-			page_no = sqlite_writer_new_page(w)
-			page = sqlite_writer_page(w, page_no)
-			content = w.usable
-			count = 0
+	// The level being written: its entries, and for an interior level the page
+	// left of each entry plus the one after the last.
+	entries := make([dynamic][]u8, 0, len(payloads), alloc)
+	defer delete(entries)
+	for payload in payloads do append(&entries, payload)
+	children := make([dynamic]int, 0, 8, alloc)
+	defer delete(children)
+	leaf := true
+	for {
+		sizes := make([]int, len(entries), alloc)
+		defer delete(sizes, alloc)
+		for entry, i in entries do sizes[i] = cell_size(w, entry) + (leaf ? 0 : 4)
+		room := w.usable - (leaf ? 8 : 12)
+		groups, separators := sqlite_index_split(sizes, room, alloc)
+		defer {
+			for group in groups do delete(group)
+			delete(groups)
+			delete(separators)
 		}
-		if len(cell) + 8 + (count + 1) * 2 > content && count > 0 {
-			finish_leaf(w, page, count, content)
-			append(&nodes, Sqlite_Index_Node{page = page_no, last_payload = last})
-			page_no = sqlite_writer_new_page(w)
-			page = sqlite_writer_page(w, page_no)
-			content = w.usable
-			count = 0
-		}
-		content -= len(cell)
-		copy(page[content:content + len(cell)], cell)
-		at := 8 + count * 2
-		page[at] = u8(content >> 8)
-		page[at + 1] = u8(content)
-		count += 1
-		kept := make([]u8, len(payload), alloc)
-		copy(kept, payload)
-		append(&owned, kept)
-		last = kept
-		// The payload is encoded fresh per entry; the leaf keeps a copy in `kept`.
-		delete(payload, alloc)
-	}
-	if page_no != 0 {
-		finish_leaf(w, page, count, content)
-		append(&nodes, Sqlite_Index_Node{page = page_no, last_payload = last})
-	}
-	if len(nodes) == 0 do return 0
-	for len(nodes) > 1 {
-		next := make([dynamic]Sqlite_Index_Node, 0, 8, alloc)
-		i := 0
-		for i < len(nodes) {
-			interior_no := sqlite_writer_new_page(w)
-			interior := sqlite_writer_page(w, interior_no)
-			interior[0] = 2
-			content = w.usable
-			count = 0
-			for i + 1 < len(nodes) {
-				key := nodes[i].last_payload
-				cell_size := 4 + varint_size(i64(len(key))) + len(key)
-				if cell_size + 12 + (count + 1) * 2 > content && count > 0 do break
-				content -= cell_size
-				child := u32(nodes[i].page)
-				interior[content] = u8(child >> 24)
-				interior[content + 1] = u8(child >> 16)
-				interior[content + 2] = u8(child >> 8)
-				interior[content + 3] = u8(child)
-				key_buffer := make([dynamic]u8, 0, 9)
-				sqlite_put_varint(&key_buffer, u64(len(key)))
-				copy(interior[content + 4:content + 4 + len(key_buffer)], key_buffer[:])
-				copy(interior[content + 4 + len(key_buffer):content + 4 + len(key_buffer) + len(key)], key)
-				delete(key_buffer)
-				at := 12 + count * 2
-				interior[at] = u8(content >> 8)
-				interior[at + 1] = u8(content)
-				count += 1
-				i += 1
+		pages := make([dynamic]int, 0, len(groups), alloc)
+		for group in groups {
+			page_no := sqlite_writer_new_page(w)
+			content := w.usable
+			for item, k in group {
+				cell := sqlite_index_cell(w, entries[item])
+				defer delete(cell)
+				page := sqlite_writer_page(w, page_no)
+				if leaf {
+					content -= len(cell)
+					copy(page[content:], cell)
+				} else {
+					content -= len(cell) + 4
+					child := u32(children[item])
+					page[content], page[content + 1], page[content + 2], page[content + 3] =
+						u8(child >> 24), u8(child >> 16), u8(child >> 8), u8(child)
+					copy(page[content + 4:], cell)
+				}
+				at := (leaf ? 8 : 12) + k * 2
+				page[at], page[at + 1] = u8(content >> 8), u8(content)
 			}
-			right := u32(nodes[i].page)
-			interior[8] = u8(right >> 24)
-			interior[9] = u8(right >> 16)
-			interior[10] = u8(right >> 8)
-			interior[11] = u8(right)
-			i += 1
-			interior[3] = u8(count >> 8)
-			interior[4] = u8(count)
-			interior[5] = u8(content >> 8)
-			interior[6] = u8(content)
-			last_key := nodes[i - 1].last_payload
-			append(&next, Sqlite_Index_Node{page = interior_no, last_payload = last_key})
+			page := sqlite_writer_page(w, page_no)
+			page[0] = leaf ? 10 : 2
+			page[3], page[4] = u8(len(group) >> 8), u8(len(group))
+			page[5], page[6] = u8(content >> 8), u8(content)
+			if !leaf {
+				right := u32(children[group[len(group) - 1] + 1])
+				page[8], page[9], page[10], page[11] = u8(right >> 24), u8(right >> 16), u8(right >> 8), u8(right)
+			}
+			append(&pages, page_no)
 		}
-		delete(nodes)
-		nodes = next
+		if len(separators) == 0 {
+			root := pages[0]
+			delete(pages)
+			return root
+		}
+		next := make([dynamic][]u8, 0, len(separators), alloc)
+		for item in separators do append(&next, entries[item])
+		delete(entries)
+		entries = next
+		delete(children)
+		children = pages
+		leaf = false
 	}
-	return nodes[0].page
+}
+
+// sqlite_index_split cuts a level's entries into pages of `room` bytes (a
+// cell plus its 2-byte pointer each). The entry at a cut goes to no page: it
+// separates the two pages in the level above. The last entry never separates,
+// since no page would follow it; the one before it does instead.
+@(private)
+sqlite_index_split :: proc(sizes: []int, room: int, alloc: mem.Allocator) -> (groups: [dynamic][dynamic]int, separators: [dynamic]int) {
+	groups = make([dynamic][dynamic]int, 0, 8, alloc)
+	separators = make([dynamic]int, 0, 8, alloc)
+	current := make([dynamic]int, 0, 16, alloc)
+	used := 0
+	for i := 0; i < len(sizes); i += 1 {
+		cost := sizes[i] + 2
+		if len(current) > 0 && used + cost > room {
+			if i == len(sizes) - 1 && len(current) > 1 {
+				last := pop(&current)
+				append(&groups, current)
+				append(&separators, last)
+				current = make([dynamic]int, 0, 16, alloc)
+				append(&current, i)
+				used = cost
+				continue
+			}
+			if i < len(sizes) - 1 {
+				append(&groups, current)
+				append(&separators, i)
+				current = make([dynamic]int, 0, 16, alloc)
+				used = 0
+				continue
+			}
+		}
+		append(&current, i)
+		used += cost
+	}
+	append(&groups, current)
+	return groups, separators
 }
 
 @(private)

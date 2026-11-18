@@ -72,6 +72,15 @@ Sqlite_Index :: struct {
 	sql:   string,
 }
 
+// Sqlite_Index_Tree is one index row of sqlite_master with a b-tree: its
+// name, its table, its root page and whether a WHERE makes it partial.
+Sqlite_Index_Tree :: struct {
+	name:    string,
+	table:   string,
+	root:    u32,
+	partial: bool,
+}
+
 // Sqlite_File is an open SQLite database image held in memory.
 Sqlite_File :: struct {
 	data:      []u8,
@@ -86,6 +95,9 @@ Sqlite_File :: struct {
 	// others are the views and triggers, kept as text because the engine has no
 	// model for them. A rewrite re-emits them unchanged (D27).
 	others:    []Sqlite_Object,
+	// index_trees are every index b-tree sqlite_master names, automatic ones
+	// included: what a check walks to count an index's entries.
+	index_trees: []Sqlite_Index_Tree,
 	// sequence_root is sqlite_sequence's root page, 0 when the file has none.
 	sequence_root: u32,
 	// wal_pages holds the images a write-ahead log carries; the reader consults
@@ -471,6 +483,7 @@ Sqlite_Master_Ctx :: struct {
 	tables:  [dynamic]Sqlite_Table,
 	indexes: [dynamic]Sqlite_Index,
 	others:  [dynamic]Sqlite_Object,
+	trees:   [dynamic]Sqlite_Index_Tree,
 	sequence_root: u32,
 }
 
@@ -489,6 +502,17 @@ sqlite_master_visit :: proc(user: rawptr, rowid: i64, payload: []u8) -> bool {
 	name := values[1]
 	sql := values[4]
 	if kind.kind == .String && strings.equal_fold(kind.s, "index") {
+		if name.kind == .String && values[3].kind == .Int && values[3].i > 0 {
+			append(
+				&ctx.trees,
+				Sqlite_Index_Tree {
+					name = strings.clone(name.s, ctx.file.alloc),
+					table = values[2].kind == .String ? strings.clone(values[2].s, ctx.file.alloc) : "",
+					root = u32(values[3].i),
+					partial = sql.kind == .String && sqlite_contains_word(sql.s, "WHERE"),
+				},
+			)
+		}
 		// sql is the CREATE INDEX statement SQLite kept; the table name is the
 		// fourth column. An automatic index has no SQL and is left out.
 		if name.kind == .String && sql.kind == .String && len(sql.s) > 0 &&
@@ -902,6 +926,7 @@ sqlite_file_parse :: proc(
 	file.tables = ctx.tables[:]
 	file.indexes = ctx.indexes[:]
 	file.others = ctx.others[:]
+	file.index_trees = ctx.trees[:]
 	file.sequence_root = ctx.sequence_root
 	return file, ERROR_NONE
 }
@@ -937,6 +962,11 @@ sqlite_file_destroy :: proc(file: ^Sqlite_File) {
 		delete(object.sql, file.alloc)
 	}
 	delete(file.others, file.alloc)
+	for tree in file.index_trees {
+		delete(tree.name, file.alloc)
+		delete(tree.table, file.alloc)
+	}
+	delete(file.index_trees, file.alloc)
 	delete(file.tables, file.alloc)
 	delete(file.data, file.alloc)
 	file^ = {}

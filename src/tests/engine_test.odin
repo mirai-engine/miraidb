@@ -6403,6 +6403,36 @@ test_sqlite_import_without_rowid_pages :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT sum(n) FROM k").i, i64(1125750))
 }
 
+// An index over several pages stores each entry once, as SQLite's do: the
+// entry at a page boundary lives in the interior cell, not on a leaf as well
+// (SQLite's integrity_check answered "wrong # of entries in index").
+@(test)
+test_sqlite_write_index_pages :: proc(t: ^testing.T) {
+	store, host := fresh_host(t, "sqlite_write_index_pages")
+	if store == nil do return
+	defer destroy_host(store, host, "sqlite_write_index_pages")
+	run(t, store, "CREATE TABLE t (a INT PRIMARY KEY, b TEXT)")
+	run(t, store, "CREATE INDEX tb ON t (b)")
+	tx := db.tx_begin_write(store)
+	for i in 1 ..= 3000 {
+		_, err := db.sql_execute_in_tx_params(
+			tx,
+			"INSERT INTO t (a, b) VALUES (?, ?)",
+			[]db.Value{db.value_int(i64(i)), db.value_string(fmt.tprintf("value-%06d-padding-padding", i))},
+		)
+		testing.expect(t, db.error_ok(err))
+	}
+	testing.expect(t, db.error_ok(db.tx_commit(tx)))
+
+	path := "_test_sqlite_index_pages.db"
+	defer os.remove(path)
+	_, rows, write_err := db.sqlite_file_write(store, path)
+	if !testing.expectf(t, db.error_ok(write_err), "write: %s", write_err.message) do return
+	testing.expect_value(t, rows, 3000)
+	ok, reason := db.sqlite_mirror_validate(path)
+	testing.expectf(t, ok, "the written file is broken: %s", reason)
+}
+
 @(test)
 test_sqlite_write_roundtrip :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "sqlite_write")
