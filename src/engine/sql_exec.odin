@@ -5174,7 +5174,9 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 		defer sql_result_destroy(&sub)
 		if e.exists do return value_bool(len(sub.rows) > 0), ERROR_NONE
 		if len(sub.rows) == 0 || len(sub.rows[0]) == 0 do return value_null(), ERROR_NONE
-		return sub.rows[0][0], ERROR_NONE
+		// The result is destroyed on return: a text or blob it owns (an
+		// aggregate's, a function's) is copied into the transaction first.
+		return value_clone(sub.rows[0][0], ctx.tx.alloc), ERROR_NONE
 	case In_Expr:
 		if row, is_row := row_value_items(e.operand); is_row {
 			if e.subquery == nil do return {}, errf(.Sql_Syntax, "row value misused")

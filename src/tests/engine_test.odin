@@ -8001,6 +8001,21 @@ test_column_collation_and_generated :: proc(t: ^testing.T) {
 	db.store_close(reopened)
 }
 
+// A scalar subquery's value outlives the subquery: an aggregate's text was
+// read after its result had been freed (an UPDATE stored the freed bytes).
+@(test)
+test_scalar_subquery_text_outlives_it :: proc(t: ^testing.T) {
+	store, host := fresh_host(t, "scalar_subquery_text")
+	if store == nil do return
+	defer destroy_host(store, host, "scalar_subquery_text")
+	run(t, store, "CREATE TABLE s (k INTEGER PRIMARY KEY, label TEXT)")
+	run(t, store, "INSERT INTO s VALUES (1, 'a'), (2, 'zz-the-largest-label-of-all-of-them'), (3, 'm')")
+	testing.expect_value(t, scalar(t, store, "SELECT (SELECT max(label) FROM s) || '!'").s, "zz-the-largest-label-of-all-of-them!")
+	run(t, store, "UPDATE s SET label = (SELECT upper(max(label)) FROM s) WHERE k = 1")
+	run(t, store, "INSERT INTO s VALUES (4, 'filler-' || hex(randomblob(64)))")
+	testing.expect_value(t, scalar(t, store, "SELECT label FROM s WHERE k = 1").s, "ZZ-THE-LARGEST-LABEL-OF-ALL-OF-THEM")
+}
+
 @(test)
 test_attach_and_detach :: proc(t: ^testing.T) {
 	other_path := fmt.aprintf("_test_%s", "attached_other")
