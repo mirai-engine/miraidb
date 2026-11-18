@@ -39,7 +39,6 @@ that way.
 
 | # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
-| 12 | **S5 — functions** | 39 missing: hyperbolic math, `timediff`, `soundex`, `unistr`, planner hints, introspection, the rest of JSON and the `jsonb_*` family. | M | — |
 | 15 | **D4 — secondary indexes in the mirror** | A table with a secondary index re-encodes the `.sqlite` file per commit. | L | — |
 | 16 | **D36 — partial and expression indexes in plans** | The planner skips them; match a predicate to a partial index's WHERE and an expression to its index. | M | 8 |
 | 17 | **D24 — the mirror's last gaps** | A counted skip for an index the engine cannot express, and a mirror fuzz pass. | S | 8 |
@@ -74,8 +73,7 @@ with peer-to-peer sync; its networked phases build on items 27 and 28.
    enforced today but never read.
 3. **D23**: the remaining way the process can die instead of answering; **D34**
    still owes the sanitized suite in CI.
-4. **S5**, then **R3/R4**: the rest of the visible surface and the smaller
-   speed items.
+4. **R3/R4**: the smaller speed items.
 5. **D4/D24** and the depth items of track C.
 6. **D15, D14** and the release gates, in that order.
 

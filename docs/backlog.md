@@ -33,7 +33,6 @@ Rules for this file:
 | R2 | every index entry is an encoded string | fixed-size keys where the column allows | M |
 | R3 | pruning walks every row of every table after each statement | prune what the commit touched | S |
 | R4 | a committed row is copied from the transaction arena to the table | hand the staged row over | M |
-| S5 | 15 of 121 built-in functions missing | the `jsonb_*` family, `json_parse`, `json_array_insert`, `sqlite_offset` | M |
 | D2 | overlap on an `rtree` table is a scan | node pages and a descent | M |
 | D3 | versions stay until `store_prune_versions` is called | automatic retention, `AS OF` on a join | M |
 | D4 | a table with a secondary index re-encodes the `.sqlite` mirror | patch the index b-trees | L |
@@ -109,34 +108,6 @@ only; a test proves a commit to one table never visits another.
 
 **Done when.** The table takes ownership of the staged values. The ownership has
 to survive savepoints, `ALTER` and rollback, which is why this is last.
-
----
-
-## S — SQLite's surface
-
-Measured by `python scripts/sqlite_gaps.py`, which runs every built-in function
-and pragma of SQLite 3.54.1 and 63 grammar shapes through the CLI. Every gap below
-is **refused with a message**, never answered differently: that is the property
-`scripts/differential.py` guards, and each item keeps it. An item is done when
-its shapes run, `sqlite_gaps.py --check` is updated, and the differential corpus
-gains a query per shape that compares the answer with SQLite's.
-
-## S5 — Built-in functions
-
-**Missing (15 of 121).** Math (the hyperbolic family, `ln`), the aliases
-`if`/`ceiling`/`power`, `soundex`, `unistr`/`unistr_quote`, `affinity`,
-`timediff`, the planner hints, `sqlite_source_id`, `sqlite_compileoption_*`, the
-JSON mutators and the ordered-set aggregates all landed.
-
-- `json_parse` and `json_array_insert`: SQLite 3.51's, over the JSON text this
-  engine already parses.
-- `sqlite_offset`: SQLite's storage offset of a row's record; this engine is a log,
-  so it has no such number and the honest answer is a refusal or a row `refused`.
-- The `jsonb_*` family (13 names): SQLite's binary JSON. A first version can keep
-  the text form and answer the same values, which is a decision to write down.
-
-**Done when.** `sqlite_gaps.py` lists none of them, and each family has
-differential queries.
 
 ---
 

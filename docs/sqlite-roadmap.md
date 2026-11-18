@@ -29,7 +29,6 @@ The detail of each item is in [backlog.md](backlog.md); the order is in
 
 | Item | Missing today |
 |---|---|
-| **S5** — functions | `acosh`, `asinh`, `atanh`, `cosh`, `sinh`, `tanh`, `soundex`, `unistr`, `unistr_quote`, `affinity`, `timediff`, `sqlite_source_id`, `sqlite_compileoption_get`, `sqlite_compileoption_used`, `sqlite_offset`, `json_insert`, `json_patch`, `json_pretty`, `json_parse`, `json_error_position`, `json_array_insert`, and 13 `jsonb_*` functions |
 | **D4**, **D24** — the `.sqlite` mirror | secondary index b-trees patched in place; a reported skip for an index the engine cannot express |
 | **D36** — the planner and partial or expression indexes | a query never reads one; it answers from the rows |
 
