@@ -135,6 +135,28 @@ sqlite_is_empty_file :: proc(path: string) -> bool {
 	return info.type == .Regular && info.size == 0
 }
 
+// Path_Kind is what a path names on disk, for opening it the way SQLite does.
+Path_Kind :: enum {
+	Missing,
+	File,
+	Directory,
+}
+
+path_kind :: proc(path: string) -> Path_Kind {
+	info, err := os.stat(path, context.temp_allocator)
+	if err != nil do return .Missing
+	return info.type == .Directory ? .Directory : .File
+}
+
+// sqlite_create_empty_file makes the zero-byte file SQLite leaves for a new
+// database; the first commit writes it.
+sqlite_create_empty_file :: proc(path: string) -> bool {
+	file, err := os.open(path, {.Read, .Write, .Create})
+	if err != nil do return false
+	os.close(file)
+	return true
+}
+
 sqlite_is_file :: proc(path: string) -> bool {
 	data, err := os.read_entire_file(path, context.temp_allocator)
 	if err != nil || len(data) < len(SQLITE_MAGIC) do return false

@@ -318,6 +318,17 @@ store_path_is_memory :: proc(path: string) -> bool {
 	return false
 }
 
+// store_is_database_directory reports a directory that holds an engine
+// database: its log is there.
+store_is_database_directory :: proc(path: string) -> bool {
+	return os.exists(log_segment_path_temp(path))
+}
+
+@(private)
+log_segment_path_temp :: proc(path: string) -> string {
+	return strings.concatenate({path, "/log"}, context.temp_allocator)
+}
+
 store_open :: proc(path: string, options: Store_Options) -> (^Store, Error) {
 	settings := options
 	open_path := path

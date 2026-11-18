@@ -412,23 +412,132 @@ fail :: proc(db: ^Database, err: engine.Error) -> c.int {
 	return code
 }
 
+SQLITE_OPEN_READONLY :: c.int(0x01)
+SQLITE_OPEN_READWRITE :: c.int(0x02)
+SQLITE_OPEN_CREATE :: c.int(0x04)
+SQLITE_OPEN_URI :: c.int(0x40)
+SQLITE_OPEN_MEMORY :: c.int(0x80)
+SQLITE_CANTOPEN :: c.int(14)
+SQLITE_CANTOPEN_ISDIR :: c.int(14 | (2 << 8))
+
+// open_uri reads a `file:` URI as SQLite does: the path after an empty or
+// `localhost` authority, percent-decoded, and the mode its query asks for.
+@(private)
+open_uri :: proc(uri: string, flags: c.int) -> (path: string, out_flags: c.int, ok: bool) {
+	out_flags = flags
+	rest := uri[len("file:"):]
+	query := ""
+	if at := strings.index_any(rest, "?#"); at >= 0 {
+		if rest[at] == '?' {
+			query = rest[at + 1:]
+			if hash := strings.index_byte(query, '#'); hash >= 0 do query = query[:hash]
+		}
+		rest = rest[:at]
+	}
+	if strings.has_prefix(rest, "//") {
+		authority_end := strings.index_byte(rest[2:], '/')
+		authority := authority_end < 0 ? rest[2:] : rest[2:2 + authority_end]
+		if authority != "" && !strings.equal_fold(authority, "localhost") do return "", flags, false
+		rest = authority_end < 0 ? "" : rest[2 + authority_end:]
+	}
+	decoded := strings.builder_make(context.temp_allocator)
+	for i := 0; i < len(rest); i += 1 {
+		if rest[i] == '%' && i + 2 < len(rest) {
+			if value, parsed := strconv.parse_int(rest[i + 1:i + 3], 16); parsed {
+				strings.write_byte(&decoded, u8(value))
+				i += 2
+				continue
+			}
+		}
+		strings.write_byte(&decoded, rest[i])
+	}
+	path = strings.to_string(decoded)
+	// "/C:/x" names the drive path C:/x.
+	when ODIN_OS == .Windows {
+		if len(path) >= 3 && path[0] == '/' && path[2] == ':' do path = path[1:]
+	}
+	for pair in strings.split(query, "&", context.temp_allocator) {
+		key, _, value := strings.partition(pair, "=")
+		if key != "mode" do continue
+		mode := flags &~ (SQLITE_OPEN_READONLY | SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)
+		switch value {
+		case "ro":
+			out_flags = mode | SQLITE_OPEN_READONLY
+		case "rw":
+			out_flags = mode | SQLITE_OPEN_READWRITE
+		case "rwc":
+			out_flags = mode | SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE
+		case "memory":
+			out_flags = flags | SQLITE_OPEN_MEMORY
+		case:
+			return "", flags, false
+		}
+	}
+	return path, out_flags, true
+}
+
+// open_failed answers a failed open as SQLite does: a handle all the same,
+// which carries the error for sqlite3_errmsg and closes with sqlite3_close.
+@(private)
+open_failed :: proc(ppDb: ^rawptr, code: c.int, message: string) -> c.int {
+	db := new(Database)
+	db.error_offset = -1
+	db.last_code = code & 0xff
+	db.last_extended = code
+	db.last_error = string(strings.clone_to_cstring(message))
+	db.filename = strings.clone_to_cstring("")
+	db.statements = make(map[rawptr]^Statement)
+	engine.handle_register(rawptr(db))
+	ppDb^ = rawptr(db)
+	return code & 0xff
+}
+
 @(export)
 sqlite3_open :: proc "c" (filename: cstring, ppDb: ^rawptr) -> c.int {
 	context = runtime.default_context()
-	context = runtime.default_context()
+	return open_database(filename, ppDb, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)
+}
+
+// open_database opens a database the way SQLite's open does: an in-memory
+// spelling in memory, a SQLite file as one (a path that does not exist yet
+// becomes an empty one when the flags allow creating it), and a directory
+// only when it is an engine database.
+@(private)
+open_database :: proc(filename: cstring, ppDb: ^rawptr, open_flags: c.int) -> c.int {
 	if ppDb == nil do return SQLITE_MISUSE
 	if filename == nil {
 		ppDb^ = nil
 		return SQLITE_MISUSE
 	}
 	path := string(filename)
+	flags := open_flags
+	if !engine.store_path_is_memory(path) && flags & SQLITE_OPEN_URI != 0 && strings.has_prefix(path, "file:") {
+		decoded, uri_flags, uri_ok := open_uri(path, flags)
+		if !uri_ok do return open_failed(ppDb, SQLITE_ERROR, "invalid uri")
+		path, flags = decoded, uri_flags
+		if flags & SQLITE_OPEN_MEMORY != 0 do path = ":memory:"
+	}
+	unable :: "unable to open database file"
+	if !engine.store_path_is_memory(path) {
+		switch engine.path_kind(path) {
+		case .Missing:
+			if flags & SQLITE_OPEN_CREATE == 0 || flags & SQLITE_OPEN_READONLY != 0 do return open_failed(ppDb, SQLITE_CANTOPEN, unable)
+			if !engine.sqlite_create_empty_file(path) do return open_failed(ppDb, SQLITE_CANTOPEN, unable)
+		case .Directory:
+			// A directory is an engine database or nothing SQLite can open.
+			if !engine.store_is_database_directory(path) do return open_failed(ppDb, SQLITE_CANTOPEN_ISDIR, unable)
+		case .File:
+		}
+	}
 	in_memory := engine.sqlite_is_file(path)
 	conn, err := engine.embed_open(path)
-	if !engine.error_drop(err) {
-		ppDb^ = nil
-		return SQLITE_ERROR
+	if err.kind != .None {
+		message := strings.clone(err.message, context.temp_allocator)
+		engine.error_free(&err)
+		return open_failed(ppDb, SQLITE_CANTOPEN, len(message) > 0 ? message : unable)
 	}
 	db := new(Database)
+	if flags & SQLITE_OPEN_READONLY != 0 do conn.store.read_only = true
 	db.conn = conn
 	db.error_offset = -1
 	// An expression column is named by its text, as SQLite names it.
@@ -454,9 +563,8 @@ sqlite3_open :: proc "c" (filename: cstring, ppDb: ^rawptr) -> c.int {
 @(export)
 sqlite3_open_v2 :: proc "c" (filename: cstring, ppDb: ^rawptr, flags: c.int, vfs: cstring) -> c.int {
 	context = runtime.default_context()
-	_ = flags
 	_ = vfs
-	return sqlite3_open(filename, ppDb)
+	return open_database(filename, ppDb, flags)
 }
 
 @(export)
@@ -465,6 +573,15 @@ sqlite3_close :: proc "c" (handle: rawptr) -> c.int {
 	context = runtime.default_context()
 	db := db_of(handle)
 	if db == nil do return SQLITE_OK
+	// A handle from a failed open holds only its error.
+	if db.conn == nil {
+		engine.handle_forget(rawptr(db))
+		delete(db.statements)
+		delete(db.filename)
+		delete(db.last_error)
+		free(db)
+		return SQLITE_OK
+	}
 	// SQLite answers SQLITE_BUSY while a statement is not finalized, and frees
 	// nothing: the caller finalizes and closes again (F6). Freeing them here, as
 	// this used to, told a caller that checked for BUSY that everything was gone.
@@ -519,7 +636,8 @@ sqlite3_errmsg :: proc "c" (handle: rawptr) -> cstring {
 	context = runtime.default_context()
 	context = runtime.default_context()
 	db := db_of(handle)
-	if db == nil do return "no connection"
+	if db == nil do return "out of memory"
+	if db.conn == nil do return cstring(raw_data(db.last_error))
 	delete(db.last_error)
 	db.last_error = strings.clone(engine.embed_error(db.conn))
 	// SQLite names success too: errmsg after a call that worked is "not an error".
