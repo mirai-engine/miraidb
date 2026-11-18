@@ -197,7 +197,9 @@ def observe(lib, db, seen: dict) -> None:
     seen["aggregate over no row"] = first_failure(b"SELECT sumsq(x) FROM sq WHERE x > 99")
 
     # Misuse is refused, and a destructor runs on replace and on delete.
-    seen["arity 200 is misuse"] = lib.sqlite3_create_function_v2(db, b"bad", 200, 1, None, None, None, None, None)
+    # SQLite takes up to 1000 arguments since 3.48 (127 before), so 1001 is
+    # misuse in every version.
+    seen["arity 1001 is misuse"] = lib.sqlite3_create_function_v2(db, b"bad", 1001, 1, None, None, None, None, None)
     seen["func and step is misuse"] = register(b"bad", 1, func=one, step=sq_step, final=sq_final)
     register(b"temp", 0, func=one, destroy=destroy, user=5)
     register(b"temp", 0, func=two, destroy=destroy, user=6)

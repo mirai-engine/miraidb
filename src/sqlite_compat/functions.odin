@@ -251,6 +251,11 @@ functions_close :: proc(db: ^Database) {
 	delete(db.functions)
 }
 
+
+// SQLITE_MAX_FUNCTION_ARG is the most arguments a function takes: SQLite's
+// limit since 3.48, which raised it from 127.
+SQLITE_MAX_FUNCTION_ARG :: 1000
+
 @(export)
 sqlite3_create_function :: proc "c" (
 	handle: rawptr,
@@ -297,7 +302,7 @@ create_function :: proc(
 	destroy: Destroy_Callback,
 ) -> c.int {
 	db := db_of(handle)
-	misuse := db == nil || name == nil || arity < -1 || arity > 127 || len(string(name)) > 255 ||
+	misuse := db == nil || name == nil || arity < -1 || arity > SQLITE_MAX_FUNCTION_ARG || len(string(name)) > 255 ||
 		(func != nil && (step != nil || final != nil)) ||
 		(func == nil && (step == nil) != (final == nil))
 	if misuse {
