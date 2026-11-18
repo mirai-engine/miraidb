@@ -19,6 +19,7 @@ Exit code 0 means every check held.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import shutil
@@ -99,6 +100,12 @@ def scenario(failures: list[str], label: str, path: str, first: Side, second: Si
     expect(failures, f"{label}: first sees it", first.run("SELECT x FROM t ORDER BY x"), [[1], [2]])
 
 
+def facade_libversion(facade: str) -> str:
+    library = ctypes.CDLL(os.path.abspath(facade))
+    library.sqlite3_libversion.restype = ctypes.c_char_p
+    return library.sqlite3_libversion().decode()
+
+
 def main() -> int:
     facade = sys.argv[1] if len(sys.argv) > 1 else os.path.join("bin", "sqlite3_miraidb.dll")
     if not os.path.exists(facade):
@@ -112,10 +119,16 @@ def main() -> int:
             ("facade writes, SQLite waits", True, False),
             ("SQLite writes, facade waits", False, True),
         ]
+        facade_version = facade_libversion(facade)
         for k, (label, first_facade, second_facade) in enumerate(pairs):
             path = os.path.join(work, f"shared_{k}.db")
             first = Side(f"{label} (first)", path, staged if first_facade else None)
             second = Side(f"{label} (second)", path, staged if second_facade else None)
+            # A side that should run on the facade and found the system's
+            # SQLite instead would make the pairing prove nothing.
+            for side, on_facade in ((first, first_facade), (second, second_facade)):
+                if on_facade and side.version != facade_version:
+                    failures.append(f"{side.name}: loaded SQLite {side.version}, not the facade ({facade_version})")
             try:
                 scenario(failures, label, path, first, second)
             finally:

@@ -4,6 +4,7 @@
     python3 scripts/ci.py
     python3 scripts/ci.py --skip-dll          # no Windows Python available
     python3 scripts/ci.py --odin /path/to/odin --windows-python /path/to/python.exe
+    python3 scripts/ci.py --linux-odin /opt/odin/odin   # under WSL: the Linux gates too
     python3 scripts/ci.py --list              # print the gate names and exit
 
 Each gate is reported on its own line with its duration; the run keeps going
@@ -30,6 +31,10 @@ DEFAULT_ODIN = os.environ.get("ODIN") or shutil.which("odin") or "odin"
 # (or --windows-python) to the interpreter that can load the DLL. Without it the
 # DLL smokes are skipped with a message.
 DEFAULT_WINDOWS_PYTHON = os.environ.get("MIRAIDB_WINDOWS_PYTHON", "")
+# A run under WSL can also build for Linux: set MIRAIDB_LINUX_ODIN (or
+# --linux-odin) to a Linux Odin compiler and the suite and the cross-process
+# gate run on Linux too (scripts/linux_gates.py). Without it they are skipped.
+DEFAULT_LINUX_ODIN = os.environ.get("MIRAIDB_LINUX_ODIN", "")
 # A gate that runs longer than this is stopped and fails: a hang (a test that
 # spins under a lock) used to keep the whole run waiting with no report.
 GATE_TIMEOUT_SECONDS = 1800
@@ -185,6 +190,25 @@ def build_gates(args: argparse.Namespace) -> list[Gate]:
             )
         else:
             print(f"ci: no Windows Python at {args.windows_python}; skipping the DLL smokes")
+    if args.list or (args.linux_odin and sys.platform.startswith("linux")):
+        # The suite on Linux, where the locks are POSIX's and the allocator
+        # another; and two processes on one SQLite file through the Linux
+        # facade and Linux's own SQLite.
+        gates.append(
+            Gate(
+                "unit tests (Linux)",
+                [sys.executable, "scripts/linux_gates.py", "tests", "--odin", args.linux_odin],
+                timeout=900,
+            )
+        )
+        gates.append(
+            Gate(
+                "SQLite file across processes (Linux)",
+                [sys.executable, "scripts/linux_gates.py", "processes", "--odin", args.linux_odin],
+            )
+        )
+    elif args.linux_odin:
+        print("ci: --linux-odin needs a Linux Python (run under WSL); skipping the Linux gates")
     for package in PACKAGES:
         gates.append(
             Gate(f"vet {package}", [args.odin, "check", package, "-no-entry-point", "-vet"])
@@ -207,6 +231,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--odin", default=os.environ.get("ODIN", DEFAULT_ODIN))
     parser.add_argument("--windows-python", default=DEFAULT_WINDOWS_PYTHON)
+    parser.add_argument("--linux-odin", default=DEFAULT_LINUX_ODIN, help="a Linux Odin for the Linux gates")
     parser.add_argument("--skip-dll", action="store_true", help="skip the DLL smokes")
     parser.add_argument("--skip-build", action="store_true", help="reuse the existing binaries")
     parser.add_argument("--list", action="store_true", help="print the gate names and exit")
