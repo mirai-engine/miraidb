@@ -678,6 +678,19 @@ res_index_exists :: proc(walk: ^Res_Walk, name: string) -> bool {
 	return found
 }
 
+// res_trigger_exists finds a trigger by name, whatever its case.
+@(private)
+res_trigger_exists :: proc(walk: ^Res_Walk, name: string) -> bool {
+	if tx_table_probe(walk.tx, TRIGGER_TABLE) == nil do return false
+	result, err := sql_execute_in_tx_params(walk.tx, "SELECT 1 FROM _triggers WHERE lower(name) = lower(?)", []Value{value_string(name)})
+	if err.kind != .None {
+		error_free(&err)
+		return false
+	}
+	defer sql_result_destroy(&result)
+	return len(result.rows) > 0
+}
+
 @(private)
 res_ddl :: proc(walk: ^Res_Walk, statement: ^Statement) {
 	#partial switch &s in statement^ {
@@ -768,6 +781,12 @@ res_ddl :: proc(walk: ^Res_Walk, statement: ^Statement) {
 		res_canonical(walk, &s.table)
 		if kind := res_relation_kind(walk, s.table); kind != "table" && kind != "view" {
 			res_fail(walk, .Table_Not_Found, "no such table: main.%s", s.table)
+			return
+		}
+		// Under SQLite's rules a trigger's name is taken once (whatever its
+		// case); the engine's own rules let CREATE TRIGGER replace one.
+		if walk.tx.store.sqlite_names && !s.if_not_exists && res_trigger_exists(walk, s.name) {
+			res_fail(walk, .Table_Exists, "trigger %s already exists", s.name)
 		}
 	case Alter_Table_Stmt:
 		res_canonical(walk, &s.table)
@@ -776,6 +795,18 @@ res_ddl :: proc(walk: ^Res_Walk, statement: ^Statement) {
 		if table == nil {
 			res_fail(walk, .Table_Not_Found, "no such table: %s", s.table)
 			return
+		}
+		// A new name another table, view or index has is refused, in SQLite's
+		// words; one that starts with sqlite_ is SQLite's own.
+		if len(s.rename_to) > 0 && len(s.rename_column) == 0 && !strings.equal_fold(s.rename_to, s.table) {
+			if walk.tx.store.sqlite_names && len(s.rename_to) >= 7 && strings.equal_fold(s.rename_to[:7], "sqlite_") {
+				res_fail(walk, .Invalid_Argument, "object name reserved for internal use: %s", s.rename_to)
+				return
+			}
+			if len(res_relation_kind(walk, s.rename_to)) > 0 || res_index_exists(walk, s.rename_to) {
+				res_fail(walk, .Table_Exists, "there is already another table or index with this name: %s", s.rename_to)
+				return
+			}
 		}
 		if len(s.column.name) > 0 && len(s.rename_to) == 0 && len(s.drop_column) == 0 && len(s.alter_column) == 0 {
 			if _, found := schema_column_index(&table.schema, s.column.name); found {

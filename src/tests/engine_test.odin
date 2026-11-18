@@ -8001,6 +8001,34 @@ test_column_collation_and_generated :: proc(t: ^testing.T) {
 	db.store_close(reopened)
 }
 
+// A table renamed to a name another table, view or index has is refused, in
+// SQLite's words (renaming over a view left two objects of one name); under
+// SQLite's rules a trigger's name is taken once, whatever its case.
+@(test)
+test_ddl_name_collisions :: proc(t: ^testing.T) {
+	conn, open_err := db.embed_open(":memory:")
+	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
+	defer db.embed_close(conn)
+	for sql in ([]string{"CREATE TABLE v (a)", "CREATE TABLE x (a)", "CREATE INDEX xi ON x (a)", "CREATE VIEW w AS SELECT 1"}) {
+		testing.expect(t, db.error_drop(db.embed_exec(conn, sql)))
+	}
+	for target in ([]string{"w", "x", "xi"}) {
+		err := db.embed_exec(conn, fmt.tprintf("ALTER TABLE v RENAME TO %s", target))
+		testing.expect_value(t, err.message, fmt.tprintf("there is already another table or index with this name: %s", target))
+		db.error_free(&err)
+	}
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "ALTER TABLE v RENAME TO v2")))
+	conn.store.sqlite_names = true
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "CREATE TRIGGER tr AFTER INSERT ON v2 BEGIN SELECT 1; END")))
+	again := db.embed_exec(conn, "CREATE TRIGGER TR AFTER INSERT ON v2 BEGIN SELECT 1; END")
+	testing.expect_value(t, again.message, "trigger TR already exists")
+	db.error_free(&again)
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "CREATE TRIGGER IF NOT EXISTS tr AFTER INSERT ON v2 BEGIN SELECT 1; END")))
+	reserved := db.embed_exec(conn, "ALTER TABLE v2 RENAME TO sqlite_x")
+	testing.expect_value(t, reserved.message, "object name reserved for internal use: sqlite_x")
+	db.error_free(&reserved)
+}
+
 // A transaction that writes a table and then drops it commits: the rows it
 // staged go with the table (the commit applied them after the drop, failed,
 // and lost the whole transaction). A ROLLBACK TO before the drop brings both
