@@ -446,6 +446,7 @@ sqlite_schema_order :: proc(tx: ^Tx, rows: []Sqlite_Schema_Row) {
 // statement reads like a view. rootpage numbers the tables and indexes in
 // order from 2 (page 1 is the catalog's own); views and triggers have none.
 tx_materialize_sqlite_schema :: proc(tx: ^Tx, name: string, temp: bool) -> (^Table, Error) {
+	if temp do tx.store.temp_used = true
 	rows := sqlite_schema_rows(tx, temp, tx.alloc)
 	text := Column_Type{kind = .String, width = 8}
 	columns := make([]Column, 5, tx.alloc)

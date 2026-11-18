@@ -188,6 +188,9 @@ Store :: struct {
 	// then end): the shared-file layer takes SQLite's EXCLUSIVE lock there
 	// (sqlite_share.odin).
 	mirror_guard:        proc(ctx: rawptr, begin: bool),
+	// temp_used says the temp schema has been read or written: SQLite makes
+	// it on first use, and PRAGMA database_list lists it from then on.
+	temp_used:           bool,
 	mirror_guard_ctx:    rawptr,
 	// foreign_keys_off is PRAGMA foreign_keys = OFF: the keys are declared and
 	// listed but not enforced. The engine enforces them unless told; the

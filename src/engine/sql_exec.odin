@@ -8948,6 +8948,7 @@ sql_exec_create_table :: proc(tx: ^Tx, stmt: Create_Table_Stmt, params: []Value)
 	schema.name = strings.clone(stmt.name, tx.alloc)
 	schema.auto_increment_column = NO_COLUMN
 	schema.ephemeral = stmt.ephemeral
+	if stmt.ephemeral do tx.store.temp_used = true
 	schema.event = stmt.event
 	columns := make([]Column, len(stmt.columns), tx.alloc)
 	inline_primary := NO_COLUMN

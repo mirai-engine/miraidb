@@ -7148,9 +7148,11 @@ test_sqlite_live_mirror :: proc(t: ^testing.T) {
 
 	conn, open_err := db.embed_open(path, {persistent = true, create = false, durable = false})
 	if !testing.expectf(t, db.error_ok(open_err), "embed_open: %s", open_err.message) do return
-	// The file is reported as the main database, not an empty path.
+	// The file is reported as the main database, not an empty path: by its
+	// full path, as SQLite reports it.
 	list := run(t, conn.store, "PRAGMA database_list")
-	testing.expect_value(t, list.rows[0][2].s, path)
+	listed := list.rows[0][2].s
+	testing.expectf(t, len(listed) > len(path) && strings.has_suffix(listed, path), "database_list names %q", listed)
 	db.sql_result_destroy(&list)
 
 	insert, insert_err := db.sql_execute(conn.store, "INSERT INTO items (id, name) VALUES (2, 'two')")

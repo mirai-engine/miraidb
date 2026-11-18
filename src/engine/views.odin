@@ -123,9 +123,19 @@ tx_source_table :: proc(
 	args: []Value,
 	schema: string = "",
 ) -> (table: ^Table, is_view: bool, err: Error) {
+	if strings.equal_fold(schema, "main") {
+		return tx_source_table(tx, name, args)
+	}
+	if strings.equal_fold(schema, "temp") {
+		// temp's catalog is sqlite_temp_schema; its tables share the
+		// connection's names.
+		if is_schema, _ := sqlite_schema_name(name); is_schema do return tx_source_table(tx, "sqlite_temp_schema", args)
+		return tx_source_table(tx, name, args)
+	}
 	if len(schema) > 0 {
-		// `schema.table` names an attached database, which is read-only: the
-		// table is copied under its lock and scanned like a view.
+		// `schema.table` names an attached database: the table is copied
+		// under its lock (or read through the transaction that writes it) and
+		// scanned like a view.
 		materialized, attach_err := tx_materialize_attached(tx, schema, name)
 		return materialized, true, attach_err
 	}

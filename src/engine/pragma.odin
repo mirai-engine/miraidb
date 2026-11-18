@@ -12,6 +12,7 @@ package engine
 // `PRAGMA name(arg)` all reach `sql_exec_pragma`.
 
 import "core:fmt"
+import "core:path/filepath"
 import "core:slice"
 import "core:strconv"
 import "core:strings"
@@ -32,9 +33,159 @@ sqlite_pragma_statement :: proc(sql: string) -> (body: string, is_pragma: bool) 
 	// A statement usually arrives with its terminator: `PRAGMA name;` means the
 	// same as `PRAGMA name`.
 	body = strings.trim_right(strings.trim_space(trimmed[6:]), "; \t\r\n")
-	// `PRAGMA main.name` asks the database itself, as `PRAGMA name` does.
-	if len(body) > 5 && strings.equal_fold(body[:5], "main.") do body = strings.trim_space(body[5:])
+	// `PRAGMA main.name` (or "main", temp) asks the database itself, as
+	// `PRAGMA name` does: the shell writes the schema quoted.
+	for prefix in ([]string{"main.", "\"main\".", "temp.", "\"temp\"."}) {
+		if len(body) > len(prefix) && strings.equal_fold(body[:len(prefix)], prefix) {
+			body = strings.trim_space(body[len(prefix):])
+			break
+		}
+	}
 	return body, true
+}
+
+// pragma_sqlite_table_list is PRAGMA table_list as SQLite answers it: every
+// table, view, virtual table and shadow table of main, then sqlite_schema,
+// then temp's (which this makes, as SQLite's does: database_list lists it from
+// here on), each with its column count, WITHOUT ROWID and STRICT. The engine's
+// own catalogs (a leading underscore) are not SQLite's and are left out.
+@(private)
+pragma_sqlite_table_list :: proc(store: ^Store, tx: ^Tx) -> Sql_Result {
+	reader := tx
+	if reader == nil do reader = tx_begin_read(store)
+	defer if tx == nil do tx_end(reader)
+	store.temp_used = true
+	result := Sql_Result{kind = .Rows, commit_seq = store.commit_seq}
+	result.columns = pragma_columns("schema", "name", "type", "ncol", "wr", "strict")
+	rows := make([dynamic][]Value)
+	add :: proc(rows: ^[dynamic][]Value, schema, name, kind: string, ncol: int, without_rowid, strict: bool) {
+		row := make([]Value, 6)
+		row[0] = pragma_text(schema)
+		row[1] = pragma_text(name)
+		row[2] = pragma_text(kind)
+		row[3] = value_int(i64(ncol))
+		row[4] = value_int(without_rowid ? 1 : 0)
+		row[5] = value_int(strict ? 1 : 0)
+		append(rows, row)
+	}
+	shadows := make(map[string]bool, 8, context.temp_allocator)
+	virtuals := make(map[string]bool, 8, context.temp_allocator)
+	for name in tx_table_names(reader, context.temp_allocator) {
+		if table, found := fts_virtual_lookup(reader, name); found {
+			virtuals[strings.to_lower(table.name, context.temp_allocator)] = true
+			for suffix in fts_shadow_suffixes(table.module) {
+				shadows[strings.to_lower(strings.concatenate({table.name, suffix}, context.temp_allocator), context.temp_allocator)] = true
+			}
+		}
+	}
+	for temp in ([]bool{false, true}) {
+		schema_name := temp ? "temp" : "main"
+		for name in tx_table_names(reader, context.temp_allocator) {
+			if strings.has_prefix(name, "_") do continue
+			table := tx_table_probe(reader, name)
+			if table == nil || table.schema.ephemeral != temp do continue
+			lower := strings.to_lower(name, context.temp_allocator)
+			kind := virtuals[lower] ? "virtual" : shadows[lower] ? "shadow" : "table"
+			add(&rows, schema_name, table.schema.name, kind, len(table.schema.columns), table.schema.without_rowid, table.schema.strict)
+		}
+		if !temp {
+			if views, views_err := view_names(reader, context.temp_allocator); views_err.kind == .None {
+				for view in views {
+					count := 0
+					if info, is_view := pragma_view_info(store, reader, view); is_view {
+						count = len(info.rows)
+						sql_result_destroy(&info)
+					}
+					add(&rows, "main", view, "view", count, false, false)
+				}
+			} else {
+				error_free(&views_err)
+			}
+		}
+		add(&rows, schema_name, temp ? "sqlite_temp_schema" : "sqlite_schema", "table", 5, false, false)
+	}
+	result.rows = rows[:]
+	return result
+}
+
+// pragma_catalog_info is PRAGMA table_info of SQLite's own tables, which the
+// engine answers from its catalog rather than keeping as tables:
+// sqlite_schema (and its other names) with SQLite's declared types, and
+// sqlite_sequence, declared without types, when a table counts AUTOINCREMENT.
+// The shell's .dump reads the columns of sqlite_sequence this way.
+@(private)
+pragma_catalog_info :: proc(store: ^Store, tx: ^Tx, name: string) -> (Sql_Result, bool) {
+	names: []string
+	types: []string
+	if is_schema, _ := sqlite_schema_name(name); is_schema {
+		names = {"type", "name", "tbl_name", "rootpage", "sql"}
+		types = {"TEXT", "TEXT", "TEXT", "INT", "TEXT"}
+	} else if strings.equal_fold(name, "sqlite_sequence") {
+		reader := tx
+		if reader == nil do reader = tx_begin_read(store)
+		defer if tx == nil do tx_end(reader)
+		if !sqlite_sequence_exists(reader) do return {}, false
+		names = {"name", "seq"}
+		types = {"", ""}
+	} else {
+		return {}, false
+	}
+	result := Sql_Result{kind = .Rows, commit_seq = store.commit_seq}
+	result.columns = pragma_columns("cid", "name", "type", "notnull", "dflt_value", "pk")
+	result.rows = make([][]Value, len(names))
+	for column, i in names {
+		row := make([]Value, 6)
+		row[0] = value_int(i64(i))
+		row[1] = pragma_text(column)
+		row[2] = pragma_text(types[i])
+		row[3] = value_int(0)
+		row[4] = value_null()
+		row[5] = value_int(0)
+		result.rows[i] = row
+	}
+	return result, true
+}
+
+// pragma_view_info is PRAGMA table_info of a view, as SQLite answers it: the
+// view's result columns, each with the declared type of the table column it
+// reads ("" for an expression), nullable and no key.
+@(private)
+pragma_view_info :: proc(store: ^Store, tx: ^Tx, name: string) -> (Sql_Result, bool) {
+	reader := tx
+	if reader == nil do reader = tx_begin_read(store)
+	defer if tx == nil do tx_end(reader)
+	body, is_view := view_sql(reader, name)
+	if !is_view do return {}, false
+	probe := strings.concatenate({"SELECT * FROM ", name, " LIMIT 0"}, context.temp_allocator)
+	shape, shape_err := sql_execute_in_tx(reader, probe)
+	if shape_err.kind != .None {
+		error_free(&shape_err)
+		return {}, false
+	}
+	defer sql_result_destroy(&shape)
+	types := make([]string, len(shape.columns), context.temp_allocator)
+	if query, parse_err := sql_parse(body); parse_err.kind == .None {
+		defer query_destroy(&query)
+		if origins, described := sql_describe_origins(reader, query.statement, context.temp_allocator); described && len(origins) == len(types) {
+			for origin, i in origins do types[i] = strings.clone(origin.decltype, context.temp_allocator)
+		}
+	} else {
+		error_free(&parse_err)
+	}
+	result := Sql_Result{kind = .Rows, commit_seq = store.commit_seq}
+	result.columns = pragma_columns("cid", "name", "type", "notnull", "dflt_value", "pk")
+	result.rows = make([][]Value, len(shape.columns))
+	for column, i in shape.columns {
+		row := make([]Value, 6)
+		row[0] = value_int(i64(i))
+		row[1] = pragma_text(column)
+		row[2] = pragma_text(types[i])
+		row[3] = value_int(0)
+		row[4] = value_null()
+		row[5] = value_int(0)
+		result.rows[i] = row
+	}
+	return result, true
 }
 
 // pragma_columns clones literal column names: sql_result_destroy frees them.
@@ -157,6 +308,10 @@ sql_exec_pragma :: proc(store: ^Store, body: string, locked: bool, tx: ^Tx = nil
 	case "table_info", "table_xinfo":
 		table, found := pragma_table(store, tx, argument)
 		if !found {
+			if store.sqlite_rules {
+				if view_result, is_view := pragma_view_info(store, tx, argument); is_view do return view_result, ERROR_NONE
+				if catalog_result, is_catalog := pragma_catalog_info(store, tx, argument); is_catalog do return catalog_result, ERROR_NONE
+			}
 			return pragma_result([]string{"cid", "name", "type", "notnull", "dflt_value", "pk"}, nil, store.commit_seq), ERROR_NONE
 		}
 		result := Sql_Result{kind = .Rows, commit_seq = store.commit_seq}
@@ -277,23 +432,54 @@ sql_exec_pragma :: proc(store: ^Store, body: string, locked: bool, tx: ^Tx = nil
 	case "database_list":
 		result := Sql_Result{kind = .Rows, commit_seq = store.commit_seq}
 		result.columns = pragma_columns("seq", "name", "file")
-		result.rows = make([][]Value, 1)
-		row := make([]Value, 3)
-		row[0] = value_int(0)
-		row[1] = pragma_text("main")
+		rows := make([dynamic][]Value, 0, 2 + len(store.attached))
 		file := store.path
 		if len(file) == 0 do file = store.sqlite_mirror
-		row[2] = pragma_text(file)
-		result.rows[0] = row
+		// SQLite names the file by its full path, lists temp once it has been
+		// used, and then each attached database.
+		if store.sqlite_rules && len(file) > 0 {
+			if absolute, abs_err := filepath.abs(file, context.temp_allocator); abs_err == nil do file = absolute
+		}
+		main_row := make([]Value, 3)
+		main_row[0] = value_int(0)
+		main_row[1] = pragma_text("main")
+		main_row[2] = pragma_text(file)
+		append(&rows, main_row)
+		if store.sqlite_rules {
+			if store.temp_used {
+				temp_row := make([]Value, 3)
+				temp_row[0] = value_int(1)
+				temp_row[1] = pragma_text("temp")
+				temp_row[2] = pragma_text("")
+				append(&rows, temp_row)
+			}
+			names := make([dynamic]string, 0, len(store.attached), context.temp_allocator)
+			for attached_name in store.attached do append(&names, attached_name)
+			slice_sort_strings(names[:])
+			for attached_name, k in names {
+				attached := store.attached[attached_name]
+				path := attached.path
+				if len(path) == 0 do path = attached.sqlite_mirror
+				if len(path) > 0 {
+					if absolute, abs_err := filepath.abs(path, context.temp_allocator); abs_err == nil do path = absolute
+				}
+				row := make([]Value, 3)
+				row[0] = value_int(i64(k + 2))
+				row[1] = pragma_text(attached_name)
+				row[2] = pragma_text(path)
+				append(&rows, row)
+			}
+		}
+		result.rows = rows[:]
 		return result, ERROR_NONE
 	case "table_list":
+		if store.sqlite_rules do return pragma_sqlite_table_list(store, tx), ERROR_NONE
 		result := Sql_Result{kind = .Rows, commit_seq = store.commit_seq}
 		result.columns = pragma_columns("schema", "name", "type", "ncol", "wr", "strict")
+		// The names are the map's keys, which the tables own: only the slice
+		// is this call's.
 		names := store_table_names(store, context.allocator)
-		defer {
-			for n in names do delete(n)
-			delete(names)
-		}
+		defer delete(names)
 		result.rows = make([][]Value, len(names))
 		for table_name, i in names {
 			table := store.tables[table_name]
@@ -746,7 +932,16 @@ tx_materialize_pragma :: proc(tx: ^Tx, name: string, args: []Value) -> (^Table, 
 	// The answer's columns, then SQLite's hidden `arg` and `schema`, which
 	// `SELECT *` leaves out.
 	width := len(result.columns)
-	columns := make([]Column, width + 2, tx.alloc)
+	// A pragma whose answer already has a column of that name (table_list's
+	// `schema`) keeps its own: SQLite's hidden column is not added twice.
+	has_column :: proc(names: []string, wanted: string) -> bool {
+		for name in names do if strings.equal_fold(name, wanted) do return true
+		return false
+	}
+	add_arg := !has_column(result.columns, "arg")
+	add_schema := !has_column(result.columns, "schema")
+	total := width + (add_arg ? 1 : 0) + (add_schema ? 1 : 0)
+	columns := make([]Column, total, tx.alloc)
 	for column_name, i in result.columns {
 		columns[i] = Column {
 			name = strings.clone(column_name, tx.alloc),
@@ -754,8 +949,12 @@ tx_materialize_pragma :: proc(tx: ^Tx, name: string, args: []Value) -> (^Table, 
 		}
 	}
 	text := Column_Type{kind = .Any}
-	columns[width] = Column{name = "arg", type = text, hidden = true}
-	columns[width + 1] = Column{name = "schema", type = text, hidden = true}
+	next := width
+	if add_arg {
+		columns[next] = Column{name = "arg", type = text, hidden = true}
+		next += 1
+	}
+	if add_schema do columns[next] = Column{name = "schema", type = text, hidden = true}
 	schema := Table_Schema {
 		name    = strings.clone(name, tx.alloc),
 		columns = columns,
@@ -763,10 +962,14 @@ tx_materialize_pragma :: proc(tx: ^Tx, name: string, args: []Value) -> (^Table, 
 	table, table_err := table_create(&schema)
 	if table_err.kind != .None do return nil, table_err
 	for row, i in result.rows {
-		values := make([]Value, width + 2, tx.alloc)
+		values := make([]Value, total, tx.alloc)
 		copy(values, row)
-		values[width] = argument
-		values[width + 1] = schema_name
+		next = width
+		if add_arg {
+			values[next] = argument
+			next += 1
+		}
+		if add_schema do values[next] = schema_name
 		if insert_err := table_insert(table, Row_Id(i + 1), values); insert_err.kind != .None {
 			table_destroy(table)
 			return nil, insert_err
