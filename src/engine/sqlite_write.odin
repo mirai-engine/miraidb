@@ -722,6 +722,10 @@ sqlite_type_name :: proc(t: Column_Type) -> string {
 		return "TEXT"
 	case .Uuid:
 		return "TEXT"
+	case .Any:
+		// An ANY column keeps any value: BLOB is SQLite's name for no affinity,
+		// and NUMERIC the one an affinity column was declared with.
+		return t.width == SQLITE_NUMERIC_WIDTH ? "NUMERIC" : "BLOB"
 	case:
 		return "TEXT"
 	}

@@ -39,7 +39,6 @@ Rules for this file:
 | S4 | `FILTER`, named `WINDOW` and aggregate `ORDER BY` missing; the ordered-set aggregates and `json_group_*` landed | the rest of the aggregate surface | S |
 | S5 | 15 of 121 built-in functions missing | the `jsonb_*` family, `json_parse`, `json_array_insert`, `sqlite_offset` | M |
 | S6 | six statements missing; all 63 pragmas answer | `INSTEAD OF`, `generate_series`, `ATTACH ':memory:'`, `VACUUM` in memory | S |
-| S7 | `ANY` columns exist; an untyped column, affinity and cross-class comparison do not; `WITHOUT ROWID` cannot be written | SQLite's typing rules | L |
 | D2 | overlap on an `rtree` table is a scan | node pages and a descent | M |
 | D3 | versions stay until `store_prune_versions` is called | automatic retention, `AS OF` on a join | M |
 | D4 | a table with a secondary index re-encodes the `.sqlite` mirror | patch the index b-trees | L |
@@ -263,25 +262,6 @@ checks the name) and the `INDEXED BY` / `NOT INDEXED` hints.
 `legacy_file_format`) report what they mean here.
 
 **Done when.** `sqlite_gaps.py` lists none of the remaining statements.
-
-## S7 — Affinity, untyped columns and `WITHOUT ROWID`
-
-**Now.** A column declared `ANY` keeps each value's storage class (`typeof()`
-reports it), but a column with **no** declared type (`CREATE TABLE t(x)`) is a
-syntax error, a typed column coerces rather than applying SQLite's affinity
-rules, and a comparison across classes is refused (`'1' = 1` answers "cannot
-compare string with int", where SQLite answers 0 by its ordering of classes).
-`WITHOUT ROWID` tables are read from a file but refused as a `CREATE TABLE`.
-
-**Design.** An undeclared type becomes `ANY`; SQLite's affinity (the five rules
-over the declared type name) becomes one function used on insert; comparison
-across classes follows SQLite's order (NULL < numbers < text < blob) with its
-numeric conversion for an affinity column. `WITHOUT ROWID` maps onto a table
-whose primary key is its row identity.
-
-**Done when.** An untyped column round-trips mixed values through the engine and
-through a `.sqlite` export, and comparisons between classes match SQLite in the
-differential corpus.
 
 ---
 

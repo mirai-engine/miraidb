@@ -23,7 +23,7 @@ script lists.
 | Header, page size, encoding | done | 512..65536 pages, reserved bytes, UTF-8 |
 | sqlite_master and schema SQL | done | tables and their CREATE statements, and their indexes: an imported index is recreated, so a plan walks it and `DROP INDEX` finds it (an index this engine cannot express is retried without its `WHERE`) |
 | Table b-trees, leaf and interior | done | rowid tables, multi-level trees |
-| WITHOUT ROWID (index b-trees) | done | read path |
+| WITHOUT ROWID (index b-trees) | done | read from a file, and created with `CREATE TABLE … WITHOUT ROWID`: the primary key is required and is the row's identity, `rowid` names nothing, and the option survives a reopen. An export writes such a table as a rowid table with the same key |
 | Varints and serial types | done | all widths, 0/1 shortcuts, floats, text, blob |
 | Overflow chains | done | read and write |
 | Write a valid database | done | `export-sqlite`, integrity-check clean, freelist trunk |
@@ -54,8 +54,9 @@ script lists.
 | Opening in memory | done | `:memory:`, the empty path, `file::memory:` (with or without `?cache=shared`) and `file:<name>?mode=memory` open a private database in the process: the tables live in memory, no directory is made, and every open is a fresh one (`test_open_in_memory_the_way_sqlite_does`; `scripts/capi_smoke.py` and `scripts/sqlite_abi_smoke.py` open each spelling through the DLL) |
 | CREATE TRIGGER | done | `BEFORE` and `AFTER` triggers with `WHEN`, `NEW` and `OLD`; a `BEFORE` body that fails stops the write. Column-specific (`OF`) triggers are refused |
 | CREATE VIRTUAL TABLE (FTS5, R-Tree) | done | FTS5 with BM25, `snippet` and `highlight`; spatial tables store their boxes as columns |
-| GENERATED / STRICT / WITHOUT ROWID DDL | partial | `GENERATED … STORED` and `STRICT` work; `WITHOUT ROWID` is refused for writing and supported for reading |
+| GENERATED / STRICT / WITHOUT ROWID DDL | done | `GENERATED … STORED`; `STRICT` allows SQLite's five type names and refuses a value its column cannot convert, in SQLite's words (`cannot store TEXT value in INTEGER column t.i`); `WITHOUT ROWID` as above; both options can be combined and survive a reopen |
 | `ANY` columns (dynamic typing) | done | storage classes kept per value, `typeof()` reports them |
+| Affinity and untyped columns | done | a column without a type keeps any value; a type name no `CREATE TYPE` defined is read by SQLite's five rules (`UNSIGNED BIG INT` is INTEGER, `VARCHAR2(10)` TEXT, `FLOATING POINT` INTEGER); a text that reads as a number becomes one in a numeric column and a number becomes text in a text column. Through the `sqlite3_*` face every declared type is an affinity and a value that does not convert is stored as it is, as SQLite stores it; the engine's other faces refuse it. Values of different storage classes compare in SQLite's order (NULL, numbers, text, blobs) after a column's affinity converts the other side, in comparisons, `min`/`max` and `ORDER BY`. A real's text form is SQLite's (`3.0`, `1.0e+20`). Compared with SQLite in `scripts/sqlite_abi_affinity.py` |
 | CASE | done | simple (`CASE x WHEN …`) and searched (`CASE WHEN …`) forms, anywhere an expression is allowed, including policies and triggers |
 
 ## Expressions and clauses
@@ -154,7 +155,6 @@ behaviour here will see different results:
 | `CAST('abc' AS INTEGER)` | `0` | error `invalid_type` |
 | `9223372036854775807 + 1` | a float | wraps to `-9223372036854775808` |
 | `CAST(300 AS TINYINT)` | `300` (INTEGER affinity) | error: the value does not fit the declared width |
-| `WHERE int_col = '1'` | compares through affinity | error `cannot compare int with string` |
 | `HAVING c > 1` where `c` aliases `count(*)` | works | error `column c does not exist` |
 | `UPDATE t SET u = u + 990` whose rows collide only partway through | error: a unique key is checked row by row | succeeds when the final rows are distinct: a statement's keys are checked against its result |
 | `COMMIT` a deferred foreign key fails | the transaction stays open until `ROLLBACK` | the transaction is rolled back |
@@ -186,10 +186,9 @@ matches | SELECT 'abc' LIKE 'A%'                          | [[1]]
 matches@<3.50 | SELECT printf('%.0f', 2.5)                 | [["2"]]
 ours@>=3.50 | SELECT printf('%.0f', 2.5)                    | [["2"]]
 ours    | SELECT upper(char(233))                         | [["É"]]
-refused | SELECT 1 = '1'                                 | invalid_type
+matches | SELECT 1 = '1', 1 < 'a', 'a' < x'00'           | [[0, 1, 1]]
 refused | SELECT CAST('12abc' AS INTEGER)                | invalid_type
 refused | SELECT 1/0                                     | division by zero
-refused | CREATE TABLE z (a INT) WITHOUT ROWID           | WITHOUT ROWID
 refused | SELECT 2 * 9223372036854775807                 | integer overflow
 ```
 

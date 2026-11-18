@@ -434,7 +434,19 @@ value_compare :: proc(a, b: Value) -> (order: slice.Ordering, ok: bool) {
 		return numeric_compare_exact(a, b), true
 	}
 	if a.kind != b.kind {
-		return .Equal, false
+		// Values of SQLite's storage classes compare across them in SQLite's
+		// order: numbers, then text, then blobs. Other kinds do not.
+		class_a, class_b := sqlite_class(a), sqlite_class(b)
+		if class_a == 0 || class_b == 0 do return .Equal, false
+		if class_a == 1 && class_b == 1 {
+			// A boolean is the integer 0 or 1 to SQLite.
+			as_number :: proc(v: Value) -> Value {
+				if v.kind == .Bool do return value_int(v.b ? 1 : 0)
+				return v
+			}
+			return numeric_compare_exact(as_number(a), as_number(b)), true
+		}
+		return slice_ordering(slice.cmp(class_a, class_b)), true
 	}
 	switch a.kind {
 	case .Default:
@@ -965,4 +977,19 @@ u128_digits :: proc(value: u128, buf: ^[40]u8) -> string {
 		v /= 10
 	}
 	return string(buf[pos:])
+}
+
+// sqlite_class is a value's storage class rank in SQLite's order (1 numbers,
+// 2 text, 3 blobs), or 0 for a kind SQLite does not have.
+@(private)
+sqlite_class :: proc(v: Value) -> int {
+	#partial switch v.kind {
+	case .Int, .Uint, .Float, .Int128, .Uint128, .Bool:
+		return 1
+	case .String:
+		return 2
+	case .Bytes:
+		return 3
+	}
+	return 0
 }

@@ -290,7 +290,6 @@ test_parse_errors :: proc(t: ^testing.T) {
 		"SELECT * FROM",
 		"INSERT INTO t VALUES",
 		"CREATE TABLE t ()",
-		"CREATE TABLE t (id NONSENSE)",
 		"UPDATE t SET",
 		"NONSENSE",
 	}
@@ -1437,11 +1436,11 @@ test_errors_mid_scan_are_clean :: proc(t: ^testing.T) {
 	run(t, store, "INSERT INTO entry VALUES (1, 1, NULL), (2, 2, 'x'), (3, 3, 'y')")
 
 	// The first row passes the filter (NULL keeps the row out), the second
-	// raises a type error.
-	filter_err := run_error(t, store, "SELECT amount FROM entry WHERE memo <= 1")
-	testing.expect_value(t, filter_err.kind, db.Error_Kind.Invalid_Type)
-	aggregate_err := run_error(t, store, "SELECT count(*), sum(amount) FROM entry WHERE memo <= 1")
-	testing.expect_value(t, aggregate_err.kind, db.Error_Kind.Invalid_Type)
+	// raises an error: 'x' is not JSON.
+	filter_err := run_error(t, store, "SELECT amount FROM entry WHERE json(memo) IS NOT NULL")
+	testing.expect(t, filter_err.kind != .None)
+	aggregate_err := run_error(t, store, "SELECT count(*), sum(amount) FROM entry WHERE json(memo) IS NOT NULL")
+	testing.expect(t, aggregate_err.kind != .None)
 	// A projection error after a good row: the same double free lived there.
 	// (upper(NULL) used to be the error here; it is NULL now, as in SQLite.)
 	projection_err := run_error(t, store, "SELECT memo + 1 FROM entry")
@@ -4702,8 +4701,10 @@ test_named_types :: proc(t: ^testing.T) {
 	testing.expect_value(t, shown.rows[0][0].s, "email")
 	testing.expect_value(t, shown.rows[0][1].s, "TEXT")
 
-	_, unknown := db.sql_execute(store, "CREATE TABLE broken (id nope)")
-	testing.expect(t, !db.error_ok(unknown))
+	// A name no CREATE TYPE defined is read by SQLite's affinity rules, as
+	// SQLite reads any type name: NOPE has NUMERIC affinity.
+	_, unknown := db.sql_execute(store, "CREATE TABLE loose (id nope)")
+	testing.expect(t, db.error_ok(unknown))
 	_, bad_base := db.sql_execute(store, "CREATE TYPE weird AS nonsense")
 	testing.expect(t, !db.error_ok(bad_base))
 
@@ -5299,7 +5300,7 @@ test_array_and_product_types :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(coerced.list), 2)
 	testing.expect_value(t, coerced.list[1].s, "b")
 
-	wrong := db.Value{kind = .Array, list = []db.Value{db.value_int(1)}}
+	wrong := db.Value{kind = .Array, list = []db.Value{db.value_bytes([]u8{1})}}
 	_, wrong_err := db.value_coerce(wrong, array_type)
 	testing.expect(t, !db.error_ok(wrong_err))
 	not_array := db.value_int(3)
@@ -8314,9 +8315,10 @@ test_text_truth_is_numeric :: proc(t: ^testing.T) {
 	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)")
 	run(t, store, "INSERT INTO t (id, s) VALUES (1, '1'), (2, 'a'), (3, '0')")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t WHERE s").i, i64(1))
-	// Comparison keeps its strictness: a text that looks like a number is not
-	// one, so the differential runner lists this as a deliberate difference.
-	testing.expect_value(t, run_error(t, store, `SELECT 1 WHERE 1 = '1'`).kind, db.Error_Kind.Invalid_Type)
+	// A number and a text are different storage classes: they are not equal,
+	// as in SQLite, unless a column's affinity converts one of them first.
+	testing.expect_value(t, len(run(t, store, `SELECT 1 WHERE 1 = '1'`).rows), 0)
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t WHERE id = '2'").i, i64(1))
 }
 
 // A JSON number is written back with the type it had: 1.0 is not 1, and reading
@@ -8840,9 +8842,21 @@ test_strict_table_option :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT n FROM s").s, "x")
 	_, not_null := db.sql_execute(store, "INSERT INTO s (n) VALUES (NULL)")
 	testing.expect_value(t, not_null.kind, db.Error_Kind.Not_Null_Violation)
-	// WITHOUT ROWID is refused with a clear reason instead of a syntax error.
-	_, unsupported := db.sql_execute(store, "CREATE TABLE w (id INTEGER PRIMARY KEY) WITHOUT ROWID")
-	testing.expect_value(t, unsupported.kind, db.Error_Kind.Sql_Unsupported)
+	// A STRICT table refuses a value its column cannot convert, in SQLite's words.
+	run(t, store, "CREATE TABLE si (i INTEGER) STRICT")
+	refused := run_error(t, store, "INSERT INTO si VALUES ('abc')")
+	testing.expect_value(t, refused.kind, db.Error_Kind.Check_Violation)
+	testing.expect(t, strings.contains(refused.message, "cannot store TEXT value in INTEGER column si.i"))
+	_, unknown := db.sql_execute(store, "CREATE TABLE sv (x VARCHAR) STRICT")
+	testing.expect(t, !db.error_ok(unknown))
+	// WITHOUT ROWID: the primary key is the identity, and rowid names nothing.
+	run(t, store, "CREATE TABLE w (id INTEGER PRIMARY KEY, v TEXT) WITHOUT ROWID")
+	run(t, store, "INSERT INTO w VALUES (2, 'b'), (1, 'a')")
+	testing.expect_value(t, scalar(t, store, "SELECT v FROM w WHERE id = 1").s, "a")
+	_, rowid := db.sql_execute(store, "SELECT rowid FROM w")
+	testing.expect_value(t, rowid.kind, db.Error_Kind.Column_Not_Found)
+	_, keyless := db.sql_execute(store, "CREATE TABLE nk (v TEXT) WITHOUT ROWID")
+	testing.expect(t, !db.error_ok(keyless))
 }
 
 @(test)

@@ -161,6 +161,12 @@ QUERIES = [
     "UPDATE kv SET v = 5 WHERE k = 'b' RETURNING k, v",
     "SELECT k, v FROM kv ORDER BY k",
     "SELECT k, old_v, new_v FROM audit ORDER BY id",
+    # Values of different storage classes compare in SQLite's order, after a
+    # column's affinity converts the other side (S7).
+    "SELECT 1 = '1', '1' = 1, 1 < 'a', 'a' < x'00', 2 > 'abc'",
+    "SELECT count(*) FROM nums WHERE n = '2'",
+    "SELECT count(*) FROM nums WHERE t > 1",
+    "SELECT max(t), min(t) FROM nums",
     # IN and BETWEEN compare under the left operand's collation.
     "SELECT id FROM emp WHERE name COLLATE NOCASE IN ('ANA', 'Zoe') ORDER BY id",
     "SELECT id FROM emp WHERE name COLLATE NOCASE BETWEEN 'L' AND 'MARIA' ORDER BY id",
@@ -278,7 +284,6 @@ DIFFERENT = {
     "SELECT 1 / 0": "division by zero is an error here, NULL in SQLite",
     "SELECT CAST('abc' AS INTEGER)": "a cast that cannot hold its value is an error here, 0 in SQLite",
     "SELECT 9223372036854775807 + 1": "integer arithmetic wraps here, becomes a float in SQLite",
-    "SELECT 1 = '1'": "comparing a number with text is an error here, false in SQLite",
 }
 
 

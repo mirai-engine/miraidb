@@ -571,8 +571,9 @@ sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sq
 	// changes no row, which is when SQLite calls its commit hook.
 	tx.wrote = true
 	#partial switch _ in statement {
-	case Insert_Stmt, Update_Stmt, Delete_Stmt:
-		// A name that is not there is refused before a row is written (D37).
+	case Insert_Stmt, Update_Stmt, Delete_Stmt, Create_Table_Stmt, Create_View_Stmt, Create_Index_Stmt, Drop_Table_Stmt, Drop_View_Stmt, Drop_Index_Stmt, Create_Trigger_Stmt, Alter_Table_Stmt:
+		// A name that is not there (or is already there, for a CREATE) is
+		// refused before anything is written (D37).
 		statement := statement
 		if resolve_err := sql_resolve_names(tx, &statement); resolve_err.kind != .None do return {}, resolve_err
 	}
@@ -597,6 +598,12 @@ sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sq
 		target = s.table
 	case Delete_Stmt:
 		target = s.table
+	}
+	// A STRICT table refuses what its columns cannot convert.
+	saved_strict := affinity_strict
+	defer affinity_strict = saved_strict
+	if len(target) > 0 {
+		if written := tx_table_probe(tx, target); written != nil do affinity_strict = written.schema.strict
 	}
 	if len(target) > 0 && tx_table_probe(tx, target) == nil {
 		vtab, is_vtab, vtab_err := vtab_find(tx, target)
@@ -1432,6 +1439,8 @@ rowid_alias_name :: proc(name: string) -> bool {
 rowid_value :: proc(source: Source) -> (Value, bool) {
 	if source.table == nil do return {}, false
 	if source.row.id == NO_ROW_ID do return {}, false
+	// A WITHOUT ROWID table has no row id to name.
+	if source.table.schema.without_rowid do return {}, false
 	schema := &source.table.schema
 	if len(schema.primary_key) == 1 {
 		key := schema.primary_key[0]
@@ -4826,6 +4835,10 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 		if left_err.kind != .None do return {}, left_err
 		right, right_err := eval_expr(ctx, e.right)
 		if right_err.kind != .None do return {}, right_err
+		#partial switch e.op {
+		case .Eq, .Ne, .Lt, .Le, .Gt, .Ge, .Is, .Is_Not:
+			left, right = comparison_affinity(ctx, e.left, e.right, left, right)
+		}
 		return eval_binary(e.op, left, right, collation, ctx.tx != nil ? ctx.tx.store : nil)
 	case Unary_Expr:
 		operand, operand_err := eval_expr(ctx, e.operand)
@@ -7733,7 +7746,7 @@ sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Res
 				}
 				value, eval_err := eval_expr(&ctx, assignment.value)
 				if eval_err.kind != .None do return {}, eval_err
-				coerced, coerce_err := value_coerce(value, table.schema.columns[index].type)
+				coerced, coerce_err := value_coerce_into(value, &table.schema, index)
 				if coerce_err.kind != .None do return {}, coerce_err
 				new_values[index] = coerced
 			}
@@ -7894,7 +7907,7 @@ sql_exec_merge :: proc(tx: ^Tx, stmt: Merge_Stmt, params: []Value) -> (Sql_Resul
 					}
 					value, value_err := eval_expr(&ctx, assignment.value)
 					if value_err.kind != .None do return {}, value_err
-					coerced, coerce_err := value_coerce(value, target.schema.columns[index].type)
+					coerced, coerce_err := value_coerce_into(value, &target.schema, index)
 					if coerce_err.kind != .None do return {}, coerce_err
 					new_values[index] = coerced
 				}
@@ -7952,7 +7965,7 @@ sql_exec_merge :: proc(tx: ^Tx, stmt: Merge_Stmt, params: []Value) -> (Sql_Resul
 				for expression, i in clause.values {
 					value, value_err := eval_expr(&ctx, expression)
 					if value_err.kind != .None do return {}, value_err
-					coerced, coerce_err := value_coerce(value, target.schema.columns[i].type)
+					coerced, coerce_err := value_coerce_into(value, &target.schema, i)
 					if coerce_err.kind != .None do return {}, coerce_err
 					values[i] = coerced
 				}
@@ -7977,7 +7990,7 @@ sql_exec_merge :: proc(tx: ^Tx, stmt: Merge_Stmt, params: []Value) -> (Sql_Resul
 					}
 					value, value_err := eval_expr(&ctx, clause.values[i])
 					if value_err.kind != .None do return {}, value_err
-					coerced, coerce_err := value_coerce(value, target.schema.columns[index].type)
+					coerced, coerce_err := value_coerce_into(value, &target.schema, index)
 					if coerce_err.kind != .None do return {}, coerce_err
 					values[index] = coerced
 				}
@@ -8115,7 +8128,7 @@ sql_exec_update :: proc(tx: ^Tx, stmt: Update_Stmt, params: []Value) -> (Sql_Res
 			}
 			value, eval_err := eval_expr(&ctx, assignment.value)
 			if eval_err.kind != .None do return {}, eval_err
-			coerced, coerce_err := value_coerce(value, table.schema.columns[index].type)
+			coerced, coerce_err := value_coerce_into(value, &table.schema, index)
 			if coerce_err.kind != .None do return {}, coerce_err
 			new_values[index] = coerced
 		}
@@ -8319,6 +8332,11 @@ sql_exec_create_type :: proc(tx: ^Tx, stmt: Create_Type_Stmt) -> (Sql_Result, Er
 }
 
 sql_exec_alter_table :: proc(tx: ^Tx, stmt: Alter_Table_Stmt) -> (Sql_Result, Error) {
+	stmt := stmt
+	// Through the SQLite face an added column's type is an affinity too.
+	if tx.store.sqlite_names && len(stmt.column.name) > 0 {
+		stmt.column.type = sqlite_affinity_type(stmt.add_declared)
+	}
 	if len(stmt.alter_column) > 0 {
 		if type_err := tx_alter_column_type(tx, stmt.table, stmt.alter_column, stmt.alter_type); type_err.kind != .None {
 			return {}, type_err
@@ -8379,10 +8397,33 @@ sql_exec_create_table :: proc(tx: ^Tx, stmt: Create_Table_Stmt, params: []Value)
 	inline_primary := NO_COLUMN
 	for definition, i in stmt.columns {
 		column_type := definition.type
+		named_type := definition.type_name
 		if len(definition.type_name) > 0 {
 			resolved, resolve_err := resolve_named_type(tx, definition.type_name)
-			if resolve_err.kind != .None do return {}, resolve_err
-			column_type = resolved
+			if resolve_err.kind == .Invalid_Type {
+				// A name no CREATE TYPE defined is read the way SQLite reads any
+				// type name: by its affinity.
+				error_free(&resolve_err)
+				column_type = sqlite_affinity_type(definition.type_name)
+				named_type = ""
+			} else if resolve_err.kind != .None {
+				return {}, resolve_err
+			} else {
+				column_type = resolved
+			}
+		}
+		if stmt.strict {
+			// A STRICT table names one of SQLite's five types, and holds it.
+			strict_type, known := sqlite_strict_type(definition.declared)
+			if !known {
+				return {}, errf(.Invalid_Argument, "unknown datatype for %s.%s: \"%s\"", stmt.name, definition.name, definition.declared)
+			}
+			column_type = strict_type
+			named_type = ""
+		} else if tx.store.sqlite_names && len(named_type) == 0 && !definition.autoinc {
+			// Through the SQLite face a declared type means what it means to
+			// SQLite: an affinity, not a storage type.
+			column_type = sqlite_affinity_type(definition.declared)
 		}
 		collation := ""
 		if len(definition.collation) > 0 {
@@ -8414,7 +8455,7 @@ sql_exec_create_table :: proc(tx: ^Tx, stmt: Create_Table_Stmt, params: []Value)
 		column := Column {
 			name           = strings.clone(definition.name, tx.alloc),
 			type           = column_type,
-			named_type     = definition.type_name,
+			named_type     = named_type,
 			unique         = definition.unique,
 			not_null       = definition.not_null || definition.primary,
 			auto_increment = definition.autoinc,
@@ -8602,6 +8643,11 @@ sql_exec_create_table :: proc(tx: ^Tx, stmt: Create_Table_Stmt, params: []Value)
 	}
 	delete(foreign_keys)
 
+	schema.strict = stmt.strict
+	schema.without_rowid = stmt.without_rowid
+	if stmt.without_rowid && len(schema.primary_key) == 0 {
+		return {}, errf(.Invalid_Argument, "PRIMARY KEY missing on table %s", stmt.name)
+	}
 	if create_err := tx_create_table(tx, &schema); create_err.kind != .None {
 		if create_err.kind == .Table_Exists && stmt.if_not_exists {
 			// The result outlives the transaction: its arena is gone by the time
@@ -9579,7 +9625,7 @@ generated_plan_apply :: proc(
 		value, eval_err := eval_expr(ctx, expr)
 		if eval_err.kind != .None do return eval_err
 		target := plan.columns[i]
-		coerced, coerce_err := value_coerce(value, table.schema.columns[target].type)
+		coerced, coerce_err := value_coerce_into(value, &table.schema, target)
 		if coerce_err.kind != .None {
 			return errf(
 				.Invalid_Type,
@@ -9671,4 +9717,73 @@ column_collation :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (string, bool) {
 		return "", false
 	}
 	return "", false
+}
+
+// Column_Affinity is what SQLite's comparison reads from an operand: a column
+// of a numeric or a text type has that affinity, anything else has none.
+Column_Affinity :: enum u8 {
+	None,
+	Numeric,
+	Text,
+}
+
+// column_affinity is the affinity of an operand that names a column.
+@(private)
+column_affinity :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> Column_Affinity {
+	if expr == nil do return .None
+	operand := expr
+	if collate, ok := operand^.(Collate_Expr); ok do operand = collate.operand
+	column, ok := operand^.(Column_Expr)
+	if !ok do return .None
+	for source in ctx.sources {
+		if source.table == nil do continue
+		if len(column.table) > 0 {
+			matches := strings.equal_fold(column.table, source.table.schema.name) ||
+				(len(source.alias) > 0 && strings.equal_fold(column.table, source.alias))
+			if !matches do continue
+		}
+		index, found := schema_column_index(&source.table.schema, column.name)
+		if !found do continue
+		declared := source.table.schema.columns[index].type
+		#partial switch declared.kind {
+		case .Int, .Uint, .Float:
+			return .Numeric
+		case .String:
+			return .Text
+		case .Any:
+			return declared.width == SQLITE_NUMERIC_WIDTH ? .Numeric : .None
+		}
+		return .None
+	}
+	return .None
+}
+
+// comparison_affinity applies SQLite's rule before a comparison: a numeric
+// column makes a text on the other side a number when it reads as one, and a
+// text column makes a number on a side without affinity text.
+@(private)
+comparison_affinity :: proc(ctx: ^Eval_Ctx, left_expr, right_expr: ^Expr, left, right: Value) -> (Value, Value) {
+	if left.kind == right.kind || left.kind == .Null || right.kind == .Null do return left, right
+	left_affinity := column_affinity(ctx, left_expr)
+	right_affinity := column_affinity(ctx, right_expr)
+	if left_affinity == .None && right_affinity == .None do return left, right
+	convert :: proc(v: Value, affinity: Column_Affinity) -> Value {
+		switch affinity {
+		case .Numeric:
+			if v.kind == .String {
+				if number, ok := sqlite_text_number(v.s); ok do return number
+			}
+		case .Text:
+			if sqlite_class(v) == 1 && v.kind != .Bool do return value_string(sqlite_value_text(v, context.temp_allocator))
+		case .None:
+		}
+		return v
+	}
+	if left_affinity == .Numeric || right_affinity == .Numeric {
+		return convert(left, .Numeric), convert(right, .Numeric)
+	}
+	// Text affinity converts only the side that has none.
+	if left_affinity == .Text && right_affinity == .None do return left, convert(right, .Text)
+	if right_affinity == .Text && left_affinity == .None do return convert(left, .Text), right
+	return left, right
 }

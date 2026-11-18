@@ -1196,7 +1196,8 @@ tx_insert_row :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error)
 	row_values := make([]Value, len(values), tx.alloc)
 	// SQLite's INTEGER PRIMARY KEY is the rowid: an omitted value is assigned.
 	pk_position := -1
-	if len(table.schema.primary_key) == 1 {
+	// A WITHOUT ROWID table has no rowid for its key to stand for.
+	if len(table.schema.primary_key) == 1 && !table.schema.without_rowid {
 		position := table.schema.primary_key[0]
 		if table.schema.columns[position].type.kind == .Int do pk_position = position
 	}
@@ -1227,7 +1228,7 @@ tx_insert_row :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error)
 		} else if v.kind == .Null && column.auto_increment {
 			v = value_int(writes.next_sequence)
 		}
-		coerced, coerce_err := value_coerce(v, column.type)
+		coerced, coerce_err := value_coerce_into(v, &table.schema, i)
 		if coerce_err.kind != .None do return 0, coerce_err
 		if coerced.kind == .Null && column.not_null {
 			return 0, errf(.Not_Null_Violation, "column %s.%s cannot be NULL", name, column.name)
@@ -1342,7 +1343,8 @@ tx_update_row :: proc(tx: ^Tx, name: string, id: Row_Id, values: []Value) -> Err
 	row_values := make([]Value, len(values), tx.alloc)
 	// SQLite's INTEGER PRIMARY KEY is the rowid: an omitted value is assigned.
 	pk_position := -1
-	if len(table.schema.primary_key) == 1 {
+	// A WITHOUT ROWID table has no rowid for its key to stand for.
+	if len(table.schema.primary_key) == 1 && !table.schema.without_rowid {
 		position := table.schema.primary_key[0]
 		if table.schema.columns[position].type.kind == .Int do pk_position = position
 	}
@@ -1369,7 +1371,7 @@ tx_update_row :: proc(tx: ^Tx, name: string, id: Row_Id, values: []Value) -> Err
 		} else if v.kind == .Null && column.auto_increment {
 			v = value_uint(u64(id))
 		}
-		coerced, coerce_err := value_coerce(v, column.type)
+		coerced, coerce_err := value_coerce_into(v, &table.schema, i)
 		if coerce_err.kind != .None do return coerce_err
 		if coerced.kind == .Null && column.not_null {
 			return errf(.Not_Null_Violation, "column %s.%s cannot be NULL", name, column.name)

@@ -428,6 +428,9 @@ Column_Def :: struct {
 	// type_name holds a named type when it is not a builtin; it is resolved
 	// against the type catalog when the statement runs.
 	type_name: string,
+	// declared is the type as written, every word of it ("" for a column
+	// declared without one): what SQLite's affinity rules read.
+	declared: string,
 	primary: bool,
 	unique:  bool,
 	not_null: bool,
@@ -484,12 +487,18 @@ Alter_Table_Stmt :: struct {
 	alter_type:   Column_Type,
 	table:  string,
 	column: Column,
+	// add_declared is the type ADD COLUMN wrote ("" for none), which the
+	// SQLite face reads by its affinity.
+	add_declared: string,
 }
 
 Create_Table_Stmt :: struct {
-	// strict records the STRICT table option; the engine already enforces the
-	// declared types, so it changes nothing at run time.
-	strict: bool,
+	// strict is the STRICT table option: a value that does not convert to its
+	// column's type is refused, through the SQLite face too. without_rowid is
+	// WITHOUT ROWID: the primary key is the row's identity and `rowid` names
+	// nothing.
+	strict:        bool,
+	without_rowid: bool,
 	name:          string,
 	if_not_exists: bool,
 	ephemeral:     bool,

@@ -844,13 +844,27 @@ parse_alter_table :: proc(p: ^Parser) -> Statement {
 	if p_expect_keyword(p, "add") == false do return stmt
 	p_match_keyword(p, "column")
 	stmt.column.name = p_ident(p)
-	type_name := p_ident_or_keyword(p)
-	kind, width, type_ok := type_kind_from_name(type_name)
-	if !type_ok {
-		p_fail(p, .Sql_Syntax, "unknown column type %q", type_name)
-		return stmt
+	// The type may be absent, or any words SQLite reads by affinity.
+	type_start := p.prev_end
+	words := make([dynamic]string, 0, 2, context.temp_allocator)
+	for (p.current.kind == .Ident || p.current.kind == .Quoted_Ident) && !p_column_constraint_ahead(p) {
+		append(&words, p.current.text)
+		p_advance(p)
 	}
-	stmt.column.type = Column_Type{kind = kind, width = width}
+	if len(words) > 0 && p_match_punct(p, "(") {
+		for !p_is_punct(p, ")") && p.current.kind != .EOF do p_advance(p)
+		p_expect_punct(p, ")")
+	}
+	if len(words) > 0 do stmt.add_declared = p_text_since(p, type_start)
+	if len(words) == 1 {
+		if kind, width, type_ok := type_kind_from_name(words[0]); type_ok {
+			stmt.column.type = Column_Type{kind = kind, width = width}
+		} else {
+			stmt.column.type = sqlite_affinity_type(words[0])
+		}
+	} else {
+		stmt.column.type = sqlite_affinity_type(strings.join(words[:], " ", context.temp_allocator))
+	}
 	if p_match_keyword(p, "not") {
 		p_expect_keyword(p, "null")
 		stmt.column.not_null = true
@@ -1868,6 +1882,17 @@ p_reset :: proc(p: ^Parser, lexer: Lexer, token: Token) {
 
 // parse_type_ref reads a column type. `builtin` is false when the name is
 // unknown, in which case the caller defers to the type catalog.
+// p_column_constraint_ahead reports a column constraint where a type could
+// be: the column was declared without one.
+@(private)
+p_column_constraint_ahead :: proc(p: ^Parser) -> bool {
+	if p.current.kind != .Ident do return false
+	for word in ([]string{"primary", "not", "null", "unique", "check", "default", "collate", "references", "generated", "as", "constraint", "autoincrement"}) {
+		if strings.equal_fold(p.current.text, word) do return true
+	}
+	return false
+}
+
 @(private)
 parse_type_ref :: proc(p: ^Parser) -> (t: Column_Type, builtin: bool, name: string) {
 	t, builtin, name = parse_type_base(p)
@@ -2213,7 +2238,23 @@ parse_create_table :: proc(p: ^Parser, ephemeral: bool, event: bool) -> Statemen
 		}
 		column: Column_Def
 		column.name = p_ident(p)
-		parsed, builtin, type_name := parse_type_ref(p)
+		type_start := p.prev_end
+		// A column may have no type at all, as SQLite allows: it then keeps any
+		// value as it arrives.
+		untyped := p_is_punct(p, ",") || p_is_punct(p, ")") || p_column_constraint_ahead(p)
+		parsed, builtin, type_name := Column_Type{kind = .Any}, true, ""
+		if !untyped do parsed, builtin, type_name = parse_type_ref(p)
+		if !builtin {
+			// A type SQLite reads by its words (UNSIGNED BIG INT, VARYING
+			// CHARACTER) takes every word up to the length or a constraint.
+			words := make([dynamic]string, 0, 3, context.temp_allocator)
+			append(&words, type_name)
+			for (p.current.kind == .Ident || p.current.kind == .Quoted_Ident) && !p_column_constraint_ahead(p) {
+				append(&words, p.current.text)
+				p_advance(p)
+			}
+			if len(words) > 1 do type_name = strings.join(words[:], " ", p.alloc)
+		}
 		if builtin {
 			column.type = parsed
 			if pg_serial_width(strings.to_upper(type_name, context.temp_allocator)) > 0 {
@@ -2224,13 +2265,14 @@ parse_create_table :: proc(p: ^Parser, ephemeral: bool, event: bool) -> Statemen
 			// Not a builtin: defer to the type catalog when the statement runs.
 			column.type_name = type_name
 		}
-		if p_match_punct(p, "(") {
+		if !untyped && p_match_punct(p, "(") {
 			// Length or precision is accepted and ignored.
 			for !p_is_punct(p, ")") && p.current.kind != .EOF {
 				p_advance(p)
 			}
 			p_expect_punct(p, ")")
 		}
+		if !untyped do column.declared = p_text_since(p, type_start)
 		column_checks := make([dynamic]Check_Constraint, 0, 0, p.alloc)
 		pending_name := ""
 		for {
@@ -2379,9 +2421,11 @@ parse_create_table :: proc(p: ^Parser, ephemeral: bool, event: bool) -> Statemen
 		}
 		if p_match_keyword(p, "without") {
 			p_expect_keyword(p, "rowid")
-			p_fail(p, .Sql_Unsupported, "WITHOUT ROWID tables are not supported")
-			break
+			stmt.without_rowid = true
+			_ = p_match_punct(p, ",")
+			continue
 		}
+		if p_match_punct(p, ",") do continue
 		break
 	}
 	return stmt

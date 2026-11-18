@@ -3,6 +3,7 @@ package engine
 import "core:mem"
 import "core:strings"
 import "core:slice"
+import "core:strconv"
 
 // Type_Kind is the static type of a column. The engine keeps a small, fixed set
 // so rows stay cheap and comparisons are unambiguous.
@@ -394,6 +395,9 @@ Table_Schema :: struct {
 	foreign_keys:         []Foreign_Key,
 	// checks are the table's CHECK constraints, column and table level alike.
 	checks:               []Check_Constraint,
+	// strict and without_rowid are SQLite's table options (Create_Table_Stmt).
+	strict:               bool,
+	without_rowid:        bool,
 }
 
 // SCHEMA_HAS_EXTRAS marks a schema record that carries the section written after
@@ -401,6 +405,10 @@ Table_Schema :: struct {
 // is set only when the table has one of them, so a database that uses none stays
 // readable by a build that predates the section.
 SCHEMA_HAS_EXTRAS :: u8(1 << 2)
+// SCHEMA_STRICT and SCHEMA_WITHOUT_ROWID record SQLite's table options. A
+// build that predates them reads the table without them.
+SCHEMA_STRICT :: u8(1 << 3)
+SCHEMA_WITHOUT_ROWID :: u8(1 << 4)
 
 @(private)
 schema_has_extras :: proc(schema: ^Table_Schema) -> bool {
@@ -780,7 +788,144 @@ array_parse_text :: proc(text: string, inner: Column_Type) -> (Value, Error) {
 	return Value{kind = .Array, list = list}, ERROR_NONE
 }
 
+// value_coerce converts a value for a column of type `t`. A text that reads as
+// a number becomes one for a numeric column and a number becomes text for a
+// text column, as SQLite's affinity does. Through the SQLite face a value that
+// does not convert is kept as it is, which is what SQLite stores; elsewhere it
+// is refused.
 value_coerce :: proc(v: Value, t: Column_Type) -> (Value, Error) {
+	converted, keep := affinity_convert(v, t)
+	if keep do return converted, ERROR_NONE
+	out, err := value_coerce_strict(converted, t)
+	if err.kind != .None && affinity_keeps_mismatch(t) {
+		error_free(&err)
+		return converted, ERROR_NONE
+	}
+	return out, err
+}
+
+// SQLITE_NUMERIC_WIDTH marks an ANY column with SQLite's NUMERIC affinity:
+// it keeps any value, and turns a text that reads as a number into one.
+SQLITE_NUMERIC_WIDTH :: u8(1)
+
+// sqlite_affinity_type is SQLite's five rules over a declared type name.
+sqlite_affinity_type :: proc(declared: string) -> Column_Type {
+	upper := strings.to_upper(declared, context.temp_allocator)
+	switch {
+	case strings.contains(upper, "INT"):
+		return Column_Type{kind = .Int, width = 8}
+	case strings.contains(upper, "CHAR"), strings.contains(upper, "CLOB"), strings.contains(upper, "TEXT"):
+		return Column_Type{kind = .String}
+	case strings.contains(upper, "BLOB"), len(strings.trim_space(upper)) == 0:
+		return Column_Type{kind = .Any}
+	case strings.contains(upper, "REAL"), strings.contains(upper, "FLOA"), strings.contains(upper, "DOUB"):
+		return Column_Type{kind = .Float, width = 8}
+	}
+	return Column_Type{kind = .Any, width = SQLITE_NUMERIC_WIDTH}
+}
+
+@(private)
+affinity_sqlite_mode :: proc() -> bool {
+	store := statement_store()
+	return store != nil && store.sqlite_names
+}
+
+// affinity_strict is set while a write to a STRICT table runs: its columns
+// refuse what they cannot convert, whatever face the statement came through.
+@(thread_local)
+affinity_strict: bool
+
+@(private)
+affinity_keeps_mismatch :: proc(t: Column_Type) -> bool {
+	if affinity_strict do return false
+	#partial switch t.kind {
+	case .Int, .Uint, .Float, .String, .Bytes, .Bool, .Timestamp, .Uuid, .Duration:
+		return affinity_sqlite_mode()
+	}
+	return false
+}
+
+// sqlite_text_number reads a text the way SQLite's affinity does: the whole
+// text, spaces around it allowed, as an integer or a real.
+sqlite_text_number :: proc(text: string) -> (Value, bool) {
+	trimmed := strings.trim_space(text)
+	if len(trimmed) == 0 do return {}, false
+	digits := trimmed
+	if digits[0] == '+' || digits[0] == '-' do digits = digits[1:]
+	if len(digits) == 0 do return {}, false
+	integer := true
+	for c in digits {
+		if c < '0' || c > '9' {
+			integer = false
+			break
+		}
+	}
+	if integer {
+		if i, ok := strconv.parse_i64(trimmed); ok do return value_int(i), true
+	}
+	// A real needs a digit, and nothing that is not part of a number.
+	has_digit := false
+	for c in digits {
+		switch c {
+		case '0' ..= '9':
+			has_digit = true
+		case '.', 'e', 'E', '+', '-':
+		case:
+			return {}, false
+		}
+	}
+	if !has_digit do return {}, false
+	f, ok := strconv.parse_f64(trimmed)
+	if !ok do return {}, false
+	return value_float(f), true
+}
+
+// affinity_integral turns a real that is exactly an integer into one.
+@(private)
+affinity_integral :: proc(v: Value) -> Value {
+	if v.kind != .Float do return v
+	if v.f >= -9.2e18 && v.f <= 9.2e18 && f64(i64(v.f)) == v.f do return value_int(i64(v.f))
+	return v
+}
+
+// affinity_convert applies SQLite's conversions before the column's own.
+// `keep` says the value is final as it is: a real an INTEGER column keeps
+// because it is not whole, through the SQLite face.
+@(private)
+affinity_convert :: proc(v: Value, t: Column_Type) -> (out: Value, keep: bool) {
+	#partial switch t.kind {
+	case .Any:
+		if t.width != SQLITE_NUMERIC_WIDTH do return v, false
+		if v.kind == .String {
+			if number, ok := sqlite_text_number(v.s); ok do return affinity_integral(number), true
+		}
+		return affinity_integral(v), true
+	case .Int, .Uint:
+		number := v
+		if v.kind == .String {
+			parsed, ok := sqlite_text_number(v.s)
+			if !ok do return v, false
+			number = parsed
+		}
+		whole := affinity_integral(number)
+		// SQLite's INTEGER affinity keeps a real that is not whole.
+		if whole.kind == .Float && affinity_sqlite_mode() && !affinity_strict do return whole, true
+		return whole, false
+	case .Float:
+		if v.kind == .String {
+			if number, ok := sqlite_text_number(v.s); ok do return number, false
+		}
+	case .String:
+		#partial switch v.kind {
+		case .Int, .Uint, .Float, .Int128, .Uint128:
+			return value_string(sqlite_value_text(v, context.temp_allocator)), false
+		}
+	}
+	return v, false
+}
+
+@(private)
+value_coerce_strict :: proc(v: Value, t: Column_Type) -> (Value, Error) {
 	if t.kind == .Unit {
 		if v.kind == .Null do return value_null(), ERROR_NONE
 		return {}, errf(.Invalid_Type, "UNIT carries no value")
@@ -1168,6 +1313,8 @@ schema_encode :: proc(w: ^Byte_Writer, schema: ^Table_Schema) {
 	flags := u8(0)
 	if schema.ephemeral do flags |= 1 << 0
 	if schema.event do flags |= 1 << 1
+	if schema.strict do flags |= SCHEMA_STRICT
+	if schema.without_rowid do flags |= SCHEMA_WITHOUT_ROWID
 	extras := schema_has_extras(schema)
 	if extras do flags |= SCHEMA_HAS_EXTRAS
 	bw_write_u8(w, flags)
@@ -1264,6 +1411,8 @@ schema_decode :: proc(r: ^Byte_Reader, alloc: mem.Allocator) -> Table_Schema {
 	schema_flags := br_read_u8(r)
 	schema.ephemeral = schema_flags & (1 << 0) != 0
 	schema.event = schema_flags & (1 << 1) != 0
+	schema.strict = schema_flags & SCHEMA_STRICT != 0
+	schema.without_rowid = schema_flags & SCHEMA_WITHOUT_ROWID != 0
 	if r.bad do return schema
 	auto_increment_column := NO_COLUMN
 	column_count := int(br_read_u32(r))
@@ -1458,4 +1607,56 @@ schema_copy :: proc(schema: ^Table_Schema, alloc: mem.Allocator) -> Table_Schema
 		out.checks[i] = Check_Constraint{name = strings.clone(check.name, alloc), sql = strings.clone(check.sql, alloc), column = strings.clone(check.column, alloc)}
 	}
 	return out
+}
+
+// sqlite_strict_type is the type a STRICT table's column holds, for the five
+// names SQLite allows there.
+sqlite_strict_type :: proc(declared: string) -> (Column_Type, bool) {
+	switch strings.to_upper(strings.trim_space(declared), context.temp_allocator) {
+	case "INT", "INTEGER":
+		return Column_Type{kind = .Int, width = 8}, true
+	case "REAL":
+		return Column_Type{kind = .Float, width = 8}, true
+	case "TEXT":
+		return Column_Type{kind = .String}, true
+	case "BLOB":
+		return Column_Type{kind = .Bytes}, true
+	case "ANY":
+		return Column_Type{kind = .Any}, true
+	}
+	return {}, false
+}
+
+// value_coerce_into converts a value for column `index` of `schema`. A STRICT
+// table refuses what does not convert, a real that is not whole into an
+// INTEGER column included, in SQLite's words.
+value_coerce_into :: proc(v: Value, schema: ^Table_Schema, index: int) -> (Value, Error) {
+	column := &schema.columns[index]
+	out, err := value_coerce(v, column.type)
+	if !schema.strict do return out, err
+	if err.kind == .None && column.type.kind == .Int && v.kind == .String {
+		// '1.5' reads as a real, which an INTEGER column of a STRICT table refuses.
+		if number, ok := sqlite_text_number(v.s); ok && number.kind == .Float && affinity_integral(number).kind == .Float {
+			err = errf(.Invalid_Type, "lossy")
+		}
+	}
+	if err.kind == .None && column.type.kind == .Int && v.kind == .Float && affinity_integral(v).kind == .Float {
+		err = errf(.Invalid_Type, "lossy")
+	}
+	if err.kind == .None do return out, err
+	error_free(&err)
+	class := "BLOB"
+	shown := v
+	if v.kind == .String {
+		if number, ok := sqlite_text_number(v.s); ok do shown = number
+	}
+	#partial switch shown.kind {
+	case .Int, .Uint, .Int128, .Uint128, .Bool:
+		class = "INTEGER"
+	case .Float:
+		class = "REAL"
+	case .String:
+		class = "TEXT"
+	}
+	return {}, errf(.Check_Violation, "cannot store %s value in %s column %s.%s", class, sqlite_type_name(column.type), schema.name, column.name)
 }

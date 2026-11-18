@@ -44,8 +44,9 @@ Res_Source :: struct {
 	columns: []string,
 	known:   bool,
 	// table is set for a table of the database: its row id and a full-text
-	// table's hidden columns are names too.
+	// table's hidden columns are names too; no_rowid for one WITHOUT ROWID.
 	table:   bool,
+	no_rowid: bool,
 }
 
 @(private)
@@ -144,6 +145,8 @@ res_statement :: proc(walk: ^Res_Walk, statement: ^Statement) {
 			res_expr(walk, assignment.value)
 		}
 		res_expr(walk, s.where_clause)
+	case Create_Table_Stmt, Create_View_Stmt, Create_Index_Stmt, Drop_Table_Stmt, Drop_View_Stmt, Drop_Index_Stmt, Create_Trigger_Stmt, Alter_Table_Stmt:
+		res_ddl(walk, statement)
 	case Delete_Stmt:
 		base := res_push_ctes(walk, s.ctes, s.ctes_recursive)
 		defer resize(&walk.ctes, base)
@@ -187,7 +190,7 @@ res_internal :: proc(name: string) -> bool {
 res_table_source :: proc(table: ^Table, alias: string) -> Res_Source {
 	columns := make([]string, len(table.schema.columns), context.temp_allocator)
 	for column, i in table.schema.columns do columns[i] = column.name
-	return Res_Source{name = table.schema.name, alias = alias, columns = columns, known = true, table = true}
+	return Res_Source{name = table.schema.name, alias = alias, columns = columns, known = true, table = true, no_rowid = table.schema.without_rowid}
 }
 
 // res_vtab_source is a program's virtual table: its declared columns, hidden
@@ -204,7 +207,8 @@ res_has_column :: proc(source: Res_Source, name: string) -> bool {
 	for column in source.columns do if strings.equal_fold(column, name) do return true
 	if source.table {
 		// The row id, and a full-text table's score and its own name (`t MATCH`).
-		if rowid_alias_name(name) || strings.equal_fold(name, "rank") || strings.equal_fold(name, source.name) do return true
+		if rowid_alias_name(name) && !source.no_rowid do return true
+		if strings.equal_fold(name, "rank") || strings.equal_fold(name, source.name) do return true
 	}
 	return false
 }
@@ -496,5 +500,131 @@ res_expr :: proc(walk: ^Res_Walk, expr: ^Expr) {
 			res_expr(walk, branch.result)
 		}
 		res_expr(walk, e.fallback)
+	}
+}
+
+// --- DDL -------------------------------------------------------------------
+//
+// SQLite refuses at prepare a CREATE of a name that exists, a DROP of one
+// that does not or of the wrong kind, and an index or trigger on a table that
+// is not there. These are the same checks, in SQLite's words.
+
+@(private)
+res_fail :: proc(walk: ^Res_Walk, kind: Error_Kind, format: string, args: ..any) {
+	if walk.err.kind != .None do return
+	walk.err = errf(kind, format, ..args)
+}
+
+// res_relation_kind says what a name is: a table (any kind of it), a view, or
+// nothing.
+@(private)
+res_relation_kind :: proc(walk: ^Res_Walk, name: string) -> string {
+	if tx_table_probe(walk.tx, name) != nil do return "table"
+	if _, is_view := view_sql(walk.tx, name); is_view do return "view"
+	if _, is_virtual := fts_virtual_lookup(walk.tx, name); is_virtual do return "table"
+	if _, is_vtab, _ := vtab_find(walk.tx, name); is_vtab do return "table"
+	return ""
+}
+
+// res_index_exists answers whether the transaction sees index `name`: one in
+// the catalog that it did not drop, or one it created itself.
+@(private)
+res_index_exists :: proc(walk: ^Res_Walk, name: string) -> bool {
+	found := false
+	for _, table in walk.tx.store.tables {
+		for index in table.schema.indexes do if strings.equal_fold(index.name, name) do found = true
+	}
+	for op in walk.tx.state.index_ops {
+		if strings.equal_fold(op.index.name, name) do found = !op.drop
+	}
+	return found
+}
+
+@(private)
+res_ddl :: proc(walk: ^Res_Walk, statement: ^Statement) {
+	#partial switch &s in statement^ {
+	case Create_Table_Stmt:
+		if !s.if_not_exists {
+			if kind := res_relation_kind(walk, s.name); len(kind) > 0 {
+				res_fail(walk, .Table_Exists, "%s %s already exists", kind, s.name)
+				return
+			}
+		}
+		for column, i in s.columns {
+			for other in s.columns[:i] {
+				if strings.equal_fold(other.name, column.name) {
+					res_fail(walk, .Invalid_Argument, "duplicate column name: %s", column.name)
+					return
+				}
+			}
+			if s.strict {
+				if _, known := sqlite_strict_type(column.declared); !known {
+					res_fail(walk, .Invalid_Argument, "unknown datatype for %s.%s: \"%s\"", s.name, column.name, column.declared)
+					return
+				}
+			}
+		}
+		if s.without_rowid {
+			has_key := false
+			for column in s.columns do if column.primary do has_key = true
+			for constraint in s.constraints do if constraint.primary do has_key = true
+			if !has_key do res_fail(walk, .Invalid_Argument, "PRIMARY KEY missing on table %s", s.name)
+		}
+	case Create_View_Stmt:
+		if s.if_not_exists || s.or_replace do return
+		if kind := res_relation_kind(walk, s.name); len(kind) > 0 {
+			res_fail(walk, .Table_Exists, "%s %s already exists", kind, s.name)
+		}
+	case Create_Index_Stmt:
+		if !s.if_not_exists && res_index_exists(walk, s.name) {
+			res_fail(walk, .Table_Exists, "index %s already exists", s.name)
+			return
+		}
+		table := tx_table_probe(walk.tx, s.table)
+		if table == nil {
+			res_fail(walk, .Table_Not_Found, "no such table: main.%s", s.table)
+			return
+		}
+		for column in s.columns {
+			// An expression term has no column name.
+			if len(column) == 0 do continue
+			if _, found := schema_column_index(&table.schema, column); !found {
+				res_fail(walk, .Column_Not_Found, "no such column: %s", column)
+				return
+			}
+		}
+	case Drop_Table_Stmt:
+		kind := res_relation_kind(walk, s.name)
+		if kind == "view" {
+			res_fail(walk, .Invalid_Argument, "use DROP VIEW to delete view %s", s.name)
+		} else if len(kind) == 0 && !s.if_exists && !res_internal(s.name) {
+			res_fail(walk, .Table_Not_Found, "no such table: %s", s.name)
+		}
+	case Drop_View_Stmt:
+		kind := res_relation_kind(walk, s.name)
+		if kind == "table" {
+			res_fail(walk, .Invalid_Argument, "use DROP TABLE to delete table %s", s.name)
+		} else if len(kind) == 0 && !s.if_exists {
+			res_fail(walk, .Table_Not_Found, "no such view: %s", s.name)
+		}
+	case Drop_Index_Stmt:
+		if !s.if_exists && !res_index_exists(walk, s.name) {
+			res_fail(walk, .Index_Not_Found, "no such index: %s", s.name)
+		}
+	case Create_Trigger_Stmt:
+		if res_relation_kind(walk, s.table) != "table" {
+			res_fail(walk, .Table_Not_Found, "no such table: main.%s", s.table)
+		}
+	case Alter_Table_Stmt:
+		table := tx_table_probe(walk.tx, s.table)
+		if table == nil {
+			res_fail(walk, .Table_Not_Found, "no such table: %s", s.table)
+			return
+		}
+		if len(s.column.name) > 0 && len(s.rename_to) == 0 && len(s.drop_column) == 0 && len(s.alter_column) == 0 {
+			if _, found := schema_column_index(&table.schema, s.column.name); found {
+				res_fail(walk, .Invalid_Argument, "duplicate column name: %s", s.column.name)
+			}
+		}
 	}
 }
