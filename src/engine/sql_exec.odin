@@ -4043,7 +4043,9 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		append(&star_sources, Source{table = from_table, alias = stmt.from.alias})
 	}
 	for join in stmt.joins {
-		if table, ok := tx_table(tx, join.table.name); ok.kind == .None {
+		// A probe: a join on a table function or a view has no table here, and
+		// building the error that says so would only be dropped.
+		if table := tx_table_probe(tx, join.table.name); table != nil {
 			append(&star_sources, Source{table = table, alias = join.table.alias})
 		}
 	}
@@ -7731,8 +7733,8 @@ like_match :: proc(text, pattern: string, case_insensitive: bool, escape: u8 = 0
 			t = ascii_case(text, false, context.temp_allocator)
 			p = ascii_case(pattern, false, context.temp_allocator)
 		} else {
-			t = strings.to_lower(text)
-			p = strings.to_lower(pattern)
+			t = strings.to_lower(text, context.temp_allocator)
+			p = strings.to_lower(pattern, context.temp_allocator)
 		}
 	}
 	Like_Token_Kind :: enum u8 {

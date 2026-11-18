@@ -159,6 +159,7 @@ tx_source_table :: proc(
 	if table_err.kind != .Table_Not_Found do return nil, false, table_err
 	// A table a program's module serves is read like a view.
 	if vtab, is_vtab, vtab_err := vtab_find(tx, name); vtab_err.kind != .None || is_vtab {
+		error_drop(table_err)
 		if vtab_err.kind != .None do return nil, false, vtab_err
 		materialized, materialize_err := vtab_materialize(tx, vtab, args)
 		return materialized, true, materialize_err
@@ -182,6 +183,7 @@ tx_source_table :: proc(
 		}
 		return nil, false, table_err
 	}
+	error_drop(table_err)
 	materialized, view_err := tx_materialize_view(tx, name, sql, args)
 	return materialized, true, view_err
 }
@@ -198,7 +200,9 @@ view_args :: proc(
 	if len(ref.args) == 0 do return nil, ERROR_NONE
 	// A correlated subquery's arguments may read the row of the query around it.
 	ctx := Eval_Ctx{tx = tx, params = params, sources = sources, now_us = now_microseconds(), outer = tx.outer}
-	out := make([]Value, len(ref.args))
+	// The values live as long as the statement's transaction: the reference
+	// they are for is read within it.
+	out := make([]Value, len(ref.args), tx.alloc)
 	for expr, i in ref.args {
 		value, eval_err := eval_expr(&ctx, expr)
 		if eval_err.kind != .None do return nil, eval_err

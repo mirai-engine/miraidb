@@ -248,3 +248,21 @@ test_a_parse_error_leaves_nothing :: proc(t: ^testing.T) {
 	// The error names the line and column; the detail it wraps is not kept.
 	expect_nothing_left(t, .Memory, "_test_memory_parse", {"SELECT FROM WHERE", "SELEC 1", "CREATE TABLE ("}, fails = true)
 }
+
+@(test)
+test_catalog_pragmas_leave_nothing :: proc(t: ^testing.T) {
+	// What SQLite's shell reads: the table and index lists, joined; a view's
+	// columns; the temp schema; LIKE over the names.
+	expect_nothing_left(t, .Memory, "_test_memory_pragmas", {
+		"CREATE TABLE people (id INTEGER PRIMARY KEY, age INTEGER UNIQUE)",
+		"CREATE INDEX people_age ON people (age)",
+		"CREATE VIEW adults AS SELECT age FROM people",
+		"SELECT i.name FROM pragma_table_list t, pragma_index_list(t.name, t.schema) i WHERE i.name NOT LIKE 'sqlite__%' ESCAPE '_'",
+		"PRAGMA table_list",
+		"PRAGMA database_list",
+		"PRAGMA table_info(adults)",
+		"PRAGMA index_list(people)",
+		"SELECT name FROM temp.sqlite_master",
+		"SELECT rowid, name FROM sqlite_schema",
+	})
+}
