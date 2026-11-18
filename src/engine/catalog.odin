@@ -103,8 +103,8 @@ catalog_encode :: proc(store: ^Store, seq: u64) -> []u8 {
 			bw_write_u32(&payload, u32(len(row.values)))
 			for value in row.values do value_encode(&payload, value)
 		}
+		// The release frees the array too.
 		table_collect_release(table, &rows)
-		delete(rows)
 	}
 	body := bw_bytes(&payload)
 	out := make([]u8, CATALOG_HEADER_LEN + len(body))
