@@ -2966,6 +2966,26 @@ parse_comparison :: proc(p: ^Parser) -> ^Expr {
 			left = p_compare(p, .Gt, left, parse_operand(p))
 			continue
 		}
+		// SQLite's postfix spellings: `x ISNULL`, `x NOTNULL`, `x NOT NULL`.
+		if p_is_keyword(p, "isnull") || p_is_keyword(p, "notnull") {
+			negated := p_is_keyword(p, "notnull")
+			p_advance(p)
+			e := new(Expr, p.alloc)
+			e^ = Is_Null_Expr{operand = left, negated = negated}
+			left = e
+			continue
+		}
+		if p_is_keyword(p, "not") {
+			lexer, token := p_mark(p)
+			p_advance(p)
+			if p_match_keyword(p, "null") {
+				e := new(Expr, p.alloc)
+				e^ = Is_Null_Expr{operand = left, negated = true}
+				left = e
+				continue
+			}
+			p_reset(p, lexer, token)
+		}
 		if p_match_keyword(p, "is") {
 			negated := p_match_keyword(p, "not")
 			if p_match_keyword(p, "null") {
