@@ -250,6 +250,8 @@ QUERIES = [
     "SELECT json_array(coalesce(json('[1]'), 0)), json_array((SELECT json('[1]')))",
     "SELECT json_array(x) FROM (SELECT json('[1]') AS x)",
     # FILTER, an aggregate's ORDER BY and the WINDOW clause (S4).
+    "SELECT t, sum(sum(n)) FILTER (WHERE t > 'a') OVER (ORDER BY t) FROM nums WHERE t IS NOT NULL GROUP BY t ORDER BY t",
+    "SELECT t, count(*) FILTER (WHERE count(*) > 1) OVER (), max(sum(n)) FILTER (WHERE sum(n) < 5) OVER (ORDER BY t ROWS 1 PRECEDING) FROM nums WHERE t IS NOT NULL GROUP BY t ORDER BY t",
     "SELECT dept, count(*) FILTER (WHERE salary > 60), sum(salary) FILTER (WHERE name IS NOT NULL) FROM emp GROUP BY dept ORDER BY dept",
     "SELECT dept, group_concat(name, '/' ORDER BY name DESC) FROM emp GROUP BY dept ORDER BY dept",
     "SELECT group_concat(t ORDER BY m, t) FILTER (WHERE n IS NOT NULL) FROM nums",

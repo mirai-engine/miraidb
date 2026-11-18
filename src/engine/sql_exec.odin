@@ -1911,6 +1911,9 @@ Window_Cell :: struct {
 	partition: []u8,
 	order:     []u8,
 	args:      []Value,
+	// filtered_out is a grouped row the call's FILTER leaves out of every
+	// frame, decided when the row's values are captured.
+	filtered_out: bool,
 }
 
 // window_partition_key encodes the PARTITION BY values of the current row.
@@ -2630,21 +2633,24 @@ window_aggregate_frame :: proc(
 	if len(sources) != 0 {
 		return window_aggregate_over(ctx, call, sources, indexes, lo, hi)
 	}
-	// Over grouped rows a frame holds values, not rows a FILTER could read.
-	if call.filter != nil do return {}, errf(.Sql_Unsupported, "FILTER on a window over grouped rows is not supported")
+	// Over grouped rows a frame holds values; a FILTER was decided when they
+	// were captured, so a row it leaves out is skipped here.
 	if lo > hi do return value_null(), ERROR_NONE
-	values := make([]Value, hi - lo + 1)
+	values := make([dynamic]Value, 0, hi - lo + 1)
 	defer delete(values)
 	for f in lo ..= hi {
 		cell := cells[indexes[f]][cell_index]
+		if cell.filtered_out do continue
 		if window.star || len(cell.args) == 0 {
 			// count(*) over the frame: one non-null stand-in per row.
-			values[f - lo] = value_int(1)
+			append(&values, value_int(1))
 			continue
 		}
-		values[f - lo] = cell.args[0]
+		append(&values, cell.args[0])
 	}
-	return eval_aggregate_values(ctx, call, values)
+	plain := call
+	plain.filter = nil
+	return eval_aggregate_values(ctx, plain, values[:])
 }
 
 // window_sort orders the row indexes of a partition by their ORDER BY keys.
@@ -2760,7 +2766,18 @@ window_row_cells :: proc(
 			}
 			args[a] = value_clone(arg_value, context.allocator)
 		}
-		append(&cells, Window_Cell{partition = partition_key, order = order_key, args = args})
+		filtered_out := false
+		if window.filter != nil {
+			kept, filter_err := eval_expr(ctx, window.filter)
+			if filter_err.kind != .None {
+				delete(partition_key)
+				delete(order_key)
+				free_values(args)
+				return cells, filter_err
+			}
+			filtered_out = !value_is_truthy(kept)
+		}
+		append(&cells, Window_Cell{partition = partition_key, order = order_key, args = args, filtered_out = filtered_out})
 	}
 	return cells, ERROR_NONE
 }

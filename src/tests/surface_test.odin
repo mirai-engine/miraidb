@@ -193,6 +193,23 @@ test_aggregate_filter_and_order :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_window_filter_over_groups :: proc(t: ^testing.T) {
+	// FILTER on a window over grouped rows reads each group's values; the
+	// answers are SQLite's.
+	store := fresh_db(t, "window_filter_groups")
+	if store == nil do return
+	defer cleanup_db(store, "window_filter_groups")
+	run(t, store, "CREATE TABLE w (g INTEGER, n INTEGER)")
+	run(t, store, "INSERT INTO w VALUES (1, 10), (1, 5), (2, 7), (3, 1), (3, 2), (3, 3)")
+	answer :: proc(t: ^testing.T, store: ^db.Store, sql: string) -> string {
+		return scalar(t, store, strings.concatenate({"SELECT group_concat(coalesce(x, 'null'), ',') FROM (", sql, ")"}, context.temp_allocator)).s
+	}
+	testing.expect_value(t, answer(t, store, "SELECT sum(sum(n)) FILTER (WHERE g > 1) OVER (ORDER BY g) AS x FROM w GROUP BY g ORDER BY g"), "null,7,13")
+	testing.expect_value(t, answer(t, store, "SELECT count(*) FILTER (WHERE count(*) > 1) OVER () AS x FROM w GROUP BY g ORDER BY g"), "2,2,2")
+	testing.expect_value(t, answer(t, store, "SELECT max(sum(n)) FILTER (WHERE sum(n) < 15) OVER (ORDER BY g ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS x FROM w GROUP BY g ORDER BY g"), "null,7,7")
+}
+
+@(test)
 test_window_clause :: proc(t: ^testing.T) {
 	// The WINDOW clause (S4): `OVER name` takes a definition whole, `OVER (name
 	// ...)` adds an ORDER BY or a frame to it, a definition may build on an
