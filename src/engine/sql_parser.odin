@@ -1104,13 +1104,26 @@ parse_fk_clauses :: proc(p: ^Parser) -> (on_delete, on_update: Foreign_Key_Actio
 	return
 }
 
-// p_refuse_conflict_clause refuses `ON CONFLICT <resolution>` on a constraint:
-// it changes what a violation does, and ignoring it would answer differently.
+// p_conflict_clause reads a constraint's `ON CONFLICT <resolution>`, which
+// decides what a row that breaks it does when the statement names none.
 @(private)
-p_refuse_conflict_clause :: proc(p: ^Parser) -> bool {
-	if !p_is_keyword(p, "on") do return false
-	p_fail(p, .Sql_Unsupported, "ON CONFLICT on a constraint is not supported: use INSERT OR <resolution>")
-	return true
+p_conflict_clause :: proc(p: ^Parser) -> Conflict_Resolution {
+	if !p_match_keyword(p, "on") do return .Abort
+	p_expect_keyword(p, "conflict")
+	switch {
+	case p_match_keyword(p, "rollback"):
+		return .Rollback
+	case p_match_keyword(p, "abort"):
+		return .Abort
+	case p_match_keyword(p, "fail"):
+		return .Fail
+	case p_match_keyword(p, "ignore"):
+		return .Ignore
+	case p_match_keyword(p, "replace"):
+		return .Replace
+	}
+	p_fail(p, .Sql_Syntax, "expected ROLLBACK, ABORT, FAIL, IGNORE or REPLACE after ON CONFLICT")
+	return .Abort
 }
 
 // parse_values_select reads `VALUES (a, b), (c, d)` as the query SQLite makes of
@@ -1422,11 +1435,13 @@ parse_insert :: proc(p: ^Parser) -> Statement {
 	// `REPLACE INTO` is SQLite's short form of `INSERT OR REPLACE INTO`.
 	if p_match_keyword(p, "replace") {
 		insert.conflict_replace = true
+		insert.conflict_explicit = true
 	} else {
 		p_expect_keyword(p, "insert")
 	}
 	// INSERT OR <action> INTO: what a constraint violation does to the statement.
 	if !insert.conflict_replace && p_match_keyword(p, "or") {
+		insert.conflict_explicit = true
 		switch {
 		case p_match_keyword(p, "replace"):
 			insert.conflict_replace = true
@@ -1547,6 +1562,7 @@ parse_update :: proc(p: ^Parser) -> Statement {
 	p_expect_keyword(p, "update")
 	// UPDATE OR <action>: what a row that breaks a constraint does.
 	if p_match_keyword(p, "or") {
+		update.conflict_explicit = true
 		switch {
 		case p_match_keyword(p, "abort"):
 		case p_match_keyword(p, "fail"):
@@ -2257,7 +2273,8 @@ parse_create_table :: proc(p: ^Parser, ephemeral: bool, event: bool) -> Statemen
 			}
 			p_expect_punct(p, ")")
 			constraint.columns = cols[:]
-			if conflict_err := p_refuse_conflict_clause(p); conflict_err do break
+			constraint.conflict = p_conflict_clause(p)
+			if p.err.kind != .None do break
 			append(&constraints, constraint)
 			if !p_match_punct(p, ",") do break
 			continue
@@ -2312,7 +2329,7 @@ parse_create_table :: proc(p: ^Parser, ephemeral: bool, event: bool) -> Statemen
 				p_expect_keyword(p, "key")
 				column.primary = true
 				if !p_match_keyword(p, "asc") do p_match_keyword(p, "desc")
-				if p_refuse_conflict_clause(p) do break
+				column.primary_conflict = p_conflict_clause(p)
 				continue
 			}
 			if p_match_keyword(p, "check") {
@@ -2373,13 +2390,13 @@ parse_create_table :: proc(p: ^Parser, ephemeral: bool, event: bool) -> Statemen
 			}
 			if p_match_keyword(p, "unique") {
 				column.unique = true
-				if p_refuse_conflict_clause(p) do break
+				column.unique_conflict = p_conflict_clause(p)
 				continue
 			}
 			if p_match_keyword(p, "not") {
 				p_expect_keyword(p, "null")
 				column.not_null = true
-				if p_refuse_conflict_clause(p) do break
+				column.not_null_conflict = p_conflict_clause(p)
 				continue
 			}
 			if p_match_keyword(p, "null") {

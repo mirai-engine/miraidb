@@ -349,6 +349,9 @@ Insert_Stmt :: struct {
 	conflict_ignore:   bool,
 	conflict_fail:     bool,
 	conflict_rollback: bool,
+	// conflict_explicit says the statement named its resolution (OR ...,
+	// REPLACE INTO); without one, a constraint's ON CONFLICT decides.
+	conflict_explicit: bool,
 	// ctes are the common table expressions of `WITH ... INSERT|UPDATE|DELETE`
 	// (and of `INSERT INTO t WITH ... SELECT`), materialized before the write.
 	ctes:           []Cte,
@@ -389,6 +392,7 @@ Update_Stmt :: struct {
 	// conflict is UPDATE OR <resolution>: what a row that breaks a constraint
 	// does to the statement, as for INSERT.
 	conflict:     Conflict_Resolution,
+	conflict_explicit: bool,
 	// ctes are the common table expressions of `WITH ... INSERT|UPDATE|DELETE`
 	// (and of `INSERT INTO t WITH ... SELECT`), materialized before the write.
 	ctes:           []Cte,
@@ -462,6 +466,10 @@ Column_Def :: struct {
 	default_sql: string,
 	// checks are the column's CHECK clauses.
 	checks: []Check_Constraint,
+	// The ON CONFLICT clauses of the column's constraints.
+	primary_conflict:  Conflict_Resolution,
+	unique_conflict:   Conflict_Resolution,
+	not_null_conflict: Conflict_Resolution,
 }
 
 // Table_Constraint is a table-level PRIMARY KEY or UNIQUE clause. Columns are
@@ -480,6 +488,8 @@ Table_Constraint :: struct {
 	// A table-level CHECK uses check_sql instead of columns.
 	is_check:    bool,
 	check_sql:   string,
+	// conflict is the constraint's ON CONFLICT clause.
+	conflict:    Conflict_Resolution,
 }
 
 Create_Type_Stmt :: struct {

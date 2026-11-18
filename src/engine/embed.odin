@@ -337,7 +337,16 @@ embed_run :: proc(conn: ^Embed_Conn, prepared: ^Stmt_Prepared, params: []Value) 
 	// The triggers it fires give again the Ignore answers kept about them.
 	saved := auth_replay_begin(prepared)
 	defer auth_replay_end(saved)
-	if conn.tx != nil do return prepared_execute_in_tx(conn.tx, prepared, params)
+	if conn.tx != nil {
+		result, err := prepared_execute_in_tx(conn.tx, prepared, params)
+		// A constraint's ON CONFLICT ROLLBACK ends the transaction it broke in.
+		if err.kind != .None && conn.tx.rollback_requested {
+			tx_rollback(conn.tx)
+			conn.tx = nil
+			store_fire_rollback(conn.store)
+		}
+		return result, err
+	}
 	return prepared_execute(conn.store, prepared, params)
 }
 

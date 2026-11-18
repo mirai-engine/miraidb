@@ -306,6 +306,10 @@ Column :: struct {
 	// hidden marks a column `SELECT *` leaves out: a virtual table's HIDDEN
 	// columns (vtab.odin). It is never stored.
 	hidden:         bool,
+	// not_null_conflict is the NOT NULL constraint's ON CONFLICT, and
+	// unique_conflict the UNIQUE one's, which the column's index takes.
+	not_null_conflict: Conflict_Resolution,
+	unique_conflict:   Conflict_Resolution,
 }
 
 // Index_Algorithm selects how an index answers equality lookups. Btree keeps
@@ -322,6 +326,9 @@ Index_Schema :: struct {
 	columns:   []int,
 	unique:    bool,
 	implicit:  bool, // generated from the primary key or a UNIQUE column
+	// on_conflict is the key's ON CONFLICT: what a row that breaks it does
+	// when the statement names no resolution.
+	on_conflict: Conflict_Resolution,
 	algorithm: Index_Algorithm,
 	// where_sql makes a partial index: only the rows for which it is true are in
 	// the index, and a UNIQUE one constrains only those rows.
@@ -343,6 +350,12 @@ index_is_plain :: proc(index: Index_Schema) -> bool {
 // expression texts. Only a partial or expression index sets it, so every other
 // index encodes as before.
 INDEX_HAS_EXTRAS :: u8(1 << 2)
+// INDEX_CONFLICT_SHIFT places a unique index's ON CONFLICT in bits 3..5 of
+// its flags; 0 is ABORT, which is what a build that predates it reads.
+INDEX_CONFLICT_SHIFT :: 3
+// COLUMN_HAS_CONFLICT says a byte with the NOT NULL's ON CONFLICT follows the
+// column's flags.
+COLUMN_HAS_CONFLICT :: u8(1 << 0)
 
 // INDEX_EXPRESSION_COLUMN is how NO_COLUMN travels in an index encoding.
 INDEX_EXPRESSION_COLUMN :: u32(0xFFFF_FFFF)
@@ -398,6 +411,8 @@ Table_Schema :: struct {
 	// strict and without_rowid are SQLite's table options (Create_Table_Stmt).
 	strict:               bool,
 	without_rowid:        bool,
+	// pk_conflict is the primary key's ON CONFLICT, which its index takes.
+	pk_conflict:          Conflict_Resolution,
 }
 
 // SCHEMA_HAS_EXTRAS marks a schema record that carries the section written after
@@ -1267,6 +1282,7 @@ index_encode :: proc(w: ^Byte_Writer, index: ^Index_Schema) {
 	flags := u8(0)
 	if index.unique do flags |= 1 << 0
 	if index.implicit do flags |= 1 << 1
+	flags |= (u8(index.on_conflict) & 0x7) << INDEX_CONFLICT_SHIFT
 	extras := !index_is_plain(index^)
 	if extras do flags |= INDEX_HAS_EXTRAS
 	bw_write_u8(w, flags)
@@ -1286,6 +1302,7 @@ index_decode :: proc(r: ^Byte_Reader, alloc: mem.Allocator) -> Index_Schema {
 	flags := br_read_u8(r)
 	index.unique = flags & (1 << 0) != 0
 	index.implicit = flags & (1 << 1) != 0
+	index.on_conflict = Conflict_Resolution((flags >> INDEX_CONFLICT_SHIFT) & 0x7)
 	index.algorithm = Index_Algorithm(br_read_u8(r))
 	n := int(br_read_u32(r))
 	if r.bad do return index
@@ -1339,6 +1356,7 @@ schema_encode :: proc(w: ^Byte_Writer, schema: ^Table_Schema) {
 			}
 		}
 		column_flags := u8(0)
+		if col.not_null_conflict != .Abort do column_flags |= COLUMN_HAS_CONFLICT
 		if col.unique do column_flags |= 1 << 1
 		if col.not_null do column_flags |= 1 << 2
 		if col.auto_increment do column_flags |= 1 << 3
@@ -1365,6 +1383,7 @@ schema_encode :: proc(w: ^Byte_Writer, schema: ^Table_Schema) {
 			bw_write_i64(w, col.sequence.min)
 			bw_write_i64(w, col.sequence.max)
 		}
+		if col.not_null_conflict != .Abort do bw_write_u8(w, u8(col.not_null_conflict))
 	}
 	bw_write_u32(w, u32(len(schema.primary_key)))
 	for col in schema.primary_key {
@@ -1466,6 +1485,7 @@ schema_decode :: proc(r: ^Byte_Reader, alloc: mem.Allocator) -> Table_Schema {
 			col.sequence.min = br_read_i64(r)
 			col.sequence.max = br_read_i64(r)
 		}
+		if flags & COLUMN_HAS_CONFLICT != 0 do col.not_null_conflict = Conflict_Resolution(br_read_u8(r))
 		if r.bad do return schema
 		if col.auto_increment do auto_increment_column = i
 		columns[i] = col

@@ -39,7 +39,6 @@ that way.
 
 | # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
-| 8 | **S1 — the schema real files declare** — *done but one* | Done: `CHECK`, `CONSTRAINT` names, column `REFERENCES`, deferred foreign keys, `ASC`/`DESC` columns, `CURRENT_TIMESTAMP` and per-row defaults, partial and expression indexes, many NULLs in a UNIQUE column. Left: `ON CONFLICT` on a constraint. | S | — |
 | 10 | **S3 — joins** | `NATURAL` (the shared columns are known only when the tables are resolved). | S | — |
 | 11 | **S4 — aggregates and windows** | `FILTER`, the `WINDOW` clause, `ORDER BY` inside an aggregate, `median` and the percentiles, `json_group_array`/`_object`. | M | — |
 | 12 | **S5 — functions** | 39 missing: hyperbolic math, `timediff`, `soundex`, `unistr`, planner hints, introspection, the rest of JSON and the `jsonb_*` family. | M | — |
@@ -72,17 +71,16 @@ with peer-to-peer sync; its networked phases build on items 27 and 28.
 
 ## Suggested order
 
-1. **The leftover of S1**, small: `ON CONFLICT <resolution>` on a constraint.
-2. **R1 and R2**: the two largest gaps against the reference, measured, with the
+1. **R1 and R2**: the two largest gaps against the reference, measured, with the
    parity gate (item 5) landing alongside so the gain cannot slip back.
-3. **D36**: let the planner read partial and expression indexes, which are
+2. **D36**: let the planner read partial and expression indexes, which are
    enforced today but never read.
-4. **D23**: the remaining way the process can die instead of answering; **D34**
+3. **D23**: the remaining way the process can die instead of answering; **D34**
    still owes the sanitized suite in CI.
-5. **S3 to S6**, then **R3/R4**: the rest of the visible surface and the smaller
+4. **S3 to S6**, then **R3/R4**: the rest of the visible surface and the smaller
    speed items.
-6. **D4/D24** and the depth items of track C.
-7. **D15, D14** and the release gates, in that order.
+5. **D4/D24** and the depth items of track C.
+6. **D15, D14** and the release gates, in that order.
 
 ## Efficiency contract and current baseline
 

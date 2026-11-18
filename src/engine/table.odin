@@ -528,6 +528,7 @@ schema_normalize :: proc(schema: ^Table_Schema) -> Error {
 					columns = slice.clone(schema.primary_key),
 					unique = true,
 					implicit = true,
+					on_conflict = schema.pk_conflict,
 				},
 			)
 		}
@@ -555,6 +556,7 @@ schema_normalize :: proc(schema: ^Table_Schema) -> Error {
 				columns = index_columns,
 				unique = true,
 				implicit = true,
+				on_conflict = col.unique_conflict,
 			},
 		)
 	}

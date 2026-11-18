@@ -33,7 +33,6 @@ Rules for this file:
 | R2 | every index entry is an encoded string | fixed-size keys where the column allows | M |
 | R3 | pruning walks every row of every table after each statement | prune what the commit touched | S |
 | R4 | a committed row is copied from the transaction arena to the table | hand the staged row over | M |
-| S1 | `ON CONFLICT` on a constraint is refused; the rest landed | the constraint resolutions | S |
 | S3 | `NATURAL` joins are refused; `RIGHT` and `FULL` landed | the natural join | S |
 | S4 | `FILTER`, named `WINDOW` and aggregate `ORDER BY` missing; the ordered-set aggregates and `json_group_*` landed | the rest of the aggregate surface | S |
 | S5 | 15 of 121 built-in functions missing | the `jsonb_*` family, `json_parse`, `json_array_insert`, `sqlite_offset` | M |
@@ -124,52 +123,6 @@ is **refused with a message**, never answered differently: that is the property
 `scripts/differential.py` guards, and each item keeps it. An item is done when
 its shapes run, `sqlite_gaps.py --check` is updated, and the differential corpus
 gains a query per shape that compares the answer with SQLite's.
-
-## S1 — The schema real files declare
-
-**Done.** `CHECK` constraints, column and table level, named or not, enforced
-on every write path (they run in `tx_insert`/`tx_update`, before a row is
-staged) with SQLite's message and `SQLITE_CONSTRAINT_CHECK`; a column's own
-CHECK goes with it on `DROP COLUMN`, and one that another part of the table
-uses blocks the drop or a rename. `CONSTRAINT <name>` before any constraint. A
-column-level `REFERENCES`, with the parent's primary key implied and a table
-referencing itself. `DEFERRABLE INITIALLY DEFERRED` foreign keys, verified at
-COMMIT. `CURRENT_TIMESTAMP`/`CURRENT_DATE`/`CURRENT_TIME`, and a DEFAULT that
-calls a function evaluated per row. `ASC`/`DESC` on index and key columns. The
-schema keeps them in a new optional section (`docs/file-format.md`), an export
-writes the CHECKs and per-row defaults into the `.sqlite` file, and an import
-reads them from the file's declaration (`test_check_constraints`,
-`test_column_references_and_defaults`, `test_deferred_foreign_keys`,
-`scripts/shell_smoke.py`).
-
-Partial indexes (`WHERE`) and indexes over expressions, unique or not: a row
-outside a partial index is not constrained by it, a key is the expression's value
-(its `COLLATE` included), an expression that changes between evaluations
-(`random()`, `'now'`, a subquery) is refused as SQLite refuses it, and the export
-writes such an index's own entries so `PRAGMA integrity_check` passes and SQLite
-enforces it (`test_partial_and_expression_indexes`). Three wrong answers found on
-the way, fixed: `CREATE UNIQUE INDEX` over rows that already shared a key was
-accepted and the index lost a row, so a lookup by that key answered fewer rows
-than the table held; a UNIQUE column refused a second NULL, where SQL holds no
-two NULLs equal (`test_unique_allows_many_nulls`); and `REPLACE` that found no
-row to replace freed its error and reported a row it never inserted, which a
-column left to its DEFAULT made happen. `lower`, `upper`, `replace`, `instr`,
-`sign`, `sqrt` and `printf` give NULL for NULL instead of failing
-(`test_functions_give_null_for_null`). The export now writes constant DEFAULTs
-too.
-
-**Now refused.** `ON CONFLICT <resolution>` on a constraint. An import does not
-carry `REFERENCES` (a file may list a child before its parent). The planner does
-not read a partial or expression index yet (D36).
-
-**Why first.** A schema that uses any of them fails at `CREATE TABLE`, so
-nothing written against it runs; and an imported file whose index is partial or
-over an expression loses that index today (D24).
-
-**Done when.** Each form is accepted and enforced: a `CHECK` that fails refuses
-the row with SQLite's message and `SQLITE_CONSTRAINT_CHECK` through the facade; a
-deferred foreign key is checked at `COMMIT`; a partial index holds only matching
-rows and the planner uses it only when the query implies its `WHERE`.
 
 ## S3 — Joins
 

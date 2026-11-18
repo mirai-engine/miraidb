@@ -379,8 +379,8 @@ test_column_references_and_defaults :: proc(t: ^testing.T) {
 	// Index and key columns may carry a direction.
 	run(t, store, "CREATE INDEX stamps_at ON stamps (at DESC, id ASC)")
 	run(t, store, "CREATE TABLE k (a INTEGER, b INTEGER, PRIMARY KEY (a DESC, b))")
-	// ON CONFLICT on a constraint would change what a violation does: refused.
-	testing.expect_value(t, run_error(t, store, "CREATE TABLE oc (x INTEGER UNIQUE ON CONFLICT REPLACE)").kind, db.Error_Kind.Sql_Unsupported)
+	// ON CONFLICT on a constraint is accepted (test_constraint_on_conflict).
+	run(t, store, "CREATE TABLE oc (x INTEGER UNIQUE ON CONFLICT REPLACE)")
 
 	// The per-row default survives a reopen.
 	db.store_close(store)

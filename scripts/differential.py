@@ -68,6 +68,9 @@ SETUP = [
     "CREATE TABLE empty_t (a INTEGER, b TEXT)",
     "CREATE TABLE uq (id INTEGER PRIMARY KEY, u INTEGER UNIQUE, n INTEGER NOT NULL)",
     "INSERT INTO uq (id, u, n) VALUES (1, 10, 1), (2, 20, 2), (3, 30, 3), (4, 40, 4)",
+    "CREATE TABLE oc (id INTEGER PRIMARY KEY ON CONFLICT REPLACE, u INTEGER UNIQUE ON CONFLICT IGNORE, "
+    "n INTEGER NOT NULL ON CONFLICT REPLACE DEFAULT 7, f INTEGER, UNIQUE (f) ON CONFLICT FAIL)",
+    "INSERT INTO oc (id, u, n, f) VALUES (1, 1, 1, 1), (2, 2, 2, 2)",
 ]
 
 QUERIES = [
@@ -186,6 +189,13 @@ QUERIES = [
     "UPDATE OR REPLACE uq SET u = 20 WHERE id = 3 RETURNING id, u",
     "SELECT id, u FROM uq ORDER BY id",
     "UPDATE OR ABORT uq SET n = n + 1 WHERE id = 1 RETURNING n",
+    # A constraint's ON CONFLICT (S1) decides when the statement names none.
+    "INSERT INTO oc (id, u, n, f) VALUES (1, 10, 10, 10) RETURNING id, u",
+    "INSERT INTO oc (id, u, n, f) VALUES (3, 2, 3, 3) RETURNING id",
+    "INSERT INTO oc (id, u, n, f) VALUES (4, 4, NULL, 4) RETURNING n",
+    "UPDATE oc SET u = 4 WHERE id = 2 RETURNING id",
+    "UPDATE oc SET n = NULL WHERE id = 2 RETURNING n",
+    "SELECT id, u, n, f FROM oc ORDER BY id",
     # A CTE's body may be a VALUES list, with the materialization hints.
     "WITH t(n) AS (VALUES (1), (2), (3)) SELECT sum(n) FROM t",
     "WITH t(a, b) AS MATERIALIZED (VALUES (1, 'x'), (2, 'y')) SELECT b FROM t WHERE a = 2",
@@ -294,6 +304,7 @@ REJECTED = {
     "DELETE FROM empty_t WHERE nope = 1": "a misspelled column in a DELETE",
     "INSERT INTO empty_t (nope) VALUES (1)": "an inserted column that does not exist",
     "UPDATE OR FAIL uq SET u = 40 WHERE id = 1": "a key a FAIL update breaks",
+    "INSERT OR ABORT INTO oc (id, u, n, f) VALUES (9, 1000, 1, 2)": "an explicit OR overrides the constraint's ON CONFLICT",
 }
 
 # Both engines answer, differently, on purpose. These are the decisions listed

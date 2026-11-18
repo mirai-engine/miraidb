@@ -116,7 +116,9 @@ sql_run_statement :: proc(store: ^Store, statement: Statement, params: []Value) 
 		result, exec_err := sql_exec_mutation(tx, stmt, params)
 		if fail_mode do tx_statement_end(tx, mark, false)
 		if exec_err.kind != .None {
-			if fail_mode {
+			// A constraint's ON CONFLICT FAIL keeps the rows before the failing
+			// one, as an OR FAIL does.
+			if fail_mode || tx.keep_partial {
 				// The rows before the failing one stay, as SQLite keeps them.
 				if commit_err := tx_commit(tx); commit_err.kind != .None {
 					error_free(&exec_err)
@@ -310,8 +312,10 @@ sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value) 
 		// transaction keeps the work of the statements before it and none of this
 		// one's. OR FAIL keeps the rows before the failing one instead.
 		mark := tx_statement_begin(tx)
+		tx.keep_partial = false
 		result, err := sql_exec_mutation(tx, stmt, params)
-		tx_statement_end(tx, mark, err.kind != .None && !statement_fails_partially(stmt))
+		tx_statement_end(tx, mark, err.kind != .None && !statement_fails_partially(stmt) && !tx.keep_partial)
+		tx.keep_partial = false
 		return result, err
 	case Create_Table_Stmt, Alter_Table_Stmt, Create_Type_Stmt, Drop_Table_Stmt, Create_Index_Stmt, Drop_Index_Stmt, Create_View_Stmt, Drop_View_Stmt, Create_Policy_Stmt, Drop_Policy_Stmt, Truncate_Stmt, Create_Trigger_Stmt, Drop_Trigger_Stmt, Grant_Stmt, Create_Virtual_Table_Stmt, Load_Extension_Stmt:
 		return sql_exec_mutation(tx, stmt, params)
@@ -7592,6 +7596,29 @@ returning_append :: proc(
 	row: Row,
 ) -> Error {
 	if returning == nil do return ERROR_NONE
+	if prepare_err := returning_prepare(result, returning, table); prepare_err.kind != .None do return prepare_err
+	values := make([]Value, len(result.columns))
+	if returning.star {
+		for value, i in row.values {
+			if i >= len(values) do break
+			values[i] = value_clone(value, context.allocator)
+		}
+	} else {
+		for name, i in returning.columns {
+			index, _ := schema_column_index(&table.schema, name)
+			values[i] = value_clone(row.values[index], context.allocator)
+		}
+	}
+	append(rows, values)
+	return ERROR_NONE
+}
+
+// returning_prepare makes `result` the rows of a RETURNING, with its columns,
+// even when no row comes back: a statement that wrote nothing still answers
+// an empty set of rows.
+@(private)
+returning_prepare :: proc(result: ^Sql_Result, returning: ^Returning, table: ^Table) -> Error {
+	if returning == nil do return ERROR_NONE
 	if result.kind != .Rows {
 		result.kind = .Rows
 		if returning.star {
@@ -7609,19 +7636,6 @@ returning_append :: proc(
 			}
 		}
 	}
-	values := make([]Value, len(result.columns))
-	if returning.star {
-		for value, i in row.values {
-			if i >= len(values) do break
-			values[i] = value_clone(value, context.allocator)
-		}
-	} else {
-		for name, i in returning.columns {
-			index, _ := schema_column_index(&table.schema, name)
-			values[i] = value_clone(row.values[index], context.allocator)
-		}
-	}
-	append(rows, values)
 	return ERROR_NONE
 }
 
@@ -7718,10 +7732,39 @@ sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Res
 		// values the table would hold. Under OR FAIL a row is its own unit: if it
 		// fails, what it staged (a trigger's work included) is taken back and the
 		// rows before it stay.
-		row_mark := stmt.conflict_fail ? tx_statement_begin(tx) : 0
+		// Without an OR of its own, the statement takes the ON CONFLICT of the
+		// constraint the row breaks, so such a row is its own unit too.
+		declares := !stmt.conflict_explicit && table_declares_resolution(table)
+		row_fail, row_ignore, row_replace := stmt.conflict_fail, stmt.conflict_ignore, stmt.conflict_replace
+		row_mark := row_fail || declares ? tx_statement_begin(tx) : 0
 		row_id, insert_err := tx_insert(tx, stmt.table, values)
-		if stmt.conflict_fail do tx_statement_end(tx, row_mark, insert_err.kind != .None)
-		if insert_err.kind != .None && stmt.conflict_ignore && conflict_skippable(insert_err.kind) {
+		if declares && insert_err.kind != .None && conflict_skippable(insert_err.kind) {
+			switch declared_resolution(tx, table, row_with_defaults(tx, table, values), insert_err) {
+			case .Fail:
+				row_fail = true
+				tx.keep_partial = true
+			case .Ignore:
+				row_ignore = true
+			case .Replace:
+				if insert_err.kind == .Not_Null_Violation {
+					// REPLACE on NOT NULL stores the column's default instead.
+					if filled, ok := not_null_defaults(tx, table, values); ok {
+						tx_statement_end(tx, row_mark, true)
+						row_mark = tx_statement_begin(tx)
+						error_free(&insert_err)
+						row_id, insert_err = tx_insert(tx, stmt.table, filled)
+						values = filled
+					}
+				} else {
+					row_replace = true
+				}
+			case .Rollback:
+				tx.rollback_requested = true
+			case .Abort:
+			}
+		}
+		if row_fail || declares do tx_statement_end(tx, row_mark, insert_err.kind != .None)
+		if insert_err.kind != .None && row_ignore && conflict_skippable(insert_err.kind) {
 			// INSERT OR IGNORE: the row breaks a constraint by itself and is skipped;
 			// nothing of it was staged.
 			error_free(&insert_err)
@@ -7732,7 +7775,7 @@ sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Res
 				return {}, fts_err
 			}
 		}
-		if insert_err.kind != .None && stmt.conflict_replace {
+		if insert_err.kind != .None && row_replace {
 			// INSERT OR REPLACE: delete what the new row collides with, on any
 			// unique index, and insert again. SQLite counts one affected row and
 			// fires no delete trigger, which is what happens here: the deletes go
@@ -7843,7 +7886,10 @@ sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Res
 		}
 		result.affected += 1
 	}
-	if stmt.returning != nil do result.rows = returned[:]
+	if stmt.returning != nil {
+		if prepare_err := returning_prepare(&result, stmt.returning, table); prepare_err.kind != .None do return {}, prepare_err
+		result.rows = returned[:]
+	}
 	tx.store.last_changes = i64(result.affected)
 	tx.store.total_changes += i64(result.affected)
 	return result, ERROR_NONE
@@ -8189,10 +8235,26 @@ sql_exec_update :: proc(tx: ^Tx, stmt: Update_Stmt, params: []Value) -> (Sql_Res
 		}
 		// Under OR FAIL and OR IGNORE a row is its own unit: if it breaks a
 		// constraint, what it staged (a trigger's work included) is taken back.
-		per_row := stmt.conflict == .Fail || stmt.conflict == .Ignore || stmt.conflict == .Replace
+		resolution := stmt.conflict
+		declares := !stmt.conflict_explicit && table_declares_resolution(table)
+		per_row := resolution == .Fail || resolution == .Ignore || resolution == .Replace || declares
 		row_mark := per_row ? tx_statement_begin(tx) : 0
 		update_err := tx_update(tx, stmt.table, row.id, new_values)
-		if update_err.kind != .None && stmt.conflict == .Replace && (update_err.kind == .Duplicate_Unique || update_err.kind == .Duplicate_Primary_Key) {
+		if declares && update_err.kind != .None && conflict_skippable(update_err.kind) {
+			resolution = declared_resolution(tx, table, new_values, update_err, row.id)
+			if resolution == .Fail do tx.keep_partial = true
+			if resolution == .Rollback do tx.rollback_requested = true
+			if resolution == .Replace && update_err.kind == .Not_Null_Violation {
+				if filled, ok := not_null_defaults(tx, table, new_values); ok {
+					tx_statement_end(tx, row_mark, true)
+					row_mark = tx_statement_begin(tx)
+					error_free(&update_err)
+					new_values = filled
+					update_err = tx_update(tx, stmt.table, row.id, new_values)
+				}
+			}
+		}
+		if update_err.kind != .None && resolution == .Replace && (update_err.kind == .Duplicate_Unique || update_err.kind == .Duplicate_Primary_Key) {
 			// UPDATE OR REPLACE: the rows the new values collide with go, without
 			// delete triggers, and the row is written again.
 			tx_statement_end(tx, row_mark, true)
@@ -8212,7 +8274,7 @@ sql_exec_update :: proc(tx: ^Tx, stmt: Update_Stmt, params: []Value) -> (Sql_Res
 			}
 		}
 		if per_row do tx_statement_end(tx, row_mark, update_err.kind != .None)
-		if update_err.kind != .None && stmt.conflict == .Ignore && conflict_skippable(update_err.kind) {
+		if update_err.kind != .None && resolution == .Ignore && conflict_skippable(update_err.kind) {
 			// UPDATE OR IGNORE: the row keeps its values and the statement goes on.
 			error_free(&update_err)
 			continue
@@ -8232,7 +8294,7 @@ sql_exec_update :: proc(tx: ^Tx, stmt: Update_Stmt, params: []Value) -> (Sql_Res
 	tx.store.last_changes = i64(affected)
 	tx.store.total_changes += i64(affected)
 	if stmt.returning != nil {
-		result.kind = .Rows
+		if prepare_err := returning_prepare(&result, stmt.returning, table); prepare_err.kind != .None do return {}, prepare_err
 		result.rows = returned[:]
 	}
 	return result, ERROR_NONE
@@ -8318,7 +8380,7 @@ sql_exec_delete :: proc(tx: ^Tx, stmt: Delete_Stmt, params: []Value) -> (Sql_Res
 	tx.store.last_changes = i64(affected)
 	tx.store.total_changes += i64(affected)
 	if stmt.returning != nil {
-		result.kind = .Rows
+		if prepare_err := returning_prepare(&result, stmt.returning, table); prepare_err.kind != .None do return {}, prepare_err
 		result.rows = returned[:]
 	}
 	return result, ERROR_NONE
@@ -8536,6 +8598,8 @@ sql_exec_create_table :: proc(tx: ^Tx, stmt: Create_Table_Stmt, params: []Value)
 			named_type     = named_type,
 			unique         = definition.unique,
 			not_null       = definition.not_null || definition.primary,
+			not_null_conflict = definition.not_null_conflict,
+			unique_conflict   = definition.unique_conflict,
 			auto_increment = definition.autoinc,
 			sequence       = definition.sequence,
 			collation      = collation,
@@ -8577,6 +8641,7 @@ sql_exec_create_table :: proc(tx: ^Tx, stmt: Create_Table_Stmt, params: []Value)
 		pk := make([]int, 1, tx.alloc)
 		pk[0] = inline_primary
 		schema.primary_key = pk
+		schema.pk_conflict = stmt.columns[inline_primary].primary_conflict
 	}
 
 	checks := make([dynamic]Check_Constraint, 0, 0, tx.alloc)
@@ -8691,6 +8756,7 @@ sql_exec_create_table :: proc(tx: ^Tx, stmt: Create_Table_Stmt, params: []Value)
 				return {}, errf(.Invalid_Argument, "table %s declares more than one primary key", stmt.name)
 			}
 			schema.primary_key = positions
+			schema.pk_conflict = constraint.conflict
 			for position in positions {
 				schema.columns[position].not_null = true
 			}
@@ -8707,7 +8773,7 @@ sql_exec_create_table :: proc(tx: ^Tx, stmt: Create_Table_Stmt, params: []Value)
 		}
 		append(
 			&indexes,
-			Index_Schema{name = name, columns = positions, unique = true, implicit = false},
+			Index_Schema{name = name, columns = positions, unique = true, implicit = false, on_conflict = constraint.conflict},
 		)
 	}
 	if len(indexes) > 0 {
@@ -9965,4 +10031,64 @@ column_host_collated :: proc(store: ^Store, column: Column) -> bool {
 	if len(column.collation) == 0 || collation_folds(store, column.collation) do return false
 	_, found := store_collation(store, column.collation)
 	return found
+}
+
+// declared_resolution is the ON CONFLICT of the constraint a row broke, for a
+// statement that named no resolution of its own: the first NOT NULL column
+// the row leaves NULL, or the first unique key another row already holds.
+@(private)
+declared_resolution :: proc(tx: ^Tx, table: ^Table, values: []Value, err: Error, row: Row_Id = NO_ROW_ID) -> Conflict_Resolution {
+	#partial switch err.kind {
+	case .Not_Null_Violation:
+		for column, i in table.schema.columns {
+			if i >= len(values) || !column.not_null do continue
+			if values[i].kind == .Null do return column.not_null_conflict
+		}
+	case .Duplicate_Unique, .Duplicate_Primary_Key:
+		for idx, i in table.indexes {
+			if !idx.unique || !index_row_included(table, i, values) do continue
+			// The row an UPDATE rewrites holds its own keys: only another row's count.
+			found := table_index_lookup(table, i, values)
+			taken := false
+			for id in found do if id != row do taken = true
+			delete(found)
+			if taken do return idx.schema.on_conflict
+		}
+		// A key this statement staged is not in the committed index: the
+		// message names the index.
+		for idx in table.indexes {
+			if idx.unique && strings.contains(err.message, idx.schema.name) do return idx.schema.on_conflict
+		}
+	}
+	return .Abort
+}
+
+// not_null_defaults gives the row with each NULL of a NOT NULL ... ON CONFLICT
+// REPLACE column replaced by the column's default; false when one has none.
+@(private)
+not_null_defaults :: proc(tx: ^Tx, table: ^Table, values: []Value) -> ([]Value, bool) {
+	out := make([]Value, len(values), tx.alloc)
+	copy(out, values)
+	changed := false
+	for column, i in table.schema.columns {
+		if i >= len(out) || !column.not_null || out[i].kind != .Null do continue
+		if column.not_null_conflict != .Replace || !column.has_default do return nil, false
+		filled, fill_err := column_default_for_row(tx, column)
+		if fill_err.kind != .None {
+			error_free(&fill_err)
+			return nil, false
+		}
+		out[i] = filled
+		changed = true
+	}
+	return out, changed
+}
+
+// table_declares_resolution reports a table with a constraint whose ON
+// CONFLICT is not ABORT, which makes every row of a write its own unit.
+@(private)
+table_declares_resolution :: proc(table: ^Table) -> bool {
+	for column in table.schema.columns do if column.not_null_conflict != .Abort do return true
+	for idx in table.indexes do if idx.schema.on_conflict != .Abort do return true
+	return false
 }

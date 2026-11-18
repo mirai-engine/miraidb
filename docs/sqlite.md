@@ -37,7 +37,7 @@ script lists.
 |---|---|---|
 | SELECT with joins, subqueries, aggregates | done | `INNER`/`LEFT`/`CROSS`, no `NATURAL`/`RIGHT`/`FULL` (refused with a reason); a subquery or `VALUES` in `FROM` (a derived table, named `(subquery-N)` when unaliased); `UNION [ALL]`, `INTERSECT` and `EXCEPT` applied left to right; `VALUES (…), (…)` as a statement, with columns `column1`, `column2`, … |
 | INSERT / UPDATE / DELETE | done | `RETURNING` with `*` or a column list. Conflict resolution as SQLite's: `OR ABORT` (the default: a failed statement is undone whole, inside a transaction too), `OR IGNORE` (skips a row that breaks a key or `NOT NULL`), `OR FAIL` (keeps the rows before the failing one), `OR REPLACE` and `REPLACE INTO` (delete the colliding rows, fire no delete trigger). `OR ROLLBACK` is `ABORT` when the statement owns its transaction and refused inside one a caller opened. `UPDATE OR <resolution>` takes the same five |
-| CREATE/DROP TABLE, ALTER | done | `CHECK` (column and table, named with `CONSTRAINT` or not), `DEFAULT` (one that calls a function, like `CURRENT_TIMESTAMP`, is evaluated per row), `NOT NULL`, `UNIQUE`, `PRIMARY KEY` with `ASC`/`DESC`. `ALTER` adds, drops and renames columns, changes a column's type and renames the table; a column's own CHECK goes with it, and a CHECK that names a column blocks dropping or renaming it. `ON CONFLICT` on a constraint is refused |
+| CREATE/DROP TABLE, ALTER | done | `CHECK` (column and table, named with `CONSTRAINT` or not), `DEFAULT` (one that calls a function, like `CURRENT_TIMESTAMP`, is evaluated per row), `NOT NULL`, `UNIQUE`, `PRIMARY KEY` with `ASC`/`DESC`. `ALTER` adds, drops and renames columns, changes a column's type and renames the table; a column's own CHECK goes with it, and a CHECK that names a column blocks dropping or renaming it. `ON CONFLICT <resolution>` on a `PRIMARY KEY`, `UNIQUE` or `NOT NULL` decides what a row that breaks it does when the statement names no `OR` (`REPLACE` on `NOT NULL` stores the default), and survives a reopen |
 | CREATE/DROP INDEX, UNIQUE | done | btree, hash, direct; `ASC`/`DESC` columns accepted (they order SQLite's storage, not an answer). Partial indexes (`WHERE`) and indexes over expressions, enforced when UNIQUE and exported with their own entries; a query does not read them yet (backlog D36). A UNIQUE index takes any number of NULLs, and one the rows already break is refused |
 | CREATE/DROP VIEW | done | `OR REPLACE`, parameters, materialization |
 | CREATE TYPE | done | engine extension |
@@ -159,6 +159,7 @@ behaviour here will see different results:
 | `UPDATE t SET u = u + 990` whose rows collide only partway through | error: a unique key is checked row by row | succeeds when the final rows are distinct: a statement's keys are checked against its result |
 | `COMMIT` a deferred foreign key fails | the transaction stays open until `ROLLBACK` | the transaction is rolled back |
 | foreign keys | enforced only after `PRAGMA foreign_keys = ON` | always enforced |
+| `REFERENCES` in an imported `.sqlite` file | kept, enforced only after `PRAGMA foreign_keys = ON` | not imported: enforcing them always would refuse what the file's own SQLite accepts by default |
 
 ## The claims in this file are executed
 

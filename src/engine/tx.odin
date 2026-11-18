@@ -86,6 +86,11 @@ Tx :: struct {
 	// vtabs_written are the program's virtual tables this transaction wrote
 	// to; they hear its commit or its rollback (vtab_transaction_step).
 	vtabs_written: [dynamic]^Vtab,
+	// keep_partial says the failing statement's rows before the failing one
+	// stay (a constraint's ON CONFLICT FAIL), and rollback_requested that it
+	// ends the transaction (ON CONFLICT ROLLBACK).
+	keep_partial:       bool,
+	rollback_requested: bool,
 	vtabs_done:    bool,
 	vtab_sources: []Source,
 	vtab_alias:   string,
