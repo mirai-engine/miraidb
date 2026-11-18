@@ -72,6 +72,13 @@ Mirror_Master_Row :: struct {
 	sql:   string,
 }
 
+// Mirror_Sequence is one row of sqlite_sequence.
+@(private)
+Mirror_Sequence :: struct {
+	rowid: i64,
+	seq:   i64,
+}
+
 // Mirror_Table is one table's place in the file.
 @(private)
 Mirror_Table :: struct {
@@ -110,6 +117,11 @@ Sqlite_Mirror :: struct {
 	crash_before_header: bool,
 	// why the last commit had to re-encode the whole file, for the tests
 	fallback_reason: string,
+	// sequence is sqlite_sequence's rows by table name: the rowid each lives
+	// at and the counter the file holds, so an insert into an AUTOINCREMENT
+	// table patches its counter too. has_sequence says the file has the table.
+	sequence:      map[string]Mirror_Sequence,
+	has_sequence:  bool,
 	// What a commit costs: the number this file exists to shrink.
 	bytes_written: u64,
 	pages_written: int,
@@ -128,6 +140,8 @@ mirror_destroy :: proc(m: ^Sqlite_Mirror) {
 		delete(table.name, m.alloc)
 	}
 	delete(m.tables)
+	for name in m.sequence do delete(name, m.alloc)
+	delete(m.sequence)
 	for page, bytes in m.dirty {
 		_ = page
 		delete(bytes, m.alloc)
@@ -411,10 +425,12 @@ mirror_build :: proc(store: ^Store, path: string, alloc := context.allocator) ->
 	m.root = 1
 
 	failed := false
+	m.sequence = make(map[string]Mirror_Sequence, alloc)
 	for row in m.master {
-		if row.kind != "table" || row.name == "sqlite_sequence" do continue
+		if row.kind != "table" do continue
 		table, known := store.tables[row.name]
-		if !known do continue
+		is_sequence := row.name == "sqlite_sequence"
+		if !known && !is_sequence do continue
 		entry := Mirror_Table {
 			name = strings.clone(row.name, alloc),
 			root = row.root,
@@ -441,6 +457,29 @@ mirror_build :: proc(store: ^Store, path: string, alloc := context.allocator) ->
 			delete(entry.rowid_of)
 			delete(entry.name, alloc)
 			failed = true
+			continue
+		}
+		if is_sequence {
+			// Its rows are read once, to know where each counter lives.
+			Sequence_Ctx :: struct {
+				m:     ^Sqlite_Mirror,
+				alloc: mem.Allocator,
+			}
+			sequence_ctx := Sequence_Ctx{m = m, alloc = alloc}
+			visit := proc(user: rawptr, rowid: i64, payload: []u8) -> bool {
+				ctx := cast(^Sequence_Ctx)user
+				values, ok := sqlite_record(payload, context.temp_allocator)
+				if !ok || len(values) < 2 || values[0].kind != .String do return true
+				seq := values[1].kind == .Int ? values[1].i : 0
+				ctx.m.sequence[strings.clone(values[0].s, ctx.alloc)] = Mirror_Sequence{rowid = rowid, seq = seq}
+				return true
+			}
+			if !sqlite_walk(&file, u32(row.root), true, visit, &sequence_ctx, 0) {
+				failed = true
+			}
+			entry.supported = true
+			m.has_sequence = true
+			m.tables[entry.name] = entry
 			continue
 		}
 		entry.supported = mirror_rowid_column(table.schema) >= 0
@@ -1436,6 +1475,38 @@ mirror_apply_commit :: proc(store: ^Store, m: ^Sqlite_Mirror, ops: []Store_Op) -
 			append(&tables[at].edits, Mirror_Edit{rowid = new_rowid, payload = payload})
 		case .Create_Table, .Truncate, .Drop_Table, .Create_Index, .Drop_Index, .Alter_Table:
 			return true, ERROR_NONE
+		}
+	}
+
+	// An insert into an AUTOINCREMENT table moves its counter, which
+	// sqlite_sequence keeps as the last rowid given out.
+	for group in tables {
+		schema, known := store.tables[group.name]
+		if !known || schema.schema.auto_increment_column < 0 do continue
+		seq := max(schema.next_sequence - 1, 0)
+		current, has_row := m.sequence[group.name]
+		if has_row && current.seq == seq do continue
+		if !m.has_sequence {
+			m.fallback_reason = "no sqlite_sequence"
+			return true, ERROR_NONE
+		}
+		rowid := current.rowid
+		if !has_row {
+			rowid = 1
+			for _, existing in m.sequence do rowid = max(rowid, existing.rowid + 1)
+		}
+		record := sqlite_encode_record([]Value{value_string(group.name), value_int(seq)}, -1, m.alloc)
+		at, seen := groups["sqlite_sequence"]
+		if !seen {
+			at = len(tables)
+			groups["sqlite_sequence"] = at
+			append(&tables, Mirror_Table_Edits{name = "sqlite_sequence"})
+		}
+		append(&tables[at].edits, Mirror_Edit{rowid = rowid, payload = record})
+		if has_row {
+			m.sequence[group.name] = Mirror_Sequence{rowid = rowid, seq = seq}
+		} else {
+			m.sequence[strings.clone(group.name, m.alloc)] = Mirror_Sequence{rowid = rowid, seq = seq}
 		}
 	}
 

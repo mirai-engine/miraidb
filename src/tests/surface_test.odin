@@ -622,3 +622,36 @@ test_alter_table_follows :: proc(t: ^testing.T) {
 	testing.expect_value(t, run_error(t, store, "alter table k drop column a").message, `cannot drop PRIMARY KEY column: "a"`)
 	testing.expect_value(t, run_error(t, store, "alter table k drop column b").message, `cannot drop UNIQUE column: "b"`)
 }
+
+@(test)
+test_mirror_patches_sqlite_sequence :: proc(t: ^testing.T) {
+	// A mirrored file keeps sqlite_sequence current on the page-patch path:
+	// a deleted top rowid is not handed out again by the next reader of the
+	// file, and the commits rewrite nothing whole.
+	store := fresh_db(t, "mirror_sequence")
+	if store == nil do return
+	defer cleanup_db(store, "mirror_sequence")
+	run(t, store, "CREATE TABLE s (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER)")
+	run(t, store, "CREATE TABLE n (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER)")
+	run(t, store, "INSERT INTO s (v) VALUES (1)")
+	path := "_test_mirror_sequence.sqlite"
+	os.remove(path)
+	defer os.remove(path)
+	_, _, export_err := db.sqlite_file_write(store, path)
+	if !testing.expectf(t, db.error_ok(export_err), "export: %s", export_err.message) do return
+
+	conn, open_err := db.embed_open(path)
+	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
+	for sql in ([]string{"INSERT INTO s (v) VALUES (2)", "INSERT INTO s (v) VALUES (3)", "DELETE FROM s WHERE id = 3", "INSERT INTO n (v) VALUES (7)"}) {
+		testing.expectf(t, db.error_drop(db.embed_exec(conn, sql)), "%s: %s", sql, db.embed_error(conn))
+	}
+	testing.expect_value(t, conn.store.mirror_full_writes, 0)
+	db.embed_close(conn)
+
+	again, again_err := db.embed_open(path)
+	if !testing.expectf(t, db.error_ok(again_err), "reopen: %s", again_err.message) do return
+	defer db.embed_close(again)
+	testing.expect(t, db.error_drop(db.embed_exec(again, "INSERT INTO s (v) VALUES (4)")))
+	testing.expect_value(t, file_scalar(t, again, "SELECT max(id) FROM s"), "4")
+	testing.expect_value(t, file_scalar(t, again, "SELECT max(id) FROM n"), "1")
+}

@@ -316,10 +316,10 @@ mirror's rewrite) does the reverse: the engine's views and triggers with the
 file's own text when they came from it unchanged, `INTEGER PRIMARY KEY
 AUTOINCREMENT` inline, the last rowid given out in `sqlite_sequence`, and the
 two header integers. A view or trigger dropped through the engine leaves the
-file. The page patcher does not touch `sqlite_sequence`: an insert the mirror
-patches in place leaves the file's counter behind until the next rewrite, and
-SQLite, which takes the larger of the counter and the largest rowid, only
-differs after rows at the top were deleted (`test_sqlite_file_round_trip`).
+file. The page patcher keeps `sqlite_sequence` current too: an insert into an
+`AUTOINCREMENT` table patches its counter's row (or adds it) with the pages it
+already writes (`test_sqlite_file_round_trip`,
+`test_mirror_patches_sqlite_sequence`).
 
 A table whose declaration spells a key is kept too, and that is where the
 numbering matters: SQLite creates an automatic index for each key in the order
