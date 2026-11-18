@@ -1234,21 +1234,31 @@ tx_drop_table :: proc(tx: ^Tx, name: string) -> Error {
 		map_erase(&tx.state.created, name)
 		table_destroy(created)
 		// Rows staged for a table created in this transaction disappear with it.
-		if writes, has_writes := tx.state.writes[name]; has_writes {
-			delete(writes.inserts)
-			delete(writes.updates)
-			delete(writes.deletes)
-			delete(writes.unique_keys)
-			free(writes)
-			map_erase(&tx.state.writes, name)
-		}
+		tx_discard_writes(tx, name)
 		return ERROR_NONE
 	}
 	if _, exists := tx.store.tables[name]; !exists {
 		return errf(.Table_Not_Found, "table %s does not exist", name)
 	}
+	// What the transaction wrote to the table goes with it: the commit applies
+	// the drop first, and a staged row left behind made it fail ("table does
+	// not exist"), losing the whole transaction.
+	tx_discard_writes(tx, name)
 	tx.state.dropped[strings.clone(name, tx.alloc)] = true
 	return ERROR_NONE
+}
+
+// tx_discard_writes forgets the rows the transaction staged for one table.
+@(private)
+tx_discard_writes :: proc(tx: ^Tx, name: string) {
+	writes, has_writes := tx.state.writes[name]
+	if !has_writes do return
+	delete(writes.inserts)
+	delete(writes.updates)
+	delete(writes.deletes)
+	delete(writes.unique_keys)
+	free(writes)
+	map_erase(&tx.state.writes, name)
 }
 
 // --- DML -------------------------------------------------------------------

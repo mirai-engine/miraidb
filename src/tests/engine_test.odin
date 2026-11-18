@@ -8001,6 +8001,53 @@ test_column_collation_and_generated :: proc(t: ^testing.T) {
 	db.store_close(reopened)
 }
 
+// A transaction that writes a table and then drops it commits: the rows it
+// staged go with the table (the commit applied them after the drop, failed,
+// and lost the whole transaction). A ROLLBACK TO before the drop brings both
+// back.
+@(test)
+test_drop_after_writes_commits :: proc(t: ^testing.T) {
+	conn, open_err := db.embed_open(":memory:")
+	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
+	defer db.embed_close(conn)
+	exec :: proc(t: ^testing.T, conn: ^db.Embed_Conn, sql: string, loc := #caller_location) {
+		err := db.embed_exec(conn, sql)
+		testing.expectf(t, err.kind == .None, "%s: %s", sql, err.message, loc = loc)
+		db.error_free(&err)
+	}
+	exec(t, conn, "CREATE TABLE t (a INT)")
+	exec(t, conn, "CREATE TABLE keep (a INT)")
+	exec(t, conn, "INSERT INTO t VALUES (1)")
+	exec(t, conn, "BEGIN")
+	exec(t, conn, "INSERT INTO t VALUES (9)")
+	exec(t, conn, "UPDATE t SET a = 2 WHERE a = 1")
+	exec(t, conn, "INSERT INTO keep VALUES (7)")
+	exec(t, conn, "DROP TABLE t")
+	exec(t, conn, "COMMIT")
+	testing.expect(t, tx_has_table(conn, "keep") && !tx_has_table(conn, "t"))
+
+	exec(t, conn, "CREATE TABLE u (a INT)")
+	exec(t, conn, "BEGIN")
+	exec(t, conn, "INSERT INTO u VALUES (1)")
+	exec(t, conn, "SAVEPOINT s")
+	exec(t, conn, "INSERT INTO u VALUES (2)")
+	exec(t, conn, "DROP TABLE u")
+	exec(t, conn, "ROLLBACK TO s")
+	exec(t, conn, "COMMIT")
+	stmt := db.embed_prepare(conn, "SELECT count(*), sum(a) FROM u")
+	if testing.expect(t, stmt != nil) {
+		_, step_err := db.embed_step(stmt)
+		testing.expect(t, db.error_drop(step_err))
+		testing.expect_value(t, db.embed_column_int(stmt, 0), i64(1))
+		testing.expect_value(t, db.embed_column_int(stmt, 1), i64(1))
+		db.embed_finalize(stmt)
+	}
+	tx_has_table :: proc(conn: ^db.Embed_Conn, name: string) -> bool {
+		_, found := conn.store.tables[name]
+		return found
+	}
+}
+
 // A program that asks for a statement's columns before its first step makes
 // it run then; a runtime error it meets is still the first step's answer
 // (SQLite's shell asks first, and printed nothing for such an error).
