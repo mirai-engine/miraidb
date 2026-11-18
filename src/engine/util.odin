@@ -193,3 +193,56 @@ ids_heapsort :: proc(data: []Row_Id) {
 		sift(data, 0, end)
 	}
 }
+
+// rows_sort_by_key orders rows by the values of some of their columns, the
+// way SQLite walks a WITHOUT ROWID table: by its primary key. A stable merge
+// sort, so rows the key does not tell apart keep their order.
+rows_sort_by_key :: proc(rows: []Row, key: []int) {
+	if len(rows) < 2 || len(key) == 0 do return
+	less :: proc(a, b: Row, key: []int) -> bool {
+		for column in key {
+			left := column < len(a.values) ? a.values[column] : Value{}
+			right := column < len(b.values) ? b.values[column] : Value{}
+			order, ok := value_compare(left, right)
+			if ok && order != .Equal do return order == .Less
+		}
+		return false
+	}
+	sorted := true
+	for i in 1 ..< len(rows) {
+		if less(rows[i], rows[i - 1], key) {
+			sorted = false
+			break
+		}
+	}
+	if sorted do return
+	scratch := make([]Row, len(rows), context.temp_allocator)
+	for width := 1; width < len(rows); width *= 2 {
+		for start := 0; start < len(rows); start += 2 * width {
+			middle := min(start + width, len(rows))
+			end := min(start + 2 * width, len(rows))
+			i, j, k := start, middle, start
+			for i < middle && j < end {
+				if less(rows[j], rows[i], key) {
+					scratch[k] = rows[j]
+					j += 1
+				} else {
+					scratch[k] = rows[i]
+					i += 1
+				}
+				k += 1
+			}
+			for i < middle {
+				scratch[k] = rows[i]
+				i += 1
+				k += 1
+			}
+			for j < end {
+				scratch[k] = rows[j]
+				j += 1
+				k += 1
+			}
+		}
+		copy(rows, scratch)
+	}
+}

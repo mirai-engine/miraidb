@@ -8976,6 +8976,16 @@ test_strict_table_option :: proc(t: ^testing.T) {
 	testing.expect_value(t, rowid.kind, db.Error_Kind.Column_Not_Found)
 	_, keyless := db.sql_execute(store, "CREATE TABLE nk (v TEXT) WITHOUT ROWID")
 	testing.expect(t, !db.error_ok(keyless))
+	// SQLite walks a WITHOUT ROWID table in its key's order, so does a scan here.
+	run(t, store, "CREATE TABLE z (x, y, z, PRIMARY KEY (z, x)) WITHOUT ROWID")
+	run(t, store, "INSERT INTO z VALUES ('x1', 'y1', 2), ('x0', 'y2', 2), ('x9', 'y3', 1)")
+	scanned := run(t, store, "SELECT x FROM z").rows
+	testing.expect_value(t, len(scanned), 3)
+	if len(scanned) == 3 {
+		testing.expect_value(t, scanned[0][0].s, "x9")
+		testing.expect_value(t, scanned[1][0].s, "x0")
+		testing.expect_value(t, scanned[2][0].s, "x1")
+	}
 }
 
 @(test)

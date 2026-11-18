@@ -3328,6 +3328,8 @@ sql_exec_stream_select :: proc(
 	system_name: bool,
 ) -> (result: Sql_Result, handled: bool, err: Error) {
 	if base == nil || base.paged == nil || base_is_view || system_name do return {}, false, ERROR_NONE
+	// A WITHOUT ROWID table is read in its key's order, which pages do not keep.
+	if base.schema.without_rowid do return {}, false, ERROR_NONE
 	if len(stmt.joins) != 0 || len(stmt.group_by) != 0 || len(stmt.order_by) != 0 do return {}, false, ERROR_NONE
 	if stmt.is_distinct || stmt.having != nil || stmt.from.as_of != nil do return {}, false, ERROR_NONE
 	if tx.state.dropped[stmt.from.name] do return {}, false, ERROR_NONE
@@ -3717,6 +3719,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			used_index = true
 		}
 	}
+	key_ordered := false
 	if !used_index {
 		rows := make([dynamic]Row)
 		if base_is_view {
@@ -3728,6 +3731,11 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		} else if collect_err := tx_collect(tx, exec.from.name, &rows); collect_err.kind != .None {
 			return {}, collect_err
 		}
+		// SQLite walks a WITHOUT ROWID table in its key's order.
+		if !base_is_view && base != nil && base.schema.without_rowid {
+			rows_sort_by_key(rows[:], base.schema.primary_key[:])
+			key_ordered = true
+		}
 		for row in rows {
 			tx.rows_scanned += 1
 			one := make([]Source, 1)
@@ -3737,7 +3745,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		}
 		delete(rows)
 	}
-	if !empty_row && !ordered {
+	if !empty_row && !ordered && !key_ordered {
 		slice.sort_by(partials[:], proc(a, b: []Source) -> bool {
 			return u64(a[0].row.id) < u64(b[0].row.id)
 		})
@@ -3809,6 +3817,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 				free_partials(&partials)
 				return {}, collect_err
 			}
+			if !join_is_view && table != nil && table.schema.without_rowid do rows_sort_by_key(rows[:], table.schema.primary_key[:])
 		}
 		// The inner side is probed when its ON clause binds a column that leads an
 		// index: a nested loop then reads the rows the outer row matches instead
