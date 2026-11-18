@@ -21,7 +21,7 @@ script lists.
 | Feature | Status | Notes |
 |---|---|---|
 | Header, page size, encoding | done | 512..65536 pages, reserved bytes, UTF-8 |
-| sqlite_master and schema SQL | done | tables and their CREATE statements, and their indexes: an imported index is recreated, so a plan walks it and `DROP INDEX` finds it (an index this engine cannot express is retried without its `WHERE`) |
+| sqlite_master and schema SQL | done | tables and their CREATE statements, views, triggers, `sqlite_sequence` and the header's `user_version` and `application_id`, read and written; indexes: an imported index is recreated, so a plan walks it and `DROP INDEX` finds it (an index this engine cannot express is retried without its `WHERE`) |
 | Table b-trees, leaf and interior | done | rowid tables, multi-level trees |
 | WITHOUT ROWID (index b-trees) | done | read from a file, and created with `CREATE TABLE … WITHOUT ROWID`: the primary key is required and is the row's identity, `rowid` names nothing, and the option survives a reopen. An export writes such a table as a rowid table with the same key |
 | Varints and serial types | done | all widths, 0/1 shortcuts, floats, text, blob |
@@ -302,6 +302,22 @@ a table whose schema the engine did not touch, and for every view and trigger �
 so `ALTER TABLE parent …` leaves `child`'s `REFERENCES … ON DELETE CASCADE`,
 `CHECK`, `DEFAULT` and `COLLATE` alone and keeps the views and triggers
 (`scripts/sqlite_abi_smoke.py` compares `sqlite_master` before and after).
+
+**Views, triggers, AUTOINCREMENT and the header travel both ways.** Opening a
+file creates its views and its triggers as the engine's own, so a query reads a
+view and an insert fires a trigger (before, they were text the engine kept for
+the file but could not run); one the engine cannot read stays that text. An
+`AUTOINCREMENT` key keeps the keyword, and the counter `sqlite_sequence` holds
+is read, so a rowid the table gave out is not given again; `user_version` and
+`application_id` are read from the header. Writing a file (an export or the
+mirror's rewrite) does the reverse: the engine's views and triggers with the
+file's own text when they came from it unchanged, `INTEGER PRIMARY KEY
+AUTOINCREMENT` inline, the last rowid given out in `sqlite_sequence`, and the
+two header integers. A view or trigger dropped through the engine leaves the
+file. The page patcher does not touch `sqlite_sequence`: an insert the mirror
+patches in place leaves the file's counter behind until the next rewrite, and
+SQLite, which takes the larger of the counter and the largest rowid, only
+differs after rows at the top were deleted (`test_sqlite_file_round_trip`).
 
 A table whose declaration spells a key is kept too, and that is where the
 numbering matters: SQLite creates an automatic index for each key in the order

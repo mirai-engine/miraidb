@@ -650,11 +650,18 @@ sqlite_master_sql :: proc(table: ^Table) -> string {
 	strings.write_string(&builder, "CREATE TABLE ")
 	sqlite_write_ident(&builder, table.schema.name)
 	strings.write_string(&builder, " (")
+	// An AUTOINCREMENT key is spelled inline, the only place SQLite accepts it.
+	counted := table.schema.auto_increment_column
+	if counted >= 0 && sqlite_rowid_alias(table) != counted do counted = -1
 	for column, i in table.schema.columns {
 		if i > 0 do strings.write_string(&builder, ", ")
 		sqlite_write_ident(&builder, column.name)
 		strings.write_byte(&builder, ' ')
 		strings.write_string(&builder, sqlite_type_name(column.type))
+		if i == counted {
+			strings.write_string(&builder, " PRIMARY KEY AUTOINCREMENT")
+			continue
+		}
 		// A key column is never NULL in this engine, and the exported table has
 		// to keep saying so: the PRIMARY KEY clause is written only for the rowid
 		// alias, and SQLite would let a NULL into a text key.
@@ -683,7 +690,7 @@ sqlite_master_sql :: proc(table: ^Table) -> string {
 	// or composite key needs that index; without it SQLite reports the file as
 	// malformed (D33). A `UNIQUE` column is not declared here, because it would
 	// ask for an automatic index of its own; it travels as a named index instead.
-	if len(table.schema.primary_key) > 0 {
+	if len(table.schema.primary_key) > 0 && counted < 0 {
 		strings.write_string(&builder, ", PRIMARY KEY (")
 		for position, i in table.schema.primary_key {
 			if i > 0 do strings.write_string(&builder, ", ")
@@ -882,21 +889,16 @@ sqlite_file_write :: proc(store: ^Store, path: string, alloc := context.allocato
 		}
 	}
 
-	// Views and triggers are not modelled, so their text is re-emitted as it came:
-	// a rewrite used to delete them from the user's file (D27).
-	opaque := make([dynamic]Mirror_Kept, 0, len(store.mirror_kept))
-	defer delete(opaque)
-	for kept in store.mirror_kept {
-		if kept.kind == "view" || kept.kind == "trigger" do append(&opaque, kept)
-	}
-	slice.sort_by(opaque[:], proc(a, b: Mirror_Kept) -> bool { return a.name < b.name })
-	for kept in opaque {
+	// The views and triggers: the engine's, with the file's own text for one
+	// that came from it unchanged, and then the ones a file held that the
+	// engine could not read, as the file had them (D27).
+	for object in store_catalog_objects(store, context.temp_allocator) {
 		row := make([]Value, 5, alloc)
-		row[0] = value_string(kept.kind)
-		row[1] = value_string(kept.name)
-		row[2] = value_string(kept.table)
+		row[0] = value_string(object.type)
+		row[1] = value_string(object.name)
+		row[2] = value_string(object.tbl_name)
 		row[3] = value_int(0)
-		row[4] = value_string(kept.sql)
+		row[4] = value_string(strings.clone(object.sql, alloc))
 		append(&master_rows, Sqlite_Export_Row{rowid = i64(len(master_rows) + 1), values = row})
 	}
 
@@ -907,9 +909,10 @@ sqlite_file_write :: proc(store: ^Store, path: string, alloc := context.allocato
 	for name in names {
 		table := store.tables[name]
 		if table.schema.auto_increment_column < 0 do continue
+		// SQLite stores the last rowid given out; the engine keeps the next.
 		values := make([]Value, 2, alloc)
 		values[0] = value_string(table.schema.name)
-		values[1] = value_int(table.next_sequence)
+		values[1] = value_int(max(table.next_sequence - 1, 0))
 		append(&sequence_rows, Sqlite_Export_Row{rowid = i64(len(sequence_rows) + 1), values = values})
 	}
 	if len(sequence_rows) > 0 {
@@ -978,6 +981,12 @@ sqlite_file_write :: proc(store: ^Store, path: string, alloc := context.allocato
 		header[34] = u8(freelist_trunk >> 8)
 		header[35] = u8(freelist_trunk)
 		header[36], header[37], header[38], header[39] = 0, 0, 0, 1
+	}
+	// The program's integers: user_version and application_id.
+	for name, offset in ([2]string{"user_version", "application_id"}) {
+		value := u32(i32(store_header_value(store, name)))
+		at := offset == 0 ? 60 : 68
+		header[at], header[at + 1], header[at + 2], header[at + 3] = u8(value >> 24), u8(value >> 16), u8(value >> 8), u8(value)
 	}
 	// Schema cookie, schema format 4, default cache size.
 	header[40], header[41], header[42], header[43] = 0, 0, 0, 1

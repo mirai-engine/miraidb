@@ -1,5 +1,6 @@
 package tests
 
+import "core:os"
 import "core:strings"
 import "core:testing"
 
@@ -403,4 +404,67 @@ test_update_of_triggers :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT sql FROM sqlite_master WHERE name = 'tbc'").s,
 		`CREATE TRIGGER "tbc" BEFORE UPDATE OF "c", "b" ON "t" BEGIN INSERT INTO log VALUES ('bc:' || coalesce(new.c,'')); END`)
 	_ = run_error(t, store, "CREATE TRIGGER bad AFTER INSERT OF b ON t BEGIN SELECT 1; END")
+}
+
+// file_scalar answers one value from a connection, as text.
+@(private)
+file_scalar :: proc(t: ^testing.T, conn: ^db.Embed_Conn, sql: string) -> string {
+	stmt := db.embed_prepare(conn, sql)
+	if !testing.expectf(t, stmt != nil, "%s did not prepare: %s", sql, db.embed_error(conn)) do return ""
+	defer db.embed_finalize(stmt)
+	has_row, step_err := db.embed_step(stmt)
+	if !testing.expectf(t, db.error_drop(step_err) && has_row, "%s: %s", sql, db.embed_error(conn)) do return ""
+	value, _ := db.embed_column_value(stmt, 0)
+	return db.sqlite_value_text(value, context.temp_allocator)
+}
+
+@(test)
+test_sqlite_file_round_trip :: proc(t: ^testing.T) {
+	// A SQLite file carries views, triggers, an AUTOINCREMENT key with the
+	// counter sqlite_sequence keeps, and user_version and application_id in
+	// its header. An export writes them all, and opening the file gives them
+	// back as working objects: before, a view or a trigger from a file was
+	// text the engine could not run, AUTOINCREMENT and the header were lost.
+	store := fresh_db(t, "file_round_trip")
+	if store == nil do return
+	defer cleanup_db(store, "file_round_trip")
+	for sql in ([]string {
+		"CREATE TABLE s (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)",
+		"CREATE TABLE log (m TEXT)",
+		"INSERT INTO s (v) VALUES ('a'), ('b')",
+		"DELETE FROM s WHERE id = 2",
+		"CREATE VIEW sv AS SELECT v FROM s",
+		"CREATE TRIGGER tr AFTER INSERT ON s BEGIN INSERT INTO log VALUES (new.v); END",
+		"CREATE TRIGGER svi INSTEAD OF INSERT ON sv BEGIN INSERT INTO s (v) VALUES (upper(new.v)); END",
+		"CREATE TRIGGER tu AFTER UPDATE OF v ON s BEGIN INSERT INTO log VALUES ('u'); END",
+		"PRAGMA user_version = 42",
+		"PRAGMA application_id = -7",
+	}) {
+		result := run(t, store, sql)
+		db.sql_result_destroy(&result)
+	}
+	path := "_test_round_trip.sqlite"
+	os.remove(path)
+	defer os.remove(path)
+	_, _, export_err := db.sqlite_file_write(store, path)
+	if !testing.expectf(t, db.error_ok(export_err), "export: %s", export_err.message) do return
+
+	conn, open_err := db.embed_open(path)
+	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
+	defer db.embed_close(conn)
+	testing.expect_value(t, file_scalar(t, conn, "SELECT group_concat(v, ',') FROM sv"), "a")
+	testing.expect_value(t, file_scalar(t, conn, "PRAGMA user_version"), "42")
+	testing.expect_value(t, file_scalar(t, conn, "PRAGMA application_id"), "-7")
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "INSERT INTO s (v) VALUES ('c')")))
+	// AUTOINCREMENT does not hand out 2 again.
+	testing.expect_value(t, file_scalar(t, conn, "SELECT group_concat(id, ',') FROM s"), "1,3")
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "INSERT INTO sv VALUES ('d')")))
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "UPDATE s SET v = v WHERE id = 1")))
+	testing.expect_value(t, file_scalar(t, conn, "SELECT group_concat(m, ',') FROM log"), "c,D,u")
+	testing.expect_value(t, file_scalar(t, conn, "SELECT count(*) FROM sqlite_master WHERE type IN ('view', 'trigger')"), "4")
+	testing.expect_value(t, file_scalar(t, conn, "SELECT sql FROM sqlite_master WHERE name = 's'"), `CREATE TABLE "s" ("id" INTEGER PRIMARY KEY AUTOINCREMENT, "v" TEXT)`)
+	// A dropped view leaves the file's catalog too.
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "DROP TRIGGER svi")))
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "DROP VIEW sv")))
+	testing.expect_value(t, file_scalar(t, conn, "SELECT count(*) FROM sqlite_master WHERE type IN ('view', 'trigger')"), "2")
 }

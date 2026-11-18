@@ -536,6 +536,11 @@ Mirror_Kept :: struct {
 	// carries each automatic index the kept text implies. Empty when the text
 	// declares no key beyond the rowid.
 	key_indexes: []string,
+	// modelled is set for a view or a trigger the import made an engine
+	// object: from then on the engine's catalog says whether it exists, so a
+	// DROP removes it from the file too. One the engine could not read stays
+	// text the file keeps.
+	modelled:  bool,
 }
 
 // store_mirror_keep records the file's catalog, so a later rewrite can put back
@@ -568,7 +573,10 @@ store_mirror_keep :: proc(store: ^Store, file: ^Sqlite_File) {
 			},
 		)
 	}
+	modelled := store_catalog_objects(store, context.temp_allocator)
 	for &object in file.others {
+		known := false
+		for row in modelled do known ||= row.type == object.kind && row.name == object.name
 		append(
 			&store.mirror_kept,
 			Mirror_Kept {
@@ -576,6 +584,7 @@ store_mirror_keep :: proc(store: ^Store, file: ^Sqlite_File) {
 				name = strings.clone(object.name),
 				table = strings.clone(object.table),
 				sql = strings.clone(object.sql),
+				modelled = known,
 			},
 		)
 	}

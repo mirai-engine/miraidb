@@ -24,6 +24,9 @@ Sqlite_Column :: struct {
 	declared:    string,
 	not_null:    bool,
 	primary_key: bool,
+	// autoincrement is INTEGER PRIMARY KEY AUTOINCREMENT: a rowid is never
+	// handed out twice, which sqlite_sequence remembers.
+	autoincrement: bool,
 	inferred:    Type_Kind,
 }
 
@@ -83,6 +86,8 @@ Sqlite_File :: struct {
 	// others are the views and triggers, kept as text because the engine has no
 	// model for them. A rewrite re-emits them unchanged (D27).
 	others:    []Sqlite_Object,
+	// sequence_root is sqlite_sequence's root page, 0 when the file has none.
+	sequence_root: u32,
 	// wal_pages holds the images a write-ahead log carries; the reader consults
 	// them before the database file. wal_committed is the database size at the
 	// last commit frame (0 when the log has no commit).
@@ -432,6 +437,7 @@ Sqlite_Master_Ctx :: struct {
 	tables:  [dynamic]Sqlite_Table,
 	indexes: [dynamic]Sqlite_Index,
 	others:  [dynamic]Sqlite_Object,
+	sequence_root: u32,
 }
 
 @(private)
@@ -477,6 +483,10 @@ sqlite_master_visit :: proc(user: rawptr, rowid: i64, payload: []u8) -> bool {
 	}
 	if kind.kind != .String || !strings.equal_fold(kind.s, "table") do return true
 	if name.kind != .String do return true
+	if strings.equal_fold(name.s, "sqlite_sequence") && values[3].kind == .Int {
+		ctx.sequence_root = u32(values[3].i)
+		return true
+	}
 	if strings.has_prefix(name.s, "sqlite_") do return true
 	table := Sqlite_Table {
 		name      = strings.clone(name.s, ctx.file.alloc),
@@ -746,6 +756,7 @@ sqlite_parse_column :: proc(item: string, alloc: mem.Allocator) -> (Sqlite_Colum
 		declared    = strings.clone(declared, alloc),
 		not_null    = strings.contains(rest_upper, "NOT NULL"),
 		primary_key = strings.contains(rest_upper, "PRIMARY KEY"),
+		autoincrement = sqlite_has_word(rest_upper, "AUTOINCREMENT"),
 		inferred    = sqlite_affinity(declared),
 	}
 	return column, true
@@ -825,6 +836,7 @@ sqlite_file_open :: proc(
 	file.tables = ctx.tables[:]
 	file.indexes = ctx.indexes[:]
 	file.others = ctx.others[:]
+	file.sequence_root = ctx.sequence_root
 	return file, ERROR_NONE
 }
 
@@ -985,6 +997,9 @@ sqlite_import :: proc(
 			// an index: the import only has to hand the engine a schema it accepts,
 			// and an export writes the key as an index row (D33).
 			if column.primary_key do strings.write_string(&create, " PRIMARY KEY")
+			if column.primary_key && column.autoincrement && i == table.pk_position {
+				strings.write_string(&create, " AUTOINCREMENT")
+			}
 		}
 		// A key wider than one column, or a text key, is declared as a table
 		// constraint: the engine keeps it as an index and enforces it, and an
@@ -1056,8 +1071,50 @@ sqlite_import :: proc(
 			_, _ = sql_execute_in_tx(tx, plain)
 		}
 	}
+	// The views, then the triggers (an INSTEAD OF trigger needs its view), as
+	// the file wrote them. One this engine cannot read stays text the file
+	// keeps (D27), as every view and trigger did before.
+	for kind in ([]string{"view", "trigger"}) {
+		for object in file.others {
+			if !strings.equal_fold(object.kind, kind) do continue
+			created, create_err := sql_execute_in_tx(tx, object.sql)
+			if create_err.kind != .None {
+				error_free(&create_err)
+				continue
+			}
+			sql_result_destroy(&created)
+		}
+	}
+	// The integers SQLite keeps in the header for the program.
+	page_one := sqlite_page(file, 1)
+	if len(page_one) >= 72 {
+		for name, offset in ([2]string{"user_version", "application_id"}) {
+			at := offset == 0 ? 60 : 68
+			value := i64(i32(sqlite_be32(page_one, at)))
+			if value == 0 do continue
+			if header_err := header_set(tx, name, value); header_err.kind != .None {
+				tx_rollback(tx)
+				return tables, rows, header_err
+			}
+		}
+	}
 	if commit_err := tx_commit(tx); commit_err.kind != .None {
 		return tables, rows, commit_err
+	}
+	// sqlite_sequence remembers the last rowid each AUTOINCREMENT table gave
+	// out, which may be above every rowid left in the table.
+	if file.sequence_root != 0 {
+		sequence := Sqlite_Table{name = "sqlite_sequence", root_page = file.sequence_root, pk_position = -1}
+		if counters, counters_err := sqlite_table_rows(file, &sequence, context.temp_allocator); counters_err.kind == .None {
+			for counter in counters {
+				if len(counter) < 2 || counter[0].kind != .String || counter[1].kind != .Int do continue
+				table, found := store.tables[counter[0].s]
+				if !found || table.schema.auto_increment_column < 0 do continue
+				if counter[1].i + 1 > table.next_sequence do table.next_sequence = counter[1].i + 1
+			}
+		} else {
+			error_free(&counters_err)
+		}
 	}
 	// Remember the catalog the file spelled, now that the tables exist in the
 	// store: a rewrite re-emits it for every object it does not change (D27).

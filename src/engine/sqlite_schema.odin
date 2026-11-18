@@ -159,37 +159,56 @@ sqlite_trigger_sql :: proc(store: ^Store, trigger: Sqlite_Trigger, alloc: mem.Al
 	return strings.to_string(builder)
 }
 
-// tx_triggers reads the trigger catalog, sorted by name.
-tx_triggers :: proc(tx: ^Tx, alloc: mem.Allocator) -> []Sqlite_Trigger {
-	if tx_table_probe(tx, TRIGGER_TABLE) == nil do return nil
-	catalog := tx_table_probe(tx, TRIGGER_TABLE)
-	rows := make([dynamic]Row, context.temp_allocator)
-	if collect_err := tx_collect(tx, TRIGGER_TABLE, &rows); collect_err.kind != .None {
-		error_drop(collect_err)
-		return nil
-	}
-	text :: proc(row: Row, schema: ^Table_Schema, column: string) -> string {
+// catalog_triggers reads rows of the trigger catalog, sorted by name. The
+// text is cloned: a paged table's rows are released after the read.
+@(private)
+catalog_triggers :: proc(rows: []Row, schema: ^Table_Schema, alloc: mem.Allocator) -> []Sqlite_Trigger {
+	text :: proc(row: Row, schema: ^Table_Schema, column: string, alloc: mem.Allocator) -> string {
 		position, found := schema_column_index(schema, column)
 		if !found || position >= len(row.values) || row.values[position].kind != .String do return ""
-		return row.values[position].s
+		return strings.clone(row.values[position].s, alloc)
 	}
 	out := make([dynamic]Sqlite_Trigger, 0, len(rows), alloc)
 	for row in rows {
 		append(&out, Sqlite_Trigger {
-			name = text(row, &catalog.schema, "name"),
-			table = text(row, &catalog.schema, "table_name"),
-			event = text(row, &catalog.schema, "event"),
-			timing = text(row, &catalog.schema, "timing"),
-			body = text(row, &catalog.schema, "body"),
-			when_text = text(row, &catalog.schema, "when_text"),
-			columns = text(row, &catalog.schema, "columns"),
+			name = text(row, schema, "name", alloc),
+			table = text(row, schema, "table_name", alloc),
+			event = text(row, schema, "event", alloc),
+			timing = text(row, schema, "timing", alloc),
+			body = text(row, schema, "body", alloc),
+			when_text = text(row, schema, "when_text", alloc),
+			columns = text(row, schema, "columns", alloc),
 		})
 	}
 	slice.sort_by(out[:], proc(a, b: Sqlite_Trigger) -> bool { return a.name < b.name })
 	return out[:]
 }
 
-// tx_views reads the view catalog as (name, body) pairs, sorted by name.
+// catalog_views reads rows of the view catalog as (name, body), sorted.
+@(private)
+catalog_views :: proc(rows: []Row, alloc: mem.Allocator) -> [][2]string {
+	out := make([dynamic][2]string, 0, len(rows), alloc)
+	for row in rows {
+		if len(row.values) < 2 || row.values[0].kind != .String || row.values[1].kind != .String do continue
+		append(&out, [2]string{strings.clone(row.values[0].s, alloc), strings.clone(row.values[1].s, alloc)})
+	}
+	slice.sort_by(out[:], proc(a, b: [2]string) -> bool { return a[0] < b[0] })
+	return out[:]
+}
+
+// tx_triggers reads the trigger catalog as the transaction sees it.
+tx_triggers :: proc(tx: ^Tx, alloc: mem.Allocator) -> []Sqlite_Trigger {
+	catalog := tx_table_probe(tx, TRIGGER_TABLE)
+	if catalog == nil do return nil
+	rows := make([dynamic]Row, context.temp_allocator)
+	if collect_err := tx_collect(tx, TRIGGER_TABLE, &rows); collect_err.kind != .None {
+		error_drop(collect_err)
+		return nil
+	}
+	return catalog_triggers(rows[:], &catalog.schema, alloc)
+}
+
+// tx_views reads the view catalog as the transaction sees it.
 tx_views :: proc(tx: ^Tx, alloc: mem.Allocator) -> [][2]string {
 	if tx_table_probe(tx, VIEW_TABLE) == nil do return nil
 	rows := make([dynamic]Row, context.temp_allocator)
@@ -197,13 +216,69 @@ tx_views :: proc(tx: ^Tx, alloc: mem.Allocator) -> [][2]string {
 		error_drop(collect_err)
 		return nil
 	}
-	out := make([dynamic][2]string, 0, len(rows), alloc)
-	for row in rows {
-		if len(row.values) < 2 || row.values[0].kind != .String || row.values[1].kind != .String do continue
-		append(&out, [2]string{row.values[0].s, row.values[1].s})
+	return catalog_views(rows[:], alloc)
+}
+
+// catalog_object_rows lists the views and then the triggers, with the ones a
+// SQLite file held that the engine could not read after them, as the file
+// had them.
+@(private)
+catalog_object_rows :: proc(store: ^Store, views: [][2]string, triggers: []Sqlite_Trigger, out: ^[dynamic]Sqlite_Schema_Row, alloc: mem.Allocator) {
+	for view in views {
+		append(out, Sqlite_Schema_Row{type = "view", name = view[0], tbl_name = view[0], sql = sqlite_view_sql(store, view[0], view[1], alloc)})
 	}
-	slice.sort_by(out[:], proc(a, b: [2]string) -> bool { return a[0] < b[0] })
+	for trigger in triggers {
+		append(out, Sqlite_Schema_Row{type = "trigger", name = trigger.name, tbl_name = trigger.table, sql = sqlite_trigger_sql(store, trigger, alloc)})
+	}
+	for kept in store.mirror_kept {
+		if kept.kind != "view" && kept.kind != "trigger" do continue
+		if kept.modelled do continue
+		modelled := false
+		if kept.kind == "view" {
+			for view in views do modelled ||= view[0] == kept.name
+		} else {
+			for trigger in triggers do modelled ||= trigger.name == kept.name
+		}
+		if modelled do continue
+		append(out, Sqlite_Schema_Row{type = kept.kind, name = kept.name, tbl_name = kept.table, sql = kept.sql})
+	}
+}
+
+// store_catalog_objects is catalog_object_rows over the committed state, for
+// an export.
+store_catalog_objects :: proc(store: ^Store, alloc: mem.Allocator) -> []Sqlite_Schema_Row {
+	views: [][2]string
+	triggers: []Sqlite_Trigger
+	if table, found := store.tables[VIEW_TABLE]; found {
+		rows := make([dynamic]Row, context.temp_allocator)
+		table_collect(table, &rows, max(u64))
+		views = catalog_views(rows[:], alloc)
+		table_collect_release(table, &rows)
+	}
+	if table, found := store.tables[TRIGGER_TABLE]; found {
+		rows := make([dynamic]Row, context.temp_allocator)
+		table_collect(table, &rows, max(u64))
+		triggers = catalog_triggers(rows[:], &table.schema, alloc)
+		table_collect_release(table, &rows)
+	}
+	out := make([dynamic]Sqlite_Schema_Row, 0, len(views) + len(triggers), alloc)
+	catalog_object_rows(store, views, triggers, &out, alloc)
 	return out[:]
+}
+
+// store_header_value is user_version or application_id as committed, for an
+// export's file header.
+store_header_value :: proc(store: ^Store, name: string) -> i64 {
+	table, found := store.tables[HEADER_TABLE]
+	if !found do return 0
+	rows := make([dynamic]Row, context.temp_allocator)
+	table_collect(table, &rows, max(u64))
+	defer table_collect_release(table, &rows)
+	for row in rows {
+		if len(row.values) < 2 || row.values[0].kind != .String || row.values[1].kind != .Int do continue
+		if row.values[0].s == name do return row.values[1].i
+	}
+	return 0
 }
 
 // sqlite_schema_rows lists the catalog the way an export writes it: each
@@ -257,12 +332,7 @@ sqlite_schema_rows :: proc(tx: ^Tx, temp: bool, alloc: mem.Allocator) -> [dynami
 	if sequence {
 		append(&out, Sqlite_Schema_Row{type = "table", name = "sqlite_sequence", tbl_name = "sqlite_sequence", sql = "CREATE TABLE sqlite_sequence(name,seq)"})
 	}
-	for view in tx_views(tx, context.temp_allocator) {
-		append(&out, Sqlite_Schema_Row{type = "view", name = view[0], tbl_name = view[0], sql = sqlite_view_sql(tx.store, view[0], view[1], alloc)})
-	}
-	for trigger in tx_triggers(tx, context.temp_allocator) {
-		append(&out, Sqlite_Schema_Row{type = "trigger", name = trigger.name, tbl_name = trigger.table, sql = sqlite_trigger_sql(tx.store, trigger, alloc)})
-	}
+	catalog_object_rows(tx.store, tx_views(tx, alloc), tx_triggers(tx, alloc), &out, alloc)
 	return out
 }
 
