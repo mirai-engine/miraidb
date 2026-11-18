@@ -13,6 +13,7 @@ package engine
 
 import "core:fmt"
 import "core:slice"
+import "core:strconv"
 import "core:strings"
 import "core:sync"
 
@@ -117,8 +118,9 @@ pragma_single :: proc(column: string, value: Value, commit_seq: u64) -> Sql_Resu
 }
 
 // sql_exec_pragma runs a PRAGMA. `locked` says whether the caller already holds
-// the store lock (a transaction does).
-sql_exec_pragma :: proc(store: ^Store, body: string, locked: bool) -> (Sql_Result, Error) {
+// the store lock (a transaction does); `tx` is the transaction it runs in, if
+// any.
+sql_exec_pragma :: proc(store: ^Store, body: string, locked: bool, tx: ^Tx = nil) -> (Sql_Result, Error) {
 	name := body
 	argument := ""
 	has_argument := false
@@ -142,6 +144,11 @@ sql_exec_pragma :: proc(store: ^Store, body: string, locked: bool) -> (Sql_Resul
 	defer if lowered_owned do delete(lowered_name)
 	name = lowered_name
 	argument = strings.trim(argument, " \t\r\n\"'")
+	// These two are stored data, written and read through a transaction, so
+	// they are taken before the catalog lock the others read under.
+	if name == "user_version" || name == "application_id" {
+		return pragma_header_value(store, tx, name, argument, has_argument)
+	}
 	if !locked {
 		sync.shared_lock(&store.mutex)
 		defer sync.shared_unlock(&store.mutex)
@@ -264,18 +271,6 @@ sql_exec_pragma :: proc(store: ^Store, body: string, locked: bool) -> (Sql_Resul
 			result.rows[i] = row
 		}
 		return result, ERROR_NONE
-	case "user_version", "application_id":
-		if has_argument {
-			value := pragma_text(argument)
-			if set_err := store_set_variable_locked(store, name, value); set_err.kind != .None {
-				return {}, set_err
-			}
-			return Sql_Result{kind = .Ack, message = strings.clone("ok"), commit_seq = store.commit_seq}, ERROR_NONE
-		}
-		if value, found := store_get_variable_locked(store, name); found {
-			return pragma_single(name, value, store.commit_seq), ERROR_NONE
-		}
-		return pragma_single(name, value_int(0), store.commit_seq), ERROR_NONE
 	case "schema_version":
 		return pragma_single("schema_version", value_int(i64(store.commit_seq)), store.commit_seq), ERROR_NONE
 	case "page_size":
@@ -591,4 +586,66 @@ pragma_action_name :: proc(action: Foreign_Key_Action) -> string {
 		return "RESTRICT"
 	}
 	return "RESTRICT"
+}
+
+// HEADER_TABLE holds what SQLite keeps in its file header for the program:
+// `user_version` and `application_id`. Rows of a table, so a value is logged,
+// survives a reopen, is seen by every connection, and is set or undone with
+// the transaction it is written in, as the header page is in SQLite.
+HEADER_TABLE :: "_sqlite_header"
+
+// pragma_header_value reads or writes one of the header integers. SQLite
+// stores a 32-bit signed integer.
+@(private)
+pragma_header_value :: proc(store: ^Store, tx: ^Tx, name, argument: string, has_argument: bool) -> (Sql_Result, Error) {
+	if !has_argument {
+		reader := tx
+		if reader == nil do reader = tx_begin_read(store)
+		value := header_value(reader, name)
+		if tx == nil do tx_end(reader)
+		return pragma_single(name, value_int(value), store.commit_seq), ERROR_NONE
+	}
+	// A value that is not a 32-bit integer is 0, as SQLite stores it.
+	value, parsed := strconv.parse_i64(argument)
+	if !parsed || value < i64(min(i32)) || value > i64(max(i32)) do value = 0
+	writer := tx
+	if writer == nil do writer = tx_begin_write(store)
+	if set_err := header_set(writer, name, value); set_err.kind != .None {
+		if tx == nil do tx_rollback(writer)
+		return {}, set_err
+	}
+	if tx == nil {
+		if commit_err := tx_commit(writer); commit_err.kind != .None do return {}, commit_err
+	}
+	return Sql_Result{kind = .Ack, message = strings.clone("ok"), commit_seq = store.commit_seq}, ERROR_NONE
+}
+
+// header_value is one header integer as the transaction sees it, 0 when unset.
+header_value :: proc(tx: ^Tx, name: string) -> i64 {
+	if tx_table_probe(tx, HEADER_TABLE) == nil do return 0
+	result, err := sql_execute_in_tx_params(tx, "SELECT value FROM _sqlite_header WHERE name = ?", []Value{value_string(name)})
+	if err.kind != .None {
+		error_drop(err)
+		return 0
+	}
+	defer sql_result_destroy(&result)
+	if len(result.rows) == 0 || len(result.rows[0]) == 0 || result.rows[0][0].kind != .Int do return 0
+	return result.rows[0][0].i
+}
+
+// header_set writes one header integer in the transaction.
+header_set :: proc(tx: ^Tx, name: string, value: i64) -> Error {
+	if tx_table_probe(tx, HEADER_TABLE) == nil {
+		created, create_err := sql_execute_in_tx(tx, "CREATE TABLE _sqlite_header (name TEXT PRIMARY KEY NOT NULL, value INTEGER NOT NULL)")
+		if create_err.kind != .None do return create_err
+		sql_result_destroy(&created)
+	}
+	result, err := sql_execute_in_tx_params(
+		tx,
+		"INSERT INTO _sqlite_header (name, value) VALUES (?, ?) ON CONFLICT (name) DO UPDATE SET value = excluded.value",
+		[]Value{value_string(name), value_int(value)},
+	)
+	if err.kind != .None do return err
+	sql_result_destroy(&result)
+	return ERROR_NONE
 }

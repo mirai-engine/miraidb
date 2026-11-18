@@ -200,7 +200,7 @@ per node out, as a temporary table the executor scans like a view
 | `page_size`, `encoding` | `4096`, `UTF-8` | the export's page size and the only text encoding |
 | `page_count`, `freelist_count`, `data_version` | log pages, `0`, the commit sequence | real numbers, not neutral zeros |
 | `foreign_keys` | `1` | enforcement lives in the transaction layer and cannot be turned off |
-| `user_version`, `application_id` | stored in the catalog | read back after a reopen |
+| `user_version`, `application_id` | stored as 32-bit integers in `_sqlite_header` (they were session text until block 4) | read back after a reopen, undone by a rollback (`test_user_version_is_stored`) |
 
 A knob that would change what a statement does (`query_only`, `read_uncommitted`,
 `recursive_triggers`, `defer_foreign_keys`, `ignore_check_constraints`,

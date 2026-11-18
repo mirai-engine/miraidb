@@ -152,6 +152,12 @@ The engine sorts the 63 names in the inventory into four classes:
   `soft_heap_limit64`, `temp_store`, `temp_store_directory`,
   `data_store_directory`. There is no unknown pragma left in the inventory.
 
+`user_version` and `application_id` are 32-bit integers stored with the data
+(the internal table `_sqlite_header`), as SQLite keeps them in the file header:
+every connection sees them, a reopen reads them back, the transaction they are
+written in commits or undoes them, and a value that is not a 32-bit integer is
+stored as 0. `PRAGMA main.name` is `PRAGMA name`.
+
 `REINDEX` is accepted and answers `ok`: every index is rebuilt from the log when
 the database opens, so there is never one that is out of date. `INDEXED BY name`
 and `NOT INDEXED` are read as the hints they are -- the plan is priced by the

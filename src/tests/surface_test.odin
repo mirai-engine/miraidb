@@ -306,3 +306,43 @@ test_sqlite_schema_catalog :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(info.rows), 3)
 	db.sql_result_destroy(&info)
 }
+
+@(test)
+test_user_version_is_stored :: proc(t: ^testing.T) {
+	// PRAGMA user_version and application_id are 32-bit integers kept with
+	// the data: a reopen reads them back, a rollback undoes them, and a value
+	// that is no 32-bit integer is 0, as SQLite stores it. They used to be
+	// session variables held as text.
+	store := fresh_db(t, "user_version")
+	if store == nil do return
+	testing.expect_value(t, scalar(t, store, "PRAGMA user_version").i, i64(0))
+	run(t, store, "PRAGMA main.user_version = 7")
+	run(t, store, "PRAGMA application_id = -5")
+	version := scalar(t, store, "PRAGMA user_version")
+	testing.expect_value(t, version.kind, db.Value_Kind.Int)
+	testing.expect_value(t, version.i, i64(7))
+
+	conn := db.embed_wrap(store)
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "BEGIN")))
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "PRAGMA user_version = 9")))
+	stmt := db.embed_prepare(conn, "PRAGMA user_version")
+	has_row, step_err := db.embed_step(stmt)
+	testing.expect(t, db.error_drop(step_err) && has_row)
+	testing.expect_value(t, db.embed_column_int(stmt, 0), i64(9))
+	db.embed_finalize(stmt)
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "ROLLBACK")))
+	db.embed_close(conn)
+	testing.expect_value(t, scalar(t, store, "PRAGMA user_version").i, i64(7))
+
+	db.store_close(store)
+	reopened, err := db.store_open("_test_user_version", {persistent = true, create = false, durable = false})
+	if !testing.expectf(t, db.error_ok(err), "reopen failed: %s", err.message) do return
+	defer cleanup_db(reopened, "user_version")
+	testing.expect_value(t, scalar(t, reopened, "PRAGMA user_version").i, i64(7))
+	testing.expect_value(t, scalar(t, reopened, "PRAGMA application_id").i, i64(-5))
+	for text in ([]string{"4294967297", "'abc'", "2147483648"}) {
+		run(t, reopened, strings.concatenate({"PRAGMA user_version = ", text}, context.temp_allocator))
+		testing.expectf(t, scalar(t, reopened, "PRAGMA user_version").i == 0, "%s", text)
+	}
+	testing.expect_value(t, scalar(t, reopened, "SELECT count(*) FROM sqlite_master").i, i64(0))
+}

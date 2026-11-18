@@ -206,7 +206,7 @@ sql_execute_in_tx :: proc(tx: ^Tx, sql: string) -> (Sql_Result, Error) {
 
 sql_execute_in_tx_params :: proc(tx: ^Tx, sql: string, params: []Value) -> (Sql_Result, Error) {
 	if body, is_pragma := sqlite_pragma_statement(sql); is_pragma {
-		return sql_exec_pragma(tx.store, body, tx.locked)
+		return sql_exec_pragma(tx.store, body, tx.locked, tx)
 	}
 	query, parse_err := sql_parse(sql)
 	if parse_err.kind != .None do return {}, parse_err
@@ -838,7 +838,7 @@ prepared_execute :: proc(store: ^Store, prepared: ^Stmt_Prepared, params: []Valu
 // transaction (the path benchmarks and reducers use).
 prepared_execute_in_tx :: proc(tx: ^Tx, prepared: ^Stmt_Prepared, params: []Value) -> (Sql_Result, Error) {
 	if prepared == nil do return {}, errf(.Invalid_Argument, "no prepared statement")
-	if prepared.is_pragma do return sql_exec_pragma(tx.store, prepared.pragma_body, tx.locked)
+	if prepared.is_pragma do return sql_exec_pragma(tx.store, prepared.pragma_body, tx.locked, tx)
 	return sql_run_statement_in_tx(tx, prepared.query.statement, params)
 }
 
