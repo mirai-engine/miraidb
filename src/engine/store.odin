@@ -1308,12 +1308,20 @@ store_apply_payload :: proc(store: ^Store, payload: []u8, seq: u64) -> Error {
 	br_init(&r, payload)
 	count := int(br_read_u32(&r))
 	if r.bad do return errf(.Corrupt_Log, "commit payload is truncated")
+	// An operation is decoded into a scratch arena: applying it copies what the
+	// store keeps (the table's schema, the row's values), so the arena is reset
+	// after each one and a snapshot of the whole state costs one operation.
+	scratch: virtual.Arena
+	if arena_err := virtual.arena_init_growing(&scratch); arena_err != .None {
+		return errf(.Out_Of_Memory, "cannot create the replay arena: %v", arena_err)
+	}
+	defer virtual.arena_destroy(&scratch)
 	for _ in 0 ..< count {
-		op, op_err := store_op_decode(&r)
+		op, op_err := store_op_decode(&r, virtual.arena_allocator(&scratch))
 		if op_err.kind != .None do return op_err
-		if apply_err := store_apply(store, op); apply_err.kind != .None {
-			return apply_err
-		}
+		apply_err := store_apply(store, op)
+		virtual.arena_free_all(&scratch)
+		if apply_err.kind != .None do return apply_err
 	}
 	if r.bad do return errf(.Corrupt_Log, "commit payload is truncated")
 	return ERROR_NONE
@@ -1460,27 +1468,27 @@ store_op_encode :: proc(w: ^Byte_Writer, op: Store_Op) {
 	}
 }
 
-store_op_decode :: proc(r: ^Byte_Reader) -> (Store_Op, Error) {
+store_op_decode :: proc(r: ^Byte_Reader, alloc: mem.Allocator) -> (Store_Op, Error) {
 	op: Store_Op
 	op.kind = Store_Op_Kind(br_read_u8(r))
-	op.name = br_read_string(r, context.allocator)
+	op.name = br_read_string(r, alloc)
 	if r.bad do return op, errf(.Corrupt_Log, "truncated operation")
 	#partial switch op.kind {
 	case .Create_Table, .Alter_Table:
-		op.schema = schema_decode(r, context.allocator)
+		op.schema = schema_decode(r, alloc)
 	case .Create_Index:
-		op.index = index_decode(r, context.allocator)
+		op.index = index_decode(r, alloc)
 	case .Drop_Index:
-		op.index.name = br_read_string(r, context.allocator)
+		op.index.name = br_read_string(r, alloc)
 	case .Insert, .Update:
 		op.row_id = Row_Id(br_read_u64(r))
 		count := int(br_read_u32(r))
 		if r.bad || count < 0 || count > br_remaining(r) {
 			return op, errf(.Corrupt_Log, "truncated row")
 		}
-		values := make([]Value, count)
+		values := make([]Value, count, alloc)
 		for i in 0 ..< count {
-			values[i] = value_decode(r, context.allocator)
+			values[i] = value_decode(r, alloc)
 		}
 		op.values = values
 	case .Delete:
