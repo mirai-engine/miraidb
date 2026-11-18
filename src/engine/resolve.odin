@@ -276,7 +276,7 @@ res_ref :: proc(walk: ^Res_Walk, scope: ^Res_Scope, ref: ^Table_Ref) {
 		source.known = cte.known
 		return
 	}
-	if len(ref.schema) > 0 || is_json_table_function(ref.name) || is_system_table(ref.name) do return
+	if len(ref.schema) > 0 || is_json_table_function(ref.name) || is_pragma_function(ref.name) || is_system_table(ref.name) do return
 	if is_schema, _ := sqlite_schema_name(ref.name); is_schema && tx_table_probe(walk.tx, ref.name) == nil {
 		source.columns = SQLITE_SCHEMA_COLUMNS
 		source.known = true

@@ -228,6 +228,11 @@ QUERIES = [
     "SELECT name FROM main.sqlite_master WHERE type = 'view'",
     "SELECT d.name, count(*) FROM main.dept d JOIN sqlite_master m ON m.tbl_name = 'emp' AND m.type = 'table' GROUP BY d.name ORDER BY d.name",
     "SELECT count(*) FROM sqlite_temp_master",
+    # A pragma read as a table, alone and once per row of the catalog.
+    "SELECT name, \"notnull\", pk FROM pragma_table_info('emp') ORDER BY cid",
+    "SELECT m.name, c.name FROM sqlite_master m JOIN pragma_table_info(m.name) c WHERE m.type = 'table' AND m.name IN ('dept', 'kv') ORDER BY 1, 2",
+    "SELECT count(*) FROM pragma_table_info('nosuch')",
+    "SELECT * FROM pragma_user_version",
     # FILTER, an aggregate's ORDER BY and the WINDOW clause (S4).
     "SELECT dept, count(*) FILTER (WHERE salary > 60), sum(salary) FILTER (WHERE name IS NOT NULL) FROM emp GROUP BY dept ORDER BY dept",
     "SELECT dept, group_concat(name, '/' ORDER BY name DESC) FROM emp GROUP BY dept ORDER BY dept",

@@ -498,7 +498,7 @@ auth_ref :: proc(walk: ^Auth_Walk, scope: ^Auth_Scope, ref: ^Table_Ref, merged: 
 	source.name = ref.name
 	source.alias = ref.alias
 	source.silent = true
-	if len(ref.schema) > 0 || is_json_table_function(ref.name) do return
+	if len(ref.schema) > 0 || is_json_table_function(ref.name) || is_pragma_function(ref.name) do return
 	if table := tx_table_probe(walk.tx, ref.name); table != nil {
 		source = auth_table_source(table, ref.alias)
 		return

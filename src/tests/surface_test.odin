@@ -346,3 +346,25 @@ test_user_version_is_stored :: proc(t: ^testing.T) {
 	}
 	testing.expect_value(t, scalar(t, reopened, "SELECT count(*) FROM sqlite_master").i, i64(0))
 }
+
+@(test)
+test_pragma_table_functions :: proc(t: ^testing.T) {
+	// A pragma that answers rows is readable as a table, pragma_<name>(arg),
+	// alone, filtered, and once per row of the catalog it is joined to.
+	store := fresh_db(t, "pragma_functions")
+	if store == nil do return
+	defer cleanup_db(store, "pragma_functions")
+	run(t, store, "CREATE TABLE p (id INTEGER PRIMARY KEY, k TEXT NOT NULL, n INT)")
+	run(t, store, "CREATE TABLE q (a TEXT, b TEXT)")
+	run(t, store, "CREATE INDEX q_b ON q (b)")
+	testing.expect_value(t, scalar(t, store, "SELECT group_concat(name, ',') FROM pragma_table_info('p')").s, "id,k,n")
+	testing.expect_value(t, scalar(t, store, "SELECT \"notnull\" FROM pragma_table_info('p') WHERE name = 'id'").i, i64(0))
+	testing.expect_value(t, scalar(t, store, "SELECT \"notnull\" FROM pragma_table_info('p') WHERE name = 'k'").i, i64(1))
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM sqlite_master m JOIN pragma_table_info(m.name) c WHERE m.type = 'table'").i, i64(5))
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM pragma_index_list('q') WHERE name = 'q_b'").i, i64(1))
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM pragma_table_info('nosuch')").i, i64(0))
+	run(t, store, "PRAGMA user_version = 12")
+	testing.expect_value(t, scalar(t, store, "SELECT user_version FROM pragma_user_version").i, i64(12))
+	// A pragma that changes something is not a table function.
+	_ = run_error(t, store, "SELECT * FROM pragma_optimize")
+}

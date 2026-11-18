@@ -167,7 +167,11 @@ sql_exec_pragma :: proc(store: ^Store, body: string, locked: bool, tx: ^Tx = nil
 			row[0] = value_int(i64(i))
 			row[1] = pragma_text(column.name)
 			row[2] = pragma_text(column_type_name(column.type))
-			row[3] = value_int(column.not_null ? 1 : 0)
+			// The rowid alias (one INTEGER key) reads 0, as SQLite reports it:
+			// its NULL becomes the next rowid rather than a refusal.
+			rowid_alias := len(table.schema.primary_key) == 1 && table.schema.primary_key[0] == i &&
+				column.type.kind == .Int && !table.schema.without_rowid
+			row[3] = value_int(column.not_null && !rowid_alias ? 1 : 0)
 			if column.has_default {
 				row[4] = value_string(value_format(column.default_value, context.allocator))
 			} else {
@@ -648,4 +652,61 @@ header_set :: proc(tx: ^Tx, name: string, value: i64) -> Error {
 	if err.kind != .None do return err
 	sql_result_destroy(&result)
 	return ERROR_NONE
+}
+
+// PRAGMA_TABLE_FUNCTIONS are the pragmas a query can read as a table, as
+// SQLite offers them: `SELECT * FROM pragma_table_info('t')`. They are the ones
+// that answer rows and change nothing.
+PRAGMA_TABLE_FUNCTIONS := []string {
+	"application_id", "collation_list", "compile_options", "data_version",
+	"database_list", "encoding", "foreign_key_check", "foreign_key_list",
+	"freelist_count", "function_list", "index_info", "index_list",
+	"index_xinfo", "integrity_check", "journal_mode", "module_list",
+	"page_count", "page_size", "pragma_list", "quick_check",
+	"schema_version", "table_info", "table_list", "table_xinfo",
+	"user_version",
+}
+
+// is_pragma_function reports a `pragma_<name>` table function.
+is_pragma_function :: proc(name: string) -> bool {
+	if len(name) <= 7 || !strings.equal_fold(name[:7], "pragma_") do return false
+	for candidate in PRAGMA_TABLE_FUNCTIONS {
+		if strings.equal_fold(name[7:], candidate) do return true
+	}
+	return false
+}
+
+// tx_materialize_pragma runs the pragma a `pragma_<name>(arg)` names, with
+// its first argument as the pragma's, and reads the answer as a temporary
+// table the statement scans like a view.
+tx_materialize_pragma :: proc(tx: ^Tx, name: string, args: []Value) -> (^Table, Error) {
+	body := name[7:]
+	if len(args) > 0 && args[0].kind != .Null {
+		argument := sqlite_value_text(args[0], context.temp_allocator)
+		body = strings.concatenate({body, "(", argument, ")"}, context.temp_allocator)
+	}
+	result, pragma_err := sql_exec_pragma(tx.store, body, tx.locked, tx)
+	if pragma_err.kind != .None do return nil, pragma_err
+	defer sql_result_destroy(&result)
+	columns := make([]Column, len(result.columns), tx.alloc)
+	for column_name, i in result.columns {
+		columns[i] = Column {
+			name = strings.clone(column_name, tx.alloc),
+			type = view_column_type(result.rows, i),
+		}
+	}
+	schema := Table_Schema {
+		name    = strings.clone(name, tx.alloc),
+		columns = columns,
+	}
+	table, table_err := table_create(&schema)
+	if table_err.kind != .None do return nil, table_err
+	for row, i in result.rows {
+		if insert_err := table_insert(table, Row_Id(i + 1), row); insert_err.kind != .None {
+			table_destroy(table)
+			return nil, insert_err
+		}
+	}
+	append(&tx.temp_tables, table)
+	return table, ERROR_NONE
 }

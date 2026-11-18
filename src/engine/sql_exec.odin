@@ -3578,7 +3578,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		// statement ends, because the rows the join reads point into them.
 		// A program's virtual table is read once per outer row too: its
 		// arguments and its ON terms may read the row before it.
-		lateral := is_json_table_function(step.ref.name) ||
+		lateral := is_json_table_function(step.ref.name) || is_pragma_function(step.ref.name) ||
 			(step.ref.lateral && step.ref.subquery != nil) ||
 			(len(step.ref.schema) == 0 && tx_table_probe(tx, step.ref.name) == nil && vtab_is_named(tx, step.ref.name))
 		if lateral && (step.kind == .Right || step.kind == .Full) {

@@ -158,6 +158,12 @@ every connection sees them, a reopen reads them back, the transaction they are
 written in commits or undoes them, and a value that is not a 32-bit integer is
 stored as 0. `PRAGMA main.name` is `PRAGMA name`.
 
+A pragma that answers rows and changes nothing is also a table function, as in
+SQLite: `SELECT name FROM pragma_table_info('t')`, and once per row of a join
+(`sqlite_master m JOIN pragma_table_info(m.name)`). The pragma's argument is the
+function's first argument; SQLite's hidden `arg` and `schema` columns are not
+there. `table_info` reports `notnull = 0` for the rowid alias, as SQLite does.
+
 `REINDEX` is accepted and answers `ok`: every index is rebuilt from the log when
 the database opens, so there is never one that is out of date. `INDEXED BY name`
 and `NOT INDEXED` are read as the hints they are -- the plan is priced by the

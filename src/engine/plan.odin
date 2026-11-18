@@ -1031,7 +1031,7 @@ plan_can_reorder :: proc(tx: ^Tx, stmt: Select_Stmt) -> bool {
 	if stmt.from.as_of != nil do return false
 	if stmt.from.lateral do return false
 	if len(stmt.from.args) > 0 do return false
-	if is_json_table_function(stmt.from.name) do return false
+	if is_json_table_function(stmt.from.name) || is_pragma_function(stmt.from.name) do return false
 	if _, base_table := tx.store.tables[stmt.from.name]; !base_table do return false
 	for join in stmt.joins {
 		// An outer join keeps rows the other side has no match for, so the order
@@ -1040,7 +1040,7 @@ plan_can_reorder :: proc(tx: ^Tx, stmt: Select_Stmt) -> bool {
 		if join.table.as_of != nil do return false
 		if join.table.lateral do return false
 		if len(join.table.args) > 0 do return false
-		if is_json_table_function(join.table.name) do return false
+		if is_json_table_function(join.table.name) || is_pragma_function(join.table.name) do return false
 		if _, table := tx.store.tables[join.table.name]; !table do return false
 	}
 	return true

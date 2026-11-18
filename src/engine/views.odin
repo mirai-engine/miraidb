@@ -130,6 +130,10 @@ tx_source_table :: proc(
 		materialized, json_err := tx_materialize_json_table(tx, name, args)
 		return materialized, true, json_err
 	}
+	if is_pragma_function(name) && tx_table_probe(tx, name) == nil {
+		materialized, pragma_err := tx_materialize_pragma(tx, name, args)
+		return materialized, true, pragma_err
+	}
 	resolved, table_err := tx_table(tx, name)
 	if table_err.kind == .None {
 		if len(args) > 0 {
