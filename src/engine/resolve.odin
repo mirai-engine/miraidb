@@ -72,12 +72,20 @@ sql_resolve_names :: proc(tx: ^Tx, statement: ^Statement, alloc := context.alloc
 	// A statement that writes an attached database names that database's
 	// objects: it is checked there, through the transaction that writes it when
 	// there is one.
-	if schema, local, attached := statement_attached(statement^); attached {
-		if writer, open := tx.attached_txs[schema]; open do return sql_resolve_names(writer, &local, alloc)
+	if schema, object, local, attached := statement_attached_object(statement^); attached {
+		if writer, open := tx.attached_txs[schema]; open {
+			saved_target := writer.attach_target
+			writer.attach_target = object
+			defer writer.attach_target = saved_target
+			return sql_resolve_names(writer, &local, alloc)
+		}
 		store := tx.store.attached[schema]
 		if store == nil do return errf(.Table_Not_Found, "unknown database %s", schema)
 		reader := tx_begin_read(store)
 		defer tx_end(reader)
+		reader.attach_parent = tx
+		reader.attach_name = schema
+		reader.attach_target = object
 		return sql_resolve_names(reader, &local, alloc)
 	}
 	walk := Res_Walk{tx = tx, alloc = alloc}
@@ -311,6 +319,12 @@ res_ref :: proc(walk: ^Res_Walk, scope: ^Res_Scope, ref: ^Table_Ref) {
 		// sqlite_schema is a table in SQLite: its rows have a rowid, which the
 		// shell orders .schema and .dump by.
 		source.table = true
+		return
+	}
+	// In an attached database's transaction an unqualified name is main's
+	// first, as SQLite resolves it.
+	if table := tx_parent_probe(walk.tx, ref.name); table != nil {
+		source = res_table_source(table, ref.alias)
 		return
 	}
 	if table := tx_table_probe(walk.tx, ref.name); table != nil {

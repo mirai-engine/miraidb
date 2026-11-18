@@ -41,6 +41,35 @@ attach_display :: proc(name: string, alloc := context.temp_allocator) -> string 
 // gives it back naming the object without the database.
 @(private)
 statement_attached :: proc(statement: Statement) -> (schema: string, local: Statement, attached: bool) {
+	schema, _, local, attached = statement_attached_object(statement)
+	return
+}
+
+// statement_attached_object is statement_attached that also names the object
+// the statement writes, without its database.
+@(private)
+statement_attached_object :: proc(statement: Statement) -> (schema: string, object: string, local: Statement, attached: bool) {
+	s, l, ok := statement_attached_split(statement)
+	if !ok do return "", "", statement, false
+	#partial switch stmt in l {
+	case Insert_Stmt:
+		object = stmt.table
+	case Update_Stmt:
+		object = stmt.table
+	case Delete_Stmt:
+		object = stmt.table
+	case Create_Table_Stmt:
+		object = stmt.name
+	case Drop_Table_Stmt:
+		object = stmt.name
+	case Create_Index_Stmt:
+		object = stmt.table
+	}
+	return s, object, l, true
+}
+
+@(private)
+statement_attached_split :: proc(statement: Statement) -> (schema: string, local: Statement, attached: bool) {
 	#partial switch stmt in statement {
 	case Insert_Stmt:
 		if s, object, ok := attach_split(stmt.table); ok {
@@ -102,6 +131,8 @@ tx_attached :: proc(tx: ^Tx, schema: string) -> (^Tx, Error) {
 		tx_end(attached)
 		return nil, errf(.Transaction_Read_Only, "attempt to write a readonly database")
 	}
+	attached.attach_parent = tx
+	attached.attach_name = strings.clone(schema, attached.alloc)
 	if tx.attached_txs == nil do tx.attached_txs = make(map[string]^Tx, runtime.heap_allocator())
 	tx.attached_txs[strings.clone(schema, runtime.heap_allocator())] = attached
 	return attached, ERROR_NONE
@@ -270,6 +301,41 @@ store_attach_restore :: proc(store: ^Store) -> Error {
 		}
 	}
 	return first_err
+}
+
+// tx_parent_source resolves, in the transaction of an attached database, a
+// name that belongs to another database of the connection, and answers
+// handled = false for one that is this database's own. Under SQLite's rules an
+// unqualified name is main's (or temp's) when main has it, else this
+// database's; the table the statement writes is always this database's. What
+// the parent answers is copied into this transaction, which owns it for the
+// statement.
+@(private)
+tx_parent_source :: proc(tx: ^Tx, name: string, args: []Value, schema: string) -> (table: ^Table, handled: bool, err: Error) {
+	parent := tx.attach_parent
+	if parent == nil do return nil, false, ERROR_NONE
+	if len(schema) > 0 && strings.equal_fold(schema, tx.attach_name) do return nil, false, ERROR_NONE
+	if len(schema) == 0 {
+		if strings.equal_fold(name, tx.attach_target) do return nil, false, ERROR_NONE
+		_, parent_view := view_sql(parent, name)
+		if tx_table_probe(parent, name) == nil && !parent_view do return nil, false, ERROR_NONE
+	}
+	source, is_view, source_err := tx_source_table(parent, name, args, schema)
+	if source_err.kind != .None do return nil, true, source_err
+	if is_view do return source, true, ERROR_NONE
+	rows := make([dynamic]Row)
+	defer delete(rows)
+	if collect_err := tx_collect(parent, name, &rows); collect_err.kind != .None do return nil, true, collect_err
+	copied, copy_err := attach_copy_table(tx, len(schema) > 0 ? schema : "main", name, source, rows[:])
+	return copied, true, copy_err
+}
+
+// tx_parent_probe is the table an unqualified name means in the transaction
+// of an attached database when it is another database's (tx_parent_source).
+@(private)
+tx_parent_probe :: proc(tx: ^Tx, name: string) -> ^Table {
+	if tx.attach_parent == nil || strings.equal_fold(name, tx.attach_target) do return nil
+	return tx_table_probe(tx.attach_parent, name)
 }
 
 // tx_materialize_attached copies one table of an attached database into a

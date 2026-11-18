@@ -32,6 +32,15 @@ Tx :: struct {
 	// wrote, by database name (attach.odin): they commit before it and roll back
 	// with it.
 	attached_txs: map[string]^Tx,
+	// attach_parent is set on the transaction of an attached database: the
+	// connection's transaction it writes for. A statement that writes the
+	// attached database reads the others through it, as SQLite resolves
+	// names across every database of the connection (attach.odin).
+	// attach_name is this database's name there, and attach_target the
+	// table the running statement writes.
+	attach_parent: ^Tx,
+	attach_name:   string,
+	attach_target: string,
 	arena:     virtual.Arena,
 	alloc:     mem.Allocator,
 	// read_seq is the commit sequence the transaction started from and

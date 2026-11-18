@@ -1,0 +1,24 @@
+CREATE TABLE t(a, b);
+INSERT INTO t VALUES (1, 'x'), (2, 'y');
+ATTACH 'other.db' AS o;
+CREATE TABLE o.u(a, b);
+INSERT INTO o.u SELECT * FROM t;
+SELECT * FROM o.u;
+INSERT INTO t SELECT a + 10, b FROM o.u;
+SELECT * FROM t;
+INSERT INTO o.u SELECT a, b FROM o.u WHERE a = 1;
+SELECT count(*) FROM o.u;
+UPDATE o.u SET b = (SELECT max(b) FROM t);
+SELECT * FROM o.u;
+DELETE FROM t WHERE a IN (SELECT a FROM o.u);
+SELECT * FROM t;
+BEGIN;
+INSERT INTO t VALUES (99, 'tx');
+INSERT INTO o.u SELECT a, b FROM t WHERE a = 99;
+SELECT * FROM o.u WHERE a = 99;
+ROLLBACK;
+SELECT count(*) FROM o.u WHERE a = 99;
+SELECT count(*) FROM t WHERE a = 99;
+SELECT name FROM pragma_database_list ORDER BY seq;
+.databases
+DETACH o;

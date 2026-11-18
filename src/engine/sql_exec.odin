@@ -584,12 +584,15 @@ sql_exec_vacuum :: proc(store: ^Store, stmt: Vacuum_Stmt) -> (Sql_Result, Error)
 sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sql_Result, Error) {
 	// A statement that writes an attached database runs in that database's
 	// transaction, which this one opens and ends.
-	if schema, local, attached := statement_attached(statement); attached {
+	if schema, object, local, attached := statement_attached_object(statement); attached {
 		writer, writer_err := tx_attached(tx, schema)
 		if writer_err.kind != .None do return {}, writer_err
 		// A statement that fails is undone there as a unit, as it is here.
 		mark := tx_statement_begin(writer)
+		saved_target := writer.attach_target
+		writer.attach_target = object
 		result, err := sql_exec_mutation(writer, local, params)
+		writer.attach_target = saved_target
 		tx_statement_end(writer, mark, err.kind != .None)
 		return result, err
 	}

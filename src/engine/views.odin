@@ -123,6 +123,12 @@ tx_source_table :: proc(
 	args: []Value,
 	schema: string = "",
 ) -> (table: ^Table, is_view: bool, err: Error) {
+	// A statement writing an attached database reads the connection's other
+	// databases through the transaction it writes for.
+	if parent_table, handled, parent_err := tx_parent_source(tx, name, args, schema); handled {
+		return parent_table, true, parent_err
+	}
+	if len(schema) > 0 && strings.equal_fold(schema, tx.attach_name) do return tx_source_table(tx, name, args)
 	if strings.equal_fold(schema, "main") {
 		return tx_source_table(tx, name, args)
 	}

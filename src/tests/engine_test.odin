@@ -8063,6 +8063,23 @@ test_attach_and_detach :: proc(t: ^testing.T) {
 	testing.expectf(t, db.error_ok(write), "write: %s", write.message)
 	db.sql_result_destroy(&write_result)
 
+	// A write to one database reads the others, as SQLite resolves names
+	// across the connection: main's rows into side, side's into main, and
+	// side's own rows into side, all in the statement's transaction.
+	run(t, store, "CREATE TABLE side.copied (id INTEGER PRIMARY KEY, label TEXT)")
+	run(t, store, "INSERT INTO side.copied SELECT id, label FROM mine")
+	testing.expect_value(t, scalar(t, store, "SELECT label FROM side.copied WHERE id = 10").s, "ten")
+	run(t, store, "INSERT INTO side.copied SELECT id + 100, name FROM side.other_items WHERE id = 1")
+	testing.expect_value(t, scalar(t, store, "SELECT label FROM side.copied WHERE id = 101").s, "one")
+	run(t, store, "UPDATE side.copied SET label = (SELECT max(label) FROM mine) WHERE id = 101")
+	testing.expect_value(t, scalar(t, store, "SELECT label FROM side.copied WHERE id = 101").s, "ten")
+	run(t, store, "INSERT INTO mine SELECT id + 1000, name FROM side.other_items")
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM mine").i, i64(4))
+	run(t, store, "DELETE FROM side.copied WHERE id IN (SELECT id FROM mine)")
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM side.copied").i, i64(1))
+	run(t, store, "DROP TABLE side.copied")
+	run(t, store, "DELETE FROM mine WHERE id > 1000")
+
 	// The catalog survives a reopen of the principal.
 	db.store_close(store)
 	reopened, reopen_err := db.store_open("_test_attach_principal", {persistent = true, create = false, durable = false})
