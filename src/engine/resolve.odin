@@ -308,6 +308,9 @@ res_ref :: proc(walk: ^Res_Walk, scope: ^Res_Scope, ref: ^Table_Ref) {
 	if is_schema, _ := sqlite_schema_name(ref.name); is_schema && tx_table_probe(walk.tx, ref.name) == nil {
 		source.columns = SQLITE_SCHEMA_COLUMNS
 		source.known = true
+		// sqlite_schema is a table in SQLite: its rows have a rowid, which the
+		// shell orders .schema and .dump by.
+		source.table = true
 		return
 	}
 	if table := tx_table_probe(walk.tx, ref.name); table != nil {
