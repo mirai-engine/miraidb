@@ -557,6 +557,12 @@ res_ddl :: proc(walk: ^Res_Walk, statement: ^Statement) {
 					return
 				}
 			}
+			if len(column.collation) > 0 && !collation_is_builtin(column.collation) {
+				if _, found := store_collation(walk.tx.store, column.collation); !found {
+					res_fail(walk, .Invalid_Argument, "no such collation sequence: %s", column.collation)
+					return
+				}
+			}
 			if s.strict {
 				if _, known := sqlite_strict_type(column.declared); !known {
 					res_fail(walk, .Invalid_Argument, "unknown datatype for %s.%s: \"%s\"", s.name, column.name, column.declared)

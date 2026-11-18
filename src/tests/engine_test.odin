@@ -13512,12 +13512,18 @@ test_host_collations :: proc(t: ^testing.T) {
 		}
 	}
 
-	// Where a key is folded, the statement is refused instead of misgrouped.
-	for statement in ([]string {
-		"SELECT name FROM w GROUP BY name COLLATE by_length",
-		"SELECT DISTINCT name COLLATE by_length FROM w",
-		"SELECT sum(length(name)) OVER (ORDER BY name COLLATE by_length) FROM w",
-	}) {
+	// GROUP BY and DISTINCT group by the classes the comparison makes: 'ab'
+	// and 'xy' are not equal by length then bytes, so every name is its own.
+	testing.expect_value(t, len(run(t, store, "SELECT name FROM w GROUP BY name COLLATE by_length").rows), 4)
+	testing.expect_value(t, len(run(t, store, "SELECT DISTINCT name COLLATE by_length FROM w").rows), 4)
+	// A window's ORDER BY ranks under it too: the running sum follows the
+	// comparison's order, 'ab' (2), 'xy' (2), 'abc' (3), 'abcd' (4).
+	running := run(t, store, "SELECT name, sum(length(name)) OVER (ORDER BY name COLLATE by_length) FROM w ORDER BY 2")
+	if testing.expect_value(t, len(running.rows), 4) {
+		testing.expect_value(t, running.rows[0][1].i, i64(2))
+		testing.expect_value(t, running.rows[3][1].i, i64(11))
+	}
+	for statement in ([]string{}) {
 		_, refused := db.sql_execute(store, statement)
 		testing.expectf(
 			t,
@@ -13527,9 +13533,16 @@ test_host_collations :: proc(t: ^testing.T) {
 			db.error_kind_name(refused.kind),
 		)
 	}
-	// A column cannot carry one either: its text is folded into every key.
-	_, column := db.sql_execute(store, "CREATE TABLE bad (x TEXT COLLATE by_length)")
-	testing.expect_value(t, column.kind, db.Error_Kind.Sql_Unsupported)
+	// A column may carry one: its comparisons and its ORDER BY follow it. A key
+	// on it cannot, since an index orders folded text.
+	run(t, store, "CREATE TABLE lc (x TEXT COLLATE by_length)")
+	run(t, store, "INSERT INTO lc VALUES ('abc'), ('ab'), ('xy')")
+	testing.expect_value(t, scalar(t, store, "SELECT x FROM lc ORDER BY x LIMIT 1").s, "ab")
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM lc WHERE x < 'aaa'").i, i64(2))
+	_, keyed := db.sql_execute(store, "CREATE TABLE bad (x TEXT COLLATE by_length UNIQUE)")
+	testing.expect_value(t, keyed.kind, db.Error_Kind.Sql_Unsupported)
+	_, indexed := db.sql_execute(store, "CREATE INDEX lc_x ON lc (x)")
+	testing.expect_value(t, indexed.kind, db.Error_Kind.Sql_Unsupported)
 
 	// The built-in names still fold: NOCASE matches 'ab' against 'AB', which the
 	// host comparison would not (same length, different bytes).

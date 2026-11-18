@@ -167,6 +167,13 @@ QUERIES = [
     "SELECT count(*) FROM nums WHERE n = '2'",
     "SELECT count(*) FROM nums WHERE t > 1",
     "SELECT max(t), min(t) FROM nums",
+    # GROUP BY, DISTINCT, a DISTINCT aggregate and PARTITION BY group under a
+    # collation, and ORDER BY 1 sorts under its projection's.
+    "SELECT count(*) FROM (VALUES ('a'), ('A'), ('b'), ('b ')) GROUP BY column1 COLLATE NOCASE ORDER BY 1",
+    "SELECT count(*) FROM (VALUES ('a'), ('A'), ('b'), ('b ')) GROUP BY column1 COLLATE RTRIM ORDER BY 1",
+    "SELECT count(DISTINCT column1 COLLATE NOCASE) FROM (VALUES ('a'), ('A'), ('b'))",
+    "SELECT count(*) FROM (SELECT DISTINCT column1 COLLATE NOCASE FROM (VALUES ('a'), ('A'), ('b')))",
+    "SELECT column1, rank() OVER (PARTITION BY column1 COLLATE NOCASE ORDER BY column2) FROM (VALUES ('a', 1), ('A', 2), ('b', 3)) ORDER BY column2",
     # IN and BETWEEN compare under the left operand's collation.
     "SELECT id FROM emp WHERE name COLLATE NOCASE IN ('ANA', 'Zoe') ORDER BY id",
     "SELECT id FROM emp WHERE name COLLATE NOCASE BETWEEN 'L' AND 'MARIA' ORDER BY id",

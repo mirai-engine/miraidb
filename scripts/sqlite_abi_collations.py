@@ -89,6 +89,22 @@ def observe(lib, seen: dict) -> None:
         b"SELECT CASE WHEN 'X' = 'x' COLLATE fold THEN 1 ELSE 0 END",
         b"SELECT v FROM t WHERE typeof(v) = 'text' ORDER BY v COLLATE rev LIMIT 2 OFFSET 1",
         b"SELECT 1 ORDER BY 1 COLLATE nope",
+        # Grouping under a host collation: equality classes, as SQLite groups.
+        b"SELECT count(*) FROM w GROUP BY v COLLATE fold ORDER BY 1",
+        b"SELECT count(DISTINCT v COLLATE fold) FROM w",
+        b"SELECT count(*) FROM (SELECT DISTINCT v COLLATE fold FROM w)",
+        b"SELECT v, rank() OVER (PARTITION BY v COLLATE fold ORDER BY id) FROM w ORDER BY id",
+        b"SELECT v, row_number() OVER (ORDER BY v COLLATE rev, id) FROM w ORDER BY id",
+        b"SELECT v, rank() OVER (ORDER BY v COLLATE fold DESC) FROM w ORDER BY id",
+        # A column declared with the collation compares, sorts and groups by it.
+        b"CREATE TABLE hc (id INTEGER PRIMARY KEY, v TEXT COLLATE fold)",
+        b"INSERT INTO hc (v) VALUES ('b'), ('A'), ('a'), ('B'), ('c')",
+        b"SELECT id FROM hc WHERE v = 'a' ORDER BY id",
+        b"SELECT v FROM hc ORDER BY v, id",
+        b"SELECT count(*) FROM hc GROUP BY v ORDER BY 1",
+        b"SELECT count(*) FROM (SELECT DISTINCT v FROM hc)",
+        b"SELECT id FROM hc WHERE v IN ('B', 'C') ORDER BY id",
+        b"CREATE TABLE hc2 (v TEXT COLLATE never_registered)",
     ):
         seen[f"collation: {sql!r}"] = rows(sql)
 

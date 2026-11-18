@@ -1859,7 +1859,7 @@ window_partition_key :: proc(ctx: ^Eval_Ctx, window: Window_Expr) -> ([]u8, Erro
 	for expr in window.partition {
 		value, eval_err := eval_expr(ctx, expr)
 		if eval_err.kind != .None do return nil, eval_err
-		value_encode_key(&w, value)
+		value_encode_key(&w, collation_key_value(ctx, expr, value))
 	}
 	raw := bw_bytes(&w)
 	out := make([]u8, len(raw))
@@ -1873,9 +1873,16 @@ window_order_key :: proc(ctx: ^Eval_Ctx, window: Window_Expr) -> ([]u8, Error) {
 	w: Byte_Writer
 	bw_init(&w)
 	defer bw_destroy(&w)
-	for item in window.order_by {
+	first_slot := ctx.host_slots != nil ? len(ctx.host_slots^) : 0
+	for item, term in window.order_by {
 		value, eval_err := eval_expr(ctx, item.expr)
 		if eval_err.kind != .None do return nil, eval_err
+		// A host collation leaves a slot for the value's rank, filled before
+		// the windows are sorted (collations.odin).
+		if host, is_host := host_order_collation(ctx, item.expr); is_host {
+			host_slot_append(ctx, &w, item, WINDOW_ORDER_TERM + term, value, host)
+			continue
+		}
 		collation, has := collate_name(item.expr)
 		if !has {
 			collation, has = column_collation(ctx, item.expr)
@@ -1888,6 +1895,9 @@ window_order_key :: proc(ctx: ^Eval_Ctx, window: Window_Expr) -> ([]u8, Error) {
 	raw := bw_bytes(&w)
 	out := make([]u8, len(raw))
 	copy(out, raw)
+	if ctx.host_slots != nil {
+		for &slot in ctx.host_slots^[first_slot:] do slot.key = out
+	}
 	return out, ERROR_NONE
 }
 
@@ -2387,7 +2397,7 @@ eval_aggregate_values :: proc(ctx: ^Eval_Ctx, call: Call_Expr, values: []Value) 
 		for value in values {
 			if value.kind == .Null do continue
 			if call.is_distinct {
-				key := agg_distinct_key(value)
+				key := agg_distinct_key(collation_key_value(ctx, call.args[0], value))
 				_, repeated := keys[key]
 				if repeated {
 					delete(key)
@@ -2432,7 +2442,7 @@ eval_aggregate_values :: proc(ctx: ^Eval_Ctx, call: Call_Expr, values: []Value) 
 		defer delete(list)
 		for value in values {
 			if call.is_distinct {
-				key := agg_distinct_key(value)
+				key := agg_distinct_key(collation_key_value(ctx, call.args[0], value))
 				_, repeated := keys[key]
 				if repeated {
 					delete(key)
@@ -2463,7 +2473,7 @@ eval_aggregate_values :: proc(ctx: ^Eval_Ctx, call: Call_Expr, values: []Value) 
 	for value in values {
 		if value.kind == .Null do continue
 		if call.is_distinct {
-			key := agg_distinct_key(value)
+			key := agg_distinct_key(collation_key_value(ctx, call.args[0], value))
 			_, repeated := keys[key]
 			if repeated {
 				delete(key)
@@ -2880,7 +2890,7 @@ agg_stream_add :: proc(row_ctx: ^Eval_Ctx, stream: ^Agg_Stream) -> Error {
 		// PostgreSQL. Every other aggregate skips them.
 		if value.kind == .Null && acc.name != "array_agg" do continue
 		if acc.fold_distinct {
-			key := agg_distinct_key(value)
+			key := agg_distinct_key(collation_key_value(row_ctx, acc.call.args[0], value))
 			_, repeated := acc.keys[key]
 			if repeated {
 				delete(key)
@@ -3919,7 +3929,8 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 							group_ok = false
 							break
 						}
-						value_encode_key(&w, value)
+						// Texts a collation calls equal are one group.
+						value_encode_key(&w, collation_key_value(&ctx, group_exprs[expr_index], value))
 					}
 					if !group_ok {
 						for key in keys do delete(key)
@@ -4111,6 +4122,12 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 	delete(filtered)
 
 	if has_windows {
+		// The window keys a host collation left open are filled before the
+		// windows sort, and forgotten: those keys go with the cells.
+		if ctx.host_slots != nil {
+			host_order_resolve(tx.store, ctx.host_slots^[:])
+			clear(ctx.host_slots)
+		}
 		if window_err := apply_windows(&ctx, window_nodes[:], window_slot_list[:], window_cells[:], output[:], window_sources[:]); window_err.kind != .None {
 			free_values_over_rows(&output)
 			window_cell_rows_destroy(&window_cells)
@@ -4227,7 +4244,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		defer delete(seen)
 		kept := make([dynamic]Output_Row, 0, len(output))
 		for row in output {
-			key := encode_output_key(row.values)
+			key := encode_output_key(distinct_key_values(&ctx, expanded, row.values))
 			if key in seen {
 				delete(key)
 				free_values(row.values)
@@ -4413,31 +4430,17 @@ build_order_key :: proc(
 	first_slot := ctx.host_slots != nil ? len(ctx.host_slots^) : 0
 	for item, term in order_by {
 		value := eval_order_value(ctx, item.expr, projections, values, names)
+		// An ordinal or an alias sorts under its projection's collation.
+		target := order_target_expr(item.expr, projections, names)
 		// A host collation cannot fold: the key keeps a slot for the value's rank.
-		if host, is_host := host_order_collation(ctx, item.expr); is_host {
-			if ctx.host_slots == nil {
-				ctx.host_slots = new([dynamic]Host_Order_Slot, ctx.tx.alloc)
-				ctx.host_slots^ = make([dynamic]Host_Order_Slot, 0, 16, ctx.tx.alloc)
-			}
-			if item.nulls != .Default {
-				marker: u8 = 1
-				if value.kind == .Null do marker = item.nulls == .First ? 0 : 2
-				append(&w.data, marker)
-			}
-			append(ctx.host_slots, Host_Order_Slot {
-				offset     = len(w.data),
-				term       = term,
-				value      = value_clone(value, ctx.tx.alloc),
-				collation  = host,
-				descending = item.descending,
-			})
-			for _ in 0 ..< 8 do append(&w.data, 0)
+		if host, is_host := host_order_collation(ctx, target); is_host {
+			host_slot_append(ctx, &w, item, term, value, host)
 			continue
 		}
 		// ORDER BY x COLLATE NOCASE sorts on the folded key.
-		collation, has := collate_name(item.expr)
+		collation, has := collate_name(target)
 		if !has {
-			collation, has = column_collation(ctx, item.expr)
+			collation, has = column_collation(ctx, target)
 		}
 		if has && len(collation) > 0 {
 			value = collate_ordered_value(value, collation)
@@ -4485,6 +4488,23 @@ collate_ordered_value :: proc(v: Value, collation: string) -> Value {
 		return value_string(strings.trim_right(v.s, " "))
 	}
 	return v
+}
+
+// order_target_expr is the expression an ORDER BY term stands for: the
+// projection an ordinal or an output name refers to, or the term itself.
+@(private)
+order_target_expr :: proc(expr: ^Expr, projections: []^Expr, names: []string) -> ^Expr {
+	if literal, ok := expr^.(Literal_Expr); ok {
+		if index, int_ok := value_to_i64(literal.value); int_ok && index >= 1 && index <= i64(len(projections)) {
+			return projections[index - 1]
+		}
+	}
+	if column, ok := expr^.(Column_Expr); ok && len(column.table) == 0 {
+		for name, i in names {
+			if i < len(projections) && strings.equal_fold(name, column.name) do return projections[i]
+		}
+	}
+	return expr
 }
 
 @(private)
@@ -6015,7 +6035,7 @@ eval_host_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr, rows: [][]Source) -
 			args[i] = value
 		}
 		if call.is_distinct && len(args) > 0 {
-			key := agg_distinct_key(args[0])
+			key := agg_distinct_key(collation_key_value(&sub, call.args[0], args[0]))
 			if key in keys {
 				delete(key)
 				continue
@@ -6981,7 +7001,7 @@ eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 			if eval_err.kind != .None do return {}, eval_err
 			if value.kind == .Null do continue
 			if call.is_distinct {
-				key := agg_distinct_key(value)
+				key := agg_distinct_key(collation_key_value(ctx, call.args[0], value))
 				_, repeated := keys[key]
 				if repeated {
 					delete(key)
@@ -7184,7 +7204,7 @@ eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 			if eval_err.kind != .None do return {}, eval_err
 			if value.kind == .Null do continue
 			if call.is_distinct {
-				key := agg_distinct_key(value)
+				key := agg_distinct_key(collation_key_value(ctx, call.args[0], value))
 				_, repeated := keys[key]
 				if repeated {
 					delete(key)
@@ -7223,7 +7243,7 @@ eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 			value, eval_err := eval_expr(&sub, call.args[0])
 			if eval_err.kind != .None do return {}, eval_err
 			if call.is_distinct {
-				key := agg_distinct_key(value)
+				key := agg_distinct_key(collation_key_value(ctx, call.args[0], value))
 				_, repeated := keys[key]
 				if repeated {
 					delete(key)
@@ -7261,7 +7281,7 @@ eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		if eval_err.kind != .None do return {}, eval_err
 		if value.kind == .Null do continue
 		if call.is_distinct {
-			key := agg_distinct_key(value)
+			key := agg_distinct_key(collation_key_value(ctx, call.args[0], value))
 			_, repeated := keys[key]
 			if repeated {
 				delete(key)
@@ -8428,24 +8448,21 @@ sql_exec_create_table :: proc(tx: ^Tx, stmt: Create_Table_Stmt, params: []Value)
 		collation := ""
 		if len(definition.collation) > 0 {
 			if !collation_known(definition.collation) {
-				// A registered host comparison cannot be a column's collation: the
-				// column's text is folded into the keys that index it and order it, and
-				// a host comparison has no fold. Comparing against it explicitly is fine.
+				// A host comparison may be a column's collation: comparisons, ORDER BY
+				// and grouping read it. A key cannot: an index orders folded bytes,
+				// and a host comparison has none, so the column takes no key.
 				if _, is_host := store_collation(tx.store, definition.collation); is_host {
-					return {}, errf(
-						.Sql_Unsupported,
-						"collation %s cannot be a column's collation on %s: it has no folded key to index or order by; use COLLATE %s in a comparison instead",
-						definition.collation,
-						definition.name,
-						definition.collation,
-					)
+					if definition.primary || definition.unique {
+						return {}, errf(
+							.Sql_Unsupported,
+							"column %s cannot be a key under collation %s: an index orders folded text, which a host comparison does not have",
+							definition.name,
+							definition.collation,
+						)
+					}
+				} else {
+					return {}, errf(.Invalid_Argument, "no such collation sequence: %s", definition.collation)
 				}
-				return {}, errf(
-					.Sql_Unsupported,
-					"unknown collation %s on column %s",
-					definition.collation,
-					definition.name,
-				)
 			}
 			collation = strings.clone(definition.collation, tx.alloc)
 		}
@@ -8643,6 +8660,19 @@ sql_exec_create_table :: proc(tx: ^Tx, stmt: Create_Table_Stmt, params: []Value)
 	}
 	delete(foreign_keys)
 
+	// A table-level key over a host-collated column cannot be indexed either.
+	for index in schema.indexes {
+		for position in index.columns {
+			if position >= 0 && position < len(schema.columns) && column_host_collated(tx.store, schema.columns[position]) {
+				return {}, errf(.Sql_Unsupported, "column %s cannot be a key under collation %s: an index orders folded text, which a host comparison does not have", schema.columns[position].name, schema.columns[position].collation)
+			}
+		}
+	}
+	for position in schema.primary_key {
+		if column_host_collated(tx.store, schema.columns[position]) {
+			return {}, errf(.Sql_Unsupported, "column %s cannot be a key under collation %s: an index orders folded text, which a host comparison does not have", schema.columns[position].name, schema.columns[position].collation)
+		}
+	}
 	schema.strict = stmt.strict
 	schema.without_rowid = stmt.without_rowid
 	if stmt.without_rowid && len(schema.primary_key) == 0 {
@@ -8695,6 +8725,9 @@ sql_exec_create_index :: proc(tx: ^Tx, stmt: Create_Index_Stmt) -> (Sql_Result, 
 		index, found := schema_column_index(&table.schema, name)
 		if !found {
 			return {}, errf(.Column_Not_Found, "column %s does not exist in %s", name, stmt.table)
+		}
+		if column_host_collated(tx.store, table.schema.columns[index]) {
+			return {}, errf(.Sql_Unsupported, "column %s cannot be indexed under collation %s: an index orders folded text, which a host comparison does not have", name, table.schema.columns[index].collation)
 		}
 		columns[i] = index
 		for prior in columns[:i] {
@@ -9786,4 +9819,84 @@ comparison_affinity :: proc(ctx: ^Eval_Ctx, left_expr, right_expr: ^Expr, left, 
 	if left_affinity == .Text && right_affinity == .None do return left, convert(right, .Text)
 	if right_affinity == .Text && left_affinity == .None do return convert(left, .Text), right
 	return left, right
+}
+
+// collation_key_value is the value a key is built from when equality goes by
+// a collation: NOCASE and RTRIM fold the text, and a host collation answers
+// the first text of its class (collation_class). Anything else is the value.
+collation_key_value :: proc(ctx: ^Eval_Ctx, expr: ^Expr, value: Value) -> Value {
+	if value.kind != .String || expr == nil do return value
+	name, has := collate_name(expr)
+	if !has do name, has = column_collation(ctx, expr)
+	if !has || len(name) == 0 || strings.equal_fold(name, "binary") do return value
+	if collation_is_builtin(name) do return collate_ordered_value(value, name)
+	if ctx.tx == nil do return value
+	return value_string(collation_class(ctx.tx, name, value.s))
+}
+
+// collation_class is the first text this transaction saw that the host
+// collation `name` calls equal to `text`: the classes are found by comparing
+// with each one's first member, which a collation that is an equivalence
+// makes the same answer whichever member is asked.
+@(private)
+collation_class :: proc(tx: ^Tx, name: string, text: string) -> string {
+	if tx.collation_classes == nil do tx.collation_classes = make(map[string][dynamic]string, 2, tx.alloc)
+	key := strings.to_lower(name, context.temp_allocator)
+	classes, found := tx.collation_classes[key]
+	if !found {
+		key = strings.clone(key, tx.alloc)
+		classes = make([dynamic]string, 0, 8, tx.alloc)
+	}
+	for member in classes {
+		if order, known := collation_compare(tx.store, name, member, text); known && order == 0 do return member
+	}
+	append(&classes, strings.clone(text, tx.alloc))
+	tx.collation_classes[key] = classes
+	return classes[len(classes) - 1]
+}
+
+// distinct_key_values are a row's values as DISTINCT compares them: each
+// under its projection's collation.
+@(private)
+distinct_key_values :: proc(ctx: ^Eval_Ctx, projections: []^Expr, values: []Value) -> []Value {
+	keyed := make([]Value, len(values), context.temp_allocator)
+	for value, i in values {
+		keyed[i] = i < len(projections) ? collation_key_value(ctx, projections[i], value) : value
+	}
+	return keyed
+}
+
+// WINDOW_ORDER_TERM numbers a window's ORDER BY terms apart from the
+// statement's, so their values are ranked among their own.
+WINDOW_ORDER_TERM :: 1 << 20
+
+// host_slot_append writes an order key slot for a host collation: the NULLS
+// marker when there is one, then eight bytes the rank fills.
+@(private)
+host_slot_append :: proc(ctx: ^Eval_Ctx, w: ^Byte_Writer, item: Order_Item, term: int, value: Value, collation: string) {
+	if ctx.host_slots == nil {
+		ctx.host_slots = new([dynamic]Host_Order_Slot, ctx.tx.alloc)
+		ctx.host_slots^ = make([dynamic]Host_Order_Slot, 0, 16, ctx.tx.alloc)
+	}
+	if item.nulls != .Default {
+		marker: u8 = 1
+		if value.kind == .Null do marker = item.nulls == .First ? 0 : 2
+		append(&w.data, marker)
+	}
+	append(ctx.host_slots, Host_Order_Slot {
+		offset     = len(w.data),
+		term       = term,
+		value      = value_clone(value, ctx.tx.alloc),
+		collation  = collation,
+		descending = item.descending,
+	})
+	for _ in 0 ..< 8 do append(&w.data, 0)
+}
+
+// column_host_collated reports a column declared with a host collation.
+@(private)
+column_host_collated :: proc(store: ^Store, column: Column) -> bool {
+	if len(column.collation) == 0 || collation_is_builtin(column.collation) do return false
+	_, found := store_collation(store, column.collation)
+	return found
 }

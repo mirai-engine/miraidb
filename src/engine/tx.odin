@@ -72,6 +72,9 @@ Tx :: struct {
 	// vtab_where and vtab_params are the WHERE of the query whose sources are
 	// being read, so a program's virtual table is offered its terms
 	// (vtab_materialize).
+	// collation_classes groups the texts a host collation calls equal, per
+	// collation, for GROUP BY, DISTINCT and PARTITION BY (collation_class).
+	collation_classes: map[string][dynamic]string,
 	vtab_where:  ^Expr,
 	vtab_params: []Value,
 	// savepoints is the open savepoint stack, innermost last.

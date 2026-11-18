@@ -187,7 +187,9 @@ collation_check_visit :: proc(expr: ^Expr, user: rawptr) -> bool {
 	// A window's PARTITION BY and ORDER BY are keys as surely as the statement's
 	// own GROUP BY and ORDER BY are, so they are checked as keys.
 	if window, is_window := expr^.(Window_Expr); is_window {
-		nested := Collation_Check{store = check.store, clause = check.clause, needs_key = true}
+		// PARTITION BY groups by the classes a host collation makes, and the
+		// window's ORDER BY ranks under it, as the statement's does.
+		nested := Collation_Check{store = check.store, clause = check.clause}
 		for item in window.partition do expr_walk(item, collation_check_visit, &nested)
 		if nested.problem.kind != .None {
 			check.problem = nested.problem
@@ -226,9 +228,9 @@ collation_check_expr :: proc(
 select_collation_guard :: proc(tx: ^Tx, stmt: Select_Stmt) -> Error {
 	store := tx != nil ? tx.store : nil
 	for item in stmt.projections {
-		// DISTINCT compares the output rows, so a projection is a key when the
-		// statement asks for distinct ones.
-		if err := collation_check_expr(store, item.expr, "SELECT", stmt.is_distinct); err.kind != .None {
+		// DISTINCT compares the output rows under each projection's collation,
+		// a host one too (collation_key_value).
+		if err := collation_check_expr(store, item.expr, "SELECT", false); err.kind != .None {
 			return err
 		}
 	}
@@ -236,7 +238,7 @@ select_collation_guard :: proc(tx: ^Tx, stmt: Select_Stmt) -> Error {
 		return err
 	}
 	for expr in stmt.group_by {
-		if err := collation_check_expr(store, expr, "GROUP BY", true); err.kind != .None do return err
+		if err := collation_check_expr(store, expr, "GROUP BY", false); err.kind != .None do return err
 	}
 	if err := collation_check_expr(store, stmt.having, "HAVING", false); err.kind != .None do return err
 	// ORDER BY ranks a host collation's values instead of folding them (the
@@ -324,13 +326,14 @@ host_order_resolve :: proc(store: ^Store, slots: []Host_Order_Slot) {
 	for &slot, i in slots do order[i] = &slot
 	slice.sort_by(order, proc(a, b: ^Host_Order_Slot) -> bool {
 		if a.term != b.term do return a.term < b.term
+		if a.collation != b.collation do return a.collation < b.collation
 		return host_value_compare(a, b) < 0
 	})
 	rank: u64 = 0
 	for slot, i in order {
 		if i > 0 {
 			previous := order[i - 1]
-			if previous.term != slot.term {
+			if previous.term != slot.term || previous.collation != slot.collation {
 				rank = 0
 			} else if host_value_compare(previous, slot) != 0 {
 				rank += 1
