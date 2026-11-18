@@ -120,6 +120,21 @@ test_returning_takes_expressions :: proc(t: ^testing.T) {
 	testing.expect_value(t, db.embed_column_int(stmt, 3), i64(21))
 }
 
+@(test)
+test_create_virtual_table_keeps_its_text :: proc(t: ^testing.T) {
+	store := face_store(t)
+	defer db.store_close(store)
+	conn := db.embed_wrap(store)
+	defer db.embed_close(conn)
+	face_ok(t, conn, "CREATE VIRTUAL TABLE docs USING fts4(body)")
+	stmt := db.embed_prepare(conn, "SELECT sql FROM sqlite_master WHERE name = 'docs'")
+	if !testing.expect(t, stmt != nil) do return
+	defer db.embed_finalize(stmt)
+	has_row, err := db.embed_step(stmt)
+	testing.expect(t, db.error_ok(err) && has_row)
+	testing.expect_value(t, db.embed_column_text(stmt, 0), "CREATE VIRTUAL TABLE docs USING fts4(body)")
+}
+
 // A function that opens a transaction on its own connection in the middle of
 // a SELECT, as Python's sqlite3 does when the function inserts.
 @(private = "file")

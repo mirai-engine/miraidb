@@ -784,6 +784,10 @@ sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sq
 		if fts_err := fts_create(tx, stmt.name, stmt.module, stmt.columns); fts_err.kind != .None {
 			return {}, fts_err
 		}
+		// sqlite_master shows the statement as written, as SQLite keeps it.
+		if len(stmt.text) > 0 {
+			if text_err := sql_text_set(tx, stmt.name, stmt.text); text_err.kind != .None do return {}, text_err
+		}
 		return Sql_Result{kind = .Ack, commit_seq = tx.store.commit_seq}, ERROR_NONE
 	case Select_Stmt, With_Stmt, Set_Stmt, Show_Stmt, Explain_Stmt, Describe_Stmt, Vacuum_Stmt, Attach_Stmt, Detach_Stmt, Begin_Stmt, Commit_Stmt, Rollback_Stmt, Savepoint_Stmt:
 	}

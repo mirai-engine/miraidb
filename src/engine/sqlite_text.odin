@@ -33,6 +33,8 @@ sqlite_text_capture :: proc(p: ^Parser, statement: ^Statement) {
 		s.text = strings.concatenate({"CREATE VIEW ", tail}, p.alloc)
 	case Create_Trigger_Stmt:
 		s.text = strings.concatenate({"CREATE TRIGGER ", tail}, p.alloc)
+	case Create_Virtual_Table_Stmt:
+		s.text = strings.concatenate({"CREATE VIRTUAL TABLE ", tail}, p.alloc)
 	case Alter_Table_Stmt:
 		if len(s.column.name) > 0 && len(s.rename_to) == 0 && len(s.drop_column) == 0 && len(s.alter_column) == 0 {
 			s.add_text = strings.clone(tail, p.alloc)

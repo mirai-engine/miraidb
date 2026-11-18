@@ -2254,6 +2254,7 @@ parse_create_virtual_table :: proc(p: ^Parser) -> Statement {
 		stmt.if_not_exists = true
 	}
 	stmt.name = p_ident(p)
+	p.object_start = p.ident_start
 	p_expect_keyword(p, "using")
 	stmt.module = p_ident(p)
 	// Without arguments the module gets none.

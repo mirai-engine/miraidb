@@ -819,6 +819,8 @@ Create_Virtual_Table_Stmt :: struct {
 	// receives; columns are their first words, which fts5 and rtree read.
 	arguments:     []string,
 	if_not_exists: bool,
+	// text is the statement as SQLite keeps it in sqlite_master.
+	text:          string,
 }
 
 // Load_Extension_Stmt is `LOAD EXTENSION name AT 'host:port' [USING reducers]`, or
