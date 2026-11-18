@@ -25,10 +25,21 @@ Parser :: struct {
 	expression_depth: int,
 	// derived_count numbers the derived tables a statement does not name.
 	derived_count: int,
+	// windows are the window calls that name a window of a WINDOW clause, in
+	// the order they were read; the SELECT that owns them resolves them.
+	windows: [dynamic]Pending_Window,
 	// binary_depth is how deep each binary node's subtree is. A chain such as
 	// `1+1+...` nests one level per operator without any parenthesis, and the
 	// tree is walked recursively before it is evaluated.
 	binary_depth: map[^Expr]int,
+}
+
+// Pending_Window is a window call that names a window of a WINDOW clause:
+// `OVER name` takes it whole, `OVER (name ...)` (parenthesized) adds to it.
+Pending_Window :: struct {
+	expr:          ^Expr,
+	base:          string,
+	parenthesized: bool,
 }
 
 // sql_parse turns one SQL statement into a Query tree. The Query owns an arena
@@ -48,6 +59,10 @@ sql_parse :: proc(source: string) -> (Query, Error) {
 	}
 	p.current = lexer_next(&p.lexer)
 	statement := parse_statement(&p)
+	// A window name outside any SELECT that defines it.
+	if p.err.kind == .None {
+		if len(p.windows) > 0 do p_fail(&p, .Sql_Syntax, "no such window: %s", p.windows[0].base)
+	}
 	if p.err.kind != .None {
 		virtual.arena_destroy(&q.arena)
 		return {}, p.err
@@ -902,6 +917,7 @@ parse_scalar_subquery :: proc(p: ^Parser) -> ^Select_Stmt {
 
 parse_select :: proc(p: ^Parser) -> Statement {
 	select: Select_Stmt
+	windows_mark := len(p.windows)
 	p_expect_keyword(p, "select")
 	if p_match_keyword(p, "distinct") do select.is_distinct = true
 	projections := make([dynamic]Select_Item, 0, 4, p.alloc)
@@ -1002,23 +1018,36 @@ parse_select :: proc(p: ^Parser) -> Statement {
 	if p_match_keyword(p, "having") {
 		select.having = parse_expression(p)
 	}
-	if p_match_keyword(p, "order") {
-		p_expect_keyword(p, "by")
-		orders := make([dynamic]Order_Item, 0, 2, p.alloc)
-		for {
-			item: Order_Item
-			item.expr = parse_expression(p)
-			if p_match_keyword(p, "desc") {
-				item.descending = true
-			} else {
-				p_match_keyword(p, "asc")
+	// WINDOW name AS (spec), ...: windows the calls of this select name.
+	definitions := make([dynamic]Window_Definition, 0, 0, p.alloc)
+	if p_match_keyword(p, "window") {
+		for p.err.kind == .None {
+			definition: Window_Definition
+			definition.name = p_ident(p)
+			p_expect_keyword(p, "as")
+			p_expect_punct(p, "(")
+			if base := parse_window_spec(p, &definition.spec); len(base) > 0 {
+				// A definition may build on one defined before it.
+				_ = window_chain(p, &definition.spec, base, true, definitions[:])
 			}
-			item.nulls = parse_nulls_order(p)
-			append(&orders, item)
+			append(&definitions, definition)
 			if !p_match_punct(p, ",") do break
 		}
-		select.order_by = orders[:]
 	}
+	if p_match_keyword(p, "order") {
+		p_expect_keyword(p, "by")
+		select.order_by = parse_order_items(p)
+	}
+	// The windows of this select's projection, HAVING and ORDER BY take their
+	// definitions; a subquery's were resolved by its own select.
+	for i in windows_mark ..< len(p.windows) {
+		if p.err.kind != .None do break
+		pending := p.windows[i]
+		if window, is_window := &pending.expr.(Window_Expr); is_window {
+			_ = window_chain(p, window, pending.base, pending.parenthesized, definitions[:])
+		}
+	}
+	resize(&p.windows, windows_mark)
 	if p_match_keyword(p, "limit") {
 		select.limit = parse_expression(p)
 		// SQLite's `LIMIT <offset>, <count>`: the first number is the offset.
@@ -3249,89 +3278,9 @@ parse_primary :: proc(p: ^Parser) -> ^Expr {
 			return parse_case_expression(p)
 		}
 		name := p_ident(p)
-		if p_is_punct(p, "(") {
-			// Function call.
-			p_advance(p)
-			call := new(Expr, p.alloc)
-			call_expr: Call_Expr
-			call_expr.name = name
-			if p_match_punct(p, "*") {
-				call_expr.star = true
-			} else if !p_is_punct(p, ")") {
-				if p_match_keyword(p, "distinct") do call_expr.is_distinct = true
-				args := make([dynamic]^Expr, 0, 2, p.alloc)
-				for {
-					append(&args, parse_expression(p))
-					if !p_match_punct(p, ",") do break
-				}
-				call_expr.args = args[:]
-			}
-			p_expect_punct(p, ")")
-			if p_match_keyword(p, "over") {
-				window := new(Expr, p.alloc)
-				window_expr: Window_Expr
-				window_expr.name = call_expr.name
-				window_expr.args = call_expr.args
-				window_expr.star = call_expr.star
-				window_expr.is_distinct = call_expr.is_distinct
-				p_expect_punct(p, "(")
-				if p_match_keyword(p, "partition") {
-					p_expect_keyword(p, "by")
-					parts := make([dynamic]^Expr, 0, 2, p.alloc)
-					for {
-						append(&parts, parse_expression(p))
-						if !p_match_punct(p, ",") do break
-					}
-					window_expr.partition = parts[:]
-				}
-				if p_match_keyword(p, "order") {
-					p_expect_keyword(p, "by")
-					items := make([dynamic]Order_Item, 0, 2, p.alloc)
-					for {
-						item: Order_Item
-						item.expr = parse_expression(p)
-						if p_match_keyword(p, "desc") {
-							item.descending = true
-						} else {
-							_ = p_match_keyword(p, "asc")
-						}
-						item.nulls = parse_nulls_order(p)
-						append(&items, item)
-						if !p_match_punct(p, ",") do break
-					}
-					window_expr.order_by = items[:]
-				}
-				// An explicit frame, or the default one when it is absent: from the
-				// partition start to the last peer of each row.
-				frame: Window_Frame
-				if p_match_keyword(p, "rows") {
-					frame.has = true
-					frame.unit = .Rows
-				} else if p_match_keyword(p, "range") {
-					frame.has = true
-					frame.unit = .Range
-				} else if p_match_keyword(p, "groups") {
-					frame.has = true
-					frame.unit = .Groups
-				}
-				if frame.has {
-					if p_match_keyword(p, "between") {
-						frame.start = parse_frame_bound(p)
-						p_expect_keyword(p, "and")
-						frame.end = parse_frame_bound(p)
-					} else {
-						frame.start = parse_frame_bound(p)
-						frame.end = Frame_Bound{kind = .Current_Row}
-					}
-					window_expr.frame = frame
-				}
-				p_expect_punct(p, ")")
-				window^ = window_expr
-				return window
-			}
-			call^ = call_expr
-			return call
-		}
+		// A call has its own frame: its locals would otherwise sit in every
+		// level of a nested expression.
+		if p_is_punct(p, "(") do return parse_call(p, name)
 		if p_match_punct(p, ".") {
 			if p_match_punct(p, "*") {
 				e := new(Expr, p.alloc)
@@ -3568,4 +3517,192 @@ parse_case_expression :: proc(p: ^Parser) -> ^Expr {
 	expression := new(Expr, p.alloc)
 	expression^ = Case_Expr{operand = operand, branches = branches[:], fallback = fallback}
 	return expression
+}
+
+// Window_Definition is one `name AS (spec)` of a WINDOW clause.
+Window_Definition :: struct {
+	name: string,
+	spec: Window_Expr,
+}
+
+// parse_order_items reads the terms of an ORDER BY, after BY.
+@(private)
+parse_order_items :: proc(p: ^Parser) -> []Order_Item {
+	items := make([dynamic]Order_Item, 0, 2, p.alloc)
+	for p.err.kind == .None {
+		item: Order_Item
+		item.expr = parse_expression(p)
+		if p_match_keyword(p, "desc") {
+			item.descending = true
+		} else {
+			_ = p_match_keyword(p, "asc")
+		}
+		item.nulls = parse_nulls_order(p)
+		append(&items, item)
+		if !p_match_punct(p, ",") do break
+	}
+	return items[:]
+}
+
+// parse_window_spec reads a window's parentheses after the opening one:
+// [base] [PARTITION BY ...] [ORDER BY ...] [frame], and the closing one. It
+// answers the name of the window it builds on, if any.
+@(private)
+parse_window_spec :: proc(p: ^Parser, window: ^Window_Expr) -> (base: string) {
+	if p.current.kind == .Ident || p.current.kind == .Quoted_Ident {
+		is_clause := false
+		for keyword in ([]string{"partition", "order", "rows", "range", "groups"}) {
+			if p_is_keyword(p, keyword) do is_clause = true
+		}
+		if !is_clause do base = p_ident(p)
+	}
+	if p_match_keyword(p, "partition") {
+		p_expect_keyword(p, "by")
+		parts := make([dynamic]^Expr, 0, 2, p.alloc)
+		for p.err.kind == .None {
+			append(&parts, parse_expression(p))
+			if !p_match_punct(p, ",") do break
+		}
+		window.partition = parts[:]
+	}
+	if p_match_keyword(p, "order") {
+		p_expect_keyword(p, "by")
+		window.order_by = parse_order_items(p)
+	}
+	// An explicit frame, or the default one when it is absent: from the
+	// partition start to the last peer of each row.
+	frame: Window_Frame
+	if p_match_keyword(p, "rows") {
+		frame.has = true
+		frame.unit = .Rows
+	} else if p_match_keyword(p, "range") {
+		frame.has = true
+		frame.unit = .Range
+	} else if p_match_keyword(p, "groups") {
+		frame.has = true
+		frame.unit = .Groups
+	}
+	if frame.has {
+		if p_match_keyword(p, "between") {
+			frame.start = parse_frame_bound(p)
+			p_expect_keyword(p, "and")
+			frame.end = parse_frame_bound(p)
+		} else {
+			frame.start = parse_frame_bound(p)
+			frame.end = Frame_Bound{kind = .Current_Row}
+		}
+		window.frame = frame
+	}
+	p_expect_punct(p, ")")
+	return
+}
+
+// window_chain gives a window that names a defined one what it takes from it,
+// with SQLite's rules: `OVER name` takes the definition whole; `OVER (name
+// ...)` keeps its PARTITION BY, may add an ORDER BY it lacks and a frame, and
+// may not build on a definition that has a frame.
+@(private)
+window_chain :: proc(
+	p: ^Parser,
+	window: ^Window_Expr,
+	name: string,
+	parenthesized: bool,
+	definitions: []Window_Definition,
+) -> bool {
+	base: ^Window_Expr
+	for &definition in definitions {
+		if strings.equal_fold(definition.name, name) do base = &definition.spec
+	}
+	if base == nil {
+		p_fail(p, .Sql_Syntax, "no such window: %s", name)
+		return false
+	}
+	if !parenthesized {
+		window.partition = base.partition
+		window.order_by = base.order_by
+		window.frame = base.frame
+		return true
+	}
+	if len(window.partition) > 0 {
+		p_fail(p, .Sql_Syntax, "cannot override PARTITION clause of window: %s", name)
+		return false
+	}
+	if len(window.order_by) > 0 && len(base.order_by) > 0 {
+		p_fail(p, .Sql_Syntax, "cannot override ORDER BY clause of window: %s", name)
+		return false
+	}
+	if base.frame.has {
+		p_fail(p, .Sql_Syntax, "cannot override frame specification of window: %s", name)
+		return false
+	}
+	window.partition = base.partition
+	if len(window.order_by) == 0 do window.order_by = base.order_by
+	return true
+}
+
+// parse_call reads a function call after its name: the arguments, an
+// aggregate's ORDER BY and FILTER, and a window's OVER.
+@(private)
+parse_call :: #force_no_inline proc(p: ^Parser, name: string) -> ^Expr {
+	p_advance(p)
+	call := new(Expr, p.alloc)
+	call_expr: Call_Expr
+	call_expr.name = name
+	if p_match_punct(p, "*") {
+		call_expr.star = true
+	} else if !p_is_punct(p, ")") {
+		if p_match_keyword(p, "distinct") do call_expr.is_distinct = true
+		args := make([dynamic]^Expr, 0, 2, p.alloc)
+		for {
+			append(&args, parse_expression(p))
+			if !p_match_punct(p, ",") do break
+		}
+		call_expr.args = args[:]
+		// An aggregate's own ORDER BY: `group_concat(x, ',' ORDER BY y)`.
+		if p_match_keyword(p, "order") {
+			p_expect_keyword(p, "by")
+			call_expr.order_by = parse_order_items(p)
+		}
+	}
+	p_expect_punct(p, ")")
+	// FILTER (WHERE ...) only when a parenthesis follows: `filter` is
+	// also a name a column or an alias may have.
+	if p_is_keyword(p, "filter") {
+		lexer, saved := p_mark(p)
+		p_advance(p)
+		if p_match_punct(p, "(") {
+			p_expect_keyword(p, "where")
+			call_expr.filter = parse_expression(p)
+			p_expect_punct(p, ")")
+		} else {
+			p_reset(p, lexer, saved)
+		}
+	}
+	if p_match_keyword(p, "over") {
+		window := new(Expr, p.alloc)
+		window_expr: Window_Expr
+		window_expr.name = call_expr.name
+		window_expr.args = call_expr.args
+		window_expr.star = call_expr.star
+		window_expr.is_distinct = call_expr.is_distinct
+		window_expr.filter = call_expr.filter
+		if len(call_expr.order_by) > 0 {
+			p_fail(p, .Sql_Syntax, "ORDER BY may not be used with window function %s()", call_expr.name)
+			return nil
+		}
+		if !p_is_punct(p, "(") {
+			// OVER name: a window of the WINDOW clause, whole.
+			base := p_ident(p)
+			window^ = window_expr
+			append(&p.windows, Pending_Window{expr = window, base = base})
+			return window
+		}
+		p_expect_punct(p, "(")
+		base := parse_window_spec(p, &window_expr)
+		window^ = window_expr
+		if len(base) > 0 do append(&p.windows, Pending_Window{expr = window, base = base, parenthesized = true})
+		return window
+	}
+	call^ = call_expr
+	return call
 }

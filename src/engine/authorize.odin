@@ -766,9 +766,12 @@ auth_expr :: proc(walk: ^Auth_Walk, slot: ^^Expr) {
 	case Call_Expr:
 		auth_function(walk, e.name)
 		for &arg in e.args do auth_expr(walk, &arg)
+		if e.filter != nil do auth_expr(walk, &e.filter)
+		for &item in e.order_by do auth_expr(walk, &item.expr)
 	case Window_Expr:
 		auth_function(walk, e.name)
 		for &arg in e.args do auth_expr(walk, &arg)
+		if e.filter != nil do auth_expr(walk, &e.filter)
 		for &part in e.partition do auth_expr(walk, &part)
 		for &item in e.order_by do auth_expr(walk, &item.expr)
 	case Like_Expr:

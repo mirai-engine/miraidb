@@ -466,8 +466,11 @@ res_expr :: proc(walk: ^Res_Walk, expr: ^Expr) {
 		if e.subquery != nil do res_select(walk, e.subquery)
 	case Call_Expr:
 		for arg in e.args do res_expr(walk, arg)
+		res_expr(walk, e.filter)
+		for item in e.order_by do res_expr(walk, item.expr)
 	case Window_Expr:
 		for arg in e.args do res_expr(walk, arg)
+		res_expr(walk, e.filter)
 		for part in e.partition do res_expr(walk, part)
 		for item in e.order_by do res_expr(walk, item.expr)
 	case Like_Expr:

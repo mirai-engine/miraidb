@@ -129,6 +129,10 @@ Window_Expr :: struct {
 	partition: []^Expr,
 	order_by:  []Order_Item,
 	frame:     Window_Frame,
+	// filter is the aggregate's FILTER (WHERE ...), which a window applies to
+	// each frame. A window that names one of the WINDOW clause is resolved by
+	// the parser (window_chain), so the executor never sees a name.
+	filter:    ^Expr,
 }
 
 // Collate_Expr attaches a collation to an operand. It changes how comparisons
@@ -193,6 +197,10 @@ Call_Expr :: struct {
 	args:        []^Expr,
 	star:        bool,
 	is_distinct: bool,
+	// An aggregate's `FILTER (WHERE filter)` keeps only the rows it holds for,
+	// and its `ORDER BY` (inside the parentheses) is the order it reads them in.
+	filter:      ^Expr,
+	order_by:    []Order_Item,
 }
 
 Like_Expr :: struct {

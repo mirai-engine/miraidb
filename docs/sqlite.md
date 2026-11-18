@@ -73,7 +73,7 @@ script lists.
 | LIKE, GLOB, ESCAPE | done | LIKE ignores ASCII case; GLOB is exact with `*`, `?`, `[...]` |
 | `||` string concatenation | done | tested with text and numbers |
 | COLLATE (BINARY, NOCASE, RTRIM) | done | on a column, in comparisons, in unique keys and index probes |
-| Window functions, FILTER | partial | `OVER` with `PARTITION BY`/`ORDER BY` and `ROWS`/`RANGE`/`GROUPS` frames; aggregate `FILTER (WHERE …)` is not implemented, and windows beside `GROUP BY` are refused |
+| Window functions, FILTER | done | `OVER` with `PARTITION BY`/`ORDER BY` and `ROWS`/`RANGE`/`GROUPS` frames, beside `GROUP BY` too; the `WINDOW` clause (`OVER name`, and `OVER (name …)` adding an `ORDER BY` or a frame, with SQLite's four refusals). `FILTER (WHERE …)` on an aggregate and on an aggregate window, and an aggregate's own `ORDER BY` (`group_concat(x, ',' ORDER BY y)`), which a scalar function refuses as SQLite does. Not supported: `FILTER` on a window over grouped rows, and a program's collation in an aggregate's `ORDER BY` |
 | Foreign keys | done | `FOREIGN KEY (…) REFERENCES` and a column's `REFERENCES t [(col)]` (the parent's key when no column is named, the table itself allowed); `ON DELETE`/`ON UPDATE` `RESTRICT`/`CASCADE`; `DEFERRABLE INITIALLY DEFERRED` checked at COMMIT. Always enforced, on every path |
 | `AS OF <seq>` | done | engine extension: read a table as it was |
 

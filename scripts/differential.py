@@ -200,6 +200,16 @@ QUERIES = [
     "UPDATE OR REPLACE uq SET u = 20 WHERE id = 3 RETURNING id, u",
     "SELECT id, u FROM uq ORDER BY id",
     "UPDATE OR ABORT uq SET n = n + 1 WHERE id = 1 RETURNING n",
+    # FILTER, an aggregate's ORDER BY and the WINDOW clause (S4).
+    "SELECT dept, count(*) FILTER (WHERE salary > 60), sum(salary) FILTER (WHERE name IS NOT NULL) FROM emp GROUP BY dept ORDER BY dept",
+    "SELECT dept, group_concat(name, '/' ORDER BY name DESC) FROM emp GROUP BY dept ORDER BY dept",
+    "SELECT group_concat(t ORDER BY m, t) FILTER (WHERE n IS NOT NULL) FROM nums",
+    "SELECT json_group_array(n ORDER BY m DESC) FROM nums",
+    "SELECT sum(n) FILTER (WHERE n > 1) FROM nums",
+    "SELECT id, count(*) FILTER (WHERE salary > 60) OVER (ORDER BY id) FROM emp ORDER BY id",
+    "SELECT id, sum(salary) OVER w, max(id) OVER w FROM emp WINDOW w AS (PARTITION BY dept ORDER BY id) ORDER BY id",
+    "SELECT id, sum(salary) OVER (w ORDER BY id ROWS 1 PRECEDING) FROM emp WINDOW w AS (PARTITION BY dept) ORDER BY id",
+    "SELECT id, sum(salary) OVER v FROM emp WINDOW w AS (PARTITION BY dept), v AS (w ORDER BY salary, id) ORDER BY id",
     # INSTEAD OF triggers (S6) write a view: the body does the write, NEW and
     # OLD are the view's columns, and RETURNING answers the view's row.
     "INSERT INTO vtv (b, a) VALUES ('x', 1), ('y', 2), ('z', 3) RETURNING a, b, c",
@@ -301,9 +311,6 @@ QUERIES = [
 # The engine refuses these and says why; SQLite answers them. A refusal that
 # starts working fails the gate, which is how the list shrinks.
 REFUSED = {
-
-    "SELECT sum(n) FILTER (WHERE n > 1) FROM nums": "an aggregate FILTER is not implemented; windows accept one",
-
 }
 
 # Both engines refuse these. A name that is not there is refused before the

@@ -163,3 +163,51 @@ test_instead_of_triggers :: proc(t: ^testing.T) {
 	db.sql_result_destroy(&dropped)
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM _triggers WHERE table_name = 'v'").i, i64(0))
 }
+
+@(test)
+test_aggregate_filter_and_order :: proc(t: ^testing.T) {
+	// An aggregate's FILTER (WHERE ...) and ORDER BY (S4): the group keeps the
+	// rows the filter holds for, in the order the ORDER BY gives, for the
+	// built-in aggregates, a window's frame and DISTINCT alike; a scalar
+	// function refuses both, as in SQLite.
+	store := fresh_db(t, "aggregate_filter")
+	if store == nil do return
+	defer cleanup_db(store, "aggregate_filter")
+	result := run(t, store, "CREATE TABLE t (g INTEGER, x TEXT, y INTEGER)")
+	db.sql_result_destroy(&result)
+	result = run(t, store, "INSERT INTO t VALUES (1, 'b', 2), (1, 'a', 3), (2, 'c', 1), (2, NULL, 5), (1, 'd', NULL)")
+	db.sql_result_destroy(&result)
+	testing.expect_value(t, scalar(t, store, "SELECT group_concat(x ORDER BY y DESC) FROM t WHERE g = 1").s, "a,b,d")
+	testing.expect_value(t, scalar(t, store, "SELECT group_concat(x, '-' ORDER BY x) FILTER (WHERE y > 1) FROM t").s, "a-b")
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FILTER (WHERE y > 1) FROM t").i, i64(3))
+	testing.expect_value(t, scalar(t, store, "SELECT json_group_array(x ORDER BY y) FROM t").s, `["d","c","b","a",null]`)
+	testing.expect_value(t, scalar(t, store, "SELECT count(DISTINCT x ORDER BY x) FILTER (WHERE g = 1) FROM t").i, i64(3))
+	testing.expect_value(t, scalar(t, store, "SELECT max(c) FROM (SELECT count(*) FILTER (WHERE y > 1) OVER (ORDER BY y) AS c FROM t)").i, i64(3))
+	// `filter` stays a name a column or an alias may have.
+	testing.expect_value(t, scalar(t, store, "SELECT filter FROM (SELECT count(*) AS filter FROM t)").i, i64(5))
+	_ = run_error(t, store, "SELECT abs(y) FILTER (WHERE 1) FROM t")
+	_ = run_error(t, store, "SELECT abs(y ORDER BY x) FROM t")
+	_ = run_error(t, store, "SELECT row_number() FILTER (WHERE y > 1) OVER (ORDER BY y) FROM t")
+}
+
+@(test)
+test_window_clause :: proc(t: ^testing.T) {
+	// The WINDOW clause (S4): `OVER name` takes a definition whole, `OVER (name
+	// ...)` adds an ORDER BY or a frame to it, a definition may build on an
+	// earlier one, and SQLite's four refusals hold.
+	store := fresh_db(t, "window_clause")
+	if store == nil do return
+	defer cleanup_db(store, "window_clause")
+	result := run(t, store, "CREATE TABLE t (g INTEGER, x TEXT, y INTEGER)")
+	db.sql_result_destroy(&result)
+	result = run(t, store, "INSERT INTO t VALUES (1, 'b', 2), (1, 'a', 3), (2, 'c', 1), (2, 'e', 5), (1, 'd', 4)")
+	db.sql_result_destroy(&result)
+	testing.expect_value(t, scalar(t, store, "SELECT group_concat(s, ',') FROM (SELECT sum(y) OVER w AS s FROM t WINDOW w AS (PARTITION BY g ORDER BY y) ORDER BY x)").s, "5,2,1,9,6")
+	testing.expect_value(t, scalar(t, store, "SELECT group_concat(s, ',') FROM (SELECT sum(y) OVER (w ORDER BY x) AS s FROM t WINDOW w AS (PARTITION BY g) ORDER BY x)").s, "3,5,1,9,6")
+	testing.expect_value(t, scalar(t, store, "SELECT group_concat(s, ',') FROM (SELECT sum(y) OVER (w ROWS 1 PRECEDING) AS s FROM t WINDOW w AS (ORDER BY y) ORDER BY y)").s, "1,3,5,7,9")
+	testing.expect_value(t, scalar(t, store, "SELECT group_concat(s, ',') FROM (SELECT sum(y) OVER v AS s FROM t WINDOW w AS (PARTITION BY g), v AS (w ORDER BY y) ORDER BY x)").s, "5,2,1,9,6")
+	_ = run_error(t, store, "SELECT sum(y) OVER nope FROM t")
+	_ = run_error(t, store, "SELECT sum(y) OVER (w PARTITION BY x) FROM t WINDOW w AS (PARTITION BY g)")
+	_ = run_error(t, store, "SELECT sum(y) OVER (w ORDER BY x) FROM t WINDOW w AS (ORDER BY y)")
+	_ = run_error(t, store, "SELECT sum(y) OVER (w) FROM t WINDOW w AS (ROWS 1 PRECEDING)")
+}

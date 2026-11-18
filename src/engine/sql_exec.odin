@@ -1955,6 +1955,9 @@ window_fill :: proc(
 ) -> Error {
 	running := len(window.order_by) > 0
 	name := window.name
+	if window.filter != nil && !is_aggregate_name(name) {
+		return errf(.Sql_Syntax, "FILTER clause may only be used with aggregate window functions")
+	}
 	// A RANGE frame with an offset runs from one ORDER BY *value* to another, so the
 	// values are read once for the partition. The slice lives until the function
 	// ends: a `defer` inside the block below would free it as soon as the block
@@ -2109,6 +2112,7 @@ window_fill :: proc(
 		args        = window.args,
 		star        = window.star,
 		is_distinct = window.is_distinct,
+		filter      = window.filter,
 	}
 	if window.frame.has {
 		for j in 0 ..< len(indexes) {
@@ -2580,6 +2584,8 @@ window_aggregate_frame :: proc(
 	if len(sources) != 0 {
 		return window_aggregate_over(ctx, call, sources, indexes, lo, hi)
 	}
+	// Over grouped rows a frame holds values, not rows a FILTER could read.
+	if call.filter != nil do return {}, errf(.Sql_Unsupported, "FILTER on a window over grouped rows is not supported")
 	if lo > hi do return value_null(), ERROR_NONE
 	values := make([]Value, hi - lo + 1)
 	defer delete(values)
@@ -2774,6 +2780,8 @@ expr_walk :: proc(expr: ^Expr, visit: Expr_Visit, user: rawptr) {
 		expr_walk(e.operand, visit, user)
 	case Call_Expr:
 		for arg in e.args do expr_walk(arg, visit, user)
+		expr_walk(e.filter, visit, user)
+		for item in e.order_by do expr_walk(item.expr, visit, user)
 	case Case_Expr:
 		expr_walk(e.operand, visit, user)
 		for branch in e.branches {
@@ -3167,6 +3175,9 @@ sql_exec_stream_select :: proc(
 				return {}, false, ERROR_NONE
 			}
 		}
+		// FILTER and an aggregate's ORDER BY choose and order the group's rows,
+		// which the materializing path does.
+		if call.filter != nil || len(call.order_by) > 0 do return {}, false, ERROR_NONE
 		if strings.equal_fold(call.name, "json_group_array") ||
 		   strings.equal_fold(call.name, "json_group_object") ||
 		   strings.equal_fold(call.name, "median") ||
@@ -6206,6 +6217,9 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 	// A row value is taken apart by the comparison that holds it; reaching it
 	// here means it stands alone, which SQLite refuses with the same words.
 	if call.name == ROW_VALUE_CALL do return {}, errf(.Sql_Syntax, "row value misused")
+	if (call.filter != nil || len(call.order_by) > 0) && (scalar_minmax(call) || !is_aggregate_name(call.name)) {
+		return {}, errf(.Sql_Syntax, "%s may not be used with non-aggregate %s()", call.filter != nil ? "FILTER" : "ORDER BY", call.name)
+	}
 	if scalar_minmax(call) {
 		return eval_scalar_minmax(ctx, call)
 	}
@@ -7010,6 +7024,7 @@ eval_scalar_minmax :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 }
 
 eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
+	if call.filter != nil || len(call.order_by) > 0 do return eval_aggregate_chosen(ctx, call)
 	if ctx.stream != nil {
 		acc := agg_stream_lookup(ctx.stream, call)
 		if acc == nil {
@@ -10161,4 +10176,79 @@ natural_joins_resolve :: proc(tx: ^Tx, stmt: Select_Stmt) -> (Select_Stmt, Error
 		if len(shared) == 0 && join.kind == .Inner do join.kind = .Cross
 	}
 	return out, ERROR_NONE
+}
+
+// Chosen_Row is one row of a group an aggregate reads, with the key its own
+// ORDER BY sorts it under.
+@(private)
+Chosen_Row :: struct {
+	key:     []u8,
+	sources: []Source,
+}
+
+// eval_aggregate_chosen runs an aggregate with a FILTER or an ORDER BY of its
+// own: the group keeps the rows the filter holds for, sorted by the ORDER BY
+// (stably, so equal keys keep the group's order), and the plain aggregate runs
+// over that group.
+@(private)
+eval_aggregate_chosen :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
+	rows := ctx.group
+	single_rows: [1][]Source
+	if !ctx.grouped {
+		single_rows[0] = ctx.sources
+		rows = single_rows[:]
+	}
+	chosen := make([dynamic]Chosen_Row, 0, len(rows))
+	defer {
+		for row in chosen do delete(row.key)
+		delete(chosen)
+	}
+	for sources in rows {
+		sub := ctx^
+		sub.sources = sources
+		if call.filter != nil {
+			value, filter_err := eval_expr(&sub, call.filter)
+			if filter_err.kind != .None do return {}, filter_err
+			if !value_is_truthy(value) do continue
+		}
+		key: []u8
+		if len(call.order_by) > 0 {
+			w: Byte_Writer
+			bw_init(&w)
+			for item in call.order_by {
+				value, order_err := eval_expr(&sub, item.expr)
+				if order_err.kind != .None {
+					bw_destroy(&w)
+					return {}, order_err
+				}
+				if _, is_host := host_order_collation(&sub, item.expr); is_host {
+					bw_destroy(&w)
+					return {}, errf(.Sql_Unsupported, "a program's collation cannot order an aggregate's rows")
+				}
+				collation, has := collate_name(item.expr)
+				if !has do collation, has = column_collation(&sub, item.expr)
+				if has && len(collation) > 0 do value = collate_ordered_value(value, collation)
+				order_key_append(&w, value, item)
+			}
+			key = slice.clone(bw_bytes(&w))
+			bw_destroy(&w)
+		}
+		append(&chosen, Chosen_Row{key = key, sources = sources})
+	}
+	if len(call.order_by) > 0 {
+		slice.stable_sort_by(chosen[:], proc(a, b: Chosen_Row) -> bool {
+			return string(a.key) < string(b.key)
+		})
+	}
+	group := make([][]Source, len(chosen))
+	defer delete(group)
+	for row, i in chosen do group[i] = row.sources
+	sub := ctx^
+	sub.group = group
+	sub.grouped = true
+	sub.stream = nil
+	plain := call
+	plain.filter = nil
+	plain.order_by = nil
+	return eval_aggregate(&sub, plain)
 }
