@@ -92,18 +92,34 @@ as scalars, `trim`/`ltrim`/`rtrim` with a character set, `random`, `zeroblob`,
 `changes`, `total_changes`, `last_insert_rowid`, `sqlite_version`, `affinity`,
 `soundex`, `unistr`, `unistr_quote`, `timediff`, `sqlite_source_id`,
 `sqlite_compileoption_used`, `sqlite_compileoption_get`, `date`,
-`time`, `datetime`, `strftime`, `now`, sixteen `json_*` scalars
+`time`, `datetime`, `strftime`, `now`, seventeen `json_*` scalars
 (`json_set`, `json_replace`, `json_insert`, `json_remove`, `json_patch`,
-`json_pretty`, `json_error_position` and the readers), the
-`json_group_array`/`json_group_object` aggregates, the ordered aggregates
+`json_array_insert`, `json_pretty`, `json_error_position` and the readers),
+the ten `jsonb_*` scalars, the `json_group_array`/`json_group_object` and
+`jsonb_group_array`/`jsonb_group_object` aggregates, the ordered aggregates
 `median`, `percentile`, `percentile_cont` and `percentile_disc` and the
 `json_each`/`json_tree` table functions,
 `group_concat`/`string_agg`, `rank`, `snippet`, `highlight`, `current_identity`
 and `has_role` (engine extensions), plus `count`, `sum`, `avg`, `min`, `max`,
 `total`.
 
-**Missing:** the list `scripts/sqlite_gaps.py --missing` prints, grouped by
-roadmap item in [sqlite-roadmap.md](sqlite-roadmap.md) (S5).
+**JSONB.** SQLite's binary JSON: `jsonb()` of a JSON text is SQLite's bytes
+(the smallest header for each size), every JSON function and `json_each`/
+`json_tree` read a JSONB document, a JSONB value inside `json_array` or
+`json_set` is the document it holds, and a BLOB that is not JSONB is
+"malformed JSON". A JSON number keeps the text it was written with (`1.50`), and
+a path's `[#]` and `[#-n]` read as SQLite reads them (`src/engine/jsonb.odin`,
+`test_jsonb_and_array_insert`, the differential corpus). Not SQLite's: an edit
+(`jsonb_set`, `jsonb_replace`, …) may pick another valid encoding of the same
+document (SQLite stores text that came from a SQL value as TEXTRAW, and a string
+written with an unneeded escape keeps it), which reads back the same; and a
+JSON value made by another JSON function is not marked as JSON when it is an
+argument (`json_array(json('[1]'))` holds the text `"[1]"`, SQLite the array),
+since the engine's values carry no subtype.
+
+**Not counted:** `json_parse` (built only with `SQLITE_DEBUG`) and
+`sqlite_offset` (only with `SQLITE_ENABLE_OFFSET_SQL_FUNC`), which a default
+SQLite build answers "no such function" for, as this engine does.
 
 ## Pragmas
 

@@ -28,12 +28,15 @@ ROADMAP = os.path.join(ROOT, "docs", "sqlite-roadmap.md")
 # The sentence in the roadmap that carries the counts --check compares.
 CLAIM = re.compile(r"functions \*\*(\d+) / (\d+)\*\*, pragmas \*\*(\d+) / (\d+)\*\*, grammar \*\*(\d+) / (\d+)\*\*")
 
-# Functions SQLite only builds for its own tests or debugging; not surface a
-# user calls, so they are not counted.
+# Functions SQLite only builds for its own tests or debugging, or behind a
+# compile-time option a default build leaves off: not surface a user of a
+# default build can call (it answers "no such function" for them too), so they
+# are not counted. json_parse needs SQLITE_DEBUG and sqlite_offset
+# SQLITE_ENABLE_OFFSET_SQL_FUNC.
 INTERNAL = {
     "datedebug", "expr_compare", "expr_implies_expr", "fpdecode",
-    "implies_nonnull_row", "oom", "parseuri", "sqlite_filestat",
-    "sqlite_walstat", "unknown",
+    "implies_nonnull_row", "json_parse", "oom", "parseuri", "sqlite_filestat",
+    "sqlite_offset", "sqlite_walstat", "unknown",
 }
 
 # Statements per grammar feature. A feature is present when every statement
@@ -182,7 +185,7 @@ def main():
         print(f"sqlite_gaps: functions {have_f}/{len(functions)}, pragmas {have_p}/{len(names['Pragmas'])}, "
               f"grammar {have_g}/{len(grammar)}, as documented")
         return 0
-    print(f"Functions: {have_f} / {len(functions)} (SQLite's internal test functions not counted)")
+    print(f"Functions: {have_f} / {len(functions)} (functions a default SQLite build lacks not counted)")
     print(f"Pragmas: {have_p} / {len(names['Pragmas'])}")
     print(f"Grammar features: {have_g} / {len(grammar)}")
     print()

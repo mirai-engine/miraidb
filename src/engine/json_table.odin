@@ -170,16 +170,19 @@ tx_materialize_json_table :: proc(tx: ^Tx, name: string, args: []Value) -> (^Tab
 	if len(args) != 1 {
 		return nil, errf(.Invalid_Argument, "%s takes exactly one JSON argument", name)
 	}
-	text: string
+	root: Json_Value
+	parsed: bool
 	#partial switch args[0].kind {
 	case .String:
-		text = args[0].s
+		root, parsed = json_parse(args[0].s, tx.alloc)
+	case .Bytes:
+		// A JSONB document is read as the JSON it holds.
+		root, parsed = jsonb_decode(args[0].bytes, tx.alloc)
 	case .Null:
 		return nil, errf(.Invalid_Argument, "%s needs JSON text, not NULL", name)
 	case:
 		return nil, errf(.Invalid_Argument, "%s needs a JSON text argument", name)
 	}
-	root, parsed := json_parse(text, tx.alloc)
 	if !parsed do return nil, errf(.Invalid_Argument, "%s got invalid JSON", name)
 
 	schema := json_table_schema(name, tx.alloc)

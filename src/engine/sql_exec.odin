@@ -2414,6 +2414,11 @@ eval_aggregate_values :: proc(ctx: ^Eval_Ctx, call: Call_Expr, values: []Value) 
 	name := strings.to_lower(call.name)
 	defer delete(name)
 	if !builtin_aggregate_name(name) do return eval_host_aggregate_values(ctx, call, values)
+	if plain, is_jsonb := jsonb_aggregate_plain(call); is_jsonb {
+		text, err := eval_aggregate_values(ctx, plain, values)
+		if err.kind != .None do return {}, err
+		return jsonb_from_text(text)
+	}
 	if name == "count" {
 		if call.star || len(call.args) == 0 do return value_int(i64(len(values))), ERROR_NONE
 		count := 0
@@ -3180,6 +3185,8 @@ sql_exec_stream_select :: proc(
 		if call.filter != nil || len(call.order_by) > 0 do return {}, false, ERROR_NONE
 		if strings.equal_fold(call.name, "json_group_array") ||
 		   strings.equal_fold(call.name, "json_group_object") ||
+		   strings.equal_fold(call.name, "jsonb_group_array") ||
+		   strings.equal_fold(call.name, "jsonb_group_object") ||
 		   strings.equal_fold(call.name, "median") ||
 		   strings.equal_fold(call.name, "percentile") ||
 		   strings.equal_fold(call.name, "percentile_cont") ||
@@ -6022,7 +6029,7 @@ is_aggregate_name :: proc(name: string) -> bool {
 
 // builtin_aggregate_name reports one of the engine's own aggregates.
 builtin_aggregate_name :: proc(name: string) -> bool {
-	for candidate in ([]string{"count", "sum", "avg", "min", "max", "total", "group_concat", "string_agg", "array_agg", "json_group_array", "json_group_object", "median", "percentile", "percentile_cont", "percentile_disc"}) {
+	for candidate in ([]string{"count", "sum", "avg", "min", "max", "total", "group_concat", "string_agg", "array_agg", "json_group_array", "json_group_object", "jsonb_group_array", "jsonb_group_object", "median", "percentile", "percentile_cont", "percentile_disc"}) {
 		if strings.equal_fold(name, candidate) do return true
 	}
 	return false
@@ -7041,6 +7048,13 @@ eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		rows = single_rows[:]
 	}
 	if !builtin_aggregate_name(name) do return eval_host_aggregate(ctx, call, rows)
+	// jsonb_group_array and jsonb_group_object build what their json_ forms
+	// build, as JSONB.
+	if plain, is_jsonb := jsonb_aggregate_plain(call); is_jsonb {
+		text, err := eval_aggregate(ctx, plain)
+		if err.kind != .None do return {}, err
+		return jsonb_from_text(text)
+	}
 
 	if name == "count" {
 		if call.star || len(call.args) == 0 {
@@ -10251,4 +10265,15 @@ eval_aggregate_chosen :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error)
 	plain.filter = nil
 	plain.order_by = nil
 	return eval_aggregate(&sub, plain)
+}
+
+// jsonb_aggregate_plain is the json_ aggregate a jsonb_group_* call stands for.
+@(private)
+jsonb_aggregate_plain :: proc(call: Call_Expr) -> (Call_Expr, bool) {
+	if !strings.equal_fold(call.name, "jsonb_group_array") && !strings.equal_fold(call.name, "jsonb_group_object") {
+		return call, false
+	}
+	plain := call
+	plain.name = strings.equal_fold(call.name, "jsonb_group_array") ? "json_group_array" : "json_group_object"
+	return plain, true
 }

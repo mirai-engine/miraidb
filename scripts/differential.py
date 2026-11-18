@@ -200,6 +200,22 @@ QUERIES = [
     "UPDATE OR REPLACE uq SET u = 20 WHERE id = 3 RETURNING id, u",
     "SELECT id, u FROM uq ORDER BY id",
     "UPDATE OR ABORT uq SET n = n + 1 WHERE id = 1 RETURNING n",
+    # JSONB (S5): jsonb() of a JSON text is SQLite's bytes, every JSON function
+    # reads a JSONB document, and a number keeps the text it was written with.
+    # An edit may pick another valid encoding of the same document (SQLite
+    # stores text from SQL values as TEXTRAW), so edits compare as JSON.
+    "SELECT hex(jsonb('[1.50, 1e2, \"b\", null, true, false, {\"k\":-3}]'))",
+    "SELECT hex(jsonb('\"abcdefghijklmnop\"')), hex(jsonb('\"a\\\"b\\nc\"'))",
+    "SELECT hex(jsonb_array(1, 2.5, 'x', 'a\"b', NULL)), hex(jsonb_object('a', 1, 'b', 'c'))",
+    "SELECT json(jsonb('{\"a\":[1,2,{\"b\":null}],\"c\":\"d\"}'))",
+    "SELECT json_extract(jsonb('{\"a\":[1,2]}'), '$.a'), jsonb('[1]') -> 0, json_type(jsonb('{}')), json_array_length(jsonb('[1,2,3]'))",
+    "SELECT typeof(jsonb_extract(jsonb('{\"a\":[1,2],\"b\":3}'), '$.a')), jsonb_extract(jsonb('{\"a\":[1,2],\"b\":3}'), '$.b')",
+    "SELECT hex(jsonb_extract('{\"a\":[1,2],\"b\":\"x\"}', '$.a', '$.b'))",
+    "SELECT json_array(jsonb('[1]')), json_array(x'00'), json_set(jsonb('{\"a\":1}'), '$.a', 5)",
+    "SELECT json(jsonb_set('{\"a\":1}', '$.b', 2)), json(jsonb_insert('[1]', '$[#]', 2)), json(jsonb_replace('{\"a\":1}', '$.a', 'z'))",
+    "SELECT hex(jsonb_remove('[1,2,3]', '$[1]')), hex(jsonb_patch('{\"a\":1,\"b\":2}', '{\"b\":null,\"c\":3}'))",
+    "SELECT hex(jsonb_group_array(n ORDER BY n, t)), hex(jsonb_group_object(t, n ORDER BY t)) FROM nums WHERE t IS NOT NULL",
+    "SELECT value FROM json_each(jsonb('[10,20]')) ORDER BY value",
     # `[#]` is one past the last element and `[#-n]` counts back from it.
     "SELECT json_extract('[1,2,3]', '$[#]'), json_extract('[1,2,3]', '$[#-1]'), json_extract('[1,2,3]', '$[#-3]'), json_extract('[1,2,3]', '$[#-4]')",
     "SELECT json_insert('[1]', '$[#]', 2), json_set('[1,2]', '$[#-1]', 9), json_replace('[1,2]', '$[#]', 9), json_remove('[1,2,3]', '$[#-1]'), json_set('{\"a\":[1]}', '$.a[#]', 5)",

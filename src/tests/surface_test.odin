@@ -1,5 +1,6 @@
 package tests
 
+import "core:strings"
 import "core:testing"
 
 import db "../engine"
@@ -210,4 +211,50 @@ test_window_clause :: proc(t: ^testing.T) {
 	_ = run_error(t, store, "SELECT sum(y) OVER (w PARTITION BY x) FROM t WINDOW w AS (PARTITION BY g)")
 	_ = run_error(t, store, "SELECT sum(y) OVER (w ORDER BY x) FROM t WINDOW w AS (ORDER BY y)")
 	_ = run_error(t, store, "SELECT sum(y) OVER (w) FROM t WINDOW w AS (ROWS 1 PRECEDING)")
+}
+
+@(test)
+test_jsonb_and_array_insert :: proc(t: ^testing.T) {
+	// JSONB (S5): jsonb() writes SQLite's binary form with the smallest header
+	// for each size, every JSON function reads it back, the jsonb_* forms
+	// answer it, and a number keeps the text it was written with.
+	// json_array_insert answers what SQLite's own json109.test expects.
+	store := fresh_db(t, "jsonb")
+	if store == nil do return
+	defer cleanup_db(store, "jsonb")
+	testing.expect_value(t, scalar(t, store, `SELECT hex(jsonb('[1.50, 1e2, "b", null, true, false, {"k":-3}]'))`).s, "CB1445312E35303531653217620001025C176B232D33")
+	testing.expect_value(t, scalar(t, store, `SELECT hex(jsonb('"abcdefghijklmnop"'))`).s, "C7106162636465666768696A6B6C6D6E6F70")
+	testing.expect_value(t, scalar(t, store, `SELECT hex(jsonb_array(1, 2.5, 'x', 'a"b', NULL))`).s, "CB0E133135322E35177848615C226200")
+	testing.expect_value(t, scalar(t, store, `SELECT json(jsonb('{"a":[1,2,{"b":null}],"c":"d"}'))`).s, `{"a":[1,2,{"b":null}],"c":"d"}`)
+	testing.expect_value(t, scalar(t, store, `SELECT json('[1.50, 1e2, -0, 12345678901234567890]')`).s, "[1.50,1e2,-0,12345678901234567890]")
+	testing.expect_value(t, scalar(t, store, `SELECT jsonb_extract(jsonb('{"a":[1,2],"b":3}'), '$.b')`).i, i64(3))
+	testing.expect_value(t, scalar(t, store, `SELECT typeof(jsonb_extract(jsonb('{"a":[1,2]}'), '$.a'))`).s, "blob")
+	testing.expect_value(t, scalar(t, store, `SELECT json_extract(jsonb_set(jsonb('{"a":1}'), '$.b', 2), '$.b')`).i, i64(2))
+	testing.expect_value(t, scalar(t, store, `SELECT json(jsonb_group_array(n)) FROM (SELECT 1 AS n UNION ALL SELECT 2)`).s, "[1,2]")
+	testing.expect_value(t, scalar(t, store, `SELECT sum(value) FROM json_each(jsonb('[10,20]'))`).i, i64(30))
+	testing.expect_value(t, scalar(t, store, `SELECT json_extract('[1,2,3]', '$[#-1]')`).i, i64(3))
+	_ = run_error(t, store, "SELECT json(x'ff')")
+
+	cases := [][2]string {
+		{`SELECT json_array_insert('[1,2,3]','$[0]',999,'$[0]',888)`, "[888,999,1,2,3]"},
+		{`SELECT json_array_insert('[1,2,3]','$[0]',999,'$[#]',888)`, "[999,1,2,3,888]"},
+		{`SELECT json_array_insert('[1,2,3]','$[1]',888)`, "[1,888,2,3]"},
+		{`SELECT json_array_insert('[1,2,3]','$[3]',888)`, "[1,2,3,888]"},
+		{`SELECT json_array_insert('[1,2,3]','$[#-1]',888)`, "[1,2,888,3]"},
+		{`SELECT json_array_insert('[1,2,3]','$[#-3]',888)`, "[888,1,2,3]"},
+		{`SELECT json_array_insert('[1,2,3]','$[#-4]',888)`, "[1,2,3]"},
+		{`SELECT json_array_insert('{"a":[1,2,3]}','$.b[0]',888)`, `{"a":[1,2,3],"b":[888]}`},
+		{`SELECT json_array_insert('{"a":[1,2,3]}','$.b.c.d[0]',888)`, `{"a":[1,2,3],"b":{"c":{"d":[888]}}}`},
+		{`SELECT json_array_insert('{"a":[1,2,3]}','$[0]',888)`, `{"a":[1,2,3]}`},
+		{`SELECT json(jsonb_array_insert('[1]','$[0]',0))`, "[0,1]"},
+	}
+	for c in cases do testing.expectf(t, scalar(t, store, c[0]).s == c[1], "%s", c[0])
+	for sql in ([]string {
+		`SELECT json_array_insert('{"a":[1,2,3]}','$.a',888)`,
+		`SELECT json_array_insert('{"a":[1,2,3]}','$.b.c.d[0',888)`,
+		`SELECT json_array_insert('{"a":[1,2,3]}','$.b[0]',888,'$.a[1]','999','$.c',0)`,
+	}) {
+		err := run_error(t, store, sql)
+		testing.expectf(t, strings.contains(err.message, "not an array element"), "%s: %s", sql, err.message)
+	}
 }

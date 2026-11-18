@@ -482,6 +482,8 @@ json_from_value :: proc(value: Value, alloc: mem.Allocator) -> Json_Value {
 		return Json_Value{kind = .Number, number = value.f}
 	case .String:
 		return Json_Value{kind = .String, text = strings.clone(value.s, alloc)}
+	case .Bytes:
+		if doc, ok := jsonb_decode(value.bytes, alloc); ok do return doc
 	}
 	text := value_format(value, alloc)
 	return Json_Value{kind = .String, text = text}
@@ -590,6 +592,22 @@ json_type_name :: proc(value: Json_Value) -> string {
 // json_call runs a JSON function. It reports false when the name is not one of
 // them, and returns a NULL value for invalid input or a missing path.
 json_call :: proc(name: string, args: []Value) -> (Value, bool, Error) {
+	if !json_call_name(name) do return {}, false, ERROR_NONE
+	// jsonb_X answers what json_X answers, as JSONB.
+	if len(name) >= 5 && strings.equal_fold(name[:5], "jsonb") {
+		plain := strings.concatenate({"json", name[5:]}, context.temp_allocator)
+		if strings.equal_fold(plain, "json_extract") do return jsonb_extract_call(args)
+		result, _, err := json_call(plain, args)
+		if err.kind != .None do return {}, true, err
+		encoded, encode_err := jsonb_from_text(result)
+		if result.kind == .String do delete(result.s)
+		return encoded, true, encode_err
+	}
+	// A document given as JSONB reads as the JSON it holds; another BLOB is
+	// not a document.
+	args, documents_ok := json_documents_as_text(name, args)
+	if !documents_ok do return {}, true, errf(.Invalid_Argument, "malformed JSON")
+	if strings.equal_fold(name, "json_array_insert") do return json_array_insert_call(args)
 	if strings.equal_fold(name, "json_set") || strings.equal_fold(name, "json_replace") ||
 	   strings.equal_fold(name, "json_remove") || strings.equal_fold(name, "json_insert") {
 		return json_mutation(name, args)
@@ -740,7 +758,7 @@ json_call :: proc(name: string, args: []Value) -> (Value, bool, Error) {
 
 // json_call_name reports whether a function name belongs to the JSON family.
 json_call_name :: proc(name: string) -> bool {
-	for candidate in ([]string{"json", "json_arrow", "json_arrow_value", "json_valid", "json_type", "json_extract", "json_array", "json_object", "json_quote", "json_array_length", "json_set", "json_replace", "json_remove", "json_insert", "json_patch", "json_pretty", "json_error_position"}) {
+	for candidate in ([]string{"json", "json_arrow", "json_arrow_value", "json_valid", "json_type", "json_extract", "json_array", "json_object", "json_quote", "json_array_length", "json_set", "json_replace", "json_remove", "json_insert", "json_patch", "json_pretty", "json_error_position", "json_array_insert", "jsonb", "jsonb_array", "jsonb_array_insert", "jsonb_extract", "jsonb_insert", "jsonb_object", "jsonb_patch", "jsonb_remove", "jsonb_replace", "jsonb_set"}) {
 		if strings.equal_fold(name, candidate) do return true
 	}
 	return false
@@ -1114,4 +1132,138 @@ json_pretty_write :: proc(builder: ^strings.Builder, value: Json_Value, indent: 
 @(private)
 json_pretty_indent :: proc(builder: ^strings.Builder, indent: string, depth: int) {
 	for _ in 0 ..< depth do strings.write_string(builder, indent)
+}
+
+// json_documents_as_text gives the JSON text of every argument a function reads
+// as a document (the first, and both of json_patch's) when it is JSONB. A value
+// argument stays as it is: json_from_value reads JSONB there.
+@(private)
+json_documents_as_text :: proc(name: string, args: []Value) -> ([]Value, bool) {
+	// json_valid and json_error_position read a BLOB as SQLite does by default:
+	// as something other than JSON text.
+	for plain in ([]string{"json_array", "json_object", "json_valid", "json_error_position"}) {
+		if strings.equal_fold(name, plain) do return args, true
+	}
+	documents := strings.equal_fold(name, "json_patch") ? 2 : 1
+	out: []Value
+	for i in 0 ..< min(documents, len(args)) {
+		if args[i].kind != .Bytes do continue
+		doc, ok := jsonb_decode(args[i].bytes, context.temp_allocator)
+		if !ok do return args, false
+		if out == nil {
+			out = make([]Value, len(args), context.temp_allocator)
+			copy(out, args)
+		}
+		out[i] = value_string(json_write(doc, context.temp_allocator))
+	}
+	return out != nil ? out : args, true
+}
+
+// jsonb_extract_call is json_extract answering JSONB: one path gives an array
+// or an object as JSONB and anything else as its SQL value; several paths give
+// a JSONB array of what each found.
+@(private)
+jsonb_extract_call :: proc(args: []Value) -> (Value, bool, Error) {
+	args, documents_ok := json_documents_as_text("jsonb_extract", args)
+	if !documents_ok do return {}, true, errf(.Invalid_Argument, "malformed JSON")
+	if len(args) < 2 do return {}, true, errf(.Invalid_Argument, "jsonb_extract() needs a document and a path")
+	if args[0].kind == .Null do return value_null(), true, ERROR_NONE
+	if args[0].kind != .String do return {}, true, errf(.Invalid_Argument, "malformed JSON")
+	doc, ok := json_parse(args[0].s, context.temp_allocator)
+	if !ok do return {}, true, errf(.Invalid_Argument, "malformed JSON")
+	if len(args) == 2 {
+		if args[1].kind != .String do return value_null(), true, ERROR_NONE
+		target, found := json_path_find(doc, args[1].s)
+		if !found do return value_null(), true, ERROR_NONE
+		if target.kind == .Array || target.kind == .Object do return jsonb_value(target, context.allocator), true, ERROR_NONE
+		return json_to_value(target, context.allocator), true, ERROR_NONE
+	}
+	items := make([dynamic]Json_Value, 0, len(args) - 1, context.temp_allocator)
+	for path in args[1:] {
+		if path.kind != .String do return value_null(), true, ERROR_NONE
+		target, found := json_path_find(doc, path.s)
+		append(&items, Json_Value{kind = .Null} if !found else target)
+	}
+	return jsonb_value(Json_Value{kind = .Array, items = items[:]}, context.allocator), true, ERROR_NONE
+}
+
+// json_array_insert_call inserts each value before the array element its path
+// names, as SQLite 3.51's json_array_insert: `$[#]` (or the length) appends,
+// `$[#-n]` counts from the end, a slot past the end changes nothing, missing
+// objects on the way are created, and a path that does not end in an array
+// slot is an error.
+@(private)
+json_array_insert_call :: proc(args: []Value) -> (Value, bool, Error) {
+	if len(args) < 1 do return {}, true, errf(.Invalid_Argument, "json_array_insert() needs a document")
+	if args[0].kind == .Null do return value_null(), true, ERROR_NONE
+	if (len(args) - 1) % 2 != 0 {
+		return {}, true, errf(.Invalid_Argument, "json_array_insert() needs an odd number of arguments")
+	}
+	if args[0].kind != .String do return {}, true, errf(.Invalid_Argument, "malformed JSON")
+	doc, ok := json_parse(args[0].s, context.allocator)
+	if !ok do return {}, true, errf(.Invalid_Argument, "malformed JSON")
+	for i := 1; i + 1 < len(args); i += 2 {
+		if args[i].kind != .String do continue
+		path := strings.trim_space(args[i].s)
+		open := strings.last_index_byte(path, '[')
+		if !strings.has_suffix(path, "]") || open < 1 || !strings.has_prefix(path, "$") {
+			json_destroy(doc, context.allocator)
+			return {}, true, errf(.Invalid_Argument, "not an array element: '%s'", path)
+		}
+		parent, reached := json_path_reach(&doc, path[:open], context.allocator)
+		if !reached || parent.kind != .Array do continue
+		slot := path[open + 1:len(path) - 1]
+		index := 0
+		if strings.has_prefix(slot, "#") {
+			index = len(parent.items)
+			if len(slot) > 1 {
+				back, back_ok := strconv.parse_int(slot[2:], 10)
+				if slot[1] != '-' || !back_ok || back < 0 do continue
+				if back > index do continue
+				index -= back
+			}
+		} else {
+			parsed, parsed_ok := strconv.parse_int(slot, 10)
+			if !parsed_ok || parsed < 0 do continue
+			index = parsed
+		}
+		if index > len(parent.items) do continue
+		grown := make([]Json_Value, len(parent.items) + 1, context.allocator)
+		copy(grown[:index], parent.items[:index])
+		grown[index] = json_from_value(args[i + 1], context.allocator)
+		copy(grown[index + 1:], parent.items[index:])
+		delete(parent.items, context.allocator)
+		parent.items = grown
+	}
+	text := json_write(doc, context.allocator)
+	json_destroy(doc, context.allocator)
+	return value_string(text), true, ERROR_NONE
+}
+
+// json_path_reach finds the value a path names and creates what is missing on
+// the way: an object member for `.key`, and an empty array for the last step
+// when it is missing. It does not create array elements.
+@(private)
+json_path_reach :: proc(root: ^Json_Value, path: string, alloc: mem.Allocator, as_array := true) -> (^Json_Value, bool) {
+	if found, ok := json_path_find_ptr(root, path); ok do return found, true
+	parent_path, last, split_ok := json_path_split(path)
+	if !split_ok || last.is_index do return nil, false
+	parent, reached := json_path_reach(root, parent_path, alloc, false)
+	if !reached || parent.kind != .Object do return nil, false
+	// A missing member on the way is an empty object, and the last one the
+	// empty array the caller inserts into.
+	created := Json_Value{kind = .Object}
+	keys := make([]string, len(parent.keys) + 1, alloc)
+	copy(keys, parent.keys)
+	keys[len(parent.keys)] = strings.clone(last.name, alloc)
+	values := make([]Json_Value, len(parent.values) + 1, alloc)
+	copy(values, parent.values)
+	values[len(parent.values)] = created
+	delete(parent.keys, alloc)
+	delete(parent.values, alloc)
+	parent.keys = keys
+	parent.values = values
+	member := &parent.values[len(parent.values) - 1]
+	if as_array do member.kind = .Array
+	return member, true
 }
