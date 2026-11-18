@@ -669,7 +669,7 @@ sqlite_constraints_from_sql :: proc(sql: string, table: ^Sqlite_Table, alloc: me
 				group[0] = position
 				append(&table.unique_groups, group)
 				append(&table.key_order, group)
-			} else if column.primary_key && !sqlite_declared_integer(column.declared) {
+			} else if column.primary_key && (table.without_rowid || !sqlite_declared_integer(column.declared)) {
 				// Owned by unique_groups so the destroy loop frees it once; the
 				// import skips a group that repeats the column's key.
 				group := make([]int, 1, alloc)
@@ -686,7 +686,7 @@ sqlite_constraints_from_sql :: proc(sql: string, table: ^Sqlite_Table, alloc: me
 		if len(positions) == 0 do continue
 		// An INTEGER PRIMARY KEY in a rowid table is the rowid, and SQLite makes
 		// no index for it, so it takes no automatic number.
-		rowid_alias := primary && len(positions) == 1 &&
+		rowid_alias := primary && len(positions) == 1 && !table.without_rowid &&
 			sqlite_declared_integer(table.columns[positions[0]].declared)
 		if !rowid_alias do append(&table.key_order, positions)
 		if primary {
@@ -1233,6 +1233,7 @@ sqlite_import_tx :: proc(
 			}
 		}
 		strings.write_string(&create, ")")
+		if table.without_rowid do strings.write_string(&create, " WITHOUT ROWID")
 		created[strings.to_lower(table.name, context.temp_allocator)] = true
 		if _, create_err := sql_execute_in_tx(tx, strings.to_string(create)); create_err.kind != .None {
 			return tables, rows, create_err

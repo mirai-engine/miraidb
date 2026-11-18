@@ -6433,6 +6433,51 @@ test_sqlite_write_index_pages :: proc(t: ^testing.T) {
 	testing.expectf(t, ok, "the written file is broken: %s", reason)
 }
 
+// A WITHOUT ROWID table is written as SQLite stores it: an index b-tree keyed
+// by its primary key, its own text kept, its secondary indexes ending in the
+// key instead of a rowid, and no sqlite_master row for the key itself.
+@(test)
+test_sqlite_write_without_rowid :: proc(t: ^testing.T) {
+	store, host := fresh_host(t, "sqlite_write_without_rowid")
+	if store == nil do return
+	defer destroy_host(store, host, "sqlite_write_without_rowid")
+	run(t, store, "CREATE TABLE w (b, a TEXT PRIMARY KEY, c INT) WITHOUT ROWID")
+	run(t, store, "CREATE INDEX wc ON w (c)")
+	run(t, store, "CREATE TABLE n (id INTEGER PRIMARY KEY, v TEXT) WITHOUT ROWID")
+	run(t, store, "INSERT INTO w VALUES (1, 'x', 3), (2, 'a', 30), (NULL, 'm', -1)")
+	tx := db.tx_begin_write(store)
+	for i in 1 ..= 2000 {
+		_, err := db.sql_execute_in_tx_params(tx, "INSERT INTO n VALUES (?, ?)", []db.Value{db.value_int(i64(2001 - i)), db.value_string(fmt.tprintf("v%d", i))})
+		testing.expect(t, db.error_ok(err))
+	}
+	testing.expect(t, db.error_ok(db.tx_commit(tx)))
+
+	path := "_test_sqlite_without_rowid.db"
+	defer os.remove(path)
+	_, rows, write_err := db.sqlite_file_write(store, path)
+	if !testing.expectf(t, db.error_ok(write_err), "write: %s", write_err.message) do return
+	testing.expect_value(t, rows, 2003)
+	ok, reason := db.sqlite_mirror_validate(path)
+	testing.expectf(t, ok, "the written file is broken: %s", reason)
+
+	file, open_err := db.sqlite_file_open(path)
+	if !testing.expectf(t, db.error_ok(open_err), "reopen: %s", open_err.message) do return
+	defer db.sqlite_file_destroy(&file)
+	for table in file.tables {
+		testing.expect(t, table.without_rowid)
+		if table.name == "w" do testing.expect_value(t, table.sql, "CREATE TABLE w (b, a TEXT PRIMARY KEY, c INT) WITHOUT ROWID")
+	}
+	for tree in file.index_trees do testing.expectf(t, tree.name == "wc", "unexpected index b-tree %s", tree.name)
+	back := fresh_db(t, "sqlite_write_without_rowid_back")
+	if back == nil do return
+	defer cleanup_db(back, "sqlite_write_without_rowid_back")
+	_, imported, import_err := db.sqlite_import(&file, back)
+	if !testing.expectf(t, db.error_ok(import_err), "import: %s", import_err.message) do return
+	testing.expect_value(t, imported, 2003)
+	testing.expect_value(t, scalar(t, back, "SELECT b FROM w WHERE a = 'a'").i, i64(2))
+	testing.expect_value(t, scalar(t, back, "SELECT v FROM n WHERE id = 1").s, "v2000")
+}
+
 // The index of an empty table is in the file, with an empty b-tree.
 @(test)
 test_sqlite_write_empty_index :: proc(t: ^testing.T) {

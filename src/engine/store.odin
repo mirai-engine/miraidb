@@ -669,7 +669,6 @@ mirror_text_has_rules :: proc(sql: string) -> bool {
 // it as long as every automatic index it implies can be written with the number
 // the declaration gives it.
 mirror_text_keepable :: proc(table: ^Sqlite_Table) -> bool {
-	if table.without_rowid do return false
 	if sqlite_contains_word(table.sql, "GENERATED") do return false
 	return true
 }

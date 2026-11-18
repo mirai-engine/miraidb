@@ -105,12 +105,13 @@ sql_text_table_kept :: proc(table: ^Table, text: string) -> (Mirror_Kept, bool) 
 	if !mirror_text_keepable(&parsed) do return {}, false
 	alias := -1
 	for column, i in parsed.columns {
+		if parsed.without_rowid do break
 		if column.primary_key && strings.equal_fold(column.declared, "INTEGER") {
 			alias = i
 			break
 		}
 	}
-	if alias < 0 && len(parsed.primary_group) == 1 && strings.equal_fold(parsed.columns[parsed.primary_group[0]].declared, "INTEGER") {
+	if alias < 0 && !parsed.without_rowid && len(parsed.primary_group) == 1 && strings.equal_fold(parsed.columns[parsed.primary_group[0]].declared, "INTEGER") {
 		alias = parsed.primary_group[0]
 	}
 	if alias != sqlite_rowid_alias(table) do return {}, false
@@ -346,7 +347,8 @@ sqlite_schema_rows :: proc(tx: ^Tx, temp: bool, alloc: mem.Allocator) -> [dynami
 		if table.schema.auto_increment_column >= 0 do sequence = true
 		if keep_text {
 			for index_name, order in original.key_indexes {
-				if _, found := sqlite_index_by_name(&table.schema, index_name); !found do continue
+				index, found := sqlite_index_by_name(&table.schema, index_name)
+				if !found || sqlite_is_table_key(table, &index) do continue
 				append(&out, Sqlite_Schema_Row {
 					type = "index",
 					name = fmt.aprintf("sqlite_autoindex_%s_%d", table.schema.name, order + 1, allocator = alloc),
@@ -358,6 +360,8 @@ sqlite_schema_rows :: proc(tx: ^Tx, temp: bool, alloc: mem.Allocator) -> [dynami
 		alias := sqlite_rowid_alias(table)
 		for &index in table.schema.indexes {
 			if index.implicit && len(index.columns) == 1 && index.columns[0] == alias do continue
+			// A WITHOUT ROWID table's key is the table's own b-tree: no row.
+			if sqlite_is_table_key(table, &index) do continue
 			if keep_text && sqlite_name_in(original.key_indexes, index.name) do continue
 			implied := !keep_text && index.unique && len(table.schema.primary_key) > 0 &&
 				schema_index_matches(&index, table.schema.primary_key)

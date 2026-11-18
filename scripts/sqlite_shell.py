@@ -40,11 +40,7 @@ LIBRARY = "sqlite3_miraidb.dll" if os.name == "nt" else "libsqlite3_miraidb.so"
 
 # A difference is known when SQLite's line matches the pattern: the reason is
 # what the engine does instead.
-KNOWN: list[tuple[str, str]] = [
-    (r"WITHOUT ROWID",
-     "a WITHOUT ROWID table keeps the engine's text in sqlite_schema, not the one it was "
-     "created with, because an export writes it as a rowid table (S7)"),
-]
+KNOWN: list[tuple[str, str]] = []
 
 
 def tool(*names: str) -> str | None:

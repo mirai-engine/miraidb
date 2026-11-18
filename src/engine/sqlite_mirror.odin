@@ -368,6 +368,8 @@ mirror_collect_leaves :: proc(m: ^Sqlite_Mirror, root: int, out: ^[dynamic]int, 
 // rowid, or -1 when the table has no single INTEGER primary key.
 @(private)
 mirror_rowid_column :: proc(schema: Table_Schema) -> int {
+	// A WITHOUT ROWID table is an index b-tree: a commit rewrites the file.
+	if schema.without_rowid do return -1
 	if len(schema.primary_key) != 1 do return -1
 	position := schema.primary_key[0]
 	if position < 0 || position >= len(schema.columns) do return -1

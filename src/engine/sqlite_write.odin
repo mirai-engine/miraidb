@@ -445,18 +445,28 @@ sqlite_write_index_tree :: proc(
 	// its expressions over the file's own values, which is what SQLite checks.
 	position, has_position := table_index_position(table, index.name)
 	plain := index_is_plain(index) || !has_position
+	// What follows the indexed values in each entry: the rowid, or for a
+	// WITHOUT ROWID table the primary key's columns the index does not hold.
+	suffix := make([dynamic]int, 0, 4, alloc)
+	defer delete(suffix)
+	if table.schema.without_rowid {
+		for column in table.schema.primary_key {
+			if !plain || !slice.contains(index.columns[:], column) do append(&suffix, column)
+		}
+	}
+	width := len(index.columns) + (table.schema.without_rowid ? len(suffix) : 1)
 	keys := make([dynamic][]Value, 0, len(rows), alloc)
 	// A plain key borrows the row's values; an expression's are its own.
 	defer {
 		for key in keys {
-			if !plain do for value in key[:len(key) - 1] do value_deep_free(value, alloc)
+			if !plain do for value in key[:len(index.columns)] do value_deep_free(value, alloc)
 			delete(key, alloc)
 		}
 		delete(keys)
 	}
 	for row in rows {
 		if !plain && !index_row_included(table, position, row.values) do continue
-		values := make([]Value, len(index.columns) + 1, alloc)
+		values := make([]Value, width, alloc)
 		if plain {
 			for column, part in index.columns {
 				if column >= 0 && column < len(row.values) do values[part] = row.values[column]
@@ -466,16 +476,16 @@ sqlite_write_index_tree :: proc(
 			copy(values, parts)
 			delete(parts, alloc)
 		}
-		values[len(index.columns)] = value_int(row.rowid)
+		if table.schema.without_rowid {
+			for column, k in suffix {
+				if column < len(row.values) do values[len(index.columns) + k] = row.values[column]
+			}
+		} else {
+			values[len(index.columns)] = value_int(row.rowid)
+		}
 		append(&keys, values)
 	}
-	slice.sort_by(keys[:], proc(a, b: []Value) -> bool {
-		for i in 0 ..< len(a) - 1 {
-			order, ok := value_compare(a[i], b[i])
-			if ok && order != .Equal do return order == .Less
-		}
-		return a[len(a) - 1].i < b[len(b) - 1].i
-	})
+	slice.sort_by(keys[:], sqlite_entry_less)
 
 	payloads := make([][]u8, len(keys), alloc)
 	defer {
@@ -483,15 +493,50 @@ sqlite_write_index_tree :: proc(
 		delete(payloads, alloc)
 	}
 	for values, i in keys do payloads[i] = sqlite_encode_record(values, -1, alloc)
-	if len(payloads) == 0 {
-		// An index over no rows is still an index: one empty leaf, as SQLite
-		// writes it (the file used to lose the index of an empty table).
-		page_no := sqlite_writer_new_page(w)
-		page := sqlite_writer_page(w, page_no)
-		page[0] = 10
-		page[5], page[6] = u8(w.usable >> 8), u8(w.usable)
-		return page_no
+	return sqlite_index_btree(w, payloads, alloc)
+}
+
+// sqlite_entry_less orders index entries value by value, in SQLite's order of
+// storage classes.
+@(private)
+sqlite_entry_less :: proc(a, b: []Value) -> bool {
+	for i in 0 ..< min(len(a), len(b)) {
+		order, ok := value_compare(a[i], b[i])
+		if ok && order != .Equal do return order == .Less
 	}
+	return len(a) < len(b)
+}
+
+// sqlite_write_without_rowid writes a WITHOUT ROWID table as SQLite stores
+// it: an index b-tree whose entries are the primary key's columns, then the
+// other columns in declaration order, sorted by the key.
+@(private)
+sqlite_write_without_rowid :: proc(w: ^Sqlite_Writer, table: ^Table, rows: []Sqlite_Export_Row, alloc: mem.Allocator) -> int {
+	order := make([dynamic]int, 0, len(table.schema.columns), alloc)
+	defer delete(order)
+	for column in table.schema.primary_key do append(&order, column)
+	for _, column in table.schema.columns {
+		if !slice.contains(table.schema.primary_key[:], column) do append(&order, column)
+	}
+	entries := make([][]Value, len(rows), alloc)
+	defer {
+		for entry in entries do delete(entry, alloc)
+		delete(entries, alloc)
+	}
+	for row, i in rows {
+		entry := make([]Value, len(order), alloc)
+		for column, k in order {
+			if column < len(row.values) do entry[k] = row.values[column]
+		}
+		entries[i] = entry
+	}
+	slice.sort_by(entries, sqlite_entry_less)
+	payloads := make([][]u8, len(entries), alloc)
+	defer {
+		for payload in payloads do delete(payload, alloc)
+		delete(payloads, alloc)
+	}
+	for entry, i in entries do payloads[i] = sqlite_encode_record(entry, -1, alloc)
 	return sqlite_index_btree(w, payloads, alloc)
 }
 
@@ -501,6 +546,15 @@ sqlite_write_index_tree :: proc(
 // that page from the next one, as in SQLite's own index b-trees.
 @(private)
 sqlite_index_btree :: proc(w: ^Sqlite_Writer, payloads: [][]u8, alloc: mem.Allocator) -> int {
+	if len(payloads) == 0 {
+		// A b-tree over no entries is one empty leaf, as SQLite writes it (the
+		// file used to lose the index of an empty table).
+		page_no := sqlite_writer_new_page(w)
+		page := sqlite_writer_page(w, page_no)
+		page[0] = 10
+		page[5], page[6] = u8(w.usable >> 8), u8(w.usable)
+		return page_no
+	}
 	cell_size := proc(w: ^Sqlite_Writer, payload: []u8) -> int {
 		local := sqlite_local_size(len(payload), w.usable, false)
 		return varint_size(i64(len(payload))) + local + (local < len(payload) ? 4 : 0)
@@ -607,6 +661,14 @@ sqlite_index_split :: proc(sizes: []int, room: int, alloc: mem.Allocator) -> (gr
 	return groups, separators
 }
 
+// sqlite_is_table_key answers whether an index is a WITHOUT ROWID table's
+// primary key, which SQLite keeps as the table's own b-tree.
+@(private)
+sqlite_is_table_key :: proc(table: ^Table, index: ^Index_Schema) -> bool {
+	return table.schema.without_rowid && index.implicit && index.unique &&
+		schema_index_matches(index, table.schema.primary_key)
+}
+
 @(private)
 sqlite_index_by_name :: proc(schema: ^Table_Schema, name: string) -> (Index_Schema, bool) {
 	for index in schema.indexes {
@@ -655,6 +717,7 @@ sqlite_index_sql :: proc(table: ^Table, index: Index_Schema) -> string {
 // the row's own key is the index.
 @(private)
 sqlite_rowid_alias :: proc(table: ^Table) -> int {
+	if table.schema.without_rowid do return -1
 	if len(table.schema.primary_key) != 1 do return -1
 	position := table.schema.primary_key[0]
 	if position < 0 || position >= len(table.schema.columns) do return -1
@@ -759,6 +822,7 @@ sqlite_master_sql :: proc(table: ^Table, store: ^Store = nil) -> string {
 		strings.write_byte(&builder, ')')
 	}
 	strings.write_string(&builder, ")")
+	if table.schema.without_rowid do strings.write_string(&builder, " WITHOUT ROWID")
 	return strings.to_string(builder)
 }
 
@@ -904,19 +968,25 @@ sqlite_file_image :: proc(store: ^Store, alloc := context.allocator) -> (image: 
 			next_rowid = max(next_rowid + 1, rowid + 1)
 		}
 		sort_export_rows(exported[:])
-		cells := make([][]u8, len(exported), alloc)
-		keys := make([]i64, len(exported), alloc)
-		for row, i in exported {
-			payload := sqlite_encode_record(row.values, rowid_column, alloc)
-			cells[i] = sqlite_leaf_cell(&w, payload, row.rowid)
-			delete(payload, alloc)
-			keys[i] = row.rowid
-			rows += 1
+		root: int
+		if table.schema.without_rowid {
+			root = sqlite_write_without_rowid(&w, table, exported[:], alloc)
+			rows += len(exported)
+		} else {
+			cells := make([][]u8, len(exported), alloc)
+			keys := make([]i64, len(exported), alloc)
+			for row, i in exported {
+				payload := sqlite_encode_record(row.values, rowid_column, alloc)
+				cells[i] = sqlite_leaf_cell(&w, payload, row.rowid)
+				delete(payload, alloc)
+				keys[i] = row.rowid
+				rows += 1
+			}
+			root = sqlite_build_tree(&w, cells, keys, alloc)
+			for cell in cells do delete(cell)
+			delete(cells, alloc)
+			delete(keys, alloc)
 		}
-		root := sqlite_build_tree(&w, cells, keys, alloc)
-		for cell in cells do delete(cell)
-		delete(cells, alloc)
-		delete(keys, alloc)
 		append(&root_pages, root)
 		master := make([]Value, 5, alloc)
 		master[0] = value_string("table")
@@ -947,6 +1017,7 @@ sqlite_file_image :: proc(store: ^Store, alloc := context.allocator) -> (image: 
 			for index_name, order in original.key_indexes {
 				index, found := sqlite_index_by_name(&table.schema, index_name)
 				if !found do continue
+				if sqlite_is_table_key(table, &index) do continue
 				index_root := sqlite_write_index_tree(&w, table, index, exported[:], alloc)
 				if index_root == 0 do continue
 				row := make([]Value, 5, alloc)
@@ -968,6 +1039,7 @@ sqlite_file_image :: proc(store: ^Store, alloc := context.allocator) -> (image: 
 		alias := sqlite_rowid_alias(table)
 		for &index in table.schema.indexes {
 			if index.implicit && len(index.columns) == 1 && index.columns[0] == alias do continue
+			if sqlite_is_table_key(table, &index) do continue
 			if keep_text && sqlite_name_in(original.key_indexes, index.name) do continue
 			index_root := sqlite_write_index_tree(&w, table, index, exported[:], alloc)
 			if index_root == 0 do continue
