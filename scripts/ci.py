@@ -34,10 +34,19 @@ PACKAGES = ["src/engine", "src/cli", "src/capi", "src/sqlite_compat", "src/serve
 
 
 class Gate:
-    def __init__(self, name: str, command: list[str], env: dict[str, str] | None = None):
+    def __init__(
+        self,
+        name: str,
+        command: list[str],
+        env: dict[str, str] | None = None,
+        refuse: str | None = None,
+    ):
         self.name = name
         self.command = command
         self.env = env or {}
+        # A line the output must not hold even when the command exits 0: the
+        # test runner reports a bad free and still passes the test.
+        self.refuse = refuse
 
     def run(self) -> tuple[bool, str, float]:
         started = time.time()
@@ -51,6 +60,11 @@ class Gate:
         )
         elapsed = time.time() - started
         output = (done.stdout + done.stderr).strip()
+        if self.refuse is not None:
+            refused = [line for line in output.splitlines() if self.refuse in line]
+            if refused:
+                report = [*refused[:10], f"{len(refused)} line(s) hold {self.refuse!r}"]
+                return False, "\n".join(report), elapsed
         return done.returncode == 0, output, elapsed
 
 
@@ -66,7 +80,7 @@ def build_gates(args: argparse.Namespace) -> list[Gate]:
     gates: list[Gate] = []
     if not args.skip_build:
         gates.append(Gate("build (binaries + suite)", [sys.executable, "scripts/build.py"], odin_env))
-    gates.append(Gate("unit tests", [args.odin, "test", "src/tests"]))
+    gates.append(Gate("unit tests", [args.odin, "test", "src/tests"], refuse="+++ bad free"))
     gates.append(
         Gate("conformance (20 cases)", [sys.executable, "scripts/conformance.py", "--bin", cli])
     )
