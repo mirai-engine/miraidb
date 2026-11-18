@@ -410,6 +410,8 @@ sqlite_walk :: proc(
 	if page_type == 5 || page_type == 2 do header = base + 12
 	if page_type == 5 || page_type == 2 {
 		// Interior page: visit children in order, then the right-most pointer.
+		// An index's interior cell is an entry of its own, between the child
+		// before it and the next one (a table's only carries a key).
 		for i in 0 ..< cell_count {
 			at := header + i * 2
 			if at + 2 > len(page) do return false
@@ -417,6 +419,16 @@ sqlite_walk :: proc(
 			if pointer + 4 > len(page) do return false
 			child := sqlite_be32(page, pointer)
 			if !sqlite_walk(file, child, table, visit, user, depth + 1) do return false
+			if page_type == 2 {
+				cell := page[pointer + 4:]
+				payload_len, size := sqlite_varint(cell, 0)
+				if size == 0 do return false
+				payload, ok := sqlite_payload(file, cell, size, int(payload_len), false, file.alloc)
+				if !ok do return false
+				keep_going := visit(user, 0, payload)
+				delete(payload, file.alloc)
+				if !keep_going do return false
+			}
 		}
 		right := sqlite_be32(page, base + 8)
 		if right != 0 {

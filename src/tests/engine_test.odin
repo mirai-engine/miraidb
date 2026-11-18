@@ -6385,6 +6385,24 @@ test_sqlite_import_without_rowid_order :: proc(t: ^testing.T) {
 	testing.expect_value(t, z.rows[2][2].i, i64(1))
 }
 
+// An index b-tree keeps entries in its interior cells too: a WITHOUT ROWID
+// table SQLite 3.54.1 spread over 1 KiB pages loses none of its 1500 rows.
+@(test)
+test_sqlite_import_without_rowid_pages :: proc(t: ^testing.T) {
+	file, open_err := db.sqlite_file_open("src/tests/fixtures/without_rowid_pages.sqlite")
+	if !testing.expectf(t, db.error_ok(open_err), "open fixture: %s", open_err.message) do return
+	defer db.sqlite_file_destroy(&file)
+	store := fresh_db(t, "sqlite_import_without_rowid_pages")
+	if store == nil do return
+	defer cleanup_db(store, "sqlite_import_without_rowid_pages")
+
+	_, rows, import_err := db.sqlite_import(&file, store)
+	if !testing.expectf(t, db.error_ok(import_err), "import: %s", import_err.message) do return
+	testing.expect_value(t, rows, 1500)
+	testing.expect_value(t, scalar(t, store, "SELECT count(DISTINCT id) FROM k").i, i64(1500))
+	testing.expect_value(t, scalar(t, store, "SELECT sum(n) FROM k").i, i64(1125750))
+}
+
 @(test)
 test_sqlite_write_roundtrip :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "sqlite_write")
