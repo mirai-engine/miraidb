@@ -466,7 +466,13 @@ Sqlite_Master_Ctx :: struct {
 sqlite_master_visit :: proc(user: rawptr, rowid: i64, payload: []u8) -> bool {
 	ctx := cast(^Sqlite_Master_Ctx)user
 	values, ok := sqlite_record(payload, ctx.file.alloc)
-	if !ok || len(values) < 5 do return true
+	if !ok do return true
+	// What is kept below is cloned; the decoded row is this call's.
+	defer {
+		for value in values do value_deep_free(value, ctx.file.alloc)
+		delete(values, ctx.file.alloc)
+	}
+	if len(values) < 5 do return true
 	kind := values[0]
 	name := values[1]
 	sql := values[4]
@@ -514,12 +520,13 @@ sqlite_master_visit :: proc(user: rawptr, rowid: i64, payload: []u8) -> bool {
 		name      = strings.clone(name.s, ctx.file.alloc),
 		root_page = u32(values[3].i),
 		sql       = sql.kind == .String ? strings.clone(sql.s, ctx.file.alloc) : "",
-		columns   = sqlite_columns_from_sql(sql.kind == .String ? sql.s : "", ctx.file.alloc),
 		// No column is the rowid until the declaration says so: a NULL in the
 		// first column of a table without an INTEGER PRIMARY KEY used to come
 		// back as the row's rowid.
 		pk_position = -1,
 	}
+	// The columns are read from the table's own copy of the text.
+	table.columns = sqlite_columns_from_sql(table.sql, ctx.file.alloc)
 	table.without_rowid = sqlite_contains_word(table.sql, "WITHOUT ROWID")
 	sqlite_constraints_from_sql(table.sql, &table, ctx.file.alloc)
 	for column, i in table.columns {
@@ -911,6 +918,13 @@ sqlite_file_destroy :: proc(file: ^Sqlite_File) {
 		delete(index.sql, file.alloc)
 	}
 	delete(file.indexes, file.alloc)
+	for &object in file.others {
+		delete(object.kind, file.alloc)
+		delete(object.name, file.alloc)
+		delete(object.table, file.alloc)
+		delete(object.sql, file.alloc)
+	}
+	delete(file.others, file.alloc)
 	delete(file.tables, file.alloc)
 	delete(file.data, file.alloc)
 	file^ = {}
@@ -1032,6 +1046,14 @@ sqlite_import_tx :: proc(
 		if len(table.columns) == 0 do continue
 		rows_of_table, rows_err := sqlite_table_rows(file, table, alloc)
 		if rows_err.kind != .None do return tables, rows, rows_err
+		// The rows are inserted through SQL, which copies them.
+		defer {
+			for row in rows_of_table {
+				for value in row do value_deep_free(value, alloc)
+				delete(row, alloc)
+			}
+			delete(rows_of_table, alloc)
+		}
 		sqlite_infer_columns(table, rows_of_table)
 		create := strings.builder_make(alloc)
 		defer strings.builder_destroy(&create)

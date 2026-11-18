@@ -448,22 +448,30 @@ sqlite_write_index_tree :: proc(
 	alloc: mem.Allocator,
 ) -> int {
 	if len(index.columns) == 0 do return 0
-	keys := make([dynamic][]Value, 0, len(rows), alloc)
-	defer delete(keys)
 	// A partial index holds only its rows, and an expression index the values of
 	// its expressions over the file's own values, which is what SQLite checks.
 	position, has_position := table_index_position(table, index.name)
 	plain := index_is_plain(index) || !has_position
+	keys := make([dynamic][]Value, 0, len(rows), alloc)
+	// A plain key borrows the row's values; an expression's are its own.
+	defer {
+		for key in keys {
+			if !plain do for value in key[:len(key) - 1] do value_deep_free(value, alloc)
+			delete(key, alloc)
+		}
+		delete(keys)
+	}
 	for row in rows {
+		if !plain && !index_row_included(table, position, row.values) do continue
 		values := make([]Value, len(index.columns) + 1, alloc)
 		if plain {
 			for column, part in index.columns {
 				if column >= 0 && column < len(row.values) do values[part] = row.values[column]
 			}
 		} else {
-			if !index_row_included(table, position, row.values) do continue
 			parts := index_part_values(table, position, row.values, alloc)
 			copy(values, parts)
+			delete(parts, alloc)
 		}
 		values[len(index.columns)] = value_int(row.rowid)
 		append(&keys, values)
@@ -819,7 +827,15 @@ sqlite_file_image :: proc(store: ^Store, alloc := context.allocator) -> (image: 
 	root_pages := make([dynamic]int, 0, len(names))
 	defer delete(root_pages)
 	master_rows := make([dynamic]Sqlite_Export_Row, 0, len(names))
-	defer delete(master_rows)
+	// Each row's array is `alloc`'s; the texts the rows own are listed in
+	// `owned`, the rest (names) are borrowed from the schemas.
+	owned := make([dynamic]string)
+	defer {
+		for row in master_rows do delete(row.values, alloc)
+		delete(master_rows)
+		for text in owned do delete(text)
+		delete(owned)
+	}
 	for name in names {
 		table := store.tables[name]
 		// Reading through the collect makes a paged table export the same as a
@@ -849,6 +865,8 @@ sqlite_file_image :: proc(store: ^Store, alloc := context.allocator) -> (image: 
 			payload := sqlite_encode_record(row.values, rowid_column, alloc)
 			cells[i] = sqlite_leaf_cell(&w, payload, row.rowid)
 			delete(payload, alloc)
+			// The copy of the row's values was only for sorting and encoding.
+			delete(row.values, alloc)
 			keys[i] = row.rowid
 			rows += 1
 		}
@@ -857,7 +875,7 @@ sqlite_file_image :: proc(store: ^Store, alloc := context.allocator) -> (image: 
 		delete(cells, alloc)
 		delete(keys, alloc)
 		append(&root_pages, root)
-		master := make([]Value, 5)
+		master := make([]Value, 5, alloc)
 		master[0] = value_string("table")
 		master[1] = value_string(table.schema.name)
 		master[2] = value_string(table.schema.name)
@@ -865,6 +883,7 @@ sqlite_file_image :: proc(store: ^Store, alloc := context.allocator) -> (image: 
 		// An object the engine did not change keeps the text the file had, so a
 		// rewrite no longer drops the rules the model cannot hold (D27).
 		table_sql, original, keep_text := sqlite_table_sql(store, table, texts)
+		append(&owned, table_sql)
 		master[4] = value_string(table_sql)
 		if !keep_text {
 			if imported, was_imported := store_mirror_kept_lookup(store, table.schema.name); was_imported && imported.has_rules {
@@ -887,11 +906,11 @@ sqlite_file_image :: proc(store: ^Store, alloc := context.allocator) -> (image: 
 				if !found do continue
 				index_root := sqlite_write_index_tree(&w, table, index, exported[:], alloc)
 				if index_root == 0 do continue
-				row := make([]Value, 5)
+				row := make([]Value, 5, alloc)
 				row[0] = value_string("index")
-				row[1] = value_string(
-					fmt.aprintf("sqlite_autoindex_%s_%d", table.schema.name, order + 1),
-				)
+				autoindex := fmt.aprintf("sqlite_autoindex_%s_%d", table.schema.name, order + 1)
+				append(&owned, autoindex)
+				row[1] = value_string(autoindex)
 				row[2] = value_string(table.schema.name)
 				row[3] = value_int(i64(index_root))
 				row[4] = value_null()
@@ -911,12 +930,12 @@ sqlite_file_image :: proc(store: ^Store, alloc := context.allocator) -> (image: 
 			if index_root == 0 do continue
 			implied := !keep_text && index.unique && len(table.schema.primary_key) > 0 &&
 				schema_index_matches(&index, table.schema.primary_key)
-			index_row := make([]Value, 5)
+			index_row := make([]Value, 5, alloc)
 			index_row[0] = value_string("index")
 			if implied {
-				index_row[1] = value_string(
-					fmt.aprintf("sqlite_autoindex_%s_1", table.schema.name),
-				)
+				autoindex := fmt.aprintf("sqlite_autoindex_%s_1", table.schema.name)
+				append(&owned, autoindex)
+				index_row[1] = value_string(autoindex)
 			} else {
 				index_row[1] = value_string(index.name)
 			}
@@ -932,6 +951,7 @@ sqlite_file_image :: proc(store: ^Store, alloc := context.allocator) -> (image: 
 				} else {
 					index_row[4] = value_string(sqlite_index_sql(table, index))
 				}
+				append(&owned, index_row[4].s)
 			}
 			append(&master_rows, Sqlite_Export_Row{rowid = i64(len(master_rows) + 1), values = index_row})
 		}
@@ -946,14 +966,18 @@ sqlite_file_image :: proc(store: ^Store, alloc := context.allocator) -> (image: 
 		row[1] = value_string(object.name)
 		row[2] = value_string(object.tbl_name)
 		row[3] = value_int(0)
-		row[4] = value_string(strings.clone(object.sql, alloc))
+		row[4] = value_string(strings.clone(object.sql))
+		append(&owned, row[4].s)
 		append(&master_rows, Sqlite_Export_Row{rowid = i64(len(master_rows) + 1), values = row})
 	}
 
 	// sqlite_sequence tracks AUTOINCREMENT counters; SQLite creates it only when a
 	// table uses one.
 	sequence_rows := make([dynamic]Sqlite_Export_Row, 0, 2)
-	defer delete(sequence_rows)
+	defer {
+		for row in sequence_rows do delete(row.values, alloc)
+		delete(sequence_rows)
+	}
 	for name in names {
 		table := store.tables[name]
 		if table.schema.auto_increment_column < 0 do continue
@@ -976,7 +1000,7 @@ sqlite_file_image :: proc(store: ^Store, alloc := context.allocator) -> (image: 
 		for cell in sequence_cells do delete(cell)
 		delete(sequence_cells, alloc)
 		delete(sequence_keys, alloc)
-		sequence_row := make([]Value, 5)
+		sequence_row := make([]Value, 5, alloc)
 		sequence_row[0] = value_string("table")
 		sequence_row[1] = value_string("sqlite_sequence")
 		sequence_row[2] = value_string("sqlite_sequence")

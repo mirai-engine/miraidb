@@ -380,6 +380,7 @@ mirror_rowid_column :: proc(schema: Table_Schema) -> int {
 mirror_build :: proc(store: ^Store, path: string, alloc := context.allocator) -> (^Sqlite_Mirror, Error) {
 	file, open_err := sqlite_file_open(path, alloc, true)
 	if open_err.kind != .None {
+		defer error_free(&open_err)
 		return nil, errf(.Io, "cannot read %s: %v", path, open_err.message)
 	}
 	defer sqlite_file_destroy(&file)
@@ -1597,7 +1598,10 @@ mirror_apply_commit :: proc(store: ^Store, m: ^Sqlite_Mirror, ops: []Store_Op) -
 // implementation.
 sqlite_mirror_validate :: proc(path: string, alloc := context.allocator) -> (ok: bool, reason: string) {
 	file, open_err := sqlite_file_open(path, alloc, true)
-	if open_err.kind != .None do return false, "cannot open"
+	if open_err.kind != .None {
+		error_free(&open_err)
+		return false, "cannot open"
+	}
 	defer sqlite_file_destroy(&file)
 	for &table in file.tables {
 		check := Mirror_Check{file = &file, alloc = alloc, ok = true}

@@ -96,6 +96,8 @@ sqlite_table_sql :: proc(store: ^Store, table: ^Table, texts: map[string]string)
 @(private)
 sql_text_table_kept :: proc(table: ^Table, text: string) -> (Mirror_Kept, bool) {
 	parsed := Sqlite_Table{name = table.schema.name, sql = text, pk_position = -1}
+	parsed.unique_groups = make([dynamic][]int, context.temp_allocator)
+	parsed.key_order = make([dynamic][]int, context.temp_allocator)
 	parsed.columns = sqlite_columns_from_sql(text, context.temp_allocator)
 	parsed.without_rowid = sqlite_contains_word(text, "WITHOUT ROWID")
 	sqlite_constraints_from_sql(text, &parsed, context.temp_allocator)

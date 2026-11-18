@@ -730,8 +730,11 @@ store_set_sqlite_mirror :: proc(store: ^Store, path: string) {
 	// with, so it needs the map a commit would otherwise build too late.
 	mirror_destroy(store.mirror)
 	store.mirror = nil
-	if built, build_err := mirror_build(store, store.sqlite_mirror); build_err.kind == .None {
+	built, build_err := mirror_build(store, store.sqlite_mirror)
+	if build_err.kind == .None {
 		store.mirror = built
+	} else {
+		error_free(&build_err)
 	}
 }
 
@@ -750,6 +753,7 @@ store_sqlite_mirror_flush :: proc(store: ^Store, ops: []Store_Op = nil) -> Error
 		if build_err.kind != .None {
 			delete(store.mirror_reason)
 			store.mirror_reason = strings.clone(build_err.message)
+			error_free(&build_err)
 			return store_sqlite_mirror_rewrite(store)
 		}
 		store.mirror = built
@@ -798,6 +802,8 @@ store_sqlite_mirror_rewrite :: proc(store: ^Store) -> Error {
 	if refreshed_err.kind == .None {
 		store_mirror_keep(store, &refreshed)
 		sqlite_file_destroy(&refreshed)
+	} else {
+		error_free(&refreshed_err)
 	}
 	return ERROR_NONE
 }

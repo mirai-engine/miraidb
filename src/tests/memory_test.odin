@@ -223,6 +223,24 @@ test_catalog_probes_leave_nothing :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_a_sqlite_file_leaves_nothing :: proc(t: ^testing.T) {
+	// Import, export and the mirror: the rows a file is read into, the
+	// sqlite_master rows an export writes, the index keys it sorts, the views
+	// and triggers it keeps.
+	expect_nothing_left(t, .Sqlite_File, "_test_memory_file.sqlite", {
+		"CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, n INT)",
+		"INSERT INTO t VALUES (1, 'ab', 2), (2, 'cd', 3)",
+		"CREATE VIEW w AS SELECT * FROM t",
+		"CREATE INDEX i ON t (v)",
+		"CREATE INDEX e ON t (n + 1) WHERE n > 2",
+		"CREATE TABLE u (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT UNIQUE)",
+		"INSERT INTO u (b) VALUES ('x')",
+		"CREATE TRIGGER g AFTER INSERT ON t BEGIN SELECT 1; END",
+		"UPDATE t SET v = 'zz' WHERE id = 1",
+	})
+}
+
+@(test)
 test_a_parse_error_leaves_nothing :: proc(t: ^testing.T) {
 	// The error names the line and column; the detail it wraps is not kept.
 	expect_nothing_left(t, .Memory, "_test_memory_parse", {"SELECT FROM WHERE", "SELEC 1", "CREATE TABLE ("}, fails = true)
