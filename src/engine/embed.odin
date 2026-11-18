@@ -48,6 +48,10 @@ Embed_Statement :: struct {
 	// sqlite3_stmt_status answers for RUN and VM_STEP.
 	runs:  int,
 	steps: int,
+	// pending is the error the statement met when a program asked for its
+	// columns before the first step and it ran then: that first step answers
+	// it, as SQLite's step is where a runtime error is reported.
+	pending: Error,
 }
 
 Embed_Conn :: struct {
@@ -502,6 +506,7 @@ embed_finalize :: proc(stmt: ^Embed_Statement) {
 	stmt_prepared_destroy(stmt.prepared)
 	embed_clear_bindings(stmt)
 	sql_result_destroy(&stmt.result)
+	error_free(&stmt.pending)
 	free(stmt)
 }
 
@@ -640,6 +645,7 @@ embed_bind_blob :: proc(stmt: ^Embed_Statement, index: int, value: []u8) -> Erro
 embed_reset :: proc(stmt: ^Embed_Statement) {
 	if stmt == nil do return
 	sql_result_destroy(&stmt.result)
+	error_free(&stmt.pending)
 	stmt.started = false
 	stmt.done = false
 	stmt.row = 0
@@ -712,8 +718,15 @@ embed_start :: proc(stmt: ^Embed_Statement) -> Error {
 embed_step :: proc(stmt: ^Embed_Statement) -> (has_row: bool, err: Error) {
 	if stmt == nil do return false, errf(.Invalid_Argument, "no statement")
 	stmt.steps += 1
-	if stmt.done do return false, ERROR_NONE
 	counts := prepared_counts_changes(stmt.prepared)
+	if stmt.pending.kind != .None {
+		// The error the early run met is this step's, and the caller's.
+		pending := stmt.pending
+		stmt.pending = ERROR_NONE
+		if counts do stmt.conn.changes = 0
+		return false, embed_fail(stmt.conn, pending)
+	}
+	if stmt.done do return false, ERROR_NONE
 	if !stmt.started {
 		if start_err := embed_start(stmt); start_err.kind != .None {
 			// A write that failed changed nothing, as SQLite counts it.
@@ -733,7 +746,11 @@ embed_step :: proc(stmt: ^Embed_Statement) -> (has_row: bool, err: Error) {
 embed_column_count :: proc(stmt: ^Embed_Statement) -> int {
 	if stmt == nil do return 0
 	if !stmt.started && embed_is_query(stmt.sql) {
-		if embed_start(stmt).kind != .None do return 0
+		if start_err := embed_start(stmt); start_err.kind != .None {
+			error_free(&stmt.pending)
+			stmt.pending = start_err
+			return 0
+		}
 	}
 	return len(stmt.result.columns)
 }
@@ -747,7 +764,11 @@ embed_column_value :: proc(stmt: ^Embed_Statement, index: int) -> (Value, bool) 
 embed_column_name :: proc(stmt: ^Embed_Statement, index: int) -> string {
 	if stmt == nil || index < 0 do return ""
 	if !stmt.started && embed_is_query(stmt.sql) {
-		if embed_start(stmt).kind != .None do return ""
+		if start_err := embed_start(stmt); start_err.kind != .None {
+			error_free(&stmt.pending)
+			stmt.pending = start_err
+			return ""
+		}
 	}
 	if index >= len(stmt.result.columns) do return ""
 	return stmt.result.columns[index]

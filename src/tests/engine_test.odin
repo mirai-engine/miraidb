@@ -8001,6 +8001,37 @@ test_column_collation_and_generated :: proc(t: ^testing.T) {
 	db.store_close(reopened)
 }
 
+// A program that asks for a statement's columns before its first step makes
+// it run then; a runtime error it meets is still the first step's answer
+// (SQLite's shell asks first, and printed nothing for such an error).
+@(test)
+test_step_reports_error_of_early_run :: proc(t: ^testing.T) {
+	conn, open_err := db.embed_open(":memory:")
+	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
+	defer db.embed_close(conn)
+	for ask in 0 ..< 3 {
+		stmt := db.embed_prepare(conn, "SELECT json('{')")
+		if !testing.expect(t, stmt != nil) do return
+		switch ask {
+		case 1:
+			_ = db.embed_column_count(stmt)
+		case 2:
+			_ = db.embed_column_name(stmt, 0)
+		}
+		has_row, step_err := db.embed_step(stmt)
+		testing.expectf(t, !has_row && step_err.kind != .None, "ask %d: the step answered no error", ask)
+		testing.expect_value(t, db.embed_error(conn), "malformed JSON")
+		db.error_free(&step_err)
+		// A reset runs it again, and the error comes again.
+		db.embed_reset(stmt)
+		_ = db.embed_column_count(stmt)
+		_, again := db.embed_step(stmt)
+		testing.expect(t, again.kind != .None)
+		db.error_free(&again)
+		db.embed_finalize(stmt)
+	}
+}
+
 // A scalar subquery's value outlives the subquery: an aggregate's text was
 // read after its result had been freed (an UPDATE stored the freed bytes).
 @(test)
