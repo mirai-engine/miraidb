@@ -10297,9 +10297,13 @@ eval_aggregate_chosen :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error)
 		for row in chosen do delete(row.key)
 		delete(chosen)
 	}
+	// A program's collation leaves a slot in the key for the value's rank,
+	// filled once every row is known, as an ORDER BY does (collations.odin).
+	host_slots: ^[dynamic]Host_Order_Slot
 	for sources in rows {
 		sub := ctx^
 		sub.sources = sources
+		sub.host_slots = host_slots
 		if call.filter != nil {
 			value, filter_err := eval_expr(&sub, call.filter)
 			if filter_err.kind != .None do return {}, filter_err
@@ -10309,15 +10313,17 @@ eval_aggregate_chosen :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error)
 		if len(call.order_by) > 0 {
 			w: Byte_Writer
 			bw_init(&w)
-			for item in call.order_by {
+			first_slot := host_slots != nil ? len(host_slots^) : 0
+			for item, term in call.order_by {
 				value, order_err := eval_expr(&sub, item.expr)
 				if order_err.kind != .None {
 					bw_destroy(&w)
 					return {}, order_err
 				}
-				if _, is_host := host_order_collation(&sub, item.expr); is_host {
-					bw_destroy(&w)
-					return {}, errf(.Sql_Unsupported, "a program's collation cannot order an aggregate's rows")
+				if host, is_host := host_order_collation(&sub, item.expr); is_host {
+					host_slot_append(&sub, &w, item, term, value_clone(value, sub.tx.alloc), host)
+					host_slots = sub.host_slots
+					continue
 				}
 				collation, has := collate_name(item.expr)
 				if !has do collation, has = column_collation(&sub, item.expr)
@@ -10326,9 +10332,13 @@ eval_aggregate_chosen :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error)
 			}
 			key = slice.clone(bw_bytes(&w))
 			bw_destroy(&w)
+			if host_slots != nil {
+				for &slot in host_slots^[first_slot:] do slot.key = key
+			}
 		}
 		append(&chosen, Chosen_Row{key = key, sources = sources})
 	}
+	if host_slots != nil do host_order_resolve(ctx.tx.store, host_slots^[:])
 	if len(call.order_by) > 0 {
 		slice.stable_sort_by(chosen[:], proc(a, b: Chosen_Row) -> bool {
 			return string(a.key) < string(b.key)

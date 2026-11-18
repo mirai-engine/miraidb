@@ -96,6 +96,10 @@ def observe(lib, seen: dict) -> None:
         b"SELECT v, rank() OVER (PARTITION BY v COLLATE fold ORDER BY id) FROM w ORDER BY id",
         b"SELECT v, row_number() OVER (ORDER BY v COLLATE rev, id) FROM w ORDER BY id",
         b"SELECT v, rank() OVER (ORDER BY v COLLATE fold DESC) FROM w ORDER BY id",
+        # An aggregate's own ORDER BY under a host collation.
+        b"SELECT group_concat(v, ',' ORDER BY v COLLATE rev, id) FROM w",
+        b"SELECT group_concat(v, ',' ORDER BY v COLLATE fold DESC, id) FROM w",
+        b"SELECT json_group_array(v ORDER BY v COLLATE rev) FILTER (WHERE id > 1) FROM w",
         # A column declared with the collation compares, sorts and groups by it.
         b"CREATE TABLE hc (id INTEGER PRIMARY KEY, v TEXT COLLATE fold)",
         b"INSERT INTO hc (v) VALUES ('b'), ('A'), ('a'), ('B'), ('c')",
