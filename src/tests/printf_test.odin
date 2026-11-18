@@ -106,3 +106,29 @@ test_printf_doubles_are_sqlite_doubles :: proc(t: ^testing.T) {
 	testing.expect_value(t, mismatches, 0)
 	testing.expect_value(t, len(lines), 500)
 }
+
+// sqlite3_incomplete (SQLite 3.54) says what a text needs to be a complete
+// statement; every value here is what SQLite 3.54.1 answers for the same text.
+@(test)
+test_incomplete_is_sqlite_incomplete :: proc(t: ^testing.T) {
+	cases := []struct {
+		sql:  cstring,
+		want: i64,
+	} {
+		{"SELECT 1;", 0},
+		{"   ", 16},
+		{"SELECT 1", 0x101},
+		{"SELECT 'a", 0x270101},
+		{"CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1;", 0x201},
+		{"SELECT ((", 0x200000101},
+		{"/* x", 0x2f0001},
+		{"-- c", 0x2d0001},
+		{"SELECT 1 )", -0xfffffeff},
+		{"CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1; END;", 0},
+	}
+	for c in cases {
+		testing.expectf(t, face.sqlite3_incomplete(c.sql) == c.want, "%s: got %x, want %x", c.sql, face.sqlite3_incomplete(c.sql), c.want)
+	}
+	testing.expect_value(t, face.sqlite3_complete("SELECT 1;"), 1)
+	testing.expect_value(t, face.sqlite3_complete("SELECT 'a;"), 0)
+}

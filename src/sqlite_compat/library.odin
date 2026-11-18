@@ -71,72 +71,121 @@ sqlite3_complete16 :: proc "c" (sql: rawptr) -> c.int {
 	return sql_complete(string(buffer[:written])) ? 1 : 0
 }
 
-// sql_complete is SQLite's sqlite3_complete: the last token that is not a
-// space or a comment is a semicolon that ends a statement. Inside CREATE
-// TRIGGER only the semicolon after END does; an unclosed quote or comment
-// leaves the text incomplete.
+// SQLITE_EMPTY is what sqlite3_incomplete answers for text that holds no
+// statement.
+SQLITE_EMPTY :: 16
+
+// sql_incomplete is SQLite 3.54's sqlite3_incomplete (complete.c): 0 when the
+// text is complete (every comment, literal and quoted name closed, and it ends
+// with ";", or ";END;" for CREATE TRIGGER), SQLITE_EMPTY when it is only
+// spaces and comments, and otherwise a value that says what is missing: the
+// low byte SQLITE_ERROR, the next 1 for a semicolon, 2 for "END;", 3 for both,
+// the third the quote or comment left open, and the upper half the "(" left
+// unmatched.
 @(private)
-sql_complete :: proc(text: string) -> bool {
-	complete := false
-	// words is how many words the statement has had, for spotting CREATE
-	// [TEMP] TRIGGER; trigger says the statement is one; after_end that the
-	// last word was END.
-	words := 0
-	first_create := false
-	trigger := false
-	after_end := false
+sql_incomplete :: proc(text: string) -> i64 {
+	SEMI, WS, OTHER, EXPLAIN, CREATE, TEMP, TRIGGER, END :: 0, 1, 2, 3, 4, 5, 6, 7
+	trans := [8][8]u8 {
+		{1, 0, 2, 3, 4, 2, 2, 2},
+		{1, 1, 2, 3, 4, 2, 2, 2},
+		{1, 2, 2, 2, 2, 2, 2, 2},
+		{1, 3, 3, 2, 4, 2, 2, 2},
+		{1, 4, 2, 2, 2, 4, 5, 2},
+		{6, 5, 5, 5, 5, 5, 5, 5},
+		{6, 6, 5, 5, 5, 5, 5, 7},
+		{1, 7, 5, 5, 5, 5, 5, 5},
+	}
+	statemap := [8]u8{0, 0, 1, 1, 1, 3, 2, 1}
+	id_char :: proc(b: u8) -> bool {
+		return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_' || b == '$' || b >= 0x80
+	}
+	state: u8 = 0
+	pending: u8 = 0
+	parens: i32 = 0
 	i := 0
-	for i < len(text) {
-		ch := text[i]
-		if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f' {
-			i += 1
-			continue
-		}
-		if ch == '-' && i + 1 < len(text) && text[i + 1] == '-' {
-			for i < len(text) && text[i] != '\n' do i += 1
-			continue
-		}
-		if ch == '/' && i + 1 < len(text) && text[i + 1] == '*' {
-			close := strings.index(text[i + 2:], "*/")
-			if close < 0 do return false
-			i += close + 4
-			continue
-		}
-		if ch == ';' {
-			if !trigger || after_end {
-				complete = true
-				words, first_create, trigger, after_end = 0, false, false, false
-			} else {
-				complete = false
+	scan: for i < len(text) {
+		token := OTHER
+		switch text[i] {
+		case ';':
+			token = SEMI
+		case ' ', '\r', '\t', '\n', '\f':
+			token = WS
+		case '/':
+			if i + 1 >= len(text) || text[i + 1] != '*' do break
+			i += 2
+			for i < len(text) && !(text[i] == '*' && i + 1 < len(text) && text[i + 1] == '/') do i += 1
+			if i >= len(text) {
+				pending = '/'
+				break scan
 			}
 			i += 1
-			continue
+			token = WS
+		case '-':
+			if i + 1 >= len(text) || text[i + 1] != '-' do break
+			for i < len(text) && text[i] != '\n' do i += 1
+			if i >= len(text) {
+				pending = '-'
+				break scan
+			}
+			token = WS
+		case '[':
+			i += 1
+			for i < len(text) && text[i] != ']' do i += 1
+			if i >= len(text) {
+				pending = ']'
+				break scan
+			}
+		case '`', '"', '\'':
+			quote := text[i]
+			i += 1
+			for i < len(text) && text[i] != quote do i += 1
+			if i >= len(text) {
+				pending = quote
+				break scan
+			}
+		case '(':
+			parens += 1
+		case ')':
+			parens -= 1
+		case:
+			if !id_char(text[i]) do break
+			n := 1
+			for i + n < len(text) && id_char(text[i + n]) do n += 1
+			word := text[i:i + n]
+			switch {
+			case strings.equal_fold(word, "create"):
+				token = CREATE
+			case strings.equal_fold(word, "trigger"):
+				token = TRIGGER
+			case strings.equal_fold(word, "temp"), strings.equal_fold(word, "temporary"):
+				token = TEMP
+			case strings.equal_fold(word, "end"):
+				token = END
+			case strings.equal_fold(word, "explain"):
+				token = EXPLAIN
+			}
+			i += n - 1
 		}
-		complete = false
-		if ch == '\'' || ch == '"' || ch == '`' || ch == '[' {
-			closing := ch == '[' ? u8(']') : ch
-			close := strings.index_byte(text[i + 1:], closing)
-			if close < 0 do return false
-			i += close + 2
-			words += 1
-			after_end = false
-			continue
-		}
-		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' || ch >= 0x80 {
-			start := i
-			for i < len(text) && ((text[i] >= 'a' && text[i] <= 'z') || (text[i] >= 'A' && text[i] <= 'Z') || (text[i] >= '0' && text[i] <= '9') || text[i] == '_' || text[i] == '$' || text[i] >= 0x80) do i += 1
-			word := text[start:i]
-			words += 1
-			if words == 1 do first_create = strings.equal_fold(word, "create")
-			if first_create && words <= 3 && strings.equal_fold(word, "trigger") do trigger = true
-			after_end = strings.equal_fold(word, "end")
-			continue
-		}
+		state = trans[state][token]
 		i += 1
-		words += 1
-		after_end = false
 	}
-	return complete
+	if state == 0 && pending == 0 do return SQLITE_EMPTY
+	if state == 1 do parens = 0
+	incomplete: u64 = (state > 1 || pending != 0) ? 1 : 0
+	return i64(u64(u32(parens)) << 32 | u64(pending) << 16 | u64(statemap[state]) << 8 | incomplete)
+}
+
+@(private)
+sql_complete :: proc(text: string) -> bool {
+	return sql_incomplete(text) == 0
+}
+
+// sqlite3_incomplete is sql_incomplete for a C string; NULL is SQLITE_MISUSE.
+@(export)
+sqlite3_incomplete :: proc "c" (sql: cstring) -> i64 {
+	context = runtime.default_context()
+	if sql == nil do return i64(SQLITE_MISUSE)
+	return sql_incomplete(string(sql))
 }
 
 // Limits: SQLite's defaults, kept per connection. A program may lower one;
