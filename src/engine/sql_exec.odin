@@ -2943,6 +2943,70 @@ window_cell_rows_destroy :: proc(rows: ^[dynamic][dynamic]Window_Cell) {
 	delete(rows^)
 }
 
+// select_minmax_calls lists the query's min() and max() aggregates (calls
+// with one argument): with any, SQLite reads a bare column from a row they
+// chose (minmax_row).
+@(private)
+select_minmax_calls :: proc(projections: []^Expr, having: ^Expr, alloc: mem.Allocator) -> []^Call_Expr {
+	found := make([dynamic]^Call_Expr, 0, 2, alloc)
+	visit := proc(expr: ^Expr, user: rawptr) -> bool {
+		found := cast(^[dynamic]^Call_Expr)user
+		#partial switch &e in expr^ {
+		case Call_Expr:
+			if len(e.args) == 1 && !e.star && (strings.equal_fold(e.name, "min") || strings.equal_fold(e.name, "max")) {
+				append(found, &e)
+			}
+		case Subquery_Expr:
+			return false
+		}
+		return true
+	}
+	for projection in projections do expr_walk(projection, visit, &found)
+	expr_walk(having, visit, &found)
+	return found[:]
+}
+
+// minmax_row is the row of a group a bare column reads beside min() and
+// max(), as SQLite picks it: each row is loaded unless one of them kept its
+// value there (a value that is not better, or a NULL once it has one), so
+// the answer is the last row every one of them took, or with a single one,
+// the first row that reaches its extreme.
+@(private)
+minmax_row :: proc(ctx: ^Eval_Ctx, calls: []^Call_Expr, group: [][]Source) -> int {
+	best := make([]Value, len(calls), context.temp_allocator)
+	have := make([]bool, len(calls), context.temp_allocator)
+	chosen := 0
+	saved := ctx.sources
+	defer ctx.sources = saved
+	for row, k in group {
+		ctx.sources = row
+		hit := true
+		for call, i in calls {
+			value, err := eval_expr(ctx, call.args[0])
+			if err.kind != .None {
+				error_drop(err)
+				hit = false
+				continue
+			}
+			if value.kind == .Null {
+				if have[i] do hit = false
+				continue
+			}
+			if have[i] {
+				order, ok := value_compare(value, best[i])
+				better := ok && order != .Equal && (order == .Greater) == strings.equal_fold(call.name, "max")
+				if !better {
+					hit = false
+					continue
+				}
+			}
+			best[i], have[i] = value, true
+		}
+		if hit do chosen = k
+	}
+	return chosen
+}
+
 // Expr_Visit returns whether the walk should descend into the node it was given.
 Expr_Visit :: #type proc(expr: ^Expr, user: rawptr) -> bool
 
@@ -4226,6 +4290,9 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 				delete(buckets)
 			}
 		}
+		// Beside min() or max(), a bare column takes its value from a row they
+		// chose, as in SQLite; otherwise from the group's first row.
+		minmax := select_minmax_calls(expanded, stmt.having, context.temp_allocator)
 		for group, group_number in groups {
 			ctx.group = group[:]
 			ctx.grouped = true
@@ -4237,6 +4304,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			}
 			if len(group) > 0 {
 				ctx.sources = group[0]
+				if len(minmax) > 0 do ctx.sources = group[minmax_row(&ctx, minmax, group[:])]
 			} else {
 				ctx.sources = nil
 			}

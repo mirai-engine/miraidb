@@ -9094,6 +9094,31 @@ test_create_table_as_select :: proc(t: ^testing.T) {
 	testing.expect_value(t, taken.kind, db.Error_Kind.Table_Exists)
 }
 
+// A bare column beside min() or max() reads the row they chose, as SQLite
+// answers: the row of the extreme, the last row of an all-NULL group, and the
+// group's first row when no min() or max() is there.
+@(test)
+test_bare_columns_follow_min_max :: proc(t: ^testing.T) {
+	store, host := fresh_host(t, "bare_min_max")
+	if store == nil do return
+	defer destroy_host(store, host, "bare_min_max")
+	run(t, store, "CREATE TABLE t (g INT, a INT, b TEXT)")
+	run(t, store, "INSERT INTO t VALUES (1, 1, 'x'), (1, 5, 'y'), (1, 3, 'z'), (2, NULL, 'n'), (2, 7, 'q'), (2, 7, 'r'), (3, NULL, 'o1'), (3, NULL, 'o2')")
+	testing.expect_value(t, scalar(t, store, "SELECT b FROM (SELECT max(a), b FROM t)").s, "q")
+	testing.expect_value(t, scalar(t, store, "SELECT b FROM (SELECT min(a), b FROM t)").s, "x")
+	grouped := run(t, store, "SELECT g, max(a), b FROM t GROUP BY g ORDER BY g").rows
+	testing.expect_value(t, len(grouped), 3)
+	if len(grouped) == 3 {
+		testing.expect_value(t, grouped[0][2].s, "y")
+		testing.expect_value(t, grouped[1][2].s, "q")
+		testing.expect_value(t, grouped[2][2].s, "o2")
+	}
+	both := run(t, store, "SELECT g, max(a), min(a), b FROM t WHERE g = 1 GROUP BY g").rows
+	if testing.expect_value(t, len(both), 1) do testing.expect_value(t, both[0][3].s, "x")
+	counted := run(t, store, "SELECT g, count(*), b FROM t WHERE g = 2 GROUP BY g").rows
+	if testing.expect_value(t, len(counted), 1) do testing.expect_value(t, counted[0][2].s, "n")
+}
+
 @(test)
 test_alter_table_drop_column :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "drop_column")

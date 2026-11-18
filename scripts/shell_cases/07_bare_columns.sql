@@ -1,0 +1,17 @@
+CREATE TABLE t(g, a, b);
+INSERT INTO t VALUES (1, 1, 'x'), (1, 5, 'y'), (1, 3, 'z'), (2, NULL, 'n'), (2, 7, 'q'), (2, 7, 'r'), (3, NULL, 'only');
+SELECT max(a), b FROM t;
+SELECT min(a), b FROM t;
+SELECT b, max(a) FROM t;
+SELECT g, max(a), b FROM t GROUP BY g;
+SELECT g, min(a), b FROM t GROUP BY g;
+SELECT g, max(a), min(a), b FROM t GROUP BY g;
+SELECT g, max(a) + 1, b FROM t GROUP BY g HAVING count(*) > 1;
+SELECT g, b FROM t GROUP BY g HAVING max(a) > 4;
+SELECT max(a, g), b FROM t WHERE g = 1;
+DELETE FROM t;
+INSERT INTO t VALUES (1, 1, 'x'), (1, 5, 'y'), (1, 3, 'z'), (2, NULL, 'n'), (2, 7, 'q'), (2, 7, 'r'), (3, NULL, 'o1'), (3, NULL, 'o2');
+SELECT g, b FROM t GROUP BY g;
+SELECT g, count(*), b FROM t GROUP BY g;
+SELECT g, max(a), b FROM t GROUP BY g;
+SELECT g, sum(a), b FROM t GROUP BY g;
