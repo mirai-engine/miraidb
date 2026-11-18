@@ -634,6 +634,13 @@ embed_start :: proc(stmt: ^Embed_Statement) -> Error {
 		stmt.prepared = prepared
 	}
 	store_clear_cancel(stmt.conn.store)
+	// A statement's start counts as a step of the progress handler too, as
+	// SQLite's first instructions do: a statement that visits no row still
+	// gives it its chance to stop it.
+	if store_cancelled(stmt.conn.store) {
+		stmt.done = true
+		return embed_fail(stmt.conn, errf(.Cancelled, "interrupted"))
+	}
 	result, exec_err := embed_run(stmt.conn, stmt.prepared, stmt.params[:])
 	if exec_err.kind != .None {
 		stmt.done = true
