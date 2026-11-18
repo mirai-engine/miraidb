@@ -111,6 +111,9 @@ Database :: struct {
 	// zombie is a connection sqlite3_close_v2 closed while statements were
 	// still open: it closes when the last one is finalized.
 	zombie: bool,
+	// not_a_database is set by sqlite3_deserialize of bytes that are not a
+	// SQLite database (backup.odin).
+	not_a_database: bool,
 }
 
 Statement :: struct {
@@ -378,8 +381,12 @@ fail :: proc(db: ^Database, err: engine.Error) -> c.int {
 		dropped := err
 		engine.error_free(&dropped)
 	}
-	// An interrupted statement says so in SQLite's word.
-	set_error(db, err.kind == .Cancelled ? "interrupted" : err.message)
+	// An interrupted statement says so in SQLite's word, and so does a write to
+	// a database that is read-only.
+	message := err.message
+	if err.kind == .Cancelled do message = "interrupted"
+	if err.kind == .Transaction_Read_Only && db != nil && db.conn.store.read_only do message = "attempt to write a readonly database"
+	set_error(db, message)
 	code := sqlite_code(err)
 	extended := sqlite_extended_code(err)
 	// A function that failed with its own code (sqlite3_result_error_code) is
@@ -702,6 +709,13 @@ prepare :: proc(handle: rawptr, sql: cstring, nByte: c.int, ppStmt: ^rawptr, pzT
 	// Whitespace, semicolons or a comment and nothing else is not an error in
 	// SQLite: there is no statement to prepare, and *ppStmt stays NULL.
 	if only_space_or_comments(text[:end]) do return SQLITE_OK
+	// A damaged image handed to sqlite3_deserialize: every statement says so,
+	// as SQLite's does, until another image replaces it.
+	if db.not_a_database {
+		set_error(db, "file is not a database")
+		db.last_code, db.last_extended = SQLITE_NOTADB, SQLITE_NOTADB
+		return SQLITE_NOTADB
+	}
 	statement := engine.embed_prepare(db.conn, head)
 	if statement == nil {
 		// The engine reports where in `head` it stopped; SQLite reports where in

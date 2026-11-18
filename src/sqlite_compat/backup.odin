@@ -65,9 +65,10 @@ db_image :: proc(db: ^Database) -> ([]u8, engine.Error) {
 // sqlite3_deserialize makes the connection's database hold the image. The
 // bytes are copied (an image handed over with FREEONCLOSE is freed now, since
 // nothing keeps it), and a database opened on a SQLite file stops writing that
-// file, as SQLite's deserialized connection lives in memory. SQLite takes any
-// bytes and reports a damaged image on the first statement that reads it;
-// this refuses it here, with SQLITE_NOTADB.
+// file, as SQLite's deserialized connection lives in memory. Bytes that are not
+// a database are taken, as SQLite takes them, and every statement then fails
+// with SQLITE_NOTADB. With SQLITE_DESERIALIZE_READONLY a write fails with
+// SQLITE_READONLY.
 @(export)
 sqlite3_deserialize :: proc "c" (handle: rawptr, schema: cstring, data: [^]u8, db_size: i64, buffer_size: i64, flags: c.uint) -> c.int {
 	context = runtime.default_context()
@@ -85,13 +86,22 @@ sqlite3_deserialize :: proc "c" (handle: rawptr, schema: cstring, data: [^]u8, d
 		return SQLITE_BUSY
 	}
 	image := db_size > 0 ? data[:db_size] : nil
-	err := engine.store_replace_content(db.conn.store, image, true)
+	store := db.conn.store
+	store.read_only = false
+	db.not_a_database = false
+	err := engine.store_replace_content(store, image, true)
+	if err.kind == .Invalid_Argument || err.kind == .Corrupt_Log || err.kind == .Sql_Unsupported {
+		engine.error_free(&err)
+		db.not_a_database = true
+		err = engine.store_replace_content(store, nil, true)
+	}
 	if err.kind != .None {
-		code := err.kind == .Invalid_Argument || err.kind == .Corrupt_Log ? SQLITE_NOTADB : sqlite_code(err)
+		code := sqlite_code(err)
 		set_error_from(db, err)
 		db.last_code, db.last_extended = code, code
 		return code
 	}
+	if flags & SQLITE_DESERIALIZE_READONLY != 0 do store.read_only = true
 	db.in_memory = true
 	delete(db.filename)
 	db.filename = strings.clone_to_cstring("")

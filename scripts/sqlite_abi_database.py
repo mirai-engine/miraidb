@@ -142,6 +142,24 @@ def observe(lib, seen: dict) -> None:
         lib.sqlite3_deserialize(target, None, None, 0, 0, 0),
         answers(lib, target, b"SELECT count(*) FROM sqlite_master"),
     )
+    # READONLY: reads answer, a write is SQLITE_READONLY; bytes that are not a
+    # database are taken, and every statement after says so.
+    image = lib.sqlite3_serialize(source, b"main", ctypes.byref(size), 0)
+    copy = lib.sqlite3_malloc(size.value)
+    ctypes.memmove(copy, image, size.value)
+    lib.sqlite3_free(image)
+    seen["deserialize readonly"] = (
+        lib.sqlite3_deserialize(target, b"main", copy, size.value, size.value, FREEONCLOSE | 4),
+        answers(lib, target, b"SELECT count(*) FROM k"),
+        answers(lib, target, b"INSERT INTO k VALUES ('w', 9)"),
+    )
+    garbage = ctypes.create_string_buffer(b"not a database at all" * 50)
+    # (A statement that reads no table, SELECT 1, runs in some SQLite
+    # versions and not in others; one that reads the schema fails in all.)
+    seen["deserialize of bytes that are no database"] = (
+        lib.sqlite3_deserialize(target, b"main", garbage, len(garbage), len(garbage), 0),
+        answers(lib, target, b"SELECT count(*) FROM sqlite_master"),
+    )
     lib.sqlite3_close(target)
 
     # backup: what the destination held is replaced; a second step after the
@@ -222,7 +240,8 @@ def observe_foreign_keys(lib, seen: dict) -> None:
     steps = [
         b"CREATE TABLE p (id INTEGER PRIMARY KEY, k)",
         b"CREATE TABLE c (pid INTEGER REFERENCES p(id), n)",
-        b"CREATE TABLE m (r REFERENCES p(k))",
+        b"CREATE TABLE p2 (id INTEGER PRIMARY KEY, k)",
+        b"CREATE TABLE m (r REFERENCES p2(k))",
         b"INSERT INTO c VALUES (9, 1)",
         b"INSERT INTO m VALUES (1)",
         b"PRAGMA foreign_keys",
