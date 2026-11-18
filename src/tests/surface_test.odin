@@ -264,7 +264,7 @@ test_sqlite_rules :: proc(t: ^testing.T) {
 	defer db.embed_close(conn)
 	cases := [][2]string {
 		{"SELECT 1 / 0 IS NULL AND 5 % 0 IS NULL", "1"},
-		{"SELECT 9223372036854775807 + 1", "9.22337203685478e+18"},
+		{"SELECT 9223372036854775807 + 1", "9.2233720368547758e+18"},
 		{"SELECT CAST('12abc' AS INTEGER) || ',' || CAST('abc' AS REAL) || ',' || CAST('1e3' AS NUMERIC)", "12,0.0,1000"},
 		{"SELECT 10 % 3.5", "1.0"},
 		{"SELECT upper('straße') || lower(char(201))", "STRAßEÉ"},

@@ -1359,21 +1359,14 @@ sqlite_infer_columns :: proc(table: ^Sqlite_Table, rows: [][]Value) {
 	}
 }
 
-// sqlite_real_text renders a real as SQLite's text form does (`%!.15g`):
-// fifteen significant digits, and a real that prints as a whole number keeps
-// a ".0" so it still reads as a real.
+// sqlite_real_text renders a real as SQLite 3.54's text form does: printf's
+// `%!.17g` with SQLite's own decimal conversion (sqlite_fp.odin), which keeps
+// up to 17 significant digits but stops at fewer when they already read back
+// as the same double (0.1 is "0.1", 0.1 + 0.2 is "0.30000000000000004"), and
+// keeps a ".0" on a whole number (1.0, 1.0e+20). An infinity is "Inf" or
+// "-Inf", and zero prints without its sign.
 sqlite_real_text :: proc(f: f64, alloc: mem.Allocator) -> string {
 	if f != f do return strings.clone("NaN", alloc)
-	if f > 1.7976931348623157e308 do return strings.clone("Inf", alloc)
-	if f < -1.7976931348623157e308 do return strings.clone("-Inf", alloc)
-	// Zero prints without its sign, as SQLite prints it.
-	if f == 0 do return strings.clone("0.0", alloc)
-	text := fmt.tprintf("%.15g", f)
-	// A whole mantissa keeps its ".0" before the exponent too: 1.0e+20.
-	if at := strings.index_any(text, "eE"); at >= 0 {
-		if strings.contains_rune(text[:at], '.') do return strings.clone(text, alloc)
-		return strings.concatenate({text[:at], ".0", text[at:]}, alloc)
-	}
-	if strings.contains_any(text, ".n") do return strings.clone(text, alloc)
-	return strings.concatenate({text, ".0"}, alloc)
+	text, _, _ := sqlite_format_double('g', f, 0, false, false, true, false, 17, context.temp_allocator)
+	return strings.clone(string(text), alloc)
 }
