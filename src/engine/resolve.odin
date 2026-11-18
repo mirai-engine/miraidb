@@ -169,7 +169,7 @@ res_write_target :: proc(walk: ^Res_Walk, name: string) -> (Res_Source, bool) {
 	if table := tx_table_probe(walk.tx, name); table != nil {
 		return res_table_source(table, ""), true
 	}
-	if _, is_view := view_sql(walk.tx, name); is_view || is_system_table(name) || res_internal(name) {
+	if _, is_view := view_sql(walk.tx, name); is_view || is_system_table(name) || res_internal(name) || (strings.equal_fold(name, "sqlite_sequence") && sqlite_sequence_exists(walk.tx)) {
 		return Res_Source{name = name}, true
 	}
 	if vtab, is_vtab, _ := vtab_find(walk.tx, name); is_vtab {
@@ -277,6 +277,11 @@ res_ref :: proc(walk: ^Res_Walk, scope: ^Res_Scope, ref: ^Table_Ref) {
 		return
 	}
 	if len(ref.schema) > 0 || is_json_table_function(ref.name) || is_pragma_function(ref.name) || is_system_table(ref.name) do return
+	if strings.equal_fold(ref.name, "sqlite_sequence") && tx_table_probe(walk.tx, ref.name) == nil && sqlite_sequence_exists(walk.tx) {
+		source.columns = SEQUENCE_COLUMNS
+		source.known = true
+		return
+	}
 	if is_schema, _ := sqlite_schema_name(ref.name); is_schema && tx_table_probe(walk.tx, ref.name) == nil {
 		source.columns = SQLITE_SCHEMA_COLUMNS
 		source.known = true

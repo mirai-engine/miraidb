@@ -631,6 +631,8 @@ sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sq
 		if is_vtab do return vtab_write(tx, vtab, statement, params)
 		// A view is written through its INSTEAD OF triggers.
 		if _, is_view := view_sql(tx, target); is_view do return view_write(tx, target, statement, params)
+		// SQLite's table of AUTOINCREMENT counters (sqlite_sequence.odin).
+		if strings.equal_fold(target, "sqlite_sequence") && sqlite_sequence_exists(tx) do return sqlite_sequence_write(tx, statement, params)
 	}
 	switch stmt in statement {
 	case Reindex_Stmt:

@@ -150,6 +150,12 @@ tx_source_table :: proc(
 	}
 	sql, found := view_sql(tx, name)
 	if !found {
+		// SQLite's table of AUTOINCREMENT counters, once a table counts.
+		if strings.equal_fold(name, "sqlite_sequence") && sqlite_sequence_exists(tx) {
+			error_drop(table_err)
+			materialized, sequence_err := tx_materialize_sqlite_sequence(tx, name)
+			return materialized, true, sequence_err
+		}
 		// SQLite's catalog is read like a view (sqlite_schema.odin).
 		if is_schema, temp := sqlite_schema_name(name); is_schema {
 			error_drop(table_err)

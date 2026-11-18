@@ -1392,11 +1392,15 @@ store_apply :: proc(store: ^Store, op: Store_Op) -> Error {
 			return insert_err
 		}
 		table.next_row_id = max(table.next_row_id, u64(op.row_id) + 1)
+		// A counter written through sqlite_sequence (sqlite_sequence.odin).
+		if op.name == SEQUENCE_TABLE do store_apply_sequence(store, op.values)
 		return ERROR_NONE
 	case .Update:
 		table, table_err := store_table_writable(store, op.name)
 		if table_err.kind != .None do return table_err
-		return table_update(table, op.row_id, op.values)
+		update_err := table_update(table, op.row_id, op.values)
+		if update_err.kind == .None && op.name == SEQUENCE_TABLE do store_apply_sequence(store, op.values)
+		return update_err
 	case .Delete:
 		table, table_err := store_table_writable(store, op.name)
 		if table_err.kind != .None do return table_err
