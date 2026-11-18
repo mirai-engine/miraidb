@@ -315,10 +315,12 @@ int  sqlite3_create_function16(sqlite3 *db, const void *name, int nArg,
 
 /* --- Collations -----------------------------------------------------------
 ** A comparison SQL names with COLLATE: it answers in WHERE, ON, CASE, IN and
-** BETWEEN, and ORDER BY ranks the values under it. GROUP BY, DISTINCT, a
-** window's keys, an index and a column declaration need a key folded from the
-** text and refuse it with a message. BINARY, NOCASE and RTRIM cannot be
-** replaced here. A NULL comparison deletes the collation; the destructor runs
+** BETWEEN; ORDER BY (a window's too) ranks the values under it; GROUP BY,
+** DISTINCT and PARTITION BY group by the classes it makes; a column may be
+** declared with it, but not a key: an index orders folded text and refuses it.
+** BINARY, NOCASE and RTRIM may be replaced on the connection; an index under
+** a replaced name is not read meanwhile. A NULL comparison deletes the
+** collation (a deleted replacement gives the built-in back); the destructor runs
 ** on replace, delete and close. A UTF-16 text representation hands the
 ** comparison UTF-16 bytes. */
 

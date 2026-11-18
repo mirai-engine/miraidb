@@ -96,13 +96,12 @@ create_collation :: proc(
 		utf16      = utf16,
 		big_endian = big_endian,
 	}
-	err := engine.store_register_collation(db.conn.store, name, collation_call, rawptr(collation))
+	// BINARY, NOCASE and RTRIM may be replaced on the connection, as in SQLite.
+	err := engine.store_register_collation(db.conn.store, name, collation_call, rawptr(collation), replace_builtin = true)
 	if err.kind != .None {
-		// A built-in name cannot be replaced here; SQLite would. The destructor
-		// runs, since the registration did not take.
 		engine.error_free(&err)
 		collation_destroy(collation)
-		return set_error_code(db, SQLITE_ERROR, "unable to replace a built-in collation")
+		return SQLITE_ERROR
 	}
 	append(&db.collations, collation)
 	return SQLITE_OK

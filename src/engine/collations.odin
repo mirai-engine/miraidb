@@ -45,11 +45,14 @@ store_register_collation :: proc(
 	name: string,
 	compare: Collation_Fn,
 	user: rawptr = nil,
+	// replace_builtin lets BINARY, NOCASE or RTRIM be replaced on this store,
+	// as sqlite3_create_collation allows: the name then stops folding.
+	replace_builtin := false,
 ) -> Error {
 	if store == nil do return errf(.Invalid_Argument, "no database")
 	if len(name) == 0 do return errf(.Invalid_Argument, "a collation needs a name")
 	if compare == nil do return errf(.Invalid_Argument, "collation %s has no comparison", name)
-	if collation_is_builtin(name) {
+	if collation_is_builtin(name) && !replace_builtin {
 		return errf(.Invalid_Argument, "collation %s is built in and cannot be replaced", name)
 	}
 	// The map owns its keys, and `strings.to_lower` answers the argument itself when
@@ -114,6 +117,12 @@ store_collation_count :: proc(store: ^Store) -> int {
 // It is the one place that decides what a collation name means, so a comparison in
 // SQL and a comparison in the C ABI cannot drift apart.
 collation_compare :: proc(store: ^Store, name: string, a: string, b: string) -> (int, bool) {
+	// A built-in name the program replaced answers with its comparison.
+	if len(name) > 0 && collation_is_builtin(name) && store != nil && len(store.collations) > 0 {
+		for stored, def in store.collations {
+			if strings.equal_fold(stored, name) do return def.compare(a, b, def.user), true
+		}
+	}
 	if len(name) == 0 || strings.equal_fold(name, "binary") {
 		return strings.compare(a, b), true
 	}
@@ -277,7 +286,7 @@ host_order_collation :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (string, bool) {
 	if ctx == nil || ctx.tx == nil do return "", false
 	name, has := collate_name(expr)
 	if !has do name, has = column_collation(ctx, expr)
-	if !has || len(name) == 0 || collation_is_builtin(name) do return "", false
+	if !has || len(name) == 0 || collation_folds(ctx.tx.store, name) do return "", false
 	if _, found := store_collation(ctx.tx.store, name); !found do return "", false
 	return name, true
 }
@@ -344,4 +353,13 @@ host_order_resolve :: proc(store: ^Store, slots: []Host_Order_Slot) {
 			slot.key[slot.offset + b] = slot.descending ? ~byte : byte
 		}
 	}
+}
+
+// collation_folds reports a collation the engine folds into keys: a built-in
+// name the program did not replace on this store.
+collation_folds :: proc(store: ^Store, name: string) -> bool {
+	if !collation_is_builtin(name) do return false
+	if store == nil || len(store.collations) == 0 do return true
+	for stored, _ in store.collations do if strings.equal_fold(stored, name) do return false
+	return true
 }

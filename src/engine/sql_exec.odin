@@ -9063,6 +9063,9 @@ range_key :: proc(
 	if !constant do return {}, false
 	coerced, coerce_err := value_coerce(value, table.schema.columns[column_index].type)
 	if coerce_err.kind != .None do return {}, false
+	// An index cannot answer a collation the program replaced: it was folded
+	// by the built-in rule.
+	if column_host_collated(statement_store(), table.schema.columns[column_index]) do return {}, false
 	if len(table.schema.columns[column_index].collation) > 0 {
 		coerced = collate_ordered_value(coerced, table.schema.columns[column_index].collation)
 	}
@@ -9268,6 +9271,7 @@ join_probe_rows :: proc(
 	if eval_err.kind != .None do return nil, false
 	coerced, coerce_err := value_coerce(value, table.schema.columns[probe.column].type)
 	if coerce_err.kind != .None do return nil, false
+	if column_host_collated(tx.store, table.schema.columns[probe.column]) do return nil, false
 	if len(table.schema.columns[probe.column].collation) > 0 {
 		coerced = collate_ordered_value(coerced, table.schema.columns[probe.column].collation)
 	}
@@ -9318,6 +9322,7 @@ candidates_from_conjunct :: proc(
 		if !constant do return nil, false
 		coerced, coerce_err := value_coerce(value, table.schema.columns[column_index].type)
 		if coerce_err.kind != .None do return nil, false
+		if column_host_collated(statement_store(), table.schema.columns[column_index]) do return nil, false
 		// The index folded the text, so the probe must fold it the same way.
 		if len(table.schema.columns[column_index].collation) > 0 {
 			coerced = collate_ordered_value(coerced, table.schema.columns[column_index].collation)
@@ -9829,7 +9834,7 @@ collation_key_value :: proc(ctx: ^Eval_Ctx, expr: ^Expr, value: Value) -> Value 
 	name, has := collate_name(expr)
 	if !has do name, has = column_collation(ctx, expr)
 	if !has || len(name) == 0 || strings.equal_fold(name, "binary") do return value
-	if collation_is_builtin(name) do return collate_ordered_value(value, name)
+	if collation_folds(ctx.tx != nil ? ctx.tx.store : nil, name) do return collate_ordered_value(value, name)
 	if ctx.tx == nil do return value
 	return value_string(collation_class(ctx.tx, name, value.s))
 }
@@ -9896,7 +9901,7 @@ host_slot_append :: proc(ctx: ^Eval_Ctx, w: ^Byte_Writer, item: Order_Item, term
 // column_host_collated reports a column declared with a host collation.
 @(private)
 column_host_collated :: proc(store: ^Store, column: Column) -> bool {
-	if len(column.collation) == 0 || collation_is_builtin(column.collation) do return false
+	if len(column.collation) == 0 || collation_folds(store, column.collation) do return false
 	_, found := store_collation(store, column.collation)
 	return found
 }

@@ -133,6 +133,22 @@ def observe(lib, seen: dict) -> None:
     seen["needed: order"] = rows(b"SELECT v FROM t WHERE typeof(v) = 'text' ORDER BY v COLLATE late")
     seen["needed: asked"] = asked[:1]
 
+    # A built-in name may be replaced on the connection, a column declared
+    # with it included, and deleting the replacement restores it here. (An index
+    # built under the old rule is left out: SQLite documents that changing a
+    # collation under an index corrupts what the index answers.)
+    rows(b"CREATE TABLE nc (id INTEGER PRIMARY KEY, v TEXT COLLATE NOCASE)")
+    rows(b"INSERT INTO nc (v) VALUES ('a'), ('A'), ('b'), ('B')")
+    seen["replace NOCASE"] = lib.sqlite3_create_collation(db, b"NOCASE", UTF8, None, reverse)
+    for sql in (b"SELECT 'a' = 'A' COLLATE NOCASE, 'b' < 'a' COLLATE NOCASE",
+                b"SELECT v FROM nc ORDER BY v, id",
+                b"SELECT id FROM nc WHERE v = 'a' ORDER BY id",
+                b"SELECT count(*) FROM nc GROUP BY v ORDER BY 1"):
+        seen[f"replaced NOCASE: {sql!r}"] = rows(sql)
+    # Deleting the replacement gives the built-in rule back here; SQLite is
+    # left comparing in BINARY, so that answer is not compared.
+    lib.sqlite3_create_collation(db, b"NOCASE", UTF8, None, None)
+
     # Replace and delete run the destructor; close runs the rest.
     lib.sqlite3_create_collation_v2(db, b"rev", UTF8, c_void_p(2), reverse, destroy_p)
     seen["destroyed after replace"] = len(destroyed)
