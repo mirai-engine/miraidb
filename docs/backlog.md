@@ -33,7 +33,6 @@ Rules for this file:
 | R2 | every index entry is an encoded string | fixed-size keys where the column allows | M |
 | R3 | pruning walks every row of every table after each statement | prune what the commit touched | S |
 | R4 | a committed row is copied from the transaction arena to the table | hand the staged row over | M |
-| S3 | `NATURAL` joins are refused; `RIGHT` and `FULL` landed | the natural join | S |
 | S4 | `FILTER`, named `WINDOW` and aggregate `ORDER BY` missing; the ordered-set aggregates and `json_group_*` landed | the rest of the aggregate surface | S |
 | S5 | 15 of 121 built-in functions missing | the `jsonb_*` family, `json_parse`, `json_array_insert`, `sqlite_offset` | M |
 | S6 | six statements missing; all 63 pragmas answer | `INSTEAD OF`, `generate_series`, `ATTACH ':memory:'`, `VACUUM` in memory | S |
@@ -123,18 +122,6 @@ is **refused with a message**, never answered differently: that is the property
 `scripts/differential.py` guards, and each item keeps it. An item is done when
 its shapes run, `sqlite_gaps.py --check` is updated, and the differential corpus
 gains a query per shape that compares the answer with SQLite's.
-
-## S3 — Joins
-
-**Done.** `RIGHT` and `FULL` answer: the step remembers which rows of the inner
-side matched, and the ones that did not answer with every column of the left side
-NULL (`test_right_and_full_joins`). The left side's absent columns are built from
-the tables bound so far, so an empty left table still answers the right side.
-
-**Left.** `NATURAL`, which is `USING` over the shared column names. It cannot be
-desugared in the parser, because the shared names are known only when the tables
-are resolved; the executor would have to build the equality and the `USING` list
-from both schemas. Refused with a message that says to name the columns.
 
 ## S4 — Aggregates and windows
 

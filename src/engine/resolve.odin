@@ -635,3 +635,23 @@ res_ddl :: proc(walk: ^Res_Walk, statement: ^Statement) {
 		}
 	}
 }
+
+// relation_columns are the column names one FROM or JOIN entry has, as the
+// name pass sees them; false when they cannot be listed.
+relation_columns :: proc(tx: ^Tx, ref: ^Table_Ref) -> ([]string, bool) {
+	walk := Res_Walk{tx = tx}
+	walk.scopes = make([dynamic]Res_Scope, 0, 2, context.temp_allocator)
+	walk.ctes = make([dynamic]Res_Cte, 0, 1, context.temp_allocator)
+	scope := Res_Scope{sources = make([dynamic]Res_Source, 0, 1, context.temp_allocator)}
+	res_ref(&walk, &scope, ref)
+	if walk.err.kind != .None || len(scope.sources) == 0 || !scope.sources[0].known do return nil, false
+	source := scope.sources[0]
+	// A table's own name, the row id and hidden columns are not columns a
+	// natural join compares.
+	if tx_table := tx_table_probe(tx, ref.name); tx_table != nil && ref.subquery == nil {
+		names := make([dynamic]string, 0, len(tx_table.schema.columns), context.temp_allocator)
+		for column in tx_table.schema.columns do if !column.hidden do append(&names, column.name)
+		return names[:], true
+	}
+	return source.columns, true
+}

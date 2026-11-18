@@ -182,6 +182,12 @@ QUERIES = [
     # IN and BETWEEN compare under the left operand's collation.
     "SELECT id FROM emp WHERE name COLLATE NOCASE IN ('ANA', 'Zoe') ORDER BY id",
     "SELECT id FROM emp WHERE name COLLATE NOCASE BETWEEN 'L' AND 'MARIA' ORDER BY id",
+    # NATURAL joins (S3): USING over the names both sides share.
+    "SELECT emp.id FROM emp NATURAL JOIN dept ORDER BY 1",
+    "SELECT * FROM emp NATURAL JOIN dept ORDER BY id",
+    "SELECT d.id, n FROM dept AS d NATURAL LEFT JOIN nums ORDER BY 1, 2",
+    "SELECT count(*) FROM dept NATURAL JOIN kv",
+    "SELECT a.id, b.name FROM dept AS a NATURAL JOIN (SELECT id, name FROM dept WHERE id < 3) AS b ORDER BY 1",
     # UPDATE OR <resolution> (S2): IGNORE skips a row that breaks a key and goes
     # on, REPLACE removes the rows it collides with.
     "UPDATE OR IGNORE uq SET u = 10 WHERE id >= 2 RETURNING id",
@@ -284,7 +290,6 @@ QUERIES = [
 # The engine refuses these and says why; SQLite answers them. A refusal that
 # starts working fails the gate, which is how the list shrinks.
 REFUSED = {
-    "SELECT emp.id FROM emp NATURAL JOIN dept": "NATURAL joins are refused, not approximated",
 
     "SELECT sum(n) FILTER (WHERE n > 1) FROM nums": "an aggregate FILTER is not implemented; windows accept one",
 

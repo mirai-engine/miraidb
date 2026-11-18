@@ -292,6 +292,9 @@ Join_Clause :: struct {
 	// condition; the list stays because `SELECT *` prints a merged column once, as
 	// SQL says.
 	using_columns: []string,
+	// natural is NATURAL JOIN: USING over the column names both sides have,
+	// which are known once the tables are (natural_joins_resolve).
+	natural: bool,
 }
 
 Select_Stmt :: struct {

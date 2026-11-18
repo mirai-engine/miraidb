@@ -936,6 +936,7 @@ parse_select :: proc(p: ^Parser) -> Statement {
 				continue
 			}
 			kind := Join_Kind.Inner
+			natural := false
 			if p_match_keyword(p, "inner") {
 				if !p_expect_keyword(p, "join") do break
 			} else if p_is_keyword(p, "left") || p_is_keyword(p, "right") || p_is_keyword(p, "full") {
@@ -954,22 +955,27 @@ parse_select :: proc(p: ^Parser) -> Statement {
 				p_advance(p)
 				kind = .Cross
 				if !p_expect_keyword(p, "join") do break
-			} else if p_is_keyword(p, "natural") {
-				// NATURAL reads as an alias for the preceding table, so accepting
-				// it would turn an outer join into a cross join and answer a
-				// different question. Naming the columns with USING asks the one
-				// that was meant.
-				p_fail(
-					p,
-					.Sql_Syntax,
-					"NATURAL join is not supported: name the columns with USING (a, b)",
-				)
-				break
+			} else if p_match_keyword(p, "natural") {
+				// NATURAL [LEFT | RIGHT | FULL | INNER] JOIN: the columns come when
+				// the tables are known.
+				natural = true
+				if p_match_keyword(p, "left") {
+					kind = .Left
+				} else if p_match_keyword(p, "right") {
+					kind = .Right
+				} else if p_match_keyword(p, "full") {
+					kind = .Full
+				} else {
+					_ = p_match_keyword(p, "inner")
+				}
+				if kind != .Inner do p_match_keyword(p, "outer")
+				if !p_expect_keyword(p, "join") do break
 			} else if !p_match_keyword(p, "join") {
 				break
 			}
 			join: Join_Clause
 			join.kind = kind
+			join.natural = natural
 			join.table = parse_table_ref(p)
 			if p_match_keyword(p, "on") {
 				join.on = parse_expression(p)

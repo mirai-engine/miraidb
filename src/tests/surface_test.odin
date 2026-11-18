@@ -67,3 +67,24 @@ test_constraint_on_conflict :: proc(t: ^testing.T) {
 	testing.expect(t, !db.embed_in_transaction(conn))
 	testing.expect_value(t, scalar(t, reopened, "SELECT count(*) FROM c").i, i64(2))
 }
+
+@(test)
+test_natural_joins :: proc(t: ^testing.T) {
+	// NATURAL JOIN (S3) is USING over the names both sides share: `*` lists a
+	// shared column once, LEFT keeps the unmatched rows, and two tables with
+	// nothing in common give their cross product.
+	store := fresh_db(t, "natural")
+	if store == nil do return
+	defer cleanup_db(store, "natural")
+	run(t, store, "CREATE TABLE a (id INTEGER, k TEXT, x INTEGER)")
+	run(t, store, "CREATE TABLE b (id INTEGER, k TEXT, y INTEGER)")
+	run(t, store, "CREATE TABLE c (z INTEGER)")
+	run(t, store, "INSERT INTO a VALUES (1, 'p', 10), (2, 'q', 20), (3, 'r', 30)")
+	run(t, store, "INSERT INTO b VALUES (1, 'p', 100), (2, 'x', 200)")
+	run(t, store, "INSERT INTO c VALUES (7), (8)")
+	star := run(t, store, "SELECT * FROM a NATURAL JOIN b")
+	testing.expect_value(t, len(star.columns), 4)
+	testing.expect_value(t, len(star.rows), 1)
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM a NATURAL LEFT JOIN b").i, i64(3))
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM a NATURAL JOIN c").i, i64(6))
+}

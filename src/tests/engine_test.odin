@@ -1324,17 +1324,14 @@ test_unsupported_joins_are_refused :: proc(t: ^testing.T) {
 	run(t, store, "INSERT INTO a (id) VALUES (1), (2), (3)")
 	run(t, store, "INSERT INTO b (id) VALUES (2), (3), (4)")
 
-	// Read as an alias for the preceding table, NATURAL would become a cross
-	// join (nine rows here) and answer a question nobody asked, so it is refused
-	// with the spelling that does ask it. RIGHT and FULL are joins of their own.
-	for sql in ([]string {
-		"SELECT * FROM a NATURAL JOIN b",
-		"SELECT * FROM a NATURAL LEFT JOIN b",
-	}) {
-		result, err := db.sql_execute(store, sql)
-		db.sql_result_destroy(&result)
-		testing.expectf(t, err.kind == .Sql_Syntax, "%s must be refused, got %v", sql, err.kind)
-	}
+	// NATURAL is not an alias for the preceding table: it joins on the shared
+	// id (two rows here, not the nine of a cross join).
+	natural := run(t, store, "SELECT count(*) FROM a NATURAL JOIN b")
+	testing.expect_value(t, natural.rows[0][0].i, i64(2))
+	db.sql_result_destroy(&natural)
+	natural_left := run(t, store, "SELECT count(*) FROM a NATURAL LEFT JOIN b")
+	testing.expect_value(t, natural_left.rows[0][0].i, i64(3))
+	db.sql_result_destroy(&natural_left)
 
 	// LEFT OUTER still parses, and keeps the three rows of the left side.
 	left := run(t, store, "SELECT count(*) FROM a LEFT OUTER JOIN b ON a.id = b.id")

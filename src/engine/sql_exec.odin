@@ -3273,6 +3273,12 @@ sql_exec_stream_select :: proc(
 }
 
 sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Result, Error) {
+	// A NATURAL join becomes the USING it stands for, now the tables are known.
+	if select_has_natural_join(stmt) {
+		resolved, natural_err := natural_joins_resolve(tx, stmt)
+		if natural_err.kind != .None do return {}, natural_err
+		return sql_exec_select(tx, resolved, params)
+	}
 	// A virtual table a program implements is offered this query's WHERE.
 	saved_where, saved_params, saved_order := tx.vtab_where, tx.vtab_params, tx.vtab_order
 	tx.vtab_where, tx.vtab_params = stmt.where_clause, params
@@ -10091,4 +10097,61 @@ table_declares_resolution :: proc(table: ^Table) -> bool {
 	for column in table.schema.columns do if column.not_null_conflict != .Abort do return true
 	for idx in table.indexes do if idx.schema.on_conflict != .Abort do return true
 	return false
+}
+
+@(private)
+select_has_natural_join :: proc(stmt: Select_Stmt) -> bool {
+	for join in stmt.joins do if join.natural do return true
+	return false
+}
+
+// natural_joins_resolve gives `stmt` with each NATURAL join written as the
+// USING over the names the table before it and the joined one share (none
+// makes it a cross join), as SQLite reads it.
+@(private)
+natural_joins_resolve :: proc(tx: ^Tx, stmt: Select_Stmt) -> (Select_Stmt, Error) {
+	out := stmt
+	out.joins = make([]Join_Clause, len(stmt.joins), tx.alloc)
+	copy(out.joins, stmt.joins)
+	for &join, i in out.joins {
+		if !join.natural do continue
+		join.natural = false
+		left := i == 0 ? out.from : out.joins[i - 1].table
+		left_columns, left_known := relation_columns(tx, &left)
+		right_columns, right_known := relation_columns(tx, &join.table)
+		if !left_known || !right_known {
+			return {}, errf(.Sql_Unsupported, "a NATURAL join needs the columns of both sides")
+		}
+		shared := make([dynamic]string, 0, 2, tx.alloc)
+		for name in left_columns {
+			for other in right_columns {
+				if strings.equal_fold(name, other) {
+					append(&shared, strings.clone(name, tx.alloc))
+					break
+				}
+			}
+		}
+		join.using_columns = shared[:]
+		left_name := len(left.alias) > 0 ? left.alias : left.name
+		right_name := len(join.table.alias) > 0 ? join.table.alias : join.table.name
+		condition: ^Expr
+		for name in shared {
+			l := new(Expr, tx.alloc)
+			l^ = Column_Expr{table = left_name, name = name}
+			r := new(Expr, tx.alloc)
+			r^ = Column_Expr{table = right_name, name = name}
+			equality := new(Expr, tx.alloc)
+			equality^ = Binary_Expr{op = .Eq, left = l, right = r}
+			if condition == nil {
+				condition = equality
+			} else {
+				both := new(Expr, tx.alloc)
+				both^ = Binary_Expr{op = .And, left = condition, right = equality}
+				condition = both
+			}
+		}
+		join.on = condition
+		if len(shared) == 0 && join.kind == .Inner do join.kind = .Cross
+	}
+	return out, ERROR_NONE
 }
