@@ -185,10 +185,12 @@ p_expect_keyword :: proc(p: ^Parser, keyword: string) -> bool {
 	return false
 }
 
-// p_ident accepts a bare or quoted identifier.
+// p_ident accepts a bare or quoted identifier. A string literal where a name
+// is required is that name, as SQLite reads it: `CREATE TABLE 't'('c')` is what
+// SQLite's own full-text module writes for its shadow tables.
 @(private)
 p_ident :: proc(p: ^Parser) -> string {
-	if p.current.kind == .Ident || p.current.kind == .Quoted_Ident {
+	if p.current.kind == .Ident || p.current.kind == .Quoted_Ident || p.current.kind == .String {
 		name := strings.clone(p.current.text, p.alloc)
 		p.ident_start = p.current.start
 		p_advance(p)

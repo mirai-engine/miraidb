@@ -393,3 +393,15 @@ test_attached_databases_are_written :: proc(t: ^testing.T) {
 	defer db.embed_close(again)
 	expect_list(t, face_ints(t, again, "SELECT count(*) FROM kept"), {1}, "the file holds the commit")
 }
+
+// A string literal where a name goes is that name, as SQLite reads it.
+@(test)
+test_a_string_literal_names_an_object :: proc(t: ^testing.T) {
+	store := face_store(t)
+	defer db.store_close(store)
+	conn := db.embed_wrap(store)
+	defer db.embed_close(conn)
+	face_ok(t, conn, "CREATE TABLE 'quoted'(id INTEGER PRIMARY KEY, 'c0name')")
+	face_ok(t, conn, "INSERT INTO 'quoted' VALUES (1, 'x')")
+	expect_list(t, face_ints(t, conn, "SELECT id FROM quoted WHERE c0name = 'x'"), {1}, "the row")
+}
