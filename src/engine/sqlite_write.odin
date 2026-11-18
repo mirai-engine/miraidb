@@ -791,10 +791,32 @@ sqlite_file_write :: proc(store: ^Store, path: string, alloc := context.allocato
 	image, tables, rows, err = sqlite_file_image(store, alloc)
 	if err.kind != .None do return
 	defer delete(image)
+	// The change counter goes on from the file being replaced: a connection in
+	// another process notices a commit by the counter moving, and a rewrite
+	// that started it over at 1 could land on the value it last saw.
+	if previous, previous_ok := sqlite_file_change_counter(path); previous_ok && len(image) >= 96 {
+		next := previous + 1
+		for k in 0 ..< 4 {
+			image[24 + k] = u8(next >> uint(24 - 8 * k))
+			image[92 + k] = u8(next >> uint(24 - 8 * k))
+		}
+	}
 	if write_err := os.write_entire_file(path, image); write_err != nil {
 		return tables, rows, errf(.Io, "cannot write %s: %v", path, write_err)
 	}
 	return tables, rows, ERROR_NONE
+}
+
+// sqlite_file_change_counter reads the file change counter at offset 24 of a
+// SQLite file's header.
+sqlite_file_change_counter :: proc(path: string) -> (counter: u32, ok: bool) {
+	file, open_err := os.open(path, {.Read})
+	if open_err != nil do return 0, false
+	defer os.close(file)
+	header: [28]u8
+	got, read_err := os.read(file, header[:])
+	if read_err != nil || got < 28 || string(header[:16]) != SQLITE_MAGIC do return 0, false
+	return u32(header[24]) << 24 | u32(header[25]) << 16 | u32(header[26]) << 8 | u32(header[27]), true
 }
 
 // sqlite_file_image builds the SQLite database image of the store, the bytes

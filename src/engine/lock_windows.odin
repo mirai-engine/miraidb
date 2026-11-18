@@ -64,3 +64,38 @@ lock_os_release :: proc(handle: uintptr, offset: u64) {
 lock_os_close :: proc(handle: uintptr) {
 	_ = win.CloseHandle(win.HANDLE(handle))
 }
+
+// lock_os_acquire_range locks `length` bytes from `offset`, shared or exclusive,
+// without waiting: SQLite's file locks are ranges (its SHARED range is 510
+// bytes), and a lock some other handle holds fails at once.
+lock_os_acquire_range :: proc(handle: uintptr, offset: u64, length: u32, exclusive: bool) -> bool {
+	overlapped := lock_os_overlapped(offset)
+	flags := u32(win.LOCKFILE_FAIL_IMMEDIATELY)
+	if exclusive do flags |= win.LOCKFILE_EXCLUSIVE_LOCK
+	return win.LockFileEx(win.HANDLE(handle), flags, 0, length, 0, &overlapped) != false
+}
+
+lock_os_release_range :: proc(handle: uintptr, offset: u64, length: u32) {
+	overlapped := lock_os_overlapped(offset)
+	_ = win.UnlockFileEx(win.HANDLE(handle), 0, length, 0, &overlapped)
+}
+
+// lock_os_read_at reads from `offset` through the locking handle, so reading
+// the file never opens (and closes) another handle on it.
+lock_os_read_at :: proc(handle: uintptr, offset: u64, buffer: []u8) -> int {
+	total := 0
+	for total < len(buffer) {
+		overlapped := lock_os_overlapped(offset + u64(total))
+		read: win.DWORD
+		if !win.ReadFile(win.HANDLE(handle), raw_data(buffer[total:]), win.DWORD(len(buffer) - total), &read, &overlapped) do break
+		if read == 0 do break
+		total += int(read)
+	}
+	return total
+}
+
+lock_os_size :: proc(handle: uintptr) -> i64 {
+	size: win.LARGE_INTEGER
+	if !win.GetFileSizeEx(win.HANDLE(handle), &size) do return -1
+	return i64(size)
+}

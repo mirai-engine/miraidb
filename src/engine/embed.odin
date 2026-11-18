@@ -73,6 +73,9 @@ Embed_Conn :: struct {
 	// holds (sqlite_share.odin).
 	share:            ^Sqlite_Share,
 	share_generation: u64,
+	// share_counter is the file's change counter as this connection last read
+	// or wrote the file: another process's commit moves it.
+	share_counter:    u32,
 	// busy_timeout_ms is how long a write waits for another connection's write
 	// lock before it fails with "database is locked" (sqlite3_busy_timeout).
 	busy_timeout_ms:  int,

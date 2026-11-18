@@ -184,6 +184,11 @@ Store :: struct {
 	// attached holds the databases ATTACH opened, by name. They are read-only
 	// and their catalog lives in `_attach`.
 	attached:            map[string]^Store,
+	// mirror_guard runs around each write of the mirrored SQLite file (begin,
+	// then end): the shared-file layer takes SQLite's EXCLUSIVE lock there
+	// (sqlite_share.odin).
+	mirror_guard:        proc(ctx: rawptr, begin: bool),
+	mirror_guard_ctx:    rawptr,
 	// foreign_keys_off is PRAGMA foreign_keys = OFF: the keys are declared and
 	// listed but not enforced. The engine enforces them unless told; the
 	// SQLite face opens with them off, as SQLite does.
