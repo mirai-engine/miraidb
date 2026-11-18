@@ -1194,6 +1194,20 @@ store_table_open_paged :: proc(store: ^Store, entry: ^Catalog_Entry, seq: u64) -
 	schema := entry.schema
 	table, table_err := table_create(&schema)
 	if table_err.kind != .None do return nil, table_err
+	// A table the engine keeps for itself comes whole from the catalog.
+	if entry.inline {
+		for row in entry.rows {
+			if insert_err := table_insert(table, row.id, row.values); insert_err.kind != .None {
+				table_destroy(table)
+				return nil, insert_err
+			}
+		}
+		table.next_row_id = entry.next_row_id
+		table.next_sequence = entry.next_sequence
+		table.next_int_key = entry.next_int_key
+		table.apply_seq = seq
+		return table, ERROR_NONE
+	}
 	if strings.has_prefix(table.schema.name, "_") {
 		table_destroy(table)
 		return nil, errf(.Corrupt_Log, "the catalog names the system table %s", entry.schema.name)

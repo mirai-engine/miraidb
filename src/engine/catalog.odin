@@ -25,11 +25,16 @@ import "core:strings"
 //	header  32 bytes: "MRCT" | u32 version | u64 commit_seq | u64 payload_len | u32 crc32c | u32 flags
 //	payload        : u32 count | count * entry
 //	entry          : string name | schema_encode | u64 next_row_id | i64 next_sequence | i64 next_int_key
+//	                 | u8 inline | (inline: u32 rows | rows * (u64 id | u32 n | n * value))
+//
+// A table the engine keeps for itself (a `_`-prefixed one: views, triggers,
+// the CREATE texts) has no page file; its few rows travel inline, so a
+// database that has a view or a trigger still opens without replaying.
 //
 // The payload is written before the header, so a torn write leaves a header that
 // describes a payload that is not there, and the checksum rejects it.
 CATALOG_MAGIC :: "MRCT"
-CATALOG_VERSION :: u32(1)
+CATALOG_VERSION :: u32(2)
 CATALOG_HEADER_LEN :: 32
 
 // Catalog_Entry is one table as the catalog remembers it: the schema the log
@@ -39,6 +44,9 @@ Catalog_Entry :: struct {
 	next_row_id:   u64,
 	next_sequence: i64,
 	next_int_key:  i64,
+	// inline says the table has no page file and rows are all of it.
+	inline:        bool,
+	rows:          []Row,
 }
 
 store_catalog_path :: proc(store: ^Store) -> string {
@@ -50,10 +58,17 @@ store_catalog_path :: proc(store: ^Store) -> string {
 // without a page file keeps its rows nowhere else.
 @(private)
 catalog_covers_everything :: proc(store: ^Store) -> bool {
-	for _, table in store.tables {
-		if table.paged == nil do return false
+	for name, table in store.tables {
+		if table.paged == nil && !catalog_inline(name, table) do return false
 	}
 	return true
+}
+
+// catalog_inline reports a table whose rows the catalog carries itself: one
+// the engine keeps for itself, in memory.
+@(private)
+catalog_inline :: proc(name: string, table: ^Table) -> bool {
+	return table.paged == nil && strings.has_prefix(name, "_") && !table.schema.ephemeral
 }
 
 // catalog_encode serializes every table of the store at `seq`, header included.
@@ -63,14 +78,33 @@ catalog_encode :: proc(store: ^Store, seq: u64) -> []u8 {
 	defer delete(names)
 	payload: Byte_Writer
 	bw_init(&payload)
-	bw_write_u32(&payload, u32(len(names)))
+	count := 0
+	for name in names {
+		if !store.tables[name].schema.ephemeral do count += 1
+	}
+	bw_write_u32(&payload, u32(count))
 	for name in names {
 		table := store.tables[name]
+		// A temporary table is never logged, so it is not part of the state.
+		if table.schema.ephemeral do continue
 		bw_write_string(&payload, table.schema.name)
 		schema_encode(&payload, &table.schema)
 		bw_write_u64(&payload, table.next_row_id)
 		bw_write_u64(&payload, u64(table.next_sequence))
 		bw_write_u64(&payload, u64(table.next_int_key))
+		inline := catalog_inline(name, table)
+		bw_write_u8(&payload, inline ? 1 : 0)
+		if !inline do continue
+		rows := make([dynamic]Row)
+		table_collect(table, &rows, max(u64))
+		bw_write_u32(&payload, u32(len(rows)))
+		for row in rows {
+			bw_write_u64(&payload, u64(row.id))
+			bw_write_u32(&payload, u32(len(row.values)))
+			for value in row.values do value_encode(&payload, value)
+		}
+		table_collect_release(table, &rows)
+		delete(rows)
 	}
 	body := bw_bytes(&payload)
 	out := make([]u8, CATALOG_HEADER_LEN + len(body))
@@ -170,6 +204,27 @@ catalog_read :: proc(store: ^Store) -> (seq: u64, entries: []Catalog_Entry, ok: 
 			next_sequence = i64(br_read_u64(&r)),
 			next_int_key  = i64(br_read_u64(&r)),
 		}
+		entries[i].inline = br_read_u8(&r) == 1
+		if entries[i].inline && !r.bad {
+			row_count := int(br_read_u32(&r))
+			if r.bad || row_count < 0 || row_count > length {
+				catalog_entries_destroy(entries[:i + 1])
+				return 0, nil, false
+			}
+			rows := make([]Row, row_count)
+			entries[i].rows = rows
+			for j in 0 ..< row_count {
+				id := Row_Id(br_read_u64(&r))
+				width := int(br_read_u32(&r))
+				if r.bad || width < 0 || width > length {
+					catalog_entries_destroy(entries[:i + 1])
+					return 0, nil, false
+				}
+				values := make([]Value, width)
+				for k in 0 ..< width do values[k] = value_decode(&r, context.allocator)
+				rows[j] = Row{id = id, values = values}
+			}
+		}
 		if r.bad {
 			catalog_entries_destroy(entries[:i + 1])
 			return 0, nil, false
@@ -179,6 +234,13 @@ catalog_read :: proc(store: ^Store) -> (seq: u64, entries: []Catalog_Entry, ok: 
 }
 
 catalog_entries_destroy :: proc(entries: []Catalog_Entry) {
-	for &entry in entries do schema_destroy(&entry.schema, context.allocator)
+	for &entry in entries {
+		schema_destroy(&entry.schema, context.allocator)
+		for row in entry.rows {
+			for value in row.values do value_deep_free(value, context.allocator)
+			delete(row.values)
+		}
+		delete(entry.rows)
+	}
 	delete(entries)
 }

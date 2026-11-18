@@ -319,16 +319,20 @@ with a different pool size), `test_paged_table_churn` (compaction under churn).
 replaying the log. It is a cache with a proof attached: it is trusted only when
 its checksum holds and its sequence is exactly the one the log ends at.
 
-    header  32 B: "MRCT" | u32 version (1) | u64 commit_seq | u64 payload_len |
+    header  32 B: "MRCT" | u32 version (2) | u64 commit_seq | u64 payload_len |
                   u32 crc32c(payload) | u32 flags
     payload      : u32 count | count * entry
     entry        : string name | schema_encode(schema) | u64 next_row_id |
-                   i64 next_sequence | i64 next_int_key
+                   i64 next_sequence | i64 next_int_key | u8 inline |
+                   (inline: u32 rows | rows * (u64 id | u32 n | n * value))
 
-Bit 0 of `flags` promises that a page file backs every table in it, which is what
-makes the file sufficient on its own: a table without a page file keeps its rows
-only in the log, so a catalog that names one is refused (the store replays
-instead).
+Bit 0 of `flags` promises that the file holds the whole state: a page file backs
+every table in it, except the engine's own tables (`_view`, `_triggers`, the
+CREATE texts and the like), which have no page file and whose few rows travel
+inline. A table that is neither keeps its rows only in the log, so a catalog
+that names one is refused (the store replays instead). Version 1 had no inline
+tables, so a database with a view or a trigger always replayed; a version-1
+file is not read, which costs one replay.
 
 The payload is written before the header, so a torn write leaves a header whose
 checksum no longer matches its payload. The file is replaced in place with a

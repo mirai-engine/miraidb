@@ -11327,6 +11327,11 @@ test_trusted_open_skips_the_replay :: proc(t: ^testing.T) {
 	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
 	run(t, store, "CREATE TABLE item (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
 	run(t, store, "CREATE INDEX item_name ON item (name)")
+	// A view and a trigger live in the engine's own tables, which have no page
+	// file: the catalog carries their rows, so they no longer force a replay.
+	run(t, store, "CREATE VIEW item_names AS SELECT name FROM item")
+	run(t, store, "CREATE TABLE item_log (n INTEGER)")
+	run(t, store, "CREATE TRIGGER item_logged AFTER DELETE ON item BEGIN INSERT INTO item_log VALUES (old.id); END")
 	for i in 0 ..< 200 {
 		run(t, store, fmt.tprintf("INSERT INTO item (id, name) VALUES (%d, 'n%03d')", i, i))
 	}
@@ -11350,6 +11355,8 @@ test_trusted_open_skips_the_replay :: proc(t: ^testing.T) {
 	if !testing.expectf(t, db.error_ok(reopen_err), "reopen: %s", reopen_err.message) do return
 	testing.expect_value(t, reopened.replays_skipped, u64(1))
 	testing.expect_value(t, reopened.replay_records, u64(0))
+	testing.expect_value(t, scalar(t, reopened, "SELECT count(*) FROM item_names").i, i64(199))
+	testing.expect_value(t, scalar(t, reopened, "SELECT n FROM item_log").i, i64(7))
 	testing.expect_value(t, reopened.commit_seq, closed_seq)
 	testing.expect_value(t, scalar(t, reopened, "SELECT count(*) FROM item").i, i64(199))
 	testing.expect_value(t, scalar(t, reopened, "SELECT name FROM item WHERE id = 8").s, "changed")
