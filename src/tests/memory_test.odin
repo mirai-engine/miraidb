@@ -198,6 +198,16 @@ test_alter_table_leaves_nothing :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_full_text_leaves_nothing :: proc(t: ^testing.T) {
+	expect_nothing_left(t, .Memory, "_test_memory_fts", {
+		"CREATE VIRTUAL TABLE d USING fts5(title, body)",
+		"INSERT INTO d (title, body) VALUES ('one', 'the quick brown fox'), ('two', 'a lazy dog'), ('three', 'quick dogs run')",
+		"SELECT title FROM d WHERE d MATCH 'quick'",
+		"DELETE FROM d WHERE title = 'two'",
+	})
+}
+
+@(test)
 test_a_parse_error_leaves_nothing :: proc(t: ^testing.T) {
 	// The error names the line and column; the detail it wraps is not kept.
 	expect_nothing_left(t, .Memory, "_test_memory_parse", {"SELECT FROM WHERE", "SELEC 1", "CREATE TABLE ("}, fails = true)

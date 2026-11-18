@@ -81,7 +81,7 @@ fts_virtual_lookup :: proc(tx: ^Tx, name: string) -> (Fts_Table, bool) {
 		module := ""
 		if len(row.values) > 1 && row.values[1].kind == .String do module = row.values[1].s
 		columns := make([dynamic]string, 0, 4, tx.alloc)
-		for piece in strings.split(settings, ",") {
+		for piece in strings.split(settings, ",", context.temp_allocator) {
 			trimmed := strings.trim_space(piece)
 			if len(trimmed) > 0 do append(&columns, trimmed)
 		}
@@ -110,7 +110,7 @@ fts_create :: proc(tx: ^Tx, name: string, module: string, columns: []string) -> 
 	if existing, found := fts_virtual_lookup(tx, name); found {
 		return errf(.Table_Exists, "virtual table %s already exists", existing.name)
 	}
-	settings := strings.join(columns, ",")
+	settings := strings.join(columns, ",", tx.alloc)
 
 	create := strings.concatenate({"CREATE TABLE IF NOT EXISTS ", name, " ("}, tx.alloc)
 	for column, i in columns {
@@ -202,10 +202,12 @@ fts_drop :: proc(tx: ^Tx, name: string, if_exists: bool) -> Error {
 // in the size of the index.
 fts_index_row :: proc(tx: ^Tx, table: Fts_Table, doc: Row_Id, values: []Value, is_new: bool) -> Error {
 	if tx.fts_new_docs == nil do tx.fts_new_docs = make(map[string]map[Row_Id]bool)
-	documents := tx.fts_new_docs[table.name]
-	if documents == nil {
-		documents = make(map[Row_Id]bool)
-		tx.fts_new_docs[table.name] = documents
+	// The set is reached through the outer map, never copied out: inserting
+	// into a copy would grow storage the transaction no longer points at.
+	documents, found := &tx.fts_new_docs[table.name]
+	if !found {
+		tx.fts_new_docs[strings.clone(table.name, tx.alloc)] = make(map[Row_Id]bool)
+		documents = &tx.fts_new_docs[table.name]
 	}
 	old_length := 0
 	had_doc := false
@@ -284,8 +286,8 @@ fts_count_term :: proc(seen: ^map[string]int, word: string) -> int {
 }
 
 fts_remove_row :: proc(tx: ^Tx, table: Fts_Table, doc: Row_Id) -> Error {
-	if documents, exists := tx.fts_new_docs[table.name]; exists {
-		delete_key(&documents, doc)
+	if documents, exists := &tx.fts_new_docs[table.name]; exists {
+		delete_key(documents, doc)
 	}
 	length, existed := fts_doc_length(tx, table, doc)
 	del_terms := strings.concatenate({"DELETE FROM ", table.terms, " WHERE doc = ?"}, tx.alloc)
