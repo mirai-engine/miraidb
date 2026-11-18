@@ -38,8 +38,6 @@ def suite_modules() -> list[str]:
 
 # test id (module.Class.test) -> why it differs from SQLite here.
 KNOWN: dict[str, str] = {
-    "test_backup.BackupTests.test_database_source_name":
-        "an attached database is read-only here: CREATE TABLE attached_db.foo is refused",
     "test_dump.DumpTests.test_dump_virtual_tables":
         "fts4 keeps its index in the engine, not in SQLite's shadow tables "
         "(test_content, test_segdir, ...), so the dump has no CREATE TABLE for them",

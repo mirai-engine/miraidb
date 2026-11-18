@@ -28,6 +28,10 @@ Tx :: struct {
 	// these are the transaction's to free, including one a later ALTER or a
 	// ROLLBACK TO left out of state.altered.
 	replaced:  [dynamic]^Table,
+	// attached_txs are the transactions of the attached databases this one
+	// wrote, by database name (attach.odin): they commit before it and roll back
+	// with it.
+	attached_txs: map[string]^Tx,
 	arena:     virtual.Arena,
 	alloc:     mem.Allocator,
 	// read_seq is the commit sequence the transaction started from and
@@ -589,6 +593,8 @@ tx_rollback :: proc(tx: ^Tx) {
 
 @(private)
 tx_discard :: proc(tx: ^Tx) {
+	// What a commit did not take is undone with the transaction.
+	if tx.attached_txs != nil do tx_attached_rollback(tx)
 	// A virtual table written in a transaction that did not commit rolls back.
 	if len(tx.vtabs_written) > 0 && !tx.vtabs_done {
 		tx.vtabs_done = true
@@ -1924,6 +1930,14 @@ tx_commit :: proc(tx: ^Tx) -> Error {
 		if sync_err := vtab_transaction_step(tx, .Sync); sync_err.kind != .None {
 			tx_discard(tx)
 			return sync_err
+		}
+	}
+	// The attached databases commit first; one that fails is the transaction's
+	// failure.
+	if tx.attached_txs != nil {
+		if attached_err := tx_attached_commit(tx); attached_err.kind != .None {
+			tx_discard(tx)
+			return attached_err
 		}
 	}
 	started_us := now_microseconds()

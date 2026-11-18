@@ -351,3 +351,45 @@ test_shared_files_outlive_the_opener_allocator :: proc(t: ^testing.T) {
 	face_fails(t, second, "INSERT INTO t VALUES (2)", "database is locked")
 	face_ok(t, first, "COMMIT")
 }
+
+// An attached database is written as SQLite writes one: a table made there, rows
+// put in it inside the connection's transaction, which reads its own writes and
+// takes them back on ROLLBACK; and a SQLite file that was not there is created
+// and holds what was committed to it.
+@(test)
+test_attached_databases_are_written :: proc(t: ^testing.T) {
+	path := "_test_attached_write.db"
+	os.remove(path)
+	defer os.remove(path)
+	conn, open_err := db.embed_open(":memory:")
+	testing.expect(t, db.error_ok(open_err))
+	defer db.embed_close(conn)
+	conn.store.sqlite_rules = true
+	conn.store.sqlite_names = true
+
+	face_ok(t, conn, "ATTACH DATABASE ':memory:' AS side")
+	face_ok(t, conn, "CREATE TABLE side.foo (key INTEGER)")
+	face_ok(t, conn, "INSERT INTO side.foo (key) VALUES (3), (4)")
+	expect_list(t, face_ints(t, conn, "SELECT key FROM side.foo ORDER BY key"), {3, 4}, "autocommit")
+	face_ok(t, conn, "BEGIN")
+	face_ok(t, conn, "INSERT INTO side.foo VALUES (5)")
+	face_ok(t, conn, "UPDATE side.foo SET key = key * 10 WHERE key = 3")
+	expect_list(t, face_ints(t, conn, "SELECT key FROM side.foo ORDER BY key"), {4, 5, 30}, "inside the transaction")
+	face_ok(t, conn, "ROLLBACK")
+	expect_list(t, face_ints(t, conn, "SELECT key FROM side.foo ORDER BY key"), {3, 4}, "after ROLLBACK")
+	face_ok(t, conn, "DELETE FROM side.foo WHERE key = 3")
+	face_fails(t, conn, "INSERT INTO nowhere.foo VALUES (1)", "unknown database nowhere")
+	// A failed statement is undone there alone.
+	face_ok(t, conn, "CREATE UNIQUE INDEX side.foo_key ON foo (key)")
+	face_fails(t, conn, "INSERT INTO side.foo VALUES (6), (4)", "UNIQUE constraint failed")
+	expect_list(t, face_ints(t, conn, "SELECT key FROM side.foo ORDER BY key"), {4}, "after a failed statement")
+
+	face_ok(t, conn, "ATTACH DATABASE '_test_attached_write.db' AS disk")
+	face_ok(t, conn, "CREATE TABLE disk.kept (v TEXT)")
+	face_ok(t, conn, "INSERT INTO disk.kept VALUES ('on disk')")
+	face_ok(t, conn, "DETACH DATABASE disk")
+	again, again_err := db.embed_open(path)
+	testing.expect(t, db.error_ok(again_err))
+	defer db.embed_close(again)
+	expect_list(t, face_ints(t, again, "SELECT count(*) FROM kept"), {1}, "the file holds the commit")
+}

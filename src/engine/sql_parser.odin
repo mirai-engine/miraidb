@@ -1755,20 +1755,24 @@ parse_merge :: proc(p: ^Parser) -> Statement {
 	return stmt
 }
 
-// p_write_target reads the table an INSERT, UPDATE or DELETE writes. `main.t`
-// is the database itself, as in SQLite; any other qualifier names an attached
-// database, which is read-only.
+// p_object_name reads the name of a table or an index a statement writes or
+// makes. `main.t` and `temp.t` are the database itself (p_ident reads `main.`);
+// any other qualifier names an attached database, and the name comes back as
+// `schema` ATTACHED_SEPARATOR `t` for the executor to route (attach_split).
+@(private)
+p_object_name :: proc(p: ^Parser) -> string {
+	name := p_ident(p)
+	if p.err.kind != .None || !p_is_punct(p, ".") do return name
+	p_advance(p)
+	table := p_ident(p)
+	if strings.equal_fold(name, "temp") do return table
+	return strings.concatenate({name, ATTACHED_SEPARATOR, table}, p.alloc)
+}
+
+// p_write_target reads the table an INSERT, UPDATE or DELETE writes.
 @(private)
 p_write_target :: proc(p: ^Parser) -> string {
-	name := p_ident(p)
-	if !p_is_punct(p, ".") do return name
-	if !strings.equal_fold(name, "main") {
-		// Say so instead of a syntax error.
-		p_fail(p, .Sql_Unsupported, "writes to an attached database are read-only")
-		return name
-	}
-	p_advance(p)
-	return p_ident(p)
+	return p_object_name(p)
 }
 
 @(private)
@@ -2298,7 +2302,7 @@ parse_create_table :: proc(p: ^Parser, ephemeral: bool, event: bool) -> Statemen
 		p_expect_keyword(p, "exists")
 		stmt.if_not_exists = true
 	}
-	stmt.name = p_ident(p)
+	stmt.name = p_object_name(p)
 	p.object_start = p.ident_start
 	if !p_expect_punct(p, "(") do return stmt
 	columns := make([dynamic]Column_Def, 0, 4, p.alloc)
@@ -2656,7 +2660,7 @@ parse_create_index :: proc(p: ^Parser, unique: bool) -> Statement {
 		p_expect_keyword(p, "exists")
 		stmt.if_not_exists = true
 	}
-	stmt.name = p_ident(p)
+	stmt.name = p_object_name(p)
 	p.object_start = p.ident_start
 	p_expect_keyword(p, "on")
 	stmt.table = p_ident(p)
@@ -2809,7 +2813,7 @@ parse_drop :: proc(p: ^Parser) -> Statement {
 			p_expect_keyword(p, "exists")
 			stmt.if_exists = true
 		}
-		stmt.name = p_ident(p)
+		stmt.name = p_object_name(p)
 		if p_match_keyword(p, "on") do stmt.table = p_ident(p)
 		return stmt
 	}
@@ -2819,7 +2823,7 @@ parse_drop :: proc(p: ^Parser) -> Statement {
 		p_expect_keyword(p, "exists")
 		stmt.if_exists = true
 	}
-	stmt.name = p_ident(p)
+	stmt.name = p_object_name(p)
 	return stmt
 }
 

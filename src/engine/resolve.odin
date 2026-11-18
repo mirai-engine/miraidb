@@ -69,6 +69,17 @@ Res_Cte :: struct {
 // one that is not there.
 sql_resolve_names :: proc(tx: ^Tx, statement: ^Statement, alloc := context.allocator) -> Error {
 	if tx == nil || statement == nil do return ERROR_NONE
+	// A statement that writes an attached database names that database's
+	// objects: it is checked there, through the transaction that writes it when
+	// there is one.
+	if schema, local, attached := statement_attached(statement^); attached {
+		if writer, open := tx.attached_txs[schema]; open do return sql_resolve_names(writer, &local, alloc)
+		store := tx.store.attached[schema]
+		if store == nil do return errf(.Table_Not_Found, "unknown database %s", schema)
+		reader := tx_begin_read(store)
+		defer tx_end(reader)
+		return sql_resolve_names(reader, &local, alloc)
+	}
 	walk := Res_Walk{tx = tx, alloc = alloc}
 	walk.scopes = make([dynamic]Res_Scope, 0, 4, context.temp_allocator)
 	walk.ctes = make([dynamic]Res_Cte, 0, 2, context.temp_allocator)

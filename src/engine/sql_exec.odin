@@ -582,6 +582,17 @@ sql_exec_vacuum :: proc(store: ^Store, stmt: Vacuum_Stmt) -> (Sql_Result, Error)
 }
 
 sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sql_Result, Error) {
+	// A statement that writes an attached database runs in that database's
+	// transaction, which this one opens and ends.
+	if schema, local, attached := statement_attached(statement); attached {
+		writer, writer_err := tx_attached(tx, schema)
+		if writer_err.kind != .None do return {}, writer_err
+		// A statement that fails is undone there as a unit, as it is here.
+		mark := tx_statement_begin(writer)
+		result, err := sql_exec_mutation(writer, local, params)
+		tx_statement_end(writer, mark, err.kind != .None)
+		return result, err
+	}
 	// A write statement makes the transaction a write transaction even when it
 	// changes no row, which is when SQLite calls its commit hook.
 	tx.wrote = true

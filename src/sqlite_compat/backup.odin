@@ -325,8 +325,8 @@ sqlite3_db_name :: proc "c" (handle: rawptr, index: c.int) -> cstring {
 }
 
 // sqlite3_db_readonly is 1 for a read-only database, 0 for a writable one and
-// -1 for a name the connection does not hold. An attached database is
-// read-only here.
+// -1 for a name the connection does not hold. An attached database answers
+// for its own store, as SQLite's does.
 @(export)
 sqlite3_db_readonly :: proc "c" (handle: rawptr, schema: cstring) -> c.int {
 	context = runtime.default_context()
@@ -334,7 +334,7 @@ sqlite3_db_readonly :: proc "c" (handle: rawptr, schema: cstring) -> c.int {
 	if db == nil do return -1
 	if schema_is_main(schema) do return db.conn.store.read_only ? 1 : 0
 	if strings.equal_fold(string(schema), "temp") do return 0
-	if _, found := db.conn.store.attached[string(schema)]; found do return 1
+	if attached, found := db.conn.store.attached[string(schema)]; found do return attached.read_only ? 1 : 0
 	return -1
 }
 

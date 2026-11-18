@@ -7891,9 +7891,10 @@ test_attach_and_detach :: proc(t: ^testing.T) {
 	_, unknown_table := db.sql_execute(store, "SELECT * FROM side.nope")
 	testing.expect_value(t, unknown_table.kind, db.Error_Kind.Table_Not_Found)
 
-	// Writes against an attached database are refused: it is opened read-only.
-	_, write := db.sql_execute(store, "INSERT INTO side.other_items (id, name) VALUES (3, 'three')")
-	testing.expect(t, !db.error_ok(write))
+	// A write to the attached database lands there, as in SQLite.
+	write_result, write := db.sql_execute(store, "INSERT INTO side.other_items (id, name) VALUES (3, 'three')")
+	testing.expectf(t, db.error_ok(write), "write: %s", write.message)
+	db.sql_result_destroy(&write_result)
 
 	// The catalog survives a reopen of the principal.
 	db.store_close(store)
@@ -7901,7 +7902,7 @@ test_attach_and_detach :: proc(t: ^testing.T) {
 	if !testing.expectf(t, db.error_ok(reopen_err), "reopen: %s", reopen_err.message) do return
 	host = db.host_init(reopened)
 	count = scalar(t, reopened, "SELECT count(*) FROM side.other_items")
-	testing.expect_value(t, count.i, i64(2))
+	testing.expect_value(t, count.i, i64(3))
 
 	// DETACH forgets it, and a reopen stays detached.
 	detach_result := run(t, reopened, "DETACH side")
