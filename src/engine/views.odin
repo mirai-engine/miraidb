@@ -146,6 +146,15 @@ tx_source_table :: proc(
 	}
 	sql, found := view_sql(tx, name)
 	if !found {
+		// SQLite's catalog is read like a view (sqlite_schema.odin).
+		if is_schema, temp := sqlite_schema_name(name); is_schema {
+			error_drop(table_err)
+			if len(args) > 0 {
+				return nil, false, errf(.Sql_Unsupported, "table %s does not take parameters", name)
+			}
+			materialized, schema_err := tx_materialize_sqlite_schema(tx, name, temp)
+			return materialized, true, schema_err
+		}
 		return nil, false, table_err
 	}
 	materialized, view_err := tx_materialize_view(tx, name, sql, args)

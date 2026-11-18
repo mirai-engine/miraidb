@@ -258,3 +258,51 @@ test_jsonb_and_array_insert :: proc(t: ^testing.T) {
 		testing.expectf(t, strings.contains(err.message, "not an array element"), "%s: %s", sql, err.message)
 	}
 }
+
+@(test)
+test_sqlite_schema_catalog :: proc(t: ^testing.T) {
+	// sqlite_schema (and its older name sqlite_master) lists the tables,
+	// indexes, views and triggers, in any query shape, including what the
+	// current transaction created; `main.` names the database itself.
+	store := fresh_db(t, "sqlite_schema")
+	if store == nil do return
+	defer cleanup_db(store, "sqlite_schema")
+	run(t, store, "CREATE TABLE main.p (id INTEGER PRIMARY KEY, k TEXT UNIQUE, n INT)")
+	run(t, store, "CREATE INDEX main.p_n ON p (n)")
+	run(t, store, "CREATE TABLE log (m)")
+	run(t, store, "CREATE VIEW v AS SELECT k FROM p")
+	run(t, store, "CREATE TRIGGER tr AFTER INSERT ON p BEGIN INSERT INTO log VALUES (new.k); END")
+	run(t, store, "INSERT INTO main.p (k, n) VALUES ('a', 1)")
+	run(t, store, "UPDATE main.p SET n = 2")
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM main.p WHERE n = 2").i, i64(1))
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM log").i, i64(1))
+
+	testing.expect_value(t, scalar(t, store, "SELECT group_concat(name, ',') FROM (SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name)").s, "log,p")
+	testing.expect_value(t, scalar(t, store, "SELECT group_concat(name, ',') FROM (SELECT name FROM sqlite_schema WHERE type = 'index' ORDER BY name)").s, "p_k_key,p_n")
+	testing.expect_value(t, scalar(t, store, "SELECT sql FROM main.sqlite_master WHERE name = 'v'").s, `CREATE VIEW "v" AS SELECT k FROM p`)
+	testing.expect_value(t, scalar(t, store, "SELECT tbl_name FROM sqlite_master WHERE type = 'trigger'").s, "p")
+	testing.expect_value(t, scalar(t, store, "SELECT sql FROM sqlite_master WHERE type = 'trigger'").s, `CREATE TRIGGER "tr" AFTER INSERT ON "p" BEGIN INSERT INTO log VALUES (new.k); END`)
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM sqlite_master m JOIN p ON m.tbl_name = 'p'").i, i64(4))
+	testing.expect_value(t, scalar(t, store, "SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE name = 'p') AND NOT EXISTS (SELECT 1 FROM sqlite_schema WHERE name = 'gone')").b, true)
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM sqlite_temp_master").i, i64(0))
+	_ = run_error(t, store, "SELECT nosuch FROM sqlite_master")
+	_ = run_error(t, store, "INSERT INTO other.p (k) VALUES ('x')")
+
+	// What a transaction created is in its own catalog before it commits.
+	conn := db.embed_wrap(store)
+	defer db.embed_close(conn)
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "BEGIN")))
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "CREATE TABLE fresh (a)")))
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "DROP TABLE log")))
+	stmt := db.embed_prepare(conn, "SELECT group_concat(name, ',') FROM (SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name)")
+	has_row, step_err := db.embed_step(stmt)
+	testing.expect(t, db.error_drop(step_err) && has_row)
+	testing.expect_value(t, db.embed_column_text(stmt, 0), "fresh,p")
+	db.embed_finalize(stmt)
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "ROLLBACK")))
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM sqlite_master WHERE name IN ('fresh', 'log')").i, i64(1))
+	run(t, store, "DROP TABLE main.log")
+	info := run(t, store, "PRAGMA main.table_info(p)")
+	testing.expect_value(t, len(info.rows), 3)
+	db.sql_result_destroy(&info)
+}

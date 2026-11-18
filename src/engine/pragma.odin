@@ -30,7 +30,10 @@ sqlite_pragma_statement :: proc(sql: string) -> (body: string, is_pragma: bool) 
 	}
 	// A statement usually arrives with its terminator: `PRAGMA name;` means the
 	// same as `PRAGMA name`.
-	return strings.trim_right(strings.trim_space(trimmed[6:]), "; \t\r\n"), true
+	body = strings.trim_right(strings.trim_space(trimmed[6:]), "; \t\r\n")
+	// `PRAGMA main.name` asks the database itself, as `PRAGMA name` does.
+	if len(body) > 5 && strings.equal_fold(body[:5], "main.") do body = strings.trim_space(body[5:])
+	return body, true
 }
 
 // pragma_columns clones literal column names: sql_result_destroy frees them.

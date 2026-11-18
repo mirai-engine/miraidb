@@ -26,7 +26,8 @@ INFORMATION_SCHEMA_COLUMNS :: "_information_schema_columns"
 // it does not know is left alone, so `ATTACH … AS s` keeps working.
 pg_catalog_table :: proc(schema, name: string) -> (string, bool) {
 	switch {
-	case strings.equal_fold(schema, "public"):
+	case strings.equal_fold(schema, "public"), strings.equal_fold(schema, "main"):
+		// `main` is SQLite's name for the database itself.
 		return name, true
 	case strings.equal_fold(schema, "information_schema"):
 		if strings.equal_fold(name, "tables") do return INFORMATION_SCHEMA_TABLES, true

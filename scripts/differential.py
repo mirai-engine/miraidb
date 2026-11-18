@@ -221,6 +221,13 @@ QUERIES = [
     "SELECT json_insert('[1]', '$[#]', 2), json_set('[1,2]', '$[#-1]', 9), json_replace('[1,2]', '$[#]', 9), json_remove('[1,2,3]', '$[#-1]'), json_set('{\"a\":[1]}', '$.a[#]', 5)",
     # A JSON number keeps the text it was written with.
     "SELECT json('[1.50, 1e2, -0, 12345678901234567890]')",
+    # sqlite_schema: which tables, views and triggers exist, and `main.`. The
+    # sql text is the engine's rendering (docs/sqlite.md), so it is not compared.
+    "SELECT type, name, tbl_name FROM sqlite_master WHERE type IN ('table', 'view', 'trigger') ORDER BY type, name",
+    "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+    "SELECT name FROM main.sqlite_master WHERE type = 'view'",
+    "SELECT d.name, count(*) FROM main.dept d JOIN sqlite_master m ON m.tbl_name = 'emp' AND m.type = 'table' GROUP BY d.name ORDER BY d.name",
+    "SELECT count(*) FROM sqlite_temp_master",
     # FILTER, an aggregate's ORDER BY and the WINDOW clause (S4).
     "SELECT dept, count(*) FILTER (WHERE salary > 60), sum(salary) FILTER (WHERE name IS NOT NULL) FROM emp GROUP BY dept ORDER BY dept",
     "SELECT dept, group_concat(name, '/' ORDER BY name DESC) FROM emp GROUP BY dept ORDER BY dept",

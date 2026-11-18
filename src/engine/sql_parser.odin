@@ -183,6 +183,18 @@ p_ident :: proc(p: ^Parser) -> string {
 	if p.current.kind == .Ident || p.current.kind == .Quoted_Ident {
 		name := strings.clone(p.current.text, p.alloc)
 		p_advance(p)
+		// `main.x` names x in the database itself, as SQLite reads it; a name
+		// qualified by anything else is left to the caller.
+		if strings.equal_fold(name, "main") && p_is_punct(p, ".") {
+			lexer, token := p_mark(p)
+			p_advance(p)
+			if p.current.kind == .Ident || p.current.kind == .Quoted_Ident {
+				qualified := strings.clone(p.current.text, p.alloc)
+				p_advance(p)
+				return qualified
+			}
+			p_reset(p, lexer, token)
+		}
 		return name
 	}
 	p_fail(p, .Sql_Syntax, "expected a name, found %q", p.current.text)
@@ -1498,12 +1510,8 @@ parse_insert :: proc(p: ^Parser) -> Statement {
 		}
 	}
 	p_expect_keyword(p, "into")
-	insert.table = p_ident(p)
-	if p_is_punct(p, ".") {
-		// An attached database is read-only: say so instead of a syntax error.
-		p_fail(p, .Sql_Unsupported, "writes to an attached database are read-only")
-		return insert
-	}
+	insert.table = p_write_target(p)
+	if p.err.kind != .None do return insert
 	columns := make([dynamic]string, 0, 4, p.alloc)
 	if p_match_punct(p, "(") {
 		for {
@@ -1617,11 +1625,8 @@ parse_update :: proc(p: ^Parser) -> Statement {
 			return update
 		}
 	}
-	update.table = p_ident(p)
-	if p_is_punct(p, ".") {
-		p_fail(p, .Sql_Unsupported, "writes to an attached database are read-only")
-		return update
-	}
+	update.table = p_write_target(p)
+	if p.err.kind != .None do return update
 	p_expect_keyword(p, "set")
 	assignments := make([dynamic]Assignment, 0, 4, p.alloc)
 	for {
@@ -1729,16 +1734,29 @@ parse_merge :: proc(p: ^Parser) -> Statement {
 	return stmt
 }
 
+// p_write_target reads the table an INSERT, UPDATE or DELETE writes. `main.t`
+// is the database itself, as in SQLite; any other qualifier names an attached
+// database, which is read-only.
+@(private)
+p_write_target :: proc(p: ^Parser) -> string {
+	name := p_ident(p)
+	if !p_is_punct(p, ".") do return name
+	if !strings.equal_fold(name, "main") {
+		// Say so instead of a syntax error.
+		p_fail(p, .Sql_Unsupported, "writes to an attached database are read-only")
+		return name
+	}
+	p_advance(p)
+	return p_ident(p)
+}
+
 @(private)
 parse_delete :: proc(p: ^Parser) -> Statement {
 	delete_stmt: Delete_Stmt
 	p_expect_keyword(p, "delete")
 	p_expect_keyword(p, "from")
-	delete_stmt.table = p_ident(p)
-	if p_is_punct(p, ".") {
-		p_fail(p, .Sql_Unsupported, "writes to an attached database are read-only")
-		return delete_stmt
-	}
+	delete_stmt.table = p_write_target(p)
+	if p.err.kind != .None do return delete_stmt
 	if p_match_keyword(p, "using") {
 		delete_stmt.using_ref = parse_table_ref(p)
 	}
