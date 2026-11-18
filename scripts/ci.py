@@ -159,6 +159,11 @@ def build_gates(args: argparse.Namespace) -> list[Gate]:
             gates.append(
                 Gate("SQLite file across processes", [args.windows_python, "scripts/sqlite_processes.py"])
             )
+            # SQLite's own command-line shell, built against SQLite and against
+            # the facade: the same cases give the same output.
+            gates.append(
+                Gate("SQLite's shell on the facade", [args.windows_python, "scripts/sqlite_shell.py"])
+            )
             gates.append(
                 Gate("Python SDK smoke", [args.windows_python, "scripts/sdk_smoke.py"])
             )
