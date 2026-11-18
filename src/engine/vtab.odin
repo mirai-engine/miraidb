@@ -30,6 +30,13 @@ Vtab_Constraint :: struct {
 
 VTAB_OP_EQ :: u8(2)
 
+// Vtab_Order is one ORDER BY term the engine offers a module: a column and
+// its direction. The engine sorts the rows whatever the module answers.
+Vtab_Order :: struct {
+	column:     int,
+	descending: bool,
+}
+
 // Vtab_Row is one row a module produced: its row id and a value per declared
 // column, owned by the caller's allocator.
 Vtab_Row :: struct {
@@ -45,9 +52,19 @@ Vtab_Module :: struct {
 	eponymous_only: bool,
 	connect:        proc(ctx: rawptr, create: bool, table: string, args: []string) -> (handle: rawptr, declaration: string, err: Error),
 	disconnect:     proc(ctx: rawptr, handle: rawptr, destroy: bool) -> Error,
-	scan:           proc(ctx: rawptr, handle: rawptr, constraints: []Vtab_Constraint, values: []Value, columns: int, rows: ^[dynamic]Vtab_Row) -> Error,
+	scan:           proc(ctx: rawptr, handle: rawptr, constraints: []Vtab_Constraint, values: []Value, order: []Vtab_Order, columns: int, rows: ^[dynamic]Vtab_Row) -> Error,
 	// update is nil for a read-only module.
 	update:         proc(ctx: rawptr, handle: rawptr, argv: []Value, rowid: ^i64) -> Error,
+	// transaction is called at each step of a transaction that wrote to the
+	// table: begin before its first write, sync then commit when it commits,
+	// rollback when it does not; savepoint, release and rollback_to with the
+	// savepoint's level. nil when the module does not take part.
+	transaction:    proc(ctx: rawptr, handle: rawptr, step: Vtab_Tx_Step, level: int) -> Error,
+	// rename runs for ALTER TABLE ... RENAME TO; nil refuses it.
+	rename:         proc(ctx: rawptr, handle: rawptr, new_name: string) -> Error,
+	// find_function answers a function the module overloads for a call whose
+	// first argument is one of its columns.
+	find_function:  proc(ctx: rawptr, handle: rawptr, name: string, arity: int) -> (Scalar_Function, rawptr, bool),
 	// release runs when the module is unregistered or the store closes.
 	release:        proc(ctx: rawptr),
 }
@@ -310,7 +327,21 @@ vtab_materialize :: proc(tx: ^Tx, vtab: ^Vtab, args: []Value) -> (^Table, Error)
 	append(&offered, ..args)
 	vtab_where_terms(tx, vtab, &constraints, &offered)
 	rows := make([dynamic]Vtab_Row, 0, 16, tx.alloc)
-	if err := module.scan(module.ctx, vtab.handle, constraints[:], offered[:], len(vtab.columns), &rows); err.kind != .None {
+	// The query's ORDER BY, when it names only this table's columns.
+	order := make([dynamic]Vtab_Order, 0, len(tx.vtab_order), tx.alloc)
+	for item in tx.vtab_order {
+		column, is_column := item.expr^.(Column_Expr)
+		index := -1
+		if is_column && (len(column.table) == 0 || strings.equal_fold(column.table, vtab.name)) {
+			for candidate, i in vtab.columns do if strings.equal_fold(candidate.name, column.name) do index = i
+		}
+		if index < 0 {
+			clear(&order)
+			break
+		}
+		append(&order, Vtab_Order{column = index, descending = item.descending})
+	}
+	if err := module.scan(module.ctx, vtab.handle, constraints[:], offered[:], order[:], len(vtab.columns), &rows); err.kind != .None {
 		return nil, err
 	}
 	columns := make([]Column, len(vtab.columns) + 1, tx.alloc)
@@ -341,6 +372,7 @@ vtab_materialize :: proc(tx: ^Tx, vtab: ^Vtab, args: []Value) -> (^Table, Error)
 vtab_write :: proc(tx: ^Tx, vtab: ^Vtab, statement: Statement, params: []Value) -> (Sql_Result, Error) {
 	module, _, _ := vtab_module(tx.store, vtab.module)
 	if module.update == nil do return {}, errf(.Sql_Unsupported, "table %s may not be modified", vtab.name)
+	if err := vtab_join_transaction(tx, vtab, module); err.kind != .None do return {}, err
 	affected := 0
 	width := len(vtab.columns)
 	argv := make([]Value, width + 2, tx.alloc)
@@ -458,9 +490,15 @@ vtab_list_remove :: proc(list: ^[dynamic]^Vtab, index: int) {
 // with the constant first) that name a column of `vtab`, with SQLite's codes.
 @(private)
 vtab_where_terms :: proc(tx: ^Tx, vtab: ^Vtab, constraints: ^[dynamic]Vtab_Constraint, values: ^[dynamic]Value) {
-	if tx.vtab_where == nil do return
+	if tx.vtab_where == nil && tx.vtab_join == nil do return
 	terms := make([dynamic]^Expr, 0, 4, tx.alloc)
-	split_and(tx.vtab_where, &terms)
+	if tx.vtab_where != nil do split_and(tx.vtab_where, &terms)
+	if tx.vtab_join != nil do split_and(tx.vtab_join, &terms)
+	names_vtab :: proc(tx: ^Tx, vtab: ^Vtab, qualifier: string) -> bool {
+		if len(qualifier) == 0 do return true
+		if strings.equal_fold(qualifier, vtab.name) do return true
+		return len(tx.vtab_alias) > 0 && strings.equal_fold(qualifier, tx.vtab_alias)
+	}
 	for term in terms {
 		binary, is_binary := term^.(Binary_Expr)
 		if !is_binary || binary.left == nil || binary.right == nil do continue
@@ -480,7 +518,8 @@ vtab_where_terms :: proc(tx: ^Tx, vtab: ^Vtab, constraints: ^[dynamic]Vtab_Const
 			continue
 		}
 		column_side, constant_side := binary.left, binary.right
-		if _, left_is_column := column_side^.(Column_Expr); !left_is_column {
+		left_column, left_is_column := column_side^.(Column_Expr)
+		if !left_is_column || !names_vtab(tx, vtab, left_column.table) || !vtab_has_column(vtab, left_column.name) {
 			column_side, constant_side = binary.right, binary.left
 			// `5 > x` is `x < 5`.
 			switch op {
@@ -496,7 +535,7 @@ vtab_where_terms :: proc(tx: ^Tx, vtab: ^Vtab, constraints: ^[dynamic]Vtab_Const
 		}
 		column, is_column := column_side^.(Column_Expr)
 		if !is_column do continue
-		if len(column.table) > 0 && !strings.equal_fold(column.table, vtab.name) do continue
+		if !names_vtab(tx, vtab, column.table) do continue
 		index := -1
 		for candidate, i in vtab.columns do if strings.equal_fold(candidate.name, column.name) do index = i
 		if index < 0 do continue
@@ -507,10 +546,111 @@ vtab_where_terms :: proc(tx: ^Tx, vtab: ^Vtab, constraints: ^[dynamic]Vtab_Const
 		case Param_Expr:
 			if c.index < 0 || c.index >= len(tx.vtab_params) do continue
 			constant = tx.vtab_params[c.index]
+		case Column_Expr:
+			// A column of a table bound before this one, or of the query around
+			// it, is a constant for this scan.
+			if names_vtab(tx, vtab, c.table) && (len(c.table) > 0 || vtab_has_column(vtab, c.name)) do continue
+			ctx := Eval_Ctx{tx = tx, params = tx.vtab_params, sources = tx.vtab_sources, outer = tx.outer, now_us = now_microseconds()}
+			value, eval_err := eval_expr(&ctx, constant_side)
+			if eval_err.kind != .None {
+				error_free(&eval_err)
+				continue
+			}
+			constant = value
 		case:
 			continue
 		}
 		append(constraints, Vtab_Constraint{column = index, op = op, usable = true})
 		append(values, constant)
 	}
+}
+
+@(private)
+vtab_has_column :: proc(vtab: ^Vtab, name: string) -> bool {
+	for column in vtab.columns do if strings.equal_fold(column.name, name) do return true
+	return false
+}
+
+// vtab_is_named reports a name a program's module serves.
+vtab_is_named :: proc(tx: ^Tx, name: string) -> bool {
+	_, found, err := vtab_find(tx, name)
+	error_drop(err)
+	return found
+}
+
+Vtab_Tx_Step :: enum u8 {
+	Begin,
+	Sync,
+	Commit,
+	Rollback,
+	Savepoint,
+	Release,
+	Rollback_To,
+}
+
+// vtab_join_transaction makes a table part of the transaction before its
+// first write: begin, and a savepoint for each one already open.
+@(private)
+vtab_join_transaction :: proc(tx: ^Tx, vtab: ^Vtab, module: Vtab_Module) -> Error {
+	if module.transaction == nil do return ERROR_NONE
+	for joined in tx.vtabs_written do if joined == vtab do return ERROR_NONE
+	if err := module.transaction(module.ctx, vtab.handle, .Begin, 0); err.kind != .None do return err
+	for level in 0 ..< len(tx.savepoints) {
+		if err := module.transaction(module.ctx, vtab.handle, .Savepoint, level); err.kind != .None do return err
+	}
+	append(&tx.vtabs_written, vtab)
+	return ERROR_NONE
+}
+
+// vtab_transaction_step tells every table the transaction wrote about one step
+// of it, and stops at the first that refuses.
+vtab_transaction_step :: proc(tx: ^Tx, step: Vtab_Tx_Step, level := 0) -> Error {
+	for vtab in tx.vtabs_written {
+		module, _, registered := vtab_module(tx.store, vtab.module)
+		if !registered || module.transaction == nil do continue
+		if err := module.transaction(module.ctx, vtab.handle, step, level); err.kind != .None do return err
+	}
+	return ERROR_NONE
+}
+
+// vtab_rename runs ALTER TABLE ... RENAME TO for a module's table.
+vtab_rename :: proc(tx: ^Tx, name: string, new_name: string) -> (bool, Error) {
+	if _, _, recorded := vtab_catalog_entry(tx, name); !recorded do return false, ERROR_NONE
+	vtab, found, find_err := vtab_find(tx, name)
+	if find_err.kind != .None do return true, find_err
+	if !found do return true, errf(.Table_Not_Found, "no such table: %s", name)
+	module, _, _ := vtab_module(tx.store, vtab.module)
+	if module.rename == nil do return true, errf(.Sql_Unsupported, "table %s may not be altered", name)
+	if err := module.rename(module.ctx, vtab.handle, new_name); err.kind != .None do return true, err
+	rename_row := strings.concatenate({"UPDATE ", VIRTUAL_TABLE, " SET name = ? WHERE name = ?"}, tx.alloc)
+	if err := fts_run(tx, rename_row, []Value{value_string(strings.clone(new_name, tx.alloc)), value_string(strings.clone(name, tx.alloc))}); err.kind != .None {
+		return true, err
+	}
+	alloc := runtime.heap_allocator()
+	delete(vtab.name, alloc)
+	vtab.name = strings.clone(new_name, alloc)
+	return true, ERROR_NONE
+}
+
+// vtab_overload asks the module behind the first argument's table whether it
+// overloads `call`: the argument must be a column of a source that is one of
+// a program's virtual tables.
+vtab_overload :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Scalar_Function, rawptr, bool) {
+	column, is_column := call.args[0]^.(Column_Expr)
+	if !is_column do return nil, nil, false
+	for source in ctx.sources {
+		if source.table == nil do continue
+		columns := source.table.schema.columns
+		// A materialized module table ends with its hidden rowid column.
+		if len(columns) == 0 || columns[len(columns) - 1].name != VTAB_ROWID_COLUMN do continue
+		if len(column.table) > 0 && !strings.equal_fold(column.table, source.table.schema.name) && !(len(source.alias) > 0 && strings.equal_fold(column.table, source.alias)) do continue
+		if _, found := schema_column_index(&source.table.schema, column.name); !found do continue
+		vtab, is_vtab, err := vtab_find(ctx.tx, source.table.schema.name)
+		error_drop(err)
+		if !is_vtab do return nil, nil, false
+		module, _, _ := vtab_module(ctx.tx.store, vtab.module)
+		if module.find_function == nil do return nil, nil, false
+		return module.find_function(module.ctx, vtab.handle, call.name, len(call.args))
+	}
+	return nil, nil, false
 }

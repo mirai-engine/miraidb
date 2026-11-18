@@ -27,6 +27,7 @@ numbers_scan :: proc(
 	handle: rawptr,
 	constraints: []db.Vtab_Constraint,
 	values: []db.Value,
+	order: []db.Vtab_Order,
 	columns: int,
 	rows: ^[dynamic]db.Vtab_Row,
 ) -> db.Error {
@@ -54,6 +55,7 @@ memo_scan :: proc(
 	handle: rawptr,
 	constraints: []db.Vtab_Constraint,
 	values: []db.Value,
+	order: []db.Vtab_Order,
 	columns: int,
 	rows: ^[dynamic]db.Vtab_Row,
 ) -> db.Error {

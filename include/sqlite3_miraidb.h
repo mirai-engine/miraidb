@@ -347,9 +347,13 @@ int sqlite3_collation_needed16(sqlite3 *db, void *pArg,
 ** equality constraints on the HIDDEN columns in order) and the WHERE terms
 ** `column op constant`, xFilter receives the ones it numbered, and the rows
 ** come from xOpen/xEof/xColumn/xRowid/xNext; the WHERE is applied to them
-** afterwards whatever the module did. INSERT, UPDATE and DELETE call xUpdate
-** with SQLite's arguments. xBegin, xSync, xCommit, xRollback, the savepoint
-** methods, xRename, xFindFunction, xShadowName and xIntegrity are not called. */
+** afterwards whatever the module did. A table after the first of a join is
+** read once per outer row, with its arguments and its ON terms bound to that
+** row. INSERT, UPDATE and DELETE call xUpdate with SQLite's arguments; xBegin,
+** xSync, xCommit and xRollback (and, from iVersion 2, xSavepoint, xRelease and
+** xRollbackTo) follow the transaction that wrote; ALTER TABLE RENAME calls
+** xRename; xFindFunction overloads a function whose first argument is one of
+** the table's columns. xShadowName and xIntegrity are not called. */
 
 typedef struct sqlite3_vtab sqlite3_vtab;
 typedef struct sqlite3_index_info sqlite3_index_info;

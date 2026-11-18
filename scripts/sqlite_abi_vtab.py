@@ -36,6 +36,10 @@ class Constraint(ctypes.Structure):
     _fields_ = [("iColumn", c_int), ("op", c_ubyte), ("usable", c_ubyte), ("iTermOffset", c_int)]
 
 
+class OrderBy(ctypes.Structure):
+    _fields_ = [("iColumn", c_int), ("desc", c_ubyte)]
+
+
 class Usage(ctypes.Structure):
     _fields_ = [("argvIndex", c_int), ("omit", c_ubyte)]
 
@@ -58,6 +62,10 @@ FILTER = ctypes.CFUNCTYPE(c_int, c_void_p, c_int, c_char_p, c_int, ctypes.POINTE
 COLUMN = ctypes.CFUNCTYPE(c_int, c_void_p, c_void_p, c_int)
 ROWID = ctypes.CFUNCTYPE(c_int, c_void_p, ctypes.POINTER(c_longlong))
 UPDATE = ctypes.CFUNCTYPE(c_int, c_void_p, c_int, ctypes.POINTER(c_void_p), ctypes.POINTER(c_longlong))
+LEVEL = ctypes.CFUNCTYPE(c_int, c_void_p, c_int)
+RENAME = ctypes.CFUNCTYPE(c_int, c_void_p, c_char_p)
+FIND = ctypes.CFUNCTYPE(c_int, c_void_p, c_int, c_char_p, ctypes.POINTER(c_void_p), ctypes.POINTER(c_void_p))
+SCALAR = ctypes.CFUNCTYPE(None, c_void_p, c_int, ctypes.POINTER(c_void_p))
 DESTROY = ctypes.CFUNCTYPE(None, c_void_p)
 
 NAMES = ["xCreate", "xConnect", "xBestIndex", "xDisconnect", "xDestroy", "xOpen", "xClose", "xFilter", "xNext",
@@ -141,7 +149,9 @@ def observe(lib, seen: dict) -> None:
                 mask |= 1 << (constraint.iColumn - 1)
                 slot += 1
         info.idxNum = mask
-        info.estimatedCost = 10.0
+        # Without a stop the series is empty: a plan that cannot bind it is the
+        # worst one, so SQLite picks the plan that binds it.
+        info.estimatedCost = 10.0 if mask & 2 else 1e9
         return 0
 
     def series_open(vtab, out):
@@ -234,6 +244,10 @@ def observe(lib, seen: dict) -> None:
         b"SELECT value FROM series WHERE start = 3 AND stop = 4",
         b"SELECT count(*) FROM series",
         b"SELECT value FROM series(1, 3) ORDER BY value DESC LIMIT 2",
+        # Arguments and join terms that read an earlier table: one scan per row.
+        b"WITH t(n) AS (VALUES (1), (2), (3)) SELECT t.n, s.value FROM t, series(1, t.n) AS s ORDER BY 1, 2",
+        b"WITH t(n) AS (VALUES (2), (3)) SELECT t.n, s.value FROM t JOIN series AS s ON s.start = 1 AND s.stop = t.n ORDER BY 1, 2",
+        b"WITH t(n) AS (VALUES (2), (4)) SELECT t.n, (SELECT count(*) FROM series(1, t.n)) FROM t ORDER BY 1",
         b"CREATE VIRTUAL TABLE s USING series",
         b"CREATE VIRTUAL TABLE z USING nomodule(a)",
         b"SELECT * FROM nomodule",
@@ -243,6 +257,7 @@ def observe(lib, seen: dict) -> None:
 
     # --- kvmod: CREATE VIRTUAL TABLE, written through xUpdate -----------------
     updates: list = []
+    tables: dict = {}
 
     def kv_create(handle, aux, argc, argv, out, err):
         args = [argv[i] for i in range(argc)]
@@ -251,12 +266,21 @@ def observe(lib, seen: dict) -> None:
             err[0] = c_string(b"kvmod refuses to fail")
             return 1
         assert lib.sqlite3_declare_vtab(handle, b"CREATE TABLE x(k TEXT, v INTEGER)") == 0
-        vtab = new_vtab({"name": args[2].decode(), "rows": {}, "next": 1})
+        # The rows belong to the table, not to one connection of it: SQLite
+        # connects a table again after a schema change.
+        name = args[2].decode()
+        state = tables.setdefault(name, {"name": name, "rows": {}, "next": 1})
+        vtab = new_vtab(state)
         out[0] = ctypes.addressof(vtab)
         return 0
 
+    orders: list = []
+
     def kv_best(vtab, info):
-        info.contents.estimatedCost = 100.0
+        info = info.contents
+        terms = ctypes.cast(info.aOrderBy, ctypes.POINTER(OrderBy))
+        orders.append(tuple((terms[i].iColumn, terms[i].desc) for i in range(info.nOrderBy)))
+        info.estimatedCost = 100.0
         return 0
 
     def kv_open(vtab, out):
@@ -309,12 +333,49 @@ def observe(lib, seen: dict) -> None:
         state["rows"][new_rowid] = [args[2], args[3]]
         return 0
 
+    events: list = []
+
+    def step(name):
+        def call(vtab):
+            events.append((name, vtabs.get(vtab, {}).get("name")))
+            return 0
+        return ONE(call)
+
+    def level(name):
+        def call(vtab, n):
+            events.append((name, vtabs.get(vtab, {}).get("name"), n))
+            return 0
+        return LEVEL(call)
+
+    def rename(vtab, new_name):
+        state = vtabs[vtab]
+        events.append(("rename", state["name"], new_name.decode()))
+        tables[new_name.decode()] = tables.pop(state["name"])
+        state["name"] = new_name.decode()
+        return 0
+
+    def shout(ctx, argc, argv):
+        lib.sqlite3_result_text(ctx, b"overloaded", -1, TRANSIENT)
+    shout_cb = SCALAR(shout)
+    keep.append(shout_cb)
+
+    def find(vtab, argc, name, func, arg):
+        if name.lower() == b"upper" and argc == 1:
+            func[0] = ctypes.cast(shout_cb, c_void_p)
+            arg[0] = None
+            return 1
+        return 0
+
     kv = module(
         xCreate=CONSTRUCT(kv_create), xConnect=CONSTRUCT(kv_create), xBestIndex=BEST(kv_best),
         xDisconnect=ONE(disconnect), xDestroy=ONE(destroy_vtab), xOpen=OPEN(kv_open), xClose=ONE(close),
         xFilter=FILTER(kv_filter), xNext=ONE(series_next), xEof=ONE(series_eof), xColumn=COLUMN(kv_column),
         xRowid=ROWID(kv_rowid), xUpdate=UPDATE(kv_update),
+        xBegin=step("begin"), xSync=step("sync"), xCommit=step("commit"), xRollback=step("rollback"),
+        xSavepoint=level("savepoint"), xRelease=level("release"), xRollbackTo=level("rollback_to"),
+        xRename=RENAME(rename), xFindFunction=FIND(find),
     )
+    kv.iVersion = 2
     released: list = []
     release = DESTROY(lambda p: released.append(p))
     keep.append(release)
@@ -339,9 +400,31 @@ def observe(lib, seen: dict) -> None:
         b"SELECT * FROM kv2",
     ):
         seen[f"kvmod: {sql!r}"] = rows(sql)
+    # Transactions reach the module: begin before the first write, sync then
+    # commit, rollback, and the savepoints with their level.
+    for script in (
+        [b"INSERT INTO kv1 VALUES ('auto', 1)"],
+        [b"BEGIN", b"INSERT INTO kv1 VALUES ('t1', 1)", b"SAVEPOINT a", b"INSERT INTO kv1 VALUES ('t2', 2)",
+         b"ROLLBACK TO a", b"RELEASE a", b"COMMIT"],
+        [b"BEGIN", b"INSERT INTO kv1 VALUES ('t3', 3)", b"ROLLBACK"],
+        [b"BEGIN", b"SELECT count(*) FROM kv1", b"COMMIT"],
+    ):
+        events.clear()
+        for sql in script:
+            rows(sql)
+        seen[f"kvmod transaction: {script!r}"] = list(events)
     # How often SQLite connects again (after a schema reload) is its own
     # business: the arguments each table is constructed with are compared.
     seen["kvmod: constructor arguments"] = sorted({tuple(args) for name, args in calls if name == "kv create"})
+    events.clear()
+    seen["kvmod: rename"] = rows(b"ALTER TABLE kv1 RENAME TO kv9")[:2]
+    seen["kvmod: rename events"] = list(events)
+    seen["kvmod: after rename"] = rows(b"SELECT count(*) FROM kv9")
+    seen["kvmod: overloaded function"] = rows(b"SELECT upper(k), upper('plain') FROM kv9 ORDER BY rowid LIMIT 1")
+    # The ORDER BY of a query that reads only the table is offered.
+    orders.clear()
+    seen["kvmod: ordered"] = rows(b"SELECT k, v FROM kv9 ORDER BY v DESC, k")
+    seen["kvmod: ORDER BY offered"] = sorted(set(orders))
     seen["kvmod: updates"] = updates
     seen["kvmod: destroyed"] = destroyed
     seen["vtab_config"] = lib.sqlite3_vtab_config(db, 2)
@@ -350,6 +433,6 @@ def observe(lib, seen: dict) -> None:
     keep_list = (c_char_p * 2)(b"kvmod", None)
     seen["drop_modules"] = lib.sqlite3_drop_modules(db, keep_list)
     seen["series after drop_modules"] = rows(b"SELECT value FROM series(1, 2)")
-    seen["kvmod after drop_modules"] = rows(b"SELECT count(*) FROM kv1")
+    seen["kvmod after drop_modules"] = rows(b"SELECT count(*) FROM kv9")
     lib.sqlite3_close(db)
     seen["module destructor after close"] = len(released)

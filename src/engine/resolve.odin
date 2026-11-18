@@ -623,6 +623,7 @@ res_ddl :: proc(walk: ^Res_Walk, statement: ^Statement) {
 		}
 	case Alter_Table_Stmt:
 		table := tx_table_probe(walk.tx, s.table)
+		if table == nil && res_relation_kind(walk, s.table) == "table" do return
 		if table == nil {
 			res_fail(walk, .Table_Not_Found, "no such table: %s", s.table)
 			return

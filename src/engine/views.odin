@@ -158,7 +158,8 @@ view_args :: proc(
 	sources: []Source = nil,
 ) -> ([]Value, Error) {
 	if len(ref.args) == 0 do return nil, ERROR_NONE
-	ctx := Eval_Ctx{tx = tx, params = params, sources = sources, now_us = now_microseconds()}
+	// A correlated subquery's arguments may read the row of the query around it.
+	ctx := Eval_Ctx{tx = tx, params = params, sources = sources, now_us = now_microseconds(), outer = tx.outer}
 	out := make([]Value, len(ref.args))
 	for expr, i in ref.args {
 		value, eval_err := eval_expr(&ctx, expr)

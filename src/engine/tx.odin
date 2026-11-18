@@ -77,6 +77,18 @@ Tx :: struct {
 	collation_classes: map[string][dynamic]string,
 	vtab_where:  ^Expr,
 	vtab_params: []Value,
+	// vtab_order is the ORDER BY of a query whose only source is being read.
+	vtab_order:  []Order_Item,
+	// vtab_join, vtab_sources and vtab_alias are the ON clause, the sources
+	// bound so far and the alias of a join step that reads a program's virtual
+	// table once per outer row.
+	vtab_join:    ^Expr,
+	// vtabs_written are the program's virtual tables this transaction wrote
+	// to; they hear its commit or its rollback (vtab_transaction_step).
+	vtabs_written: [dynamic]^Vtab,
+	vtabs_done:    bool,
+	vtab_sources: []Source,
+	vtab_alias:   string,
 	// savepoints is the open savepoint stack, innermost last.
 	savepoints:  [dynamic]Savepoint,
 	// Views materialize into temporary tables owned by the transaction.
@@ -346,7 +358,7 @@ tx_savepoint :: proc(tx: ^Tx, name: string) -> Error {
 	}
 	snapshot := tx_snapshot_clone(tx, tx_state_view(tx))
 	append(&tx.savepoints, Savepoint{name = strings.clone(name, tx.alloc), snapshot = snapshot})
-	return ERROR_NONE
+	return vtab_transaction_step(tx, .Savepoint, len(tx.savepoints) - 1)
 }
 
 // tx_release_savepoint drops the named savepoint and every one nested inside it.
@@ -355,7 +367,7 @@ tx_release_savepoint :: proc(tx: ^Tx, name: string) -> Error {
 		if !strings.equal_fold(tx.savepoints[i].name, name) do continue
 		for j := len(tx.savepoints) - 1; j >= i; j -= 1 do tx_snapshot_destroy(tx, &tx.savepoints[j].snapshot)
 		resize(&tx.savepoints, i)
-		return ERROR_NONE
+		return vtab_transaction_step(tx, .Release, i)
 	}
 	return errf(.Invalid_Argument, "no such savepoint: %s", name)
 }
@@ -375,7 +387,7 @@ tx_rollback_to_savepoint :: proc(tx: ^Tx, name: string) -> Error {
 		}
 		restored := tx_snapshot_clone(tx, tx.savepoints[i].snapshot)
 		tx_state_replace(tx, restored)
-		return ERROR_NONE
+		return vtab_transaction_step(tx, .Rollback_To, i)
 	}
 	return errf(.Invalid_Argument, "no such savepoint: %s", name)
 }
@@ -557,6 +569,11 @@ tx_rollback :: proc(tx: ^Tx) {
 
 @(private)
 tx_discard :: proc(tx: ^Tx) {
+	// A virtual table written in a transaction that did not commit rolls back.
+	if len(tx.vtabs_written) > 0 && !tx.vtabs_done {
+		tx.vtabs_done = true
+		error_drop(vtab_transaction_step(tx, .Rollback))
+	}
 	tx.active = false
 	// Cursors, their rows and their column names live in the transaction's arena:
 	// dropping the map is the whole cleanup.
@@ -1752,6 +1769,14 @@ tx_commit :: proc(tx: ^Tx) -> Error {
 			return fk_err
 		}
 	}
+	// The virtual tables the transaction wrote sync first: one that refuses
+	// turns the commit into a rollback, as in SQLite.
+	if len(tx.vtabs_written) > 0 {
+		if sync_err := vtab_transaction_step(tx, .Sync); sync_err.kind != .None {
+			tx_discard(tx)
+			return sync_err
+		}
+	}
 	started_us := now_microseconds()
 	ops := tx_build_ops(tx)
 	defer delete(ops)
@@ -1832,6 +1857,11 @@ tx_commit :: proc(tx: ^Tx) -> Error {
 	notify_ops: []Store_Op
 	if notify != nil || len(store.sqlite_mirror) > 0 do notify_ops = tx_clone_ops(ops)
 	defer if notify_ops != nil do tx_free_ops(notify_ops)
+	// The engine's part is durable: the virtual tables commit theirs.
+	if len(tx.vtabs_written) > 0 {
+		tx.vtabs_done = true
+		error_drop(vtab_transaction_step(tx, .Commit))
+	}
 	tx_discard(tx)
 	// A database opened from a .sqlite file keeps that file current, so a client
 	// reading it with any SQLite driver sees the commit. O(state) per commit, by

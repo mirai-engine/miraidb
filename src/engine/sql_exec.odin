@@ -3259,9 +3259,11 @@ sql_exec_stream_select :: proc(
 
 sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Result, Error) {
 	// A virtual table a program implements is offered this query's WHERE.
-	saved_where, saved_params := tx.vtab_where, tx.vtab_params
+	saved_where, saved_params, saved_order := tx.vtab_where, tx.vtab_params, tx.vtab_order
 	tx.vtab_where, tx.vtab_params = stmt.where_clause, params
-	defer tx.vtab_where, tx.vtab_params = saved_where, saved_params
+	// The ORDER BY is offered when the query reads one relation.
+	tx.vtab_order = len(stmt.joins) == 0 && len(stmt.compound) == 0 ? stmt.order_by : nil
+	defer tx.vtab_where, tx.vtab_params, tx.vtab_order = saved_where, saved_params, saved_order
 	// Derived tables are materialized first, under their names, for this select.
 	if stmt.from.subquery != nil || select_has_derived_join(stmt) {
 		scope := cte_scope_begin(tx)
@@ -3528,8 +3530,11 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		// is materialized once per outer row (a lateral join). Everything else is
 		// collected once. The materialized tables stay in tx.temp_tables until the
 		// statement ends, because the rows the join reads point into them.
+		// A program's virtual table is read once per outer row too: its
+		// arguments and its ON terms may read the row before it.
 		lateral := is_json_table_function(step.ref.name) ||
-			(step.ref.lateral && step.ref.subquery != nil)
+			(step.ref.lateral && step.ref.subquery != nil) ||
+			(len(step.ref.schema) == 0 && tx_table_probe(tx, step.ref.name) == nil && vtab_is_named(tx, step.ref.name))
 		if lateral && (step.kind == .Right || step.kind == .Full) {
 			free_partials(&partials)
 			return {}, errf(
@@ -3626,12 +3631,15 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 					free_partials(&next)
 					return {}, lateral_args_err
 				}
+				saved_join, saved_sources, saved_alias := tx.vtab_join, tx.vtab_sources, tx.vtab_alias
+				tx.vtab_join, tx.vtab_sources, tx.vtab_alias = step.predicate, partial, step.ref.alias
 				lateral_table, _, lateral_err := tx_source_table(
 					tx,
 					step.ref.name,
 					lateral_args,
 					step.ref.schema,
 				)
+				tx.vtab_join, tx.vtab_sources, tx.vtab_alias = saved_join, saved_sources, saved_alias
 				if lateral_err.kind != .None {
 					free_partials(&partials)
 					free_partials(&next)
@@ -6186,6 +6194,11 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		if arg_err.kind != .None do return {}, arg_err
 		append(&args, value)
 	}
+	// A virtual table's module may overload a function for a call whose first
+	// argument is one of its columns (xFindFunction).
+	if ctx.tx != nil && ctx.tx.store != nil && len(ctx.tx.store.vtab_modules) > 0 && len(call.args) > 0 {
+		if fn, user, overloaded := vtab_overload(ctx, call); overloaded do return fn(args[:], user)
+	}
 	// A host function registered to override a builtin answers before it, which
 	// is how SQLite treats an application-defined function with a builtin's name.
 	if ctx.tx != nil && ctx.tx.store != nil && len(ctx.tx.store.functions) > 0 {
@@ -8352,6 +8365,13 @@ sql_exec_create_type :: proc(tx: ^Tx, stmt: Create_Type_Stmt) -> (Sql_Result, Er
 }
 
 sql_exec_alter_table :: proc(tx: ^Tx, stmt: Alter_Table_Stmt) -> (Sql_Result, Error) {
+	// A program's module renames its own table.
+	if len(stmt.rename_to) > 0 && len(stmt.rename_column) == 0 {
+		if handled, rename_err := vtab_rename(tx, stmt.table, stmt.rename_to); handled {
+			if rename_err.kind != .None do return {}, rename_err
+			return Sql_Result{kind = .Ack}, ERROR_NONE
+		}
+	}
 	stmt := stmt
 	// Through the SQLite face an added column's type is an affinity too.
 	if tx.store.sqlite_names && len(stmt.column.name) > 0 {

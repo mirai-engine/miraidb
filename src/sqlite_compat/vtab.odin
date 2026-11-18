@@ -33,15 +33,15 @@ Sqlite3_Module :: struct {
 	xColumn:       proc "c" (cursor: ^Sqlite3_Vtab_Cursor, ctx: rawptr, column: c.int) -> c.int,
 	xRowid:        proc "c" (cursor: ^Sqlite3_Vtab_Cursor, rowid: ^i64) -> c.int,
 	xUpdate:       proc "c" (vtab: ^Sqlite3_Vtab, argc: c.int, argv: [^]rawptr, rowid: ^i64) -> c.int,
-	xBegin:        rawptr,
-	xSync:         rawptr,
-	xCommit:       rawptr,
-	xRollback:     rawptr,
-	xFindFunction: rawptr,
-	xRename:       rawptr,
-	xSavepoint:    rawptr,
-	xRelease:      rawptr,
-	xRollbackTo:   rawptr,
+	xBegin:        proc "c" (vtab: ^Sqlite3_Vtab) -> c.int,
+	xSync:         proc "c" (vtab: ^Sqlite3_Vtab) -> c.int,
+	xCommit:       proc "c" (vtab: ^Sqlite3_Vtab) -> c.int,
+	xRollback:     proc "c" (vtab: ^Sqlite3_Vtab) -> c.int,
+	xFindFunction: proc "c" (vtab: ^Sqlite3_Vtab, argc: c.int, name: cstring, func: ^Function_Callback, arg: ^rawptr) -> c.int,
+	xRename:       proc "c" (vtab: ^Sqlite3_Vtab, new_name: cstring) -> c.int,
+	xSavepoint:    proc "c" (vtab: ^Sqlite3_Vtab, level: c.int) -> c.int,
+	xRelease:      proc "c" (vtab: ^Sqlite3_Vtab, level: c.int) -> c.int,
+	xRollbackTo:   proc "c" (vtab: ^Sqlite3_Vtab, level: c.int) -> c.int,
 	xShadowName:   rawptr,
 	xIntegrity:    rawptr,
 }
@@ -100,6 +100,9 @@ Module_Entry :: struct {
 	module:  ^Sqlite3_Module,
 	aux:     rawptr,
 	destroy: Destroy_Callback,
+	// overloads are the functions xFindFunction answered, kept so each call
+	// does not make a new one.
+	overloads: [dynamic]^Function,
 }
 
 // index_values are the right-hand values of the constraints of the xBestIndex
@@ -189,6 +192,7 @@ module_scan :: proc(
 	handle: rawptr,
 	constraints: []engine.Vtab_Constraint,
 	values: []engine.Value,
+	order: []engine.Vtab_Order,
 	columns: int,
 	rows: ^[dynamic]engine.Vtab_Row,
 ) -> engine.Error {
@@ -208,9 +212,13 @@ module_scan :: proc(
 			usable  = constraint.usable ? 1 : 0,
 		}
 	}
+	orders := make([]Sqlite3_Index_Orderby, max(len(order), 1), context.temp_allocator)
+	for term, i in order do orders[i] = Sqlite3_Index_Orderby{iColumn = c.int(term.column), desc = term.descending ? 1 : 0}
 	info := Sqlite3_Index_Info {
 		nConstraint      = c.int(n),
 		aConstraint      = raw_data(offered),
+		nOrderBy         = c.int(len(order)),
+		aOrderBy         = raw_data(orders),
 		aConstraintUsage = raw_data(usage),
 		estimatedCost    = 5e98,
 		estimatedRows    = 25,
@@ -291,8 +299,71 @@ module_update :: proc(ctx: rawptr, handle: rawptr, argv: []engine.Value, rowid: 
 module_release :: proc(ctx: rawptr) {
 	entry := (^Module_Entry)(ctx)
 	if entry.destroy != nil do entry.destroy(entry.aux)
+	for overload in entry.overloads {
+		delete(overload.name)
+		free(overload)
+	}
+	delete(entry.overloads)
 	delete(entry.name)
 	free(entry)
+}
+
+// module_transaction calls the transaction method of a step; savepoints need
+// a module of version 2 or later, as in SQLite.
+@(private)
+module_transaction :: proc(ctx: rawptr, handle: rawptr, step: engine.Vtab_Tx_Step, level: int) -> engine.Error {
+	entry := (^Module_Entry)(ctx)
+	module := entry.module
+	vtab := (^Sqlite3_Vtab)(handle)
+	code := SQLITE_OK
+	switch step {
+	case .Begin:
+		if module.xBegin != nil do code = module.xBegin(vtab)
+	case .Sync:
+		if module.xSync != nil do code = module.xSync(vtab)
+	case .Commit:
+		if module.xCommit != nil do code = module.xCommit(vtab)
+	case .Rollback:
+		if module.xRollback != nil do code = module.xRollback(vtab)
+	case .Savepoint:
+		if module.iVersion >= 2 && module.xSavepoint != nil do code = module.xSavepoint(vtab, c.int(level))
+	case .Release:
+		if module.iVersion >= 2 && module.xRelease != nil do code = module.xRelease(vtab, c.int(level))
+	case .Rollback_To:
+		if module.iVersion >= 2 && module.xRollbackTo != nil do code = module.xRollbackTo(vtab, c.int(level))
+	}
+	if code != SQLITE_OK do return vtab_error(vtab, code, "virtual table transaction failed")
+	return engine.ERROR_NONE
+}
+
+@(private)
+module_rename :: proc(ctx: rawptr, handle: rawptr, new_name: string) -> engine.Error {
+	entry := (^Module_Entry)(ctx)
+	vtab := (^Sqlite3_Vtab)(handle)
+	name := strings.clone_to_cstring(new_name, context.temp_allocator)
+	if code := entry.module.xRename(vtab, name); code != SQLITE_OK do return vtab_error(vtab, code, "xRename failed")
+	return engine.ERROR_NONE
+}
+
+// module_find_function asks xFindFunction about a call; an answer becomes a
+// function the engine calls like any registered one.
+@(private)
+module_find_function :: proc(ctx: rawptr, handle: rawptr, name: string, arity: int) -> (engine.Scalar_Function, rawptr, bool) {
+	entry := (^Module_Entry)(ctx)
+	vtab := (^Sqlite3_Vtab)(handle)
+	func: Function_Callback
+	arg: rawptr
+	text := strings.clone_to_cstring(name, context.temp_allocator)
+	if entry.module.xFindFunction(vtab, c.int(arity), text, &func, &arg) == 0 || func == nil do return nil, nil, false
+	for overload in entry.overloads {
+		if overload.func == func && overload.user == arg && overload.arity == arity && strings.equal_fold(overload.name, name) {
+			return facade_scalar, rawptr(overload), true
+		}
+	}
+	overload := new(Function)
+	overload^ = Function{db = entry.db, name = strings.clone(name), arity = arity, user = arg, func = func}
+	append(&entry.overloads, overload)
+	return facade_scalar, rawptr(overload), true
 }
 
 @(private)
@@ -320,6 +391,11 @@ create_module :: proc(handle: rawptr, name: cstring, module: ^Sqlite3_Module, au
 		release        = module_release,
 	}
 	if module.xUpdate != nil do registration.update = module_update
+	if module.xBegin != nil || module.xSync != nil || module.xCommit != nil || module.xRollback != nil || (module.iVersion >= 2 && (module.xSavepoint != nil || module.xRelease != nil || module.xRollbackTo != nil)) {
+		registration.transaction = module_transaction
+	}
+	if module.xRename != nil do registration.rename = module_rename
+	if module.xFindFunction != nil do registration.find_function = module_find_function
 	if err := engine.store_register_vtab_module(db.conn.store, string(name), registration); err.kind != .None {
 		engine.error_free(&err)
 		module_release(rawptr(entry))
