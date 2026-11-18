@@ -67,11 +67,11 @@ sql_execute :: proc(store: ^Store, sql: string) -> (Sql_Result, Error) {
 sql_execute_params :: proc(store: ^Store, sql: string, params: []Value) -> (Sql_Result, Error) {
 	result, exec_err := sql_execute_priced(store, sql, params)
 	if exec_err.kind != .None do return {}, exec_err
-	sync.lock(&store.mutex)
+	// The counters are atomic, not under the store's lock: a statement ends
+	// while its connection may hold the write lock (a BEGIN a function ran).
 	result.work = statement_work(&result)
-	store.work_used += result.work
-	budget := store.max_work_per_call
-	sync.unlock(&store.mutex)
+	sync.atomic_add(&store.work_used, result.work)
+	budget := sync.atomic_load(&store.max_work_per_call)
 	if budget > 0 && result.work > budget {
 		// Read the spend before the destroy zeroes the result, or the message
 		// reports 0 work for a statement that spent 3 (the CLI's --budget showed
@@ -849,11 +849,11 @@ stmt_prepared_destroy :: proc(prepared: ^Stmt_Prepared) {
 
 @(private)
 sql_price :: proc(store: ^Store, result: ^Sql_Result) -> Error {
-	sync.lock(&store.mutex)
+	// The counters are atomic, not under the store's lock: a statement ends
+	// while its connection may hold the write lock (a BEGIN a function ran).
 	result.work = statement_work(result)
-	store.work_used += result.work
-	budget := store.max_work_per_call
-	sync.unlock(&store.mutex)
+	sync.atomic_add(&store.work_used, result.work)
+	budget := sync.atomic_load(&store.max_work_per_call)
 	if budget > 0 && result.work > budget {
 		sql_result_destroy(result)
 		return errf(.Quota_Exceeded, "statement spends %d work, budget is %d", result.work, budget)

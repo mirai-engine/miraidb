@@ -120,6 +120,34 @@ test_returning_takes_expressions :: proc(t: ^testing.T) {
 	testing.expect_value(t, db.embed_column_int(stmt, 3), i64(21))
 }
 
+// A function that opens a transaction on its own connection in the middle of
+// a SELECT, as Python's sqlite3 does when the function inserts.
+@(private = "file")
+begin_and_insert :: proc(args: []db.Value, user: rawptr) -> (db.Value, db.Error) {
+	conn := (^db.Embed_Conn)(user)
+	if !db.embed_in_transaction(conn) do db.error_drop(db.embed_exec(conn, "BEGIN"))
+	err := db.embed_exec(conn, "INSERT INTO log VALUES (1)")
+	return db.value_null(), err
+}
+
+@(test)
+test_function_may_begin_a_transaction_mid_select :: proc(t: ^testing.T) {
+	store := face_store(t)
+	defer db.store_close(store)
+	conn := db.embed_wrap(store)
+	defer db.embed_close(conn)
+	face_ok(t, conn, "CREATE TABLE t (x)")
+	face_ok(t, conn, "CREATE TABLE log (x)")
+	face_ok(t, conn, "INSERT INTO t VALUES (1), (2)")
+	testing.expect(t, db.error_ok(db.store_register_function(store, "dup", 1, begin_and_insert, rawptr(conn))))
+	// The SELECT ends while the connection holds the write lock the function
+	// took; it used to wait for that lock to price itself.
+	face_ints(t, conn, "SELECT dup(x) FROM t")
+	testing.expect(t, db.embed_in_transaction(conn))
+	face_ok(t, conn, "COMMIT")
+	expect_list(t, face_ints(t, conn, "SELECT count(*) FROM log"), {2}, "logged")
+}
+
 @(private = "file")
 Window_Calls :: struct {
 	steps, inverses, values: int,

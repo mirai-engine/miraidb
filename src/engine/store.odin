@@ -1740,23 +1740,17 @@ store_row_quota :: proc(store: ^Store) -> u64 {
 // unlimited). Energy counts rows plus returned bytes, so a caller pays roughly
 // for the work a statement does rather than for wall-clock time.
 store_set_work_budget :: proc(store: ^Store, units: u64) {
-	sync.lock(&store.mutex)
-	defer sync.unlock(&store.mutex)
-	store.max_work_per_call = units
+	sync.atomic_store(&store.max_work_per_call, units)
 }
 
 store_work_budget :: proc(store: ^Store) -> u64 {
-	sync.lock(&store.mutex)
-	defer sync.unlock(&store.mutex)
-	return store.max_work_per_call
+	return sync.atomic_load(&store.max_work_per_call)
 }
 
 // store_work_used is the total work the store spent since it was opened or
 // last reset, across every statement.
 store_work_used :: proc(store: ^Store) -> u64 {
-	sync.lock(&store.mutex)
-	defer sync.unlock(&store.mutex)
-	return store.work_used
+	return sync.atomic_load(&store.work_used)
 }
 
 // store_prune_versions drops row history no reader needs anymore: callers pass
@@ -1814,9 +1808,7 @@ store_reset_rows_scanned :: proc(store: ^Store) {
 }
 
 store_reset_work :: proc(store: ^Store) {
-	sync.lock(&store.mutex)
-	defer sync.unlock(&store.mutex)
-	store.work_used = 0
+	sync.atomic_store(&store.work_used, 0)
 }
 
 // statement_work prices one result: a unit per row plus a unit per 64 bytes
