@@ -8001,6 +8001,28 @@ test_column_collation_and_generated :: proc(t: ^testing.T) {
 	db.store_close(reopened)
 }
 
+// A column JOIN ... USING (or NATURAL JOIN) shares is the join's, unqualified:
+// the left side's value, or the right side's where an outer join left the
+// left one NULL. Every answer here is SQLite 3.54.1's.
+@(test)
+test_using_column_is_the_joins :: proc(t: ^testing.T) {
+	store, host := fresh_host(t, "using_column")
+	if store == nil do return
+	defer destroy_host(store, host, "using_column")
+	run(t, store, "CREATE TABLE v (a INT, b INT)")
+	run(t, store, "CREATE TABLE w (a INT, c INT)")
+	run(t, store, "INSERT INTO v VALUES (1, 2), (5, 6)")
+	run(t, store, "INSERT INTO w VALUES (1, 3), (7, 8)")
+	testing.expect_value(t, scalar(t, store, "SELECT a FROM v JOIN w USING (a)").i, i64(1))
+	testing.expect_value(t, scalar(t, store, "SELECT a FROM v NATURAL JOIN w").i, i64(1))
+	full := run(t, store, "SELECT a FROM v FULL JOIN w USING (a) ORDER BY a").rows
+	if testing.expect_value(t, len(full), 3) {
+		testing.expect_value(t, full[0][0].i, i64(1))
+		testing.expect_value(t, full[1][0].i, i64(5))
+		testing.expect_value(t, full[2][0].i, i64(7))
+	}
+}
+
 // A table renamed to a name another table, view or index has is refused, in
 // SQLite's words (renaming over a view left two objects of one name); under
 // SQLite's rules a trigger's name is taken once, whatever its case.

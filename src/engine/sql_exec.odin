@@ -1462,6 +1462,9 @@ Outer_Frame :: struct {
 }
 
 Eval_Ctx :: struct {
+	// using_names are the columns the query's JOIN ... USING (or NATURAL
+	// JOIN) shares: an unqualified one is the join's, not ambiguous.
+	using_names: []string,
 	// having_aliases are the projections a HAVING may name by their alias,
 	// as SQLite allows: a name no source has is looked up there.
 	having_aliases: []Select_Item,
@@ -3638,6 +3641,13 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		now_us = now_microseconds(),
 		outer  = tx.outer,
 	}
+	for join in stmt.joins {
+		if len(join.using_columns) == 0 do continue
+		shared := make([dynamic]string, 0, len(ctx.using_names) + len(join.using_columns), tx.alloc)
+		for name in ctx.using_names do append(&shared, name)
+		for name in join.using_columns do append(&shared, name)
+		ctx.using_names = shared[:]
+	}
 
 	// A page-backed table can answer a simple single-table query without ever
 	// holding it in memory: the scan streams, the projection runs per row and
@@ -5134,6 +5144,12 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 			if source.table == nil || source.hidden_unqualified do continue
 			index, exists := schema_column_index(&source.table.schema, e.name)
 			if !exists do continue
+			if found && column_in_names(e.name, ctx.using_names) {
+				// A shared column is the join's: the left side's value, or the
+				// right side's where an outer join left the left one NULL.
+				if found_value.kind == .Null && index < len(source.row.values) do found_value = source.row.values[index]
+				continue
+			}
 			if found {
 				return {}, errf(.Column_Not_Found, "column %s is ambiguous; qualify it with a table", e.name)
 			}
