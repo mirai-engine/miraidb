@@ -121,6 +121,11 @@ def build_gates(args: argparse.Namespace) -> list[Gate]:
             gates.append(
                 Gate("sqlite3_* smoke", [args.windows_python, "scripts/sqlite_abi_smoke.py"])
             )
+            # Python's own sqlite3 module, linked against the facade, runs
+            # CPython's tests of it: each that passes with SQLite has to pass.
+            gates.append(
+                Gate("Python's sqlite3 suite", [args.windows_python, "scripts/python_sqlite3.py"])
+            )
             gates.append(
                 Gate("Python SDK smoke", [args.windows_python, "scripts/sdk_smoke.py"])
             )
