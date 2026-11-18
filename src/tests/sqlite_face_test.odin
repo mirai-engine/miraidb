@@ -60,6 +60,27 @@ expect_list :: proc(t: ^testing.T, got: [dynamic]i64, want: []i64, what: string)
 	testing.expectf(t, same, "%s: got %v, want %v", what, got[:], want)
 }
 
+@(test)
+test_insert_names_the_rowid :: proc(t: ^testing.T) {
+	store := face_store(t)
+	defer db.store_close(store)
+	conn := db.embed_wrap(store)
+	defer db.embed_close(conn)
+	face_ok(t, conn, "CREATE TABLE t (x)")
+	// A rowid table without an INTEGER PRIMARY KEY takes the rowid it is given,
+	// as SQLite does, and counts on from the largest.
+	face_ok(t, conn, "INSERT INTO t (rowid, x) VALUES (4294967296, 'a')")
+	face_ok(t, conn, "INSERT INTO t (x) VALUES ('b')")
+	face_ok(t, conn, "INSERT INTO t (oid, x) VALUES (7, 'c')")
+	expect_list(t, face_ints(t, conn, "SELECT rowid FROM t ORDER BY rowid"), {7, 4294967296, 4294967297}, "rowids")
+	face_fails(t, conn, "INSERT INTO t (rowid, x) VALUES (7, 'd')", "UNIQUE constraint failed: t.rowid")
+	face_fails(t, conn, "INSERT INTO t (_rowid_, x) VALUES ('x', 'd')", "datatype mismatch")
+	// With an INTEGER PRIMARY KEY the rowid is that column.
+	face_ok(t, conn, "CREATE TABLE k (id INTEGER PRIMARY KEY, v)")
+	face_ok(t, conn, "INSERT INTO k (rowid, v) VALUES (40, 'v')")
+	expect_list(t, face_ints(t, conn, "SELECT id FROM k"), {40}, "alias")
+}
+
 @(private = "file")
 Window_Calls :: struct {
 	steps, inverses, values: int,

@@ -7912,6 +7912,34 @@ returning_prepare :: proc(result: ^Sql_Result, returning: ^Returning, table: ^Ta
 }
 
 
+// ROWID_POSITION marks the INSERT column that names the rowid of a table with
+// no INTEGER PRIMARY KEY.
+@(private)
+ROWID_POSITION :: -1
+
+// rowid_alias_column is the INTEGER PRIMARY KEY that is a table's rowid.
+@(private)
+rowid_alias_column :: proc(schema: ^Table_Schema) -> (int, bool) {
+	if schema.without_rowid || len(schema.primary_key) != 1 do return -1, false
+	key := schema.primary_key[0]
+	if key < 0 || key >= len(schema.columns) || schema.columns[key].type.kind != .Int do return -1, false
+	return key, true
+}
+
+// insert_named_rowid reads the rowid an INSERT names: NULL leaves it to the
+// table, an integer (or text or real that is one) is the row's id.
+@(private)
+insert_named_rowid :: proc(value: Value) -> (Row_Id, bool, Error) {
+	if value.kind == .Null || value.kind == .Default do return 0, false, ERROR_NONE
+	number, ok := value_to_i64(value)
+	if !ok || (value.kind == .Float && f64(number) != value.f) {
+		return 0, false, errf(.Invalid_Type, "datatype mismatch")
+	}
+	// Row ids here count from 1; SQLite's zero and negative rowids are not kept.
+	if number < 1 do return 0, false, errf(.Sql_Unsupported, "a rowid below 1 is not supported")
+	return Row_Id(number), true, ERROR_NONE
+}
+
 sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Result, Error) {
 	table, table_err := tx_table(tx, stmt.table)
 	if table_err.kind != .None do return {}, table_err
@@ -7924,6 +7952,16 @@ sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Res
 		positions = make([]int, len(stmt.columns), tx.alloc)
 		for name, i in stmt.columns {
 			index, found := schema_column_index(&table.schema, name)
+			if !found && rowid_alias_name(name) && !table.schema.without_rowid {
+				// The rowid: an INTEGER PRIMARY KEY is it, any other rowid
+				// table stores it beside the row (ROWID_POSITION).
+				if alias, has_alias := rowid_alias_column(&table.schema); has_alias {
+					index, found = alias, true
+				} else {
+					positions[i] = ROWID_POSITION
+					continue
+				}
+			}
 			if !found {
 				return {}, errf(.Column_Not_Found, "column %s does not exist in %s", name, stmt.table)
 			}
@@ -7990,9 +8028,16 @@ sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Res
 		}
 		values := make([]Value, column_count, tx.alloc)
 		for i in 0 ..< column_count do values[i] = value_default()
+		named_row_id: Maybe(Row_Id)
 		for expr, i in values_expr {
 			value, eval_err := eval_expr(&ctx, expr)
 			if eval_err.kind != .None do return {}, eval_err
+			if positions[i] == ROWID_POSITION {
+				row_id, named, row_id_err := insert_named_rowid(value)
+				if row_id_err.kind != .None do return {}, row_id_err
+				if named do named_row_id = row_id
+				continue
+			}
 			values[positions[i]] = value
 		}
 		// Generated columns are computed from the row about to be stored, so a
@@ -8009,7 +8054,9 @@ sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Res
 		declares := !stmt.conflict_explicit && table_declares_resolution(table)
 		row_fail, row_ignore, row_replace := stmt.conflict_fail, stmt.conflict_ignore, stmt.conflict_replace
 		row_mark := row_fail || declares ? tx_statement_begin(tx) : 0
+		tx.explicit_row_id, tx.has_explicit_row_id = named_row_id.? or_else 0, named_row_id != nil
 		row_id, insert_err := tx_insert(tx, stmt.table, values)
+		tx.has_explicit_row_id = false
 		if declares && insert_err.kind != .None && conflict_skippable(insert_err.kind) {
 			switch declared_resolution(tx, table, row_with_defaults(tx, table, values), insert_err) {
 			case .Fail:
@@ -8024,7 +8071,9 @@ sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Res
 						tx_statement_end(tx, row_mark, true)
 						row_mark = tx_statement_begin(tx)
 						error_free(&insert_err)
+						tx.explicit_row_id, tx.has_explicit_row_id = named_row_id.? or_else 0, named_row_id != nil
 						row_id, insert_err = tx_insert(tx, stmt.table, filled)
+						tx.has_explicit_row_id = false
 						values = filled
 					}
 				} else {

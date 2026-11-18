@@ -123,6 +123,10 @@ Tx :: struct {
 	insert_name:         string,
 	insert_table:        ^Table,
 	insert_writes:       ^Table_Writes,
+	// explicit_row_id is the rowid an INSERT names (`INSERT INTO t (rowid, x)`)
+	// for the next row it stores, when has_explicit_row_id is set.
+	explicit_row_id:     Row_Id,
+	has_explicit_row_id: bool,
 	// undo records what each change to the staged rows replaced, while a
 	// statement is open (undo_depth > 0), so a statement that fails halfway can
 	// be taken back without touching the work of the statements before it. A
@@ -1265,6 +1269,14 @@ tx_insert_row :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error)
 		tx.insert_writes = writes
 	}
 	id := Row_Id(writes.next_row_id)
+	if tx.has_explicit_row_id {
+		// The row the statement names its rowid for; a trigger's rows get their own.
+		tx.has_explicit_row_id = false
+		if _, taken := tx_get(tx, name, tx.explicit_row_id); taken {
+			return 0, errf(.Duplicate_Unique, "UNIQUE constraint failed: %s.rowid", name)
+		}
+		id = tx.explicit_row_id
+	}
 
 	row_values := make([]Value, len(values), tx.alloc)
 	// SQLite's INTEGER PRIMARY KEY is the rowid: an omitted value is assigned.
@@ -1359,7 +1371,8 @@ tx_insert_row :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error)
 	undo_note_insert(tx, writes, id)
 	undo_note_counters(tx, writes)
 	writes.inserts[id] = Row{id = id, values = row_values}
-	writes.next_row_id = u64(id) + 1
+	// A named rowid below the next one leaves the next one where it was.
+	writes.next_row_id = max(writes.next_row_id, u64(id) + 1)
 	if has_triggers {
 		tx_register_unique(tx, name, table, row_values, id)
 	} else {
