@@ -1,5 +1,7 @@
 package tests
 
+import "core:fmt"
+import "core:mem"
 import "core:os"
 import "core:strings"
 import "core:testing"
@@ -281,4 +283,52 @@ test_two_connections_share_a_sqlite_file :: proc(t: ^testing.T) {
 	expect_list(t, face_ints(t, second, "SELECT count(*) FROM t"), {1}, "after commit")
 	face_ok(t, second, "INSERT INTO t VALUES (2)")
 	expect_list(t, face_ints(t, first, "SELECT x FROM t ORDER BY x"), {1, 2}, "both")
+}
+
+// The registry of shared files outlives the allocator of whoever made it. The
+// first connection to a SQLite file in the process makes the registry; when
+// that happens under an arena that is then reused (the test runner reuses each
+// test's), a file another connection still holds must stay findable. Run on
+// its own this test is the one that makes the registry.
+@(test)
+test_shared_files_outlive_the_opener_allocator :: proc(t: ^testing.T) {
+	buffer := make([]byte, 64 * 1024 * 1024)
+	defer delete(buffer)
+	arena: mem.Arena
+	mem.arena_init(&arena, buffer)
+	paths: [8]string
+	for &path, k in paths do path = fmt.aprintf("_test_registry_%d.db", k)
+	defer for path in paths {
+		os.remove(path)
+		delete(path)
+	}
+	{
+		context.allocator = mem.arena_allocator(&arena)
+		for path in paths {
+			os.remove(path)
+			testing.expect(t, db.sqlite_create_empty_file(path))
+			conn, err := db.embed_open(path)
+			testing.expect(t, db.error_ok(err))
+			if conn != nil do db.embed_close(conn)
+		}
+	}
+
+	held := "_test_registry_held.db"
+	os.remove(held)
+	defer os.remove(held)
+	testing.expect(t, db.sqlite_create_empty_file(held))
+	first, first_err := db.embed_open(held)
+	testing.expect(t, db.error_ok(first_err))
+	defer db.embed_close(first)
+	face_ok(t, first, "CREATE TABLE t (x)")
+	// The arena is reused: what it held is gone.
+	mem.zero_slice(buffer)
+
+	second, second_err := db.embed_open(held)
+	testing.expect(t, db.error_ok(second_err))
+	defer db.embed_close(second)
+	face_ok(t, first, "BEGIN")
+	face_ok(t, first, "INSERT INTO t VALUES (1)")
+	face_fails(t, second, "INSERT INTO t VALUES (2)", "database is locked")
+	face_ok(t, first, "COMMIT")
 }

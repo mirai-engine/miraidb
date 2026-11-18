@@ -1,5 +1,6 @@
 package engine
 
+import "base:runtime"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
@@ -35,6 +36,10 @@ Sqlite_Share :: struct {
 	file:       sync.RW_Mutex,
 }
 
+// The registry outlives every connection and is shared by every thread, so it
+// lives on the process heap: a caller's context.allocator may be a per-task
+// arena (the test runner's is) that is gone while other threads still read the
+// map.
 @(private)
 sqlite_shares: map[string]^Sqlite_Share
 
@@ -56,6 +61,7 @@ sqlite_share_key :: proc(path: string) -> string {
 // sqlite_share_join makes the connection one of the file's.
 sqlite_share_join :: proc(conn: ^Embed_Conn, path: string) {
 	key := sqlite_share_key(path)
+	context.allocator = runtime.heap_allocator()
 	sync.lock(&sqlite_shares_mutex)
 	defer sync.unlock(&sqlite_shares_mutex)
 	if sqlite_shares == nil do sqlite_shares = make(map[string]^Sqlite_Share)
@@ -74,6 +80,7 @@ sqlite_share_join :: proc(conn: ^Embed_Conn, path: string) {
 sqlite_share_leave :: proc(conn: ^Embed_Conn) {
 	share := conn.share
 	if share == nil do return
+	context.allocator = runtime.heap_allocator()
 	sync.lock(&sqlite_shares_mutex)
 	defer sync.unlock(&sqlite_shares_mutex)
 	if share.writer == conn do share.writer = nil
