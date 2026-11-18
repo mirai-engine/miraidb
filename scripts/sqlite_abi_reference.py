@@ -191,6 +191,19 @@ def observe(lib) -> dict[str, object]:
     seen["runs after a reset of the counter"] = lib.sqlite3_stmt_status(stmt, STMTSTATUS_RUN, 0)
     lib.sqlite3_finalize(stmt)
 
+    # A runtime error is the step's, and the finalize that follows it without
+    # a reset answers it too: SQLite's shell reports one only from there. A
+    # program that asks for the columns first sees the same.
+    for ask_columns in (False, True):
+        failing = prepare(b"SELECT json('{')")
+        if ask_columns:
+            lib.sqlite3_column_count(failing)
+            lib.sqlite3_column_name(failing, 0)
+        step_code = lib.sqlite3_step(failing)
+        step_message = lib.sqlite3_errmsg(db)
+        seen[f"runtime error (columns asked first: {ask_columns})"] = (
+            step_code, step_message, lib.sqlite3_finalize(failing), lib.sqlite3_errmsg(db))
+
     for label, sql in (
         ("insert", b"INSERT INTO t (v) VALUES (1)"),
         ("update", b"UPDATE t SET v = 0"),

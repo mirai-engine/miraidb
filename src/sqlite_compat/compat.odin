@@ -953,6 +953,13 @@ sqlite3_finalize :: proc "c" (handle: rawptr) -> c.int {
 	if handle == nil do return SQLITE_OK
 	stmt := stmt_of(handle)
 	if stmt == nil do return SQLITE_MISUSE
+	// A step that failed and was not reset: finalize answers its code, as
+	// SQLite's does (SQLite's shell reports a runtime error only from here).
+	code := c.int(SQLITE_OK)
+	if stmt.error_code != SQLITE_OK && stmt.db != nil {
+		stmt.db.last_code, stmt.db.last_extended = stmt.error_code, stmt.error_extended
+		code = stmt.db.extended ? stmt.error_extended : stmt.error_code
+	}
 	if stmt.db != nil do delete_key(&stmt.db.statements, handle)
 	// The last statement of a connection sqlite3_close_v2 left open closes it.
 	zombie := stmt.db != nil && stmt.db.zombie && len(stmt.db.statements) == 0 ? stmt.db : nil
@@ -979,7 +986,7 @@ sqlite3_finalize :: proc "c" (handle: rawptr) -> c.int {
 	stmt_pointers_release(stmt)
 	delete(stmt.pointers)
 	free(stmt)
-	return SQLITE_OK
+	return code
 }
 
 @(export)
