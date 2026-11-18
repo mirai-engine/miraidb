@@ -18,6 +18,18 @@ how the claim is checked.
 | a SQLite file (`.sqlite`/`.db`) opened by the CLI, the server or the embedded API | SQLite's |
 | an engine database (a directory) through the CLI, the server, the embedded API or the C ABI | the engine's |
 
+Under SQLite's rules a table, view or index name matches whatever its case
+(`INSERT INTO T` reaches `t`, `CREATE TABLE T` fails when `t` exists), as in
+SQLite; the engine's own rules keep names exact
+(`test_names_match_without_case_under_sqlite_rules`).
+
+CPython's own tests of its `sqlite3` module run on the facade
+(`scripts/python_sqlite3.py`, a gate of `scripts/ci.py`): every test that
+passes with SQLite has to pass here. Two do not, each listed with its reason in
+the script: an attached database is read-only here, so `CREATE TABLE
+attached_db.foo` is refused; and `fts4` keeps its index in the engine, not in
+SQLite's shadow tables, so a dump has no `CREATE TABLE` for them.
+
 The switch is one flag on the store, `sqlite_rules`, set by `sqlite3_open` and
 by opening a SQLite file. Foreign keys follow the same split: off until
 `PRAGMA foreign_keys = ON` under SQLite's rules, on under the engine's.
