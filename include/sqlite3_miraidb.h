@@ -589,6 +589,48 @@ const char *sqlite3_db_name(sqlite3 *db, int index);
 int  sqlite3_db_readonly(sqlite3 *db, const char *schema);
 int  sqlite3_txn_state(sqlite3 *db, const char *schema);
 
+/* --- What a binding links besides the statement loop -----------------------
+** A window function's frame is aggregated afresh, so it answers with xStep and
+** xValue; xInverse is accepted and not needed. Limits are SQLite's defaults,
+** per connection; SQL_LENGTH and LENGTH are enforced. A SQLite extension
+** cannot be loaded into this library: the call says so. */
+
+#define SQLITE_LIMIT_LENGTH               0
+#define SQLITE_LIMIT_SQL_LENGTH           1
+#define SQLITE_LIMIT_COLUMN               2
+#define SQLITE_LIMIT_EXPR_DEPTH           3
+#define SQLITE_LIMIT_COMPOUND_SELECT      4
+#define SQLITE_LIMIT_VDBE_OP              5
+#define SQLITE_LIMIT_FUNCTION_ARG         6
+#define SQLITE_LIMIT_ATTACHED             7
+#define SQLITE_LIMIT_LIKE_PATTERN_LENGTH  8
+#define SQLITE_LIMIT_VARIABLE_NUMBER      9
+#define SQLITE_LIMIT_TRIGGER_DEPTH       10
+#define SQLITE_LIMIT_WORKER_THREADS      11
+#define SQLITE_DBCONFIG_ENABLE_FKEY    1002
+
+int sqlite3_create_window_function(sqlite3 *db, const char *name, int nArg,
+    int eTextRep, void *pApp,
+    void (*xStep)(sqlite3_context *, int, sqlite3_value **),
+    void (*xFinal)(sqlite3_context *),
+    void (*xValue)(sqlite3_context *),
+    void (*xInverse)(sqlite3_context *, int, sqlite3_value **),
+    void (*xDestroy)(void *));
+int  sqlite3_complete(const char *sql);
+int  sqlite3_complete16(const void *sql);
+int  sqlite3_limit(sqlite3 *db, int id, int newValue);
+int  sqlite3_db_config(sqlite3 *db, int op, ...);
+int  sqlite3_enable_load_extension(sqlite3 *db, int onoff);
+int  sqlite3_load_extension(sqlite3 *db, const char *file, const char *proc,
+                            char **errmsg);
+int  sqlite3_enable_shared_cache(int onoff);
+int  sqlite3_threadsafe(void);
+int  sqlite3_sleep(int milliseconds);
+int  sqlite3_stricmp(const char *a, const char *b);
+int  sqlite3_strnicmp(const char *a, const char *b, int n);
+int  sqlite3_strglob(const char *pattern, const char *text);
+int  sqlite3_strlike(const char *pattern, const char *text, unsigned int escape);
+
 /* --- Library ------------------------------------------------------------- */
 
 const char *sqlite3_libversion(void);

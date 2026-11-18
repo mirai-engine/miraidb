@@ -470,6 +470,9 @@ res_expr :: proc(walk: ^Res_Walk, expr: ^Expr) {
 		for item in e.items do res_expr(walk, item)
 		if e.subquery != nil do res_select(walk, e.subquery)
 	case Call_Expr:
+		if limit := walk.tx.store.function_arg_limit; limit > 0 && len(e.args) > limit && walk.err.kind == .None {
+			walk.err = errf(.Invalid_Argument, "too many arguments on function %s", e.name)
+		}
 		for arg in e.args do res_expr(walk, arg)
 		res_expr(walk, e.filter)
 		for item in e.order_by do res_expr(walk, item.expr)

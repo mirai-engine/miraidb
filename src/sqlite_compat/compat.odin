@@ -114,6 +114,13 @@ Database :: struct {
 	// not_a_database is set by sqlite3_deserialize of bytes that are not a
 	// SQLite database (backup.odin).
 	not_a_database: bool,
+	// The per-connection limits and configuration flags, and whether
+	// extension loading was enabled (library.odin).
+	limits:             [SQLITE_LIMIT_COUNT]c.int,
+	limits_set:         bool,
+	config:             [SQLITE_DBCONFIG_LAST_FLAG - SQLITE_DBCONFIG_FIRST_FLAG + 1]c.int,
+	config_set:         bool,
+	extensions_enabled: bool,
 }
 
 Statement :: struct {
@@ -1603,6 +1610,8 @@ sqlite3_expanded_sql :: proc "c" (handle: rawptr) -> cstring {
 	if stmt == nil do return nil
 	expanded := expand_sql(stmt)
 	defer delete(expanded)
+	// A text longer than SQLITE_LIMIT_LENGTH is not made: NULL, as in SQLite.
+	if len(expanded) > int(connection_limit(stmt.db, SQLITE_LIMIT_LENGTH)) do return nil
 	return sqlite_strdup(expanded)
 }
 

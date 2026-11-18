@@ -193,6 +193,9 @@ Store :: struct {
 	// REAL, a CAST reads a number's prefix, case folds ASCII only
 	// (docs/sqlite-semantics.md). The sqlite3_* face and a SQLite file set it.
 	sqlite_rules:        bool,
+	// function_arg_limit is SQLITE_LIMIT_FUNCTION_ARG when a program lowered
+	// it (0: none): a call with more arguments fails to prepare.
+	function_arg_limit:  int,
 	// sqlite_mirror is the .sqlite file this database was opened from. After a
 	// commit the pages the commit touched are written back to it, so the file
 	// stays a SQLite database a client can open. The commit log is still the
