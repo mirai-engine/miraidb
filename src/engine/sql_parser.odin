@@ -25,6 +25,10 @@ Parser :: struct {
 	expression_depth: int,
 	// derived_count numbers the derived tables a statement does not name.
 	derived_count: int,
+	// binary_depth is how deep each binary node's subtree is. A chain such as
+	// `1+1+...` nests one level per operator without any parenthesis, and the
+	// tree is walked recursively before it is evaluated.
+	binary_depth: map[^Expr]int,
 }
 
 // sql_parse turns one SQL statement into a Query tree. The Query owns an arena
@@ -3513,8 +3517,17 @@ expr_literal :: proc(p: ^Parser, value: Value) -> ^Expr {
 @(private)
 expr_binary :: proc(p: ^Parser, op: Binary_Op, left, right: ^Expr) -> ^Expr {
 	if left == nil || right == nil do return left
+	// A chain nests without parentheses: it is held to the same depth as
+	// they are, which is also the depth evaluation allows.
+	if p.binary_depth == nil do p.binary_depth = make(map[^Expr]int, 16, p.alloc)
+	depth := 1 + max(p.binary_depth[left], p.binary_depth[right])
+	if p.expression_depth + depth > MAX_EXPRESSION_DEPTH {
+		p_fail(p, .Sql_Unsupported, "expression nests deeper than %d levels", MAX_EXPRESSION_DEPTH)
+		return nil
+	}
 	e := new(Expr, p.alloc)
 	e^ = Binary_Expr{op = op, left = left, right = right}
+	p.binary_depth[e] = depth
 	return e
 }
 
