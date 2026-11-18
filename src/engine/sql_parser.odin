@@ -1601,16 +1601,26 @@ parse_insert :: proc(p: ^Parser) -> Statement {
 parse_returning :: proc(p: ^Parser) -> ^Returning {
 	if !p_match_keyword(p, "returning") do return nil
 	returning := new(Returning, p.alloc)
-	if p_match_punct(p, "*") {
-		returning.star = true
-		return returning
-	}
-	columns := make([dynamic]string, 0, 2, p.alloc)
+	items := make([dynamic]Select_Item, 0, 2, p.alloc)
 	for {
-		append(&columns, p_ident(p))
+		item: Select_Item
+		if p_is_punct(p, "*") {
+			p_advance(p)
+			item.star = true
+		} else {
+			start := p.prev_end
+			item.expr = parse_expression(p)
+			item.text = p_text_since(p, start)
+			if p_match_keyword(p, "as") {
+				item.alias = p_ident(p)
+			} else if (p.current.kind == .Ident || p.current.kind == .Quoted_Ident) && !p_is_clause_keyword(p) {
+				item.alias = p_ident(p)
+			}
+		}
+		append(&items, item)
 		if !p_match_punct(p, ",") do break
 	}
-	returning.columns = columns[:]
+	returning.items = items[:]
 	return returning
 }
 

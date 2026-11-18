@@ -7883,6 +7883,7 @@ row_with_defaults :: proc(tx: ^Tx, table: ^Table, values: []Value) -> []Value {
 
 @(private)
 returning_append :: proc(
+	tx: ^Tx,
 	result: ^Sql_Result,
 	rows: ^[dynamic][]Value,
 	returning: ^Returning,
@@ -7891,44 +7892,62 @@ returning_append :: proc(
 ) -> Error {
 	if returning == nil do return ERROR_NONE
 	if prepare_err := returning_prepare(result, returning, table); prepare_err.kind != .None do return prepare_err
-	values := make([]Value, len(result.columns))
-	if returning.star {
-		for value, i in row.values {
-			if i >= len(values) do break
-			values[i] = value_clone(value, context.allocator)
+	values := make([dynamic]Value, 0, len(result.columns))
+	sources := [1]Source{Source{table = table, row = row}}
+	ctx := Eval_Ctx{tx = tx, sources = sources[:], now_us = now_microseconds()}
+	for item in returning.items {
+		if item.star {
+			for column in 0 ..< len(table.schema.columns) {
+				value := column < len(row.values) ? row.values[column] : value_null()
+				append(&values, value_clone(value, context.allocator))
+			}
+			continue
 		}
-	} else {
-		for name, i in returning.columns {
-			index, _ := schema_column_index(&table.schema, name)
-			values[i] = value_clone(row.values[index], context.allocator)
+		value, eval_err := eval_expr(&ctx, item.expr)
+		if eval_err.kind != .None {
+			for v in values do value_deep_free(v, context.allocator)
+			delete(values)
+			return eval_err
 		}
+		append(&values, value_clone(value, context.allocator))
 	}
-	append(rows, values)
+	append(rows, values[:])
 	return ERROR_NONE
 }
 
 // returning_prepare makes `result` the rows of a RETURNING, with its columns,
 // even when no row comes back: a statement that wrote nothing still answers
-// an empty set of rows.
+// an empty set of rows. A column is named as SQLite names it: its alias, the
+// column a bare name reads, or the expression as written.
 @(private)
 returning_prepare :: proc(result: ^Sql_Result, returning: ^Returning, table: ^Table) -> Error {
 	if returning == nil do return ERROR_NONE
 	if result.kind != .Rows {
-		result.kind = .Rows
-		if returning.star {
-			result.columns = make([]string, len(table.schema.columns))
-			for column, i in table.schema.columns {
-				result.columns[i] = strings.clone(column.name)
+		names := make([dynamic]string, 0, len(returning.items))
+		for item in returning.items {
+			if item.star {
+				for column in table.schema.columns do append(&names, strings.clone(column.name))
+				continue
 			}
-		} else {
-			result.columns = make([]string, len(returning.columns))
-			for name, i in returning.columns {
-				if _, found := schema_column_index(&table.schema, name); !found {
-					return errf(.Column_Not_Found, "column %s does not exist in %s", name, table.schema.name)
+			if column, is_column := item.expr^.(Column_Expr); is_column && column.table == "" {
+				if _, found := schema_column_index(&table.schema, column.name); !found && !rowid_alias_name(column.name) {
+					for name in names do delete(name)
+					delete(names)
+					return errf(.Column_Not_Found, "no such column: %s", column.name)
 				}
-				result.columns[i] = strings.clone(name)
 			}
+			name := item.alias
+			if name == "" {
+				if column, is_column := item.expr^.(Column_Expr); is_column {
+					name = column.name
+				} else {
+					name = item.text
+				}
+			}
+			append(&names, strings.clone(name))
 		}
+		result.kind = .Rows
+		result.columns = names[:]
 	}
 	return ERROR_NONE
 }
@@ -8196,7 +8215,7 @@ sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Res
 				return {}, fts_err
 			}
 			if returning := stmt.returning; returning != nil {
-				if returning_err := returning_append(&result, &returned, returning, table, Row{values = new_values}); returning_err.kind != .None {
+				if returning_err := returning_append(tx, &result, &returned, returning, table, Row{values = new_values}); returning_err.kind != .None {
 					return {}, returning_err
 				}
 			}
@@ -8231,7 +8250,7 @@ sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Res
 		}
 		if returning := stmt.returning; returning != nil {
 			if staged, exists := tx_get(tx, stmt.table, row_id); exists {
-				if returning_err := returning_append(&result, &returned, returning, table, staged); returning_err.kind != .None {
+				if returning_err := returning_append(tx, &result, &returned, returning, table, staged); returning_err.kind != .None {
 					return {}, returning_err
 				}
 			}
@@ -8651,7 +8670,7 @@ sql_exec_update :: proc(tx: ^Tx, stmt: Update_Stmt, params: []Value) -> (Sql_Res
 		if fts_err := fts_index_if_virtual(tx, stmt.table, row.id, new_values, false); fts_err.kind != .None {
 			return {}, fts_err
 		}
-		if returning_err := returning_append(&result, &returned, stmt.returning, table, Row{values = new_values}); returning_err.kind != .None {
+		if returning_err := returning_append(tx, &result, &returned, stmt.returning, table, Row{values = new_values}); returning_err.kind != .None {
 			return {}, returning_err
 		}
 		affected += 1
@@ -8731,7 +8750,7 @@ sql_exec_delete :: proc(tx: ^Tx, stmt: Delete_Stmt, params: []Value) -> (Sql_Res
 		allowed, allow_err := policy_allows(&policies, &ctx, false)
 		if allow_err.kind != .None do return {}, allow_err
 		if !allowed do continue
-		if returning_err := returning_append(&result, &returned, stmt.returning, table, row); returning_err.kind != .None {
+		if returning_err := returning_append(tx, &result, &returned, stmt.returning, table, row); returning_err.kind != .None {
 			return {}, returning_err
 		}
 		if fts_err := fts_delete_if_virtual(tx, stmt.table, row.id); fts_err.kind != .None {

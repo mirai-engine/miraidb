@@ -374,9 +374,10 @@ Insert_Stmt :: struct {
 
 // Returning lists the rows a mutation reports back: every column with `*`, or
 // the named columns in the requested order.
+// Returning is a mutation's RETURNING list: what a projection list holds, `*`
+// and expressions with aliases, read against each row the statement wrote.
 Returning :: struct {
-	star:    bool,
-	columns: []string,
+	items: []Select_Item,
 }
 
 Assignment :: struct {

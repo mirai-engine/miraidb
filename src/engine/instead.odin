@@ -97,7 +97,7 @@ view_write :: proc(tx: ^Tx, name: string, statement: Statement, params: []Value)
 			if err := trigger_fire(tx, name, .Insert, .Instead, Row{}, Row{values = new_values}, schema); err.kind != .None {
 				return {}, err
 			}
-			if err := returning_append(&result, &returned, returning, view, Row{values = new_values}); err.kind != .None do return {}, err
+			if err := returning_append(tx, &result, &returned, returning, view, Row{values = new_values}); err.kind != .None do return {}, err
 		}
 	case Update_Stmt, Delete_Stmt:
 		where_clause: ^Expr
@@ -155,7 +155,7 @@ view_write :: proc(tx: ^Tx, name: string, statement: Statement, params: []Value)
 		for row in chosen {
 			if !is_update {
 				if err := trigger_fire(tx, name, .Delete, .Instead, row, Row{}, schema); err.kind != .None do return {}, err
-				if err := returning_append(&result, &returned, returning, view, row); err.kind != .None do return {}, err
+				if err := returning_append(tx, &result, &returned, returning, view, row); err.kind != .None do return {}, err
 				continue
 			}
 			old_row := Row{id = row.id, values = row.values[:width]}
@@ -165,7 +165,7 @@ view_write :: proc(tx: ^Tx, name: string, statement: Statement, params: []Value)
 			fire_err := trigger_fire(tx, name, .Update, .Instead, old_row, new_row, schema)
 			tx.update_set = saved_set
 			if fire_err.kind != .None do return {}, fire_err
-			if err := returning_append(&result, &returned, returning, view, new_row); err.kind != .None do return {}, err
+			if err := returning_append(tx, &result, &returned, returning, view, new_row); err.kind != .None do return {}, err
 		}
 	}
 	tx.store.last_changes = 0

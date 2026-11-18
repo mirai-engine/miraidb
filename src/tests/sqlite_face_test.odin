@@ -99,6 +99,27 @@ test_replace_and_upsert_see_the_transaction :: proc(t: ^testing.T) {
 	face_ok(t, conn, "COMMIT")
 }
 
+@(test)
+test_returning_takes_expressions :: proc(t: ^testing.T) {
+	store := face_store(t)
+	defer db.store_close(store)
+	conn := db.embed_wrap(store)
+	defer db.embed_close(conn)
+	face_ok(t, conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
+	face_ok(t, conn, "INSERT INTO t (n) VALUES (10), (20)")
+	stmt := db.embed_prepare(conn, "UPDATE t SET n = n + 1 WHERE id = 2 RETURNING 1, n * 2 AS twice, *")
+	if !testing.expect(t, stmt != nil) do return
+	defer db.embed_finalize(stmt)
+	has_row, err := db.embed_step(stmt)
+	testing.expect(t, db.error_ok(err) && has_row)
+	testing.expect_value(t, db.embed_column_count(stmt), 4)
+	testing.expect_value(t, db.embed_column_name(stmt, 0), "1")
+	testing.expect_value(t, db.embed_column_name(stmt, 1), "twice")
+	testing.expect_value(t, db.embed_column_int(stmt, 0), i64(1))
+	testing.expect_value(t, db.embed_column_int(stmt, 1), i64(42))
+	testing.expect_value(t, db.embed_column_int(stmt, 3), i64(21))
+}
+
 @(private = "file")
 Window_Calls :: struct {
 	steps, inverses, values: int,
