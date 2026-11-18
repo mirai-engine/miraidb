@@ -1280,8 +1280,8 @@ sqlite3_free :: proc "c" (pointer: rawptr) {
 
 // sqlite3_libversion is the SQLite release this facade answers as: the one
 // its surface is measured against (docs/sqlite-roadmap.md), the same
-// sqlite_version() answers in SQL. A program reads it as numbers, so the
-// facade's own name is in sqlite3_sourceid instead.
+// sqlite_version() answers in SQL. A program reads it as numbers; the
+// facade's own name follows SQLite's source id in sqlite3_sourceid.
 @(export)
 sqlite3_libversion :: proc "c" () -> cstring {
 	context = runtime.default_context()
@@ -1558,10 +1558,16 @@ sqlite3_libversion_number :: proc "c" () -> c.int {
 	return 3054001
 }
 
+// SQLITE_SOURCE_ID is SQLite 3.54.1's: the check-in date and hash. A program
+// built against SQLite's header compares the first 60 characters with its own
+// SQLITE_SOURCE_ID (the command-line shell refuses to start on a mismatch),
+// so they are SQLite's, and the facade's name follows them, the way SQLite
+// marks a modified build at the end of the id.
+SQLITE_SOURCE_ID :: "2026-10-16 14:45:20 555e07ef33f69a0957d24d8e555b702464a131d6f1607f4c3c1e4551e8e6ca76 miraidb"
+
 @(export)
 sqlite3_sourceid :: proc "c" () -> cstring {
-	context = runtime.default_context()
-	return "miraidb sqlite3 facade"
+	return SQLITE_SOURCE_ID
 }
 
 // --- Where a result column comes from ----------------------------------------
