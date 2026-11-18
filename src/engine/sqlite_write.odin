@@ -866,7 +866,12 @@ sqlite_file_image :: proc(store: ^Store, alloc := context.allocator) -> (image: 
 		table_collect(table, &collected, max(u64))
 		defer table_collect_release(table, &collected)
 		exported := make([dynamic]Sqlite_Export_Row, 0, len(collected))
-		defer delete(exported)
+		// The copies of the rows' values serve the table's cells and then its
+		// indexes (sqlite_write_index_tree reads them): they go with the table.
+		defer {
+			for row in exported do delete(row.values, alloc)
+			delete(exported)
+		}
 		rowid_column := sqlite_rowid_alias(table)
 		next_rowid := i64(1)
 		for row in collected {
@@ -887,8 +892,6 @@ sqlite_file_image :: proc(store: ^Store, alloc := context.allocator) -> (image: 
 			payload := sqlite_encode_record(row.values, rowid_column, alloc)
 			cells[i] = sqlite_leaf_cell(&w, payload, row.rowid)
 			delete(payload, alloc)
-			// The copy of the row's values was only for sorting and encoding.
-			delete(row.values, alloc)
 			keys[i] = row.rowid
 			rows += 1
 		}
