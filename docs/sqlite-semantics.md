@@ -25,10 +25,9 @@ SQLite; the engine's own rules keep names exact
 
 CPython's own tests of its `sqlite3` module run on the facade
 (`scripts/python_sqlite3.py`, a gate of `scripts/ci.py`): every test that
-passes with SQLite has to pass here. Two do not, each listed with its reason in
-the script: an attached database is read-only here, so `CREATE TABLE
-attached_db.foo` is refused; and `fts4` keeps its index in the engine, not in
-SQLite's shadow tables, so a dump has no `CREATE TABLE` for them.
+passes with SQLite has to pass here, and every one does: the list of known
+differences in the script is empty. The last two were an attached database that
+could not be written and a full-text table without SQLite's shadow tables.
 
 The switch is one flag on the store, `sqlite_rules`, set by `sqlite3_open` and
 by opening a SQLite file. Foreign keys follow the same split: off until

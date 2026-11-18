@@ -308,7 +308,7 @@ rows, and `PRAGMA database_list` reports it as `main`.
 | 23 | Backup API and `VACUUM INTO` | 2 | done: `VACUUM`, `VACUUM INTO 'path'` (a full database), `miraidb_backup`; an existing target is refused. SQLite's `sqlite3_backup_*`, `sqlite3_serialize` and `sqlite3_deserialize` landed with ABI block 4 (`scripts/sqlite_abi_database.py`) |
 | 24 | `sqlite3_blob_*` incremental I/O | 1 | done: open/bytes/read/write/close/reopen over a copy flushed by `UPDATE`; the row is named by its rowid, so a table without a primary key works too; covered by the ABI smoke |
 | 25 | `load_extension` through `core:dynlib` | 1 | done out of process instead of in-process: `LOAD EXTENSION name AT 'host:port' [USING reducers]` registers a remote module over the wire protocol, `UNLOAD EXTENSION` forgets it, the row in `_extension` makes `host_init` register it again after a restart, and no engine struct crosses the boundary (the in-process DLL attempt is documented below as refused) |
-| 26 | `ATTACH` / `DETACH` as a store catalog | 1 | done: `ATTACH 'path' AS name` opens a database read-only and records it in `_attach` (so a reopen restores it), `name.table` and `db.table.column` read it, `DETACH` forgets it, writes are refused at parse time with a reason |
+| 26 | `ATTACH` / `DETACH` as a store catalog | 1 | done: `ATTACH 'path' AS name` opens a database and records it in `_attach` (so a reopen restores it), `name.table` and `db.table.column` read it, `DETACH` forgets it; writes to it run in its own transaction, which the statement's transaction ends (session 4: they used to be refused) |
 
 ### Delivered in #25 (for the record): extensions as processes
 

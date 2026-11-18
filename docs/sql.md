@@ -565,13 +565,22 @@ column of another table, which turns the call into a lateral join:
 
 ## Attached databases
 
-`ATTACH 'path' AS name` opens a second database read-only; its tables are then
-readable as `name.table`, including in joins and with three-part references
-(`name.table.column`). The name and path are recorded in the internal `_attach`
-table, so reopening the principal restores the set. `DETACH name` forgets it.
-Writes against an attached database are refused with
-`writes to an attached database are read-only`, and both statements are refused
-inside a transaction. A database opened *without* host access refuses `ATTACH`
+`ATTACH 'path' AS name` opens a second database: an engine database, a SQLite
+file (read, and mirrored back on each commit, as `sqlite3_open` does) or
+`':memory:'`; under SQLite's rules a path that does not exist becomes an empty
+SQLite file. Its tables are readable as `name.table`, including in joins and
+with three-part references (`name.table.column`), and writable, as in SQLite:
+`CREATE TABLE name.t`, `INSERT`, `UPDATE` and `DELETE` on `name.t`,
+`CREATE INDEX name.i ON t` and the `DROP`s run in a transaction of the attached
+database that the statement's own transaction opens and ends; inside it a read
+of `name.t` sees what it wrote, a statement that fails is undone alone and
+`ROLLBACK` takes it all back. The attached database commits first, so the
+commit is two commits: a crash between them keeps the attached one's, as
+SQLite's WAL mode does across files. A statement that writes `name.t` resolves
+its other names in that database too, so `INSERT INTO name.t SELECT ... FROM
+main_table` is not supported. The name and path are recorded in the internal
+`_attach` table, so reopening the principal restores the set. `DETACH name`
+forgets it. Both statements are refused inside a transaction. A database opened *without* host access refuses `ATTACH`
 with `Permission_Denied` before it looks at the path: the path is the caller's,
 not the operator's. `miraidb-server` opens without host access unless it was
 started with `--allow-host` (`docs/security.md`). Reading an attached table copies it whole for the
