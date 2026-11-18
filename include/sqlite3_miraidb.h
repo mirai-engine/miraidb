@@ -99,6 +99,9 @@ int         sqlite3_open(const char *filename, sqlite3 **db);
 int         sqlite3_open_v2(const char *filename, sqlite3 **db, int flags,
                             const char *vfs);
 int         sqlite3_close(sqlite3 *db);
+/* With statements still open, the connection closes when the last one is
+** finalized; the call answers SQLITE_OK. */
+int         sqlite3_close_v2(sqlite3 *db);
 const char *sqlite3_errmsg(sqlite3 *db);
 int         sqlite3_errcode(sqlite3 *db);
 int         sqlite3_extended_errcode(sqlite3 *db);
@@ -553,6 +556,37 @@ int  sqlite3_blob_write(sqlite3_blob *blob, const void *buffer, int count,
                         int offset);
 int  sqlite3_blob_reopen(sqlite3_blob *blob, sqlite3_int64 row);
 int  sqlite3_blob_close(sqlite3_blob *blob);
+
+/* --- The database as a whole ---------------------------------------------
+** The image is SQLite's file format. A backup copies the source as it is at
+** the last step, in one transaction of the destination; only "main" can be
+** named. A deserialized connection stops writing the file it was opened on. */
+
+#define SQLITE_SERIALIZE_NOCOPY         0x001
+#define SQLITE_DESERIALIZE_FREEONCLOSE  1
+#define SQLITE_DESERIALIZE_RESIZEABLE   2
+#define SQLITE_DESERIALIZE_READONLY     4
+#define SQLITE_TXN_NONE   0
+#define SQLITE_TXN_READ   1
+#define SQLITE_TXN_WRITE  2
+
+typedef struct sqlite3_backup sqlite3_backup;
+
+unsigned char *sqlite3_serialize(sqlite3 *db, const char *schema,
+                                 sqlite3_int64 *size, unsigned int flags);
+int sqlite3_deserialize(sqlite3 *db, const char *schema, unsigned char *data,
+                        sqlite3_int64 db_size, sqlite3_int64 buffer_size,
+                        unsigned int flags);
+sqlite3_backup *sqlite3_backup_init(sqlite3 *dest, const char *dest_name,
+                                    sqlite3 *source, const char *source_name);
+int  sqlite3_backup_step(sqlite3_backup *backup, int pages);
+int  sqlite3_backup_finish(sqlite3_backup *backup);
+int  sqlite3_backup_remaining(sqlite3_backup *backup);
+int  sqlite3_backup_pagecount(sqlite3_backup *backup);
+const char *sqlite3_db_filename(sqlite3 *db, const char *schema);
+const char *sqlite3_db_name(sqlite3 *db, int index);
+int  sqlite3_db_readonly(sqlite3 *db, const char *schema);
+int  sqlite3_txn_state(sqlite3 *db, const char *schema);
 
 /* --- Library ------------------------------------------------------------- */
 

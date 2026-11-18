@@ -746,6 +746,19 @@ Sqlite_Export_Row :: struct {
 
 // sqlite_file_write exports every persistent user table to a SQLite database.
 sqlite_file_write :: proc(store: ^Store, path: string, alloc := context.allocator) -> (tables: int, rows: int, err: Error) {
+	image: []u8
+	image, tables, rows, err = sqlite_file_image(store, alloc)
+	if err.kind != .None do return
+	defer delete(image)
+	if write_err := os.write_entire_file(path, image); write_err != nil {
+		return tables, rows, errf(.Io, "cannot write %s: %v", path, write_err)
+	}
+	return tables, rows, ERROR_NONE
+}
+
+// sqlite_file_image builds the SQLite database image of the store, the bytes
+// a file would hold. The caller owns them.
+sqlite_file_image :: proc(store: ^Store, alloc := context.allocator) -> (image: []u8, tables: int, rows: int, err: Error) {
 	w := Sqlite_Writer {
 		page_size = SQLITE_WRITE_PAGE_SIZE,
 		usable    = SQLITE_WRITE_PAGE_SIZE,
@@ -955,8 +968,15 @@ sqlite_file_write :: proc(store: ^Store, path: string, alloc := context.allocato
 		// offset 100 and every cell offset shifts by 100. The built root page
 		// becomes a freelist trunk once its content has moved.
 		sqlite_move_to_page_one(&w, master_root)
-		sqlite_release_page(&w, master_root)
-		freelist_trunk = master_root
+		if master_root == len(w.pages) {
+			// The root was the last page written, so the file just ends before
+			// it: an empty database is one page, as SQLite writes it.
+			delete(w.pages[master_root - 1])
+			resize(&w.pages, master_root - 1)
+		} else {
+			sqlite_release_page(&w, master_root)
+			freelist_trunk = master_root
+		}
 	}
 
 	page_count := len(w.pages)
@@ -1001,10 +1021,7 @@ sqlite_file_write :: proc(store: ^Store, path: string, alloc := context.allocato
 	for page, i in w.pages {
 		copy(file[i * w.page_size:], page)
 	}
-	if write_err := os.write_entire_file(path, file); write_err != nil {
-		return tables, rows, errf(.Io, "cannot write %s: %v", path, write_err)
-	}
-	return tables, rows, ERROR_NONE
+	return file, tables, rows, ERROR_NONE
 }
 
 // sqlite_move_to_page_one copies a built root page into page 1, shifting the

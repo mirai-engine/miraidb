@@ -796,6 +796,28 @@ sqlite_file_open :: proc(
 	if read_err != nil {
 		return {}, errf(.Io, "cannot read %s: %v", path, read_err)
 	}
+	return sqlite_file_parse(data, path, alloc, recover, true)
+}
+
+// sqlite_file_from_bytes reads a database image held in memory, the bytes
+// sqlite3_serialize hands out: there is no journal or log beside it. The
+// bytes are copied.
+sqlite_file_from_bytes :: proc(image: []u8, alloc := context.allocator) -> (Sqlite_File, Error) {
+	data := make([]u8, len(image), alloc)
+	copy(data, image)
+	return sqlite_file_parse(data, "the database image", alloc, false, false)
+}
+
+// sqlite_file_parse reads a database image it owns. `side_files` says the
+// image is a file, whose journal or write-ahead log is read through.
+@(private)
+sqlite_file_parse :: proc(
+	data: []u8,
+	path: string,
+	alloc: mem.Allocator,
+	recover: bool,
+	side_files: bool,
+) -> (Sqlite_File, Error) {
 	if len(data) < SQLITE_HEADER_MIN {
 		delete(data, alloc)
 		return {}, errf(.Invalid_Argument, "%s is too short to be a SQLite database", path)
@@ -815,15 +837,18 @@ sqlite_file_open :: proc(
 	reserved := u32(data[20])
 	file.usable = page_size - reserved
 	file.encoding = u32(sqlite_be32(data, 56))
-	// A hot rollback journal holds the pages the interrupted transaction must
-	// restore, so it wins over the database file.
-	journal_path := fmt.aprintf("%s-journal", path, allocator = alloc)
-	defer delete(journal_path, alloc)
-	sqlite_journal_rollback(&file, journal_path, recover)
-	// A write-ahead log keeps the most recent commits out of the database file.
-	wal_path := fmt.aprintf("%s-wal", path, allocator = alloc)
-	defer delete(wal_path, alloc)
-	sqlite_wal_load(&file, wal_path)
+	if side_files {
+		// A hot rollback journal holds the pages the interrupted transaction
+		// must restore, so it wins over the database file.
+		journal_path := fmt.aprintf("%s-journal", path, allocator = alloc)
+		defer delete(journal_path, alloc)
+		sqlite_journal_rollback(&file, journal_path, recover)
+		// A write-ahead log keeps the most recent commits out of the database
+		// file.
+		wal_path := fmt.aprintf("%s-wal", path, allocator = alloc)
+		defer delete(wal_path, alloc)
+		sqlite_wal_load(&file, wal_path)
+	}
 	if file.encoding != 0 && file.encoding != 1 {
 		delete(data, alloc)
 		return {}, errf(.Sql_Unsupported, "%s uses a non-UTF-8 text encoding", path)
@@ -953,6 +978,26 @@ sqlite_import :: proc(
 ) -> (tables: int, rows: int, err: Error) {
 	// One write transaction: import is all-or-nothing and pays a single commit.
 	tx := tx_begin_write(store)
+	tables, rows, err = sqlite_import_tx(file, tx, alloc)
+	if err.kind != .None {
+		tx_rollback(tx)
+		return
+	}
+	if commit_err := tx_commit(tx); commit_err.kind != .None {
+		return tables, rows, commit_err
+	}
+	sqlite_import_finish(file, store)
+	return tables, rows, ERROR_NONE
+}
+
+// sqlite_import_tx creates a file's tables, rows, indexes, views, triggers
+// and header integers in the transaction. On an error the caller rolls the
+// transaction back.
+sqlite_import_tx :: proc(
+	file: ^Sqlite_File,
+	tx: ^Tx,
+	alloc := context.allocator,
+) -> (tables: int, rows: int, err: Error) {
 	for &table in file.tables {
 		if len(table.columns) == 0 do continue
 		rows_of_table, rows_err := sqlite_table_rows(file, &table, alloc)
@@ -1029,7 +1074,6 @@ sqlite_import :: proc(
 		}
 		strings.write_string(&create, ")")
 		if _, create_err := sql_execute_in_tx(tx, strings.to_string(create)); create_err.kind != .None {
-			tx_rollback(tx)
 			return tables, rows, create_err
 		}
 		tables += 1
@@ -1052,7 +1096,6 @@ sqlite_import :: proc(
 			values := make([]Value, len(table.columns), context.temp_allocator)
 			copy(values, row)
 			if _, insert_err := sql_execute_in_tx_params(tx, strings.to_string(insert), values); insert_err.kind != .None {
-				tx_rollback(tx)
 				return tables, rows, insert_err
 			}
 			rows += 1
@@ -1093,14 +1136,16 @@ sqlite_import :: proc(
 			value := i64(i32(sqlite_be32(page_one, at)))
 			if value == 0 do continue
 			if header_err := header_set(tx, name, value); header_err.kind != .None {
-				tx_rollback(tx)
 				return tables, rows, header_err
 			}
 		}
 	}
-	if commit_err := tx_commit(tx); commit_err.kind != .None {
-		return tables, rows, commit_err
-	}
+	return tables, rows, ERROR_NONE
+}
+
+// sqlite_import_finish does what has to wait for the import's commit: the
+// AUTOINCREMENT counters, and the catalog text a mirror rewrite keeps.
+sqlite_import_finish :: proc(file: ^Sqlite_File, store: ^Store) {
 	// sqlite_sequence remembers the last rowid each AUTOINCREMENT table gave
 	// out, which may be above every rowid left in the table.
 	if file.sequence_root != 0 {
@@ -1119,7 +1164,6 @@ sqlite_import :: proc(
 	// Remember the catalog the file spelled, now that the tables exist in the
 	// store: a rewrite re-emits it for every object it does not change (D27).
 	store_mirror_keep(store, file)
-	return tables, rows, ERROR_NONE
 }
 
 @(private)

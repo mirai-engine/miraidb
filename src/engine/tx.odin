@@ -692,6 +692,15 @@ tx_table_probe :: proc(tx: ^Tx, name: string) -> ^Table {
 	return table if ok else nil
 }
 
+// tx_read_any reports whether the transaction has read one of the program's
+// tables, which is when SQLite's deferred transaction starts reading.
+tx_read_any :: proc(tx: ^Tx) -> bool {
+	for name in tx.read_tables {
+		if len(name) > 0 && name[0] != '_' do return true
+	}
+	return false
+}
+
 // tx_read_seq is the commit the transaction reads from.
 tx_read_seq :: proc(tx: ^Tx) -> u64 {
 	return tx.read_seq

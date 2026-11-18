@@ -13,6 +13,7 @@ package sqlite_compat
 
 import "base:runtime"
 import "core:c"
+import "core:path/filepath"
 import "core:strconv"
 import "core:strings"
 
@@ -102,6 +103,14 @@ Database :: struct {
 	// xCreate or xConnect running now (vtab.odin).
 	pending_declaration:  string,
 	in_vtab_constructor:  bool,
+	// filename is what sqlite3_db_filename answers for main: the absolute
+	// path of the file, "" in memory. attached_name holds the last name
+	// sqlite3_db_name answered for an attached database.
+	filename:      cstring,
+	attached_name: cstring,
+	// zombie is a connection sqlite3_close_v2 closed while statements were
+	// still open: it closes when the last one is finalized.
+	zombie: bool,
 }
 
 Statement :: struct {
@@ -410,6 +419,13 @@ sqlite3_open :: proc "c" (filename: cstring, ppDb: ^rawptr) -> c.int {
 	// An expression column is named by its text, as SQLite names it.
 	conn.store.sqlite_names = true
 	db.in_memory = in_memory
+	db.filename = strings.clone_to_cstring("")
+	if !engine.store_path_is_memory(path) {
+		if absolute, abs_err := filepath.abs(path, context.temp_allocator); abs_err == nil {
+			delete(db.filename)
+			db.filename = strings.clone_to_cstring(absolute)
+		}
+	}
 	db.statements = make(map[rawptr]^Statement)
 	engine.handle_register(rawptr(db))
 	ppDb^ = rawptr(db)
@@ -455,11 +471,28 @@ sqlite3_close :: proc "c" (handle: rawptr) -> c.int {
 	// Every virtual table disconnects while the connection can still be named.
 	engine.store_vtab_close(db.conn.store)
 	delete(db.pending_declaration)
+	delete(db.filename)
+	delete(db.attached_name)
 	engine.embed_close(db.conn)
 	delete(db.last_error)
 	delete(db.last_error16)
 	free(db)
 	return SQLITE_OK
+}
+
+// sqlite3_close_v2 closes the connection, or, while statements are still
+// open, makes it a zombie that closes when the last one is finalized, as
+// SQLite does: the call answers OK either way.
+@(export)
+sqlite3_close_v2 :: proc "c" (handle: rawptr) -> c.int {
+	context = runtime.default_context()
+	db := db_of(handle)
+	if db == nil do return SQLITE_OK
+	if len(db.statements) > 0 {
+		db.zombie = true
+		return SQLITE_OK
+	}
+	return sqlite3_close(handle)
 }
 
 @(export)
@@ -693,6 +726,9 @@ sqlite3_finalize :: proc "c" (handle: rawptr) -> c.int {
 	stmt := stmt_of(handle)
 	if stmt == nil do return SQLITE_MISUSE
 	if stmt.db != nil do delete_key(&stmt.db.statements, handle)
+	// The last statement of a connection sqlite3_close_v2 left open closes it.
+	zombie := stmt.db != nil && stmt.db.zombie && len(stmt.db.statements) == 0 ? stmt.db : nil
+	defer if zombie != nil do sqlite3_close(rawptr(zombie))
 	engine.handle_forget(handle)
 	stmt_clear_text_cache(stmt)
 	delete(stmt.text_cache)
