@@ -210,6 +210,20 @@ test_window_filter_over_groups :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_sum_overflow :: proc(t: ^testing.T) {
+	// A sum of integers that leaves 64 bits is an error, as in SQLite; it used
+	// to wrap silently.
+	store := fresh_db(t, "sum_overflow")
+	if store == nil do return
+	defer cleanup_db(store, "sum_overflow")
+	run(t, store, "CREATE TABLE g (k INTEGER, n INTEGER)")
+	run(t, store, "INSERT INTO g VALUES (1, 9223372036854775807), (1, 1), (2, 5)")
+	testing.expect_value(t, run_error(t, store, "SELECT sum(n) FROM g WHERE k = 1").message, "integer overflow")
+	testing.expect_value(t, run_error(t, store, "SELECT k, sum(n) FROM g GROUP BY k").message, "integer overflow")
+	testing.expect_value(t, scalar(t, store, "SELECT sum(n) FROM g WHERE k = 2").i, i64(5))
+}
+
+@(test)
 test_window_clause :: proc(t: ^testing.T) {
 	// The WINDOW clause (S4): `OVER name` takes a definition whole, `OVER (name
 	// ...)` adds an ORDER BY or a frame to it, a definition may build on an

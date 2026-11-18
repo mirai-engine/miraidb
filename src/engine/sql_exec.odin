@@ -2597,7 +2597,10 @@ eval_aggregate_values :: proc(ctx: ^Eval_Ctx, call: Call_Expr, values: []Value) 
 				sum_128 += i128(number)
 			} else {
 				number, _ := value_to_i64(value)
-				sum_int += number
+				// A sum that leaves 64 bits is an error, as in SQLite: it used to wrap.
+				total, overflow := intrinsics.overflow_add(sum_int, number)
+				if overflow do return {}, integer_overflow_error()
+				sum_int = total
 			}
 		}
 	}
@@ -3029,7 +3032,9 @@ agg_stream_add :: proc(row_ctx: ^Eval_Ctx, stream: ^Agg_Stream) -> Error {
 				acc.sum_128 += i128(number)
 			} else {
 				number, _ := value_to_i64(value)
-				acc.sum_int += number
+				total, overflow := intrinsics.overflow_add(acc.sum_int, number)
+				if overflow do return integer_overflow_error()
+				acc.sum_int = total
 			}
 		case "array_agg":
 			append(&acc.list, value_clone(value, context.allocator))
@@ -7463,7 +7468,10 @@ eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 				sum_128 += i128(number)
 			} else {
 				number, _ := value_to_i64(value)
-				sum_int += number
+				// A sum that leaves 64 bits is an error, as in SQLite: it used to wrap.
+				total, overflow := intrinsics.overflow_add(sum_int, number)
+				if overflow do return {}, integer_overflow_error()
+				sum_int = total
 			}
 		}
 	}
