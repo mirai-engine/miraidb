@@ -224,6 +224,9 @@ Match_Expr :: struct {
 Cast_Expr :: struct {
 	operand: ^Expr,
 	target:  Column_Type,
+	// type_name is the target as written, which SQLite's rules read by its
+	// affinity.
+	type_name: string,
 }
 
 // Param_Expr is a positional bind parameter (`?`). Indexes start at zero in

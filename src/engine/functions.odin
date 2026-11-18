@@ -235,6 +235,12 @@ aggregate_scope_leave :: proc(previous: ^Store) {
 	aggregate_scope = previous
 }
 
+// sqlite_rules_on reports a statement running under SQLite's rules
+// (docs/sqlite-semantics.md).
+sqlite_rules_on :: proc() -> bool {
+	return aggregate_scope != nil && aggregate_scope.sqlite_rules
+}
+
 // statement_store is the store whose statement this thread is running, or nil.
 statement_store :: proc() -> ^Store {
 	return aggregate_scope

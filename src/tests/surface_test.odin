@@ -238,6 +238,39 @@ test_having_alias :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_sqlite_rules :: proc(t: ^testing.T) {
+	// Under SQLite's rules (a SQLite file, the sqlite3_* face) a statement
+	// answers as SQLite does where the engine's rules differ; an engine
+	// database keeps the engine's (docs/sqlite-semantics.md).
+	store := fresh_db(t, "sqlite_rules")
+	if store == nil do return
+	defer cleanup_db(store, "sqlite_rules")
+	run(t, store, "CREATE TABLE g (k INTEGER, n INTEGER)")
+	run(t, store, "INSERT INTO g VALUES (2, 5), (2, 6)")
+	testing.expect_value(t, run_error(t, store, "SELECT 1 / 0").message, "division by zero")
+	testing.expect_value(t, run_error(t, store, "SELECT 9223372036854775807 + 1").message, "integer overflow")
+
+	path := "_test_sqlite_rules.sqlite"
+	os.remove(path)
+	defer os.remove(path)
+	_, _, export_err := db.sqlite_file_write(store, path)
+	if !testing.expectf(t, db.error_ok(export_err), "export: %s", export_err.message) do return
+	conn, open_err := db.embed_open(path)
+	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
+	defer db.embed_close(conn)
+	cases := [][2]string {
+		{"SELECT 1 / 0 IS NULL AND 5 % 0 IS NULL", "1"},
+		{"SELECT 9223372036854775807 + 1", "9.22337203685478e+18"},
+		{"SELECT CAST('12abc' AS INTEGER) || ',' || CAST('abc' AS REAL) || ',' || CAST('1e3' AS NUMERIC)", "12,0.0,1000"},
+		{"SELECT 10 % 3.5", "1.0"},
+		{"SELECT upper('straße') || lower(char(201))", "STRAßEÉ"},
+		{"SELECT 1 + '2'", "3"},
+		{"SELECT group_concat(k, ',') FROM (SELECT k, sum(n) AS s FROM g WHERE k = 2 GROUP BY k HAVING s > 10)", "2"},
+	}
+	for c in cases do testing.expectf(t, file_scalar(t, conn, c[0]) == c[1], "%s: %s", c[0], file_scalar(t, conn, c[0]))
+}
+
+@(test)
 test_window_clause :: proc(t: ^testing.T) {
 	// The WINDOW clause (S4): `OVER name` takes a definition whole, `OVER (name
 	// ...)` adds an ORDER BY or a frame to it, a definition may build on an

@@ -427,8 +427,10 @@ sqlite3_open :: proc "c" (filename: cstring, ppDb: ^rawptr) -> c.int {
 	db.error_offset = -1
 	// An expression column is named by its text, as SQLite names it.
 	conn.store.sqlite_names = true
-	// Foreign keys are off until PRAGMA foreign_keys = ON, as in SQLite.
+	// Foreign keys are off until PRAGMA foreign_keys = ON, and a statement
+	// answers with SQLite's rules, as in SQLite (docs/sqlite-semantics.md).
 	conn.store.foreign_keys_off = true
+	conn.store.sqlite_rules = true
 	db.in_memory = in_memory
 	db.filename = strings.clone_to_cstring("")
 	if !engine.store_path_is_memory(path) {

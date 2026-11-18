@@ -179,8 +179,10 @@ planner, and the answer is the same with or without them.
 
 ## Semantics that differ from SQLite
 
-These are decisions, not accidents, and a program that relies on SQLite's
-behaviour here will see different results:
+These are decisions, not accidents, and they are the engine's own rules: an
+engine database (a directory) answers this way. Through the `sqlite3_*` face
+and on a SQLite file a statement answers with SQLite's rules instead, as
+[sqlite-semantics.md](sqlite-semantics.md) records case by case:
 
 | Case | SQLite | This engine |
 |---|---|---|
@@ -188,7 +190,6 @@ behaviour here will see different results:
 | `CAST('abc' AS INTEGER)` | `0` | error `invalid_type` |
 | `9223372036854775807 + 1` | a float | wraps to `-9223372036854775808` |
 | `CAST(300 AS TINYINT)` | `300` (INTEGER affinity) | error: the value does not fit the declared width |
-| `HAVING c > 1` where `c` aliases `count(*)` | works | error `column c does not exist` |
 | `UPDATE t SET u = u + 990` whose rows collide only partway through | error: a unique key is checked row by row | succeeds when the final rows are distinct: a statement's keys are checked against its result |
 | `COMMIT` a deferred foreign key fails | the transaction stays open until `ROLLBACK` | the transaction is rolled back |
 | foreign keys, engine default | enforced only after `PRAGMA foreign_keys = ON` | enforced until `PRAGMA foreign_keys = OFF` (the `sqlite3_*` face starts with them off) |

@@ -5112,6 +5112,7 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 	case Cast_Expr:
 		operand, operand_err := eval_expr(ctx, e.operand)
 		if operand_err.kind != .None do return {}, operand_err
+		if sqlite_rules_on() && len(e.type_name) > 0 do return sqlite_cast(operand, e.type_name), ERROR_NONE
 		return value_cast(operand, e.target)
 	case Param_Expr:
 		if e.index < 0 || e.index >= len(ctx.params) {
@@ -5242,6 +5243,10 @@ eval_binary :: proc(
 		if left.kind == .Array || right.kind == .Array {
 			return array_concat(left, right)
 		}
+		// Under SQLite's rules a real reads `1.0`, a blob its bytes.
+		if sqlite_rules_on() {
+			return value_string(strings.concatenate({sqlite_cast(left, "TEXT").s, sqlite_cast(right, "TEXT").s})), ERROR_NONE
+		}
 		left_text := value_to_text(left)
 		right_text := value_to_text(right)
 		return value_string(strings.concatenate({left_text, right_text})), ERROR_NONE
@@ -5269,8 +5274,17 @@ eval_binary :: proc(
 
 @(private)
 eval_arithmetic :: proc(op: Binary_Op, left, right: Value) -> (Value, Error) {
+	// SQLite reads a text or a blob operand as the number it starts with.
+	left, right := left, right
+	if sqlite_rules_on() {
+		if left.kind == .String || left.kind == .Bytes do left = sqlite_cast(left, "NUMERIC")
+		if right.kind == .String || right.kind == .Bytes do right = sqlite_cast(right, "NUMERIC")
+	}
 	if !value_is_numeric(left) || !value_is_numeric(right) {
 		return {}, errf(.Invalid_Type, "arithmetic needs numbers")
+	}
+	if sqlite_rules_on() && (left.kind == .Int || left.kind == .Float || left.kind == .Bool) && (right.kind == .Int || right.kind == .Float || right.kind == .Bool) {
+		return sqlite_arithmetic(op, left, right), ERROR_NONE
 	}
 	if left.kind == .Int128 ||
 	   left.kind == .Uint128 ||
@@ -5458,6 +5472,8 @@ eval_unary :: proc(op: Unary_Op, operand: Value) -> (Value, Error) {
 			}
 			return value_int128(big), ERROR_NONE
 		}
+		// SQLite negates the one integer that has no negative as a REAL.
+		if sqlite_rules_on() && operand.kind == .Int && operand.i == min(i64) do return value_float(-f64(operand.i)), ERROR_NONE
 		value, ok := value_to_i64(operand)
 		if !ok do return {}, errf(.Invalid_Type, "cannot negate a %s", value_kind_name(operand.kind))
 		if value == min(i64) {
@@ -6460,11 +6476,13 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 	case "lower":
 		if len(args) != 1 do return {}, errf(.Invalid_Argument, "lower() takes one argument")
 		if args[0].kind == .Null do return value_null(), ERROR_NONE
+		if sqlite_rules_on() do return value_string(ascii_case(sqlite_value_text(args[0], context.temp_allocator), false)), ERROR_NONE
 		if args[0].kind != .String do return {}, errf(.Invalid_Type, "lower() expects text")
 		return value_string(strings.to_lower(args[0].s)), ERROR_NONE
 	case "upper":
 		if len(args) != 1 do return {}, errf(.Invalid_Argument, "upper() takes one argument")
 		if args[0].kind == .Null do return value_null(), ERROR_NONE
+		if sqlite_rules_on() do return value_string(ascii_case(sqlite_value_text(args[0], context.temp_allocator), true)), ERROR_NONE
 		if args[0].kind != .String do return {}, errf(.Invalid_Type, "upper() expects text")
 		return value_string(strings.to_upper(args[0].s)), ERROR_NONE
 	case "length", "char_length":
@@ -7575,8 +7593,14 @@ like_match :: proc(text, pattern: string, case_insensitive: bool, escape: u8 = 0
 	t := text
 	p := pattern
 	if case_insensitive {
-		t = strings.to_lower(text)
-		p = strings.to_lower(pattern)
+		// SQLite's LIKE folds ASCII letters only.
+		if sqlite_rules_on() {
+			t = ascii_case(text, false, context.temp_allocator)
+			p = ascii_case(pattern, false, context.temp_allocator)
+		} else {
+			t = strings.to_lower(text)
+			p = strings.to_lower(pattern)
+		}
 	}
 	Like_Token_Kind :: enum u8 {
 		Literal,

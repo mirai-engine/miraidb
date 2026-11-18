@@ -188,6 +188,11 @@ Store :: struct {
 	// listed but not enforced. The engine enforces them unless told; the
 	// SQLite face opens with them off, as SQLite does.
 	foreign_keys_off:    bool,
+	// sqlite_rules makes a statement answer as SQLite does where the engine's
+	// own rules differ: a division by zero is NULL, an overflowing integer a
+	// REAL, a CAST reads a number's prefix, case folds ASCII only
+	// (docs/sqlite-semantics.md). The sqlite3_* face and a SQLite file set it.
+	sqlite_rules:        bool,
 	// sqlite_mirror is the .sqlite file this database was opened from. After a
 	// commit the pages the commit touched are written back to it, so the file
 	// stays a SQLite database a client can open. The commit log is still the
@@ -700,8 +705,10 @@ schema_signature :: proc(schema: ^Table_Schema) -> string {
 store_set_sqlite_mirror :: proc(store: ^Store, path: string) {
 	if store == nil do return
 	// A SQLite database keeps SQLite's default: its foreign keys are declared
-	// and enforced after PRAGMA foreign_keys = ON.
+	// and enforced after PRAGMA foreign_keys = ON; and its statements answer
+	// with SQLite's rules.
 	store.foreign_keys_off = true
+	store.sqlite_rules = true
 	delete(store.sqlite_mirror)
 	store.sqlite_mirror = strings.clone(path)
 	// The layout is read now, while every row the file holds is still in the

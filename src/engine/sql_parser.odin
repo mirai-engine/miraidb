@@ -24,6 +24,8 @@ Parser :: struct {
 	// SQLite keeps starts there (sqlite_text.odin).
 	ident_start:  int,
 	object_start: int,
+	// cast_name is the type name the last CAST target was written with.
+	cast_name:    string,
 	// expression_depth is how many expressions are open right now. It is one
 	// counter for the whole parser, not one per rule, because every nesting that
 	// costs stack goes through parse_expression.
@@ -2143,6 +2145,7 @@ pg_serial_width :: proc(upper: string) -> u8 {
 @(private)
 parse_cast_target :: proc(p: ^Parser) -> (Column_Type, bool) {
 	type_name := p_ident_or_keyword(p)
+	p.cast_name = type_name
 	upper := strings.to_upper(type_name, context.temp_allocator)
 	kind, width, type_ok := type_kind_from_name(type_name)
 	if !type_ok {
@@ -3174,7 +3177,7 @@ parse_unary :: proc(p: ^Parser) -> ^Expr {
 		target, target_ok := parse_cast_target(p)
 		if !target_ok do return nil
 		e := new(Expr, p.alloc)
-		e^ = Cast_Expr{operand = expr, target = target}
+		e^ = Cast_Expr{operand = expr, target = target, type_name = p.cast_name}
 		expr = e
 	}
 	// `json -> path` and `json ->> path` are SQLite's spellings of a JSON lookup:
@@ -3301,7 +3304,7 @@ parse_primary :: proc(p: ^Parser) -> ^Expr {
 			if !target_ok do return nil
 			p_expect_punct(p, ")")
 			e := new(Expr, p.alloc)
-			e^ = Cast_Expr{operand = operand, target = target}
+			e^ = Cast_Expr{operand = operand, target = target, type_name = p.cast_name}
 			return e
 		}
 		if p_is_keyword(p, "exists") {

@@ -21,6 +21,7 @@ import sqlite_abi_affinity
 import sqlite_abi_authorizer
 import sqlite_abi_collations
 import sqlite_abi_database
+import sqlite_abi_semantics
 import sqlite_abi_hooks
 import sqlite_abi_values
 import sqlite_abi_vtab
@@ -362,6 +363,7 @@ def observe(lib) -> dict[str, object]:
     sqlite_abi_values.observe(lib, seen)
     sqlite_abi_vtab.observe(lib, seen)
     sqlite_abi_database.observe(lib, seen)
+    sqlite_abi_semantics.observe(lib, seen)
 
     seen["errstr"] = [lib.sqlite3_errstr(code) for code in (*range(0, 30), 100, 101, 516, 19 | 8 << 8, 9999)]
     assert lib.sqlite3_close(db) == 0
