@@ -117,6 +117,12 @@ sqlite3_deserialize :: proc "c" (handle: rawptr, schema: cstring, data: [^]u8, d
 Backup :: struct {
 	dest:      ^Database,
 	source:    ^Database,
+	// source_store is the database copied: the main one, an attached one, or
+	// none for the temp database, which is empty here.
+	source_store: ^engine.Store,
+	// source_seq is the source's commit when the copy started: a commit since
+	// starts the copy over, as SQLite restarts a backup whose source changed.
+	source_seq: u64,
 	pages:     c.int,
 	copied:    c.int,
 	started:   bool,
@@ -143,10 +149,20 @@ sqlite3_backup_init :: proc "c" (dest_handle: rawptr, dest_name: cstring, source
 		backup_fail(dest, SQLITE_ERROR, "source and destination must be distinct")
 		return nil
 	}
-	for named in ([2]cstring{dest_name, source_name}) {
-		if !schema_is_main(named) {
-			text := strings.concatenate({"unknown database ", string(named)}, context.temp_allocator)
-			backup_fail(dest, SQLITE_ERROR, text)
+	if !schema_is_main(dest_name) {
+		backup_fail(dest, SQLITE_ERROR, strings.concatenate({"unknown database ", string(dest_name)}, context.temp_allocator))
+		return nil
+	}
+	// The source may be main, temp (empty here) or an attached database.
+	source_store := source.conn.store
+	if !schema_is_main(source_name) {
+		name := string(source_name)
+		if strings.equal_fold(name, "temp") {
+			source_store = nil
+		} else if attached, found := source.conn.store.attached[name]; found && attached != nil {
+			source_store = attached
+		} else {
+			backup_fail(dest, SQLITE_ERROR, strings.concatenate({"unknown database ", name}, context.temp_allocator))
 			return nil
 		}
 	}
@@ -158,8 +174,21 @@ sqlite3_backup_init :: proc "c" (dest_handle: rawptr, dest_name: cstring, source
 	backup := new(Backup)
 	backup.dest = dest
 	backup.source = source
+	backup.source_store = source_store
 	engine.handle_register(rawptr(backup))
 	return rawptr(backup)
+}
+
+// backup_image is the source database as SQLite file bytes.
+@(private)
+backup_image :: proc(backup: ^Backup) -> ([]u8, engine.Error) {
+	if backup.source_store == backup.source.conn.store do return db_image(backup.source)
+	if backup.source_store != nil do return engine.store_sqlite_image(backup.source_store)
+	// The temp database: nothing in it.
+	empty, open_err := engine.store_open("", {persistent = false})
+	if open_err.kind != .None do return nil, open_err
+	defer engine.store_close(empty)
+	return engine.store_sqlite_image(empty)
 }
 
 @(private)
@@ -181,8 +210,14 @@ sqlite3_backup_step :: proc "c" (handle: rawptr, pages: c.int) -> c.int {
 		// A transaction open on either side holds the lock the copy needs.
 		return SQLITE_BUSY
 	}
+	// A source that committed since the copy started is copied again from
+	// its first page.
+	if backup.started && backup.source_store != nil && backup.source_store.commit_seq != backup.source_seq {
+		backup.started = false
+		backup.copied = 0
+	}
 	if !backup.started {
-		image, err := db_image(backup.source)
+		image, err := backup_image(backup)
 		if !engine.error_drop(err) {
 			backup.code = SQLITE_ERROR
 			return backup.code
@@ -190,6 +225,7 @@ sqlite3_backup_step :: proc "c" (handle: rawptr, pages: c.int) -> c.int {
 		backup.pages = c.int(len(image) / engine.SQLITE_WRITE_PAGE_SIZE)
 		delete(image)
 		backup.started = true
+		if backup.source_store != nil do backup.source_seq = backup.source_store.commit_seq
 	}
 	if pages < 0 || backup.copied + pages >= backup.pages {
 		backup.copied = backup.pages
@@ -198,7 +234,7 @@ sqlite3_backup_step :: proc "c" (handle: rawptr, pages: c.int) -> c.int {
 		return SQLITE_OK
 	}
 	// The last step copies the source as it is now.
-	image, err := db_image(backup.source)
+	image, err := backup_image(backup)
 	if !engine.error_drop(err) {
 		backup.code = SQLITE_ERROR
 		return backup.code
