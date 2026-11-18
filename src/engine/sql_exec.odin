@@ -708,6 +708,7 @@ sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sq
 	case Merge_Stmt:
 		return sql_exec_merge(tx, stmt, params)
 	case Create_Table_Stmt:
+		if stmt.as_select != nil do return sql_exec_create_table_as(tx, stmt, params)
 		existed := tx_table_probe(tx, stmt.name) != nil
 		result, err := sql_exec_create_table(tx, stmt, params)
 		if err.kind == .None && !existed && len(stmt.text) > 0 {

@@ -549,6 +549,8 @@ Create_Table_Stmt :: struct {
 	constraints:   []Table_Constraint,
 	// text is the statement as SQLite keeps it in sqlite_master (sqlite_text.odin).
 	text:          string,
+	// as_select is the query of CREATE TABLE ... AS SELECT (create_as.odin).
+	as_select:     ^Select_Stmt,
 }
 
 Drop_Table_Stmt :: struct {

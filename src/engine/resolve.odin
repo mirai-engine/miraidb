@@ -688,6 +688,11 @@ res_ddl :: proc(walk: ^Res_Walk, statement: ^Statement) {
 				return
 			}
 		}
+		if s.as_select != nil {
+			names := make([dynamic]string, 0, 4, context.temp_allocator)
+			res_select(walk, s.as_select, &names)
+			return
+		}
 		for column, i in s.columns {
 			for other in s.columns[:i] {
 				if strings.equal_fold(other.name, column.name) {

@@ -2311,6 +2311,17 @@ parse_create_table :: proc(p: ^Parser, ephemeral: bool, event: bool) -> Statemen
 	}
 	stmt.name = p_object_name(p)
 	p.object_start = p.ident_start
+	// CREATE TABLE name AS SELECT ...: the columns come from the query.
+	if p_match_keyword(p, "as") {
+		if !p_is_keyword(p, "select") {
+			p_fail(p, .Sql_Syntax, "near \"%s\": syntax error", p.current.text)
+			return stmt
+		}
+		if select_stmt, ok := parse_select(p).(Select_Stmt); ok {
+			stmt.as_select = new_clone(select_stmt, p.alloc)
+		}
+		return stmt
+	}
 	if !p_expect_punct(p, "(") do return stmt
 	columns := make([dynamic]Column_Def, 0, 4, p.alloc)
 	constraints := make([dynamic]Table_Constraint, 0, 1, p.alloc)

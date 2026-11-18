@@ -26,6 +26,23 @@ Column_Origin :: struct {
 	// export writes it: INTEGER, REAL, TEXT or BLOB. The text a CREATE TABLE
 	// spelled (VARCHAR(10)) is not kept, so it reads as its affinity's name.
 	decltype: string,
+	// cast_type is, for a column that is a CAST, the type it names: what a
+	// CREATE TABLE ... AS SELECT reads the column's affinity from.
+	cast_type: string,
+}
+
+// sql_describe_declared answers, for each result column of `select`, the type
+// SQLite reads its affinity from: a table column's declared type, a CAST's
+// type, or "" for any other expression. The strings are the temporary
+// allocator's.
+sql_describe_declared :: proc(tx: ^Tx, select: Select_Stmt) -> []string {
+	origins, ok := sql_describe_origins(tx, Statement(select), context.temp_allocator)
+	if !ok do return nil
+	declared := make([]string, len(origins), context.temp_allocator)
+	for origin, i in origins {
+		declared[i] = len(origin.table) > 0 ? origin.decltype : origin.cast_type
+	}
+	return declared
 }
 
 // sql_describe_origins describes the result columns of `statement` in `tx`.
@@ -77,6 +94,10 @@ sql_describe_origins :: proc(tx: ^Tx, statement: Statement, alloc := context.all
 			target = collate.operand
 		}
 		if target == nil do continue
+		if cast_expr, is_cast := target^.(Cast_Expr); is_cast {
+			origins[i].cast_type = strings.clone(cast_expr.type_name, context.temp_allocator)
+			continue
+		}
 		column, is_column := target^.(Column_Expr)
 		if !is_column do continue
 		source, index, found := describe_column_source(sources[:], column)

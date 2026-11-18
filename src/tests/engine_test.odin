@@ -9065,6 +9065,35 @@ test_strict_table_option :: proc(t: ^testing.T) {
 	}
 }
 
+// CREATE TABLE ... AS SELECT: columns named after the result, declared with
+// their expression's affinity, the rows copied, and the text SQLite writes
+// (every expected text here is SQLite 3.54.1's for the same statement).
+@(test)
+test_create_table_as_select :: proc(t: ^testing.T) {
+	store, host := fresh_host(t, "create_table_as")
+	if store == nil do return
+	defer destroy_host(store, host, "create_table_as")
+	run(t, store, "CREATE TABLE t (a INTEGER, b TEXT, c REAL, d, e NUMERIC)")
+	run(t, store, "INSERT INTO t VALUES (1, 'x', 1.5, 'any', 3), (2, 'y', 2.5, 7, 4)")
+	run(t, store, "CREATE TABLE v AS SELECT a, b FROM t")
+	testing.expect_value(t, scalar(t, store, "SELECT sql FROM sqlite_schema WHERE name = 'v'").s, "CREATE TABLE v(a INT,b TEXT)")
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM v").i, i64(2))
+	run(t, store, "CREATE TABLE w AS SELECT *, a + 1 AS plus, CAST(a AS TEXT) AS ct, a AS \"select\", b AS a FROM t WHERE a = 2")
+	testing.expect_value(
+		t,
+		scalar(t, store, "SELECT sql FROM sqlite_schema WHERE name = 'w'").s,
+		"CREATE TABLE w(\n  a INT,\n  b TEXT,\n  c REAL,\n  d,\n  e NUM,\n  plus,\n  ct TEXT,\n  \"select\" INT,\n  \"a:1\" TEXT\n)",
+	)
+	testing.expect_value(t, scalar(t, store, "SELECT \"a:1\" FROM w").s, "y")
+	run(t, store, "CREATE TABLE e AS SELECT a FROM t WHERE 0")
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM e").i, i64(0))
+	// IF NOT EXISTS leaves an existing table alone; without it, the name is taken.
+	run(t, store, "CREATE TABLE IF NOT EXISTS v AS SELECT 1")
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM v").i, i64(2))
+	_, taken := db.sql_execute(store, "CREATE TABLE v AS SELECT 1")
+	testing.expect_value(t, taken.kind, db.Error_Kind.Table_Exists)
+}
+
 @(test)
 test_alter_table_drop_column :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "drop_column")
