@@ -382,7 +382,62 @@ sqlite_schema_rows :: proc(tx: ^Tx, temp: bool, alloc: mem.Allocator) -> [dynami
 		append(&out, Sqlite_Schema_Row{type = "table", name = "sqlite_sequence", tbl_name = "sqlite_sequence", sql = "CREATE TABLE sqlite_sequence(name,seq)"})
 	}
 	catalog_object_rows(tx.store, tx_views(tx, alloc), tx_triggers(tx, alloc), texts, &out, alloc)
+	sqlite_schema_order(tx, out[:])
 	return out
+}
+
+// sqlite_schema_order puts the catalog in the order its objects were made, as
+// SQLite lists it: each object's place is the row its CREATE text has in
+// _sqlite_sql. An automatic index follows its table, sqlite_sequence the
+// first table that counts AUTOINCREMENT, and an object made before the texts
+// were kept keeps its place after the ones that have one.
+@(private)
+sqlite_schema_order :: proc(tx: ^Tx, rows: []Sqlite_Schema_Row) {
+	created := make(map[string]f64, len(rows), context.temp_allocator)
+	if table := tx_table_probe(tx, SQL_TEXT_TABLE); table != nil {
+		stored := make([dynamic]Row, context.temp_allocator)
+		if collect_err := tx_collect(tx, SQL_TEXT_TABLE, &stored); collect_err.kind == .None {
+			for row in stored {
+				if len(row.values) > 0 && row.values[0].kind == .String do created[row.values[0].s] = f64(row.id)
+			}
+		} else {
+			error_free(&collect_err)
+		}
+	}
+	Keyed :: struct {
+		key:   f64,
+		index: int,
+		row:   Sqlite_Schema_Row,
+	}
+	keyed := make([]Keyed, len(rows), context.temp_allocator)
+	last := f64(1e15)
+	previous := f64(0)
+	for row, i in rows {
+		key, found := created[row.name]
+		switch {
+		case found:
+		case row.type == "index" && row.null_sql:
+			// An automatic index: right after its table.
+			key = (created[row.tbl_name] or_else previous) + 0.25
+		case row.name == "sqlite_sequence":
+			key = previous + 0.5
+			for other in rows {
+				if other.type != "table" do continue
+				if table := tx_table_probe(tx, other.name); table != nil && table.schema.auto_increment_column >= 0 {
+					if at, has := created[other.name]; has {
+						key = at + 0.5
+						break
+					}
+				}
+			}
+		case:
+			key = last + f64(i)
+		}
+		if found do previous = key
+		keyed[i] = Keyed{key = key, index = i, row = row}
+	}
+	slice.stable_sort_by(keyed, proc(a, b: Keyed) -> bool { return a.key < b.key })
+	for item, i in keyed do rows[i] = item.row
 }
 
 // tx_materialize_sqlite_schema builds the catalog as a temporary table the
