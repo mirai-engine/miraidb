@@ -59,6 +59,11 @@ SQLITE_NULL :: c.int(5)
 
 Database :: struct {
 	conn:         ^engine.Embed_Conn,
+	// clientdata is what sqlite3_set_clientdata keeps, by name; the strings
+	// are sqlite3_table_column_metadata's last answer (shell_api.odin).
+	clientdata:         map[string]Client_Data,
+	metadata_decltype:  cstring,
+	metadata_collation: cstring,
 	last_code:    c.int,  // what sqlite3_errcode answers
 	last_extended: c.int, // what sqlite3_extended_errcode answers
 	// extended is set by sqlite3_extended_result_codes: with it, sqlite3_errcode
@@ -156,6 +161,9 @@ Statement :: struct {
 	// wide_names the UTF-16 names and origins, kept until finalize.
 	wide_cache: [dynamic][]u16,
 	wide_names: [dynamic][]u16,
+	// value_cache holds the values sqlite3_column_value handed out, freed with
+	// text_cache (shell_api.odin).
+	value_cache: [dynamic]^Value_Box,
 	// error_code is what the last step failed with, which sqlite3_reset
 	// answers and leaves on the connection, as SQLite does.
 	error_code:     c.int,
@@ -256,6 +264,7 @@ stmt_clear_text_cache :: proc(stmt: ^Statement) {
 	clear(&stmt.text_cache)
 	for units in stmt.wide_cache do delete(units)
 	clear(&stmt.wide_cache)
+	stmt_clear_value_cache(stmt)
 }
 
 // column_text renders a column as the C string SQLite would hand out: every
@@ -604,6 +613,9 @@ sqlite3_close :: proc "c" (handle: rawptr) -> c.int {
 	trace_close(db)
 	functions_close(db)
 	collations_close(db)
+	clientdata_close(db)
+	delete(db.metadata_decltype)
+	delete(db.metadata_collation)
 	// Every virtual table disconnects while the connection can still be named.
 	engine.store_vtab_close(db.conn.store)
 	delete(db.pending_declaration)
@@ -885,6 +897,7 @@ sqlite3_finalize :: proc "c" (handle: rawptr) -> c.int {
 	stmt_clear_text_cache(stmt)
 	delete(stmt.text_cache)
 	delete(stmt.wide_cache)
+	delete(stmt.value_cache)
 	for units in stmt.wide_names do delete(units)
 	delete(stmt.wide_names)
 	delete(stmt.sql_text)

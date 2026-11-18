@@ -672,6 +672,43 @@ int          sqlite3_str_errcode(sqlite3_str *s);
 int          sqlite3_str_length(sqlite3_str *s);
 char        *sqlite3_str_value(sqlite3_str *s);
 
+/* What SQLite's command-line shell links besides the statement loop. A value
+** from sqlite3_column_value lives until the statement steps, resets or is
+** finalized; sqlite3_result_str takes the text with SQLITE_COPY (0),
+** SQLITE_XFER (1) or SQLITE_FINISH (2). The status counters SQLite keeps for
+** its page cache and lookaside are zero here, sqlite3_config accepts every
+** option it knows, and sqlite3_file_control answers SQLITE_FCNTL_DATA_VERSION
+** and SQLITE_NOTFOUND for the rest. The default VFS names the system and
+** opens no file: the engine's files are its own. */
+typedef struct sqlite3_vfs sqlite3_vfs;
+int           sqlite3_bind_value(sqlite3_stmt *stmt, int index, const sqlite3_value *value);
+sqlite3_value *sqlite3_column_value(sqlite3_stmt *stmt, int column);
+void          sqlite3_result_str(sqlite3_context *ctx, sqlite3_str *s, int ownership);
+int           sqlite3_config(int option, ...);
+int           sqlite3_status(int op, int *current, int *highwater, int reset);
+int           sqlite3_status64(int op, sqlite3_int64 *current, sqlite3_int64 *highwater, int reset);
+int           sqlite3_db_status(sqlite3 *db, int op, int *current, int *highwater, int reset);
+int           sqlite3_db_status64(sqlite3 *db, int op, sqlite3_int64 *current, sqlite3_int64 *highwater, int reset);
+int           sqlite3_file_control(sqlite3 *db, const char *schema, int op, void *argument);
+int           sqlite3_test_control(int op, ...);
+void          sqlite3_reset_auto_extension(void);
+int           sqlite3_keyword_count(void);
+int           sqlite3_keyword_name(int index, const char **name, int *length);
+int           sqlite3_keyword_check(const char *text, int n);
+void          sqlite3_randomness(int n, void *buffer);
+sqlite3_int64 sqlite3_incomplete(const char *sql);
+sqlite3_vfs  *sqlite3_vfs_find(const char *name);
+int           sqlite3_vfs_register(sqlite3_vfs *vfs, int make_default);
+int           sqlite3_vfs_unregister(sqlite3_vfs *vfs);
+int           sqlite3_set_clientdata(sqlite3 *db, const char *name, void *data, void (*destroy)(void *));
+void         *sqlite3_get_clientdata(sqlite3 *db, const char *name);
+int           sqlite3_stmt_explain(sqlite3_stmt *stmt, int mode);
+int           sqlite3_table_column_metadata(sqlite3 *db, const char *schema, const char *table, const char *column,
+                                            const char **decltype, const char **collation, int *not_null,
+                                            int *primary_key, int *auto_increment);
+const char   *sqlite3_filename_database(const char *filename);
+void         *sqlite3_win32_utf8_to_unicode(const char *text);
+
 #ifdef __cplusplus
 }
 #endif

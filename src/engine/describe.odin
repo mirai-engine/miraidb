@@ -122,3 +122,71 @@ describe_column_source :: proc(sources: []Source, column: Column_Expr) -> (Sourc
 	}
 	return match, match_index, match_index >= 0
 }
+
+// Column_Metadata is what sqlite3_table_column_metadata answers for a column of
+// a table: its declared type, its collation, NOT NULL, whether it is part of
+// the primary key and whether it is an AUTOINCREMENT key.
+Column_Metadata :: struct {
+	decltype:       string,
+	collation:      string,
+	not_null:       bool,
+	primary_key:    bool,
+	auto_increment: bool,
+}
+
+// embed_column_metadata looks the column up as the connection sees it (inside
+// its transaction when it has one). The rowid of a table that has no column of
+// that name answers as SQLite's does: INTEGER, BINARY, the primary key. The
+// strings live in the temporary allocator.
+embed_column_metadata :: proc(conn: ^Embed_Conn, table_name: string, column_name: string) -> (meta: Column_Metadata, has_table: bool, has_column: bool) {
+	if conn == nil || conn.store == nil do return {}, false, false
+	tx := conn.tx
+	if tx == nil {
+		tx = tx_begin_read(conn.store)
+		defer tx_end(tx)
+		return column_metadata_in(tx, table_name, column_name)
+	}
+	return column_metadata_in(tx, table_name, column_name)
+}
+
+@(private)
+column_metadata_in :: proc(tx: ^Tx, table_name: string, column_name: string) -> (meta: Column_Metadata, has_table: bool, has_column: bool) {
+	table := tx_table_probe(tx, table_name)
+	if table == nil {
+		for name in tx_table_names(tx, context.temp_allocator) {
+			if strings.has_prefix(name, "_") || !strings.equal_fold(name, table_name) do continue
+			table = tx_table_probe(tx, name)
+			break
+		}
+	}
+	if table == nil || strings.has_prefix(table.schema.name, "_") do return {}, false, false
+	if len(column_name) == 0 do return {}, true, false
+	schema := &table.schema
+	index := -1
+	for column, k in schema.columns {
+		if strings.equal_fold(column.name, column_name) {
+			index = k
+			break
+		}
+	}
+	if index < 0 {
+		lower := strings.to_lower(column_name, context.temp_allocator)
+		if !schema.without_rowid && (lower == "rowid" || lower == "oid" || lower == "_rowid_") {
+			alias, has_alias := rowid_alias_column(schema)
+			if !has_alias do return Column_Metadata{decltype = "INTEGER", collation = "BINARY", primary_key = true}, true, true
+			index = alias
+		} else {
+			return {}, true, false
+		}
+	}
+	column := schema.columns[index]
+	meta.decltype = sqlite_type_name(column.type)
+	if types, has_text := tx_table_declared_types(tx, schema.name, false, context.temp_allocator); has_text {
+		meta.decltype = strings.clone(types[strings.to_lower(column.name, context.temp_allocator)] or_else "", context.temp_allocator)
+	}
+	meta.collation = len(column.collation) > 0 ? strings.to_upper(column.collation, context.temp_allocator) : "BINARY"
+	meta.not_null = column.not_null
+	for key in schema.primary_key do if key == index do meta.primary_key = true
+	meta.auto_increment = column.auto_increment || schema.auto_increment_column == index
+	return meta, true, true
+}
