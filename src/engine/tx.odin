@@ -308,7 +308,9 @@ tx_snapshot_clone :: proc(tx: ^Tx, from: Tx_Snapshot) -> Tx_Snapshot {
 	snapshot: Tx_Snapshot
 	snapshot.writes = make(map[string]^Table_Writes, len(from.writes), tx.alloc)
 	for name, writes in from.writes {
-		copied := new(Table_Writes, tx.alloc)
+		// The struct is the heap's, as tx_writes makes it: a snapshot that a
+		// ROLLBACK TO restores becomes the live state, which tx_discard frees.
+		copied := new(Table_Writes)
 		copied^ = writes^
 		copied.inserts = make(map[Row_Id]Row, len(writes.inserts), tx.alloc)
 		for id, row in writes.inserts do copied.inserts[id] = row
@@ -333,13 +335,14 @@ tx_snapshot_clone :: proc(tx: ^Tx, from: Tx_Snapshot) -> Tx_Snapshot {
 
 @(private)
 tx_snapshot_destroy :: proc(tx: ^Tx, snapshot: ^Tx_Snapshot) {
-	// The map headers and the struct live in the transaction arena: the maps are
-	// released, and the arena reclaims the rest with the transaction.
+	// The maps carry their own allocator; the struct is the heap's (tx_writes,
+	// tx_snapshot_clone).
 	for _, writes in snapshot.writes {
 		delete(writes.inserts)
 		delete(writes.updates)
 		delete(writes.deletes)
 		delete(writes.unique_keys)
+		free(writes)
 	}
 	delete(snapshot.writes)
 	delete(snapshot.created)
