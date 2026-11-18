@@ -709,20 +709,36 @@ is_pragma_function :: proc(name: string) -> bool {
 // table the statement scans like a view.
 tx_materialize_pragma :: proc(tx: ^Tx, name: string, args: []Value) -> (^Table, Error) {
 	body := name[7:]
-	if len(args) > 0 && args[0].kind != .Null {
-		argument := sqlite_value_text(args[0], context.temp_allocator)
-		body = strings.concatenate({body, "(", argument, ")"}, context.temp_allocator)
+	// The argument is the call's first, or what a WHERE or ON term asks of the
+	// hidden column `arg`, as SQLite reads `pragma_table_info WHERE arg = 't'`.
+	argument := value_null()
+	schema_name := value_null()
+	if len(args) > 0 do argument = args[0]
+	if len(args) > 1 do schema_name = args[1]
+	if len(args) == 0 {
+		if value, found := pragma_arg_term(tx, name, "arg"); found do argument = value
+		if value, found := pragma_arg_term(tx, name, "schema"); found do schema_name = value
+	}
+	if argument.kind != .Null {
+		text := sqlite_value_text(argument, context.temp_allocator)
+		body = strings.concatenate({body, "(", text, ")"}, context.temp_allocator)
 	}
 	result, pragma_err := sql_exec_pragma(tx.store, body, tx.locked, tx)
 	if pragma_err.kind != .None do return nil, pragma_err
 	defer sql_result_destroy(&result)
-	columns := make([]Column, len(result.columns), tx.alloc)
+	// The answer's columns, then SQLite's hidden `arg` and `schema`, which
+	// `SELECT *` leaves out.
+	width := len(result.columns)
+	columns := make([]Column, width + 2, tx.alloc)
 	for column_name, i in result.columns {
 		columns[i] = Column {
 			name = strings.clone(column_name, tx.alloc),
 			type = view_column_type(result.rows, i),
 		}
 	}
+	text := Column_Type{kind = .Any}
+	columns[width] = Column{name = "arg", type = text, hidden = true}
+	columns[width + 1] = Column{name = "schema", type = text, hidden = true}
 	schema := Table_Schema {
 		name    = strings.clone(name, tx.alloc),
 		columns = columns,
@@ -730,11 +746,50 @@ tx_materialize_pragma :: proc(tx: ^Tx, name: string, args: []Value) -> (^Table, 
 	table, table_err := table_create(&schema)
 	if table_err.kind != .None do return nil, table_err
 	for row, i in result.rows {
-		if insert_err := table_insert(table, Row_Id(i + 1), row); insert_err.kind != .None {
+		values := make([]Value, width + 2, tx.alloc)
+		copy(values, row)
+		values[width] = argument
+		values[width + 1] = schema_name
+		if insert_err := table_insert(table, Row_Id(i + 1), values); insert_err.kind != .None {
 			table_destroy(table)
 			return nil, insert_err
 		}
 	}
 	append(&tx.temp_tables, table)
 	return table, ERROR_NONE
+}
+
+// pragma_arg_term finds `column = value` in the WHERE or the ON being read,
+// for a hidden column of a pragma function, and evaluates the value against
+// the rows bound before the function.
+@(private)
+pragma_arg_term :: proc(tx: ^Tx, name, column: string) -> (Value, bool) {
+	terms := make([dynamic]^Expr, 0, 4, context.temp_allocator)
+	if tx.vtab_where != nil do split_and(tx.vtab_where, &terms)
+	if tx.vtab_join != nil do split_and(tx.vtab_join, &terms)
+	names_it :: proc(tx: ^Tx, name, qualifier: string) -> bool {
+		if len(qualifier) == 0 do return true
+		if strings.equal_fold(qualifier, name) do return true
+		return len(tx.vtab_alias) > 0 && strings.equal_fold(qualifier, tx.vtab_alias)
+	}
+	for term in terms {
+		binary, is_binary := term^.(Binary_Expr)
+		if !is_binary || binary.op != .Eq || binary.left == nil || binary.right == nil do continue
+		for side in 0 ..< 2 {
+			target, other := binary.left, binary.right
+			if side == 1 do target, other = binary.right, binary.left
+			reference, is_column := target^.(Column_Expr)
+			if !is_column || !strings.equal_fold(reference.name, column) || !names_it(tx, name, reference.table) do continue
+			// The value may not read the function's own row.
+			if other_column, other_is_column := other^.(Column_Expr); other_is_column && names_it(tx, name, other_column.table) && len(other_column.table) > 0 do continue
+			ctx := Eval_Ctx{tx = tx, params = tx.vtab_params, sources = tx.vtab_sources, outer = tx.outer, now_us = now_microseconds()}
+			value, eval_err := eval_expr(&ctx, other)
+			if eval_err.kind != .None {
+				error_free(&eval_err)
+				continue
+			}
+			return value, true
+		}
+	}
+	return {}, false
 }

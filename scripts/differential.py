@@ -235,6 +235,11 @@ QUERIES = [
     "SELECT m.name, c.name FROM sqlite_master m JOIN pragma_table_info(m.name) c WHERE m.type = 'table' AND m.name IN ('dept', 'kv') ORDER BY 1, 2",
     "SELECT count(*) FROM pragma_table_info('nosuch')",
     "SELECT * FROM pragma_user_version",
+    # The hidden columns arg and schema, and the argument given by a term.
+    "SELECT name, arg, schema FROM pragma_table_info('dept') ORDER BY cid",
+    "SELECT name FROM pragma_table_info WHERE arg = 'dept' ORDER BY cid",
+    "SELECT m.name, p.name FROM sqlite_master m JOIN pragma_table_info p ON p.arg = m.name WHERE m.name IN ('dept', 'kv') ORDER BY 1, 2",
+    "SELECT name, schema FROM pragma_table_info('kv', 'main') ORDER BY cid",
     # FILTER, an aggregate's ORDER BY and the WINDOW clause (S4).
     "SELECT dept, count(*) FILTER (WHERE salary > 60), sum(salary) FILTER (WHERE name IS NOT NULL) FROM emp GROUP BY dept ORDER BY dept",
     "SELECT dept, group_concat(name, '/' ORDER BY name DESC) FROM emp GROUP BY dept ORDER BY dept",

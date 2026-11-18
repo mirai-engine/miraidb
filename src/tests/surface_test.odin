@@ -366,6 +366,11 @@ test_pragma_table_functions :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM pragma_table_info('nosuch')").i, i64(0))
 	run(t, store, "PRAGMA user_version = 12")
 	testing.expect_value(t, scalar(t, store, "SELECT user_version FROM pragma_user_version").i, i64(12))
+	// The hidden columns arg and schema, and the argument a term gives.
+	testing.expect_value(t, scalar(t, store, "SELECT group_concat(arg, ',') FROM pragma_table_info('q')").s, "q,q")
+	testing.expect_value(t, scalar(t, store, "SELECT group_concat(name, ',') FROM pragma_table_info WHERE arg = 'q'").s, "a,b")
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM sqlite_master m, pragma_table_info p WHERE p.arg = m.name AND m.type = 'table'").i, i64(5))
+	testing.expect_value(t, scalar(t, store, "SELECT schema FROM pragma_table_info('q', 'main') LIMIT 1").s, "main")
 	// A pragma that changes something is not a table function.
 	_ = run_error(t, store, "SELECT * FROM pragma_optimize")
 }

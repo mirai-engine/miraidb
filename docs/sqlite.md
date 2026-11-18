@@ -161,8 +161,9 @@ stored as 0. `PRAGMA main.name` is `PRAGMA name`.
 A pragma that answers rows and changes nothing is also a table function, as in
 SQLite: `SELECT name FROM pragma_table_info('t')`, and once per row of a join
 (`sqlite_master m JOIN pragma_table_info(m.name)`). The pragma's argument is the
-function's first argument; SQLite's hidden `arg` and `schema` columns are not
-there. `table_info` reports `notnull = 0` for the rowid alias, as SQLite does. Its `type` is the declared type (see `sqlite_schema` above).
+function's first argument, or what a `WHERE` or `ON` term asks of the hidden
+column `arg` (`pragma_table_info WHERE arg = 't'`, `p.arg = m.name`), and the
+hidden columns `arg` and `schema` answer them, as in SQLite. `table_info` reports `notnull = 0` for the rowid alias, as SQLite does. Its `type` is the declared type (see `sqlite_schema` above).
 
 `REINDEX` is accepted and answers `ok`: every index is rebuilt from the log when
 the database opens, so there is never one that is out of date. `INDEXED BY name`
