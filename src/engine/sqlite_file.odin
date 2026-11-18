@@ -945,6 +945,20 @@ sqlite_table_rows :: proc(file: ^Sqlite_File, table: ^Sqlite_Table, alloc: mem.A
 		ctx := cast(^Ctx)user
 		values, ok := sqlite_record(payload, ctx.alloc)
 		if !ok do return true
+		if ctx.table.without_rowid {
+			// A WITHOUT ROWID record holds the key first: the columns go back
+			// to the order the table declares them.
+			declared := make([]Value, len(ctx.table.columns), ctx.alloc)
+			for column, i in sqlite_storage_order(ctx.table, context.temp_allocator) {
+				if i < len(values) {
+					declared[column] = values[i]
+					values[i] = {}
+				}
+			}
+			for value in values do value_deep_free(value, ctx.alloc)
+			delete(values, ctx.alloc)
+			values = declared
+		}
 		if ctx.table.pk_position >= 0 && ctx.table.pk_position < len(values) {
 			if values[ctx.table.pk_position].kind == .Null do values[ctx.table.pk_position] = value_int(rowid)
 		}
@@ -955,6 +969,33 @@ sqlite_table_rows :: proc(file: ^Sqlite_File, table: ^Sqlite_Table, alloc: mem.A
 		return nil, errf(.Corrupt_Log, "table %s has a malformed b-tree", table.name)
 	}
 	return rows[:], ERROR_NONE
+}
+
+// sqlite_storage_order answers, for each field of a WITHOUT ROWID table's
+// record, the declared column it holds: the primary key's columns in key
+// order, then every other column in declaration order.
+sqlite_storage_order :: proc(table: ^Sqlite_Table, alloc: mem.Allocator) -> []int {
+	order := make([dynamic]int, 0, len(table.columns), alloc)
+	in_key := make([]bool, len(table.columns), context.temp_allocator)
+	if len(table.primary_group) > 0 {
+		for column in table.primary_group {
+			if column < 0 || column >= len(table.columns) || in_key[column] do continue
+			in_key[column] = true
+			append(&order, column)
+		}
+	} else {
+		for column, i in table.columns {
+			if column.primary_key {
+				in_key[i] = true
+				append(&order, i)
+				break
+			}
+		}
+	}
+	for _, i in table.columns {
+		if !in_key[i] do append(&order, i)
+	}
+	return order[:]
 }
 
 // sqlite_value_text renders a value the way the SQLite shell does in list mode.

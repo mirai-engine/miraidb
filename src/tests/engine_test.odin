@@ -6351,6 +6351,40 @@ test_sqlite_import_queries :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(long.rows[0][0].s), 809)
 }
 
+// A WITHOUT ROWID table stores its key first; what SQLite 3.54.1 wrote in the
+// fixture has to come back in the columns the table declares.
+@(test)
+test_sqlite_import_without_rowid_order :: proc(t: ^testing.T) {
+	file, open_err := db.sqlite_file_open("src/tests/fixtures/without_rowid.sqlite")
+	if !testing.expectf(t, db.error_ok(open_err), "open fixture: %s", open_err.message) do return
+	defer db.sqlite_file_destroy(&file)
+	store := fresh_db(t, "sqlite_import_without_rowid")
+	if store == nil do return
+	defer cleanup_db(store, "sqlite_import_without_rowid")
+
+	tables, rows, import_err := db.sqlite_import(&file, store)
+	if !testing.expectf(t, db.error_ok(import_err), "import: %s", import_err.message) do return
+	testing.expect_value(t, tables, 2)
+	testing.expect_value(t, rows, 6)
+
+	w := run(t, store, "SELECT b, a, c FROM w ORDER BY a")
+	testing.expect_value(t, len(w.rows), 3)
+	testing.expect_value(t, w.rows[0][0].i, i64(2))
+	testing.expect_value(t, w.rows[0][1].s, "a")
+	testing.expect_value(t, w.rows[0][2].i, i64(30))
+	testing.expect(t, db.value_is_null(w.rows[1][0]))
+	testing.expect_value(t, w.rows[1][1].s, "m")
+	testing.expect_value(t, w.rows[2][1].s, "x")
+	testing.expect_value(t, w.rows[2][2].i, i64(3))
+	z := run(t, store, "SELECT x, y, z FROM z ORDER BY y")
+	testing.expect_value(t, len(z.rows), 3)
+	testing.expect_value(t, z.rows[0][0].s, "x1")
+	testing.expect_value(t, z.rows[0][2].i, i64(2))
+	testing.expect_value(t, z.rows[1][0].s, "x0")
+	testing.expect_value(t, z.rows[2][0].s, "x9")
+	testing.expect_value(t, z.rows[2][2].i, i64(1))
+}
+
 @(test)
 test_sqlite_write_roundtrip :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "sqlite_write")
