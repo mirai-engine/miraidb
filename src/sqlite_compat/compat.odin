@@ -32,7 +32,7 @@ SQLITE_READONLY :: c.int(8)
 SQLITE_INTERRUPT :: c.int(9)
 SQLITE_IOERR :: c.int(10)
 SQLITE_CORRUPT :: c.int(11)
-SQLITE_TOOBIG :: c.int(13)
+SQLITE_TOOBIG :: c.int(18)
 SQLITE_CONSTRAINT :: c.int(19)
 // The extended constraint codes, which SQLite reports only when a caller turns
 // sqlite3_extended_result_codes on. Each is SQLITE_CONSTRAINT plus a small
@@ -155,6 +155,10 @@ Statement :: struct {
 	// wide_names the UTF-16 names and origins, kept until finalize.
 	wide_cache: [dynamic][]u16,
 	wide_names: [dynamic][]u16,
+	// error_code is what the last step failed with, which sqlite3_reset
+	// answers and leaves on the connection, as SQLite does.
+	error_code:     c.int,
+	error_extended: c.int,
 }
 
 // Column_Origin_C is one column's origin as the C strings the metadata calls
@@ -222,6 +226,11 @@ c_text :: proc(sql: cstring, nByte: c.int) -> string {
 	if nByte < 0 do return string(sql)
 	if nByte == 0 do return ""
 	bytes := ([^]u8)(rawptr(sql))
+	// The text ends at a NUL inside nByte too, as SQLite reads it: a caller
+	// may count the terminator (Python's sqlite3 module does).
+	for i in 0 ..< int(nByte) {
+		if bytes[i] == 0 do return string(bytes[:i])
+	}
 	return string(bytes[:int(nByte)])
 }
 
@@ -750,6 +759,9 @@ prepare :: proc(handle: rawptr, sql: cstring, nByte: c.int, ppStmt: ^rawptr, pzT
 @(export)
 sqlite3_finalize :: proc "c" (handle: rawptr) -> c.int {
 	context = runtime.default_context()
+	// Finalizing NULL is a harmless no-op in SQLite: a script loop finalizes
+	// the NULL statement its last, empty, prepare gave.
+	if handle == nil do return SQLITE_OK
 	stmt := stmt_of(handle)
 	if stmt == nil do return SQLITE_MISUSE
 	if stmt.db != nil do delete_key(&stmt.db.statements, handle)
@@ -788,6 +800,19 @@ sqlite3_reset :: proc "c" (handle: rawptr) -> c.int {
 	stmt_clear_text_cache(stmt)
 	trace_end(stmt)
 	stmt.finished = false
+	// A step that failed: reset answers its code and the connection keeps its
+	// message, which a caller reads after resetting (Python's sqlite3 does).
+	if stmt.error_code != SQLITE_OK {
+		db := stmt.db
+		message := strings.clone(engine.embed_error(db.conn), context.temp_allocator)
+		kind := engine.embed_error_kind(db.conn)
+		engine.embed_reset(stmt.stmt)
+		engine.embed_note_error(db.conn, kind, message)
+		db.last_code, db.last_extended = stmt.error_code, stmt.error_extended
+		code := db.extended ? stmt.error_extended : stmt.error_code
+		stmt.error_code, stmt.error_extended = SQLITE_OK, SQLITE_OK
+		return code
+	}
 	engine.embed_reset(stmt.stmt)
 	return SQLITE_OK
 }
@@ -837,6 +862,11 @@ sqlite3_bind_double :: proc "c" (handle: rawptr, index: c.int, value: c.double) 
 	if stmt == nil do return SQLITE_MISUSE
 	if int(index) < 1 || int(index) > engine.Embed_Parameter_Count(stmt.stmt) do return SQLITE_RANGE
 	stmt_pointer_drop(stmt, int(index) - 1)
+	// SQLite has no NaN: it binds NULL.
+	if value != value {
+		if engine.error_drop(engine.embed_bind_null(stmt.stmt, int(index) - 1)) do return SQLITE_OK
+		return SQLITE_ERROR
+	}
 	if engine.error_drop(engine.embed_bind_float(stmt.stmt, int(index) - 1, f64(value))) do return SQLITE_OK
 	return SQLITE_ERROR
 }
@@ -905,9 +935,11 @@ sqlite3_step :: proc "c" (handle: rawptr) -> c.int {
 	step_pointers_end(mark)
 	if err.kind != .None {
 		code := fail(stmt.db, err)
+		stmt.error_code, stmt.error_extended = stmt.db.last_code, stmt.db.last_extended
 		trace_end(stmt)
 		return code
 	}
+	stmt.error_code, stmt.error_extended = SQLITE_OK, SQLITE_OK
 	if has_row {
 		trace_row(stmt)
 		return SQLITE_ROW
@@ -996,9 +1028,21 @@ sqlite3_column_blob :: proc "c" (handle: rawptr, index: c.int) -> rawptr {
 	context = runtime.default_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return nil
-	bytes := engine.embed_column_blob(stmt.stmt, int(index))
-	if len(bytes) == 0 do return nil
-	return raw_data(bytes)
+	// Any value has a blob form, as in SQLite: a text's bytes, a number's
+	// rendering. An empty one is NULL.
+	value, ok := engine.embed_column_value(stmt.stmt, int(index))
+	if !ok || value.kind == .Null do return nil
+	#partial switch value.kind {
+	case .Bytes:
+		if len(value.bytes) == 0 do return nil
+		return raw_data(value.bytes)
+	case .String:
+		if len(value.s) == 0 do return nil
+		return raw_data(value.s)
+	}
+	text, _ := column_text(stmt, int(index))
+	if text == nil || len(string(text)) == 0 do return nil
+	return rawptr(text)
 }
 
 @(export)
@@ -1108,10 +1152,14 @@ sqlite3_free :: proc "c" (pointer: rawptr) {
 	runtime.mem_free(block, runtime.heap_allocator())
 }
 
+// sqlite3_libversion is the SQLite release this facade answers as: the one
+// its surface is measured against (docs/sqlite-roadmap.md), the same
+// sqlite_version() answers in SQL. A program reads it as numbers, so the
+// facade's own name is in sqlite3_sourceid instead.
 @(export)
 sqlite3_libversion :: proc "c" () -> cstring {
 	context = runtime.default_context()
-	return "3.45.0-miraidb"
+	return "3.54.1"
 }
 
 @(export)
@@ -1373,13 +1421,13 @@ sqlite3_bind_zeroblob64 :: proc "c" (handle: rawptr, index: c.int, n: u64) -> c.
 	return SQLITE_ERROR
 }
 
-// sqlite3_libversion_number is the SQLite release this facade answers as,
-// 3.45.0, in SQLite's encoding: a program that checks it at start-up (Python's
-// sqlite3 module does) reads the version libversion names.
+// sqlite3_libversion_number is libversion in SQLite's encoding: a program
+// that checks it at start-up (Python's sqlite3 module does) reads the same
+// release.
 @(export)
 sqlite3_libversion_number :: proc "c" () -> c.int {
 	context = runtime.default_context()
-	return 3045000
+	return 3054001
 }
 
 @(export)

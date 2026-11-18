@@ -750,7 +750,8 @@ sqlite3_result_int64 :: proc "c" (handle: rawptr, value: c.longlong) {
 @(export)
 sqlite3_result_double :: proc "c" (handle: rawptr, value: c.double) {
 	context = runtime.default_context()
-	if ctx := context_of(handle); ctx != nil do context_set(ctx, engine.value_float(f64(value)))
+	// SQLite has no NaN: the result is NULL.
+	if ctx := context_of(handle); ctx != nil do context_set(ctx, value != value ? engine.value_null() : engine.value_float(f64(value)))
 }
 
 // sqlite3_result_text copies `n` bytes, or up to the NUL when `n` is negative.

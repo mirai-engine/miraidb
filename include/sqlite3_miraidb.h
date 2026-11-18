@@ -46,7 +46,7 @@ typedef struct sqlite3_value sqlite3_value;
 #define SQLITE_INTERRUPT    9
 #define SQLITE_IOERR       10
 #define SQLITE_CORRUPT     11
-#define SQLITE_TOOBIG      13
+#define SQLITE_TOOBIG      18
 #define SQLITE_CONSTRAINT  19
 #define SQLITE_MISMATCH    20
 #define SQLITE_MISUSE      21
