@@ -35,7 +35,11 @@ test_update_or_resolutions :: proc(t: ^testing.T) {
 	defer db.embed_close(conn)
 	testing.expect(t, db.error_drop(db.embed_exec(conn, "BEGIN")))
 	testing.expect(t, !db.error_drop(db.embed_exec(conn, "UPDATE OR ROLLBACK t SET u = 100 WHERE id = 2")))
-	testing.expect(t, db.error_drop(db.embed_exec(conn, "ROLLBACK")))
+	// The broken constraint ended the transaction, as in SQLite: there is
+	// nothing left to roll back.
+	testing.expect(t, !db.embed_in_transaction(conn))
+	testing.expect(t, !db.error_drop(db.embed_exec(conn, "ROLLBACK")))
+	testing.expect_value(t, scalar(t, store, "SELECT u FROM t WHERE id = 2").i, i64(3))
 }
 
 @(test)

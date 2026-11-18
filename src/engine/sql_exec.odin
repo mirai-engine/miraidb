@@ -296,18 +296,6 @@ sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value) 
 	case Select_Stmt, With_Stmt:
 		return sql_run_query(tx, stmt, params)
 	case Insert_Stmt, Update_Stmt, Delete_Stmt, Merge_Stmt, Copy_Stmt:
-		if insert, is_insert := stmt.(Insert_Stmt); is_insert && insert.conflict_rollback {
-			return {}, errf(
-				.Sql_Unsupported,
-				"INSERT OR ROLLBACK cannot end a transaction the caller opened: use OR ABORT and ROLLBACK",
-			)
-		}
-		if update, is_update := stmt.(Update_Stmt); is_update && update.conflict == .Rollback {
-			return {}, errf(
-				.Sql_Unsupported,
-				"UPDATE OR ROLLBACK cannot end a transaction the caller opened: use OR ABORT and ROLLBACK",
-			)
-		}
 		// A data statement that fails is taken back as a unit (SQLite's ABORT): the
 		// transaction keeps the work of the statements before it and none of this
 		// one's. OR FAIL keeps the rows before the failing one instead.
@@ -316,6 +304,13 @@ sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value) 
 		result, err := sql_exec_mutation(tx, stmt, params)
 		tx_statement_end(tx, mark, err.kind != .None && !statement_fails_partially(stmt) && !tx.keep_partial)
 		tx.keep_partial = false
+		// OR ROLLBACK: a broken constraint ends the whole transaction, which the
+		// connection that holds it rolls back (embed_run).
+		if err.kind != .None && conflict_skippable(err.kind) {
+			insert, is_insert := stmt.(Insert_Stmt)
+			update, is_update := stmt.(Update_Stmt)
+			if (is_insert && insert.conflict_rollback) || (is_update && update.conflict == .Rollback) do tx.rollback_requested = true
+		}
 		return result, err
 	case Create_Table_Stmt, Alter_Table_Stmt, Create_Type_Stmt, Drop_Table_Stmt, Create_Index_Stmt, Drop_Index_Stmt, Create_View_Stmt, Drop_View_Stmt, Create_Policy_Stmt, Drop_Policy_Stmt, Truncate_Stmt, Create_Trigger_Stmt, Drop_Trigger_Stmt, Grant_Stmt, Create_Virtual_Table_Stmt, Load_Extension_Stmt:
 		return sql_exec_mutation(tx, stmt, params)

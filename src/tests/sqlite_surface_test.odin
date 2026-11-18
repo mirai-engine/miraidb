@@ -182,15 +182,20 @@ test_insert_conflict_resolutions :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT max(id) FROM b WHERE id < 5").i, i64(2))
 
 	// OR ROLLBACK in a statement that owns its transaction is ABORT; inside a
-	// transaction the caller opened it is refused, with the reason.
+	// transaction the caller opened, a broken constraint ends that transaction,
+	// as in SQLite: its earlier work goes too.
 	run(t, store, "CREATE TABLE c (id INTEGER PRIMARY KEY)")
 	testing.expect_value(t, run_error(t, store, "INSERT OR ROLLBACK INTO c VALUES (1), (1)").kind, db.Error_Kind.Duplicate_Primary_Key)
 	testing.expect_value(t, count(t, store, "c"), i64(0))
-	tx := db.tx_begin_write(store)
-	_, refused := db.sql_execute_in_tx(tx, "INSERT OR ROLLBACK INTO c VALUES (1)")
-	testing.expect_value(t, refused.kind, db.Error_Kind.Sql_Unsupported)
-	db.error_free(&refused)
-	db.tx_rollback(tx)
+	{
+		conn := db.embed_wrap(store)
+		defer db.embed_close(conn)
+		testing.expect(t, db.error_drop(db.embed_exec(conn, "BEGIN")))
+		testing.expect(t, db.error_drop(db.embed_exec(conn, "INSERT INTO c VALUES (5)")))
+		testing.expect(t, !db.error_drop(db.embed_exec(conn, "INSERT OR ROLLBACK INTO c VALUES (5)")))
+		testing.expect(t, !db.embed_in_transaction(conn))
+	}
+	testing.expect_value(t, count(t, store, "c"), i64(0))
 
 	// REPLACE INTO is INSERT OR REPLACE.
 	run(t, store, "REPLACE INTO a VALUES (1, 'z'), (9, 'n')")
