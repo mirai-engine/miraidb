@@ -28,6 +28,7 @@ extern "C" {
 
 #include <stddef.h>   /* size_t */
 #include <stdint.h>   /* int64_t */
+#include <stdarg.h>   /* va_list */
 
 typedef int64_t sqlite3_int64;
 typedef uint64_t sqlite3_uint64;
@@ -647,6 +648,29 @@ void         *sqlite3_realloc(void *pointer, int size);
 void         *sqlite3_realloc64(void *pointer, sqlite3_uint64 size);
 sqlite3_uint64 sqlite3_msize(void *pointer);
 void          sqlite3_free(void *pointer);
+
+/* SQLite's printf: %q, %Q and %w quote for SQL, %z frees its argument, %r
+** writes an ordinal, %j and %J a JSON string; doubles carry SQLite's 16
+** significant digits (20 with the ! flag). The text comes from sqlite3_malloc;
+** sqlite3_snprintf writes at most n-1 bytes and a terminator into buffer. */
+typedef struct sqlite3_str sqlite3_str;
+char        *sqlite3_mprintf(const char *format, ...);
+char        *sqlite3_vmprintf(const char *format, va_list args);
+char        *sqlite3_snprintf(int n, char *buffer, const char *format, ...);
+char        *sqlite3_vsnprintf(int n, char *buffer, const char *format, va_list args);
+sqlite3_str *sqlite3_str_new(sqlite3 *db);
+char        *sqlite3_str_finish(sqlite3_str *s);
+void         sqlite3_str_free(sqlite3_str *s);
+void         sqlite3_str_appendf(sqlite3_str *s, const char *format, ...);
+void         sqlite3_str_vappendf(sqlite3_str *s, const char *format, va_list args);
+void         sqlite3_str_append(sqlite3_str *s, const char *text, int n);
+void         sqlite3_str_appendall(sqlite3_str *s, const char *text);
+void         sqlite3_str_appendchar(sqlite3_str *s, int n, char c);
+void         sqlite3_str_reset(sqlite3_str *s);
+void         sqlite3_str_truncate(sqlite3_str *s, int n);
+int          sqlite3_str_errcode(sqlite3_str *s);
+int          sqlite3_str_length(sqlite3_str *s);
+char        *sqlite3_str_value(sqlite3_str *s);
 
 #ifdef __cplusplus
 }
