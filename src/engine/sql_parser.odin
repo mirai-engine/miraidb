@@ -109,7 +109,7 @@ p_param_slot :: proc(p: ^Parser, index: int, name: string) {
 @(private)
 p_fail :: proc(p: ^Parser, kind: Error_Kind, format: string, args: ..any) -> Error {
 	if p.err.kind == .None {
-		detail := fmt.aprintf(format, ..args)
+		detail := fmt.aprintf(format, ..args, allocator = context.temp_allocator)
 		p.err = errf(kind, "line %d, column %d: %s", p.current.line, p.current.column, detail)
 	}
 	return p.err

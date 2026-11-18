@@ -147,3 +147,9 @@ test_a_closed_store_leaves_nothing :: proc(t: ^testing.T) {
 		"ANALYZE t",
 	})
 }
+
+@(test)
+test_a_parse_error_leaves_nothing :: proc(t: ^testing.T) {
+	// The error names the line and column; the detail it wraps is not kept.
+	expect_nothing_left(t, .Memory, "_test_memory_parse", {"SELECT FROM WHERE", "SELEC 1", "CREATE TABLE ("}, fails = true)
+}
