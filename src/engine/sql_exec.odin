@@ -7783,13 +7783,16 @@ like_match :: proc(text, pattern: string, case_insensitive: bool, escape: u8 = 0
 // find_conflict_row locates the row an UPSERT collided with: the primary key
 // columns compared against the incoming values.
 @(private)
-find_conflict_row :: proc(tx: ^Tx, table: ^Table, values: []Value) -> (Row, bool) {
+find_conflict_row :: proc(tx: ^Tx, name: string, table: ^Table, values: []Value) -> (Row, bool) {
 	if len(table.schema.primary_key) == 0 do return {}, false
-	// A paged table has no row map, so both backends answer through a collect.
-	// The values live in the transaction arena and stay valid for the statement.
+	// The rows are the ones the transaction sees: a row it staged collides as
+	// much as a committed one.
 	rows := make([dynamic]Row)
 	defer delete(rows)
-	table_collect(table, &rows, max(u64), tx.alloc)
+	if collect_err := tx_collect(tx, name, &rows); collect_err.kind != .None {
+		error_free(&collect_err)
+		return {}, false
+	}
 	for row in rows {
 		matches := true
 		for position in table.schema.primary_key {
@@ -7809,26 +7812,45 @@ find_conflict_row :: proc(tx: ^Tx, table: ^Table, values: []Value) -> (Row, bool
 
 
 // unique_conflicts collects the rows an INSERT OR REPLACE deletes: every row
-// that shares a key with the proposed values in a unique index. One row can
-// collide under two indexes, so it is listed once.
+// the transaction sees that shares a key with the proposed values in a unique
+// index, a row it staged as much as a committed one. One row can collide under
+// two indexes, so it is listed once.
 @(private)
-unique_conflicts :: proc(tx: ^Tx, table: ^Table, values: []Value) -> [dynamic]Row_Id {
+unique_conflicts :: proc(tx: ^Tx, name: string, table: ^Table, values: []Value) -> [dynamic]Row_Id {
 	ids := make([dynamic]Row_Id, 0, 2, tx.alloc)
+	add :: proc(ids: ^[dynamic]Row_Id, id: Row_Id) {
+		for existing in ids do if existing == id do return
+		append(ids, id)
+	}
+	writes := tx.state.writes[name]
+	committed := tx.store.tables[name]
 	for idx, i in table.indexes {
 		if !idx.unique do continue
+		// The rules tx_check_unique keeps: a row outside a partial index, or a
+		// key with a NULL, constrains nothing.
 		if !index_row_included(table, i, values) do continue
-		found := table_index_lookup(table, i, values)
-		for id in found {
-			seen := false
-			for existing in ids {
-				if existing == id {
-					seen = true
-					break
-				}
-			}
-			if !seen do append(&ids, id)
+		if index_key_has_null(table, i, values) do continue
+		if index_host_collated(tx.store, table, i) {
+			for id in tx_host_key_holders(tx, name, table, i, values) do add(&ids, id)
+			continue
 		}
-		delete(found)
+		if writes != nil {
+			key := unique_key(tx, table, i, values)
+			if holder, taken := writes.unique_keys[key]; taken do add(&ids, holder)
+		}
+		if committed != nil && i < len(committed.indexes) {
+			found := table_index_lookup(committed, i, values)
+			defer delete(found)
+			for id in found {
+				// A committed row the transaction deleted or rewrote no longer
+				// holds its committed key.
+				if writes != nil {
+					if writes.deletes[id] do continue
+					if _, changed := writes.updates[id]; changed do continue
+				}
+				add(&ids, id)
+			}
+		}
 	}
 	return ids
 }
@@ -8107,11 +8129,18 @@ sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Res
 			// The conflicts are looked up with the row as it would be stored: a
 			// column the statement left out holds its default, which a key or a
 			// partial index's WHERE may read.
-			conflicts := unique_conflicts(tx, table, row_with_defaults(tx, table, values))
+			conflicts := unique_conflicts(tx, stmt.table, table, row_with_defaults(tx, table, values))
 			defer delete(conflicts)
 			// Without a row to replace the failure stands; it used to be freed first
 			// and the statement reported a row it never inserted.
 			if len(conflicts) > 0 do error_free(&insert_err)
+			// An omitted INTEGER PRIMARY KEY is chosen before the rows it
+			// replaces go, as SQLite chooses it: one past the largest there was.
+			if key, has_key := rowid_alias_column(&table.schema); has_key && len(conflicts) > 0 && !table.schema.columns[key].auto_increment {
+				if values[key].kind == .Default || values[key].kind == .Null {
+					values[key] = value_int(tx_next_int_key(table, tx.state.writes[stmt.table], key))
+				}
+			}
 			for id in conflicts {
 				if fts_err := fts_delete_if_virtual(tx, stmt.table, id); fts_err.kind != .None {
 					return {}, fts_err
@@ -8131,7 +8160,7 @@ sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Res
 		}
 		if insert_err.kind != .None {
 			// UPSERT: a collision on the target columns is not an error.
-			conflict, found := find_conflict_row(tx, table, values)
+			conflict, found := find_conflict_row(tx, stmt.table, table, values)
 			if !found do return {}, insert_err
 			if stmt.conflict_do_nothing {
 				error_free(&insert_err)
@@ -8596,7 +8625,7 @@ sql_exec_update :: proc(tx: ^Tx, stmt: Update_Stmt, params: []Value) -> (Sql_Res
 			// delete triggers, and the row is written again.
 			tx_statement_end(tx, row_mark, true)
 			row_mark = tx_statement_begin(tx)
-			conflicts := unique_conflicts(tx, table, new_values)
+			conflicts := unique_conflicts(tx, stmt.table, table, new_values)
 			replaced := false
 			for id in conflicts {
 				if id == row.id do continue

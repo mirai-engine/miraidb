@@ -1236,6 +1236,24 @@ tx_insert :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error) {
 	return id, err
 }
 
+// tx_next_int_key is the INTEGER PRIMARY KEY an omitted value gets: one past
+// the largest over the stored rows and the staged ones.
+tx_next_int_key :: proc(table: ^Table, writes: ^Table_Writes, position: int) -> i64 {
+	next: i64
+	if table.paged != nil {
+		next = table.next_int_key + 1
+	} else {
+		next = table_max_int(table, position) + 1
+	}
+	if next < 1 do next = 1
+	if writes != nil {
+		for _, row in writes.inserts {
+			if row.values[position].kind == .Int && row.values[position].i >= next do next = row.values[position].i + 1
+		}
+	}
+	return next
+}
+
 @(private)
 tx_insert_row :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error) {
 	if tx.read_only do return 0, errf(.Transaction_Read_Only, "cannot insert in a read transaction")
@@ -1289,18 +1307,7 @@ tx_insert_row :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error)
 	for column, i in table.schema.columns {
 		v := values[i]
 		if i == pk_position && !column.auto_increment && (v.kind == .Default || v.kind == .Null) {
-			// Assign max(pk) + 1 over the stored rows and the staged ones.
-			next: i64
-			if table.paged != nil {
-				next = table.next_int_key + 1
-			} else {
-				next = table_max_int(table, i) + 1
-			}
-			if next < 1 do next = 1
-			for _, row in writes.inserts {
-				if row.values[i].kind == .Int && row.values[i].i >= next do next = row.values[i].i + 1
-			}
-			v = value_int(next)
+			v = value_int(tx_next_int_key(table, writes, i))
 		}
 		if v.kind == .Default {
 			if column.auto_increment {
@@ -1437,18 +1444,7 @@ tx_update_row :: proc(tx: ^Tx, name: string, id: Row_Id, values: []Value) -> Err
 	for column, i in table.schema.columns {
 		v := values[i]
 		if i == pk_position && !column.auto_increment && (v.kind == .Default || v.kind == .Null) {
-			// Assign max(pk) + 1 over the stored rows and the staged ones.
-			next: i64
-			if table.paged != nil {
-				next = table.next_int_key + 1
-			} else {
-				next = table_max_int(table, i) + 1
-			}
-			if next < 1 do next = 1
-			for _, row in writes.inserts {
-				if row.values[i].kind == .Int && row.values[i].i >= next do next = row.values[i].i + 1
-			}
-			v = value_int(next)
+			v = value_int(tx_next_int_key(table, writes, i))
 		}
 		if v.kind == .Default {
 			default_value, default_err := column_default_for_row(tx, column)
@@ -1779,6 +1775,38 @@ tx_host_key_taken :: proc(tx: ^Tx, name: string, table: ^Table, index: int, valu
 		if same do return true
 	}
 	return false
+}
+
+// tx_host_key_holders lists the rows the transaction sees that hold the same
+// key under the columns' collations (tx_host_key_taken, every holder).
+tx_host_key_holders :: proc(tx: ^Tx, name: string, table: ^Table, index: int, values: []Value) -> []Row_Id {
+	holders := make([dynamic]Row_Id, context.temp_allocator)
+	rows := make([dynamic]Row, context.temp_allocator)
+	if collect_err := tx_collect(tx, name, &rows); collect_err.kind != .None {
+		error_drop(collect_err)
+		return nil
+	}
+	for row in rows {
+		same := true
+		for column in table.indexes[index].schema.columns {
+			a, b := values[column], row.values[column]
+			collation := table.schema.columns[column].collation
+			if a.kind == .String && b.kind == .String && len(collation) > 0 {
+				order, ok := collation_compare(tx.store, collation, a.s, b.s)
+				if !ok || order != 0 {
+					same = false
+					break
+				}
+				continue
+			}
+			if !value_equal(a, b) {
+				same = false
+				break
+			}
+		}
+		if same do append(&holders, row.id)
+	}
+	return holders[:]
 }
 
 // tx_committed_key_taken reports whether a committed row other than `ignore`

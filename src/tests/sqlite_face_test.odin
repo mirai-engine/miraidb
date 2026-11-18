@@ -81,6 +81,24 @@ test_insert_names_the_rowid :: proc(t: ^testing.T) {
 	expect_list(t, face_ints(t, conn, "SELECT id FROM k"), {40}, "alias")
 }
 
+@(test)
+test_replace_and_upsert_see_the_transaction :: proc(t: ^testing.T) {
+	store := face_store(t)
+	defer db.store_close(store)
+	conn := db.embed_wrap(store)
+	defer db.embed_close(conn)
+	face_ok(t, conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, u TEXT UNIQUE)")
+	face_ok(t, conn, "BEGIN")
+	// The first row is staged, not committed: REPLACE still finds it, and the
+	// new row's key is chosen before the old one goes, as SQLite chooses it.
+	face_ok(t, conn, "INSERT OR REPLACE INTO t (name, u) VALUES ('a', 'foo')")
+	face_ok(t, conn, "INSERT OR REPLACE INTO t (name, u) VALUES ('b', 'foo')")
+	expect_list(t, face_ints(t, conn, "SELECT id FROM t"), {2}, "replaced")
+	face_ok(t, conn, "INSERT INTO t (id, name, u) VALUES (2, 'c', 'bar') ON CONFLICT (id) DO UPDATE SET name = excluded.name")
+	expect_list(t, face_ints(t, conn, "SELECT count(*) FROM t WHERE name = 'c'"), {1}, "upserted")
+	face_ok(t, conn, "COMMIT")
+}
+
 @(private = "file")
 Window_Calls :: struct {
 	steps, inverses, values: int,
