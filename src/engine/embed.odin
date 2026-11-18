@@ -160,6 +160,12 @@ embed_close :: proc(conn: ^Embed_Conn) {
 	free(conn)
 }
 
+// embed_statement_active reports a statement that stepped and has neither
+// reached its end nor been reset: what SQLite calls an active statement.
+embed_statement_active :: proc(stmt: ^Embed_Statement) -> bool {
+	return stmt != nil && stmt.started && !stmt.done
+}
+
 embed_error :: proc(conn: ^Embed_Conn) -> string {
 	if conn == nil do return "no connection"
 	if conn.last_error.kind == .None do return ""

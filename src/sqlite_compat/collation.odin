@@ -84,6 +84,13 @@ create_collation :: proc(
 		// SQLITE_ANY (5) is accepted as UTF-8, as SQLite does.
 		if rep != 5 do return set_error_code(db, SQLITE_MISUSE, "bad parameter or other API misuse")
 	}
+	// A comparison an active statement may be using is not replaced, as in
+	// SQLite.
+	for existing in db.collations {
+		if strings.equal_fold(existing.name, name) && db_has_active_statement(db) {
+			return set_error_code(db, SQLITE_BUSY, "unable to delete/modify collation sequence due to active statements")
+		}
+	}
 	// The old comparison goes, destructor and all, whatever replaces it.
 	collation_drop(db, name)
 	if compare == nil do return SQLITE_OK

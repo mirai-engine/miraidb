@@ -239,6 +239,16 @@ function_destroy :: proc(fn: ^Function) {
 
 // function_drop forgets this connection's registration of `name` with `arity`
 // and runs its destructor.
+// db_has_active_statement reports a statement of the connection that is
+// running: stepped, and neither finished nor reset.
+@(private)
+db_has_active_statement :: proc(db: ^Database) -> bool {
+	for _, stmt in db.statements {
+		if engine.embed_statement_active(stmt.stmt) do return true
+	}
+	return false
+}
+
 @(private)
 function_drop :: proc(db: ^Database, name: string, arity: int) {
 	for fn, i in db.functions {
@@ -316,6 +326,14 @@ create_function :: proc(
 		return SQLITE_MISUSE
 	}
 	function_name := string(name)
+	// A function an active statement may be calling is not replaced, as in
+	// SQLite.
+	for existing in db.functions {
+		if existing.arity == int(arity) && strings.equal_fold(existing.name, function_name) && db_has_active_statement(db) {
+			if destroy != nil do destroy(user)
+			return set_error_code(db, SQLITE_BUSY, "unable to delete/modify user-function due to active statements")
+		}
+	}
 	// No callback at all deletes the function, as in SQLite.
 	if func == nil && step == nil {
 		engine.store_unregister_function(db.conn.store, function_name, int(arity))
