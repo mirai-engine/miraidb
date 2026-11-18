@@ -405,3 +405,40 @@ test_a_string_literal_names_an_object :: proc(t: ^testing.T) {
 	face_ok(t, conn, "INSERT INTO 'quoted' VALUES (1, 'x')")
 	expect_list(t, face_ints(t, conn, "SELECT id FROM quoted WHERE c0name = 'x'"), {1}, "the row")
 }
+
+// A full-text table has SQLite's shadow tables beside it, made with the text
+// SQLite writes: the content table holds the documents, kept with each write,
+// and they go with the table.
+@(test)
+test_full_text_tables_have_sqlite_shadow_tables :: proc(t: ^testing.T) {
+	store := face_store(t)
+	defer db.store_close(store)
+	conn := db.embed_wrap(store)
+	defer db.embed_close(conn)
+	face_ok(t, conn, "CREATE VIRTUAL TABLE test USING fts4(example)")
+	want := []string {
+		"CREATE TABLE 'test_content'(docid INTEGER PRIMARY KEY, 'c0example')",
+		"CREATE TABLE 'test_segments'(blockid INTEGER PRIMARY KEY, block BLOB)",
+		"CREATE TABLE 'test_segdir'(level INTEGER,idx INTEGER,start_block INTEGER,leaves_end_block INTEGER,end_block INTEGER,root BLOB,PRIMARY KEY(level, idx))",
+		"CREATE TABLE 'test_docsize'(docid INTEGER PRIMARY KEY, size BLOB)",
+		"CREATE TABLE 'test_stat'(id INTEGER PRIMARY KEY, value BLOB)",
+	}
+	for sql in want {
+		name := sql[len("CREATE TABLE '"):strings.index(sql, "'(")]
+		quoted, _ := strings.replace_all(sql, "'", "''", context.temp_allocator)
+		query := fmt.tprintf("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = '%s' AND sql = '%s'", name, quoted)
+		expect_list(t, face_ints(t, conn, query), {1}, name)
+	}
+	face_ok(t, conn, "INSERT INTO test VALUES ('hello world')")
+	face_ok(t, conn, "INSERT INTO test VALUES ('second doc')")
+	face_ok(t, conn, "DELETE FROM test WHERE rowid = 1")
+	expect_list(t, face_ints(t, conn, "SELECT docid FROM test_content"), {2}, "the content table")
+	expect_list(t, face_ints(t, conn, "SELECT rowid FROM test WHERE test MATCH 'second'"), {2}, "the match")
+	face_ok(t, conn, "DROP TABLE test")
+	expect_list(t, face_ints(t, conn, "SELECT count(*) FROM sqlite_master WHERE name LIKE 'test%'"), {0}, "after DROP")
+
+	face_ok(t, conn, "CREATE VIRTUAL TABLE five USING fts5(a, b UNINDEXED)")
+	expect_list(t, face_ints(t, conn, "SELECT v FROM five_config WHERE k = 'version'"), {4}, "fts5 config")
+	face_ok(t, conn, "INSERT INTO five VALUES ('x', 'y')")
+	expect_list(t, face_ints(t, conn, "SELECT count(*) FROM five_content WHERE c0 = 'x' AND c1 = 'y'"), {1}, "fts5 content")
+}

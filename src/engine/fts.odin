@@ -1,7 +1,9 @@
 package engine
 
 import "base:runtime"
+import "core:fmt"
 import "core:math"
+import "core:mem"
 import "core:strings"
 
 // Full-text search as data. A virtual FTS table is a normal table of documents
@@ -162,6 +164,7 @@ fts_create :: proc(tx: ^Tx, name: string, module: string, columns: []string) -> 
 		tx.alloc,
 	)
 	if err := fts_run(tx, doc_index); err.kind != .None do return err
+	if err := fts_shadow_create(tx, name, module, columns); err.kind != .None do return err
 
 	values := []Value {
 		value_string(strings.clone(name, tx.alloc)),
@@ -172,6 +175,113 @@ fts_create :: proc(tx: ^Tx, name: string, module: string, columns: []string) -> 
 	if insert_err.kind != .None do return insert_err
 	_ = row_id
 	return ERROR_NONE
+}
+
+// The shadow tables SQLite's own fts4 and fts5 keep beside a full-text table,
+// made with the text SQLite writes for each and in the order it makes them, so
+// the schema a dump or a SQLite file shows is SQLite's (test_dump's
+// test_dump_virtual_tables). The content table holds the documents, kept with
+// every write; the tables of SQLite's inverted index stay empty, because the
+// index is the engine's own (the `_fts_` tables): a SQLite that opens an
+// exported file finds the documents and rebuilds its index with
+// `INSERT INTO t(t) VALUES('rebuild')`.
+@(private)
+fts_shadow_quote :: proc(text: string, alloc: mem.Allocator) -> string {
+	doubled, _ := strings.replace_all(text, "'", "''", context.temp_allocator)
+	return strings.concatenate({"'", doubled, "'"}, alloc)
+}
+
+// fts_shadow_columns are the document columns a module's arguments declare:
+// an option (`tokenize=porter`) is not one, and a column is its first word.
+@(private)
+fts_shadow_columns :: proc(columns: []string, alloc: mem.Allocator) -> []string {
+	out := make([dynamic]string, 0, len(columns), alloc)
+	for column in columns {
+		if strings.contains(column, "=") do continue
+		word := strings.trim_space(column)
+		if space := strings.index_any(word, " \t\n"); space >= 0 do word = word[:space]
+		if len(word) >= 2 && (word[0] == '"' || word[0] == '\'' || word[0] == '`' || word[0] == '[') do word = word[1:len(word) - 1]
+		append(&out, word)
+	}
+	return out[:]
+}
+
+@(private)
+fts_shadow_is_fts4 :: proc(module: string) -> bool {
+	return strings.equal_fold(module, "fts4")
+}
+
+@(private)
+fts_shadow_create :: proc(tx: ^Tx, name, module: string, columns: []string) -> Error {
+	prefix := strings.concatenate({"CREATE TABLE '", name}, tx.alloc)
+	named := fts_shadow_columns(columns, tx.alloc)
+	content := strings.builder_make(tx.alloc)
+	statements: [dynamic]string
+	statements.allocator = tx.alloc
+	if fts_shadow_is_fts4(module) {
+		strings.write_string(&content, "docid INTEGER PRIMARY KEY")
+		for column, i in named {
+			strings.write_string(&content, ", ")
+			strings.write_string(&content, fts_shadow_quote(fmt.tprintf("c%d%s", i, column), tx.alloc))
+		}
+		append(&statements, strings.concatenate({prefix, "_content'(", strings.to_string(content), ")"}, tx.alloc))
+		append(&statements, strings.concatenate({prefix, "_segments'(blockid INTEGER PRIMARY KEY, block BLOB)"}, tx.alloc))
+		append(&statements, strings.concatenate({prefix, "_segdir'(level INTEGER,idx INTEGER,start_block INTEGER,leaves_end_block INTEGER,end_block INTEGER,root BLOB,PRIMARY KEY(level, idx))"}, tx.alloc))
+		append(&statements, strings.concatenate({prefix, "_docsize'(docid INTEGER PRIMARY KEY, size BLOB)"}, tx.alloc))
+		append(&statements, strings.concatenate({prefix, "_stat'(id INTEGER PRIMARY KEY, value BLOB)"}, tx.alloc))
+	} else {
+		strings.write_string(&content, "id INTEGER PRIMARY KEY")
+		for _, i in named do strings.write_string(&content, fmt.tprintf(", c%d", i))
+		append(&statements, strings.concatenate({prefix, "_data'(id INTEGER PRIMARY KEY, block BLOB)"}, tx.alloc))
+		append(&statements, strings.concatenate({prefix, "_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID"}, tx.alloc))
+		append(&statements, strings.concatenate({prefix, "_content'(", strings.to_string(content), ")"}, tx.alloc))
+		append(&statements, strings.concatenate({prefix, "_docsize'(id INTEGER PRIMARY KEY, sz BLOB)"}, tx.alloc))
+		append(&statements, strings.concatenate({prefix, "_config'(k PRIMARY KEY, v) WITHOUT ROWID"}, tx.alloc))
+	}
+	for sql in statements {
+		if err := fts_run(tx, sql); err.kind != .None do return err
+	}
+	if !fts_shadow_is_fts4(module) {
+		config := strings.concatenate({"INSERT INTO ", fts_shadow_quote(strings.concatenate({name, "_config"}, tx.alloc), tx.alloc), "(k, v) VALUES ('version', 4)"}, tx.alloc)
+		if err := fts_run(tx, config); err.kind != .None do return err
+	}
+	return ERROR_NONE
+}
+
+@(private)
+FTS4_SHADOW_SUFFIXES := [?]string{"_content", "_segments", "_segdir", "_docsize", "_stat"}
+@(private)
+FTS5_SHADOW_SUFFIXES := [?]string{"_data", "_idx", "_content", "_docsize", "_config"}
+
+@(private)
+fts_shadow_suffixes :: proc(module: string) -> []string {
+	if fts_shadow_is_fts4(module) do return FTS4_SHADOW_SUFFIXES[:]
+	return FTS5_SHADOW_SUFFIXES[:]
+}
+
+// fts_shadow_put keeps the content table's row of a document.
+@(private)
+fts_shadow_put :: proc(tx: ^Tx, table: Fts_Table, doc: Row_Id, values: []Value) -> Error {
+	content := fts_shadow_quote(strings.concatenate({table.name, "_content"}, tx.alloc), tx.alloc)
+	if tx_table_probe(tx, strings.concatenate({table.name, "_content"}, tx.alloc)) == nil do return ERROR_NONE
+	params := make([]Value, len(values) + 1, tx.alloc)
+	params[0] = value_int(i64(doc))
+	copy(params[1:], values)
+	marks := strings.builder_make(tx.alloc)
+	for i in 0 ..< len(params) {
+		strings.write_string(&marks, i == 0 ? "?" : ", ?")
+	}
+	sql := strings.concatenate({"INSERT OR REPLACE INTO ", content, " VALUES (", strings.to_string(marks), ")"}, tx.alloc)
+	return fts_run(tx, sql, params)
+}
+
+// fts_shadow_remove drops the content table's row of a document.
+@(private)
+fts_shadow_remove :: proc(tx: ^Tx, table: Fts_Table, doc: Row_Id) -> Error {
+	if tx_table_probe(tx, strings.concatenate({table.name, "_content"}, tx.alloc)) == nil do return ERROR_NONE
+	key := fts_shadow_is_fts4(table.module) ? "docid" : "id"
+	content := fts_shadow_quote(strings.concatenate({table.name, "_content"}, tx.alloc), tx.alloc)
+	return fts_run(tx, strings.concatenate({"DELETE FROM ", content, " WHERE ", key, " = ?"}, tx.alloc), []Value{value_int(i64(doc))})
 }
 
 fts_drop :: proc(tx: ^Tx, name: string, if_exists: bool) -> Error {
@@ -188,6 +298,11 @@ fts_drop :: proc(tx: ^Tx, name: string, if_exists: bool) -> Error {
 		return err
 	}
 	if err := tx_drop_table(tx, table.terms); err.kind != .None && err.kind != .Table_Not_Found do return err
+	for suffix in fts_shadow_suffixes(table.module) {
+		shadow := strings.concatenate({table.name, suffix}, tx.alloc)
+		if tx_table_probe(tx, shadow) == nil do continue
+		if err := tx_drop_table(tx, shadow); err.kind != .None do return err
+	}
 	return tx_drop_table(tx, table.name)
 }
 
@@ -268,7 +383,7 @@ fts_index_row :: proc(tx: ^Tx, table: Fts_Table, doc: Row_Id, values: []Value, i
 		return adjust_err
 	}
 	documents[doc] = true
-	return ERROR_NONE
+	return fts_shadow_put(tx, table, doc, values)
 }
 
 // fts_count_term counts one token, capped so a pathological document cannot grow
@@ -286,6 +401,7 @@ fts_count_term :: proc(seen: ^map[string]int, word: string) -> int {
 }
 
 fts_remove_row :: proc(tx: ^Tx, table: Fts_Table, doc: Row_Id) -> Error {
+	if shadow_err := fts_shadow_remove(tx, table, doc); shadow_err.kind != .None do return shadow_err
 	if documents, exists := &tx.fts_new_docs[table.name]; exists {
 		delete_key(documents, doc)
 	}
