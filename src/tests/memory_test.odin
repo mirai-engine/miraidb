@@ -204,6 +204,9 @@ test_full_text_leaves_nothing :: proc(t: ^testing.T) {
 		"INSERT INTO d (title, body) VALUES ('one', 'the quick brown fox'), ('two', 'a lazy dog'), ('three', 'quick dogs run')",
 		"SELECT title FROM d WHERE d MATCH 'quick'",
 		"DELETE FROM d WHERE title = 'two'",
+		"DROP TABLE d",
+		"CREATE TABLE IF NOT EXISTS q (a)",
+		"CREATE TABLE IF NOT EXISTS q (a)",
 	})
 }
 

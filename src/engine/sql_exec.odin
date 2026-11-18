@@ -9193,6 +9193,7 @@ sql_exec_create_table :: proc(tx: ^Tx, stmt: Create_Table_Stmt, params: []Value)
 	}
 	if create_err := tx_create_table(tx, &schema); create_err.kind != .None {
 		if create_err.kind == .Table_Exists && stmt.if_not_exists {
+			error_free(&create_err)
 			// The result outlives the transaction: its arena is gone by the time
 			// the caller prints the message.
 			return Sql_Result{

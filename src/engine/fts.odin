@@ -52,14 +52,14 @@ fts_is_spatial :: proc(table: Fts_Table) -> bool {
 }
 
 fts_ensure :: proc(tx: ^Tx) -> Error {
-	_, err := sql_execute_in_tx(tx, VIRTUAL_SCHEMA_SQL)
-	return err
+	return fts_run(tx, VIRTUAL_SCHEMA_SQL)
 }
 
 // fts_run executes one statement inside the transaction and keeps only the error.
 @(private)
 fts_run :: proc(tx: ^Tx, sql: string, params: []Value = nil) -> Error {
-	_, err := sql_execute_in_tx_params(tx, sql, params)
+	result, err := sql_execute_in_tx_params(tx, sql, params)
+	sql_result_destroy(&result)
 	return err
 }
 
