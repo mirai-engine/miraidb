@@ -103,7 +103,7 @@ and `has_role` (engine extensions), plus `count`, `sum`, `avg`, `min`, `max`,
 `total`.
 
 **Missing:** the list `scripts/sqlite_gaps.py --missing` prints, grouped by
-roadmap item in [sqlite-roadmap.md](sqlite-roadmap.md) (S4 and S5).
+roadmap item in [sqlite-roadmap.md](sqlite-roadmap.md) (S5).
 
 ## Pragmas
 

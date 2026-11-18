@@ -33,7 +33,6 @@ Rules for this file:
 | R2 | every index entry is an encoded string | fixed-size keys where the column allows | M |
 | R3 | pruning walks every row of every table after each statement | prune what the commit touched | S |
 | R4 | a committed row is copied from the transaction arena to the table | hand the staged row over | M |
-| S4 | `FILTER`, named `WINDOW` and aggregate `ORDER BY` missing; the ordered-set aggregates and `json_group_*` landed | the rest of the aggregate surface | S |
 | S5 | 15 of 121 built-in functions missing | the `jsonb_*` family, `json_parse`, `json_array_insert`, `sqlite_offset` | M |
 | D2 | overlap on an `rtree` table is a scan | node pages and a descent | M |
 | D3 | versions stay until `store_prune_versions` is called | automatic retention, `AS OF` on a join | M |
@@ -121,19 +120,6 @@ is **refused with a message**, never answered differently: that is the property
 `scripts/differential.py` guards, and each item keeps it. An item is done when
 its shapes run, `sqlite_gaps.py --check` is updated, and the differential corpus
 gains a query per shape that compares the answer with SQLite's.
-
-## S4 — Aggregates and windows
-
-**Now refused.** `FILTER (WHERE …)` on an aggregate or a window, a named `WINDOW`
-clause, and `ORDER BY` inside an aggregate's arguments
-(`group_concat(x ORDER BY x)`).
-
-**Done since.** The ordered-set aggregates `median`, `percentile`,
-`percentile_cont` and `percentile_disc` (SQLite 3.51's, with its percentage for
-`percentile()` and its error for a fraction outside [0, 1]), and the JSON
-aggregates `json_group_array` and `json_group_object`.
-
-**Done when.** The three refusals above run and match SQLite.
 
 ## S5 — Built-in functions
 
