@@ -159,7 +159,8 @@ collation_problem :: proc(store: ^Store, name: string, needs_key: bool) -> Error
 		return ERROR_NONE
 	}
 	// SQLite refuses an unknown name too: a comparison that falls back to BINARY
-	// answers a question nobody asked.
+	// answers a question nobody asked. Under SQLite's rules, in its words.
+	if store != nil && (store.sqlite_names || store.sqlite_rules) do return errf(.Invalid_Argument, "no such collation sequence: %s", name)
 	return errf(.Invalid_Argument, "no such collation: %s", name)
 }
 
