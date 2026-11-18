@@ -63,14 +63,30 @@ def run(command: list[str], cwd: str, log: str) -> None:
         raise SystemExit(f"sqlite shell: {' '.join(command[:3])} failed:\n{tail}")
 
 
-def build(sqlite_src: str, facade: str, rebuild: bool) -> tuple[str, str, str]:
-    """Build the reference library and both shells; answer their paths."""
+def default_source() -> str:
+    return os.environ.get("MIRAIDB_SQLITE_SRC", os.path.join(ROOT, "..", "sqlite"))
+
+
+def missing_tools(sqlite_src: str) -> list[str]:
+    """What building the reference needs and this machine lacks."""
+    return [name for name, found in [
+        ("SQLite's source tree", os.path.exists(os.path.join(sqlite_src, "VERSION"))),
+        ("tclsh", tool("tclsh", "tclsh8.6", "tclsh86")),
+        ("sh", tool("sh", "bash")),
+        ("a C compiler", tool("gcc", "cc", "clang")),
+        ("make", tool("gmake", "make", "mingw32-make")),
+    ] if not found]
+
+
+def build_reference(sqlite_src: str, rebuild: bool = False) -> tuple[str, str, str]:
+    """Build SQLite's library from its source tree once; answer the cache
+    directory, the library and the amalgamation directory."""
     version = open(os.path.join(sqlite_src, "VERSION"), encoding="utf-8").read().strip()
     cache = os.path.join(CACHE, version)
     if rebuild and os.path.exists(cache):
         shutil.rmtree(cache)
     os.makedirs(cache, exist_ok=True)
-    tclsh, sh = tool("tclsh", "tclsh8.6", "tclsh86"), tool("sh", "bash")
+    sh = tool("sh", "bash")
     cc, make = tool("gcc", "cc", "clang"), tool("gmake", "make", "mingw32-make")
     shared = "sqlite3_ref.dll" if os.name == "nt" else "libsqlite3_ref.so"
     reference = os.path.join(cache, shared)
@@ -87,6 +103,14 @@ def build(sqlite_src: str, facade: str, rebuild: bool) -> tuple[str, str, str]:
         flags = ["-shared"] if os.name == "nt" else ["-shared", "-fPIC"]
         run([cc, "-O1", "-w", *flags, *options, "sqlite3.c", "-o", reference], amalgamation,
             os.path.join(cache, "library.log"))
+    return cache, reference, amalgamation
+
+
+def build(sqlite_src: str, facade: str, rebuild: bool) -> tuple[str, str, str]:
+    """Build the reference library and both shells; answer their paths."""
+    cache, reference, amalgamation = build_reference(sqlite_src, rebuild)
+    tclsh = tool("tclsh", "tclsh8.6", "tclsh86")
+    cc = tool("gcc", "cc", "clang")
     # shell.c lives apart from any sqlite3.h, so each build reads its own header.
     source = os.path.join(cache, "shell")
     os.makedirs(source, exist_ok=True)
@@ -140,17 +164,10 @@ def run_case(shell: str, case: str, directory: str) -> list[str]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("facade", nargs="?", default=os.path.join(ROOT, "bin", LIBRARY))
-    parser.add_argument("--sqlite-src", default=os.environ.get("MIRAIDB_SQLITE_SRC", os.path.join(ROOT, "..", "sqlite")))
+    parser.add_argument("--sqlite-src", default=default_source())
     parser.add_argument("--rebuild", action="store_true", help="build the reference again")
     args = parser.parse_args()
-    missing = [name for name, found in [
-        ("SQLite's source tree", os.path.exists(os.path.join(args.sqlite_src, "VERSION"))),
-        ("tclsh", tool("tclsh", "tclsh8.6", "tclsh86")),
-        ("sh", tool("sh", "bash")),
-        ("a C compiler", tool("gcc", "cc", "clang")),
-        ("make", tool("gmake", "make", "mingw32-make")),
-        ("the facade", os.path.exists(args.facade)),
-    ] if not found]
+    missing = missing_tools(args.sqlite_src) + ([] if os.path.exists(args.facade) else ["the facade"])
     if missing:
         print(f"sqlite shell: skipped, missing {', '.join(missing)}")
         return 0

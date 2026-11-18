@@ -3,8 +3,10 @@
 A smoke that asserts what the facade answers only knows what its author thought
 SQLite answers. This module drives both libraries through ctypes with one
 script and compares what each call returned, so a difference is a difference
-from SQLite, not from a guess. The reference is the sqlite3 library the running
-Python ships (Windows: DLLs/sqlite3.dll) or the system one.
+from SQLite, not from a guess. The reference is SQLite built from its source
+tree (scripts/sqlite_shell.py builds and caches it) when this machine can build
+it, else the sqlite3 library the running Python ships (Windows: DLLs/sqlite3.dll)
+or the system one.
 
 Used by scripts/sqlite_abi_smoke.py; `observe(lib)` is the script.
 """
@@ -14,6 +16,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import os
+import re
 import sys
 
 import sqlite_abi_functions
@@ -113,7 +116,14 @@ def load(path: str):
 
 
 def reference_path() -> str | None:
-    """The SQLite library this Python links, or the system one."""
+    """SQLite built from the source tree the facade answers as (the release
+    whose text it writes: a real's digits changed in 3.54), when this machine
+    can build it; else the library this Python links, or the system one."""
+    import sqlite_shell
+
+    source = sqlite_shell.default_source()
+    if not sqlite_shell.missing_tools(source):
+        return sqlite_shell.build_reference(os.path.abspath(source))[1]
     if os.name == "nt":
         candidate = os.path.join(sys.base_prefix, "DLLs", "sqlite3.dll")
         return candidate if os.path.exists(candidate) else None
@@ -393,17 +403,46 @@ def compare(facade_path: str) -> list[str]:
     reference = reference_path()
     if reference is None:
         return ["no reference SQLite library to compare against"]
-    ours = observe(load(facade_path))
+    facade_lib = load(facade_path)
+    ours = observe(facade_lib)
     reference_lib = load(reference)
     theirs = observe(reference_lib)
     if reference_lib.missing:
         for sql, origins in EXPECTED_ORIGINS.items():
             theirs[f"origins of {sql!r}"] = origins
+    same = lambda a, b: a == b
+    if version(reference_lib) < (3, 54) <= version(facade_lib):
+        # Before 3.54 SQLite wrote a real with 15 significant digits, since
+        # then with up to 17: an older reference reads the same at 15.
+        print(f"reference is SQLite {reference_lib.sqlite3_libversion().decode()}: reals compared at 15 digits")
+        same = lambda a, b: at_15_digits(a) == at_15_digits(b)
     return [
         f"{key}: facade {ours.get(key)!r}, SQLite {theirs[key]!r}"
         for key in theirs
-        if ours.get(key) != theirs[key]
+        if not same(ours.get(key), theirs[key])
     ]
+
+
+def version(lib) -> tuple[int, ...]:
+    lib.sqlite3_libversion.restype = c_char_p
+    return tuple(int(part) for part in lib.sqlite3_libversion().decode().split(".")[:2])
+
+
+REAL_TEXT = re.compile(rb"^-?[0-9]+\.[0-9]+(e[-+][0-9]+)?$")
+
+
+def at_15_digits(value: object) -> object:
+    """A value with every real's text read back as a double and rounded to
+    15 significant digits."""
+    if isinstance(value, (list, tuple)):
+        return type(value)(at_15_digits(v) for v in value)
+    if isinstance(value, dict):
+        return {k: at_15_digits(v) for k, v in value.items()}
+    if isinstance(value, bytes) and REAL_TEXT.match(value):
+        return float(f"{float(value):.15g}")
+    if isinstance(value, str) and REAL_TEXT.match(value.encode()):
+        return float(f"{float(value):.15g}")
+    return value
 
 
 if __name__ == "__main__":
