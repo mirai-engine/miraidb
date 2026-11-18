@@ -339,9 +339,18 @@ sql_exec_pragma :: proc(store: ^Store, body: string, locked: bool, tx: ^Tx = nil
 	case "max_page_count":
 		return pragma_single("max_page_count", value_int(1073741823), store.commit_seq), ERROR_NONE
 	case "foreign_keys":
-		// Enforcement lives in the transaction layer and cannot be turned off, so
-		// the honest answer to both forms is the state in effect.
-		return pragma_single("foreign_keys", value_int(1), store.commit_seq), ERROR_NONE
+		// Inside a transaction the setting is left alone, as SQLite leaves it.
+		if has_argument && tx == nil {
+			switch strings.to_lower(argument, context.temp_allocator) {
+			case "on", "1", "true", "yes":
+				store.foreign_keys_off = false
+			case "off", "0", "false", "no":
+				store.foreign_keys_off = true
+			}
+			return Sql_Result{kind = .Ack, message = strings.clone("ok"), commit_seq = store.commit_seq}, ERROR_NONE
+		}
+		if has_argument do return Sql_Result{kind = .Ack, message = strings.clone("ok"), commit_seq = store.commit_seq}, ERROR_NONE
+		return pragma_single("foreign_keys", value_int(store.foreign_keys_off ? 0 : 1), store.commit_seq), ERROR_NONE
 	case "integrity_check", "quick_check":
 		return pragma_check(store, name), ERROR_NONE
 	case "foreign_key_check":

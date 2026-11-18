@@ -5,6 +5,10 @@ counter and user_version), sqlite3_backup_* (a copy replaces what the
 destination held; the refusals SQLite makes when it starts), sqlite3_db_filename,
 sqlite3_db_name, sqlite3_db_readonly, sqlite3_txn_state and sqlite3_close_v2.
 
+Foreign keys too: off until PRAGMA foreign_keys = ON, then a violation is
+SQLITE_CONSTRAINT_FOREIGNKEY with SQLite's words, and a key that names no
+unique key of its parent is declared but fails with "foreign key mismatch".
+
 The images themselves are not compared byte for byte: each library lays its own
 pages out. What is compared is what reading them answers, and that each is a
 whole number of 4096-byte pages.
@@ -35,6 +39,8 @@ SIGNATURES = {
     "sqlite3_db_readonly": ([c_void_p, c_char_p], c_int),
     "sqlite3_txn_state": ([c_void_p, c_char_p], c_int),
     "sqlite3_close_v2": ([c_void_p], c_int),
+    "sqlite3_extended_errcode": ([c_void_p], c_int),
+    "sqlite3_extended_result_codes": ([c_void_p, c_int], c_int),
 }
 
 NOCOPY = 1
@@ -202,3 +208,39 @@ def observe(lib, seen: dict) -> None:
     seen["close_v2 with a statement open"] = (closed, stepped, value, lib.sqlite3_finalize(stmt))
     seen["close_v2"] = lib.sqlite3_close_v2(empty)
     lib.sqlite3_close(source)
+    observe_foreign_keys(lib, seen)
+
+
+def observe_foreign_keys(lib, seen: dict) -> None:
+    db = open_db(lib)
+    lib.sqlite3_extended_result_codes(db, 1)
+
+    def run(sql: bytes):
+        code = lib.sqlite3_exec(db, sql, None, None, None)
+        return (code, lib.sqlite3_extended_errcode(db), lib.sqlite3_errmsg(db) if code else None)
+
+    steps = [
+        b"CREATE TABLE p (id INTEGER PRIMARY KEY, k)",
+        b"CREATE TABLE c (pid INTEGER REFERENCES p(id), n)",
+        b"CREATE TABLE m (r REFERENCES p(k))",
+        b"INSERT INTO c VALUES (9, 1)",
+        b"INSERT INTO m VALUES (1)",
+        b"PRAGMA foreign_keys",
+        b"PRAGMA foreign_keys = ON",
+        b"PRAGMA foreign_keys",
+        b"INSERT INTO c VALUES (8, 1)",
+        b"INSERT INTO p VALUES (1, 1)",
+        b"INSERT INTO c VALUES (1, 2)",
+        b"DELETE FROM p WHERE id = 1",
+        b"UPDATE p SET id = 5 WHERE id = 1",
+        b"INSERT INTO m VALUES (1)",
+        b"BEGIN",
+        b"PRAGMA foreign_keys = OFF",
+        b"COMMIT",
+        b"INSERT INTO c VALUES (7, 3)",
+        b"PRAGMA foreign_keys = OFF",
+        b"INSERT INTO c VALUES (7, 3)",
+    ]
+    seen["foreign keys"] = [(step, run(step)) for step in steps]
+    seen["foreign keys pragma"] = answers(lib, db, b"PRAGMA foreign_keys")
+    lib.sqlite3_close(db)

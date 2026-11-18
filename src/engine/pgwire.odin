@@ -187,6 +187,8 @@ pg_error_from :: proc(err: Error) -> []u8 {
 // pg_sqlstate is the PostgreSQL error code closest to an engine error kind.
 pg_sqlstate :: proc(kind: Error_Kind) -> string {
 	#partial switch kind {
+	case .Foreign_Key_Violation:
+		return "23503" // foreign_key_violation
 	case .Table_Not_Found:
 		return "42P01" // undefined_table
 	case .Column_Not_Found:

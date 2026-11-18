@@ -184,6 +184,10 @@ Store :: struct {
 	// attached holds the databases ATTACH opened, by name. They are read-only
 	// and their catalog lives in `_attach`.
 	attached:            map[string]^Store,
+	// foreign_keys_off is PRAGMA foreign_keys = OFF: the keys are declared and
+	// listed but not enforced. The engine enforces them unless told; the
+	// SQLite face opens with them off, as SQLite does.
+	foreign_keys_off:    bool,
 	// sqlite_mirror is the .sqlite file this database was opened from. After a
 	// commit the pages the commit touched are written back to it, so the file
 	// stays a SQLite database a client can open. The commit log is still the

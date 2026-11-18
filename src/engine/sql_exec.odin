@@ -8828,14 +8828,9 @@ sql_exec_create_table :: proc(tx: ^Tx, stmt: Create_Table_Stmt, params: []Value)
 				}
 				ref_positions[i] = position
 			}
-			if !schema_columns_unique(parent_schema, ref_positions) {
-				return {}, errf(
-					.Invalid_Argument,
-					"foreign key on %s must reference a unique key of %s",
-					stmt.name,
-					constraint.ref_table,
-				)
-			}
+			// A key that names no unique key of its parent is declared all the
+			// same, as SQLite declares it; enforcing it is what fails, with
+			// "foreign key mismatch" (foreign.odin).
 			name := constraint.name
 			if len(name) == 0 {
 				name = strings.concatenate({stmt.name, "_fkey"}, tx.alloc)

@@ -315,7 +315,7 @@ sqlite_code :: proc(err: engine.Error) -> c.int {
 	switch err.kind {
 	case .None:
 		return SQLITE_OK
-	case .Duplicate_Primary_Key, .Duplicate_Unique, .Not_Null_Violation, .Check_Violation:
+	case .Duplicate_Primary_Key, .Duplicate_Unique, .Not_Null_Violation, .Check_Violation, .Foreign_Key_Violation:
 		return SQLITE_CONSTRAINT
 	case .Invalid_Type:
 		return SQLITE_MISMATCH
@@ -363,6 +363,8 @@ sqlite_extended_code :: proc(err: engine.Error) -> c.int {
 		return SQLITE_CONSTRAINT_NOTNULL
 	case .Check_Violation:
 		return SQLITE_CONSTRAINT_CHECK
+	case .Foreign_Key_Violation:
+		return SQLITE_CONSTRAINT_FOREIGNKEY
 	}
 	return sqlite_code(err)
 }
@@ -418,6 +420,8 @@ sqlite3_open :: proc "c" (filename: cstring, ppDb: ^rawptr) -> c.int {
 	db.error_offset = -1
 	// An expression column is named by its text, as SQLite names it.
 	conn.store.sqlite_names = true
+	// Foreign keys are off until PRAGMA foreign_keys = ON, as in SQLite.
+	conn.store.foreign_keys_off = true
 	db.in_memory = in_memory
 	db.filename = strings.clone_to_cstring("")
 	if !engine.store_path_is_memory(path) {

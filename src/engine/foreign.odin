@@ -40,7 +40,9 @@ fk_parent_exists :: proc(tx: ^Tx, fk: Foreign_Key, child_values: []Value) -> (bo
 // fk_check_child verifies that every foreign key of a row being written has a
 // parent. A key with a NULL component is not enforced, which is the SQL rule.
 fk_check_child :: proc(tx: ^Tx, table: ^Table, values: []Value) -> Error {
+	if tx.store.foreign_keys_off do return ERROR_NONE
 	for fk in table.schema.foreign_keys {
+		if mismatch_err := fk_mismatch(tx, table.schema.name, fk); mismatch_err.kind != .None do return mismatch_err
 		if fk.deferred {
 			// Checked when the transaction commits (fk_check_deferred).
 			fk_defer(tx, table.schema.name)
@@ -53,15 +55,7 @@ fk_check_child :: proc(tx: ^Tx, table: ^Table, values: []Value) -> Error {
 		if has_null do continue
 		found, check_err := fk_parent_exists(tx, fk, values)
 		if check_err.kind != .None do return check_err
-		if !found {
-			return errf(
-				.Invalid_Argument,
-				"foreign key %s on %s has no matching row in %s",
-				fk.name,
-				table.schema.name,
-				fk.ref_table,
-			)
-		}
+		if !found do return errf(.Foreign_Key_Violation, "FOREIGN KEY constraint failed")
 	}
 	return ERROR_NONE
 }
@@ -93,15 +87,7 @@ fk_check_deferred :: proc(tx: ^Tx) -> Error {
 				if has_null do continue
 				found, check_err := fk_parent_exists(tx, fk, row.values)
 				if check_err.kind != .None do return check_err
-				if !found {
-					return errf(
-						.Invalid_Argument,
-						"deferred foreign key %s on %s has no matching row in %s at commit",
-						fk.name,
-						name,
-						fk.ref_table,
-					)
-				}
+				if !found do return errf(.Foreign_Key_Violation, "FOREIGN KEY constraint failed")
 			}
 		}
 	}
@@ -166,8 +152,10 @@ fk_parent_delete :: proc(
 	if depth > FK_MAX_DEPTH {
 		return errf(.Invalid_Argument, "foreign key cascade is deeper than %d", FK_MAX_DEPTH)
 	}
+	if tx.store.foreign_keys_off do return ERROR_NONE
 	referencing := fk_referencing(tx, table_name, tx.alloc)
 	for child in referencing {
+		if mismatch_err := fk_mismatch(tx, child.table.schema.name, child.fk); mismatch_err.kind != .None do return mismatch_err
 		rows := make([dynamic]Row)
 		if match_err := fk_children_matching(tx, child, values, &rows); match_err.kind != .None {
 			delete(rows)
@@ -185,13 +173,7 @@ fk_parent_delete :: proc(
 		}
 		if child.fk.on_delete == .Restrict {
 			delete(rows)
-			return errf(
-				.Invalid_Argument,
-				"cannot delete from %s: %s still references it (foreign key %s)",
-				table_name,
-				child.table.schema.name,
-				child.fk.name,
-			)
+			return errf(.Foreign_Key_Violation, "FOREIGN KEY constraint failed")
 		}
 		for row in rows {
 			if cascade_err := fk_parent_delete(tx, child.table.schema.name, row.values, depth + 1); cascade_err.kind != .None {
@@ -217,8 +199,10 @@ fk_parent_update :: proc(
 	depth: int = 0,
 ) -> Error {
 	if depth > FK_MAX_DEPTH do return errf(.Invalid_Argument, "foreign key cascade is too deep")
+	if tx.store.foreign_keys_off do return ERROR_NONE
 	referencing := fk_referencing(tx, table_name, tx.alloc)
 	for child in referencing {
+		if mismatch_err := fk_mismatch(tx, child.table.schema.name, child.fk); mismatch_err.kind != .None do return mismatch_err
 		changed := false
 		for ref_column in child.fk.ref_columns {
 			if !value_equal(old_values[ref_column], new_values[ref_column]) {
@@ -243,13 +227,7 @@ fk_parent_update :: proc(
 		}
 		if child.fk.on_update == .Restrict {
 			delete(rows)
-			return errf(
-				.Invalid_Argument,
-				"cannot change the key of %s: %s still references it (foreign key %s)",
-				table_name,
-				child.table.schema.name,
-				child.fk.name,
-			)
+			return errf(.Foreign_Key_Violation, "FOREIGN KEY constraint failed")
 		}
 		for row in rows {
 			child_values := make([]Value, len(row.values), tx.alloc)
@@ -273,4 +251,15 @@ fk_parent_update :: proc(
 		delete(rows)
 	}
 	return ERROR_NONE
+}
+
+// fk_mismatch is the error a key that names no unique key of its parent gets
+// when it is enforced, in SQLite's words; SQLite declares such a key and
+// refuses every write it would have to check.
+@(private)
+fk_mismatch :: proc(tx: ^Tx, child: string, fk: Foreign_Key) -> Error {
+	parent := tx_table_probe(tx, fk.ref_table)
+	if parent == nil do return errf(.Invalid_Argument, "no such table: main.%s", fk.ref_table)
+	if schema_columns_unique(&parent.schema, fk.ref_columns) do return ERROR_NONE
+	return errf(.Invalid_Argument, "foreign key mismatch - \"%s\" referencing \"%s\"", child, fk.ref_table)
 }

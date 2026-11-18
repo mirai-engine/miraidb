@@ -5766,11 +5766,15 @@ test_foreign_key_catalog :: proc(t: ^testing.T) {
 		"CREATE TABLE bad (id INTEGER PRIMARY KEY, other INTEGER, FOREIGN KEY (other) REFERENCES ghosts (id))",
 	)
 	testing.expect(t, !db.error_ok(missing))
+	// A key naming no unique key of its parent is declared, as SQLite declares
+	// it; enforcing it fails with "foreign key mismatch".
 	_, not_unique := db.sql_execute(
 		store,
 		"CREATE TABLE bad2 (id INTEGER PRIMARY KEY, other INTEGER, FOREIGN KEY (other) REFERENCES authors (name))",
 	)
-	testing.expect(t, !db.error_ok(not_unique))
+	testing.expect(t, db.error_ok(not_unique))
+	mismatch := run_error(t, store, "INSERT INTO bad2 VALUES (1, 1)")
+	testing.expect_value(t, mismatch.message, `foreign key mismatch - "bad2" referencing "authors"`)
 	_, bad_column := db.sql_execute(
 		store,
 		"CREATE TABLE bad3 (id INTEGER PRIMARY KEY, other INTEGER, FOREIGN KEY (other) REFERENCES authors (nope))",
@@ -5802,14 +5806,15 @@ test_foreign_key_enforcement :: proc(t: ^testing.T) {
 
 	// A child needs its parent.
 	_, missing := db.sql_execute(store, "INSERT INTO books (id, author, title) VALUES (1, 9, 'x')")
-	testing.expect_value(t, missing.kind, db.Error_Kind.Invalid_Argument)
+	testing.expect_value(t, missing.kind, db.Error_Kind.Foreign_Key_Violation)
+	testing.expect_value(t, missing.message, "FOREIGN KEY constraint failed")
 	run(t, store, "INSERT INTO books (id, author, title) VALUES (1, 1, 'x')")
 	// NULL keys are not enforced.
 	run(t, store, "INSERT INTO books (id, author, title) VALUES (2, NULL, 'y')")
 
 	// RESTRICT (the default) refuses to delete a referenced parent.
 	_, restricted := db.sql_execute(store, "DELETE FROM authors WHERE id = 1")
-	testing.expect_value(t, restricted.kind, db.Error_Kind.Invalid_Argument)
+	testing.expect_value(t, restricted.kind, db.Error_Kind.Foreign_Key_Violation)
 
 	// A cascade chains through grandchildren.
 	run(t, store, "INSERT INTO reviews (id, book) VALUES (1, 1)")

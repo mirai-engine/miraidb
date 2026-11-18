@@ -38,6 +38,10 @@ Error_Kind :: enum u8 {
 	// must read more bytes rather than treat it as a malformed request.
 	Incomplete,
 	Internal,
+	// Foreign_Key_Violation is a row whose key has no parent, or a parent
+	// whose children still need it. It is last so the kinds before it keep
+	// the numbers the wire protocols carry.
+	Foreign_Key_Violation,
 }
 
 Error :: struct {
@@ -143,6 +147,8 @@ error_kind_name :: proc(kind: Error_Kind) -> string {
 		return "incomplete"
 	case .Internal:
 		return "internal"
+	case .Foreign_Key_Violation:
+		return "foreign_key_violation"
 	}
 	return "unknown"
 }

@@ -76,7 +76,7 @@ script lists.
 | `||` string concatenation | done | tested with text and numbers |
 | COLLATE (BINARY, NOCASE, RTRIM) | done | on a column, in comparisons, in unique keys and index probes |
 | Window functions, FILTER | done | `OVER` with `PARTITION BY`/`ORDER BY` and `ROWS`/`RANGE`/`GROUPS` frames, beside `GROUP BY` too; the `WINDOW` clause (`OVER name`, and `OVER (name …)` adding an `ORDER BY` or a frame, with SQLite's four refusals). `FILTER (WHERE …)` on an aggregate and on an aggregate window, and an aggregate's own `ORDER BY` (`group_concat(x, ',' ORDER BY y)`), which a scalar function refuses as SQLite does. Not supported: `FILTER` on a window over grouped rows, and a program's collation in an aggregate's `ORDER BY` |
-| Foreign keys | done | `FOREIGN KEY (…) REFERENCES` and a column's `REFERENCES t [(col)]` (the parent's key when no column is named, the table itself allowed); `ON DELETE`/`ON UPDATE` `RESTRICT`/`CASCADE`; `DEFERRABLE INITIALLY DEFERRED` checked at COMMIT. Always enforced, on every path |
+| Foreign keys | done | `FOREIGN KEY (…) REFERENCES` and a column's `REFERENCES t [(col)]` (the parent's key when no column is named, the table itself allowed); `ON DELETE`/`ON UPDATE` `RESTRICT`/`CASCADE`; `DEFERRABLE INITIALLY DEFERRED` checked at COMMIT. Enforced on every path unless `PRAGMA foreign_keys = OFF` (a no-op inside a transaction, as in SQLite); the `sqlite3_*` face opens with them off, as SQLite does. A violation is `FOREIGN KEY constraint failed` (`SQLITE_CONSTRAINT_FOREIGNKEY`, SQLSTATE `23503`). A key that names no unique key of its parent is declared, and every write that has to enforce it fails with `foreign key mismatch - "child" referencing "parent"`, as in SQLite; a key whose parent table does not exist yet is still refused at `CREATE` |
 | `AS OF <seq>` | done | engine extension: read a table as it was |
 
 ## Functions
@@ -188,7 +188,7 @@ behaviour here will see different results:
 | `HAVING c > 1` where `c` aliases `count(*)` | works | error `column c does not exist` |
 | `UPDATE t SET u = u + 990` whose rows collide only partway through | error: a unique key is checked row by row | succeeds when the final rows are distinct: a statement's keys are checked against its result |
 | `COMMIT` a deferred foreign key fails | the transaction stays open until `ROLLBACK` | the transaction is rolled back |
-| foreign keys | enforced only after `PRAGMA foreign_keys = ON` | always enforced |
+| foreign keys, engine default | enforced only after `PRAGMA foreign_keys = ON` | enforced until `PRAGMA foreign_keys = OFF` (the `sqlite3_*` face starts with them off) |
 | `REFERENCES` in an imported `.sqlite` file | kept, enforced only after `PRAGMA foreign_keys = ON` | not imported: enforcing them always would refuse what the file's own SQLite accepts by default |
 
 ## The claims in this file are executed
