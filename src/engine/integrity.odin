@@ -86,11 +86,21 @@ store_integrity_check :: proc(store: ^Store, alloc: mem.Allocator) -> [dynamic]s
 					)
 				}
 			}
-			if fk_err := fk_check_child(tx, table, row.values); fk_err.kind != .None {
-				append(
-					&problems,
-					fmt.aprintf("%s row %d: %s", name, u64(row.id), fk_err.message, allocator = alloc),
-				)
+			// Every key is checked here, whatever PRAGMA foreign_keys says, and
+			// the report names the key, which the error a write gets does not.
+			for fk in table.schema.foreign_keys {
+				has_null := false
+				for column in fk.columns do if row.values[column].kind == .Null do has_null = true
+				if has_null do continue
+				found, check_err := fk_parent_exists(tx, fk, row.values)
+				if check_err.kind != .None {
+					append(&problems, fmt.aprintf("%s row %d: foreign key %s: %s", name, u64(row.id), fk.name, check_err.message, allocator = alloc))
+					error_drop(check_err)
+					continue
+				}
+				if !found {
+					append(&problems, fmt.aprintf("%s row %d: foreign key %s has no matching row in %s", name, u64(row.id), fk.name, fk.ref_table, allocator = alloc))
+				}
 			}
 		}
 		for index, i in table.indexes {
