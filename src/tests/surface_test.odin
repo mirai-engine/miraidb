@@ -102,3 +102,19 @@ test_memory_attach_and_vacuum :: proc(t: ^testing.T) {
 	testing.expect(t, !db.error_drop(db.embed_exec(conn, "DETACH aux")))
 	testing.expect(t, db.error_drop(db.embed_exec(conn, "VACUUM")))
 }
+
+@(test)
+test_generate_series :: proc(t: ^testing.T) {
+	// generate_series (S6), SQLite's series extension: STOP defaults to
+	// 4294967295 and STEP to 1, a negative STEP reverses the values, START is
+	// required, the arguments are HIDDEN columns, and the row id is the value.
+	store := fresh_db(t, "series")
+	if store == nil do return
+	defer cleanup_db(store, "series")
+	testing.expect_value(t, scalar(t, store, "SELECT group_concat(value, ',') FROM generate_series(1, 10, 3)").s, "1,4,7,10")
+	testing.expect_value(t, scalar(t, store, "SELECT group_concat(value, ',') FROM generate_series(1, 10, -3)").s, "10,7,4,1")
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM generate_series WHERE start = 2 AND stop = 4").i, i64(3))
+	testing.expect_value(t, scalar(t, store, "SELECT sum(g.value) FROM (SELECT 3 AS n) AS t, generate_series(1, t.n) AS g").i, i64(6))
+	testing.expect_value(t, len(run(t, store, "SELECT * FROM generate_series(1, 2)").columns), 1)
+	_ = run_error(t, store, "SELECT count(*) FROM generate_series")
+}

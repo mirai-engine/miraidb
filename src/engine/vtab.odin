@@ -128,16 +128,22 @@ store_vtab_close :: proc(store: ^Store) {
 	}
 	delete(store.vtab_modules)
 	store.vtab_modules = nil
+	// What is left belongs to the engine's own modules.
+	for vtab in store.vtabs do vtab_free(vtab)
 	delete(store.vtabs)
 	store.vtabs = nil
 }
 
 @(private)
 vtab_module :: proc(store: ^Store, name: string) -> (Vtab_Module, string, bool) {
-	if store == nil || store.vtab_modules == nil do return {}, "", false
-	for key, module in store.vtab_modules {
-		if strings.equal_fold(key, name) do return module, key, true
+	if store == nil do return {}, "", false
+	if store.vtab_modules != nil {
+		for key, module in store.vtab_modules {
+			if strings.equal_fold(key, name) do return module, key, true
+		}
 	}
+	// The engine's own modules, unless a program registered one by that name.
+	if strings.equal_fold(name, SERIES_MODULE) do return series_module(), SERIES_MODULE, true
 	return {}, "", false
 }
 
@@ -166,7 +172,10 @@ vtab_catalog_entry :: proc(tx: ^Tx, name: string) -> (module: string, args: []st
 // a statement names it.
 vtab_find :: proc(tx: ^Tx, name: string) -> (^Vtab, bool, Error) {
 	store := tx.store
-	if store == nil || store.vtab_modules == nil || len(store.vtab_modules) == 0 do return nil, false, ERROR_NONE
+	if store == nil do return nil, false, ERROR_NONE
+	if (store.vtab_modules == nil || len(store.vtab_modules) == 0) && !strings.equal_fold(name, SERIES_MODULE) && len(store.vtabs) == 0 {
+		return nil, false, ERROR_NONE
+	}
 	for vtab in store.vtabs {
 		if strings.equal_fold(vtab.name, name) do return vtab, true, ERROR_NONE
 	}
@@ -653,4 +662,75 @@ vtab_overload :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Scalar_Function, rawp
 		return module.find_function(module.ctx, vtab.handle, call.name, len(call.args))
 	}
 	return nil, nil, false
+}
+
+// --- generate_series --------------------------------------------------------
+//
+// SQLite's series extension as an eponymous table: generate_series(START,
+// STOP, STEP) gives the integers from START up to STOP by STEP. STOP defaults
+// to 4294967295 and STEP to 1 (a STEP of 0 is 1); a negative STEP gives the
+// same values in reverse; START is required. The arguments are HIDDEN columns,
+// so WHERE start = ... works too. The row id is the value.
+
+SERIES_MODULE :: "generate_series"
+
+@(private)
+series_module :: proc() -> Vtab_Module {
+	return Vtab_Module {
+		eponymous      = true,
+		eponymous_only = true,
+		connect        = series_connect,
+		scan           = series_scan,
+	}
+}
+
+@(private)
+series_connect :: proc(ctx: rawptr, create: bool, table: string, args: []string) -> (rawptr, string, Error) {
+	return nil, strings.clone("CREATE TABLE x(value, start HIDDEN, stop HIDDEN, step HIDDEN)"), ERROR_NONE
+}
+
+@(private)
+series_scan :: proc(
+	ctx: rawptr,
+	handle: rawptr,
+	constraints: []Vtab_Constraint,
+	values: []Value,
+	order: []Vtab_Order,
+	columns: int,
+	rows: ^[dynamic]Vtab_Row,
+) -> Error {
+	start, stop, step: i64 = 0, 4294967295, 1
+	has_start := false
+	for constraint, i in constraints {
+		if constraint.op != VTAB_OP_EQ || constraint.column < 1 || constraint.column > 3 do continue
+		number, ok := value_to_i64(values[i])
+		if !ok do continue
+		switch constraint.column {
+		case 1:
+			start = number
+			has_start = true
+		case 2:
+			stop = number
+		case 3:
+			step = number
+		}
+	}
+	if !has_start do return errf(.Invalid_Argument, "first argument to \"generate_series()\" missing or unusable")
+	descending := step < 0
+	if step < 0 do step = -step
+	if step == 0 do step = 1
+	if start > stop do return ERROR_NONE
+	count := (stop - start) / step + 1
+	if count > 10_000_000 do return errf(.Quota_Exceeded, "generate_series would produce %d rows", count)
+	for k in 0 ..< count {
+		index := descending ? count - 1 - k : k
+		value := start + index * step
+		row := Vtab_Row{rowid = value, values = make([]Value, columns, rows.allocator)}
+		row.values[0] = value_int(value)
+		row.values[1] = value_int(start)
+		row.values[2] = value_int(stop)
+		row.values[3] = value_int(descending ? -step : step)
+		append(rows, row)
+	}
+	return ERROR_NONE
 }
