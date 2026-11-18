@@ -249,6 +249,9 @@ QUERIES = [
     "SELECT json_object('k', json_group_array(n)) FROM nums WHERE n IS NOT NULL",
     "SELECT json_array(coalesce(json('[1]'), 0)), json_array((SELECT json('[1]')))",
     "SELECT json_array(x) FROM (SELECT json('[1]') AS x)",
+    # HAVING may name an alias of the select list.
+    "SELECT dept, count(*) AS c FROM emp GROUP BY dept HAVING c > 1 ORDER BY dept",
+    "SELECT t, sum(n) AS s FROM nums WHERE t IS NOT NULL GROUP BY t HAVING s > 1 AND t > 'a' ORDER BY t",
     # FILTER, an aggregate's ORDER BY and the WINDOW clause (S4).
     "SELECT t, sum(sum(n)) FILTER (WHERE t > 'a') OVER (ORDER BY t) FROM nums WHERE t IS NOT NULL GROUP BY t ORDER BY t",
     "SELECT t, count(*) FILTER (WHERE count(*) > 1) OVER (), max(sum(n)) FILTER (WHERE sum(n) < 5) OVER (ORDER BY t ROWS 1 PRECEDING) FROM nums WHERE t IS NOT NULL GROUP BY t ORDER BY t",

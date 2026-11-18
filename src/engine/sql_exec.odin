@@ -1446,6 +1446,9 @@ Outer_Frame :: struct {
 }
 
 Eval_Ctx :: struct {
+	// having_aliases are the projections a HAVING may name by their alias,
+	// as SQLite allows: a name no source has is looked up there.
+	having_aliases: []Select_Item,
 	// order_err is the first error an ORDER BY expression raised while the sort
 	// keys were built; the statement returns it instead of sorting.
 	order_err: Error,
@@ -4120,7 +4123,9 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 				values[i] = value_clone(value, context.allocator)
 			}
 			if stmt.having != nil {
+				ctx.having_aliases = stmt.projections
 				having, having_err := eval_expr(&ctx, stmt.having)
+				ctx.having_aliases = nil
 				if having_err.kind != .None {
 					free_values(values)
 					window_cells_destroy(cells)
@@ -4946,6 +4951,18 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 			if reachable == 1 do return rowid, ERROR_NONE
 			if reachable > 1 {
 				return {}, errf(.Column_Not_Found, "column %s is ambiguous; qualify it with a table", e.name)
+			}
+		}
+		if !found && len(e.table) == 0 && ctx.having_aliases != nil {
+			for item in ctx.having_aliases {
+				if len(item.alias) == 0 || !strings.equal_fold(item.alias, e.name) do continue
+				// The projection is evaluated in the group, without the aliases,
+				// so an alias cannot stand for itself.
+				saved := ctx.having_aliases
+				ctx.having_aliases = nil
+				value, err := eval_expr(ctx, item.expr)
+				ctx.having_aliases = saved
+				return value, err
 			}
 		}
 		if !found {

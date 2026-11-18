@@ -224,6 +224,20 @@ test_sum_overflow :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_having_alias :: proc(t: ^testing.T) {
+	// HAVING may name an alias of the select list, as SQLite allows; a column
+	// of a source with the same name wins over the alias.
+	store := fresh_db(t, "having_alias")
+	if store == nil do return
+	defer cleanup_db(store, "having_alias")
+	run(t, store, "CREATE TABLE g (k INTEGER, n INTEGER)")
+	run(t, store, "INSERT INTO g VALUES (1, 1), (1, 2), (2, 5), (3, 1)")
+	testing.expect_value(t, scalar(t, store, "SELECT group_concat(k, ',') FROM (SELECT k, count(*) AS c FROM g GROUP BY k HAVING c > 1 ORDER BY k)").s, "1")
+	testing.expect_value(t, scalar(t, store, "SELECT group_concat(k, ',') FROM (SELECT k, sum(n) AS s FROM g GROUP BY k HAVING s > 2 AND k < 3 ORDER BY k)").s, "1,2")
+	testing.expect_value(t, scalar(t, store, "SELECT group_concat(k, ',') FROM (SELECT k, sum(n) AS n FROM g GROUP BY k HAVING n > 2 ORDER BY k)").s, "2")
+}
+
+@(test)
 test_window_clause :: proc(t: ^testing.T) {
 	// The WINDOW clause (S4): `OVER name` takes a definition whole, `OVER (name
 	// ...)` adds an ORDER BY or a frame to it, a definition may build on an
