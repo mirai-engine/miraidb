@@ -41,7 +41,6 @@ that way.
 |---|---|---|---|---|
 | 11 | **S4 — aggregates and windows** | `FILTER`, the `WINDOW` clause, `ORDER BY` inside an aggregate, `median` and the percentiles, `json_group_array`/`_object`. | M | — |
 | 12 | **S5 — functions** | 39 missing: hyperbolic math, `timediff`, `soundex`, `unistr`, planner hints, introspection, the rest of JSON and the `jsonb_*` family. | M | — |
-| 13 | **S6 — statements and pragmas** | `EXPLAIN QUERY PLAN`, `REINDEX`, `INSTEAD OF` triggers, `INDEXED BY`, `generate_series`, `VACUUM`/`ATTACH` in memory, 9 pragmas. | M | — |
 | 15 | **D4 — secondary indexes in the mirror** | A table with a secondary index re-encodes the `.sqlite` file per commit. | L | — |
 | 16 | **D36 — partial and expression indexes in plans** | The planner skips them; match a predicate to a partial index's WHERE and an expression to its index. | M | 8 |
 | 17 | **D24 — the mirror's last gaps** | A counted skip for an index the engine cannot express, and a mirror fuzz pass. | S | 8 |
@@ -76,7 +75,7 @@ with peer-to-peer sync; its networked phases build on items 27 and 28.
    enforced today but never read.
 3. **D23**: the remaining way the process can die instead of answering; **D34**
    still owes the sanitized suite in CI.
-4. **S4 to S6**, then **R3/R4**: the rest of the visible surface and the smaller
+4. **S4 and S5**, then **R3/R4**: the rest of the visible surface and the smaller
    speed items.
 5. **D4/D24** and the depth items of track C.
 6. **D15, D14** and the release gates, in that order.

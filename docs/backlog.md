@@ -35,7 +35,6 @@ Rules for this file:
 | R4 | a committed row is copied from the transaction arena to the table | hand the staged row over | M |
 | S4 | `FILTER`, named `WINDOW` and aggregate `ORDER BY` missing; the ordered-set aggregates and `json_group_*` landed | the rest of the aggregate surface | S |
 | S5 | 15 of 121 built-in functions missing | the `jsonb_*` family, `json_parse`, `json_array_insert`, `sqlite_offset` | M |
-| S6 | six statements missing; all 63 pragmas answer | `INSTEAD OF`, `generate_series`, `ATTACH ':memory:'`, `VACUUM` in memory | S |
 | D2 | overlap on an `rtree` table is a scan | node pages and a descent | M |
 | D3 | versions stay until `store_prune_versions` is called | automatic retention, `AS OF` on a join | M |
 | D4 | a table with a secondary index re-encodes the `.sqlite` mirror | patch the index b-trees | L |
@@ -152,24 +151,6 @@ JSON mutators and the ordered-set aggregates all landed.
 
 **Done when.** `sqlite_gaps.py` lists none of them, and each family has
 differential queries.
-
-## S6 — Statements and pragmas
-
-**Missing statements.** `INSTEAD OF` triggers on a view, the `generate_series`
-table function, `VACUUM` and `ATTACH ':memory:'` on an in-memory database (SQLite
-accepts both; here the first is refused as "nothing to compact" and the second as
-a missing file).
-
-**Done since.** `EXPLAIN QUERY PLAN` (SQLite's four columns and its words),
-`REINDEX` (every index is rebuilt from the log at open, so it answers ok and
-checks the name) and the `INDEXED BY` / `NOT INDEXED` hints.
-
-**Pragmas.** All 63 answer: the nine that were unknown (`collation_list`,
-`module_list`, `temp_store`, `incremental_vacuum`, `shrink_memory`,
-`soft_heap_limit64`, `temp_store_directory`, `data_store_directory`,
-`legacy_file_format`) report what they mean here.
-
-**Done when.** `sqlite_gaps.py` lists none of the remaining statements.
 
 ---
 

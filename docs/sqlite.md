@@ -48,7 +48,7 @@ script lists.
 | UPSERT (ON CONFLICT DO UPDATE) | done | `DO NOTHING`, `DO UPDATE`, `excluded.*`, with `RETURNING` |
 | WITH (common table expressions) | done | recursive included; in front of an `INSERT`, `UPDATE` or `DELETE` and inside an `INSERT`'s `SELECT` too |
 | ATTACH/DETACH | done | attaches engine directories, and reads a `.sqlite` file |
-| VACUUM / ANALYZE / REINDEX | partial | `compact` is the engine's VACUUM, `VACUUM INTO` writes a copy, `ANALYZE` measures statistics; `REINDEX` does not exist |
+| VACUUM / ANALYZE / REINDEX | done | `compact` is the engine's VACUUM (on an in-memory database there is nothing to compact and it answers ok), `VACUUM INTO` writes a copy, `ANALYZE` measures statistics; `REINDEX` checks the name and answers ok, since every index is rebuilt from the log when the database opens |
 | PRAGMA | partial | four classes below: 25 answer, 18 are accepted as no-ops, 11 are refused |
 | EXPLAIN / EXPLAIN QUERY PLAN | partial | `EXPLAIN` prints the chosen access path, the estimate and the join order; there is no `EXPLAIN QUERY PLAN` row format |
 | Opening in memory | done | `:memory:`, the empty path, `file::memory:` (with or without `?cache=shared`) and `file:<name>?mode=memory` open a private database in the process: the tables live in memory, no directory is made, and every open is a fresh one (`test_open_in_memory_the_way_sqlite_does`; `scripts/capi_smoke.py` and `scripts/sqlite_abi_smoke.py` open each spelling through the DLL) |

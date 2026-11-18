@@ -31,7 +31,6 @@ The detail of each item is in [backlog.md](backlog.md); the order is in
 |---|---|
 | **S4** — aggregates and windows | `FILTER`, the `WINDOW` clause, `ORDER BY` inside an aggregate, `median`, `percentile`, `percentile_cont`, `percentile_disc`, `json_group_array`, `json_group_object` |
 | **S5** — functions | `acosh`, `asinh`, `atanh`, `cosh`, `sinh`, `tanh`, `soundex`, `unistr`, `unistr_quote`, `affinity`, `timediff`, `sqlite_source_id`, `sqlite_compileoption_get`, `sqlite_compileoption_used`, `sqlite_offset`, `json_insert`, `json_patch`, `json_pretty`, `json_parse`, `json_error_position`, `json_array_insert`, and 13 `jsonb_*` functions |
-| **S6** — statements and pragmas | `EXPLAIN QUERY PLAN`, `REINDEX`, `INSTEAD OF` triggers, `INDEXED BY`/`NOT INDEXED`, `generate_series`, `VACUUM` and `ATTACH ':memory:'` in memory; pragmas `collation_list`, `module_list`, `temp_store`, `incremental_vacuum`, `shrink_memory`, `soft_heap_limit64`, `temp_store_directory`, `data_store_directory`, `legacy_file_format` |
 | **D4**, **D24** — the `.sqlite` mirror | secondary index b-trees patched in place; a reported skip for an index the engine cannot express |
 | **D36** — the planner and partial or expression indexes | a query never reads one; it answers from the rows |
 
