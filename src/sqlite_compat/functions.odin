@@ -34,6 +34,10 @@ Function :: struct {
 	step:    Function_Callback,
 	final:   Final_Callback,
 	destroy: Destroy_Callback,
+	// value and inverse are a window function's xValue and xInverse: a frame
+	// answers with xValue (library.odin).
+	value:   Final_Callback,
+	inverse: Function_Callback,
 }
 
 // Context is what sqlite3_context points at for one call: the function, the
@@ -414,16 +418,65 @@ facade_step :: proc(group: ^engine.Aggregate_Group, args: []engine.Value) -> eng
 	call_callback(&ctx, ctx.function.step, args)
 	engine.value_deep_free(ctx.result, context.allocator)
 	if ctx.has_error {
+		group.failed = true
 		_, err := context_answer(&ctx)
 		return err
 	}
 	return engine.ERROR_NONE
 }
 
+// facade_inverse is xInverse: a row leaves the window frame.
+@(private)
+facade_inverse :: proc(group: ^engine.Aggregate_Group, args: []engine.Value) -> engine.Error {
+	ctx := Context{function = (^Function)(group.user), group = group}
+	defer context_release(&ctx)
+	call_callback(&ctx, ctx.function.inverse, args)
+	engine.value_deep_free(ctx.result, context.allocator)
+	if ctx.has_error {
+		group.failed = true
+		_, err := context_answer(&ctx)
+		return err
+	}
+	return engine.ERROR_NONE
+}
+
+// facade_value is xValue: the frame's answer, the context going on.
+@(private)
+facade_value :: proc(group: ^engine.Aggregate_Group) -> (engine.Value, engine.Error) {
+	ctx := Context{function = (^Function)(group.user), group = group}
+	defer context_release(&ctx)
+	ctx.function.value(rawptr(&ctx))
+	answer, err := context_answer(&ctx)
+	if err.kind != .None do group.failed = true
+	return answer, err
+}
+
 @(private)
 facade_final :: proc(group: ^engine.Aggregate_Group) -> (engine.Value, engine.Error) {
 	ctx := Context{function = (^Function)(group.user), group = group}
 	defer context_release(&ctx)
+	// A window frame answers with xValue, then the context ends with xFinal,
+	// whose answer is not the frame's.
+	// A step that failed leaves no value to ask for: SQLite only calls xFinal,
+	// to free the context.
+	if ctx.function.value != nil && engine.window_frame_running() && !group.failed {
+		ctx.function.value(rawptr(&ctx))
+		answer, answer_err := context_answer(&ctx)
+		ctx.result = {}
+		ctx.has_error = false
+		ctx.error_code = 0
+		delete(ctx.error_message)
+		ctx.error_message = ""
+		ctx.function.final(rawptr(&ctx))
+		engine.value_deep_free(ctx.result, context.allocator)
+		if group.state != nil {
+			memory := (^Aggregate_Memory)(group.state)
+			free(memory.block)
+			free(memory)
+			group.state = nil
+		}
+		return answer, answer_err
+	}
 	ctx.function.final(rawptr(&ctx))
 	// The group's memory goes with its final, as SQLite frees it after xFinal.
 	if group.state != nil {
@@ -431,6 +484,13 @@ facade_final :: proc(group: ^engine.Aggregate_Group) -> (engine.Value, engine.Er
 		free(memory.block)
 		free(memory)
 		group.state = nil
+	}
+	// After a failure the final only frees, and over a window its answer is
+	// not the statement's: SQLite reports neither its value nor its error, so
+	// the failure's own code stays the one sqlite3_step answers.
+	if group.failed || group.window {
+		engine.value_deep_free(ctx.result, context.allocator)
+		return {}, engine.ERROR_NONE
 	}
 	return context_answer(&ctx)
 }

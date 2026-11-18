@@ -2161,11 +2161,17 @@ window_fill :: proc(
 		is_distinct = window.is_distinct,
 		filter      = window.filter,
 	}
+	// A program's window function is fed incrementally, as SQLite feeds it.
+	if def, is_host := store_aggregate(ctx.tx.store, window.name, len(window.args)); is_host && def.value != nil && def.inverse != nil && window.filter == nil && !window.is_distinct {
+		return window_host_frames(ctx, window, def, cells, indexes, cell_index, sources, order_keys, order_numbers, running, rows, position)
+	}
 	if window.frame.has {
 		for j in 0 ..< len(indexes) {
 			lo, hi, frame_err := window_frame_bounds(window.frame, j, len(indexes), ctx.params, order_keys, order_numbers)
 			if frame_err.kind != .None do return frame_err
+			window_frames += 1
 			value, agg_err := window_aggregate_frame(ctx, window, call, cells, indexes, lo, hi, cell_index, sources)
+			window_frames -= 1
 			if agg_err.kind != .None do return agg_err
 			assign(rows, indexes[j], position, value)
 		}
@@ -2176,12 +2182,111 @@ window_fill :: proc(
 		end := running ? peer_end(order_keys, j) : len(indexes) - 1
 		// The frame of a running window is the partition up to the last peer of this
 		// row, not the row alone: `sum(n) OVER (ORDER BY k)` is cumulative.
+		window_frames += 1
 		value, agg_err := window_aggregate_frame(ctx, window, call, cells, indexes, 0, end, cell_index, sources)
+		window_frames -= 1
 		if agg_err.kind != .None do return agg_err
 		for f in j ..= end do assign(rows, indexes[f], position, value)
 		j = end + 1
 	}
 	return ERROR_NONE
+}
+
+// window_host_frames feeds a program's window function as SQLite does: one
+// group for the partition, xStep for each row that enters the frame, xInverse
+// for each row that leaves it, xValue for each row's answer, and xFinal once
+// at the end, also after an error, so the program can free its state.
+@(private)
+window_host_frames :: proc(
+	ctx: ^Eval_Ctx,
+	window: Window_Expr,
+	def: Aggregate_Function_Def,
+	cells: [][dynamic]Window_Cell,
+	indexes: []int,
+	cell_index: int,
+	sources: [][]Source,
+	order_keys: []string,
+	order_numbers: []f64,
+	running: bool,
+	rows: []Output_Row,
+	position: int,
+) -> Error {
+	group := Aggregate_Group{user = def.user, window = true}
+	args := make([]Value, len(window.args))
+	defer delete(args)
+	// row_args reads the arguments of the partition's row f.
+	row_args :: proc(ctx: ^Eval_Ctx, window: Window_Expr, cells: [][dynamic]Window_Cell, indexes: []int, cell_index: int, sources: [][]Source, f: int, args: []Value) -> Error {
+		if len(sources) != 0 {
+			sub := ctx^
+			sub.sources = sources[indexes[f]]
+			for arg, i in window.args {
+				value, err := eval_expr(&sub, arg)
+				if err.kind != .None do return err
+				args[i] = value
+			}
+			return ERROR_NONE
+		}
+		captured := cells[indexes[f]][cell_index].args
+		for i in 0 ..< len(args) do args[i] = i < len(captured) ? captured[i] : value_null()
+		return ERROR_NONE
+	}
+	failure: Error
+	// The rows [first, last] are in the group.
+	first, last := 0, -1
+	rows_loop: for j in 0 ..< len(indexes) {
+		lo, hi: int
+		switch {
+		case window.frame.has:
+			frame_err: Error
+			lo, hi, frame_err = window_frame_bounds(window.frame, j, len(indexes), ctx.params, order_keys, order_numbers)
+			if frame_err.kind != .None {
+				failure = frame_err
+				break rows_loop
+			}
+		case running:
+			lo, hi = 0, j
+			for hi + 1 < len(order_keys) && order_keys[hi + 1] == order_keys[j] do hi += 1
+		case:
+			lo, hi = 0, len(indexes) - 1
+		}
+		if first > last do first = max(lo, last + 1)
+		for f in max(last + 1, lo) ..= hi {
+			if err := row_args(ctx, window, cells, indexes, cell_index, sources, f, args); err.kind != .None {
+				failure = err
+				break rows_loop
+			}
+			if err := def.step(&group, args); err.kind != .None {
+				failure = err
+				break rows_loop
+			}
+			last = f
+		}
+		for f in first ..= min(last, lo - 1) {
+			if err := row_args(ctx, window, cells, indexes, cell_index, sources, f, args); err.kind != .None {
+				failure = err
+				break rows_loop
+			}
+			if err := def.inverse(&group, args); err.kind != .None {
+				failure = err
+				break rows_loop
+			}
+			first = f + 1
+		}
+		answer, value_err := def.value(&group)
+		if value_err.kind != .None {
+			failure = value_err
+			break rows_loop
+		}
+		assign_value := value_clone(answer, context.allocator)
+		value_deep_free(answer, context.allocator)
+		rows[indexes[j]].values[position] = assign_value
+	}
+	if failure.kind != .None do group.failed = true
+	// SQLite drops the final's answer and its error over a window.
+	closing, final_err := def.final(&group)
+	value_deep_free(closing, context.allocator)
+	error_free(&final_err)
+	return failure
 }
 
 // window_frame_reads_values reports whether a frame is measured in the ORDER BY
@@ -2425,6 +2530,17 @@ window_frame_bounds :: proc(
 // window_aggregate_over evaluates an aggregate over positions [lo, hi] of the
 // partition. An empty range is an empty group, not an error.
 @(private)
+// window_frames counts the window frames being aggregated on this thread: a
+// program's window function answers a frame with its xValue
+// (sqlite3_create_window_function).
+@(thread_local)
+window_frames: int
+
+// window_frame_running reports an aggregate computed for a window frame.
+window_frame_running :: proc() -> bool {
+	return window_frames > 0
+}
+
 window_aggregate_over :: proc(
 	ctx: ^Eval_Ctx,
 	call: Call_Expr,

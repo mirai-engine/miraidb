@@ -91,6 +91,11 @@ expr_nondeterministic :: proc(store: ^Store, expr: ^Expr) -> (string, bool) {
 Aggregate_Group :: struct {
 	state: rawptr,
 	user:  rawptr,
+	// failed says a step reported an error: the final then only frees.
+	failed: bool,
+	// window says the group feeds a window function, whose final only ends
+	// the context (window_host_frames).
+	window: bool,
 }
 
 // Aggregate_Step sees one row's arguments. Aggregate_Final answers for the group,
@@ -104,6 +109,23 @@ Aggregate_Function_Def :: struct {
 	final: Aggregate_Final,
 	arity: int,
 	user:  rawptr,
+	// value and inverse make the aggregate a window function SQLite's way:
+	// one group per partition, stepped as rows enter its frame, inverted as
+	// they leave, asked its value for each row (window_host_frames).
+	value:   Aggregate_Final,
+	inverse: Aggregate_Step,
+}
+
+// store_set_aggregate_window gives a registered aggregate its window
+// callbacks.
+store_set_aggregate_window :: proc(store: ^Store, name: string, arity: int, value: Aggregate_Final, inverse: Aggregate_Step) {
+	key := function_key(name, arity)
+	defer delete(key)
+	if def, found := store.aggregates[key]; found {
+		def.value = value
+		def.inverse = inverse
+		store.aggregates[key] = def
+	}
 }
 
 // function_key is the registry key of a name and an arity: the name folded to
