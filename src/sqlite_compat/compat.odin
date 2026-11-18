@@ -1455,7 +1455,8 @@ column_origin :: proc(stmt: ^Statement, index: c.int) -> ^Column_Origin_C {
 				database = strings.clone_to_cstring(origin.database),
 				table    = strings.clone_to_cstring(origin.table),
 				column   = strings.clone_to_cstring(origin.column),
-				decltype = strings.clone_to_cstring(origin.decltype),
+				// A column declared without a type has none: NULL, as in SQLite.
+				decltype = len(origin.decltype) > 0 ? strings.clone_to_cstring(origin.decltype) : nil,
 			}
 		}
 	}

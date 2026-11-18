@@ -82,11 +82,19 @@ sql_describe_origins :: proc(tx: ^Tx, statement: Statement, alloc := context.all
 		source, index, found := describe_column_source(sources[:], column)
 		if !found do continue
 		declared := source.table.schema.columns[index]
+		// The type as the column was declared, as SQLite answers it ("" for a
+		// column declared without one); the engine's name when the table has
+		// no text to read it from.
+		decltype := sqlite_type_name(declared.type)
+		if types, has_text := tx_table_declared_types(tx, source.table.schema.name, false, context.temp_allocator); has_text {
+			decltype = types[strings.to_lower(declared.name, context.temp_allocator)] or_else ""
+			decltype = strings.clone(decltype, context.temp_allocator)
+		}
 		origins[i] = Column_Origin {
 			database = "main",
 			table    = source.table.schema.name,
 			column   = declared.name,
-			decltype = sqlite_type_name(declared.type),
+			decltype = decltype,
 		}
 	}
 	return origins, true

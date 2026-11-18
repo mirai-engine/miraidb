@@ -98,6 +98,20 @@ sql_texts_from_rows :: proc(rows: []Row, alloc: mem.Allocator) -> map[string]str
 	return out
 }
 
+// tx_table_declared_types reads a table's declared types from the text it
+// was created with, or from the file it was imported from; found is false
+// when there is neither.
+tx_table_declared_types :: proc(tx: ^Tx, table: string, normalize: bool, alloc: mem.Allocator) -> (map[string]string, bool) {
+	text, has_text := sql_text_of(tx, table)
+	if !has_text {
+		if kept, imported := store_mirror_kept_lookup(tx.store, table); imported && kept.kind == "table" {
+			text, has_text = kept.sql, true
+		}
+	}
+	if !has_text do return nil, false
+	return sql_text_declared_types(text, alloc, normalize), true
+}
+
 // tx_sql_texts is every stored text as the transaction sees it.
 tx_sql_texts :: proc(tx: ^Tx, alloc: mem.Allocator) -> map[string]string {
 	if tx_table_probe(tx, SQL_TEXT_TABLE) == nil do return nil
@@ -350,13 +364,16 @@ sql_text_on_alter :: proc(tx: ^Tx, stmt: Alter_Table_Stmt, indexes: []string) ->
 
 // sql_text_declared_types reads each column's declared type from a CREATE
 // TABLE text, as pragma table_info answers it: as written, except SQLite's
-// own type names, which it spells in capitals.
-sql_text_declared_types :: proc(text: string, alloc: mem.Allocator) -> map[string]string {
+// own type names, which it spells in capitals (sqlite3_column_decltype keeps
+// even those as written: `normalize` false).
+sql_text_declared_types :: proc(text: string, alloc: mem.Allocator, normalize := true) -> map[string]string {
 	out := make(map[string]string, 8, alloc)
 	for column in sqlite_columns_from_sql(text, context.temp_allocator) {
 		declared := column.declared
-		for standard in ([]string{"ANY", "BLOB", "INT", "INTEGER", "REAL", "TEXT"}) {
-			if strings.equal_fold(declared, standard) do declared = standard
+		if normalize {
+			for standard in ([]string{"ANY", "BLOB", "INT", "INTEGER", "REAL", "TEXT"}) {
+				if strings.equal_fold(declared, standard) do declared = standard
+			}
 		}
 		out[strings.to_lower(column.name, alloc)] = strings.clone(declared, alloc)
 	}
