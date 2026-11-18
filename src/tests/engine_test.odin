@@ -6744,9 +6744,9 @@ test_vfs_memory_and_quota :: proc(t: ^testing.T) {
 
 @(test)
 test_prepared_statement_reuse :: proc(t: ^testing.T) {
-	store, host := fresh_host(t, "prepared")
+	store, host := fresh_host(t, "prepared_host")
 	if store == nil do return
-	defer destroy_host(store, host, "prepared")
+	defer destroy_host(store, host, "prepared_host")
 	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
 
 	insert, prepare_err := db.sql_prepare(store, "INSERT INTO t (name) VALUES (?)")
