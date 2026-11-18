@@ -143,7 +143,7 @@ sql_exec_pragma :: proc(store: ^Store, body: string, locked: bool, tx: ^Tx = nil
 	lowered_owned := raw_data(lowered_name) != raw_data(trimmed_name)
 	defer if lowered_owned do delete(lowered_name)
 	name = lowered_name
-	argument = strings.trim(argument, " \t\r\n\"'")
+	argument = pragma_unquote(argument)
 	// These two are stored data, written and read through a transaction, so
 	// they are taken before the catalog lock the others read under.
 	if name == "user_version" || name == "application_id" {
@@ -155,7 +155,7 @@ sql_exec_pragma :: proc(store: ^Store, body: string, locked: bool, tx: ^Tx = nil
 	}
 	switch name {
 	case "table_info", "table_xinfo":
-		table, found := store.tables[argument]
+		table, found := pragma_table(store, tx, argument)
 		if !found {
 			return pragma_result([]string{"cid", "name", "type", "notnull", "dflt_value", "pk"}, nil, store.commit_seq), ERROR_NONE
 		}
@@ -197,7 +197,7 @@ sql_exec_pragma :: proc(store: ^Store, body: string, locked: bool, tx: ^Tx = nil
 		}
 		return result, ERROR_NONE
 	case "index_list":
-		table, found := store.tables[argument]
+		table, found := pragma_table(store, tx, argument)
 		if !found {
 			return pragma_result([]string{"seq", "name", "unique", "origin", "partial"}, nil, store.commit_seq), ERROR_NONE
 		}
@@ -237,7 +237,7 @@ sql_exec_pragma :: proc(store: ^Store, body: string, locked: bool, tx: ^Tx = nil
 		}
 		return pragma_result([]string{"seqno", "cid", "name"}, nil, store.commit_seq), ERROR_NONE
 	case "foreign_key_list":
-		table, found := store.tables[argument]
+		table, found := pragma_table(store, tx, argument)
 		if !found {
 			return pragma_result([]string{"id", "seq", "table", "from", "to", "on_update", "on_delete"}, nil, store.commit_seq), ERROR_NONE
 		}
@@ -792,4 +792,45 @@ pragma_arg_term :: proc(tx: ^Tx, name, column: string) -> (Value, bool) {
 		}
 	}
 	return {}, false
+}
+
+// pragma_unquote reads a pragma's argument: a quoted name ("a""b", 'x',
+// [y], `z`) is the name it spells, as SQLite reads it.
+@(private)
+pragma_unquote :: proc(text: string) -> string {
+	trimmed := strings.trim_space(text)
+	if len(trimmed) >= 2 {
+		first, last := trimmed[0], trimmed[len(trimmed) - 1]
+		quoted := (first == '"' && last == '"') || (first == '\'' && last == '\'') || (first == '`' && last == '`') || (first == '[' && last == ']')
+		if quoted {
+			inner := trimmed[1:len(trimmed) - 1]
+			if first == '[' do return inner
+			doubled := first == '"' ? "\"\"" : first == '\'' ? "''" : "``"
+			single := doubled[:1]
+			unescaped, _ := strings.replace_all(inner, doubled, single, context.temp_allocator)
+			return unescaped
+		}
+	}
+	return strings.trim(trimmed, "\"'")
+}
+
+// pragma_table is a table as the pragma's transaction sees it, so a table the
+// connection created and has not committed is there, as in SQLite.
+@(private)
+pragma_table :: proc(store: ^Store, tx: ^Tx, name: string) -> (^Table, bool) {
+	if tx != nil {
+		table := tx_table_probe(tx, name)
+		if table == nil && store.sqlite_rules {
+			// SQLite matches a table's name without regard to case.
+			for candidate in tx_table_names(tx, context.temp_allocator) {
+				if strings.equal_fold(candidate, name) do return tx_table_probe(tx, candidate), true
+			}
+		}
+		return table, table != nil
+	}
+	table, found := store.tables[name]
+	if !found && store.sqlite_rules {
+		for candidate, held in store.tables do if strings.equal_fold(candidate, name) do return held, true
+	}
+	return table, found
 }
