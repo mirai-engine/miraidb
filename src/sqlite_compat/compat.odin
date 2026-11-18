@@ -854,6 +854,11 @@ prepare :: proc(handle: rawptr, sql: cstring, nByte: c.int, ppStmt: ^rawptr, pzT
 		}
 		return fail_connection(db)
 	}
+	// A statement numbers its parameters up to the connection's limit.
+	if c.int(engine.Embed_Parameter_Count(statement)) > connection_limit(db, SQLITE_LIMIT_VARIABLE_NUMBER) {
+		engine.embed_finalize(statement)
+		return set_error_code(db, SQLITE_ERROR, "too many SQL variables")
+	}
 	stmt := new(Statement)
 	stmt.db = db
 	stmt.stmt = statement
