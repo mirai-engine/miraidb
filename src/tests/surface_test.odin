@@ -88,3 +88,17 @@ test_natural_joins :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM a NATURAL LEFT JOIN b").i, i64(3))
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM a NATURAL JOIN c").i, i64(6))
 }
+
+@(test)
+test_memory_attach_and_vacuum :: proc(t: ^testing.T) {
+	// ATTACH ':memory:' adds an empty database in memory and DETACH closes it;
+	// VACUUM of a database in memory does nothing, as in SQLite (S6).
+	conn, open_err := db.embed_open(":memory:")
+	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
+	defer db.embed_close(conn)
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "ATTACH ':memory:' AS aux")))
+	testing.expect(t, !db.error_drop(db.embed_exec(conn, "ATTACH ':memory:' AS aux")))
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "DETACH aux")))
+	testing.expect(t, !db.error_drop(db.embed_exec(conn, "DETACH aux")))
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "VACUUM")))
+}

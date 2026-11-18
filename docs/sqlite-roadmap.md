@@ -9,7 +9,7 @@ says how much of the surface runs and what is left.
 
 `python scripts/sqlite_gaps.py` runs every built-in function and pragma of the
 inventory, and 63 grammar shapes, through the CLI on an in-memory database.
-Measured today: functions **106 / 121**, pragmas **63 / 63**, grammar **56 / 63**.
+Measured today: functions **106 / 121**, pragmas **63 / 63**, grammar **58 / 63**.
 
 The function count leaves out ten names SQLite builds only for its own tests
 (`expr_compare`, `fpdecode`, `oom`, …). A function or pragma counts as present

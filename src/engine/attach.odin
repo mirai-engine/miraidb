@@ -153,6 +153,19 @@ sql_exec_attach :: proc(store: ^Store, stmt: Attach_Stmt) -> (Sql_Result, Error)
 		return {}, errf(.Sql_Syntax, "ATTACH needs a database name: ATTACH 'path' AS name")
 	}
 	if len(stmt.path) == 0 do return {}, errf(.Sql_Syntax, "ATTACH needs a database path")
+	// ':memory:' (or an empty path) attaches a new, empty database in memory, as
+	// in SQLite; it is not recorded, since there is nothing to open again.
+	if store_path_is_memory(stmt.path) {
+		if _, exists := store.attached[stmt.name]; exists {
+			return {}, errf(.Invalid_Argument, "database %s is already in use", stmt.name)
+		}
+		memory, open_err := store_open("", {persistent = false})
+		if open_err.kind != .None do return {}, open_err
+		sync.lock(&store.mutex)
+		store.attached[strings.clone(stmt.name, context.allocator)] = memory
+		sync.unlock(&store.mutex)
+		return Sql_Result{kind = .Ack, commit_seq = store.commit_seq}, ERROR_NONE
+	}
 	if !os.exists(stmt.path) {
 		return {}, errf(.Io, "cannot attach %s: it does not exist", stmt.path)
 	}
@@ -187,6 +200,11 @@ sql_exec_detach :: proc(store: ^Store, stmt: Detach_Stmt) -> (Sql_Result, Error)
 	if len(stmt.name) == 0 do return {}, errf(.Sql_Syntax, "DETACH needs a database name")
 	if _, exists := store.attached[stmt.name]; !exists {
 		return {}, errf(.Table_Not_Found, "database %s is not attached", stmt.name)
+	}
+	// A database in memory has no catalog row: it is only closed.
+	if attached := store.attached[stmt.name]; attached != nil && !attached.persistent {
+		if remove_err := store_attach_remove(store, stmt.name); remove_err.kind != .None do return {}, remove_err
+		return Sql_Result{kind = .Ack, commit_seq = store.commit_seq}, ERROR_NONE
 	}
 	tx := tx_begin_write(store)
 	if attach_recorded(tx, stmt.name) {
