@@ -93,7 +93,7 @@ trigger_create :: proc(tx: ^Tx, stmt: Create_Trigger_Stmt) -> Error {
 		if exists_err := trigger_drop(tx, stmt.name, true); exists_err.kind != .None {
 			return exists_err
 		}
-	} else if _, found := trigger_lookup(tx, stmt.name); found {
+	} else if trigger_lookup(tx, stmt.name) {
 		return ERROR_NONE
 	}
 	values := []Value {
@@ -132,16 +132,14 @@ trigger_restore :: proc(
 }
 
 @(private)
-trigger_lookup :: proc(tx: ^Tx, name: string) -> (row: []Value, found: bool) {
-	result, err := sql_execute_in_tx_params(
-		tx,
-		"SELECT name, table_name, event, timing, body FROM _triggers WHERE name = ?",
-		[]Value{value_string(name)},
-	)
-	if err.kind != .None do return nil, false
+trigger_lookup :: proc(tx: ^Tx, name: string) -> (found: bool) {
+	result, err := sql_execute_in_tx_params(tx, "SELECT 1 FROM _triggers WHERE name = ?", []Value{value_string(name)})
+	if err.kind != .None {
+		error_free(&err)
+		return false
+	}
 	defer sql_result_destroy(&result)
-	if len(result.rows) == 0 do return nil, false
-	return result.rows[0], true
+	return len(result.rows) > 0
 }
 
 trigger_drop :: proc(tx: ^Tx, name: string, if_exists: bool) -> Error {
@@ -149,7 +147,7 @@ trigger_drop :: proc(tx: ^Tx, name: string, if_exists: bool) -> Error {
 		if if_exists do return ERROR_NONE
 		return errf(.Table_Not_Found, "trigger %s does not exist", name)
 	}
-	if _, found := trigger_lookup(tx, name); !found {
+	if !trigger_lookup(tx, name) {
 		if if_exists do return ERROR_NONE
 		return errf(.Table_Not_Found, "trigger %s does not exist", name)
 	}

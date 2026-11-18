@@ -755,7 +755,7 @@ sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sq
 		}
 		return Sql_Result{kind = .Affected, affected = 1, commit_seq = tx.store.commit_seq}, ERROR_NONE
 	case Create_Trigger_Stmt:
-		_, existed := trigger_lookup(tx, stmt.name)
+		existed := trigger_lookup(tx, stmt.name)
 		if trigger_err := trigger_create(tx, stmt); trigger_err.kind != .None {
 			return {}, trigger_err
 		}
@@ -8808,7 +8808,11 @@ TYPE_SCHEMA_SQL :: "CREATE TABLE IF NOT EXISTS _type (name TEXT PRIMARY KEY, bas
 
 @(private)
 types_ensure_table :: proc(tx: ^Tx) -> Error {
-	if _, table_err := tx_table(tx, TYPE_TABLE); table_err.kind == .None do return ERROR_NONE
+	if _, table_err := tx_table(tx, TYPE_TABLE); table_err.kind == .None {
+		return ERROR_NONE
+	} else {
+		error_free(&table_err)
+	}
 	result, create_err := sql_execute_in_tx(tx, TYPE_SCHEMA_SQL)
 	if create_err.kind != .None do return create_err
 	sql_result_destroy(&result)
@@ -8819,6 +8823,7 @@ types_ensure_table :: proc(tx: ^Tx) -> Error {
 @(private)
 resolve_named_type :: proc(tx: ^Tx, name: string) -> (Column_Type, Error) {
 	if _, table_err := tx_table(tx, TYPE_TABLE); table_err.kind != .None {
+		error_free(&table_err)
 		return {}, errf(.Invalid_Type, "type %s is not defined", name)
 	}
 	result, query_err := sql_execute_in_tx_params(

@@ -208,6 +208,21 @@ test_full_text_leaves_nothing :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_catalog_probes_leave_nothing :: proc(t: ^testing.T) {
+	// Asking whether a catalog table exists yet (views, triggers, policies,
+	// types) answers no without keeping the error that said so.
+	expect_nothing_left(t, .Memory, "_test_memory_catalog", {
+		"CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)",
+		"DROP VIEW IF EXISTS nowhere",
+		"DROP POLICY IF EXISTS nowhere",
+		"CREATE VIEW w AS SELECT * FROM t",
+		"DROP VIEW w",
+		"CREATE TRIGGER g AFTER INSERT ON t BEGIN SELECT 1; END",
+		"DROP TRIGGER g",
+	})
+}
+
+@(test)
 test_a_parse_error_leaves_nothing :: proc(t: ^testing.T) {
 	// The error names the line and column; the detail it wraps is not kept.
 	expect_nothing_left(t, .Memory, "_test_memory_parse", {"SELECT FROM WHERE", "SELEC 1", "CREATE TABLE ("}, fails = true)

@@ -51,6 +51,7 @@ sql_exec_create_view :: proc(tx: ^Tx, stmt: Create_View_Stmt) -> (Sql_Result, Er
 
 sql_exec_drop_view :: proc(tx: ^Tx, stmt: Drop_View_Stmt) -> (Sql_Result, Error) {
 	if _, err := tx_table(tx, VIEW_TABLE); err.kind != .None {
+		error_free(&err)
 		if stmt.if_exists do return Sql_Result{kind = .Ack, commit_seq = tx.store.commit_seq}, ERROR_NONE
 		return {}, errf(.Table_Not_Found, "view %s does not exist", stmt.name)
 	}
@@ -71,7 +72,11 @@ sql_exec_drop_view :: proc(tx: ^Tx, stmt: Drop_View_Stmt) -> (Sql_Result, Error)
 
 @(private)
 views_ensure_table :: proc(tx: ^Tx) -> Error {
-	if _, err := tx_table(tx, VIEW_TABLE); err.kind == .None do return ERROR_NONE
+	if _, err := tx_table(tx, VIEW_TABLE); err.kind == .None {
+		return ERROR_NONE
+	} else {
+		error_free(&err)
+	}
 	result, create_err := sql_execute_in_tx(tx, VIEW_SCHEMA_SQL)
 	if create_err.kind != .None do return create_err
 	sql_result_destroy(&result)
