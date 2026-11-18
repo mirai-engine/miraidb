@@ -652,8 +652,17 @@ sqlite3_errmsg :: proc "c" (handle: rawptr) -> cstring {
 	if db.conn == nil do return cstring(raw_data(db.last_error))
 	delete(db.last_error)
 	db.last_error = strings.clone(engine.embed_error(db.conn))
-	// SQLite names success too: errmsg after a call that worked is "not an error".
-	if len(db.last_error) == 0 do return "not an error"
+	// SQLite names success too: errmsg after a call that worked is "not an
+	// error", and after a step the code it answered.
+	if len(db.last_error) == 0 {
+		switch db.last_code {
+		case SQLITE_ROW:
+			return "another row available"
+		case SQLITE_DONE:
+			return "no more rows available"
+		}
+		return "not an error"
+	}
 	return cstring(raw_data(db.last_error))
 }
 
@@ -959,6 +968,8 @@ sqlite3_finalize :: proc "c" (handle: rawptr) -> c.int {
 	if stmt.error_code != SQLITE_OK && stmt.db != nil {
 		stmt.db.last_code, stmt.db.last_extended = stmt.error_code, stmt.error_extended
 		code = stmt.db.extended ? stmt.error_extended : stmt.error_code
+	} else if stmt.db != nil {
+		stmt.db.last_code, stmt.db.last_extended = SQLITE_OK, SQLITE_OK
 	}
 	if stmt.db != nil do delete_key(&stmt.db.statements, handle)
 	// The last statement of a connection sqlite3_close_v2 left open closes it.
@@ -1011,6 +1022,7 @@ sqlite3_reset :: proc "c" (handle: rawptr) -> c.int {
 		return code
 	}
 	engine.embed_reset(stmt.stmt)
+	if stmt.db != nil do stmt.db.last_code, stmt.db.last_extended = SQLITE_OK, SQLITE_OK
 	return SQLITE_OK
 }
 
@@ -1137,10 +1149,14 @@ sqlite3_step :: proc "c" (handle: rawptr) -> c.int {
 		return code
 	}
 	stmt.error_code, stmt.error_extended = SQLITE_OK, SQLITE_OK
+	// A step that worked leaves its own code as the connection's, as SQLite's
+	// does: errcode answers 100 or 101, and errmsg names it.
 	if has_row {
+		stmt.db.last_code, stmt.db.last_extended = SQLITE_ROW, SQLITE_ROW
 		trace_row(stmt)
 		return SQLITE_ROW
 	}
+	stmt.db.last_code, stmt.db.last_extended = SQLITE_DONE, SQLITE_DONE
 	stmt.finished = true
 	trace_end(stmt)
 	return SQLITE_DONE

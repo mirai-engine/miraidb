@@ -191,6 +191,16 @@ def observe(lib) -> dict[str, object]:
     seen["runs after a reset of the counter"] = lib.sqlite3_stmt_status(stmt, STMTSTATUS_RUN, 0)
     lib.sqlite3_finalize(stmt)
 
+    # A step that worked leaves its own code: errcode 100 or 101, and errmsg
+    # names it; reset and finalize bring "not an error" back.
+    lib.sqlite3_errcode.restype = c_int
+    stepping = prepare(b"SELECT 1")
+    codes = []
+    for call in (lib.sqlite3_step, lib.sqlite3_step, lib.sqlite3_reset):
+        codes.append((call(stepping), lib.sqlite3_errcode(db), lib.sqlite3_errmsg(db)))
+    codes.append((lib.sqlite3_finalize(stepping), lib.sqlite3_errcode(db), lib.sqlite3_errmsg(db)))
+    seen["codes around steps"] = codes
+
     # A runtime error is the step's, and the finalize that follows it without
     # a reset answers it too: SQLite's shell reports one only from there. A
     # program that asks for the columns first sees the same.
