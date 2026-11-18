@@ -8278,8 +8278,10 @@ sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Res
 		if prepare_err := returning_prepare(&result, stmt.returning, table); prepare_err.kind != .None do return {}, prepare_err
 		result.rows = returned[:]
 	}
-	tx.store.last_changes = i64(result.affected)
-	tx.store.total_changes += i64(result.affected)
+	if counts_changes(stmt.table) {
+		tx.store.last_changes = i64(result.affected)
+		tx.store.total_changes += i64(result.affected)
+	}
 	return result, ERROR_NONE
 }
 
@@ -8511,8 +8513,10 @@ sql_exec_merge :: proc(tx: ^Tx, stmt: Merge_Stmt, params: []Value) -> (Sql_Resul
 		}
 		affected += 1
 	}
-	tx.store.last_changes = i64(affected)
-	tx.store.total_changes += i64(affected)
+	if counts_changes(stmt.target) {
+		tx.store.last_changes = i64(affected)
+		tx.store.total_changes += i64(affected)
+	}
 	return Sql_Result{kind = .Affected, affected = affected, commit_seq = tx.store.commit_seq}, ERROR_NONE
 }
 
@@ -8693,8 +8697,10 @@ sql_exec_update :: proc(tx: ^Tx, stmt: Update_Stmt, params: []Value) -> (Sql_Res
 		affected += 1
 	}
 	result.affected = affected
-	tx.store.last_changes = i64(affected)
-	tx.store.total_changes += i64(affected)
+	if counts_changes(stmt.table) {
+		tx.store.last_changes = i64(affected)
+		tx.store.total_changes += i64(affected)
+	}
 	if stmt.returning != nil {
 		if prepare_err := returning_prepare(&result, stmt.returning, table); prepare_err.kind != .None do return {}, prepare_err
 		result.rows = returned[:]
@@ -8779,8 +8785,10 @@ sql_exec_delete :: proc(tx: ^Tx, stmt: Delete_Stmt, params: []Value) -> (Sql_Res
 		affected += 1
 	}
 	result.affected = affected
-	tx.store.last_changes = i64(affected)
-	tx.store.total_changes += i64(affected)
+	if counts_changes(stmt.table) {
+		tx.store.last_changes = i64(affected)
+		tx.store.total_changes += i64(affected)
+	}
 	if stmt.returning != nil {
 		if prepare_err := returning_prepare(&result, stmt.returning, table); prepare_err.kind != .None do return {}, prepare_err
 		result.rows = returned[:]
@@ -10650,4 +10658,13 @@ jsonb_aggregate_plain :: proc(call: Call_Expr) -> (Call_Expr, bool) {
 	plain := call
 	plain.name = strings.equal_fold(call.name, "jsonb_group_array") ? "json_group_array" : "json_group_object"
 	return plain, true
+}
+
+// counts_changes says whether a write to `table` is one changes() and
+// total_changes() count: the engine's own catalogs (the tables named with a
+// leading underscore) are not, as SQLite does not count the rows it writes to
+// sqlite_schema when a view or a trigger is made.
+@(private)
+counts_changes :: proc(table: string) -> bool {
+	return !strings.has_prefix(table, "_")
 }
