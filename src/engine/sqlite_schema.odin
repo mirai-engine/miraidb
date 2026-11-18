@@ -478,3 +478,69 @@ tx_materialize_sqlite_schema :: proc(tx: ^Tx, name: string, temp: bool) -> (^Tab
 	append(&tx.temp_tables, table)
 	return table, ERROR_NONE
 }
+
+// Sqlite_Index_Entry is one index of a table as SQLite lists it.
+Sqlite_Index_Entry :: struct {
+	name:    string, // SQLite's name: sqlite_autoindex_T_N for one a constraint made
+	unique:  bool,
+	origin:  string, // "c" CREATE INDEX, "u" UNIQUE, "pk" PRIMARY KEY
+	partial: bool,
+}
+
+// sqlite_index_list is PRAGMA index_list as SQLite answers it: the rowid
+// alias has no index, an index a constraint made is sqlite_autoindex_T_N
+// numbered in the order the constraints are written (the numbering an export
+// writes), and the newest index comes first. The names live in `alloc`.
+sqlite_index_list :: proc(tx: ^Tx, table: ^Table, alloc: mem.Allocator) -> []Sqlite_Index_Entry {
+	schema := &table.schema
+	texts := tx_sql_texts(tx, context.temp_allocator)
+	_, original, keep_text := sqlite_table_sql(tx.store, table, texts)
+	alias := sqlite_rowid_alias(table)
+	// The number SQLite gives the index a constraint made: its place among the
+	// constraints the declaration writes, or, without a declaration to read,
+	// among the model's implicit indexes.
+	constraint_number :: proc(schema: ^Table_Schema, original: ^Mirror_Kept, keep_text: bool, alias: int, index: ^Index_Schema) -> int {
+		if keep_text {
+			for name, order in original.key_indexes do if name == index.name do return order + 1
+			return 0
+		}
+		if !index.implicit do return 0
+		position := 0
+		for &other in schema.indexes {
+			if !other.implicit || (len(other.columns) == 1 && other.columns[0] == alias) do continue
+			position += 1
+			if other.name == index.name do return position
+		}
+		return 0
+	}
+	created := make([dynamic]Sqlite_Index_Entry, 0, len(schema.indexes), context.temp_allocator)
+	constraints := make([dynamic]Sqlite_Index_Entry, 0, len(schema.indexes), context.temp_allocator)
+	numbers := make([dynamic]int, 0, len(schema.indexes), context.temp_allocator)
+	for k := len(schema.indexes) - 1; k >= 0; k -= 1 {
+		index := &schema.indexes[k]
+		if index.implicit && len(index.columns) == 1 && index.columns[0] == alias do continue
+		entry := Sqlite_Index_Entry{unique = index.unique, partial = len(index.where_sql) > 0, origin = "c"}
+		if number := constraint_number(schema, &original, keep_text, alias, index); number > 0 {
+			is_pk := len(schema.primary_key) > 0 && schema_index_matches(index, schema.primary_key)
+			entry.origin = is_pk ? "pk" : "u"
+			entry.name = fmt.aprintf("sqlite_autoindex_%s_%d", schema.name, number, allocator = alloc)
+			append(&constraints, entry)
+			append(&numbers, number)
+			continue
+		}
+		entry.name = strings.clone(index.name, alloc)
+		append(&created, entry)
+	}
+	// The indexes CREATE INDEX made are newer than the table's own; the ones
+	// the declaration made come newest (the last written) first.
+	for i in 1 ..< len(constraints) {
+		for j := i; j > 0 && numbers[j - 1] < numbers[j]; j -= 1 {
+			constraints[j - 1], constraints[j] = constraints[j], constraints[j - 1]
+			numbers[j - 1], numbers[j] = numbers[j], numbers[j - 1]
+		}
+	}
+	out := make([]Sqlite_Index_Entry, len(created) + len(constraints), alloc)
+	copy(out, created[:])
+	copy(out[len(created):], constraints[:])
+	return out
+}

@@ -203,6 +203,23 @@ sql_exec_pragma :: proc(store: ^Store, body: string, locked: bool, tx: ^Tx = nil
 		}
 		result := Sql_Result{kind = .Rows, commit_seq = store.commit_seq}
 		result.columns = pragma_columns("seq", "name", "unique", "origin", "partial")
+		if store.sqlite_rules {
+			reader := tx
+			if reader == nil do reader = tx_begin_read(store)
+			defer if tx == nil do tx_end(reader)
+			entries := sqlite_index_list(reader, table, context.temp_allocator)
+			result.rows = make([][]Value, len(entries))
+			for entry, i in entries {
+				row := make([]Value, 5)
+				row[0] = value_int(i64(i))
+				row[1] = pragma_text(entry.name)
+				row[2] = value_int(entry.unique ? 1 : 0)
+				row[3] = pragma_text(entry.origin)
+				row[4] = value_int(entry.partial ? 1 : 0)
+				result.rows[i] = row
+			}
+			return result, ERROR_NONE
+		}
 		result.rows = make([][]Value, len(table.schema.indexes))
 		for index, i in table.schema.indexes {
 			row := make([]Value, 5)
