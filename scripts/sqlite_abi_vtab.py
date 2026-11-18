@@ -91,6 +91,7 @@ SIGNATURES = {
     "sqlite3_result_text": ([c_void_p, c_char_p, c_int, c_void_p], None),
     "sqlite3_result_null": ([c_void_p], None),
     "sqlite3_malloc": ([c_int], c_void_p),
+    "sqlite3_vtab_collation": ([c_void_p, c_int], c_char_p),
 }
 
 TRANSIENT = c_void_p(-1)
@@ -275,8 +276,13 @@ def observe(lib, seen: dict) -> None:
         return 0
 
     orders: list = []
+    collations: list = []
 
     def kv_best(vtab, info):
+        for i in range(info.contents.nConstraint):
+            constraint = info.contents.aConstraint[i]
+            if constraint.usable:
+                collations.append((constraint.iColumn, constraint.op, lib.sqlite3_vtab_collation(info, i)))
         info = info.contents
         terms = ctypes.cast(info.aOrderBy, ctypes.POINTER(OrderBy))
         orders.append(tuple((terms[i].iColumn, terms[i].desc) for i in range(info.nOrderBy)))
@@ -421,6 +427,11 @@ def observe(lib, seen: dict) -> None:
     seen["kvmod: rename events"] = list(events)
     seen["kvmod: after rename"] = rows(b"SELECT count(*) FROM kv9")
     seen["kvmod: overloaded function"] = rows(b"SELECT upper(k), upper('plain') FROM kv9 ORDER BY rowid LIMIT 1")
+    # Each constraint names the comparison it asks for: its COLLATE, or BINARY.
+    collations.clear()
+    seen["kvmod: collated"] = rows(b"SELECT count(*) FROM kv9 WHERE k = 'A' COLLATE nocase")
+    seen["kvmod: plain"] = rows(b"SELECT count(*) FROM kv9 WHERE k = 'a'")
+    seen["kvmod: constraint collations"] = sorted(set(collations))
     # The ORDER BY of a query that reads only the table is offered.
     orders.clear()
     seen["kvmod: ordered"] = rows(b"SELECT k, v FROM kv9 ORDER BY v DESC, k")

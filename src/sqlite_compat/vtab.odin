@@ -110,6 +110,11 @@ Module_Entry :: struct {
 @(private, thread_local)
 index_values: []engine.Value
 
+// index_collations are the constraints' collations for the same call, for
+// sqlite3_vtab_collation.
+@(private, thread_local)
+index_collations: []engine.Vtab_Constraint
+
 @(private)
 vtab_error :: proc(vtab: ^Sqlite3_Vtab, code: c.int, fallback: string) -> engine.Error {
 	message := fallback
@@ -225,8 +230,10 @@ module_scan :: proc(
 		colUsed          = max(u64),
 	}
 	index_values = values
+	index_collations = constraints
 	code := module.xBestIndex(vtab, &info)
 	index_values = nil
+	index_collations = nil
 	if code != SQLITE_OK {
 		if code == SQLITE_CONSTRAINT do return engine.errf(.Invalid_Argument, "no query solution")
 		return vtab_error(vtab, code, "xBestIndex failed")
@@ -479,9 +486,15 @@ sqlite3_vtab_nochange :: proc "c" (ctx: rawptr) -> c.int {
 	return 0
 }
 
+// sqlite3_vtab_collation names the comparison a constraint asks for while
+// xBestIndex runs: the term's COLLATE, else the column's, else BINARY.
 @(export)
 sqlite3_vtab_collation :: proc "c" (info: ^Sqlite3_Index_Info, constraint: c.int) -> cstring {
-	return "BINARY"
+	context = runtime.default_context()
+	if constraint < 0 || int(constraint) >= len(index_collations) do return "BINARY"
+	name := index_collations[constraint].collation
+	if len(name) == 0 do return "BINARY"
+	return strings.clone_to_cstring(name, context.temp_allocator)
 }
 
 @(export)

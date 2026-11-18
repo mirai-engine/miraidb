@@ -26,6 +26,9 @@ Vtab_Constraint :: struct {
 	column: int,
 	op:     u8,
 	usable: bool,
+	// collation is the comparison the term asks for: its COLLATE, or the
+	// column's declared one, or BINARY (sqlite3_vtab_collation).
+	collation: string,
 }
 
 VTAB_OP_EQ :: u8(2)
@@ -548,6 +551,12 @@ vtab_where_terms :: proc(tx: ^Tx, vtab: ^Vtab, constraints: ^[dynamic]Vtab_Const
 		index := -1
 		for candidate, i in vtab.columns do if strings.equal_fold(candidate.name, column.name) do index = i
 		if index < 0 do continue
+		// `'A' COLLATE nocase`: the value is the operand, the name the term's.
+		term_collation := ""
+		if collated, is_collated := constant_side^.(Collate_Expr); is_collated {
+			term_collation = collated.name
+			constant_side = collated.operand
+		}
 		constant: Value
 		#partial switch c in constant_side^ {
 		case Literal_Expr:
@@ -569,7 +578,15 @@ vtab_where_terms :: proc(tx: ^Tx, vtab: ^Vtab, constraints: ^[dynamic]Vtab_Const
 		case:
 			continue
 		}
-		append(constraints, Vtab_Constraint{column = index, op = op, usable = true})
+		// The term's own COLLATE wins, then the column's.
+		collation := "BINARY"
+		if len(term_collation) > 0 {
+			collation = term_collation
+		} else if len(vtab.columns[index].collation) > 0 {
+			collation = vtab.columns[index].collation
+		}
+		if collation_is_builtin(collation) do collation = strings.to_upper(collation, tx.alloc)
+		append(constraints, Vtab_Constraint{column = index, op = op, usable = true, collation = collation})
 		append(values, constant)
 	}
 }
