@@ -151,7 +151,7 @@ the gaps are named rather than left to be discovered.
   `linux_arm64` and `darwin_arm64`. The POSIX lock is the reason it is checked:
   it carried a missing `core:sys/posix` import and two wrong integer types until
   this round, so the code that a Linux build would run had never been compiled.
-- 358 integration tests covering CRUD, recovery, constraints, transactions,
+- 367 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
@@ -307,12 +307,24 @@ than 1000 bytes cannot be indexed and the insert says so.
   read cache's snapshot a second time, a test that freed the metric strings its
   result still owned, and every `EXPLAIN`, `DESCRIBE` and `SHOW` result, which
   handed a read-only literal to a caller that frees what it gets
-  (`result_own`). The remaining noise is `+++ leak`, ~320k lines
-  per suite run (~9 blocks per statement, dominated by the string builder, the
-  lexer and statement decoding); nobody has established yet whether those are
-  real leaks or allocations released by a bulk free the tracker does not see, and
-  `scripts/soak.py` does not measure the working set, so nothing would notice if
-  they were real.
+  (`result_own`). Seven bad frees had come back since (a `ROLLBACK TO` that
+  restored writes staged in the transaction arena, which `tx_discard` then
+  freed on the heap); they are gone, and the unit-test gate of `scripts/ci.py`
+  now fails on a bad free instead of passing over it.
+- **A closed store leaves nothing behind.** The `+++ leak` lines were real
+  leaks: 127,201 per suite run at `0f1e942`, 10,777 now. They were the implicit
+  indexes a key declares, type names uppercased for a comparison, the log and
+  snapshot paths, statistics errors and ANALYZE's scratch, every operation a
+  replay decoded, every GROUP BY key after a group's first row, the tables an
+  ALTER built, the error an UPSERT answered, the rows a SQLite file was
+  imported from, the `sqlite_master` rows an export wrote, and the error each
+  "is this catalog table there yet" probe dropped. One was worse than a leak: a
+  full-text table's set of new documents was grown through a copy of its map,
+  so the transaction kept pointing at storage the growth had freed.
+  `src/tests/memory_test.odin` runs each of these under a tracking allocator of
+  its own and fails on any block left. The largest remainder is test code (the
+  strings a test formats, results `run()` hands back and nobody destroys); the
+  rest has not been attributed one by one.
 - **Schema changes.** `ALTER TABLE` renames the table, adds and drops columns,
   and renames a column (keeping the rows and the indexes); the CHECK
   constraints, views, trigger bodies and `UPDATE OF` lists that name the table
