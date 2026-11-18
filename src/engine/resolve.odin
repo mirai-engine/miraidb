@@ -1,5 +1,6 @@
 package engine
 
+import "core:mem"
 import "core:strings"
 
 // --- Names are resolved before a statement runs (D37) ----------------------
@@ -21,6 +22,9 @@ import "core:strings"
 @(private)
 Res_Walk :: struct {
 	tx:     ^Tx,
+	// alloc holds the names the pass rewrites into the statement: the
+	// statement's own arena when it has one.
+	alloc:  mem.Allocator,
 	scopes: [dynamic]Res_Scope,
 	ctes:   [dynamic]Res_Cte,
 	depth:  int,
@@ -63,9 +67,9 @@ Res_Cte :: struct {
 // sql_resolve_names checks every table and column `statement` names against
 // what `tx` sees, and answers the error SQLite gives at prepare for the first
 // one that is not there.
-sql_resolve_names :: proc(tx: ^Tx, statement: ^Statement) -> Error {
+sql_resolve_names :: proc(tx: ^Tx, statement: ^Statement, alloc := context.allocator) -> Error {
 	if tx == nil || statement == nil do return ERROR_NONE
-	walk := Res_Walk{tx = tx}
+	walk := Res_Walk{tx = tx, alloc = alloc}
 	walk.scopes = make([dynamic]Res_Scope, 0, 4, context.temp_allocator)
 	walk.ctes = make([dynamic]Res_Cte, 0, 2, context.temp_allocator)
 	res_statement(&walk, statement)
@@ -104,6 +108,7 @@ res_statement :: proc(walk: ^Res_Walk, statement: ^Statement) {
 	case Insert_Stmt:
 		base := res_push_ctes(walk, s.ctes, s.ctes_recursive)
 		defer resize(&walk.ctes, base)
+		res_canonical(walk, &s.table)
 		target, found := res_write_target(walk, s.table)
 		if !found do return
 		if target.known {
@@ -134,6 +139,7 @@ res_statement :: proc(walk: ^Res_Walk, statement: ^Statement) {
 	case Update_Stmt:
 		base := res_push_ctes(walk, s.ctes, s.ctes_recursive)
 		defer resize(&walk.ctes, base)
+		res_canonical(walk, &s.table)
 		target, found := res_write_target(walk, s.table)
 		if !found do return
 		scope := Res_Scope{sources = make([dynamic]Res_Source, 0, 2, context.temp_allocator)}
@@ -154,6 +160,7 @@ res_statement :: proc(walk: ^Res_Walk, statement: ^Statement) {
 	case Delete_Stmt:
 		base := res_push_ctes(walk, s.ctes, s.ctes_recursive)
 		defer resize(&walk.ctes, base)
+		res_canonical(walk, &s.table)
 		target, found := res_write_target(walk, s.table)
 		if !found do return
 		scope := Res_Scope{sources = make([dynamic]Res_Source, 0, 2, context.temp_allocator)}
@@ -280,6 +287,7 @@ res_ref :: proc(walk: ^Res_Walk, scope: ^Res_Scope, ref: ^Table_Ref) {
 		source.known = cte.known
 		return
 	}
+	if len(ref.schema) == 0 || strings.equal_fold(ref.schema, "main") || strings.equal_fold(ref.schema, "temp") do res_canonical(walk, &ref.name)
 	if len(ref.schema) > 0 || is_json_table_function(ref.name) || is_pragma_function(ref.name) || is_system_table(ref.name) do return
 	if strings.equal_fold(ref.name, "sqlite_sequence") && tx_table_probe(walk.tx, ref.name) == nil && sqlite_sequence_exists(walk.tx) {
 		source.columns = SEQUENCE_COLUMNS
@@ -576,7 +584,56 @@ res_relation_kind :: proc(walk: ^Res_Walk, name: string) -> string {
 	if _, is_view := view_sql(walk.tx, name); is_view do return "view"
 	if _, is_virtual := fts_virtual_lookup(walk.tx, name); is_virtual do return "table"
 	if _, is_vtab, _ := vtab_find(walk.tx, name); is_vtab do return "table"
+	// Under SQLite's rules a name is the same whatever its case.
+	if spelled, kind := res_spelling(walk, name); len(spelled) > 0 do return kind
 	return ""
+}
+
+// res_spelling finds the table or view a name means without regard to case,
+// as SQLite matches names, under SQLite's rules: its stored spelling and kind.
+@(private)
+res_spelling :: proc(walk: ^Res_Walk, name: string) -> (spelled: string, kind: string) {
+	if walk.tx.store == nil || !walk.tx.store.sqlite_rules do return "", ""
+	for candidate in tx_table_names(walk.tx, context.temp_allocator) {
+		if !res_internal(candidate) && strings.equal_fold(candidate, name) do return candidate, "table"
+	}
+	for view in tx_views(walk.tx, context.temp_allocator) {
+		if strings.equal_fold(view[0], name) do return view[0], "view"
+	}
+	return "", ""
+}
+
+// res_alloc is where rewritten names live: a walk made without one (a view's
+// columns, a relation's) uses the context's.
+@(private)
+res_alloc :: proc(walk: ^Res_Walk) -> mem.Allocator {
+	return walk.alloc.procedure != nil ? walk.alloc : context.allocator
+}
+
+// res_canonical rewrites a table or view name to its stored spelling, so the
+// statement reaches it whatever case it was written in.
+@(private)
+res_canonical :: proc(walk: ^Res_Walk, name: ^string) {
+	if walk.tx.store == nil || !walk.tx.store.sqlite_rules || len(name^) == 0 do return
+	if tx_table_probe(walk.tx, name^) != nil do return
+	if _, is_view := view_sql(walk.tx, name^); is_view do return
+	if spelled, _ := res_spelling(walk, name^); len(spelled) > 0 && spelled != name^ {
+		name^ = strings.clone(spelled, res_alloc(walk))
+	}
+}
+
+// res_canonical_index rewrites an index name to its stored spelling.
+@(private)
+res_canonical_index :: proc(walk: ^Res_Walk, name: ^string) {
+	if walk.tx.store == nil || !walk.tx.store.sqlite_rules do return
+	spelled := ""
+	for _, table in walk.tx.store.tables {
+		for index in table.schema.indexes do if strings.equal_fold(index.name, name^) do spelled = index.name
+	}
+	for op in walk.tx.state.index_ops {
+		if strings.equal_fold(op.index.name, name^) do spelled = op.drop ? "" : op.index.name
+	}
+	if len(spelled) > 0 && spelled != name^ do name^ = strings.clone(spelled, res_alloc(walk))
 }
 
 // res_index_exists answers whether the transaction sees index `name`: one in
@@ -635,6 +692,7 @@ res_ddl :: proc(walk: ^Res_Walk, statement: ^Statement) {
 			res_fail(walk, .Table_Exists, "%s %s already exists", kind, s.name)
 		}
 	case Create_Index_Stmt:
+		res_canonical(walk, &s.table)
 		if !s.if_not_exists && res_index_exists(walk, s.name) {
 			res_fail(walk, .Table_Exists, "index %s already exists", s.name)
 			return
@@ -653,6 +711,7 @@ res_ddl :: proc(walk: ^Res_Walk, statement: ^Statement) {
 			}
 		}
 	case Drop_Table_Stmt:
+		res_canonical(walk, &s.name)
 		kind := res_relation_kind(walk, s.name)
 		if kind == "view" {
 			res_fail(walk, .Invalid_Argument, "use DROP VIEW to delete view %s", s.name)
@@ -660,6 +719,7 @@ res_ddl :: proc(walk: ^Res_Walk, statement: ^Statement) {
 			res_fail(walk, .Table_Not_Found, "no such table: %s", s.name)
 		}
 	case Drop_View_Stmt:
+		res_canonical(walk, &s.name)
 		kind := res_relation_kind(walk, s.name)
 		if kind == "table" {
 			res_fail(walk, .Invalid_Argument, "use DROP TABLE to delete table %s", s.name)
@@ -667,14 +727,17 @@ res_ddl :: proc(walk: ^Res_Walk, statement: ^Statement) {
 			res_fail(walk, .Table_Not_Found, "no such view: %s", s.name)
 		}
 	case Drop_Index_Stmt:
+		res_canonical_index(walk, &s.name)
 		if !s.if_exists && !res_index_exists(walk, s.name) {
 			res_fail(walk, .Index_Not_Found, "no such index: %s", s.name)
 		}
 	case Create_Trigger_Stmt:
+		res_canonical(walk, &s.table)
 		if kind := res_relation_kind(walk, s.table); kind != "table" && kind != "view" {
 			res_fail(walk, .Table_Not_Found, "no such table: main.%s", s.table)
 		}
 	case Alter_Table_Stmt:
+		res_canonical(walk, &s.table)
 		table := tx_table_probe(walk.tx, s.table)
 		if table == nil && res_relation_kind(walk, s.table) == "table" do return
 		if table == nil {

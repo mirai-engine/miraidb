@@ -27,6 +27,7 @@ package engine
 // connection keeps its own copy for embed_error, so a caller that frees the
 // returned error can still ask the connection what went wrong.
 
+import "core:mem/virtual"
 import "core:strings"
 import "core:time"
 
@@ -279,7 +280,7 @@ embed_authorize :: proc(conn: ^Embed_Conn, prepared: ^Stmt_Prepared) -> Error {
 	own := tx == nil
 	if own do tx = tx_begin_read(conn.store)
 	defer if own do tx_end(tx)
-	if resolve_err := sql_resolve_names(tx, &prepared.query.statement); resolve_err.kind != .None do return resolve_err
+	if resolve_err := sql_resolve_names(tx, &prepared.query.statement, virtual.arena_allocator(&prepared.query.arena)); resolve_err.kind != .None do return resolve_err
 	if conn.store.hooks.authorizer == nil do return ERROR_NONE
 	ignored, err := sql_authorize(conn.store, tx, prepared)
 	prepared.ignored = ignored

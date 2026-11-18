@@ -122,6 +122,30 @@ test_returning_takes_expressions :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_names_match_without_case_under_sqlite_rules :: proc(t: ^testing.T) {
+	store := face_store(t)
+	defer db.store_close(store)
+	conn := db.embed_wrap(store)
+	defer db.embed_close(conn)
+	face_ok(t, conn, "CREATE TABLE t (c)")
+	face_ok(t, conn, "INSERT INTO T VALUES (1)")
+	face_ok(t, conn, "UPDATE T SET C = 2")
+	face_ok(t, conn, "CREATE INDEX i ON T (c)")
+	face_ok(t, conn, "CREATE VIEW v AS SELECT c FROM t")
+	expect_list(t, face_ints(t, conn, "SELECT c FROM main.T"), {2}, "qualified")
+	expect_list(t, face_ints(t, conn, "SELECT c FROM V"), {2}, "view")
+	expect_list(t, face_ints(t, conn, "SELECT count(*) FROM pragma_table_info('T')"), {1}, "pragma")
+	face_fails(t, conn, "CREATE TABLE T (d)", "already exists")
+	face_ok(t, conn, "DROP INDEX I")
+	face_ok(t, conn, "DROP VIEW V")
+	face_ok(t, conn, "DROP TABLE T")
+	// The engine's own rules keep names exact.
+	store.sqlite_rules = false
+	face_ok(t, conn, "CREATE TABLE u (c)")
+	face_fails(t, conn, "INSERT INTO U VALUES (1)", "U")
+}
+
+@(test)
 test_checks_run_inside_the_open_transaction :: proc(t: ^testing.T) {
 	store := face_store(t)
 	defer db.store_close(store)
