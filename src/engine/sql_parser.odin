@@ -1545,6 +1545,23 @@ parse_returning :: proc(p: ^Parser) -> ^Returning {
 parse_update :: proc(p: ^Parser) -> Statement {
 	update: Update_Stmt
 	p_expect_keyword(p, "update")
+	// UPDATE OR <action>: what a row that breaks a constraint does.
+	if p_match_keyword(p, "or") {
+		switch {
+		case p_match_keyword(p, "abort"):
+		case p_match_keyword(p, "fail"):
+			update.conflict = .Fail
+		case p_match_keyword(p, "ignore"):
+			update.conflict = .Ignore
+		case p_match_keyword(p, "replace"):
+			update.conflict = .Replace
+		case p_match_keyword(p, "rollback"):
+			update.conflict = .Rollback
+		case:
+			p_fail(p, .Sql_Syntax, "expected replace, abort, rollback, fail or ignore after OR")
+			return update
+		}
+	}
 	update.table = p_ident(p)
 	if p_is_punct(p, ".") {
 		p_fail(p, .Sql_Unsupported, "writes to an attached database are read-only")

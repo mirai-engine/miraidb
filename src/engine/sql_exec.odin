@@ -264,8 +264,13 @@ statement_without_ctes :: proc(statement: Statement) -> Statement {
 
 @(private)
 statement_fails_partially :: proc(statement: Statement) -> bool {
-	insert, ok := statement.(Insert_Stmt)
-	return ok && insert.conflict_fail
+	#partial switch s in statement {
+	case Insert_Stmt:
+		return s.conflict_fail
+	case Update_Stmt:
+		return s.conflict == .Fail
+	}
+	return false
 }
 
 // conflict_skippable reports the failures INSERT OR IGNORE and OR FAIL act on:
@@ -293,6 +298,12 @@ sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value) 
 			return {}, errf(
 				.Sql_Unsupported,
 				"INSERT OR ROLLBACK cannot end a transaction the caller opened: use OR ABORT and ROLLBACK",
+			)
+		}
+		if update, is_update := stmt.(Update_Stmt); is_update && update.conflict == .Rollback {
+			return {}, errf(
+				.Sql_Unsupported,
+				"UPDATE OR ROLLBACK cannot end a transaction the caller opened: use OR ABORT and ROLLBACK",
 			)
 		}
 		// A data statement that fails is taken back as a unit (SQLite's ABORT): the
@@ -8176,7 +8187,37 @@ sql_exec_update :: proc(tx: ^Tx, stmt: Update_Stmt, params: []Value) -> (Sql_Res
 		if !allowed {
 			return {}, errf(.Permission_Denied, "update of %s violates a policy", stmt.table)
 		}
-		if update_err := tx_update(tx, stmt.table, row.id, new_values); update_err.kind != .None {
+		// Under OR FAIL and OR IGNORE a row is its own unit: if it breaks a
+		// constraint, what it staged (a trigger's work included) is taken back.
+		per_row := stmt.conflict == .Fail || stmt.conflict == .Ignore || stmt.conflict == .Replace
+		row_mark := per_row ? tx_statement_begin(tx) : 0
+		update_err := tx_update(tx, stmt.table, row.id, new_values)
+		if update_err.kind != .None && stmt.conflict == .Replace && (update_err.kind == .Duplicate_Unique || update_err.kind == .Duplicate_Primary_Key) {
+			// UPDATE OR REPLACE: the rows the new values collide with go, without
+			// delete triggers, and the row is written again.
+			tx_statement_end(tx, row_mark, true)
+			row_mark = tx_statement_begin(tx)
+			conflicts := unique_conflicts(tx, table, new_values)
+			replaced := false
+			for id in conflicts {
+				if id == row.id do continue
+				if fts_err := fts_delete_if_virtual(tx, stmt.table, id); fts_err.kind != .None do return {}, fts_err
+				if delete_err := tx_delete_without_triggers(tx, stmt.table, id); delete_err.kind != .None do return {}, delete_err
+				replaced = true
+			}
+			delete(conflicts)
+			if replaced {
+				error_free(&update_err)
+				update_err = tx_update(tx, stmt.table, row.id, new_values)
+			}
+		}
+		if per_row do tx_statement_end(tx, row_mark, update_err.kind != .None)
+		if update_err.kind != .None && stmt.conflict == .Ignore && conflict_skippable(update_err.kind) {
+			// UPDATE OR IGNORE: the row keeps its values and the statement goes on.
+			error_free(&update_err)
+			continue
+		}
+		if update_err.kind != .None {
 			return {}, update_err
 		}
 		if fts_err := fts_index_if_virtual(tx, stmt.table, row.id, new_values, false); fts_err.kind != .None {

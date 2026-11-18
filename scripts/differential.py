@@ -66,6 +66,8 @@ SETUP = [
     "CREATE TABLE audit (id INTEGER PRIMARY KEY, k TEXT, old_v INTEGER, new_v INTEGER)",
     "CREATE TRIGGER kv_audit AFTER UPDATE ON kv BEGIN INSERT INTO audit (k, old_v, new_v) VALUES (OLD.k, OLD.v, NEW.v); END",
     "CREATE TABLE empty_t (a INTEGER, b TEXT)",
+    "CREATE TABLE uq (id INTEGER PRIMARY KEY, u INTEGER UNIQUE, n INTEGER NOT NULL)",
+    "INSERT INTO uq (id, u, n) VALUES (1, 10, 1), (2, 20, 2), (3, 30, 3), (4, 40, 4)",
 ]
 
 QUERIES = [
@@ -177,6 +179,13 @@ QUERIES = [
     # IN and BETWEEN compare under the left operand's collation.
     "SELECT id FROM emp WHERE name COLLATE NOCASE IN ('ANA', 'Zoe') ORDER BY id",
     "SELECT id FROM emp WHERE name COLLATE NOCASE BETWEEN 'L' AND 'MARIA' ORDER BY id",
+    # UPDATE OR <resolution> (S2): IGNORE skips a row that breaks a key and goes
+    # on, REPLACE removes the rows it collides with.
+    "UPDATE OR IGNORE uq SET u = 10 WHERE id >= 2 RETURNING id",
+    "SELECT id, u FROM uq ORDER BY id",
+    "UPDATE OR REPLACE uq SET u = 20 WHERE id = 3 RETURNING id, u",
+    "SELECT id, u FROM uq ORDER BY id",
+    "UPDATE OR ABORT uq SET n = n + 1 WHERE id = 1 RETURNING n",
     # A CTE's body may be a VALUES list, with the materialization hints.
     "WITH t(n) AS (VALUES (1), (2), (3)) SELECT sum(n) FROM t",
     "WITH t(a, b) AS MATERIALIZED (VALUES (1, 'x'), (2, 'y')) SELECT b FROM t WHERE a = 2",
@@ -284,6 +293,7 @@ REJECTED = {
     "UPDATE empty_t SET nope = 1": "an assigned column that does not exist",
     "DELETE FROM empty_t WHERE nope = 1": "a misspelled column in a DELETE",
     "INSERT INTO empty_t (nope) VALUES (1)": "an inserted column that does not exist",
+    "UPDATE OR FAIL uq SET u = 40 WHERE id = 1": "a key a FAIL update breaks",
 }
 
 # Both engines answer, differently, on purpose. These are the decisions listed

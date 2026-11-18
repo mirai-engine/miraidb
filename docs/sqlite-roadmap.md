@@ -30,7 +30,6 @@ The detail of each item is in [backlog.md](backlog.md); the order is in
 | Item | Missing today |
 |---|---|
 | **S1** — the schema real files declare | `ON CONFLICT` on a constraint |
-| **S2** — statement and expression forms | `UPDATE OR <resolution>` |
 | **S3** — joins | `NATURAL` |
 | **S4** — aggregates and windows | `FILTER`, the `WINDOW` clause, `ORDER BY` inside an aggregate, `median`, `percentile`, `percentile_cont`, `percentile_disc`, `json_group_array`, `json_group_object` |
 | **S5** — functions | `acosh`, `asinh`, `atanh`, `cosh`, `sinh`, `tanh`, `soundex`, `unistr`, `unistr_quote`, `affinity`, `timediff`, `sqlite_source_id`, `sqlite_compileoption_get`, `sqlite_compileoption_used`, `sqlite_offset`, `json_insert`, `json_patch`, `json_pretty`, `json_parse`, `json_error_position`, `json_array_insert`, and 13 `jsonb_*` functions |

@@ -34,7 +34,6 @@ Rules for this file:
 | R3 | pruning walks every row of every table after each statement | prune what the commit touched | S |
 | R4 | a committed row is copied from the transaction arena to the table | hand the staged row over | M |
 | S1 | `ON CONFLICT` on a constraint is refused; the rest landed | the constraint resolutions | S |
-| S2 | `UPDATE OR <resolution>` is refused; the rest landed | the UPDATE resolutions | S |
 | S3 | `NATURAL` joins are refused; `RIGHT` and `FULL` landed | the natural join | S |
 | S4 | `FILTER`, named `WINDOW` and aggregate `ORDER BY` missing; the ordered-set aggregates and `json_group_*` landed | the rest of the aggregate surface | S |
 | S5 | 15 of 121 built-in functions missing | the `jsonb_*` family, `json_parse`, `json_array_insert`, `sqlite_offset` | M |
@@ -171,37 +170,6 @@ over an expression loses that index today (D24).
 the row with SQLite's message and `SQLITE_CONSTRAINT_CHECK` through the facade; a
 deferred foreign key is checked at `COMMIT`; a partial index holds only matching
 rows and the planner uses it only when the query implies its `WHERE`.
-
-## S2 — Statement and expression forms
-
-**Done.** `IS` / `IS NOT` between any two values and `IS [NOT] DISTINCT FROM`;
-the bitwise operators `& | ~ << >>` at SQLite's precedence; the JSON operators
-`->` and `->>` (a path, a key or an array slot); `LIMIT <offset>, <count>`
-(`test_is_compares_null_as_a_value`, `test_bitwise_operators`,
-`test_json_arrow_operators`, `test_limit_with_a_comma`, and differential
-queries). JSON object keys became case sensitive on the way, as SQLite's are.
-`INSERT OR IGNORE`, `OR FAIL`, `OR ROLLBACK` (where the statement owns its
-transaction) and `REPLACE INTO` (`test_insert_conflict_resolutions`). Making them
-right needed statement atomicity: a statement that failed inside a transaction
-used to leave the rows it staged before the failing one, and now a per-statement
-undo log takes it back whole (`test_a_failed_statement_is_undone_in_a_transaction`).
-
-`INTERSECT` and `EXCEPT`, with the chain applied left to right (a `UNION`
-anywhere used to deduplicate the whole result); `NULLS FIRST` / `NULLS LAST`; a
-subquery or `VALUES` in `FROM`, and `VALUES` as a statement; row values in
-comparisons, `IN` lists and `IN (SELECT …)` (`test_compound_operators`,
-`test_nulls_first_and_last`, `test_derived_tables_and_values`,
-`test_row_values`). Two wrong answers were found and fixed on the way: a CTE's
-name stayed bound for the rest of a transaction, hiding a real table of that
-name from later statements, and an `ORDER BY` expression that failed (a misspelt
-column, a window function) sorted as NULL instead of failing the statement.
-
-**Now refused.** `UPDATE OR <resolution>`. A unique key an `UPDATE` changes is checked against the
-statement's result, where SQLite checks it row by row; a statement whose rows
-collide only partway through succeeds here (`docs/sqlite.md`).
-
-**Done when.** Each runs and matches SQLite in the differential corpus, including
-the `NULL` cases (`NULL IS NULL` is true, `1 & NULL` is `NULL`).
 
 ## S3 — Joins
 

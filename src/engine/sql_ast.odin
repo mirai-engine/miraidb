@@ -367,6 +367,17 @@ Assignment :: struct {
 	value:  ^Expr,
 }
 
+// Conflict_Resolution is SQLite's OR clause: ABORT (the default) undoes the
+// statement, FAIL keeps the rows before the failing one, IGNORE skips it,
+// REPLACE removes what it collides with, ROLLBACK ends the transaction.
+Conflict_Resolution :: enum u8 {
+	Abort,
+	Fail,
+	Ignore,
+	Replace,
+	Rollback,
+}
+
 Update_Stmt :: struct {
 	table:        string,
 	assignments:  []Assignment,
@@ -375,6 +386,9 @@ Update_Stmt :: struct {
 	// the assignments.
 	from:         Table_Ref,
 	returning:    ^Returning,
+	// conflict is UPDATE OR <resolution>: what a row that breaks a constraint
+	// does to the statement, as for INSERT.
+	conflict:     Conflict_Resolution,
 	// ctes are the common table expressions of `WITH ... INSERT|UPDATE|DELETE`
 	// (and of `INSERT INTO t WITH ... SELECT`), materialized before the write.
 	ctes:           []Cte,

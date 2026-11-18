@@ -40,7 +40,6 @@ that way.
 | # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
 | 8 | **S1 — the schema real files declare** — *done but one* | Done: `CHECK`, `CONSTRAINT` names, column `REFERENCES`, deferred foreign keys, `ASC`/`DESC` columns, `CURRENT_TIMESTAMP` and per-row defaults, partial and expression indexes, many NULLs in a UNIQUE column. Left: `ON CONFLICT` on a constraint. | S | — |
-| 9 | **S2 — statement and expression forms** — *done but one* | Done: `IS` values, `IS DISTINCT FROM`, bitwise operators, `->`/`->>`, `LIMIT a, b`, `INSERT OR IGNORE/FAIL/ROLLBACK`, `REPLACE INTO`, `INTERSECT`/`EXCEPT`, `NULLS FIRST/LAST`, derived tables and `VALUES`, row values; a failed statement is undone whole inside a transaction. Left: `UPDATE OR <resolution>`. | S | — |
 | 10 | **S3 — joins** | `NATURAL` (the shared columns are known only when the tables are resolved). | S | — |
 | 11 | **S4 — aggregates and windows** | `FILTER`, the `WINDOW` clause, `ORDER BY` inside an aggregate, `median` and the percentiles, `json_group_array`/`_object`. | M | — |
 | 12 | **S5 — functions** | 39 missing: hyperbolic math, `timediff`, `soundex`, `unistr`, planner hints, introspection, the rest of JSON and the `jsonb_*` family. | M | — |
@@ -73,8 +72,7 @@ with peer-to-peer sync; its networked phases build on items 27 and 28.
 
 ## Suggested order
 
-1. **The two leftovers of S1 and S2**, both small: `ON CONFLICT <resolution>` on
-   a constraint, and `UPDATE OR <resolution>`.
+1. **The leftover of S1**, small: `ON CONFLICT <resolution>` on a constraint.
 2. **R1 and R2**: the two largest gaps against the reference, measured, with the
    parity gate (item 5) landing alongside so the gain cannot slip back.
 3. **D36**: let the planner read partial and expression indexes, which are
