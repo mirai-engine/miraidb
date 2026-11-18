@@ -9,6 +9,7 @@ package engine
 import "core:fmt"
 import "core:math"
 import "core:mem"
+import "core:strconv"
 import "core:strings"
 import "core:unicode/utf8"
 
@@ -540,21 +541,13 @@ json_path_find :: proc(root: Json_Value, path: string) -> (Json_Value, bool) {
 				if !found do return {}, false
 				continue
 			}
-			if at < len(trimmed) && trimmed[at] == '#' {
-				at += 1
-				if at < len(trimmed) && trimmed[at] == ']' do at += 1
-				if current.kind != .Array do return {}, false
-				return Json_Value{kind = .Number, number = f64(len(current.items)), is_integer = true}, true
-			}
 			start := at
 			for at < len(trimmed) && trimmed[at] != ']' do at += 1
 			index_text := trimmed[start:at]
 			if at < len(trimmed) && trimmed[at] == ']' do at += 1
-			index, index_ok := parse_time_number(index_text)
-			if !index_ok || index < 0 do return {}, false
 			if current.kind != .Array do return {}, false
-			slot := int(index)
-			if slot >= len(current.items) do return {}, false
+			slot, slot_ok := json_slot(index_text, len(current.items))
+			if !slot_ok || slot >= len(current.items) do return {}, false
 			current = current.items[slot]
 		case:
 			return {}, false
@@ -748,6 +741,34 @@ Json_Segment :: struct {
 	is_index: bool,
 	name:     string,
 	index:    int,
+	// from_end is `[#-n]` (index is n) or `[#]` (n is 0): the slot counts back
+	// from the array's length.
+	from_end: bool,
+}
+
+// json_slot reads an array slot of a path against the array's length: `N`,
+// `#` (one past the last element) or `#-N`. A slot before the first element is
+// not one.
+@(private)
+json_slot :: proc(text: string, length: int) -> (int, bool) {
+	if strings.has_prefix(text, "#") {
+		if len(text) == 1 do return length, true
+		if text[1] != '-' do return 0, false
+		back, ok := strconv.parse_int(text[2:], 10)
+		if !ok || back < 0 || back > length do return 0, false
+		return length - back, true
+	}
+	index, ok := strconv.parse_int(text, 10)
+	if !ok || index < 0 do return 0, false
+	return index, true
+}
+
+// json_segment_slot is a segment's slot in an array of `length` elements.
+@(private)
+json_segment_slot :: proc(segment: Json_Segment, length: int) -> (int, bool) {
+	if !segment.from_end do return segment.index, true
+	if segment.index > length do return 0, false
+	return length - segment.index, true
 }
 
 // json_path_split separates the parent path from the last segment: object keys
@@ -778,6 +799,15 @@ json_path_split :: proc(path: string) -> (parent: string, last: Json_Segment, ok
 	if rest[0] == '[' {
 		if !strings.has_suffix(rest, "]") do return "", {}, false
 		index_text := rest[1:len(rest) - 1]
+		if strings.has_prefix(index_text, "#") {
+			back := 0
+			if len(index_text) > 1 {
+				parsed, parsed_ok := strconv.parse_int(index_text[2:], 10)
+				if index_text[1] != '-' || !parsed_ok || parsed < 0 do return "", {}, false
+				back = parsed
+			}
+			return parent, Json_Segment{is_index = true, index = back, from_end = true}, true
+		}
 		index, number_ok := parse_time_number(index_text)
 		if !number_ok || index < 0 do return "", {}, false
 		return parent, Json_Segment{is_index = true, index = int(index)}, true
@@ -817,11 +847,9 @@ json_path_find_ptr :: proc(root: ^Json_Value, path: string) -> (^Json_Value, boo
 			for at < len(trimmed) && trimmed[at] != ']' do at += 1
 			index_text := trimmed[start:at]
 			if at < len(trimmed) do at += 1
-			index, number_ok := parse_time_number(index_text)
-			if !number_ok || index < 0 do return nil, false
 			if current.kind != .Array do return nil, false
-			slot := int(index)
-			if slot >= len(current.items) do return nil, false
+			slot, slot_ok := json_slot(index_text, len(current.items))
+			if !slot_ok || slot >= len(current.items) do return nil, false
 			current = &current.items[slot]
 		case:
 			return nil, false
@@ -855,10 +883,12 @@ json_set_path :: proc(
 	if !parent_ok do return false
 	if last.is_index {
 		if parent.kind != .Array do return false
-		if last.index < len(parent.items) {
+		slot, slot_ok := json_segment_slot(last, len(parent.items))
+		if !slot_ok do return false
+		if slot < len(parent.items) {
 			if mode == .Insert_Only do return false
-			json_destroy(parent.items[last.index], alloc)
-			parent.items[last.index] = new_value
+			json_destroy(parent.items[slot], alloc)
+			parent.items[slot] = new_value
 			return true
 		}
 		if mode == .Replace_Only do return false
@@ -898,9 +928,11 @@ json_remove_path :: proc(root: ^Json_Value, path: string, alloc: mem.Allocator) 
 	parent, parent_ok := json_path_find_ptr(root, parent_path)
 	if !parent_ok do return false
 	if last.is_index {
-		if parent.kind != .Array || last.index >= len(parent.items) do return false
-		json_destroy(parent.items[last.index], alloc)
-		for i in last.index ..< len(parent.items) - 1 do parent.items[i] = parent.items[i + 1]
+		if parent.kind != .Array do return false
+		slot, slot_ok := json_segment_slot(last, len(parent.items))
+		if !slot_ok || slot >= len(parent.items) do return false
+		json_destroy(parent.items[slot], alloc)
+		for i in slot ..< len(parent.items) - 1 do parent.items[i] = parent.items[i + 1]
 		parent.items = parent.items[:len(parent.items) - 1]
 		return true
 	}

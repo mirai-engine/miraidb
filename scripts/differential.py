@@ -200,6 +200,9 @@ QUERIES = [
     "UPDATE OR REPLACE uq SET u = 20 WHERE id = 3 RETURNING id, u",
     "SELECT id, u FROM uq ORDER BY id",
     "UPDATE OR ABORT uq SET n = n + 1 WHERE id = 1 RETURNING n",
+    # `[#]` is one past the last element and `[#-n]` counts back from it.
+    "SELECT json_extract('[1,2,3]', '$[#]'), json_extract('[1,2,3]', '$[#-1]'), json_extract('[1,2,3]', '$[#-3]'), json_extract('[1,2,3]', '$[#-4]')",
+    "SELECT json_insert('[1]', '$[#]', 2), json_set('[1,2]', '$[#-1]', 9), json_replace('[1,2]', '$[#]', 9), json_remove('[1,2,3]', '$[#-1]'), json_set('{\"a\":[1]}', '$.a[#]', 5)",
     # FILTER, an aggregate's ORDER BY and the WINDOW clause (S4).
     "SELECT dept, count(*) FILTER (WHERE salary > 60), sum(salary) FILTER (WHERE name IS NOT NULL) FROM emp GROUP BY dept ORDER BY dept",
     "SELECT dept, group_concat(name, '/' ORDER BY name DESC) FROM emp GROUP BY dept ORDER BY dept",

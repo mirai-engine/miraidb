@@ -8795,9 +8795,11 @@ test_json_functions :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, `SELECT json_type('[1,2]', '$[1]')`).s, "integer")
 	testing.expect_value(t, scalar(t, store, `SELECT json_type('1.5')`).s, "real")
 	testing.expect_value(t, scalar(t, store, `SELECT json_type('null')`).s, "null")
-	// Paths walk objects, arrays and the #[length].
+	// Paths walk objects and arrays; `[#]` is one past the last element, so it
+	// finds nothing, and `[#-1]` is the last, as in SQLite.
 	testing.expect_value(t, scalar(t, store, `SELECT json_extract('{"a":{"b":[10,20,30]}}', '$.a.b[1]')`).i, i64(20))
-	testing.expect_value(t, scalar(t, store, `SELECT json_extract('[10,20,30]', '$[#]')`).i, i64(3))
+	testing.expect(t, db.value_is_null(scalar(t, store, `SELECT json_extract('[10,20,30]', '$[#]')`)))
+	testing.expect_value(t, scalar(t, store, `SELECT json_extract('[10,20,30]', '$[#-1]')`).i, i64(30))
 	testing.expect(t, db.value_is_null(scalar(t, store, `SELECT json_extract('{"a":1}', '$.missing')`)))
 	// Several paths produce a JSON array.
 	testing.expect_value(t, scalar(t, store, `SELECT json_extract('{"a":1,"b":2}', '$.a', '$.b')`).s, "[1,2]")
