@@ -78,6 +78,7 @@ store_write_snapshot_locked :: proc(store: ^Store) -> Error {
 @(private)
 store_write_snapshot_payload :: proc(store: ^Store, payload: []u8) -> Error {
 	path := store_snapshot_path(store.path)
+	defer delete(path)
 	temp_path := strings.concatenate({store.path, "/snapshot.tmp"})
 	defer delete(temp_path)
 	file, open_err := os.open(temp_path, {.Read, .Write, .Create, .Trunc})
@@ -120,6 +121,7 @@ store_write_snapshot_payload :: proc(store: ^Store, payload: []u8) -> Error {
 // that sequence.
 store_load_snapshot :: proc(store: ^Store) -> Error {
 	path := store_snapshot_path(store.path)
+	defer delete(path)
 	if !os.exists(path) do return ERROR_NONE
 	data, read_err := os.read_entire_file(path, context.allocator)
 	if read_err != nil {

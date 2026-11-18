@@ -68,15 +68,13 @@ stats_analyze :: proc(store: ^Store, only: string) -> (count: int, err: Error) {
 	defer delete(names)
 	slice.sort(names)
 	measured: map[string]Table_Stats
-	// The store owns the columns and the keys once they are installed, so the
-	// cleanup below must not free what it handed over.
+	// The store owns the columns once they are installed, so the cleanup below
+	// must not free what it handed over; stats_store_put keeps its own key.
 	installed := false
 	defer {
-		if !installed {
-			for name, stats in measured {
-				delete(stats.columns)
-				delete(name)
-			}
+		for name, stats in measured {
+			if !installed do delete(stats.columns)
+			delete(name)
 		}
 		delete(measured)
 	}
@@ -133,14 +131,19 @@ stats_measure_table :: proc(tx: ^Tx, table: ^Table) -> (Table_Stats, Error) {
 	// the counts are what survives.
 	sets := make([]map[string]bool, len(columns))
 	defer {
-		for set in sets do delete(set)
+		for set in sets {
+			for key in set do delete(key)
+			delete(set)
+		}
 		delete(sets)
 	}
 	for i in 0 ..< len(sets) do sets[i] = make(map[string]bool)
 	// First pass: distinct values, NULLs and the numeric range of each column.
 	numeric := make([]bool, len(columns))
+	defer delete(numeric)
 	for i in 0 ..< len(columns) do numeric[i] = true
 	seen_numeric := make([]bool, len(columns))
+	defer delete(seen_numeric)
 	for row in rows {
 		for column, i in row.values {
 			if i >= len(columns) do break
@@ -580,12 +583,16 @@ stats_load :: proc(store: ^Store) {
 	path := store_stats_path(store)
 	defer delete(path)
 	file, open_err := log_file_open(store.vfs, path, {.Read})
-	if open_err.kind != .None do return
+	if open_err.kind != .None {
+		error_free(&open_err)
+		return
+	}
 	defer log_file_close(file)
 	size := log_file_size(file)
 	if size < STATS_FILE_HEADER_LEN do return
 	header: [STATS_FILE_HEADER_LEN]u8
 	n, read_err := log_file_read(file, header[:])
+	defer error_free(&read_err)
 	if read_err.kind != .None || n != STATS_FILE_HEADER_LEN do return
 	if string(header[:4]) != STATS_FILE_MAGIC do return
 	if get_u32_le(header[4:8]) != STATS_FILE_VERSION do return
@@ -594,6 +601,7 @@ stats_load :: proc(store: ^Store) {
 	body := make([]u8, length)
 	defer delete(body)
 	got, body_err := log_file_read(file, body)
+	defer error_free(&body_err)
 	if body_err.kind != .None || got != length do return
 	if crc32c(body) != get_u32_le(header[24:28]) do return
 	r: Byte_Reader

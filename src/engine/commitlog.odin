@@ -316,6 +316,8 @@ log_rotate :: proc(log: ^Commit_Log, next_seq: u64) -> Error {
 	}
 	new_index := log.segment + 1
 	new_path := log_segment_path(log.directory, new_index)
+	kept := false
+	defer if !kept do delete(new_path)
 	file, open_err := log_file_open(log.vfs, new_path, {.Read, .Write, .Create, .Trunc})
 	if open_err.kind != .None {
 		return errf(.Io, "cannot create %s: %v", new_path, open_err.message)
@@ -336,7 +338,9 @@ log_rotate :: proc(log: ^Commit_Log, next_seq: u64) -> Error {
 		}
 	}
 	log.file = file
+	delete(log.path)
 	log.path = new_path
+	kept = true
 	log.segment = new_index
 	log.size = LOG_HEADER_LEN
 	log.base_seq = next_seq - 1
@@ -358,6 +362,8 @@ log_open_memory :: proc() -> Commit_Log {
 }
 
 log_close :: proc(log: ^Commit_Log) {
+	delete(log.path)
+	log.path = ""
 	if log.memory_mode {
 		delete(log.memory)
 		log.memory_mode = false

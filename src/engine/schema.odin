@@ -137,7 +137,7 @@ type_kind_name :: proc(kind: Type_Kind) -> string {
 }
 
 type_kind_from_name :: proc(name: string) -> (kind: Type_Kind, width: u8, ok: bool) {
-	switch strings.to_upper(name) {
+	switch strings.to_upper(name, context.temp_allocator) {
 	case "BOOL", "BOOLEAN":
 		return .Bool, 0, true
 	case "TINYINT", "INT1":
@@ -698,7 +698,7 @@ type_split_components :: proc(body: string) -> ([]string, bool) {
 // type catalog stores bases that are themselves structural.
 type_parse_text :: proc(text: string) -> (Column_Type, bool) {
 	trimmed := strings.trim_space(text)
-	upper := strings.to_upper(trimmed)
+	upper := strings.to_upper(trimmed, context.temp_allocator)
 	if strings.has_prefix(upper, "OPTION(") && strings.has_suffix(trimmed, ")") {
 		inner, ok := type_parse_text(trimmed[7:len(trimmed) - 1])
 		if !ok do return {}, false

@@ -2045,7 +2045,7 @@ parse_type_ref :: proc(p: ^Parser) -> (t: Column_Type, builtin: bool, name: stri
 @(private)
 parse_type_base :: proc(p: ^Parser) -> (t: Column_Type, builtin: bool, name: string) {
 	name = p_ident_or_keyword(p)
-	upper := strings.to_upper(name)
+	upper := strings.to_upper(name, context.temp_allocator)
 	if upper == "OPTION" {
 		if !p_expect_punct(p, "(") do return {}, true, name
 		inner, inner_ok, inner_name := parse_type_ref(p)
@@ -2662,7 +2662,7 @@ parse_create_index :: proc(p: ^Parser, unique: bool) -> Statement {
 	stmt.table = p_ident(p)
 	if p_match_keyword(p, "using") {
 		method := p_ident_or_keyword(p)
-		switch strings.to_upper(method) {
+		switch strings.to_upper(method, context.temp_allocator) {
 		case "BTREE":
 			stmt.algorithm = .Btree
 		case "HASH":

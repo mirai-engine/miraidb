@@ -784,7 +784,7 @@ pg_describe_select :: proc(host: ^Host, sql: string) -> []u8 {
 	}
 	// Unknown shape: fall back to evaluating a SELECT with neutralized
 	// placeholders, which still yields the column set.
-	upper := strings.to_upper(strings.trim_space(sql))
+	upper := strings.to_upper(strings.trim_space(sql), context.temp_allocator)
 	if !strings.has_prefix(upper, "SELECT") && !strings.has_prefix(upper, "WITH") {
 		return pg_no_data()
 	}

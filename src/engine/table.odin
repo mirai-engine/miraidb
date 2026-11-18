@@ -328,6 +328,8 @@ index_cmp :: proc(a, b: string) -> slice.Ordering {
 
 table_create :: proc(schema: ^Table_Schema) -> (^Table, Error) {
 	normalized := schema^
+	// The table keeps a copy in its arena; what normalizing added is freed here.
+	defer schema_normalize_free(&normalized, schema)
 	if err := schema_normalize(&normalized); err.kind != .None {
 		return nil, err
 	}
@@ -567,6 +569,18 @@ schema_normalize :: proc(schema: ^Table_Schema) -> Error {
 		schema.indexes = merged
 	}
 	return ERROR_NONE
+}
+
+// schema_normalize_free frees what schema_normalize added to a copy of
+// `original`: the implicit indexes and the slice that holds them.
+@(private)
+schema_normalize_free :: proc(normalized: ^Table_Schema, original: ^Table_Schema) {
+	if raw_data(normalized.indexes) == raw_data(original.indexes) do return
+	for idx in normalized.indexes[len(original.indexes):] {
+		delete(idx.name)
+		delete(idx.columns)
+	}
+	delete(normalized.indexes)
 }
 
 clone_values :: proc(values: []Value) -> []Value {
