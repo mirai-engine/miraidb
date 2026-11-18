@@ -154,6 +154,11 @@ def build_gates(args: argparse.Namespace) -> list[Gate]:
             gates.append(
                 Gate("Python's sqlite3 suite", [args.windows_python, "scripts/python_sqlite3.py"])
             )
+            # Two processes on one SQLite file, through the facade and through
+            # SQLite itself: SQLite's locks and change counter, across processes.
+            gates.append(
+                Gate("SQLite file across processes", [args.windows_python, "scripts/sqlite_processes.py"])
+            )
             gates.append(
                 Gate("Python SDK smoke", [args.windows_python, "scripts/sdk_smoke.py"])
             )
