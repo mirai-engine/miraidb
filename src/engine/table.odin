@@ -1032,14 +1032,29 @@ table_check_unique :: proc(t: ^Table, values: []Value, ignore: Row_Id = Row_Id(m
 		defer delete(ids)
 		for id in ids {
 			if id == ignore do continue
-			return errf(
-				index_is_primary(t, i) ? .Duplicate_Primary_Key : .Duplicate_Unique,
-				"duplicate key for index %s",
-				idx.schema.name,
-			)
+			return unique_violation(t, i)
 		}
 	}
 	return ERROR_NONE
+}
+
+// unique_violation is the error a row that repeats a unique key gets, in
+// SQLite's words: the table and the key's columns, or the index for a key
+// over an expression.
+unique_violation :: proc(t: ^Table, i: int) -> Error {
+	kind := index_is_primary(t, i) ? Error_Kind.Duplicate_Primary_Key : Error_Kind.Duplicate_Unique
+	index := t.indexes[i].schema
+	for expr in index.exprs {
+		if len(expr) > 0 do return errf(kind, "UNIQUE constraint failed: index '%s'", index.name)
+	}
+	columns := strings.builder_make(context.temp_allocator)
+	for position, n in index.columns {
+		if n > 0 do strings.write_string(&columns, ", ")
+		strings.write_string(&columns, t.schema.name)
+		strings.write_byte(&columns, '.')
+		if position >= 0 && position < len(t.schema.columns) do strings.write_string(&columns, t.schema.columns[position].name)
+	}
+	return errf(kind, "UNIQUE constraint failed: %s", strings.to_string(columns))
 }
 
 @(private)

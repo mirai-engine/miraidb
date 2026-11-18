@@ -468,3 +468,30 @@ test_sqlite_file_round_trip :: proc(t: ^testing.T) {
 	testing.expect(t, db.error_drop(db.embed_exec(conn, "DROP VIEW sv")))
 	testing.expect_value(t, file_scalar(t, conn, "SELECT count(*) FROM sqlite_master WHERE type IN ('view', 'trigger')"), "2")
 }
+
+@(test)
+test_constraint_messages :: proc(t: ^testing.T) {
+	// A broken key or NOT NULL says so in SQLite's words, which programs
+	// match: "UNIQUE constraint failed: t.a, t.b", "NOT NULL constraint
+	// failed: t.c". They used to name the engine's index.
+	store := fresh_db(t, "constraint_messages")
+	if store == nil do return
+	defer cleanup_db(store, "constraint_messages")
+	run(t, store, "CREATE TABLE k (a TEXT PRIMARY KEY, b INTEGER UNIQUE, c INT NOT NULL DEFAULT 0, d INT, e INT, UNIQUE (d, e))")
+	run(t, store, "CREATE TABLE r (id INTEGER PRIMARY KEY)")
+	run(t, store, "INSERT INTO k (a, b, d, e) VALUES ('x', 1, 1, 1)")
+	run(t, store, "INSERT INTO r VALUES (1)")
+	run(t, store, "INSERT INTO k (a, b) VALUES ('m', 2)")
+	cases := [][2]string {
+		{"INSERT INTO k (a, b) VALUES ('x', 2)", "UNIQUE constraint failed: k.a"},
+		{"INSERT INTO k (a, b) VALUES ('y', 1)", "UNIQUE constraint failed: k.b"},
+		{"INSERT INTO k (a, b, d, e) VALUES ('z', 5, 1, 1)", "UNIQUE constraint failed: k.d, k.e"},
+		{"INSERT INTO k (a, b, c) VALUES ('w', 9, NULL)", "NOT NULL constraint failed: k.c"},
+		{"INSERT INTO r VALUES (1)", "UNIQUE constraint failed: r.id"},
+		{"UPDATE k SET b = 1 WHERE a = 'm'", "UNIQUE constraint failed: k.b"},
+	}
+	for c in cases {
+		err := run_error(t, store, c[0])
+		testing.expectf(t, err.message == c[1], "%s: %s", c[0], err.message)
+	}
+}

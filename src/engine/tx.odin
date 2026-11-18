@@ -1259,7 +1259,7 @@ tx_insert_row :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error)
 		coerced, coerce_err := value_coerce_into(v, &table.schema, i)
 		if coerce_err.kind != .None do return 0, coerce_err
 		if coerced.kind == .Null && column.not_null {
-			return 0, errf(.Not_Null_Violation, "column %s.%s cannot be NULL", name, column.name)
+			return 0, errf(.Not_Null_Violation, "NOT NULL constraint failed: %s.%s", name, column.name)
 		}
 		if column.auto_increment {
 			number, number_ok := value_to_i64(coerced)
@@ -1402,7 +1402,7 @@ tx_update_row :: proc(tx: ^Tx, name: string, id: Row_Id, values: []Value) -> Err
 		coerced, coerce_err := value_coerce_into(v, &table.schema, i)
 		if coerce_err.kind != .None do return coerce_err
 		if coerced.kind == .Null && column.not_null {
-			return errf(.Not_Null_Violation, "column %s.%s cannot be NULL", name, column.name)
+			return errf(.Not_Null_Violation, "NOT NULL constraint failed: %s.%s", name, column.name)
 		}
 		row_values[i] = value_clone(coerced, tx.alloc)
 	}
@@ -1661,20 +1661,12 @@ tx_check_unique :: proc(
 		if keys != nil do append(keys, key)
 		if writes != nil {
 			if holder, taken := writes.unique_keys[key]; taken && holder != ignore {
-				return errf(
-					index_is_primary(table, i) ? .Duplicate_Primary_Key : .Duplicate_Unique,
-					"duplicate key for index %s",
-					idx.schema.name,
-				)
+				return unique_violation(table, i)
 			}
 		}
 		if committed, ok := tx.store.tables[name]; ok {
 			if tx_committed_key_taken(tx, committed, i, values, ignore, writes) {
-				return errf(
-					index_is_primary(table, i) ? .Duplicate_Primary_Key : .Duplicate_Unique,
-					"duplicate key for index %s",
-					idx.schema.name,
-				)
+				return unique_violation(table, i)
 			}
 		}
 	}
