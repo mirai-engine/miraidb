@@ -8190,6 +8190,8 @@ sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Res
 				continue
 			}
 			if len(stmt.conflict_assignments) == 0 do return {}, insert_err
+			// DO UPDATE answers the statement: the collision is not its error.
+			error_free(&insert_err)
 			new_values := make([]Value, len(table.schema.columns), tx.alloc)
 			for value, i in conflict.values do new_values[i] = value
 			// Expressions see the stored row; `excluded` is the proposed row. The

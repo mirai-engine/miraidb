@@ -173,6 +173,17 @@ test_replay_leaves_nothing :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_upsert_leaves_nothing :: proc(t: ^testing.T) {
+	// DO UPDATE answers the collision the insert met; its message goes.
+	expect_nothing_left(t, .Memory, "_test_memory_upsert", {
+		"CREATE TABLE t (k INT PRIMARY KEY, n INT)",
+		"INSERT INTO t VALUES (1, 1) ON CONFLICT (k) DO UPDATE SET n = n + 1",
+		"INSERT INTO t VALUES (1, 1) ON CONFLICT (k) DO UPDATE SET n = n + 1",
+		"INSERT INTO t VALUES (1, 1) ON CONFLICT (k) DO NOTHING",
+	})
+}
+
+@(test)
 test_a_parse_error_leaves_nothing :: proc(t: ^testing.T) {
 	// The error names the line and column; the detail it wraps is not kept.
 	expect_nothing_left(t, .Memory, "_test_memory_parse", {"SELECT FROM WHERE", "SELEC 1", "CREATE TABLE ("}, fails = true)
