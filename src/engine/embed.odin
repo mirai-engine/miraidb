@@ -655,6 +655,21 @@ embed_is_query :: proc(sql: string) -> bool {
 	for prefix in ([]string{"SELECT", "WITH", "VALUES", "EXPLAIN", "SHOW", "DESCRIBE"}) {
 		if strings.has_prefix(upper, prefix) do return true
 	}
+	// A PRAGMA that reads (no `=`) answers rows whose columns a program asks
+	// for before the first step, as SQLite knows them at prepare: the shell
+	// sizes its output that way. It runs once, here, and the steps read that
+	// result.
+	if strings.has_prefix(upper, "PRAGMA") && (!strings.contains(upper, "=") || pragma_reads_with_argument(upper)) do return true
+	return false
+}
+
+// pragma_reads_with_argument reports a PRAGMA whose `= x` names what to read
+// rather than a setting: `PRAGMA table_info = t` is `PRAGMA table_info(t)`.
+@(private)
+pragma_reads_with_argument :: proc(upper: string) -> bool {
+	for name in ([]string{"TABLE_INFO", "TABLE_XINFO", "INDEX_LIST", "INDEX_INFO", "INDEX_XINFO", "FOREIGN_KEY_LIST", "FOREIGN_KEY_CHECK", "INTEGRITY_CHECK", "QUICK_CHECK"}) {
+		if strings.contains(upper, name) do return true
+	}
 	return false
 }
 
