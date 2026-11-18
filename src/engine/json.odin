@@ -591,7 +591,8 @@ json_type_name :: proc(value: Json_Value) -> string {
 
 // json_call runs a JSON function. It reports false when the name is not one of
 // them, and returns a NULL value for invalid input or a missing path.
-json_call :: proc(name: string, args: []Value) -> (Value, bool, Error) {
+json_call :: proc(name: string, given: []Value) -> (Value, bool, Error) {
+	args := given
 	if !json_call_name(name) do return {}, false, ERROR_NONE
 	// jsonb_X answers what json_X answers, as JSONB.
 	if len(name) >= 5 && strings.equal_fold(name[:5], "jsonb") {
@@ -605,7 +606,8 @@ json_call :: proc(name: string, args: []Value) -> (Value, bool, Error) {
 	}
 	// A document given as JSONB reads as the JSON it holds; another BLOB is
 	// not a document.
-	args, documents_ok := json_documents_as_text(name, args)
+	documents_ok: bool
+	args, documents_ok = json_documents_as_text(name, args)
 	if !documents_ok do return {}, true, errf(.Invalid_Argument, "malformed JSON")
 	if strings.equal_fold(name, "json_array_insert") do return json_array_insert_call(args)
 	if strings.equal_fold(name, "json_set") || strings.equal_fold(name, "json_replace") ||
@@ -1163,8 +1165,8 @@ json_documents_as_text :: proc(name: string, args: []Value) -> ([]Value, bool) {
 // or an object as JSONB and anything else as its SQL value; several paths give
 // a JSONB array of what each found.
 @(private)
-jsonb_extract_call :: proc(args: []Value) -> (Value, bool, Error) {
-	args, documents_ok := json_documents_as_text("jsonb_extract", args)
+jsonb_extract_call :: proc(given: []Value) -> (Value, bool, Error) {
+	args, documents_ok := json_documents_as_text("jsonb_extract", given)
 	if !documents_ok do return {}, true, errf(.Invalid_Argument, "malformed JSON")
 	if len(args) < 2 do return {}, true, errf(.Invalid_Argument, "jsonb_extract() needs a document and a path")
 	if args[0].kind == .Null do return value_null(), true, ERROR_NONE
