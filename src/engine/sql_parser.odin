@@ -1852,6 +1852,9 @@ parse_create_trigger :: proc(p: ^Parser) -> Statement {
 	stmt.name = p_ident(p)
 	if p_match_keyword(p, "before") {
 		stmt.before = true
+	} else if p_match_keyword(p, "instead") {
+		p_expect_keyword(p, "of")
+		stmt.instead = true
 	} else {
 		_ = p_match_keyword(p, "after")
 	}

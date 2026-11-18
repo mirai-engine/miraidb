@@ -629,6 +629,8 @@ sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sq
 		vtab, is_vtab, vtab_err := vtab_find(tx, target)
 		if vtab_err.kind != .None do return {}, vtab_err
 		if is_vtab do return vtab_write(tx, vtab, statement, params)
+		// A view is written through its INSTEAD OF triggers.
+		if _, is_view := view_sql(tx, target); is_view do return view_write(tx, target, statement, params)
 	}
 	switch stmt in statement {
 	case Reindex_Stmt:

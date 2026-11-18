@@ -62,6 +62,10 @@ sql_exec_drop_view :: proc(tx: ^Tx, stmt: Drop_View_Stmt) -> (Sql_Result, Error)
 	if affected == 0 && !stmt.if_exists {
 		return {}, errf(.Table_Not_Found, "view %s does not exist", stmt.name)
 	}
+	// The view's INSTEAD OF triggers go with it.
+	if affected > 0 {
+		if drop_err := triggers_drop_on(tx, stmt.name); drop_err.kind != .None do return {}, drop_err
+	}
 	return Sql_Result{kind = .Ack, affected = affected, commit_seq = tx.store.commit_seq}, ERROR_NONE
 }
 

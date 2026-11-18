@@ -71,6 +71,11 @@ SETUP = [
     "CREATE TABLE oc (id INTEGER PRIMARY KEY ON CONFLICT REPLACE, u INTEGER UNIQUE ON CONFLICT IGNORE, "
     "n INTEGER NOT NULL ON CONFLICT REPLACE DEFAULT 7, f INTEGER, UNIQUE (f) ON CONFLICT FAIL)",
     "INSERT INTO oc (id, u, n, f) VALUES (1, 1, 1, 1), (2, 2, 2, 2)",
+    "CREATE TABLE vt (a INTEGER, b TEXT)",
+    "CREATE VIEW vtv AS SELECT a, b, a * 10 AS c FROM vt",
+    "CREATE TRIGGER vtv_ins INSTEAD OF INSERT ON vtv BEGIN INSERT INTO vt VALUES (NEW.a, upper(NEW.b)); END",
+    "CREATE TRIGGER vtv_upd INSTEAD OF UPDATE ON vtv BEGIN UPDATE vt SET b = NEW.b WHERE a = OLD.a; END",
+    "CREATE TRIGGER vtv_del INSTEAD OF DELETE ON vtv WHEN OLD.a > 1 BEGIN DELETE FROM vt WHERE a = OLD.a; END",
 ]
 
 QUERIES = [
@@ -195,6 +200,12 @@ QUERIES = [
     "UPDATE OR REPLACE uq SET u = 20 WHERE id = 3 RETURNING id, u",
     "SELECT id, u FROM uq ORDER BY id",
     "UPDATE OR ABORT uq SET n = n + 1 WHERE id = 1 RETURNING n",
+    # INSTEAD OF triggers (S6) write a view: the body does the write, NEW and
+    # OLD are the view's columns, and RETURNING answers the view's row.
+    "INSERT INTO vtv (b, a) VALUES ('x', 1), ('y', 2), ('z', 3) RETURNING a, b, c",
+    "UPDATE vtv SET b = 'w' WHERE c >= 20 RETURNING a, b",
+    "DELETE FROM vtv WHERE a <= 2 RETURNING a",
+    "SELECT a, b, c FROM vtv ORDER BY a",
     # A constraint's ON CONFLICT (S1) decides when the statement names none.
     "INSERT INTO oc (id, u, n, f) VALUES (1, 10, 10, 10) RETURNING id, u",
     "INSERT INTO oc (id, u, n, f) VALUES (3, 2, 3, 3) RETURNING id",

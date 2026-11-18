@@ -23,6 +23,21 @@ Trigger_Fire_Event :: enum {
 Trigger_Timing :: enum {
 	Before,
 	After,
+	// Instead runs in place of a write to a view (instead.odin).
+	Instead,
+}
+
+@(private)
+trigger_timing_name :: proc(timing: Trigger_Timing) -> string {
+	switch timing {
+	case .Before:
+		return "before"
+	case .After:
+		return "after"
+	case .Instead:
+		return "instead"
+	}
+	return "after"
 }
 
 // trigger_ensure creates the catalog on first use.
@@ -52,7 +67,16 @@ trigger_create :: proc(tx: ^Tx, stmt: Create_Trigger_Stmt) -> Error {
 		return errf(.Sql_Syntax, "a trigger needs at least one statement")
 	}
 	if ensure_err := trigger_ensure(tx); ensure_err.kind != .None do return ensure_err
-	if table, table_err := tx_table(tx, stmt.table); table_err.kind != .None {
+	// A view takes only INSTEAD OF triggers, and a table never does.
+	_, is_view := view_sql(tx, stmt.table)
+	if is_view && !stmt.instead {
+		return errf(.Sql_Unsupported, "cannot create %s trigger on view: %s", stmt.before ? "BEFORE" : "AFTER", stmt.table)
+	}
+	if !is_view && stmt.instead {
+		return errf(.Sql_Unsupported, "cannot create INSTEAD OF trigger on table: %s", stmt.table)
+	}
+	if is_view {
+	} else if table, table_err := tx_table(tx, stmt.table); table_err.kind != .None {
 		return errf(.Table_Not_Found, "trigger table %s does not exist", stmt.table)
 	} else if table.schema.ephemeral {
 		return errf(.Sql_Unsupported, "triggers need a persistent table")
@@ -69,7 +93,7 @@ trigger_create :: proc(tx: ^Tx, stmt: Create_Trigger_Stmt) -> Error {
 		value_string(stmt.name),
 		value_string(stmt.table),
 		value_string(stmt.event),
-		value_string(stmt.before ? "before" : "after"),
+		value_string(stmt.instead ? "instead" : stmt.before ? "before" : "after"),
 		value_string(stmt.body),
 		value_string(stmt.when_text),
 	}
@@ -187,7 +211,7 @@ trigger_fire :: proc(
 		[]Value {
 			value_string(table_name),
 			value_string(event_name),
-			value_string(timing == .Before ? "before" : "after"),
+			value_string(trigger_timing_name(timing)),
 		},
 	)
 	if query_err.kind != .None do return query_err

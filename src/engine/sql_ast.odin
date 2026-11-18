@@ -841,6 +841,9 @@ Create_Trigger_Stmt :: struct {
 	table:         string,
 	event:         string, // insert | update | delete
 	before:        bool,
+	// instead is INSTEAD OF: the trigger of a view, whose body does the
+	// write the statement on the view asked for.
+	instead:       bool,
 	body:          string,
 	// when_text is the optional WHEN expression, kept as text and parsed when
 	// the trigger fires with NEW and OLD in scope.

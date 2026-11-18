@@ -618,7 +618,7 @@ res_ddl :: proc(walk: ^Res_Walk, statement: ^Statement) {
 			res_fail(walk, .Index_Not_Found, "no such index: %s", s.name)
 		}
 	case Create_Trigger_Stmt:
-		if res_relation_kind(walk, s.table) != "table" {
+		if kind := res_relation_kind(walk, s.table); kind != "table" && kind != "view" {
 			res_fail(walk, .Table_Not_Found, "no such table: main.%s", s.table)
 		}
 	case Alter_Table_Stmt:

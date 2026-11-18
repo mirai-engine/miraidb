@@ -118,3 +118,48 @@ test_generate_series :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(run(t, store, "SELECT * FROM generate_series(1, 2)").columns), 1)
 	_ = run_error(t, store, "SELECT count(*) FROM generate_series")
 }
+
+@(test)
+test_instead_of_triggers :: proc(t: ^testing.T) {
+	// INSTEAD OF triggers (S6) make a view writable: the statement on the view
+	// writes nothing and counts no change, its trigger's body does the write,
+	// and a view without one, a BEFORE trigger on a view and an INSTEAD OF
+	// trigger on a table are refused. The triggers go with the view.
+	store := fresh_db(t, "instead")
+	if store == nil do return
+	defer cleanup_db(store, "instead")
+	for sql in ([]string {
+		"CREATE TABLE t (a INTEGER, b TEXT)",
+		"CREATE VIEW v AS SELECT a, b FROM t",
+		"CREATE TRIGGER vi INSTEAD OF INSERT ON v BEGIN INSERT INTO t VALUES (NEW.a, NEW.b); END",
+		"CREATE TRIGGER vu INSTEAD OF UPDATE ON v BEGIN UPDATE t SET b = NEW.b WHERE a = OLD.a; END",
+		"CREATE TRIGGER vd INSTEAD OF DELETE ON v BEGIN DELETE FROM t WHERE a = OLD.a; END",
+	}) {
+		result := run(t, store, sql)
+		db.sql_result_destroy(&result)
+	}
+	inserted := run(t, store, "INSERT INTO v VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+	testing.expect_value(t, inserted.affected, 0)
+	db.sql_result_destroy(&inserted)
+	updated := run(t, store, "UPDATE v SET b = 'z' WHERE a >= 2")
+	db.sql_result_destroy(&updated)
+	deleted := run(t, store, "DELETE FROM v WHERE a = 3")
+	db.sql_result_destroy(&deleted)
+	testing.expect_value(t, scalar(t, store, "SELECT group_concat(a || b, ',') FROM (SELECT a, b FROM t ORDER BY a)").s, "1a,2z")
+	returned := run(t, store, "INSERT INTO v (b, a) VALUES ('q', 9) RETURNING a")
+	testing.expect(t, len(returned.rows) == 1 && returned.rows[0][0].i == 9)
+	db.sql_result_destroy(&returned)
+	for sql in ([]string {
+		"CREATE VIEW w AS SELECT 1 AS z",
+		"CREATE TRIGGER wi INSTEAD OF INSERT ON w BEGIN SELECT 1; END",
+	}) {
+		result := run(t, store, sql)
+		db.sql_result_destroy(&result)
+	}
+	_ = run_error(t, store, "DELETE FROM w")
+	_ = run_error(t, store, "CREATE TRIGGER vb BEFORE INSERT ON v BEGIN SELECT 1; END")
+	_ = run_error(t, store, "CREATE TRIGGER ti INSTEAD OF INSERT ON t BEGIN SELECT 1; END")
+	dropped := run(t, store, "DROP VIEW v")
+	db.sql_result_destroy(&dropped)
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM _triggers WHERE table_name = 'v'").i, i64(0))
+}
