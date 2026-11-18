@@ -31,11 +31,14 @@ fk_check_child_one :: proc(tx: ^Tx, fk: Foreign_Key, values: []Value) -> Error {
 // empty result is a healthy database. It runs on a read snapshot, so a commit
 // cannot move the rows under it, and it is a diagnostic: the cost is linear in
 // the rows of every table plus one index probe per row.
-store_integrity_check :: proc(store: ^Store, alloc: mem.Allocator) -> [dynamic]string {
+store_integrity_check :: proc(store: ^Store, alloc: mem.Allocator, in_tx: ^Tx = nil) -> [dynamic]string {
 	problems := make([dynamic]string, 0, 4, alloc)
-	tx := tx_begin_read(store)
-	defer tx_end(tx)
-	names := store_table_names(store, alloc)
+	// Inside a connection's transaction the check reads what that transaction
+	// sees: a read of its own would wait for the lock the transaction holds.
+	tx := in_tx
+	if tx == nil do tx = tx_begin_read(store)
+	defer if in_tx == nil do tx_end(tx)
+	names := slice.clone(tx_table_names(tx, context.temp_allocator), alloc)
 	defer delete(names, alloc)
 	slice.sort(names)
 	for name in names {
@@ -140,11 +143,14 @@ Foreign_Key_Problem :: struct {
 
 // store_foreign_key_check reports every child row whose foreign key does not
 // resolve to a parent row.
-store_foreign_key_check :: proc(store: ^Store, alloc: mem.Allocator) -> [dynamic]Foreign_Key_Problem {
+store_foreign_key_check :: proc(store: ^Store, alloc: mem.Allocator, in_tx: ^Tx = nil) -> [dynamic]Foreign_Key_Problem {
 	problems := make([dynamic]Foreign_Key_Problem, 0, 4, alloc)
-	tx := tx_begin_read(store)
-	defer tx_end(tx)
-	names := store_table_names(store, alloc)
+	// Inside a connection's transaction the check reads what that transaction
+	// sees: a read of its own would wait for the lock the transaction holds.
+	tx := in_tx
+	if tx == nil do tx = tx_begin_read(store)
+	defer if in_tx == nil do tx_end(tx)
+	names := slice.clone(tx_table_names(tx, context.temp_allocator), alloc)
 	defer delete(names, alloc)
 	slice.sort(names)
 	for name in names {

@@ -122,6 +122,21 @@ test_returning_takes_expressions :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_checks_run_inside_the_open_transaction :: proc(t: ^testing.T) {
+	store := face_store(t)
+	defer db.store_close(store)
+	conn := db.embed_wrap(store)
+	defer db.embed_close(conn)
+	face_ok(t, conn, "CREATE TABLE p (id INTEGER PRIMARY KEY)")
+	face_ok(t, conn, "CREATE TABLE c (id INTEGER PRIMARY KEY, p INTEGER REFERENCES p (id))")
+	face_ok(t, conn, "BEGIN")
+	face_ok(t, conn, "INSERT INTO c VALUES (1, 9)")
+	// The check reads the transaction (it used to wait for its lock forever).
+	expect_list(t, face_ints(t, conn, "SELECT count(*) FROM pragma_foreign_key_check"), {1}, "orphans")
+	face_ok(t, conn, "ROLLBACK")
+}
+
+@(test)
 test_create_virtual_table_keeps_its_text :: proc(t: ^testing.T) {
 	store := face_store(t)
 	defer db.store_close(store)

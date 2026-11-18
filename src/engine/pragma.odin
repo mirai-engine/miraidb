@@ -352,9 +352,9 @@ sql_exec_pragma :: proc(store: ^Store, body: string, locked: bool, tx: ^Tx = nil
 		if has_argument do return Sql_Result{kind = .Ack, message = strings.clone("ok"), commit_seq = store.commit_seq}, ERROR_NONE
 		return pragma_single("foreign_keys", value_int(store.foreign_keys_off ? 0 : 1), store.commit_seq), ERROR_NONE
 	case "integrity_check", "quick_check":
-		return pragma_check(store, name), ERROR_NONE
+		return pragma_check(store, name, tx), ERROR_NONE
 	case "foreign_key_check":
-		return pragma_foreign_key_check(store), ERROR_NONE
+		return pragma_foreign_key_check(store, tx), ERROR_NONE
 	case "stats":
 		return pragma_stats(store), ERROR_NONE
 	case "sqlite_version":
@@ -511,8 +511,8 @@ pragma_sync_number :: proc(durability: Durability) -> i64 {
 // pragma_check answers integrity_check with the problems the checker found, or
 // with the single row `ok`.
 @(private)
-pragma_check :: proc(store: ^Store, name: string) -> Sql_Result {
-	problems := store_integrity_check(store, context.allocator)
+pragma_check :: proc(store: ^Store, name: string, tx: ^Tx = nil) -> Sql_Result {
+	problems := store_integrity_check(store, context.allocator, tx)
 	defer delete(problems)
 	if len(problems) == 0 {
 		return pragma_single(name, pragma_text("ok"), store.commit_seq)
@@ -530,8 +530,8 @@ pragma_check :: proc(store: ^Store, name: string) -> Sql_Result {
 }
 
 @(private)
-pragma_foreign_key_check :: proc(store: ^Store) -> Sql_Result {
-	problems := store_foreign_key_check(store, context.allocator)
+pragma_foreign_key_check :: proc(store: ^Store, tx: ^Tx = nil) -> Sql_Result {
+	problems := store_foreign_key_check(store, context.allocator, tx)
 	defer delete(problems)
 	result := Sql_Result{kind = .Rows, commit_seq = store.commit_seq}
 	result.columns = pragma_columns("table", "rowid", "parent", "fkid")
