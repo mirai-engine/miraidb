@@ -4176,12 +4176,17 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 						free_partials(&filtered)
 						return {}, errf(.Invalid_Type, "GROUP BY expression failed")
 					}
-					key := strings.clone(string(bw_bytes(&w)))
+					// The key is cloned once, for a new group: the map keeps the first.
+					if bucket, exists := &buckets[string(bw_bytes(&w))]; exists {
+						append(bucket, partial)
+					} else {
+						key := strings.clone(string(bw_bytes(&w)))
+						append(&keys, key)
+						fresh: [dynamic][]Source
+						append(&fresh, partial)
+						buckets[key] = fresh
+					}
 					bw_destroy(&w)
-					bucket, exists := buckets[key]
-					if !exists do append(&keys, key)
-					append(&bucket, partial)
-					buckets[key] = bucket
 				}
 				slice.sort_by(keys[:], proc(a, b: string) -> bool {
 					return strings.compare(a, b) < 0

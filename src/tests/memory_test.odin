@@ -149,6 +149,16 @@ test_a_closed_store_leaves_nothing :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_group_by_leaves_nothing :: proc(t: ^testing.T) {
+	// Each row's group key is cloned once, for the group it opens.
+	expect_nothing_left(t, .Memory, "_test_memory_group", {
+		"CREATE TABLE s (level TEXT, amount INT)",
+		"INSERT INTO s VALUES ('info', 1), ('warn', 2), ('info', 3), ('info', 4), ('warn', 5)",
+		"SELECT level, count(*), sum(amount) FROM s GROUP BY level",
+	})
+}
+
+@(test)
 test_a_parse_error_leaves_nothing :: proc(t: ^testing.T) {
 	// The error names the line and column; the detail it wraps is not kept.
 	expect_nothing_left(t, .Memory, "_test_memory_parse", {"SELECT FROM WHERE", "SELEC 1", "CREATE TABLE ("}, fails = true)
