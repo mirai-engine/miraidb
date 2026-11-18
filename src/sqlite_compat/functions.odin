@@ -18,6 +18,7 @@ import engine "../engine"
 
 SQLITE_UTF8 :: c.int(1)
 SQLITE_TOOBIG_TEXT :: "string or blob too big"
+SQLITE_DETERMINISTIC :: c.int(0x000000800)
 
 Function_Callback :: #type proc "c" (ctx: rawptr, argc: c.int, argv: [^]rawptr)
 Final_Callback :: #type proc "c" (ctx: rawptr)
@@ -268,7 +269,7 @@ sqlite3_create_function :: proc "c" (
 	final: Final_Callback,
 ) -> c.int {
 	context = runtime.default_context()
-	return create_function(handle, name, arity, user, func, step, final, nil)
+	return create_function(handle, name, arity, user, func, step, final, nil, text_rep)
 }
 
 // sqlite3_create_function_v2 is sqlite3_create_function with a destructor for
@@ -287,7 +288,7 @@ sqlite3_create_function_v2 :: proc "c" (
 	destroy: Destroy_Callback,
 ) -> c.int {
 	context = runtime.default_context()
-	return create_function(handle, name, arity, user, func, step, final, destroy)
+	return create_function(handle, name, arity, user, func, step, final, destroy, text_rep)
 }
 
 @(private)
@@ -300,6 +301,7 @@ create_function :: proc(
 	step: Function_Callback,
 	final: Final_Callback,
 	destroy: Destroy_Callback,
+	flags: c.int = SQLITE_DETERMINISTIC,
 ) -> c.int {
 	db := db_of(handle)
 	misuse := db == nil || name == nil || arity < -1 || arity > SQLITE_MAX_FUNCTION_ARG || len(string(name)) > 255 ||
@@ -331,6 +333,11 @@ create_function :: proc(
 	err: engine.Error
 	if func != nil {
 		err = engine.store_register_function(db.conn.store, function_name, int(arity), facade_scalar, fn, true)
+		// Without SQLITE_DETERMINISTIC a function may answer differently for
+		// the same arguments, which an index cannot hold.
+		if err.kind == .None && flags & SQLITE_DETERMINISTIC == 0 {
+			engine.store_mark_nondeterministic(db.conn.store, function_name, int(arity))
+		}
 	} else {
 		err = engine.store_register_aggregate(db.conn.store, function_name, int(arity), facade_step, facade_final, fn)
 	}

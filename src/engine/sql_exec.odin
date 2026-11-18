@@ -9024,6 +9024,27 @@ sql_exec_create_index :: proc(tx: ^Tx, stmt: Create_Index_Stmt) -> (Sql_Result, 
 	if stmt.algorithm == .Direct && (!stmt.unique || len(columns) != 1) {
 		return {}, errf(.Invalid_Argument, "a DIRECT index must be unique on one column")
 	}
+	// An index holds what its expressions answered, so they have to answer the
+	// same every time, as SQLite requires.
+	if len(stmt.where_sql) > 0 {
+		if parsed, parsed_expr, parse_err := sql_parse_expression(stmt.where_sql); parse_err.kind == .None {
+			_, nondeterministic := expr_nondeterministic(tx.store, parsed_expr)
+			query_destroy(&parsed)
+			if nondeterministic do return {}, errf(.Sql_Unsupported, "non-deterministic functions prohibited in partial index WHERE clauses")
+		} else {
+			error_free(&parse_err)
+		}
+	}
+	for text in stmt.exprs {
+		if len(text) == 0 do continue
+		if parsed, parsed_expr, parse_err := sql_parse_expression(text); parse_err.kind == .None {
+			_, nondeterministic := expr_nondeterministic(tx.store, parsed_expr)
+			query_destroy(&parsed)
+			if nondeterministic do return {}, errf(.Sql_Unsupported, "non-deterministic functions prohibited in index expressions")
+		} else {
+			error_free(&parse_err)
+		}
+	}
 	index := Index_Schema {
 		name      = stmt.name,
 		columns   = columns,

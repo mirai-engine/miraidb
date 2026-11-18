@@ -187,12 +187,12 @@ sqlite3_create_function16 :: proc "c" (
 	final: Final_Callback,
 ) -> c.int {
 	context = runtime.default_context()
-	if name == nil do return create_function(handle, nil, arity, user, func, step, final, nil)
+	if name == nil do return create_function(handle, nil, arity, user, func, step, final, nil, text_rep)
 	decoded := utf16_decode(name, -1, NATIVE_BIG_ENDIAN)
 	defer delete(decoded)
 	utf8 := strings.clone_to_cstring(decoded)
 	defer delete(utf8)
-	return create_function(handle, utf8, arity, user, func, step, final, nil)
+	return create_function(handle, utf8, arity, user, func, step, final, nil, text_rep)
 }
 
 // --- Statements --------------------------------------------------------------

@@ -34,6 +34,55 @@ Scalar_Function_Def :: struct {
 	user:      rawptr,
 	// overrides makes the function answer before a builtin of the same name.
 	overrides: bool,
+	// nondeterministic is a function that may answer differently for the same
+	// arguments (registered without SQLITE_DETERMINISTIC): an index cannot
+	// hold it.
+	nondeterministic: bool,
+}
+
+// store_mark_nondeterministic records that a registered function may answer
+// differently for the same arguments.
+store_mark_nondeterministic :: proc(store: ^Store, name: string, arity: int) {
+	key := function_key(name, arity)
+	defer delete(key)
+	if def, found := store.functions[key]; found {
+		def.nondeterministic = true
+		store.functions[key] = def
+	}
+}
+
+// expr_nondeterministic names a call in `expr` that may answer differently
+// for the same arguments: a program's function registered so, or one of
+// SQLite's own (random, randomblob, changes and the like).
+expr_nondeterministic :: proc(store: ^Store, expr: ^Expr) -> (string, bool) {
+	if expr == nil do return "", false
+	State :: struct {
+		store: ^Store,
+		name:  string,
+	}
+	state := State{store = store}
+	expr_walk(expr, proc(node: ^Expr, user: rawptr) -> bool {
+		state := (^State)(user)
+		call, is_call := node^.(Call_Expr)
+		if !is_call do return true
+		for builtin in ([]string{"random", "randomblob", "changes", "total_changes", "last_insert_rowid", "date", "time", "datetime", "julianday", "unixepoch", "strftime", "current_timestamp", "current_date", "current_time"}) {
+			if strings.equal_fold(call.name, builtin) && (len(call.args) == 0 || builtin == "random" || builtin == "randomblob" || builtin == "changes" || builtin == "total_changes" || builtin == "last_insert_rowid") {
+				state.name = call.name
+				return false
+			}
+		}
+		for arity in ([]int{len(call.args), -1}) {
+			key := function_key(call.name, arity)
+			def, found := state.store.functions[key]
+			delete(key)
+			if found && def.nondeterministic {
+				state.name = call.name
+				return false
+			}
+		}
+		return true
+	}, &state)
+	return state.name, len(state.name) > 0
 }
 
 // Aggregate_Group is the state of one aggregate over one group: `state` is the
