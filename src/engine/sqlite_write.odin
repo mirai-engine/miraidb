@@ -483,7 +483,15 @@ sqlite_write_index_tree :: proc(
 		delete(payloads, alloc)
 	}
 	for values, i in keys do payloads[i] = sqlite_encode_record(values, -1, alloc)
-	if len(payloads) == 0 do return 0
+	if len(payloads) == 0 {
+		// An index over no rows is still an index: one empty leaf, as SQLite
+		// writes it (the file used to lose the index of an empty table).
+		page_no := sqlite_writer_new_page(w)
+		page := sqlite_writer_page(w, page_no)
+		page[0] = 10
+		page[5], page[6] = u8(w.usable >> 8), u8(w.usable)
+		return page_no
+	}
 	return sqlite_index_btree(w, payloads, alloc)
 }
 

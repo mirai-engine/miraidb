@@ -6433,6 +6433,29 @@ test_sqlite_write_index_pages :: proc(t: ^testing.T) {
 	testing.expectf(t, ok, "the written file is broken: %s", reason)
 }
 
+// The index of an empty table is in the file, with an empty b-tree.
+@(test)
+test_sqlite_write_empty_index :: proc(t: ^testing.T) {
+	store, host := fresh_host(t, "sqlite_write_empty_index")
+	if store == nil do return
+	defer destroy_host(store, host, "sqlite_write_empty_index")
+	run(t, store, "CREATE TABLE t (a INT PRIMARY KEY, b TEXT)")
+	run(t, store, "CREATE INDEX tb ON t (b)")
+
+	path := "_test_sqlite_empty_index.db"
+	defer os.remove(path)
+	_, _, write_err := db.sqlite_file_write(store, path)
+	if !testing.expectf(t, db.error_ok(write_err), "write: %s", write_err.message) do return
+	file, open_err := db.sqlite_file_open(path)
+	if !testing.expectf(t, db.error_ok(open_err), "reopen: %s", open_err.message) do return
+	defer db.sqlite_file_destroy(&file)
+	names := make([dynamic]string, context.temp_allocator)
+	for tree in file.index_trees do append(&names, tree.name)
+	testing.expectf(t, slice.contains(names[:], "tb"), "indexes in the file: %v", names[:])
+	ok, reason := db.sqlite_mirror_validate(path)
+	testing.expectf(t, ok, "the written file is broken: %s", reason)
+}
+
 @(test)
 test_sqlite_write_roundtrip :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "sqlite_write")
