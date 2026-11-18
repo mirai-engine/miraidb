@@ -368,3 +368,39 @@ test_pragma_table_functions :: proc(t: ^testing.T) {
 	// A pragma that changes something is not a table function.
 	_ = run_error(t, store, "SELECT * FROM pragma_optimize")
 }
+
+@(test)
+test_update_of_triggers :: proc(t: ^testing.T) {
+	// UPDATE OF fires only when the SET names one of its columns (the value
+	// need not change), for an UPSERT's DO UPDATE and for a foreign key's
+	// cascade, which writes the child's key columns. The sequence and its log
+	// are what SQLite writes for the same statements.
+	store := fresh_db(t, "update_of")
+	if store == nil do return
+	defer cleanup_db(store, "update_of")
+	for sql in ([]string {
+		"CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT, c TEXT)",
+		"CREATE TABLE log (m TEXT)",
+		"CREATE TABLE child (id INTEGER PRIMARY KEY, pa INTEGER REFERENCES t(a) ON UPDATE CASCADE, x TEXT)",
+		"CREATE TRIGGER tb AFTER UPDATE OF b ON t BEGIN INSERT INTO log VALUES ('b:' || new.b); END",
+		"CREATE TRIGGER tbc BEFORE UPDATE OF c, b ON t BEGIN INSERT INTO log VALUES ('bc:' || coalesce(new.c,'')); END",
+		"CREATE TRIGGER cpa AFTER UPDATE OF pa ON child BEGIN INSERT INTO log VALUES ('pa:' || new.pa); END",
+		"CREATE TRIGGER cx AFTER UPDATE OF x ON child BEGIN INSERT INTO log VALUES ('x'); END",
+		"PRAGMA foreign_keys = ON",
+		"INSERT INTO t VALUES (1, 'p', 'q'), (2, 'r', 's')",
+		"INSERT INTO child VALUES (10, 1, 'z')",
+		"UPDATE t SET b = b WHERE a = 1",
+		"UPDATE t SET c = 'k' WHERE a = 2",
+		"UPDATE t SET a = a",
+		"UPDATE t SET a = 5 WHERE a = 1",
+		"INSERT INTO t VALUES (2, 'dup', 'w') ON CONFLICT (a) DO UPDATE SET c = excluded.c",
+		"INSERT INTO t VALUES (2, 'dup', 'w') ON CONFLICT (a) DO UPDATE SET b = excluded.b",
+	}) {
+		result := run(t, store, sql)
+		db.sql_result_destroy(&result)
+	}
+	testing.expect_value(t, scalar(t, store, "SELECT group_concat(m, ' ') FROM log").s, "bc:q b:p bc:k pa:5 bc:w bc:w b:dup")
+	testing.expect_value(t, scalar(t, store, "SELECT sql FROM sqlite_master WHERE name = 'tbc'").s,
+		`CREATE TRIGGER "tbc" BEFORE UPDATE OF "c", "b" ON "t" BEGIN INSERT INTO log VALUES ('bc:' || coalesce(new.c,'')); END`)
+	_ = run_error(t, store, "CREATE TRIGGER bad AFTER INSERT OF b ON t BEGIN SELECT 1; END")
+}

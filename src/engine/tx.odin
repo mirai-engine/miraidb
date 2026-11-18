@@ -132,6 +132,9 @@ Tx :: struct {
 	// deferred_fks names the child tables whose DEFERRABLE INITIALLY DEFERRED
 	// keys this transaction may have broken; COMMIT verifies them.
 	deferred_fks:        map[string]bool,
+	// update_set names the columns the SET of the UPDATE running now writes,
+	// for the UPDATE OF triggers it fires; nil when the write has no SET.
+	update_set:          []string,
 }
 
 Table_Writes :: struct {

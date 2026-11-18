@@ -160,7 +160,11 @@ view_write :: proc(tx: ^Tx, name: string, statement: Statement, params: []Value)
 			}
 			old_row := Row{id = row.id, values = row.values[:width]}
 			new_row := Row{id = row.id, values = row.values[width:]}
-			if err := trigger_fire(tx, name, .Update, .Instead, old_row, new_row, schema); err.kind != .None do return {}, err
+			saved_set := tx.update_set
+			tx.update_set = assignment_columns(tx, assignments)
+			fire_err := trigger_fire(tx, name, .Update, .Instead, old_row, new_row, schema)
+			tx.update_set = saved_set
+			if fire_err.kind != .None do return {}, fire_err
 			if err := returning_append(&result, &returned, returning, view, new_row); err.kind != .None do return {}, err
 		}
 	}

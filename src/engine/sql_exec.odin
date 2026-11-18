@@ -7879,9 +7879,11 @@ sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Res
 				if coerce_err.kind != .None do return {}, coerce_err
 				new_values[index] = coerced
 			}
-			if update_err := tx_update(tx, stmt.table, conflict.id, new_values); update_err.kind != .None {
-				return {}, update_err
-			}
+			saved_set := tx.update_set
+			tx.update_set = assignment_columns(tx, stmt.conflict_assignments)
+			update_err := tx_update(tx, stmt.table, conflict.id, new_values)
+			tx.update_set = saved_set
+			if update_err.kind != .None do return {}, update_err
 			if fts_err := fts_index_if_virtual(tx, stmt.table, conflict.id, new_values, false); fts_err.kind != .None {
 				return {}, fts_err
 			}
@@ -8149,9 +8151,11 @@ sql_exec_merge :: proc(tx: ^Tx, stmt: Merge_Stmt, params: []Value) -> (Sql_Resul
 			affected += 1
 			continue
 		}
-		if update_err := tx_update(tx, stmt.target, change.id, change.values); update_err.kind != .None {
-			return {}, update_err
-		}
+		saved_set := tx.update_set
+		tx.update_set = nil
+		update_err := tx_update(tx, stmt.target, change.id, change.values)
+		tx.update_set = saved_set
+		if update_err.kind != .None do return {}, update_err
 		if fts_err := fts_index_if_virtual(tx, stmt.target, change.id, change.values, false); fts_err.kind != .None {
 			return {}, fts_err
 		}
@@ -8166,6 +8170,14 @@ sql_exec_merge :: proc(tx: ^Tx, stmt: Merge_Stmt, params: []Value) -> (Sql_Resul
 	tx.store.last_changes = i64(affected)
 	tx.store.total_changes += i64(affected)
 	return Sql_Result{kind = .Affected, affected = affected, commit_seq = tx.store.commit_seq}, ERROR_NONE
+}
+
+// assignment_columns names the columns a SET writes.
+@(private)
+assignment_columns :: proc(tx: ^Tx, assignments: []Assignment) -> []string {
+	columns := make([]string, len(assignments), tx.alloc)
+	for assignment, i in assignments do columns[i] = assignment.column
+	return columns
 }
 
 sql_exec_update :: proc(tx: ^Tx, stmt: Update_Stmt, params: []Value) -> (Sql_Result, Error) {
@@ -8203,6 +8215,10 @@ sql_exec_update :: proc(tx: ^Tx, stmt: Update_Stmt, params: []Value) -> (Sql_Res
 	returned := make([dynamic][]Value, 0, len(rows))
 	if stmt.returning == nil do defer delete(returned)
 	result := Sql_Result{kind = .Affected}
+	// The UPDATE OF triggers it fires read which columns the SET writes.
+	saved_set := tx.update_set
+	tx.update_set = assignment_columns(tx, stmt.assignments)
+	defer tx.update_set = saved_set
 	for row in rows {
 		if store_cancelled(tx.store) {
 			return {}, errf(.Cancelled, "statement cancelled")

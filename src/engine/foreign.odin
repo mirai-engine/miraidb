@@ -257,7 +257,15 @@ fk_parent_update :: proc(
 			for ref_column, i in child.fk.ref_columns {
 				child_values[child.fk.columns[i]] = new_values[ref_column]
 			}
-			if update_err := tx_update(tx, child.table.schema.name, row.id, child_values); update_err.kind != .None {
+			// The cascade writes the child's key columns, as SQLite's own UPDATE
+			// of the child does.
+			saved_set := tx.update_set
+			fk_columns := make([]string, len(child.fk.columns), tx.alloc)
+			for position, i in child.fk.columns do fk_columns[i] = child.table.schema.columns[position].name
+			tx.update_set = fk_columns
+			update_err := tx_update(tx, child.table.schema.name, row.id, child_values)
+			tx.update_set = saved_set
+			if update_err.kind != .None {
 				delete(rows)
 				return update_err
 			}

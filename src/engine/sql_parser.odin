@@ -1920,8 +1920,16 @@ parse_create_trigger :: proc(p: ^Parser) -> Statement {
 		return stmt
 	}
 	if p_match_keyword(p, "of") {
-		p_fail(p, .Sql_Unsupported, "column-specific triggers are not supported")
-		return stmt
+		if stmt.event != "update" {
+			p_fail(p, .Sql_Syntax, "OF names the columns of an UPDATE trigger")
+			return stmt
+		}
+		columns := make([dynamic]string, 0, 2, p.alloc)
+		for {
+			append(&columns, p_ident(p))
+			if !p_match_punct(p, ",") do break
+		}
+		stmt.columns = columns[:]
 	}
 	p_expect_keyword(p, "on")
 	stmt.table = p_ident(p)

@@ -47,13 +47,20 @@ trigger_ensure :: proc(tx: ^Tx) -> Error {
 		// an older database keeps its triggers instead of failing to open them.
 		if _, found := schema_column_index(&table.schema, "when_text"); !found {
 			_, alter_err := sql_execute_in_tx(tx, "ALTER TABLE _triggers ADD COLUMN when_text TEXT DEFAULT ''")
-			return alter_err
+			if alter_err.kind != .None do return alter_err
+		}
+		// UPDATE OF's columns came later still, and the same way.
+		if table = tx_table_probe(tx, TRIGGER_TABLE); table != nil {
+			if _, found := schema_column_index(&table.schema, "columns"); !found {
+				_, alter_err := sql_execute_in_tx(tx, "ALTER TABLE _triggers ADD COLUMN columns TEXT DEFAULT ''")
+				return alter_err
+			}
 		}
 		return ERROR_NONE
 	}
 	_, create_err := sql_execute_in_tx(
 		tx,
-		"CREATE TABLE _triggers (name TEXT PRIMARY KEY NOT NULL, table_name TEXT NOT NULL, event TEXT NOT NULL, timing TEXT NOT NULL, body TEXT NOT NULL, when_text TEXT DEFAULT '')",
+		"CREATE TABLE _triggers (name TEXT PRIMARY KEY NOT NULL, table_name TEXT NOT NULL, event TEXT NOT NULL, timing TEXT NOT NULL, body TEXT NOT NULL, when_text TEXT DEFAULT '', columns TEXT DEFAULT '')",
 	)
 	return create_err
 }
@@ -96,6 +103,7 @@ trigger_create :: proc(tx: ^Tx, stmt: Create_Trigger_Stmt) -> Error {
 		value_string(stmt.instead ? "instead" : stmt.before ? "before" : "after"),
 		value_string(stmt.body),
 		value_string(stmt.when_text),
+		value_string(strings.join(stmt.columns, ",", tx.alloc)),
 	}
 	_, insert_err := tx_insert(tx, TRIGGER_TABLE, values)
 	return insert_err
@@ -153,6 +161,19 @@ trigger_drop :: proc(tx: ^Tx, name: string, if_exists: bool) -> Error {
 	return delete_err
 }
 
+// trigger_columns_set reports whether an UPDATE's SET (`set`, nil when the
+// write did not come from a SET) names one of an UPDATE OF trigger's columns.
+@(private)
+trigger_columns_set :: proc(columns: string, set: []string) -> bool {
+	if set == nil do return true
+	for column in strings.split(columns, ",", context.temp_allocator) {
+		for assigned in set {
+			if strings.equal_fold(column, assigned) do return true
+		}
+	}
+	return false
+}
+
 // trigger_split cuts a body into statements, ignoring the semicolons inside
 // string literals.
 trigger_split :: proc(body: string, alloc: mem.Allocator) -> [dynamic]string {
@@ -205,9 +226,17 @@ trigger_fire :: proc(
 	case .Delete:
 		event_name = "delete"
 	}
+	// A catalog written before UPDATE OF existed has no columns column until
+	// the next CREATE TRIGGER adds it.
+	query := "SELECT body, when_text, name, '' FROM _triggers WHERE table_name = ? AND event = ? AND timing = ? ORDER BY name"
+	if catalog := tx_table_probe(tx, TRIGGER_TABLE); catalog != nil {
+		if _, found := schema_column_index(&catalog.schema, "columns"); found {
+			query = "SELECT body, when_text, name, columns FROM _triggers WHERE table_name = ? AND event = ? AND timing = ? ORDER BY name"
+		}
+	}
 	result, query_err := sql_execute_in_tx_params(
 		tx,
-		"SELECT body, when_text, name FROM _triggers WHERE table_name = ? AND event = ? AND timing = ? ORDER BY name",
+		query,
 		[]Value {
 			value_string(table_name),
 			value_string(event_name),
@@ -221,6 +250,10 @@ trigger_fire :: proc(
 		if len(row) == 0 || row[0].kind != .String do continue
 		name := ""
 		if len(row) > 2 && row[2].kind == .String do name = row[2].s
+		// UPDATE OF fires only for an UPDATE whose SET names one of its columns.
+		if event == .Update && len(row) > 3 && row[3].kind == .String && len(row[3].s) > 0 {
+			if !trigger_columns_set(row[3].s, tx.update_set) do continue
+		}
 		// An authorizer may have answered Ignore about this body when the
 		// statement firing it was prepared (authorize.odin).
 		replayed := auth_replay_concerns(name)
