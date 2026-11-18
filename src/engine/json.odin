@@ -29,6 +29,10 @@ Json_Value :: struct {
 	// is_integer separates 1 from 1.0: the number alone cannot, and a caller
 	// asking for the type of a JSON value has to get it back unchanged.
 	is_integer: bool,
+	// raw is a parsed number's text, which the document gives back as it was
+	// written (`1.50` stays `1.50`), as SQLite does; empty for a number that
+	// came from a SQL value.
+	raw:     string,
 	text:    string,
 	items:   []Json_Value,
 	keys:    []string,
@@ -130,7 +134,7 @@ json_parse_value :: proc(p: ^Json_Parser, depth: int) -> Json_Value {
 			break
 		}
 	}
-	return Json_Value{kind = .Number, number = number, is_integer = integral}
+	return Json_Value{kind = .Number, number = number, is_integer = integral, raw = strings.clone(literal, p.alloc)}
 }
 
 JSON_MAX_DEPTH :: 64
@@ -168,6 +172,9 @@ json_parse_number :: proc(p: ^Json_Parser) -> (f64, bool) {
 	text := p.text[start:p.at]
 	if parsed, ok := parse_time_number(text); ok {
 		number = parsed
+	} else if parsed_f64, ok_f64 := strconv.parse_f64(text); ok_f64 {
+		// A literal past an i64 is still a JSON number.
+		number = parsed_f64
 	} else {
 		return 0, false
 	}
@@ -356,6 +363,8 @@ json_parse_object :: proc(p: ^Json_Parser, depth: int) -> Json_Value {
 
 json_destroy :: proc(value: Json_Value, alloc: mem.Allocator) {
 	#partial switch value.kind {
+	case .Number:
+		if len(value.raw) > 0 do delete(value.raw, alloc)
 	case .String:
 		delete(value.text, alloc)
 	case .Array:
@@ -384,7 +393,9 @@ json_write_to :: proc(b: ^strings.Builder, value: Json_Value) {
 	case .Bool:
 		strings.write_string(b, value.boolean ? "true" : "false")
 	case .Number:
-		if value.is_integer && math.abs(value.number) < 9.2e18 {
+		if len(value.raw) > 0 {
+			strings.write_string(b, value.raw)
+		} else if value.is_integer && math.abs(value.number) < 9.2e18 {
 			fmt.sbprintf(b, "%d", i64(value.number))
 		} else if value.number == math.floor(value.number) && math.abs(value.number) < 1e15 {
 			// A real that happens to be integral keeps its point, so a consumer

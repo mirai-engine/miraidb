@@ -8795,6 +8795,8 @@ test_json_functions :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, `SELECT json_type('[1,2]', '$[1]')`).s, "integer")
 	testing.expect_value(t, scalar(t, store, `SELECT json_type('1.5')`).s, "real")
 	testing.expect_value(t, scalar(t, store, `SELECT json_type('null')`).s, "null")
+	// A number keeps the text it was written with, as in SQLite.
+	testing.expect_value(t, scalar(t, store, `SELECT json('[1.50, 1e2, -0, 12345678901234567890]')`).s, "[1.50,1e2,-0,12345678901234567890]")
 	// Paths walk objects and arrays; `[#]` is one past the last element, so it
 	// finds nothing, and `[#-1]` is the last, as in SQLite.
 	testing.expect_value(t, scalar(t, store, `SELECT json_extract('{"a":{"b":[10,20,30]}}', '$.a.b[1]')`).i, i64(20))
