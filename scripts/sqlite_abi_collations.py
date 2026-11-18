@@ -109,6 +109,18 @@ def observe(lib, seen: dict) -> None:
         b"SELECT count(*) FROM (SELECT DISTINCT v FROM hc)",
         b"SELECT id FROM hc WHERE v IN ('B', 'C') ORDER BY id",
         b"CREATE TABLE hc2 (v TEXT COLLATE never_registered)",
+        # A key under a host collation: the comparison decides what repeats.
+        b"CREATE TABLE hk (id INTEGER PRIMARY KEY, v TEXT COLLATE fold UNIQUE)",
+        b"INSERT INTO hk (v) VALUES ('a')",
+        b"INSERT INTO hk (v) VALUES ('A')",
+        b"INSERT INTO hk (v) VALUES ('b')",
+        b"UPDATE hk SET v = 'B' WHERE v = 'b'",
+        b"UPDATE hk SET v = 'a' WHERE v = 'B'",
+        b"CREATE TABLE hp (v TEXT COLLATE fold PRIMARY KEY, n INTEGER)",
+        b"INSERT INTO hp VALUES ('x', 1), ('X', 2)",
+        b"CREATE INDEX hk_v ON hk (v)",
+        b"SELECT id FROM hk WHERE v = 'A' ORDER BY id",
+        b"SELECT group_concat(v, ',') FROM (SELECT v FROM hk ORDER BY v, id)",
     ):
         seen[f"collation: {sql!r}"] = rows(sql)
 

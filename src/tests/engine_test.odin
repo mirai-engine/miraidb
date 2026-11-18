@@ -13558,16 +13558,20 @@ test_host_collations :: proc(t: ^testing.T) {
 			db.error_kind_name(refused.kind),
 		)
 	}
-	// A column may carry one: its comparisons and its ORDER BY follow it. A key
-	// on it cannot, since an index orders folded text.
+	// A column may carry one: its comparisons, its ORDER BY and its keys
+	// follow it. An index on it is kept and not read, so a lookup still
+	// compares with the collation.
 	run(t, store, "CREATE TABLE lc (x TEXT COLLATE by_length)")
 	run(t, store, "INSERT INTO lc VALUES ('abc'), ('ab'), ('xy')")
 	testing.expect_value(t, scalar(t, store, "SELECT x FROM lc ORDER BY x LIMIT 1").s, "ab")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM lc WHERE x < 'aaa'").i, i64(2))
-	_, keyed := db.sql_execute(store, "CREATE TABLE bad (x TEXT COLLATE by_length UNIQUE)")
-	testing.expect_value(t, keyed.kind, db.Error_Kind.Sql_Unsupported)
+	_, keyed := db.sql_execute(store, "CREATE TABLE keyed (x TEXT COLLATE by_length UNIQUE)")
+	testing.expect_value(t, keyed.kind, db.Error_Kind.None)
+	run(t, store, "INSERT INTO keyed VALUES ('ab')")
+	testing.expect_value(t, run_error(t, store, "INSERT INTO keyed VALUES ('ab')").kind, db.Error_Kind.Duplicate_Unique)
 	_, indexed := db.sql_execute(store, "CREATE INDEX lc_x ON lc (x)")
-	testing.expect_value(t, indexed.kind, db.Error_Kind.Sql_Unsupported)
+	testing.expect_value(t, indexed.kind, db.Error_Kind.None)
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM lc WHERE x < 'aaa'").i, i64(2))
 
 	// The built-in names still fold: NOCASE matches 'ab' against 'AB', which the
 	// host comparison would not (same length, different bytes).

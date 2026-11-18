@@ -8698,19 +8698,10 @@ sql_exec_create_table :: proc(tx: ^Tx, stmt: Create_Table_Stmt, params: []Value)
 		collation := ""
 		if len(definition.collation) > 0 {
 			if !collation_known(definition.collation) {
-				// A host comparison may be a column's collation: comparisons, ORDER BY
-				// and grouping read it. A key cannot: an index orders folded bytes,
-				// and a host comparison has none, so the column takes no key.
-				if _, is_host := store_collation(tx.store, definition.collation); is_host {
-					if definition.primary || definition.unique {
-						return {}, errf(
-							.Sql_Unsupported,
-							"column %s cannot be a key under collation %s: an index orders folded text, which a host comparison does not have",
-							definition.name,
-							definition.collation,
-						)
-					}
-				} else {
+				// A host comparison may be a column's collation: comparisons, ORDER BY,
+				// grouping and keys read it (a key compares rows with it,
+				// tx_host_key_taken).
+				if _, is_host := store_collation(tx.store, definition.collation); !is_host {
 					return {}, errf(.Invalid_Argument, "no such collation sequence: %s", definition.collation)
 				}
 			}
@@ -8909,19 +8900,6 @@ sql_exec_create_table :: proc(tx: ^Tx, stmt: Create_Table_Stmt, params: []Value)
 	}
 	delete(foreign_keys)
 
-	// A table-level key over a host-collated column cannot be indexed either.
-	for index in schema.indexes {
-		for position in index.columns {
-			if position >= 0 && position < len(schema.columns) && column_host_collated(tx.store, schema.columns[position]) {
-				return {}, errf(.Sql_Unsupported, "column %s cannot be a key under collation %s: an index orders folded text, which a host comparison does not have", schema.columns[position].name, schema.columns[position].collation)
-			}
-		}
-	}
-	for position in schema.primary_key {
-		if column_host_collated(tx.store, schema.columns[position]) {
-			return {}, errf(.Sql_Unsupported, "column %s cannot be a key under collation %s: an index orders folded text, which a host comparison does not have", schema.columns[position].name, schema.columns[position].collation)
-		}
-	}
 	schema.strict = stmt.strict
 	schema.without_rowid = stmt.without_rowid
 	if stmt.without_rowid && len(schema.primary_key) == 0 {
@@ -8974,9 +8952,6 @@ sql_exec_create_index :: proc(tx: ^Tx, stmt: Create_Index_Stmt) -> (Sql_Result, 
 		index, found := schema_column_index(&table.schema, name)
 		if !found {
 			return {}, errf(.Column_Not_Found, "column %s does not exist in %s", name, stmt.table)
-		}
-		if column_host_collated(tx.store, table.schema.columns[index]) {
-			return {}, errf(.Sql_Unsupported, "column %s cannot be indexed under collation %s: an index orders folded text, which a host comparison does not have", name, table.schema.columns[index].collation)
 		}
 		columns[i] = index
 		for prior in columns[:i] {

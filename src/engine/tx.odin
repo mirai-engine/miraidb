@@ -1704,6 +1704,13 @@ tx_check_unique :: proc(
 		if index_key_has_null(table, i, values) do continue
 		key := unique_key(tx, table, i, values)
 		if keys != nil do append(keys, key)
+		// A key over a column with a program's collation: two values the
+		// comparison calls equal are the same key, which folded bytes cannot
+		// tell, so the rows are compared with it.
+		if index_host_collated(tx.store, table, i) {
+			if tx_host_key_taken(tx, name, table, i, values, ignore) do return unique_violation(table, i)
+			continue
+		}
 		if writes != nil {
 			if holder, taken := writes.unique_keys[key]; taken && holder != ignore {
 				return unique_violation(table, i)
@@ -1716,6 +1723,49 @@ tx_check_unique :: proc(
 		}
 	}
 	return ERROR_NONE
+}
+
+// index_host_collated reports an index over a column whose collation is a
+// program's.
+index_host_collated :: proc(store: ^Store, table: ^Table, index: int) -> bool {
+	for column in table.indexes[index].schema.columns {
+		if column >= 0 && column < len(table.schema.columns) && column_host_collated(store, table.schema.columns[column]) do return true
+	}
+	return false
+}
+
+// tx_host_key_taken reports whether a row the transaction sees, other than
+// `ignore`, holds the same key under the columns' collations. It reads every
+// row, which is what a comparison without folded bytes costs.
+@(private)
+tx_host_key_taken :: proc(tx: ^Tx, name: string, table: ^Table, index: int, values: []Value, ignore: Row_Id) -> bool {
+	rows := make([dynamic]Row, context.temp_allocator)
+	if collect_err := tx_collect(tx, name, &rows); collect_err.kind != .None {
+		error_drop(collect_err)
+		return false
+	}
+	for row in rows {
+		if row.id == ignore do continue
+		same := true
+		for column in table.indexes[index].schema.columns {
+			a, b := values[column], row.values[column]
+			collation := table.schema.columns[column].collation
+			if a.kind == .String && b.kind == .String && len(collation) > 0 {
+				order, ok := collation_compare(tx.store, collation, a.s, b.s)
+				if !ok || order != 0 {
+					same = false
+					break
+				}
+				continue
+			}
+			if !value_equal(a, b) {
+				same = false
+				break
+			}
+		}
+		if same do return true
+	}
+	return false
 }
 
 // tx_committed_key_taken reports whether a committed row other than `ignore`

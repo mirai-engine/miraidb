@@ -396,12 +396,15 @@ def main() -> int:
     assert scalar(lib, db, b"SELECT count(*) FROM coll WHERE name < 'abc' COLLATE by_length") == 2
     assert scalar(lib, db, b"SELECT count(*) FROM coll WHERE name = 'ab' COLLATE by_length") == 1
     # ORDER BY ranks the values under the host comparison and GROUP BY groups
-    # by its classes; a key on a column declared with it, which an index would
-    # have to fold, is refused rather than answered wrongly.
+    # by its classes; a key on a column declared with it compares rows with it
+    # (scripts/sqlite_abi_collations.py checks a folding one against SQLite).
     assert lib.miraidb_exec(db, b"SELECT name FROM coll ORDER BY name COLLATE by_length") == OK
     assert lib.miraidb_exec(db, b"SELECT name FROM coll GROUP BY name COLLATE by_length") == OK
-    assert lib.miraidb_exec(db, b"CREATE TABLE keyed (x TEXT COLLATE by_length UNIQUE)") == ERROR
-    assert "cannot be a key" in lib.miraidb_errmsg(db).decode(), lib.miraidb_errmsg(db)
+    assert lib.miraidb_exec(db, b"CREATE TABLE keyed (x TEXT COLLATE by_length UNIQUE)") == OK
+    assert lib.miraidb_exec(db, b"INSERT INTO keyed (x) VALUES ('ab')") == OK
+    assert lib.miraidb_exec(db, b"INSERT INTO keyed (x) VALUES ('ab')") != OK, "a repeated key"
+    assert "UNIQUE constraint failed" in lib.miraidb_errmsg(db).decode(), lib.miraidb_errmsg(db)
+    assert lib.miraidb_exec(db, b"INSERT INTO keyed (x) VALUES ('xy')") == OK
     assert lib.miraidb_unregister_collation(db, b"by_length") == OK
     assert lib.miraidb_unregister_collation(db, b"by_length") == ERROR, "already gone"
     assert lib.miraidb_exec(db, b"SELECT 1 WHERE 'a' = 'a' COLLATE by_length") == ERROR, "an unknown name is refused"
