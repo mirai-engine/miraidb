@@ -273,7 +273,8 @@ int                  sqlite3_value_bytes16(sqlite3_value *value);
 ** type name; NULL otherwise. To SQL such a value is NULL, and a copy made with
 ** sqlite3_value_dup or a row that stores it holds a plain NULL. */
 void                *sqlite3_value_pointer(sqlite3_value *value, const char *type);
-/* A value never carries a subtype, a no-change mark or a bind origin here. */
+/* A value carries SQLite's subtype (74 for JSON text); never a no-change mark
+** or a bind origin here. */
 unsigned int         sqlite3_value_subtype(sqlite3_value *value);
 int                  sqlite3_value_nochange(sqlite3_value *value);
 int                  sqlite3_value_frombind(sqlite3_value *value);
@@ -298,7 +299,7 @@ void sqlite3_result_error(sqlite3_context *ctx, const char *message, int n);
 void sqlite3_result_error_code(sqlite3_context *ctx, int code);
 void sqlite3_result_error_nomem(sqlite3_context *ctx);
 void sqlite3_result_error_toobig(sqlite3_context *ctx);
-/* Accepted and dropped: subtypes are not carried. */
+/* The result's subtype: JSON functions nest text with subtype 74 as JSON. */
 void sqlite3_result_subtype(sqlite3_context *ctx, unsigned int subtype);
 void sqlite3_result_text16(sqlite3_context *ctx, const void *text, int nBytes,
                            void (*destructor)(void *));

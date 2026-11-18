@@ -114,10 +114,12 @@ a path's `[#]` and `[#-n]` read as SQLite reads them (`src/engine/jsonb.odin`,
 `test_jsonb_and_array_insert`, the differential corpus). Not SQLite's: an edit
 (`jsonb_set`, `jsonb_replace`, …) may pick another valid encoding of the same
 document (SQLite stores text that came from a SQL value as TEXTRAW, and a string
-written with an unneeded escape keeps it), which reads back the same; and a
-JSON value made by another JSON function is not marked as JSON when it is an
-argument (`json_array(json('[1]'))` holds the text `"[1]"`, SQLite the array),
-since the engine's values carry no subtype.
+written with an unneeded escape keeps it), which reads back the same. A JSON
+function's text carries SQLite's JSON subtype (74), so the next JSON function
+nests it as JSON (`json_array(json('[1]'))` is `[[1]]`), through `coalesce`
+and a scalar subquery; a value written to a table, or read from a subquery in
+`FROM`, has none, as in SQLite. `sqlite3_value_subtype` and
+`sqlite3_result_subtype` read and set it.
 
 **Not counted:** `json_parse` (built only with `SQLITE_DEBUG`) and
 `sqlite_offset` (only with `SQLITE_ENABLE_OFFSET_SQL_FUNC`), which a default

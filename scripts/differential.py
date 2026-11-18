@@ -240,6 +240,15 @@ QUERIES = [
     "SELECT name FROM pragma_table_info WHERE arg = 'dept' ORDER BY cid",
     "SELECT m.name, p.name FROM sqlite_master m JOIN pragma_table_info p ON p.arg = m.name WHERE m.name IN ('dept', 'kv') ORDER BY 1, 2",
     "SELECT name, schema FROM pragma_table_info('kv', 'main') ORDER BY cid",
+    # A JSON function's text is JSON to the next JSON function (its subtype),
+    # through coalesce and a scalar subquery, and not once stored or read from
+    # a subquery in FROM.
+    "SELECT json_array(json('[1]'), jsonb('[2]'), '[3]'), json_object('a', json('{\"b\":1}'), 'c', '{\"d\":2}')",
+    "SELECT json_array(json_array(1,2), json_object('k', 1), json_extract('{\"a\":[1]}', '$.a'), '{\"a\":[1]}' -> '$.a', '{\"a\":[1]}' ->> '$.a')",
+    "SELECT json_set('{}', '$.a', json('[1]'), '$.b', '[2]'), json_insert('[]', '$[#]', json_quote('x'))",
+    "SELECT json_object('k', json_group_array(n)) FROM nums WHERE n IS NOT NULL",
+    "SELECT json_array(coalesce(json('[1]'), 0)), json_array((SELECT json('[1]')))",
+    "SELECT json_array(x) FROM (SELECT json('[1]') AS x)",
     # FILTER, an aggregate's ORDER BY and the WINDOW clause (S4).
     "SELECT dept, count(*) FILTER (WHERE salary > 60), sum(salary) FILTER (WHERE name IS NOT NULL) FROM emp GROUP BY dept ORDER BY dept",
     "SELECT dept, group_concat(name, '/' ORDER BY name DESC) FROM emp GROUP BY dept ORDER BY dept",

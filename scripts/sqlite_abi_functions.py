@@ -37,6 +37,8 @@ SIGNATURES = {
     "sqlite3_result_blob": ([c_void_p, c_char_p, c_int, c_void_p], None),
     "sqlite3_result_zeroblob": ([c_void_p, c_int], None),
     "sqlite3_result_value": ([c_void_p, c_void_p], None),
+    "sqlite3_value_subtype": ([c_void_p], ctypes.c_uint),
+    "sqlite3_result_subtype": ([c_void_p, ctypes.c_uint], None),
     "sqlite3_result_error": ([c_void_p, c_char_p, c_int], None),
     "sqlite3_result_error_code": ([c_void_p, c_int], None),
     "sqlite3_user_data": ([c_void_p], c_void_p),
@@ -129,6 +131,15 @@ def observe(lib, db, seen: dict) -> None:
     def one(ctx, argc, argv):
         lib.sqlite3_result_int64(ctx, 1)
 
+    def subtype_of(ctx, argc, argv):
+        lib.sqlite3_result_int64(ctx, lib.sqlite3_value_subtype(argv[0]))
+
+    def as_json(ctx, argc, argv):
+        copy = lib.sqlite3_value_dup(argv[0])
+        lib.sqlite3_result_value(ctx, copy)
+        lib.sqlite3_value_free(copy)
+        lib.sqlite3_result_subtype(ctx, 74)
+
     def two(ctx, argc, argv):
         lib.sqlite3_result_int64(ctx, 2)
 
@@ -162,7 +173,7 @@ def observe(lib, db, seen: dict) -> None:
         (b"describe", 1, describe), (b"numeric", 1, numeric), (b"failing", 1, failing),
         (b"failing_plain", 0, failing_plain), (b"blobby", 0, blobby), (b"zeros", 1, zeros),
         (b"echo", 1, echo), (b"whoami", 0, whoami), (b"pick", 1, one), (b"pick", 2, two),
-        (b"aux", 0, aux),
+        (b"aux", 0, aux), (b"subtype_of", 1, subtype_of), (b"as_json", 1, as_json),
     ):
         assert register(name, arity, func=func) == 0, name
     assert register(b"sumsq", 1, step=sq_step, final=sq_final) == 0
@@ -179,6 +190,12 @@ def observe(lib, db, seen: dict) -> None:
     seen["failing with a cut message"] = first_failure(b"SELECT failing_plain()")
     seen["results"] = first_failure(b"SELECT hex(blobby()), length(zeros(5)), hex(zeros(2)), echo('t'), echo(2.5), typeof(echo(NULL))")
     seen["user data and db handle"] = first_failure(b"SELECT whoami()")
+    # Subtypes: what a JSON function answers is marked 74 ('J'), a function
+    # that marks its own text gets it nested as JSON, and a value read back
+    # from a table has none.
+    seen["subtypes"] = first_failure(
+        b"SELECT subtype_of(json('[1]')), subtype_of('[1]'), subtype_of(json_array(1) -> 0), "
+        b"json_array(as_json('[2]')), json_array('[3]')")
     seen["arities"] = first_failure(b"SELECT pick(1), pick(1, 2)")
     seen["an arity nobody registered"] = first_failure(b"SELECT pick(1, 2, 3)")
     seen["auxdata within a call"] = first_failure(b"SELECT aux()")

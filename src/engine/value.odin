@@ -68,7 +68,23 @@ Value_Payload :: struct #raw_union {
 // value_identity_of.
 Value :: struct {
 	kind: Value_Kind,
+	// subtype is SQLite's value subtype: JSON_SUBTYPE marks text a JSON
+	// function produced, so another JSON function nests it as JSON instead of
+	// quoting it as a string. It lives in the padding after `kind`, travels
+	// with the value through an expression, and is not stored: a value
+	// written to a table loses it, as in SQLite.
+	subtype: u8,
 	using payload: Value_Payload,
+}
+
+// JSON_SUBTYPE is the subtype SQLite's JSON functions give their text ('J').
+JSON_SUBTYPE :: u8(74)
+
+// value_json marks a JSON function's text result as JSON.
+value_json :: proc(v: Value) -> Value {
+	out := v
+	if out.kind == .String do out.subtype = JSON_SUBTYPE
+	return out
 }
 
 // big_words splits a 128-bit number into the two words the payload stores,

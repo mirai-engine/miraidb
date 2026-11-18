@@ -6301,6 +6301,11 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 	if json_call_name(call.name) {
 		value, handled, json_err := json_call(call.name, args[:])
 		if !handled do return {}, errf(.Internal, "unhandled JSON function %s", call.name)
+		// What a function that builds or edits JSON answers is JSON, as SQLite
+		// marks it with its subtype (json_extract marks its own containers).
+		for builder in ([]string{"json", "json_array", "json_object", "json_set", "json_insert", "json_replace", "json_remove", "json_patch", "json_quote", "json_array_insert"}) {
+			if strings.equal_fold(call.name, builder) do return value_json(value), json_err
+		}
 		return value, json_err
 	}
 	// Date and time functions share the argument parsing in datetime.odin.
@@ -7140,7 +7145,7 @@ eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 			append(&items, json_from_value(value, context.temp_allocator))
 		}
 		text := json_write(Json_Value{kind = .Array, items = items[:]}, context.allocator)
-		return value_string(text), ERROR_NONE
+		return value_json(value_string(text)), ERROR_NONE
 	}
 	if name == "median" || name == "percentile" || name == "percentile_cont" ||
 	   name == "percentile_disc" {
@@ -7211,7 +7216,7 @@ eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 			append(&items, json_from_value(value, context.temp_allocator))
 		}
 		text := json_write(Json_Value{kind = .Object, keys = keys[:], values = items[:]}, context.allocator)
-		return value_string(text), ERROR_NONE
+		return value_json(value_string(text)), ERROR_NONE
 	}
 	if name == "median" || name == "percentile" || name == "percentile_cont" ||
 	   name == "percentile_disc" {
@@ -7284,7 +7289,7 @@ eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 			append(&items, json_from_value(value, context.temp_allocator))
 		}
 		text := json_write(Json_Value{kind = .Object, keys = keys[:], values = items[:]}, context.allocator)
-		return value_string(text), ERROR_NONE
+		return value_json(value_string(text)), ERROR_NONE
 	}
 
 	if name == "group_concat" || name == "string_agg" {

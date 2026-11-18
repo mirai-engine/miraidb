@@ -616,12 +616,15 @@ sqlite3_value_free :: proc "c" (handle: rawptr) {
 	free(box)
 }
 
-// A value here never carries a subtype, never comes from an UPDATE that left
-// its column alone, and is not traced back to a bind.
+// sqlite3_value_subtype is the value's subtype: 74 ('J') for text a JSON
+// function produced. A value here never comes from an UPDATE that left its
+// column alone, and is not traced back to a bind.
 @(export)
 sqlite3_value_subtype :: proc "c" (handle: rawptr) -> c.uint {
 	context = runtime.default_context()
-	return 0
+	box := box_of(handle)
+	if box == nil do return 0
+	return c.uint(box.value.subtype)
 }
 
 @(export)
@@ -823,6 +826,10 @@ sqlite3_result_error_toobig :: proc "c" (handle: rawptr) {
 @(export)
 sqlite3_result_subtype :: proc "c" (handle: rawptr, subtype: c.uint) {
 	context = runtime.default_context()
+	ctx := context_of(handle)
+	if ctx == nil do return
+	// SQLite keeps the low byte; a later sqlite3_result_* call resets it.
+	ctx.result.subtype = u8(subtype & 0xff)
 }
 
 // sqlite3_overload_function makes sure a call to `name` with `arity`

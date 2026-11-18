@@ -1142,6 +1142,9 @@ table_insert :: proc(t: ^Table, id: Row_Id, values: []Value, validated := false)
 		if err := table_check_unique(t, values); err.kind != .None do return err
 	}
 	stored := clone_values(values)
+	// A value kept in a table has no subtype, as in SQLite: a JSON text read
+	// back from a table, or from a subquery in FROM, is text.
+	for &value in stored do value.subtype = 0
 	if t.schema.auto_increment_column != NO_COLUMN {
 		column := t.schema.auto_increment_column
 		if number, ok := value_to_i64(stored[column]); ok {
@@ -1193,6 +1196,9 @@ table_update :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
 		deleted_seq = t.apply_seq,
 	})
 	stored := clone_values(values)
+	// A value kept in a table has no subtype, as in SQLite: a JSON text read
+	// back from a table, or from a subquery in FROM, is text.
+	for &value in stored do value.subtype = 0
 	if t.schema.auto_increment_column != NO_COLUMN {
 		column := t.schema.auto_increment_column
 		if number, ok := value_to_i64(stored[column]); ok {

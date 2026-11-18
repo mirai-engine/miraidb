@@ -1653,6 +1653,8 @@ sqlite_strict_type :: proc(declared: string) -> (Column_Type, bool) {
 value_coerce_into :: proc(v: Value, schema: ^Table_Schema, index: int) -> (Value, Error) {
 	column := &schema.columns[index]
 	out, err := value_coerce(v, column.type)
+	// A stored value has no subtype, as in SQLite.
+	out.subtype = 0
 	if !schema.strict do return out, err
 	if err.kind == .None && column.type.kind == .Int && v.kind == .String {
 		// '1.5' reads as a real, which an INTEGER column of a STRICT table refuses.

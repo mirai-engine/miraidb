@@ -481,6 +481,10 @@ json_from_value :: proc(value: Value, alloc: mem.Allocator) -> Json_Value {
 	case .Float:
 		return Json_Value{kind = .Number, number = value.f}
 	case .String:
+		// Text a JSON function produced is JSON, not a string to quote.
+		if value.subtype == JSON_SUBTYPE {
+			if doc, ok := json_parse(value.s, alloc); ok do return doc
+		}
 		return Json_Value{kind = .String, text = strings.clone(value.s, alloc)}
 	case .Bytes:
 		if doc, ok := jsonb_decode(value.bytes, alloc); ok do return doc
@@ -684,7 +688,10 @@ json_call :: proc(name: string, given: []Value) -> (Value, bool, Error) {
 			if args[1].kind != .String do return value_null(), true, ERROR_NONE
 			target, found := json_path_find(doc, args[1].s)
 			if !found do return value_null(), true, ERROR_NONE
-			return json_to_value(target, context.allocator), true, ERROR_NONE
+			// An array or an object comes back as JSON text with the subtype.
+			result := json_to_value(target, context.allocator)
+			if target.kind == .Array || target.kind == .Object do result = value_json(result)
+			return result, true, ERROR_NONE
 		}
 		// Several paths produce a JSON array of the results.
 		items := make([dynamic]Json_Value, 0, len(args) - 1, context.temp_allocator)
@@ -693,7 +700,7 @@ json_call :: proc(name: string, given: []Value) -> (Value, bool, Error) {
 			target, found := json_path_find(doc, path.s)
 			append(&items, Json_Value{kind = .Null} if !found else target)
 		}
-		return value_string(json_write(Json_Value{kind = .Array, items = items[:]}, context.allocator)), true, ERROR_NONE
+		return value_json(value_string(json_write(Json_Value{kind = .Array, items = items[:]}, context.allocator))), true, ERROR_NONE
 	case "json_arrow", "json_arrow_value":
 		// `doc -> x` and `doc ->> x`. A path starting with `$` is a path; any other
 		// text is one object key and an integer one array slot, as SQLite reads them.
@@ -714,7 +721,7 @@ json_call :: proc(name: string, given: []Value) -> (Value, bool, Error) {
 		target, found := json_path_find(doc, path)
 		if !found do return value_null(), true, ERROR_NONE
 		if strings.equal_fold(name, "json_arrow") {
-			return value_string(json_write(target, context.allocator)), true, ERROR_NONE
+			return value_json(value_string(json_write(target, context.allocator))), true, ERROR_NONE
 		}
 		return json_to_value(target, context.allocator), true, ERROR_NONE
 	case "json_array_length":
