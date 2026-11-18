@@ -184,6 +184,20 @@ test_upsert_leaves_nothing :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_alter_table_leaves_nothing :: proc(t: ^testing.T) {
+	// Every table an ALTER builds for its transaction is the transaction's.
+	expect_nothing_left(t, .Memory, "_test_memory_alter", {
+		"CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)",
+		"INSERT INTO t VALUES (1, '7')",
+		"ALTER TABLE t ADD COLUMN w INT",
+		"ALTER TABLE t RENAME COLUMN v TO z",
+		"ALTER TABLE t ALTER COLUMN z TYPE INT",
+		"ALTER TABLE t DROP COLUMN w",
+		"ALTER TABLE t RENAME TO q",
+	})
+}
+
+@(test)
 test_a_parse_error_leaves_nothing :: proc(t: ^testing.T) {
 	// The error names the line and column; the detail it wraps is not kept.
 	expect_nothing_left(t, .Memory, "_test_memory_parse", {"SELECT FROM WHERE", "SELEC 1", "CREATE TABLE ("}, fails = true)

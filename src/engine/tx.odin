@@ -23,6 +23,11 @@ Tx :: struct {
 	// locked is true when the transaction holds the store lock (write
 	// transactions and pinned reads).
 	state:     Tx_State,
+	// replaced holds every table an ALTER built for this transaction. The commit
+	// logs only the new schema and the store builds its own table from it, so
+	// these are the transaction's to free, including one a later ALTER or a
+	// ROLLBACK TO left out of state.altered.
+	replaced:  [dynamic]^Table,
 	arena:     virtual.Arena,
 	alloc:     mem.Allocator,
 	// read_seq is the commit sequence the transaction started from and
@@ -627,6 +632,8 @@ tx_discard :: proc(tx: ^Tx) {
 	delete(tx.state.writes)
 	delete(tx.state.created)
 	delete(tx.state.altered)
+	for table in tx.replaced do table_release(table)
+	delete(tx.replaced)
 	delete(tx.state.dropped)
 	for table in tx.frozen_list do table_release(table)
 	delete(tx.frozen_list)
@@ -744,6 +751,7 @@ tx_alter_table :: proc(tx: ^Tx, name: string, next_schema: Table_Schema) -> Erro
 	schema := next_schema
 	replacement, create_err := table_create(&schema)
 	if create_err.kind != .None do return create_err
+	append(&tx.replaced, replacement)
 	for id, row in current.rows {
 		values, convert_err := alter_row_values(&current.schema, next_schema, row.values, tx.alloc)
 		if convert_err.kind != .None do return convert_err
@@ -895,6 +903,7 @@ tx_drop_column :: proc(tx: ^Tx, name, column_name: string) -> Error {
 	schema := next_schema
 	replacement, create_err := table_create(&schema)
 	if create_err.kind != .None do return create_err
+	append(&tx.replaced, replacement)
 	for id, row in current.rows {
 		values := make([]Value, len(row.values) - 1, tx.alloc)
 		copy(values, row.values[:index])
@@ -943,14 +952,15 @@ tx_rename_table :: proc(tx: ^Tx, from, to: string) -> Error {
 	}
 	current, current_err := tx_table(tx, from)
 	if current_err.kind != .None do return current_err
-	if _, clash := tx_table(tx, to); clash.kind == .None {
-		return errf(.Table_Exists, "table %s already exists", to)
-	}
+	_, clash := tx_table(tx, to)
+	if clash.kind == .None do return errf(.Table_Exists, "table %s already exists", to)
+	error_free(&clash)
 	next_schema := current.schema
 	next_schema.name = strings.clone(to, tx.alloc)
 	schema := next_schema
 	replacement, create_err := table_create(&schema)
 	if create_err.kind != .None do return create_err
+	append(&tx.replaced, replacement)
 	for id, row in current.rows {
 		if insert_err := table_insert(replacement, id, row.values); insert_err.kind != .None {
 			return insert_err
