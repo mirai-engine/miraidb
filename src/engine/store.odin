@@ -699,6 +699,9 @@ schema_signature :: proc(schema: ^Table_Schema) -> string {
 // `path`, which must already hold this database. The caller owns `path`.
 store_set_sqlite_mirror :: proc(store: ^Store, path: string) {
 	if store == nil do return
+	// A SQLite database keeps SQLite's default: its foreign keys are declared
+	// and enforced after PRAGMA foreign_keys = ON.
+	store.foreign_keys_off = true
 	delete(store.sqlite_mirror)
 	store.sqlite_mirror = strings.clone(path)
 	// The layout is read now, while every row the file holds is still in the

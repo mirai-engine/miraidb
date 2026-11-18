@@ -998,11 +998,19 @@ sqlite_import_tx :: proc(
 	tx: ^Tx,
 	alloc := context.allocator,
 ) -> (tables: int, rows: int, err: Error) {
-	for &table in file.tables {
+	// A file's rows are SQLite's, written with its foreign keys off by
+	// default, so the import does not enforce them.
+	saved_keys := tx.store.foreign_keys_off
+	tx.store.foreign_keys_off = true
+	defer tx.store.foreign_keys_off = saved_keys
+	// A table's parents come first, so its REFERENCES can be declared.
+	created := make(map[string]bool, len(file.tables), context.temp_allocator)
+	for at in sqlite_import_order(file) {
+		table := &file.tables[at]
 		if len(table.columns) == 0 do continue
-		rows_of_table, rows_err := sqlite_table_rows(file, &table, alloc)
+		rows_of_table, rows_err := sqlite_table_rows(file, table, alloc)
 		if rows_err.kind != .None do return tables, rows, rows_err
-		sqlite_infer_columns(&table, rows_of_table)
+		sqlite_infer_columns(table, rows_of_table)
 		create := strings.builder_make(alloc)
 		defer strings.builder_destroy(&create)
 		// The file's own declaration, read with the engine's parser, gives the
@@ -1051,12 +1059,12 @@ sqlite_import_tx :: proc(
 		// export then carries it as an index row (D33).
 		if len(table.primary_group) > 0 {
 			strings.write_string(&create, ", PRIMARY KEY (")
-			sqlite_write_group(&create, &table, table.primary_group)
+			sqlite_write_group(&create, table, table.primary_group)
 		}
 		for group in table.unique_groups {
 			if len(group) == 1 && table.columns[group[0]].primary_key do continue
 			strings.write_string(&create, ", UNIQUE (")
-			sqlite_write_group(&create, &table, group)
+			sqlite_write_group(&create, table, group)
 		}
 		if declared_ok {
 			for constraint in declared.stmt.constraints {
@@ -1071,8 +1079,34 @@ sqlite_import_tx :: proc(
 				strings.write_string(&create, constraint.check_sql)
 				strings.write_byte(&create, ')')
 			}
+			// The foreign keys whose parent the import has made (or the table
+			// itself); one naming a table the file lacks, or a cycle, is left
+			// out.
+			for constraint in declared.stmt.constraints {
+				if !constraint.is_foreign do continue
+				if !strings.equal_fold(constraint.ref_table, table.name) && !created[strings.to_lower(constraint.ref_table, context.temp_allocator)] do continue
+				strings.write_string(&create, ", FOREIGN KEY (")
+				for name, i in constraint.columns {
+					if i > 0 do strings.write_string(&create, ", ")
+					sqlite_write_ident(&create, name)
+				}
+				strings.write_string(&create, ") REFERENCES ")
+				sqlite_write_ident(&create, constraint.ref_table)
+				if len(constraint.ref_columns) > 0 {
+					strings.write_string(&create, " (")
+					for name, i in constraint.ref_columns {
+						if i > 0 do strings.write_string(&create, ", ")
+						sqlite_write_ident(&create, name)
+					}
+					strings.write_byte(&create, ')')
+				}
+				if constraint.on_delete == .Cascade do strings.write_string(&create, " ON DELETE CASCADE")
+				if constraint.on_update == .Cascade do strings.write_string(&create, " ON UPDATE CASCADE")
+				if constraint.deferred do strings.write_string(&create, " DEFERRABLE INITIALLY DEFERRED")
+			}
 		}
 		strings.write_string(&create, ")")
+		created[strings.to_lower(table.name, context.temp_allocator)] = true
 		if _, create_err := sql_execute_in_tx(tx, strings.to_string(create)); create_err.kind != .None {
 			return tables, rows, create_err
 		}
@@ -1164,6 +1198,55 @@ sqlite_import_finish :: proc(file: ^Sqlite_File, store: ^Store) {
 	// Remember the catalog the file spelled, now that the tables exist in the
 	// store: a rewrite re-emits it for every object it does not change (D27).
 	store_mirror_keep(store, file)
+}
+
+// sqlite_import_order lists the file's tables so that a table comes after the
+// tables its REFERENCES name; a cycle keeps the file's order for what is left.
+@(private)
+sqlite_import_order :: proc(file: ^Sqlite_File) -> []int {
+	parents := make([][]string, len(file.tables), context.temp_allocator)
+	for &table, i in file.tables {
+		declared, ok := sqlite_declared_rules(table.sql)
+		if !ok do continue
+		names := make([dynamic]string, 0, 2, context.temp_allocator)
+		for constraint in declared.stmt.constraints {
+			if constraint.is_foreign && !strings.equal_fold(constraint.ref_table, table.name) {
+				append(&names, strings.to_lower(constraint.ref_table, context.temp_allocator))
+			}
+		}
+		query_destroy(&declared.query)
+		parents[i] = names[:]
+	}
+	present := make(map[string]bool, len(file.tables), context.temp_allocator)
+	for table in file.tables do present[strings.to_lower(table.name, context.temp_allocator)] = true
+	order := make([dynamic]int, 0, len(file.tables), context.temp_allocator)
+	placed := make([]bool, len(file.tables), context.temp_allocator)
+	done := make(map[string]bool, len(file.tables), context.temp_allocator)
+	for len(order) < len(file.tables) {
+		progress := false
+		for &table, i in file.tables {
+			if placed[i] do continue
+			ready := true
+			for parent in parents[i] {
+				if present[parent] && !done[parent] do ready = false
+			}
+			if !ready do continue
+			placed[i] = true
+			done[strings.to_lower(table.name, context.temp_allocator)] = true
+			append(&order, i)
+			progress = true
+		}
+		if progress do continue
+		// A cycle: the next table in the file's order goes first.
+		for &table, i in file.tables {
+			if placed[i] do continue
+			placed[i] = true
+			done[strings.to_lower(table.name, context.temp_allocator)] = true
+			append(&order, i)
+			break
+		}
+	}
+	return order[:]
 }
 
 @(private)

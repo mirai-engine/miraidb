@@ -85,7 +85,7 @@ sqlite_table_sql :: proc(store: ^Store, table: ^Table, texts: map[string]string)
 	if text, has_text := texts[table.schema.name]; has_text {
 		if written, ok := sql_text_table_kept(table, text); ok do return strings.clone(text), written, true
 	}
-	return sqlite_master_sql(table), original, false
+	return sqlite_master_sql(table, store), original, false
 }
 
 // sql_text_table_kept reads a table's CREATE text the way an import reads a

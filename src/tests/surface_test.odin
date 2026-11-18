@@ -677,3 +677,33 @@ test_mirror_patches_sqlite_sequence :: proc(t: ^testing.T) {
 	testing.expect_value(t, file_scalar(t, again, "SELECT max(id) FROM s"), "4")
 	testing.expect_value(t, file_scalar(t, again, "SELECT max(id) FROM n"), "1")
 }
+
+@(test)
+test_sqlite_file_foreign_keys :: proc(t: ^testing.T) {
+	// A SQLite file's REFERENCES come with it, in the order their parents
+	// need, and the file opens with SQLite's default: declared, enforced after
+	// PRAGMA foreign_keys = ON. Before, the keys were dropped on import.
+	store := fresh_db(t, "file_foreign_keys")
+	if store == nil do return
+	defer cleanup_db(store, "file_foreign_keys")
+	run(t, store, "CREATE TABLE parent (id INTEGER PRIMARY KEY, n INTEGER)")
+	run(t, store, "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent (id) ON DELETE CASCADE)")
+	run(t, store, "INSERT INTO parent VALUES (1, 1)")
+	run(t, store, "INSERT INTO child VALUES (1, 1)")
+	path := "_test_file_foreign_keys.sqlite"
+	os.remove(path)
+	defer os.remove(path)
+	_, _, export_err := db.sqlite_file_write(store, path)
+	if !testing.expectf(t, db.error_ok(export_err), "export: %s", export_err.message) do return
+
+	conn, open_err := db.embed_open(path)
+	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
+	defer db.embed_close(conn)
+	testing.expect_value(t, file_scalar(t, conn, "PRAGMA foreign_keys"), "0")
+	testing.expect_value(t, file_scalar(t, conn, "SELECT \"table\" || '.' || \"to\" || ' ' || on_delete FROM pragma_foreign_key_list('child')"), "parent.id CASCADE")
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "INSERT INTO child VALUES (2, 99)")))
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "PRAGMA foreign_keys = ON")))
+	testing.expect(t, !db.error_drop(db.embed_exec(conn, "INSERT INTO child VALUES (3, 98)")))
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "DELETE FROM parent WHERE id = 1")))
+	testing.expect_value(t, file_scalar(t, conn, "SELECT group_concat(id, ',') FROM child"), "2")
+}

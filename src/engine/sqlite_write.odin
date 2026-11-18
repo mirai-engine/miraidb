@@ -645,7 +645,7 @@ sqlite_column_is_key :: proc(schema: ^Table_Schema, position: int) -> bool {
 }
 
 @(private)
-sqlite_master_sql :: proc(table: ^Table) -> string {
+sqlite_master_sql :: proc(table: ^Table, store: ^Store = nil) -> string {
 	builder := strings.builder_make()
 	strings.write_string(&builder, "CREATE TABLE ")
 	sqlite_write_ident(&builder, table.schema.name)
@@ -698,6 +698,28 @@ sqlite_master_sql :: proc(table: ^Table) -> string {
 		}
 		strings.write_byte(&builder, ')')
 	}
+	// The foreign keys, as REFERENCES SQLite enforces once they are on.
+	for key in table.schema.foreign_keys {
+		strings.write_string(&builder, ", FOREIGN KEY (")
+		for position, i in key.columns {
+			if i > 0 do strings.write_string(&builder, ", ")
+			sqlite_write_ident(&builder, table.schema.columns[position].name)
+		}
+		strings.write_string(&builder, ") REFERENCES ")
+		sqlite_write_ident(&builder, key.ref_table)
+		// The parent's column names, when the parent can be read.
+		if parent, found := store_parent_table(store, key.ref_table); found {
+			strings.write_string(&builder, " (")
+			for position, i in key.ref_columns {
+				if i > 0 do strings.write_string(&builder, ", ")
+				if position >= 0 && position < len(parent.schema.columns) do sqlite_write_ident(&builder, parent.schema.columns[position].name)
+			}
+			strings.write_byte(&builder, ')')
+		}
+		if key.on_delete == .Cascade do strings.write_string(&builder, " ON DELETE CASCADE")
+		if key.on_update == .Cascade do strings.write_string(&builder, " ON UPDATE CASCADE")
+		if key.deferred do strings.write_string(&builder, " DEFERRABLE INITIALLY DEFERRED")
+	}
 	// CHECK constraints travel as written, so SQLite keeps enforcing them.
 	for check in table.schema.checks {
 		strings.write_string(&builder, ", ")
@@ -712,6 +734,17 @@ sqlite_master_sql :: proc(table: ^Table) -> string {
 	}
 	strings.write_string(&builder, ")")
 	return strings.to_string(builder)
+}
+
+// store_parent_table is a foreign key's parent, as committed.
+@(private)
+store_parent_table :: proc(store: ^Store, name: string) -> (^Table, bool) {
+	if store == nil do return nil, false
+	if table, found := store.tables[name]; found do return table, true
+	for key, table in store.tables {
+		if strings.equal_fold(key, name) do return table, true
+	}
+	return nil, false
 }
 
 @(private)
