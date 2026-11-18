@@ -956,7 +956,12 @@ parse_select :: proc(p: ^Parser) -> Statement {
 			item.expr = parse_expression(p)
 			item.text = p_text_since(p, start)
 		}
-		if p_match_keyword(p, "as") {
+		// `*` and `t.*` take no alias, as in SQLite: `SELECT * FRM t` fails at
+		// FRM rather than naming the star.
+		star_expr := false
+		if item.expr != nil do _, star_expr = item.expr^.(Star_Expr)
+		if item.star || star_expr {
+		} else if p_match_keyword(p, "as") {
 			item.alias = p_ident(p)
 		} else if (p.current.kind == .Ident || p.current.kind == .Quoted_Ident) && !p_is_clause_keyword(p) {
 			// A trailing bare name is the alias, as SQL allows.

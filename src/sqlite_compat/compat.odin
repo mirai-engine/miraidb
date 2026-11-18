@@ -802,6 +802,42 @@ sqlite3_prepare :: proc "c" (handle: rawptr, sql: cstring, nByte: c.int, ppStmt:
 	return prepare(handle, sql, nByte, ppStmt, pzTail)
 }
 
+// sqlite_token_at is the token that starts at `offset`, as SQLite's tokenizer
+// would cut it, for a syntax error's "near" text.
+@(private)
+sqlite_token_at :: proc(text: string, offset: int) -> string {
+	rest := text[offset:]
+	if len(rest) == 0 do return ""
+	is_word :: proc(b: u8) -> bool {
+		return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_' || b == '$' || b >= 0x80
+	}
+	first := rest[0]
+	switch {
+	case is_word(first):
+		n := 1
+		for n < len(rest) && is_word(rest[n]) do n += 1
+		return rest[:n]
+	case first == '\'' || first == '"' || first == '`' || first == '[':
+		closing := first == '[' ? u8(']') : first
+		n := 1
+		for n < len(rest) {
+			if rest[n] == closing {
+				if closing != ']' && n + 1 < len(rest) && rest[n + 1] == closing {
+					n += 2
+					continue
+				}
+				return rest[:n + 1]
+			}
+			n += 1
+		}
+		return rest
+	}
+	for operator in ([]string{"->>", "||", "<=", ">=", "==", "!=", "<>", "<<", ">>", "->"}) {
+		if strings.has_prefix(rest, operator) do return rest[:len(operator)]
+	}
+	return rest[:1]
+}
+
 // error_offset_of reads "line L, column C" from a parse error and turns it into a
 // byte offset in `text`, or -1 when the message carries no position.
 @(private)
@@ -861,10 +897,38 @@ prepare :: proc(handle: rawptr, sql: cstring, nByte: c.int, ppStmt: ^rawptr, pzT
 		leading := strings.index(text, head)
 		// An error at the very end is SQLite's "incomplete input", which carries no
 		// offset.
-		if offset := error_offset_of(engine.embed_error(db.conn), head); offset >= 0 && int(offset) < len(head) && leading >= 0 {
+		offset := error_offset_of(engine.embed_error(db.conn), head)
+		if offset >= 0 && int(offset) < len(head) && leading >= 0 {
 			db.error_offset = offset + c.int(leading)
 		}
-		return fail_connection(db)
+		// fail_connection records the message again, under another kind: the
+		// kind is read first.
+		syntax := engine.embed_error_kind(db.conn) == .Sql_Syntax
+		code := fail_connection(db)
+		// A syntax error reads as SQLite's: the token it stopped at, or
+		// "incomplete input" when the text ended first.
+		if syntax && db.conn.store.sqlite_rules && offset >= 0 {
+			if int(offset) >= len(head) {
+				engine.embed_note_error(db.conn, .Sql_Syntax, "incomplete input")
+			} else {
+				token := sqlite_token_at(head, int(offset))
+				quote := token[0]
+				closed := quote != '\'' && quote != '"' && quote != '`' && quote != '['
+				if !closed {
+					closing := quote == '[' ? u8(']') : quote
+					closed = len(token) > 1 && token[len(token) - 1] == closing
+				}
+				if closed {
+					engine.embed_note_error(db.conn, .Sql_Syntax, fmt.tprintf("near \"%s\": syntax error", token))
+				} else {
+					// A quote that never closes is a token SQLite cannot read: it
+					// names the rest of the text.
+					engine.embed_note_error(db.conn, .Sql_Syntax, fmt.tprintf("unrecognized token: \"%s\"", head[offset:]))
+				}
+			}
+			set_error(db, engine.embed_error(db.conn))
+		}
+		return code
 	}
 	// A statement numbers its parameters up to the connection's limit.
 	if c.int(engine.Embed_Parameter_Count(statement)) > connection_limit(db, SQLITE_LIMIT_VARIABLE_NUMBER) {
