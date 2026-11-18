@@ -123,6 +123,13 @@ sqlite_varint :: proc(data: []u8, at: int) -> (value: u64, size: int) {
 	return value, i - at
 }
 
+// sqlite_is_empty_file reports an existing regular file with no bytes.
+sqlite_is_empty_file :: proc(path: string) -> bool {
+	info, err := os.stat(path, context.temp_allocator)
+	if err != nil do return false
+	return info.type == .Regular && info.size == 0
+}
+
 sqlite_is_file :: proc(path: string) -> bool {
 	data, err := os.read_entire_file(path, context.temp_allocator)
 	if err != nil || len(data) < len(SQLITE_MAGIC) do return false
@@ -476,10 +483,15 @@ sqlite_master_visit :: proc(user: rawptr, rowid: i64, payload: []u8) -> bool {
 		root_page = u32(values[3].i),
 		sql       = sql.kind == .String ? strings.clone(sql.s, ctx.file.alloc) : "",
 		columns   = sqlite_columns_from_sql(sql.kind == .String ? sql.s : "", ctx.file.alloc),
+		// No column is the rowid until the declaration says so: a NULL in the
+		// first column of a table without an INTEGER PRIMARY KEY used to come
+		// back as the row's rowid.
+		pk_position = -1,
 	}
 	table.without_rowid = sqlite_contains_word(table.sql, "WITHOUT ROWID")
 	sqlite_constraints_from_sql(table.sql, &table, ctx.file.alloc)
 	for column, i in table.columns {
+		if table.without_rowid do break
 		if column.primary_key && strings.equal_fold(column.declared, "INTEGER") {
 			table.pk_position = i
 			break
@@ -752,7 +764,8 @@ sqlite_affinity :: proc(declared: string) -> Type_Kind {
 	if strings.contains(upper, "CHAR") || strings.contains(upper, "CLOB") || strings.contains(upper, "TEXT") do return .String
 	// A typeless column (or NUMERIC affinity) keeps the storage class it receives.
 	if len(strings.trim_space(declared)) == 0 do return .Any
-	if strings.contains(upper, "BLOB") do return .Bytes
+	// BLOB is SQLite's "no affinity": the column keeps whatever class it holds.
+	if strings.contains(upper, "BLOB") do return .Any
 	if strings.contains(upper, "REAL") || strings.contains(upper, "FLOA") || strings.contains(upper, "DOUB") do return .Float
 	if strings.contains(upper, "NUM") do return .Any
 	// Any other declared type behaves like NUMERIC affinity.
@@ -881,7 +894,7 @@ sqlite_value_text :: proc(value: Value, alloc: mem.Allocator) -> string {
 	case .Uint:
 		return fmt.aprintf("%d", value.u, allocator = alloc)
 	case .Float:
-		return fmt.aprintf("%g", value.f, allocator = alloc)
+		return sqlite_real_text(value.f, alloc)
 	case .Bool:
 		return strings.clone(value.b ? "1" : "0", alloc)
 	case .String:
@@ -1116,4 +1129,23 @@ sqlite_infer_columns :: proc(table: ^Sqlite_Table, rows: [][]Value) {
 			column.inferred = .Int
 		}
 	}
+}
+
+// sqlite_real_text renders a real as SQLite's text form does (`%!.15g`):
+// fifteen significant digits, and a real that prints as a whole number keeps
+// a ".0" so it still reads as a real.
+sqlite_real_text :: proc(f: f64, alloc: mem.Allocator) -> string {
+	if f != f do return strings.clone("NaN", alloc)
+	if f > 1.7976931348623157e308 do return strings.clone("Inf", alloc)
+	if f < -1.7976931348623157e308 do return strings.clone("-Inf", alloc)
+	// Zero prints without its sign, as SQLite prints it.
+	if f == 0 do return strings.clone("0.0", alloc)
+	text := fmt.tprintf("%.15g", f)
+	// A whole mantissa keeps its ".0" before the exponent too: 1.0e+20.
+	if at := strings.index_any(text, "eE"); at >= 0 {
+		if strings.contains_rune(text[:at], '.') do return strings.clone(text, alloc)
+		return strings.concatenate({text[:at], ".0", text[at:]}, alloc)
+	}
+	if strings.contains_any(text, ".n") do return strings.clone(text, alloc)
+	return strings.concatenate({text, ".0"}, alloc)
 }

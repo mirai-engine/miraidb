@@ -73,6 +73,20 @@ Embed_Conn :: struct {
 embed_open :: proc(path: string, options := Store_Options{persistent = true, create = true, durable = true}) -> (^Embed_Conn, Error) {
 	conn := new(Embed_Conn)
 	store: ^Store
+	// An existing file of zero bytes is an empty SQLite database, as SQLite
+	// reads it (what `sqlite3.connect` or `touch` leaves): the first commit
+	// writes the file.
+	if len(path) > 0 && sqlite_is_empty_file(path) {
+		opened, open_err := store_open("", {persistent = false})
+		if open_err.kind != .None {
+			free(conn)
+			return nil, open_err
+		}
+		store_set_sqlite_mirror(opened, path)
+		conn.store = opened
+		conn.owns_store = true
+		return conn, ERROR_NONE
+	}
 	if len(path) > 0 && sqlite_is_file(path) {
 		file, file_err := sqlite_file_open(path)
 		if file_err.kind != .None {
