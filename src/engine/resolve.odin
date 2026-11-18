@@ -25,6 +25,10 @@ Res_Walk :: struct {
 	ctes:   [dynamic]Res_Cte,
 	depth:  int,
 	err:    Error,
+	// where_projections are the select list a WHERE may name by its aliases,
+	// as SQLite allows, while that WHERE (scope where_scope) is walked.
+	where_projections: []Select_Item,
+	where_scope:       int,
 }
 
 // Res_Scope is one query's relations and the aliases its projections give,
@@ -374,7 +378,12 @@ res_select :: proc(walk: ^Res_Walk, select: ^Select_Stmt, names: ^[dynamic]strin
 		}
 	}
 	for join in select.joins do res_expr(walk, join.on)
+	// A name in WHERE that no source has may be an alias of the select list:
+	// the reference becomes the projection's expression, as SQLite reads it.
+	saved_projections, saved_scope := walk.where_projections, walk.where_scope
+	walk.where_projections, walk.where_scope = select.projections, len(walk.scopes) - 1
 	res_expr(walk, select.where_clause)
+	walk.where_projections, walk.where_scope = saved_projections, saved_scope
 	for expr in select.group_by do res_expr(walk, expr)
 	res_expr(walk, select.having)
 	// A compound's ORDER BY names the result columns of its first term, which
@@ -434,6 +443,33 @@ res_column :: proc(walk: ^Res_Walk, column: Column_Expr) {
 	res_no_column(walk, column)
 }
 
+// res_where_alias replaces a WHERE's reference to a select-list alias with
+// the expression it names, when no source of the query has the name.
+@(private)
+res_where_alias :: proc(walk: ^Res_Walk, expr: ^Expr, column: Column_Expr) -> bool {
+	if walk.where_projections == nil || len(column.table) > 0 do return false
+	if walk.where_scope != len(walk.scopes) - 1 do return false
+	scope := walk.scopes[walk.where_scope]
+	for source in scope.sources {
+		if !source.known || res_has_column(source, column.name) do return false
+	}
+	for item in walk.where_projections {
+		if len(item.alias) == 0 || !strings.equal_fold(item.alias, column.name) || item.expr == nil do continue
+		if expr_is_aggregate(item.expr) {
+			if walk.err.kind == .None {
+				name := column.name
+				if call, is_call := item.expr^.(Call_Expr); is_call do name = call.name
+				walk.err = errf(.Invalid_Argument, "misuse of aggregate: %s()", name)
+			}
+			return true
+		}
+		expr^ = item.expr^
+		res_expr(walk, expr)
+		return true
+	}
+	return false
+}
+
 @(private)
 res_any_unknown :: proc(walk: ^Res_Walk) -> bool {
 	for scope in walk.scopes {
@@ -458,6 +494,7 @@ res_expr :: proc(walk: ^Res_Walk, expr: ^Expr) {
 	switch e in expr^ {
 	case Literal_Expr, Param_Expr, Star_Expr:
 	case Column_Expr:
+		if res_where_alias(walk, expr, e) do return
 		res_column(walk, e)
 	case Binary_Expr:
 		res_expr(walk, e.left)
