@@ -138,7 +138,8 @@ def main() -> int:
     assert lib.sqlite3_exec(db, b"CREATE TABLE blobs (id INTEGER PRIMARY KEY, payload BLOB)", None, None, None) == OK
     assert lib.sqlite3_exec(db, b"INSERT INTO blobs (id, payload) VALUES (7, x'01020304')", None, None, None) == OK
     blob = ctypes.c_void_p()
-    assert lib.sqlite3_blob_open(db, b"main", b"blobs", b"payload", 7, 0, ctypes.byref(blob)) == OK, lib.sqlite3_errmsg(db)
+    # Flags 1 opens it for writing; with 0 a write is refused, as in SQLite.
+    assert lib.sqlite3_blob_open(db, b"main", b"blobs", b"payload", 7, 1, ctypes.byref(blob)) == OK, lib.sqlite3_errmsg(db)
     assert lib.sqlite3_blob_bytes(blob) == 4
     buffer = ctypes.create_string_buffer(4)
     assert lib.sqlite3_blob_read(blob, buffer, 4, 0) == OK

@@ -13,6 +13,7 @@ package sqlite_compat
 
 import "base:runtime"
 import "core:c"
+import "core:fmt"
 import "core:path/filepath"
 import "core:strconv"
 import "core:strings"
@@ -281,7 +282,11 @@ Blob :: struct {
 	key:    string,
 	row_id: i64,
 	data:   []u8,
-	dirty:  bool,
+	// is_text says the value is text, which a write keeps; writable is the
+	// flag it was opened with; expired says its row changed under it.
+	is_text:  bool,
+	writable: bool,
+	expired:  bool,
 }
 
 @(private)
@@ -289,21 +294,6 @@ blob_of :: proc(handle: rawptr) -> ^Blob {
 	return cast(^Blob)handle
 }
 
-// blob_key_column resolves the column that names a row: a single-column
-// primary key plays the part of SQLite's rowid, which is what iRow carries.
-@(private)
-blob_key_column :: proc(db: ^Database, table_name: string) -> (column: string, ok: bool) {
-	store := db.conn.store
-	if store == nil do return "", false
-	tx := engine.tx_begin_read(store)
-	defer engine.tx_end(tx)
-	table, table_err := engine.tx_table(tx, table_name)
-	if !engine.error_drop(table_err) do return "", false
-	if len(table.schema.primary_key) != 1 do return "", false
-	position := table.schema.primary_key[0]
-	if position < 0 || position >= len(table.schema.columns) do return "", false
-	return table.schema.columns[position].name, true
-}
 
 @(private)
 set_error :: proc(db: ^Database, text: string) {
@@ -1666,6 +1656,85 @@ sqlite3_expanded_sql :: proc "c" (handle: rawptr) -> cstring {
 
 // --- Incremental BLOB I/O --------------------------------------------------
 
+// The handle reads and writes the row as SQLite's does: a write goes to the
+// row at once, so a query sees it, and a change the handle did not make to its
+// row (an UPDATE, a DELETE) expires it, after which reads and writes answer
+// SQLITE_ABORT.
+
+// blob_locate checks what sqlite3_blob_open names, with SQLite's messages,
+// and answers the column that keys the row.
+@(private)
+blob_locate :: proc(db: ^Database, schema_name, table_name, column_name: string) -> (key: string, code: c.int) {
+	if schema_name != "" && !strings.equal_fold(schema_name, "main") && !strings.equal_fold(schema_name, "temp") {
+		return "", set_error_code(db, SQLITE_ERROR, fmt.tprintf("no such table: %s.%s", schema_name, table_name))
+	}
+	store := db.conn.store
+	tx := db.conn.tx
+	own := tx == nil
+	if own do tx = engine.tx_begin_read(store)
+	defer if own do engine.tx_end(tx)
+	table, table_err := engine.tx_table(tx, table_name)
+	if !engine.error_drop(table_err) || strings.has_prefix(table_name, "_") {
+		return "", set_error_code(db, SQLITE_ERROR, fmt.tprintf("no such table: main.%s", table_name))
+	}
+	if table.schema.without_rowid {
+		return "", set_error_code(db, SQLITE_ERROR, fmt.tprintf("cannot open table without rowid: %s", table_name))
+	}
+	found := false
+	for column in table.schema.columns {
+		if strings.equal_fold(column.name, column_name) do found = true
+	}
+	if !found do return "", set_error_code(db, SQLITE_ERROR, fmt.tprintf("no such column: \"%s\"", column_name))
+	// A single-column integer primary key is the rowid, so it names the row; any
+	// other table is named by its rowid, which every stored row has (F8).
+	key = "rowid"
+	if len(table.schema.primary_key) == 1 {
+		position := table.schema.primary_key[0]
+		if position >= 0 && position < len(table.schema.columns) && table.schema.columns[position].type.kind == .Int {
+			key = table.schema.columns[position].name
+		}
+	}
+	return key, SQLITE_OK
+}
+
+// blob_fetch reads the row's value: its bytes, whether it is text, whether
+// the row is there.
+@(private)
+blob_fetch :: proc(db: ^Database, table, column, key: string, row: i64) -> (data: []u8, is_text: bool, has_row: bool, code: c.int) {
+	query := strings.concatenate({"SELECT \"", column, "\" FROM \"", table, "\" WHERE ", key, " = ?"}, context.temp_allocator)
+	stmt := engine.embed_prepare(db.conn, query)
+	if stmt == nil do return nil, false, false, set_error_code(db, SQLITE_ERROR, "no such table")
+	defer engine.embed_finalize(stmt)
+	if err := engine.embed_bind_int(stmt, 0, row); err.kind != .None {
+		set_error_from(db, err)
+		return nil, false, false, SQLITE_ERROR
+	}
+	found, step_err := engine.embed_step(stmt)
+	if step_err.kind != .None {
+		set_error_from(db, step_err)
+		return nil, false, false, SQLITE_ERROR
+	}
+	if !found do return nil, false, false, SQLITE_OK
+	value, column_ok := engine.embed_column_value(stmt, 0)
+	if !column_ok do return nil, false, true, SQLITE_ERROR
+	#partial switch value.kind {
+	case .Bytes:
+		data = make([]u8, len(value.bytes))
+		copy(data, value.bytes)
+	case .String:
+		data = make([]u8, len(value.s))
+		copy(data, value.s)
+		is_text = true
+	case .Null:
+		return nil, false, true, set_error_code(db, SQLITE_ERROR, "cannot open value of type null")
+	case .Int, .Uint:
+		return nil, false, true, set_error_code(db, SQLITE_ERROR, "cannot open value of type integer")
+	case .Float:
+		return nil, false, true, set_error_code(db, SQLITE_ERROR, "cannot open value of type real")
+	}
+	return data, is_text, true, SQLITE_OK
+}
+
 @(export)
 sqlite3_blob_open :: proc "c" (
 	handle: rawptr,
@@ -1682,46 +1751,36 @@ sqlite3_blob_open :: proc "c" (
 	ppBlob^ = nil
 	table_name := string(zTable)
 	column_name := string(zColumn)
-	// A single-column integer primary key is the rowid, so it names the row; any
-	// other table is named by its rowid, which every stored row has (F8).
-	key_column, key_ok := blob_key_column(db, table_name)
-	if !key_ok do key_column = "rowid"
-	query := strings.concatenate({"SELECT ", column_name, " FROM ", table_name, " WHERE ", key_column, " = ?"})
-	defer delete(query)
-	stmt := engine.embed_prepare(db.conn, query)
-	if stmt == nil do return SQLITE_ERROR
-	defer engine.embed_finalize(stmt)
-	if err := engine.embed_bind_int(stmt, 0, i64(iRow)); err.kind != .None {
-		set_error_from(db, err)
-		return SQLITE_ERROR
-	}
-	has_row, step_err := engine.embed_step(stmt)
-	if step_err.kind != .None {
-		set_error_from(db, step_err)
-		return SQLITE_ERROR
-	}
-	if !has_row {
-		set_error(db, "no such row")
-		return SQLITE_ERROR
-	}
-	value, column_ok := engine.embed_column_value(stmt, 0)
-	if !column_ok do return SQLITE_ERROR
+	key, locate_code := blob_locate(db, zDb == nil ? "" : string(zDb), table_name, column_name)
+	if locate_code != SQLITE_OK do return locate_code
+	data, is_text, has_row, code := blob_fetch(db, table_name, column_name, key, i64(iRow))
+	if code != SQLITE_OK do return code
+	if !has_row do return set_error_code(db, SQLITE_ERROR, "no such row")
 	blob := new(Blob)
 	blob.db = db
 	blob.table = strings.clone(table_name)
 	blob.column = strings.clone(column_name)
-	blob.key = strings.clone(key_column)
+	blob.key = strings.clone(key)
 	blob.row_id = i64(iRow)
-	switch value.kind {
-	case .Bytes:
-		blob.data = make([]u8, len(value.bytes))
-		copy(blob.data, value.bytes)
-	case .String:
-		blob.data = make([]u8, len(value.s))
-		copy(blob.data, value.s)
-	case .Null, .Default, .Bool, .Int, .Uint, .Float, .Timestamp, .Uuid, .Array, .Product, .Int128, .Uint128, .Duration, .Identity, .Connection:
-	}
+	blob.data = data
+	blob.is_text = is_text
+	blob.writable = flags != 0
 	ppBlob^ = rawptr(blob)
+	return SQLITE_OK
+}
+
+// blob_current checks that the row still holds what the handle read or wrote;
+// otherwise the handle expires, as SQLite expires it when the row changes.
+@(private)
+blob_current :: proc(blob: ^Blob) -> c.int {
+	if !blob.expired {
+		data, _, has_row, code := blob_fetch(blob.db, blob.table, blob.column, blob.key, blob.row_id)
+		defer delete(data)
+		if code != SQLITE_OK || !has_row || len(data) != len(blob.data) || string(data) != string(blob.data) {
+			blob.expired = true
+		}
+	}
+	if blob.expired do return set_error_code(blob.db, SQLITE_ABORT, "query aborted")
 	return SQLITE_OK
 }
 
@@ -1729,7 +1788,7 @@ sqlite3_blob_open :: proc "c" (
 sqlite3_blob_bytes :: proc "c" (handle: rawptr) -> c.int {
 	context = runtime.default_context()
 	blob := blob_of(handle)
-	if blob == nil do return 0
+	if blob == nil || blob.expired do return 0
 	return c.int(len(blob.data))
 }
 
@@ -1738,11 +1797,10 @@ sqlite3_blob_read :: proc "c" (handle: rawptr, buffer: rawptr, count: c.int, off
 	context = runtime.default_context()
 	blob := blob_of(handle)
 	if blob == nil || buffer == nil do return SQLITE_MISUSE
-	if count < 0 || offset < 0 do return SQLITE_ERROR
-	if int(offset) + int(count) > len(blob.data) {
-		set_error(blob.db, "read past the end of the blob")
-		return SQLITE_ERROR
+	if count < 0 || offset < 0 || int(offset) + int(count) > len(blob.data) {
+		return set_error_code(blob.db, SQLITE_ERROR, "SQL logic error")
 	}
+	if code := blob_current(blob); code != SQLITE_OK do return code
 	target := ([^]u8)(buffer)
 	for i in 0 ..< int(count) do target[i] = blob.data[int(offset) + i]
 	return SQLITE_OK
@@ -1753,16 +1811,34 @@ sqlite3_blob_write :: proc "c" (handle: rawptr, buffer: rawptr, count: c.int, of
 	context = runtime.default_context()
 	blob := blob_of(handle)
 	if blob == nil || buffer == nil do return SQLITE_MISUSE
-	if count < 0 || offset < 0 do return SQLITE_ERROR
+	if !blob.writable do return set_error_code(blob.db, SQLITE_READONLY, "attempt to write a readonly database")
 	// The size comes from the row: a write cannot grow the blob, matching
 	// SQLite's contract that growth goes through zeroblob and a full rewrite.
-	if int(offset) + int(count) > len(blob.data) {
-		set_error(blob.db, "write past the end of the blob")
-		return SQLITE_ERROR
+	if count < 0 || offset < 0 || int(offset) + int(count) > len(blob.data) {
+		return set_error_code(blob.db, SQLITE_ERROR, "SQL logic error")
 	}
+	if code := blob_current(blob); code != SQLITE_OK do return code
 	source := ([^]u8)(buffer)
 	for i in 0 ..< int(count) do blob.data[int(offset) + i] = source[i]
-	blob.dirty = true
+	update := strings.concatenate({"UPDATE \"", blob.table, "\" SET \"", blob.column, "\" = ? WHERE ", blob.key, " = ?"}, context.temp_allocator)
+	stmt := engine.embed_prepare(blob.db.conn, update)
+	if stmt == nil {
+		blob.expired = true
+		return set_error_code(blob.db, SQLITE_ERROR, "SQL logic error")
+	}
+	defer engine.embed_finalize(stmt)
+	// Text stays text, as SQLite writes a text value's bytes in place.
+	if blob.is_text {
+		_ = engine.error_drop(engine.embed_bind_text(stmt, 0, string(blob.data)))
+	} else {
+		_ = engine.error_drop(engine.embed_bind_blob(stmt, 0, blob.data))
+	}
+	_ = engine.error_drop(engine.embed_bind_int(stmt, 1, blob.row_id))
+	if _, step_err := engine.embed_step(stmt); step_err.kind != .None {
+		blob.expired = true
+		set_error_from(blob.db, step_err)
+		return SQLITE_ERROR
+	}
 	return SQLITE_OK
 }
 
@@ -1770,30 +1846,13 @@ sqlite3_blob_write :: proc "c" (handle: rawptr, buffer: rawptr, count: c.int, of
 sqlite3_blob_close :: proc "c" (handle: rawptr) -> c.int {
 	context = runtime.default_context()
 	blob := blob_of(handle)
-	if blob == nil do return SQLITE_MISUSE
-	result := SQLITE_OK
-	if blob.dirty {
-		update := strings.concatenate({"UPDATE ", blob.table, " SET ", blob.column, " = ? WHERE ", blob.key, " = ?"})
-		defer delete(update)
-		stmt := engine.embed_prepare(blob.db.conn, update)
-		if stmt == nil {
-			result = SQLITE_ERROR
-		} else {
-			defer engine.embed_finalize(stmt)
-			_ = engine.error_drop(engine.embed_bind_blob(stmt, 0, blob.data))
-			_ = engine.error_drop(engine.embed_bind_int(stmt, 1, blob.row_id))
-			if _, step_err := engine.embed_step(stmt); step_err.kind != .None {
-				set_error_from(blob.db, step_err)
-				result = SQLITE_ERROR
-			}
-		}
-	}
+	if blob == nil do return SQLITE_OK
 	delete(blob.data)
 	delete(blob.table)
 	delete(blob.column)
 	delete(blob.key)
 	free(blob)
-	return result
+	return SQLITE_OK
 }
 
 @(export)
@@ -1801,31 +1860,17 @@ sqlite3_blob_reopen :: proc "c" (handle: rawptr, iRow: c.longlong) -> c.int {
 	context = runtime.default_context()
 	blob := blob_of(handle)
 	if blob == nil do return SQLITE_MISUSE
-	query := strings.concatenate({"SELECT ", blob.column, " FROM ", blob.table, " WHERE ", blob.key, " = ?"})
-	defer delete(query)
-	stmt := engine.embed_prepare(blob.db.conn, query)
-	if stmt == nil do return SQLITE_ERROR
-	defer engine.embed_finalize(stmt)
-	_ = engine.error_drop(engine.embed_bind_int(stmt, 0, i64(iRow)))
-	has_row, step_err := engine.embed_step(stmt)
-	if step_err.kind != .None || !has_row {
-		if step_err.kind != .None do set_error_from(blob.db, step_err)
-		return SQLITE_ERROR
+	data, is_text, has_row, code := blob_fetch(blob.db, blob.table, blob.column, blob.key, i64(iRow))
+	if code == SQLITE_OK && !has_row do code = set_error_code(blob.db, SQLITE_ERROR, "no such row")
+	if code != SQLITE_OK {
+		// A failed reopen leaves the handle expired, as SQLite's does.
+		blob.expired = true
+		return code
 	}
-	value, column_ok := engine.embed_column_value(stmt, 0)
-	if !column_ok do return SQLITE_ERROR
 	delete(blob.data)
-	blob.data = nil
-	switch value.kind {
-	case .Bytes:
-		blob.data = make([]u8, len(value.bytes))
-		copy(blob.data, value.bytes)
-	case .String:
-		blob.data = make([]u8, len(value.s))
-		copy(blob.data, value.s)
-	case .Null, .Default, .Bool, .Int, .Uint, .Float, .Timestamp, .Uuid, .Array, .Product, .Int128, .Uint128, .Duration, .Identity, .Connection:
-	}
+	blob.data = data
+	blob.is_text = is_text
 	blob.row_id = i64(iRow)
-	blob.dirty = false
+	blob.expired = false
 	return SQLITE_OK
 }
