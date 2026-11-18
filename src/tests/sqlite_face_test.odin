@@ -285,6 +285,25 @@ test_two_connections_share_a_sqlite_file :: proc(t: ^testing.T) {
 	expect_list(t, face_ints(t, first, "SELECT x FROM t ORDER BY x"), {1, 2}, "both")
 }
 
+// A statement run at once (sqlite3_exec) reads the names another connection
+// committed, as a prepared one does: here the table the first made.
+@(test)
+test_exec_sees_another_connection_commit :: proc(t: ^testing.T) {
+	path := "_test_shared_exec.db"
+	os.remove(path)
+	defer os.remove(path)
+	testing.expect(t, db.sqlite_create_empty_file(path))
+	first, first_err := db.embed_open(path)
+	testing.expect(t, db.error_ok(first_err))
+	second, second_err := db.embed_open(path)
+	testing.expect(t, db.error_ok(second_err))
+	defer db.embed_close(second)
+	defer db.embed_close(first)
+	face_ok(t, first, "CREATE TABLE t (x)")
+	face_ok(t, second, "INSERT INTO t VALUES (1)")
+	expect_list(t, face_ints(t, first, "SELECT x FROM t"), {1}, "the second's row")
+}
+
 // The registry of shared files outlives the allocator of whoever made it. The
 // first connection to a SQLite file in the process makes the registry; when
 // that happens under an arena that is then reused (the test runner reuses each

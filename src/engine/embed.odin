@@ -444,6 +444,9 @@ embed_exec_params :: proc(conn: ^Embed_Conn, sql: string, params: []Value) -> Er
 	// A cancellation belongs to the statement it interrupted: the next one starts
 	// with a clean flag, so an interrupted connection is still usable (D25).
 	store_clear_cancel(conn.store)
+	// The names a statement uses are checked against the file as it is now, as
+	// embed_prepare checks them.
+	if conn.share != nil && conn.tx == nil do sqlite_share_refresh(conn)
 	prepared, prepare_err := sql_prepare(conn.store, sql)
 	if prepare_err.kind != .None do return embed_fail(conn, prepare_err)
 	defer stmt_prepared_destroy(prepared)
