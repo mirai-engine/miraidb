@@ -1365,8 +1365,17 @@ parse_with_ctes :: proc(p: ^Parser) -> (ctes: []Cte, recursive: bool) {
 			cte.columns = names[:]
 		}
 		p_expect_keyword(p, "as")
+		// SQLite's materialization hints change nothing here.
+		if p_match_keyword(p, "not") {
+			p_expect_keyword(p, "materialized")
+		} else {
+			_ = p_match_keyword(p, "materialized")
+		}
 		p_expect_punct(p, "(")
-		if select_stmt, ok := parse_select(p).(Select_Stmt); ok {
+		if p_is_keyword(p, "values") {
+			// A CTE's body may be a VALUES list, its columns named by the CTE.
+			cte.select_stmt = parse_values_select(p)
+		} else if select_stmt, ok := parse_select(p).(Select_Stmt); ok {
 			cte.select_stmt = select_stmt
 		}
 		p_expect_punct(p, ")")

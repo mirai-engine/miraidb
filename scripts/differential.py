@@ -177,6 +177,9 @@ QUERIES = [
     # IN and BETWEEN compare under the left operand's collation.
     "SELECT id FROM emp WHERE name COLLATE NOCASE IN ('ANA', 'Zoe') ORDER BY id",
     "SELECT id FROM emp WHERE name COLLATE NOCASE BETWEEN 'L' AND 'MARIA' ORDER BY id",
+    # A CTE's body may be a VALUES list, with the materialization hints.
+    "WITH t(n) AS (VALUES (1), (2), (3)) SELECT sum(n) FROM t",
+    "WITH t(a, b) AS MATERIALIZED (VALUES (1, 'x'), (2, 'y')) SELECT b FROM t WHERE a = 2",
     # Common table expressions on a write (D38): in front of it, and inside an
     # INSERT's SELECT; recursive too; seen by the WHERE of an UPDATE and a DELETE.
     "WITH c AS (SELECT 'd' AS k, 4 AS v) INSERT INTO kv (k, v) SELECT k, v FROM c RETURNING k, v",
