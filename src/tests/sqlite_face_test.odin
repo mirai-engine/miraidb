@@ -1,5 +1,6 @@
 package tests
 
+import "core:os"
 import "core:strings"
 import "core:testing"
 
@@ -216,4 +217,29 @@ test_window_function_is_fed_incrementally :: proc(t: ^testing.T) {
 	// Each row enters once and the three that leave go once: xStep five
 	// times, xInverse three, xValue once a row, as SQLite calls them.
 	testing.expect_value(t, window_calls, Window_Calls{steps = 5, inverses = 3, values = 5})
+}
+
+@(test)
+test_two_connections_share_a_sqlite_file :: proc(t: ^testing.T) {
+	path := "_test_shared.db"
+	os.remove(path)
+	defer os.remove(path)
+	testing.expect(t, db.sqlite_create_empty_file(path))
+	first, first_err := db.embed_open(path)
+	testing.expect(t, db.error_ok(first_err))
+	second, second_err := db.embed_open(path)
+	testing.expect(t, db.error_ok(second_err))
+	defer db.embed_close(second)
+	defer db.embed_close(first)
+	face_ok(t, first, "CREATE TABLE t (x)")
+	face_ok(t, first, "BEGIN")
+	face_ok(t, first, "INSERT INTO t VALUES (1)")
+	// The other connection reads the last commit while the first writes, and
+	// a write of its own finds the file locked.
+	expect_list(t, face_ints(t, second, "SELECT count(*) FROM t"), {0}, "before commit")
+	face_fails(t, second, "INSERT INTO t VALUES (2)", "database is locked")
+	face_ok(t, first, "COMMIT")
+	expect_list(t, face_ints(t, second, "SELECT count(*) FROM t"), {1}, "after commit")
+	face_ok(t, second, "INSERT INTO t VALUES (2)")
+	expect_list(t, face_ints(t, first, "SELECT x FROM t ORDER BY x"), {1, 2}, "both")
 }

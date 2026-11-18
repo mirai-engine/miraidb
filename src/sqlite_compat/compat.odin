@@ -1290,8 +1290,10 @@ sqlite3_shutdown :: proc "c" () -> c.int {
 @(export)
 sqlite3_busy_timeout :: proc "c" (handle: rawptr, milliseconds: c.int) -> c.int {
 	context = runtime.default_context()
-	_ = handle
-	_ = milliseconds
+	db := db_of(handle)
+	if db == nil || db.conn == nil do return SQLITE_MISUSE
+	// A write waits this long for another connection on the same file.
+	engine.embed_set_busy_timeout(db.conn, int(milliseconds))
 	return SQLITE_OK
 }
 

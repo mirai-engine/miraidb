@@ -67,6 +67,14 @@ Embed_Conn :: struct {
 	// savepoint_began says the open transaction started with a SAVEPOINT, so
 	// releasing the last savepoint commits it, as SQLite does.
 	savepoint_began: bool,
+	// share is the SQLite file this connection shares with the others open on
+	// it in the process, and share_generation the commit of it the store
+	// holds (sqlite_share.odin).
+	share:            ^Sqlite_Share,
+	share_generation: u64,
+	// busy_timeout_ms is how long a write waits for another connection's write
+	// lock before it fails with "database is locked" (sqlite3_busy_timeout).
+	busy_timeout_ms:  int,
 }
 
 // embed_open opens the engine format, or imports a SQLite file into memory.
@@ -85,6 +93,7 @@ embed_open :: proc(path: string, options := Store_Options{persistent = true, cre
 		store_set_sqlite_mirror(opened, path)
 		conn.store = opened
 		conn.owns_store = true
+		sqlite_share_join(conn, path)
 		return conn, ERROR_NONE
 	}
 	if len(path) > 0 && sqlite_is_file(path) {
@@ -117,7 +126,14 @@ embed_open :: proc(path: string, options := Store_Options{persistent = true, cre
 	}
 	conn.store = store
 	conn.owns_store = true
+	if len(store.sqlite_mirror) > 0 do sqlite_share_join(conn, path)
 	return conn, ERROR_NONE
+}
+
+// embed_set_busy_timeout sets how long a write waits for another connection
+// on the same file (sqlite3_busy_timeout); zero fails at once.
+embed_set_busy_timeout :: proc(conn: ^Embed_Conn, milliseconds: int) {
+	if conn != nil do conn.busy_timeout_ms = max(milliseconds, 0)
 }
 
 // embed_wrap builds a connection over an existing store without taking
@@ -135,6 +151,7 @@ embed_close :: proc(conn: ^Embed_Conn) {
 		tx_rollback(conn.tx)
 		conn.tx = nil
 	}
+	sqlite_share_leave(conn)
 	if conn.owns_store && conn.store != nil {
 		store_close(conn.store)
 	}
@@ -287,6 +304,12 @@ embed_authorize_only :: proc(conn: ^Embed_Conn, prepared: ^Stmt_Prepared) -> Err
 // SQLite's, so a caller that matches them keeps working.
 @(private)
 embed_run :: proc(conn: ^Embed_Conn, prepared: ^Stmt_Prepared, params: []Value) -> (Sql_Result, Error) {
+	if conn.share != nil do return embed_run_shared(conn, prepared, params)
+	return embed_run_statement(conn, prepared, params)
+}
+
+@(private)
+embed_run_statement :: proc(conn: ^Embed_Conn, prepared: ^Stmt_Prepared, params: []Value) -> (Sql_Result, Error) {
 	ack :: proc(conn: ^Embed_Conn) -> (Sql_Result, Error) {
 		return Sql_Result{kind = .Ack, commit_seq = conn.store.commit_seq}, ERROR_NONE
 	}
@@ -434,6 +457,8 @@ embed_exec_params :: proc(conn: ^Embed_Conn, sql: string, params: []Value) -> Er
 
 embed_prepare :: proc(conn: ^Embed_Conn, sql: string) -> ^Embed_Statement {
 	if conn == nil do return nil
+	// The names a statement uses are checked against the file as it is now.
+	if conn.share != nil && conn.tx == nil do sqlite_share_refresh(conn)
 	// Parse now rather than at the first step: it is the same work, it reports a
 	// syntax error where a caller expects one, and it is what makes the parameter
 	// count known before the first bind, so index 99 can be refused (D29).
