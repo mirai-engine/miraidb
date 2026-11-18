@@ -177,10 +177,11 @@ int miraidb_create_function(miraidb_conn db, const char *name, int arity,
  * A host comparison has no *folded* form: two texts can compare equal and still
  * differ byte for byte, and the engine orders, groups and indexes by a key it folds
  * from the text. So COLLATE with a host collation is accepted where a comparison
- * happens - WHERE, ON, HAVING, CASE, IN, BETWEEN - and in ORDER BY, which ranks
- * the values under it, and refused with a message in GROUP BY, DISTINCT, a
- * window's keys, an index and a column declaration, rather than answered
- * wrongly. */
+ * happens - WHERE, ON, HAVING, CASE, IN, BETWEEN -, in ORDER BY (a window's
+ * too), which ranks the values under it, and in GROUP BY, DISTINCT and
+ * PARTITION BY, which group by the classes it makes. A column may be declared
+ * with it; a key on such a column (an index, UNIQUE, PRIMARY KEY) is refused
+ * with a message, since an index orders folded text. */
 typedef int (*miraidb_collation)(void *user, const void *a, int a_length,
                                  const void *b, int b_length);
 
