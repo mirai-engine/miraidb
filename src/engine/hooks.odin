@@ -58,7 +58,7 @@ catalog_table_name :: proc(name: string) -> bool {
 	for candidate in ([]string {
 		META_TABLE, ATTACH_TABLE, CLIENT_TABLE, EXTENSION_TABLE, VIRTUAL_TABLE, REDUCER_TABLE,
 		SCHEDULE_TABLE, REQUEST_TABLE, POLICY_TABLE, ROLE_TABLE, GRANT_TABLE, TYPE_TABLE,
-		TOKEN_TABLE, TRIGGER_TABLE, VAR_TABLE, VIEW_TABLE,
+		TOKEN_TABLE, TRIGGER_TABLE, VAR_TABLE, VIEW_TABLE, SQL_TEXT_TABLE, HEADER_TABLE,
 	}) {
 		if strings.equal_fold(name, candidate) do return true
 	}

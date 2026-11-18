@@ -162,11 +162,26 @@ sql_exec_pragma :: proc(store: ^Store, body: string, locked: bool, tx: ^Tx = nil
 		result := Sql_Result{kind = .Rows, commit_seq = store.commit_seq}
 		result.columns = pragma_columns("cid", "name", "type", "notnull", "dflt_value", "pk")
 		result.rows = make([][]Value, len(table.schema.columns))
+		// The type is the one the column was declared with, as SQLite answers:
+		// from the text the table was created with, or the file's own text
+		// for an imported table; the engine's type name otherwise.
+		declared: map[string]string
+		table_text, has_text := store_sql_texts(store, context.temp_allocator)[argument]
+		if !has_text {
+			if kept, imported := store_mirror_kept_lookup(store, argument); imported && kept.kind == "table" {
+				table_text, has_text = kept.sql, true
+			}
+		}
+		if has_text do declared = sql_text_declared_types(table_text, context.temp_allocator)
 		for column, i in table.schema.columns {
 			row := make([]Value, 6)
 			row[0] = value_int(i64(i))
 			row[1] = pragma_text(column.name)
-			row[2] = pragma_text(column_type_name(column.type))
+			if type_text, has_type := declared[strings.to_lower(column.name, context.temp_allocator)]; has_type {
+				row[2] = pragma_text(type_text)
+			} else {
+				row[2] = pragma_text(column_type_name(column.type))
+			}
 			// The rowid alias (one INTEGER key) reads 0, as SQLite reports it:
 			// its NULL becomes the next rowid rather than a refusal.
 			rowid_alias := len(table.schema.primary_key) == 1 && table.schema.primary_key[0] == i &&
@@ -639,6 +654,10 @@ header_value :: proc(tx: ^Tx, name: string) -> i64 {
 
 // header_set writes one header integer in the transaction.
 header_set :: proc(tx: ^Tx, name: string, value: i64) -> Error {
+	// The engine's own rows are not the program's changes: changes() and
+	// total_changes() do not count them.
+	saved_last, saved_total := tx.store.last_changes, tx.store.total_changes
+	defer tx.store.last_changes, tx.store.total_changes = saved_last, saved_total
 	if tx_table_probe(tx, HEADER_TABLE) == nil {
 		created, create_err := sql_execute_in_tx(tx, "CREATE TABLE _sqlite_header (name TEXT PRIMARY KEY NOT NULL, value INTEGER NOT NULL)")
 		if create_err.kind != .None do return create_err

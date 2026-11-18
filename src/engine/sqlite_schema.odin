@@ -71,20 +71,63 @@ tx_table_names :: proc(tx: ^Tx, alloc: mem.Allocator) -> []string {
 }
 
 // sqlite_table_sql is the CREATE TABLE text of a table: the file's own text
-// for an imported table the engine has not changed, else the engine's.
+// for an imported table the engine has not changed, else the text it was
+// created with (sqlite_text.odin) when that still describes what an export
+// stores, else the engine's rendering. `kept` carries the automatic indexes a
+// kept text implies.
 @(private)
-sqlite_table_sql :: proc(store: ^Store, table: ^Table) -> (sql: string, kept: Mirror_Kept, keep_text: bool) {
+sqlite_table_sql :: proc(store: ^Store, table: ^Table, texts: map[string]string) -> (sql: string, kept: Mirror_Kept, keep_text: bool) {
 	original, imported := store_mirror_kept_lookup(store, table.schema.name)
-	keep_text = imported && original.kind == "table" && original.can_keep &&
-		original.signature == schema_signature(&table.schema)
+	signature := schema_signature(&table.schema)
+	defer delete(signature)
+	keep_text = imported && original.kind == "table" && original.can_keep && original.signature == signature
 	if keep_text do return strings.clone(original.sql), original, true
+	if text, has_text := texts[table.schema.name]; has_text {
+		if written, ok := sql_text_table_kept(table, text); ok do return strings.clone(text), written, true
+	}
 	return sqlite_master_sql(table), original, false
+}
+
+// sql_text_table_kept reads a table's CREATE text the way an import reads a
+// file's, and answers whether an export can keep it: the record it declares
+// is the one the writer stores (the same columns, the same rowid alias, no
+// WITHOUT ROWID or generated column) and each automatic index it implies is
+// an engine index. The key names live in the temporary allocator.
+@(private)
+sql_text_table_kept :: proc(table: ^Table, text: string) -> (Mirror_Kept, bool) {
+	parsed := Sqlite_Table{name = table.schema.name, sql = text, pk_position = -1}
+	parsed.columns = sqlite_columns_from_sql(text, context.temp_allocator)
+	parsed.without_rowid = sqlite_contains_word(text, "WITHOUT ROWID")
+	sqlite_constraints_from_sql(text, &parsed, context.temp_allocator)
+	if len(parsed.columns) != len(table.schema.columns) do return {}, false
+	if !mirror_text_keepable(&parsed) do return {}, false
+	alias := -1
+	for column, i in parsed.columns {
+		if column.primary_key && strings.equal_fold(column.declared, "INTEGER") {
+			alias = i
+			break
+		}
+	}
+	if alias < 0 && len(parsed.primary_group) == 1 && strings.equal_fold(parsed.columns[parsed.primary_group[0]].declared, "INTEGER") {
+		alias = parsed.primary_group[0]
+	}
+	if alias != sqlite_rowid_alias(table) do return {}, false
+	keys, keys_ok := mirror_key_indexes(&parsed, &table.schema)
+	if !keys_ok do return {}, false
+	temp_keys := make([]string, len(keys), context.temp_allocator)
+	for name, i in keys {
+		temp_keys[i] = strings.clone(name, context.temp_allocator)
+		delete(name)
+	}
+	delete(keys)
+	return Mirror_Kept{kind = "table", name = table.schema.name, table = table.schema.name, sql = text, can_keep = true, key_indexes = temp_keys}, true
 }
 
 // sqlite_view_sql renders a view: the file's text when it came from one and
 // still says the same, else CREATE VIEW over the stored body.
 @(private)
-sqlite_view_sql :: proc(store: ^Store, name, body: string, alloc: mem.Allocator) -> string {
+sqlite_view_sql :: proc(store: ^Store, name, body: string, texts: map[string]string, alloc: mem.Allocator) -> string {
+	if text, has_text := texts[name]; has_text do return strings.clone(text, alloc)
 	if original, imported := store_mirror_kept_lookup(store, name); imported && original.kind == "view" {
 		if parsed, parse_err := sql_parse(original.sql); parse_err.kind == .None {
 			defer query_destroy(&parsed)
@@ -115,7 +158,8 @@ Sqlite_Trigger :: struct {
 // sqlite_trigger_sql renders a trigger: the file's text when it came from one
 // and still says the same, else a CREATE TRIGGER built from the catalog row.
 @(private)
-sqlite_trigger_sql :: proc(store: ^Store, trigger: Sqlite_Trigger, alloc: mem.Allocator) -> string {
+sqlite_trigger_sql :: proc(store: ^Store, trigger: Sqlite_Trigger, texts: map[string]string, alloc: mem.Allocator) -> string {
+	if text, has_text := texts[trigger.name]; has_text do return strings.clone(text, alloc)
 	if original, imported := store_mirror_kept_lookup(store, trigger.name); imported && original.kind == "trigger" {
 		if parsed, parse_err := sql_parse(original.sql); parse_err.kind == .None {
 			defer query_destroy(&parsed)
@@ -223,12 +267,12 @@ tx_views :: proc(tx: ^Tx, alloc: mem.Allocator) -> [][2]string {
 // SQLite file held that the engine could not read after them, as the file
 // had them.
 @(private)
-catalog_object_rows :: proc(store: ^Store, views: [][2]string, triggers: []Sqlite_Trigger, out: ^[dynamic]Sqlite_Schema_Row, alloc: mem.Allocator) {
+catalog_object_rows :: proc(store: ^Store, views: [][2]string, triggers: []Sqlite_Trigger, texts: map[string]string, out: ^[dynamic]Sqlite_Schema_Row, alloc: mem.Allocator) {
 	for view in views {
-		append(out, Sqlite_Schema_Row{type = "view", name = view[0], tbl_name = view[0], sql = sqlite_view_sql(store, view[0], view[1], alloc)})
+		append(out, Sqlite_Schema_Row{type = "view", name = view[0], tbl_name = view[0], sql = sqlite_view_sql(store, view[0], view[1], texts, alloc)})
 	}
 	for trigger in triggers {
-		append(out, Sqlite_Schema_Row{type = "trigger", name = trigger.name, tbl_name = trigger.table, sql = sqlite_trigger_sql(store, trigger, alloc)})
+		append(out, Sqlite_Schema_Row{type = "trigger", name = trigger.name, tbl_name = trigger.table, sql = sqlite_trigger_sql(store, trigger, texts, alloc)})
 	}
 	for kept in store.mirror_kept {
 		if kept.kind != "view" && kept.kind != "trigger" do continue
@@ -262,7 +306,7 @@ store_catalog_objects :: proc(store: ^Store, alloc: mem.Allocator) -> []Sqlite_S
 		table_collect_release(table, &rows)
 	}
 	out := make([dynamic]Sqlite_Schema_Row, 0, len(views) + len(triggers), alloc)
-	catalog_object_rows(store, views, triggers, &out, alloc)
+	catalog_object_rows(store, views, triggers, store_sql_texts(store, context.temp_allocator), &out, alloc)
 	return out[:]
 }
 
@@ -287,13 +331,14 @@ store_header_value :: proc(store: ^Store, name: string) -> i64 {
 sqlite_schema_rows :: proc(tx: ^Tx, temp: bool, alloc: mem.Allocator) -> [dynamic]Sqlite_Schema_Row {
 	out := make([dynamic]Sqlite_Schema_Row, 0, 8, alloc)
 	names := tx_table_names(tx, context.temp_allocator)
+	texts := tx_sql_texts(tx, context.temp_allocator)
 	sequence := false
 	for name in names {
 		if strings.has_prefix(name, "_") do continue
 		table := tx_table_probe(tx, name)
 		if table == nil || table.schema.ephemeral != temp do continue
 		if _, is_cte := tx.cte_tables[name]; is_cte do continue
-		sql, original, keep_text := sqlite_table_sql(tx.store, table)
+		sql, original, keep_text := sqlite_table_sql(tx.store, table, texts)
 		append(&out, Sqlite_Schema_Row{type = "table", name = table.schema.name, tbl_name = table.schema.name, sql = strings.clone(sql, alloc)})
 		delete(sql)
 		if table.schema.auto_increment_column >= 0 do sequence = true
@@ -323,6 +368,10 @@ sqlite_schema_rows :: proc(tx: ^Tx, temp: bool, alloc: mem.Allocator) -> [dynami
 				})
 				continue
 			}
+			if text, has_text := texts[index.name]; has_text {
+				append(&out, Sqlite_Schema_Row{type = "index", name = index.name, tbl_name = table.schema.name, sql = strings.clone(text, alloc)})
+				continue
+			}
 			index_sql := sqlite_index_sql(table, index)
 			append(&out, Sqlite_Schema_Row{type = "index", name = index.name, tbl_name = table.schema.name, sql = strings.clone(index_sql, alloc)})
 			delete(index_sql)
@@ -332,7 +381,7 @@ sqlite_schema_rows :: proc(tx: ^Tx, temp: bool, alloc: mem.Allocator) -> [dynami
 	if sequence {
 		append(&out, Sqlite_Schema_Row{type = "table", name = "sqlite_sequence", tbl_name = "sqlite_sequence", sql = "CREATE TABLE sqlite_sequence(name,seq)"})
 	}
-	catalog_object_rows(tx.store, tx_views(tx, alloc), tx_triggers(tx, alloc), &out, alloc)
+	catalog_object_rows(tx.store, tx_views(tx, alloc), tx_triggers(tx, alloc), texts, &out, alloc)
 	return out
 }
 

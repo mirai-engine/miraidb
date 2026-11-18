@@ -19,6 +19,11 @@ Parser :: struct {
 	// prev_end is where the token before the current one ended: the end of the
 	// text a construct that just finished was written with.
 	prev_end: int,
+	// ident_start is where the last name p_ident read begins, and object_start
+	// where a CREATE's object name (or ADD COLUMN's column) begins: the text
+	// SQLite keeps starts there (sqlite_text.odin).
+	ident_start:  int,
+	object_start: int,
 	// expression_depth is how many expressions are open right now. It is one
 	// counter for the whole parser, not one per rule, because every nesting that
 	// costs stack goes through parse_expression.
@@ -67,6 +72,7 @@ sql_parse :: proc(source: string) -> (Query, Error) {
 		virtual.arena_destroy(&q.arena)
 		return {}, p.err
 	}
+	sqlite_text_capture(&p, &statement)
 	if p.current.kind != .EOF {
 		if p.current.text == ";" {
 			p.current = lexer_next(&p.lexer)
@@ -182,6 +188,7 @@ p_expect_keyword :: proc(p: ^Parser, keyword: string) -> bool {
 p_ident :: proc(p: ^Parser) -> string {
 	if p.current.kind == .Ident || p.current.kind == .Quoted_Ident {
 		name := strings.clone(p.current.text, p.alloc)
+		p.ident_start = p.current.start
 		p_advance(p)
 		// `main.x` names x in the database itself, as SQLite reads it; a name
 		// qualified by anything else is left to the caller.
@@ -190,6 +197,7 @@ p_ident :: proc(p: ^Parser) -> string {
 			p_advance(p)
 			if p.current.kind == .Ident || p.current.kind == .Quoted_Ident {
 				qualified := strings.clone(p.current.text, p.alloc)
+				p.ident_start = p.current.start
 				p_advance(p)
 				return qualified
 			}
@@ -875,6 +883,7 @@ parse_alter_table :: proc(p: ^Parser) -> Statement {
 	if p_expect_keyword(p, "add") == false do return stmt
 	p_match_keyword(p, "column")
 	stmt.column.name = p_ident(p)
+	p.object_start = p.ident_start
 	// The type may be absent, or any words SQLite reads by affinity.
 	type_start := p.prev_end
 	words := make([dynamic]string, 0, 2, context.temp_allocator)
@@ -1901,6 +1910,7 @@ parse_create_trigger :: proc(p: ^Parser) -> Statement {
 		stmt.if_not_exists = true
 	}
 	stmt.name = p_ident(p)
+	p.object_start = p.ident_start
 	if p_match_keyword(p, "before") {
 		stmt.before = true
 	} else if p_match_keyword(p, "instead") {
@@ -2275,6 +2285,7 @@ parse_create_table :: proc(p: ^Parser, ephemeral: bool, event: bool) -> Statemen
 		stmt.if_not_exists = true
 	}
 	stmt.name = p_ident(p)
+	p.object_start = p.ident_start
 	if !p_expect_punct(p, "(") do return stmt
 	columns := make([dynamic]Column_Def, 0, 4, p.alloc)
 	constraints := make([dynamic]Table_Constraint, 0, 1, p.alloc)
@@ -2632,6 +2643,7 @@ parse_create_index :: proc(p: ^Parser, unique: bool) -> Statement {
 		stmt.if_not_exists = true
 	}
 	stmt.name = p_ident(p)
+	p.object_start = p.ident_start
 	p_expect_keyword(p, "on")
 	stmt.table = p_ident(p)
 	if p_match_keyword(p, "using") {
@@ -2696,6 +2708,7 @@ parse_create_view :: proc(p: ^Parser, or_replace: bool) -> Statement {
 		stmt.if_not_exists = true
 	}
 	stmt.name = p_ident(p)
+	p.object_start = p.ident_start
 	p_expect_keyword(p, "as")
 	// The body is stored as SQL: replaying it through the parser keeps the view
 	// definition independent from the AST layout.

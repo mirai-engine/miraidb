@@ -279,10 +279,10 @@ test_sqlite_schema_catalog :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM log").i, i64(1))
 
 	testing.expect_value(t, scalar(t, store, "SELECT group_concat(name, ',') FROM (SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name)").s, "log,p")
-	testing.expect_value(t, scalar(t, store, "SELECT group_concat(name, ',') FROM (SELECT name FROM sqlite_schema WHERE type = 'index' ORDER BY name)").s, "p_k_key,p_n")
-	testing.expect_value(t, scalar(t, store, "SELECT sql FROM main.sqlite_master WHERE name = 'v'").s, `CREATE VIEW "v" AS SELECT k FROM p`)
+	testing.expect_value(t, scalar(t, store, "SELECT group_concat(name, ',') FROM (SELECT name FROM sqlite_schema WHERE type = 'index' ORDER BY name)").s, "p_n,sqlite_autoindex_p_1")
+	testing.expect_value(t, scalar(t, store, "SELECT sql FROM main.sqlite_master WHERE name = 'v'").s, `CREATE VIEW v AS SELECT k FROM p`)
 	testing.expect_value(t, scalar(t, store, "SELECT tbl_name FROM sqlite_master WHERE type = 'trigger'").s, "p")
-	testing.expect_value(t, scalar(t, store, "SELECT sql FROM sqlite_master WHERE type = 'trigger'").s, `CREATE TRIGGER "tr" AFTER INSERT ON "p" BEGIN INSERT INTO log VALUES (new.k); END`)
+	testing.expect_value(t, scalar(t, store, "SELECT sql FROM sqlite_master WHERE type = 'trigger'").s, `CREATE TRIGGER tr AFTER INSERT ON p BEGIN INSERT INTO log VALUES (new.k); END`)
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM sqlite_master m JOIN p ON m.tbl_name = 'p'").i, i64(4))
 	testing.expect_value(t, scalar(t, store, "SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE name = 'p') AND NOT EXISTS (SELECT 1 FROM sqlite_schema WHERE name = 'gone')").b, true)
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM sqlite_temp_master").i, i64(0))
@@ -402,7 +402,7 @@ test_update_of_triggers :: proc(t: ^testing.T) {
 	}
 	testing.expect_value(t, scalar(t, store, "SELECT group_concat(m, ' ') FROM log").s, "bc:q b:p bc:k pa:5 bc:w bc:w b:dup")
 	testing.expect_value(t, scalar(t, store, "SELECT sql FROM sqlite_master WHERE name = 'tbc'").s,
-		`CREATE TRIGGER "tbc" BEFORE UPDATE OF "c", "b" ON "t" BEGIN INSERT INTO log VALUES ('bc:' || coalesce(new.c,'')); END`)
+		`CREATE TRIGGER tbc BEFORE UPDATE OF c, b ON t BEGIN INSERT INTO log VALUES ('bc:' || coalesce(new.c,'')); END`)
 	_ = run_error(t, store, "CREATE TRIGGER bad AFTER INSERT OF b ON t BEGIN SELECT 1; END")
 }
 
@@ -462,7 +462,7 @@ test_sqlite_file_round_trip :: proc(t: ^testing.T) {
 	testing.expect(t, db.error_drop(db.embed_exec(conn, "UPDATE s SET v = v WHERE id = 1")))
 	testing.expect_value(t, file_scalar(t, conn, "SELECT group_concat(m, ',') FROM log"), "c,D,u")
 	testing.expect_value(t, file_scalar(t, conn, "SELECT count(*) FROM sqlite_master WHERE type IN ('view', 'trigger')"), "4")
-	testing.expect_value(t, file_scalar(t, conn, "SELECT sql FROM sqlite_master WHERE name = 's'"), `CREATE TABLE "s" ("id" INTEGER PRIMARY KEY AUTOINCREMENT, "v" TEXT)`)
+	testing.expect_value(t, file_scalar(t, conn, "SELECT sql FROM sqlite_master WHERE name = 's'"), `CREATE TABLE s (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)`)
 	// A dropped view leaves the file's catalog too.
 	testing.expect(t, db.error_drop(db.embed_exec(conn, "DROP TRIGGER svi")))
 	testing.expect(t, db.error_drop(db.embed_exec(conn, "DROP VIEW sv")))
@@ -494,4 +494,71 @@ test_constraint_messages :: proc(t: ^testing.T) {
 		err := run_error(t, store, c[0])
 		testing.expectf(t, err.message == c[1], "%s: %s", c[0], err.message)
 	}
+}
+
+@(test)
+test_create_text_is_kept :: proc(t: ^testing.T) {
+	// sqlite_master answers each CREATE as it was written, the way SQLite
+	// keeps it (no IF NOT EXISTS, no `main.`, no terminator), ALTER TABLE
+	// edits it as SQLite does, and pragma table_info reads the declared types
+	// from it. The expected texts are SQLite's for the same statements. The
+	// text is data: it survives a reopen and goes with a rollback.
+	store := fresh_db(t, "create_text")
+	if store == nil do return
+	for sql in ([]string {
+		"  CREATE TABLE IF NOT EXISTS t1 (a INT, b text, c varchar(10) NOT NULL, d) ;",
+		"CREATE TABLE main.t3(a /*c*/ )",
+		"create index if not exists i1 on t1(b)",
+		"create unique index u1 on t1 (c, d)",
+		"create view  v1 as  select 1",
+		"CREATE TRIGGER IF NOT EXISTS tr1 AFTER INSERT ON t1 BEGIN SELECT 1; END",
+		"ALTER TABLE t1 ADD COLUMN e TEXT DEFAULT 5",
+		"ALTER TABLE t1 RENAME COLUMN b TO bb",
+		"ALTER TABLE t1 RENAME TO t9",
+		"create table w (x, y integer, z text)",
+		"ALTER TABLE w DROP COLUMN y",
+		"ALTER TABLE w DROP COLUMN x",
+	}) {
+		result := run(t, store, sql)
+		db.sql_result_destroy(&result)
+	}
+	want := [][2]string {
+		{"i1", `CREATE INDEX i1 on "t9"(bb)`},
+		{"t3", `CREATE TABLE t3(a /*c*/ )`},
+		{"t9", `CREATE TABLE "t9" (a INT, bb text, c varchar(10) NOT NULL, d, e TEXT DEFAULT 5)`},
+		{"tr1", `CREATE TRIGGER tr1 AFTER INSERT ON "t9" BEGIN SELECT 1; END`},
+		{"u1", `CREATE UNIQUE INDEX u1 on "t9" (c, d)`},
+		{"v1", `CREATE VIEW v1 as  select 1`},
+		{"w", `CREATE TABLE w (z text)`},
+	}
+	check := proc(t: ^testing.T, store: ^db.Store, want: [][2]string) {
+		for pair in want {
+			sql := strings.concatenate({"SELECT sql FROM sqlite_master WHERE name = '", pair[0], "'"}, context.temp_allocator)
+			testing.expectf(t, scalar(t, store, sql).s == pair[1], "%s: %s", pair[0], scalar(t, store, sql).s)
+		}
+		info := run(t, store, "PRAGMA table_info(t9)")
+		defer db.sql_result_destroy(&info)
+		types := make([dynamic]string, context.temp_allocator)
+		for row in info.rows do append(&types, row[2].s)
+		testing.expect_value(t, strings.join(types[:], ",", context.temp_allocator), "INT,TEXT,varchar(10),,TEXT")
+	}
+	check(t, store, want)
+
+	// A rollback takes a CREATE's text with it.
+	conn := db.embed_wrap(store)
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "BEGIN")))
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "CREATE TABLE gone (q)")))
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "ROLLBACK")))
+	db.embed_close(conn)
+	run(t, store, "CREATE TABLE gone (q REAL)")
+	testing.expect_value(t, scalar(t, store, "SELECT sql FROM sqlite_master WHERE name = 'gone'").s, "CREATE TABLE gone (q REAL)")
+	run(t, store, "DROP TABLE gone")
+	run(t, store, "CREATE TABLE gone (r)")
+	testing.expect_value(t, scalar(t, store, "SELECT sql FROM sqlite_master WHERE name = 'gone'").s, "CREATE TABLE gone (r)")
+
+	db.store_close(store)
+	reopened, err := db.store_open("_test_create_text", {persistent = true, create = false, durable = false})
+	if !testing.expectf(t, db.error_ok(err), "reopen: %s", err.message) do return
+	defer cleanup_db(reopened, "create_text")
+	check(t, reopened, want)
 }

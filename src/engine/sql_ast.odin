@@ -525,6 +525,9 @@ Alter_Table_Stmt :: struct {
 	// add_declared is the type ADD COLUMN wrote ("" for none), which the
 	// SQLite face reads by its affinity.
 	add_declared: string,
+	// add_text is ADD COLUMN's column definition as written, which SQLite
+	// appends to the table's CREATE text.
+	add_text:     string,
 }
 
 Create_Table_Stmt :: struct {
@@ -540,6 +543,8 @@ Create_Table_Stmt :: struct {
 	event:         bool,
 	columns:       []Column_Def,
 	constraints:   []Table_Constraint,
+	// text is the statement as SQLite keeps it in sqlite_master (sqlite_text.odin).
+	text:          string,
 }
 
 Drop_Table_Stmt :: struct {
@@ -558,6 +563,7 @@ Create_Index_Stmt :: struct {
 	unique:        bool,
 	algorithm:     Index_Algorithm,
 	if_not_exists: bool,
+	text:          string,
 }
 
 Drop_Index_Stmt :: struct {
@@ -618,6 +624,7 @@ Explain_Stmt :: struct {
 Create_View_Stmt :: struct {
 	name:          string,
 	sql:           string,
+	text:          string,
 	if_not_exists: bool,
 	or_replace:    bool,
 }
@@ -860,6 +867,7 @@ Create_Trigger_Stmt :: struct {
 	// SET names one of them.
 	columns:       []string,
 	if_not_exists: bool,
+	text:          string,
 }
 
 Drop_Trigger_Stmt :: struct {

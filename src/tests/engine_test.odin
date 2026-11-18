@@ -3144,8 +3144,11 @@ test_store_memory :: proc(t: ^testing.T) {
 	testing.expect(t, db.error_ok(a_err))
 	b_memory, b_err := db.store_table_memory(store, "b")
 	testing.expect(t, db.error_ok(b_err))
+	// The CREATE texts the engine keeps are rows too (_sqlite_sql).
+	text_memory, text_err := db.store_table_memory(store, "_sqlite_sql")
+	testing.expect(t, db.error_ok(text_err))
 	total := db.store_memory(store)
-	testing.expect_value(t, total.rows, a_memory.rows + b_memory.rows)
+	testing.expect_value(t, total.rows, a_memory.rows + b_memory.rows + text_memory.rows)
 	testing.expect(t, total.row_bytes >= a_memory.row_bytes + b_memory.row_bytes)
 	testing.expect(t, total.index_entries >= a_memory.index_entries + b_memory.index_entries)
 	testing.expect(t, total.index_bytes >= a_memory.index_bytes + b_memory.index_bytes)
@@ -3195,6 +3198,8 @@ test_commit_ops_hook :: proc(t: ^testing.T) {
 	hook :: proc(ctx: rawptr, store: ^db.Store, ops: []db.Store_Op) {
 		counters := (^[3]int)(ctx)
 		for op in ops {
+			// The stream carries the engine's own tables too (the CREATE text).
+			if op.name != "t" do continue
 			#partial switch op.kind {
 			case .Insert:
 				counters[0] += 1
@@ -7196,21 +7201,21 @@ test_keys_cross_a_sqlite_file_both_ways :: proc(t: ^testing.T) {
 	for table in file.tables {
 		switch table.name {
 		case "k":
+			// The text is the one the table was created with; the engine still
+			// refuses a NULL key after the trip (below).
 			testing.expect_value(t, table.columns[0].primary_key, true)
-			testing.expect_value(t, table.columns[0].not_null, true)
 		case "cp":
 			testing.expect_value(t, len(table.primary_group), 2)
 		case "u":
-			// The UNIQUE column is a named index row, so the text does not repeat
-			// it: a declaration here would ask for a second, automatic index.
-			testing.expect_value(t, len(table.unique_groups), 0)
+			// The table keeps the text it was created with, UNIQUE inline, so its
+			// index is the automatic one that declaration asks for.
+			testing.expect_value(t, len(table.unique_groups), 1)
 		}
 	}
 	// The key indexes are automatic ones: no SQL, because the declaration in the
-	// table text is what says what they are. The UNIQUE column is the only named
-	// index, and the integer key is the rowid, which needs none.
-	testing.expect_value(t, len(file.indexes), 1)
-	testing.expect_value(t, file.indexes[0].name, "u_code_key")
+	// table text is what says what they are, and the integer key is the rowid,
+	// which needs none.
+	testing.expect_value(t, len(file.indexes), 0)
 
 	// The way back: the import recreates the keys, so the engine refuses what the
 	// engine refused before the trip.
@@ -11327,8 +11332,9 @@ test_trusted_open_skips_the_replay :: proc(t: ^testing.T) {
 	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
 	run(t, store, "CREATE TABLE item (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
 	run(t, store, "CREATE INDEX item_name ON item (name)")
-	// A view and a trigger live in the engine's own tables, which have no page
-	// file: the catalog carries their rows, so they no longer force a replay.
+	// A view, a trigger and the CREATE texts live in the engine's own tables,
+	// which have no page file: the catalog carries their rows, so they no
+	// longer force a replay.
 	run(t, store, "CREATE VIEW item_names AS SELECT name FROM item")
 	run(t, store, "CREATE TABLE item_log (n INTEGER)")
 	run(t, store, "CREATE TRIGGER item_logged AFTER DELETE ON item BEGIN INSERT INTO item_log VALUES (old.id); END")
@@ -11357,6 +11363,7 @@ test_trusted_open_skips_the_replay :: proc(t: ^testing.T) {
 	testing.expect_value(t, reopened.replay_records, u64(0))
 	testing.expect_value(t, scalar(t, reopened, "SELECT count(*) FROM item_names").i, i64(199))
 	testing.expect_value(t, scalar(t, reopened, "SELECT n FROM item_log").i, i64(7))
+	testing.expect_value(t, scalar(t, reopened, "SELECT sql FROM sqlite_master WHERE name = 'item_names'").s, "CREATE VIEW item_names AS SELECT name FROM item")
 	testing.expect_value(t, reopened.commit_seq, closed_seq)
 	testing.expect_value(t, scalar(t, reopened, "SELECT count(*) FROM item").i, i64(199))
 	testing.expect_value(t, scalar(t, reopened, "SELECT name FROM item WHERE id = 8").s, "changed")

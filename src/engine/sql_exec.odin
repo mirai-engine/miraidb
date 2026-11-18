@@ -697,21 +697,57 @@ sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sq
 	case Merge_Stmt:
 		return sql_exec_merge(tx, stmt, params)
 	case Create_Table_Stmt:
-		return sql_exec_create_table(tx, stmt, params)
+		existed := tx_table_probe(tx, stmt.name) != nil
+		result, err := sql_exec_create_table(tx, stmt, params)
+		if err.kind == .None && !existed && len(stmt.text) > 0 {
+			if text_err := sql_text_set(tx, stmt.name, stmt.text); text_err.kind != .None do return {}, text_err
+		}
+		return result, err
 	case Alter_Table_Stmt:
-		return sql_exec_alter_table(tx, stmt)
+		indexes := sql_text_index_names(tx, stmt.table)
+		result, err := sql_exec_alter_table(tx, stmt)
+		if err.kind == .None {
+			if text_err := sql_text_on_alter(tx, stmt, indexes); text_err.kind != .None do return {}, text_err
+		}
+		return result, err
 	case Create_Type_Stmt:
 		return sql_exec_create_type(tx, stmt)
 	case Drop_Table_Stmt:
-		return sql_exec_drop_table(tx, stmt)
+		indexes := sql_text_index_names(tx, stmt.name)
+		result, err := sql_exec_drop_table(tx, stmt)
+		if err.kind == .None {
+			if text_err := sql_text_forget(tx, stmt.name); text_err.kind != .None do return {}, text_err
+			for index in indexes {
+				if text_err := sql_text_forget(tx, index); text_err.kind != .None do return {}, text_err
+			}
+		}
+		return result, err
 	case Create_Index_Stmt:
-		return sql_exec_create_index(tx, stmt)
+		_, had_text := sql_text_of(tx, stmt.name)
+		result, err := sql_exec_create_index(tx, stmt)
+		if err.kind == .None && !(stmt.if_not_exists && had_text) && len(stmt.text) > 0 {
+			if text_err := sql_text_set(tx, stmt.name, stmt.text); text_err.kind != .None do return {}, text_err
+		}
+		return result, err
 	case Drop_Index_Stmt:
-		return sql_exec_drop_index(tx, stmt)
+		result, err := sql_exec_drop_index(tx, stmt)
+		if err.kind == .None {
+			if text_err := sql_text_forget(tx, stmt.name); text_err.kind != .None do return {}, text_err
+		}
+		return result, err
 	case Create_View_Stmt:
-		return sql_exec_create_view(tx, stmt)
+		_, existed := view_sql(tx, stmt.name)
+		result, err := sql_exec_create_view(tx, stmt)
+		if err.kind == .None && !(existed && stmt.if_not_exists) && len(stmt.text) > 0 {
+			if text_err := sql_text_set(tx, stmt.name, stmt.text); text_err.kind != .None do return {}, text_err
+		}
+		return result, err
 	case Drop_View_Stmt:
-		return sql_exec_drop_view(tx, stmt)
+		result, err := sql_exec_drop_view(tx, stmt)
+		if err.kind == .None {
+			if text_err := sql_text_forget(tx, stmt.name); text_err.kind != .None do return {}, text_err
+		}
+		return result, err
 	case Create_Policy_Stmt:
 		return sql_exec_create_policy(tx, stmt)
 	case Drop_Policy_Stmt:
@@ -722,14 +758,19 @@ sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sq
 		}
 		return Sql_Result{kind = .Affected, affected = 1, commit_seq = tx.store.commit_seq}, ERROR_NONE
 	case Create_Trigger_Stmt:
+		_, existed := trigger_lookup(tx, stmt.name)
 		if trigger_err := trigger_create(tx, stmt); trigger_err.kind != .None {
 			return {}, trigger_err
+		}
+		if !(existed && stmt.if_not_exists) && len(stmt.text) > 0 {
+			if text_err := sql_text_set(tx, stmt.name, stmt.text); text_err.kind != .None do return {}, text_err
 		}
 		return Sql_Result{kind = .Ack, commit_seq = tx.store.commit_seq}, ERROR_NONE
 	case Drop_Trigger_Stmt:
 		if trigger_err := trigger_drop(tx, stmt.name, stmt.if_exists); trigger_err.kind != .None {
 			return {}, trigger_err
 		}
+		if text_err := sql_text_forget(tx, stmt.name); text_err.kind != .None do return {}, text_err
 		return Sql_Result{kind = .Ack, commit_seq = tx.store.commit_seq}, ERROR_NONE
 	case Grant_Stmt:
 		return sql_exec_grant(tx, stmt)

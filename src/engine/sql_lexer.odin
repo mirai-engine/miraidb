@@ -21,8 +21,9 @@ Token :: struct {
 	line: int,
 	column: int,
 	// end is the offset in the source just past the token, so the parser can
-	// take the text a construct was written with.
+	// take the text a construct was written with; start is where it begins.
 	end: int,
+	start: int,
 }
 
 Lexer :: struct {
@@ -34,6 +35,8 @@ Lexer :: struct {
 	// literal is not a slice of the source, and the statement's arena is what
 	// frees it when the statement is done.
 	alloc:  mem.Allocator,
+	// start is where the token being scanned begins.
+	start:  int,
 }
 
 lexer_init :: proc(src: string, alloc := context.allocator) -> Lexer {
@@ -90,12 +93,14 @@ is_ident_char :: proc(c: u8) -> bool {
 lexer_next :: proc(l: ^Lexer) -> Token {
 	token := lexer_scan(l)
 	token.end = l.pos
+	token.start = l.start
 	return token
 }
 
 @(private)
 lexer_scan :: proc(l: ^Lexer) -> Token {
 	for {
+		l.start = l.pos
 		if l.pos >= len(l.src) {
 			return Token{kind = .EOF, line = l.line, column = l.column}
 		}

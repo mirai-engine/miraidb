@@ -781,6 +781,8 @@ sqlite_file_image :: proc(store: ^Store, alloc := context.allocator) -> (image: 
 	// ask a Store what its file lost (D27).
 	for loss in store.mirror_losses do delete(loss)
 	clear(&store.mirror_losses)
+	// The texts the objects were created with (sqlite_text.odin).
+	texts := store_sql_texts(store, context.temp_allocator)
 	root_pages := make([dynamic]int, 0, len(names))
 	defer delete(root_pages)
 	master_rows := make([dynamic]Sqlite_Export_Row, 0, len(names))
@@ -829,14 +831,10 @@ sqlite_file_image :: proc(store: ^Store, alloc := context.allocator) -> (image: 
 		master[3] = value_int(i64(root))
 		// An object the engine did not change keeps the text the file had, so a
 		// rewrite no longer drops the rules the model cannot hold (D27).
-		original, imported := store_mirror_kept_lookup(store, table.schema.name)
-		keep_text := imported && original.kind == "table" && original.can_keep &&
-			original.signature == schema_signature(&table.schema)
-		if keep_text {
-			master[4] = value_string(original.sql)
-		} else {
-			master[4] = value_string(sqlite_master_sql(table))
-			if imported && original.has_rules {
+		table_sql, original, keep_text := sqlite_table_sql(store, table, texts)
+		master[4] = value_string(table_sql)
+		if !keep_text {
+			if imported, was_imported := store_mirror_kept_lookup(store, table.schema.name); was_imported && imported.has_rules {
 				loss := fmt.aprintf(
 					"%s was rebuilt from the engine's model, which does not hold REFERENCES, UNIQUE, COLLATE or a generated column",
 					table.schema.name,
@@ -896,7 +894,11 @@ sqlite_file_image :: proc(store: ^Store, alloc := context.allocator) -> (image: 
 				// is no statement to re-run, the declaration that made it is enough.
 				index_row[4] = value_null()
 			} else {
-				index_row[4] = value_string(sqlite_index_sql(table, index))
+				if text, has_text := texts[index.name]; has_text {
+					index_row[4] = value_string(strings.clone(text))
+				} else {
+					index_row[4] = value_string(sqlite_index_sql(table, index))
+				}
 			}
 			append(&master_rows, Sqlite_Export_Row{rowid = i64(len(master_rows) + 1), values = index_row})
 		}
