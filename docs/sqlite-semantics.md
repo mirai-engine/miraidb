@@ -26,7 +26,9 @@ SQLite; the engine's own rules keep names exact
 CPython's own tests of its `sqlite3` module run on the facade
 (`scripts/python_sqlite3.py`, a gate of `scripts/ci.py`): every test that
 passes with SQLite has to pass here, and every one does: the list of known
-differences in the script is empty. The last two were an attached database that
+differences in the script is empty. SQLite's own shell does too, line for line
+against SQLite 3.54.1 (`scripts/sqlite_shell.py`), save the text of a `WITHOUT
+ROWID` table (S7). The last two were an attached database that
 could not be written and a full-text table without SQLite's shadow tables.
 
 The switch is one flag on the store, `sqlite_rules`, set by `sqlite3_open` and
