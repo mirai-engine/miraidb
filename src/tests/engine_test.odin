@@ -8023,6 +8023,30 @@ test_using_column_is_the_joins :: proc(t: ^testing.T) {
 	}
 }
 
+// Under SQLite's rules a name two relations of a query have is ambiguous at
+// prepare, in SQLite's words; a USING or NATURAL column is not.
+@(test)
+test_ambiguous_column_at_prepare :: proc(t: ^testing.T) {
+	conn, open_err := db.embed_open(":memory:")
+	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
+	defer db.embed_close(conn)
+	conn.store.sqlite_names = true
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "CREATE TABLE v (a, b)")))
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "CREATE TABLE w (a, c)")))
+	for sql in ([]string{"SELECT a FROM v, w", "SELECT a FROM v AS p, v AS q", "SELECT v.a FROM v, w WHERE a = 1", "SELECT rowid FROM v, w"}) {
+		stmt := db.embed_prepare(conn, sql)
+		testing.expectf(t, stmt == nil, "%s was prepared", sql)
+		if stmt != nil do db.embed_finalize(stmt)
+		testing.expect(t, strings.has_prefix(db.embed_error(conn), "ambiguous column name: "))
+	}
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "CREATE TABLE k (a PRIMARY KEY, n)")))
+	for sql in ([]string{"SELECT a FROM v JOIN w USING (a)", "SELECT a FROM v NATURAL JOIN w", "SELECT b, c FROM v, w", "INSERT INTO k VALUES (1, 1) ON CONFLICT (a) DO UPDATE SET n = n + excluded.n"}) {
+		stmt := db.embed_prepare(conn, sql)
+		testing.expectf(t, stmt != nil, "%s: %s", sql, db.embed_error(conn))
+		if stmt != nil do db.embed_finalize(stmt)
+	}
+}
+
 // A table renamed to a name another table, view or index has is refused, in
 // SQLite's words (renaming over a view left two objects of one name); under
 // SQLite's rules a trigger's name is taken once, whatever its case.

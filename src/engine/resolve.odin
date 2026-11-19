@@ -41,6 +41,11 @@ Res_Walk :: struct {
 Res_Scope :: struct {
 	sources: [dynamic]Res_Source,
 	aliases: []string,
+	// shared are the columns a JOIN ... USING names, which both sides have
+	// without the name being ambiguous; natural is set by a NATURAL JOIN,
+	// whose shared columns the pass does not list.
+	shared:  [dynamic]string,
+	natural: bool,
 }
 
 // Res_Source is one relation: its name, alias and columns. `known` is false
@@ -55,6 +60,9 @@ Res_Source :: struct {
 	// table's hidden columns are names too; no_rowid for one WITHOUT ROWID.
 	table:   bool,
 	no_rowid: bool,
+	// qualified_only is set on an upsert's `excluded`: it answers a name
+	// written with its qualifier, never a bare one.
+	qualified_only: bool,
 }
 
 @(private)
@@ -150,6 +158,7 @@ res_statement :: proc(walk: ^Res_Walk, statement: ^Statement) {
 			append(&scope.sources, target)
 			excluded := target
 			excluded.alias = "excluded"
+			excluded.qualified_only = true
 			append(&scope.sources, excluded)
 			append(&walk.scopes, scope)
 			for assignment in s.conflict_assignments do res_expr(walk, assignment.value)
@@ -381,7 +390,14 @@ res_select :: proc(walk: ^Res_Walk, select: ^Select_Stmt, names: ^[dynamic]strin
 	if walk.err.kind != .None do return false
 	scope := Res_Scope{sources = make([dynamic]Res_Source, 0, 2, context.temp_allocator)}
 	if len(select.from.name) > 0 || select.from.subquery != nil do res_ref(walk, &scope, &select.from)
-	for &join in select.joins do res_ref(walk, &scope, &join.table)
+	for &join in select.joins {
+		res_ref(walk, &scope, &join.table)
+		if join.natural do scope.natural = true
+		for column in join.using_columns {
+			if len(scope.shared) == 0 do scope.shared = make([dynamic]string, 0, 2, context.temp_allocator)
+			append(&scope.shared, column)
+		}
+	}
 	if walk.err.kind != .None do return false
 	aliases := make([dynamic]string, 0, len(select.projections), context.temp_allocator)
 	for item in select.projections do if len(item.alias) > 0 do append(&aliases, item.alias)
@@ -471,10 +487,22 @@ res_column :: proc(walk: ^Res_Walk, column: Column_Expr) {
 	}
 	for i := len(walk.scopes) - 1; i >= 0; i -= 1 {
 		scope := walk.scopes[i]
+		matches := 0
 		for source in scope.sources {
-			if !source.known || res_has_column(source, column.name) do return
+			if source.qualified_only do continue
+			if !source.known do return
+			if res_has_column(source, column.name) do matches += 1
 		}
 		for alias in scope.aliases do if strings.equal_fold(alias, column.name) do return
+		if matches == 0 do continue
+		// Two relations of one query that both have the name make it ambiguous
+		// at prepare, as in SQLite; a USING or NATURAL column is the join's.
+		if matches > 1 && walk.tx.store.sqlite_names && !scope.natural && walk.err.kind == .None {
+			shared := false
+			for name in scope.shared do if strings.equal_fold(name, column.name) do shared = true
+			if !shared do walk.err = errf(.Column_Not_Found, "ambiguous column name: %s", column.name)
+		}
+		return
 	}
 	res_no_column(walk, column)
 }
