@@ -218,7 +218,7 @@ store_attach_add :: proc(store: ^Store, name, path: string) -> Error {
 attach_open :: proc(parent: ^Store, path: string) -> (^Store, Error) {
 	opened: ^Store
 	if !os.exists(path) && parent.sqlite_rules {
-		if !sqlite_create_empty_file(path) do return nil, errf(.Io, "unable to open database: %s", path)
+		if parent.read_only || !sqlite_create_empty_file(path) do return nil, errf(.Io, "unable to open database: %s", path)
 	}
 	switch {
 	case sqlite_is_empty_file(path):
@@ -253,6 +253,9 @@ attach_inherit_rules :: proc(parent, attached: ^Store) {
 	attached.sqlite_rules = parent.sqlite_rules
 	attached.sqlite_names = parent.sqlite_names
 	attached.foreign_keys_off = parent.foreign_keys_off
+	// A read-only connection attaches read-only, as SQLite passes its open
+	// flags on to every database it attaches.
+	if parent.read_only do attached.read_only = true
 }
 
 // store_attach_remove closes an attached database and forgets its handle.
@@ -423,6 +426,12 @@ sql_exec_attach :: proc(store: ^Store, stmt: Attach_Stmt) -> (Sql_Result, Error)
 	if !os.exists(stmt.path) && !store.sqlite_rules {
 		return {}, errf(.Io, "cannot attach %s: it does not exist", stmt.path)
 	}
+	// A read-only store cannot record the attachment: it lasts as long as the
+	// connection, which is all SQLite's ATTACH ever does.
+	if store.read_only {
+		if add_err := store_attach_add(store, stmt.name, stmt.path); add_err.kind != .None do return {}, add_err
+		return Sql_Result{kind = .Ack, commit_seq = store.commit_seq}, ERROR_NONE
+	}
 	tx := tx_begin_write(store)
 	if attach_recorded(tx, stmt.name) {
 		tx_rollback(tx)
@@ -456,7 +465,7 @@ sql_exec_detach :: proc(store: ^Store, stmt: Detach_Stmt) -> (Sql_Result, Error)
 		return {}, errf(.Table_Not_Found, "database %s is not attached", stmt.name)
 	}
 	// A database in memory has no catalog row: it is only closed.
-	if attached := store.attached[stmt.name]; attached != nil && !attached.persistent {
+	if attached := store.attached[stmt.name]; attached != nil && (!attached.persistent || store.read_only) {
 		if remove_err := store_attach_remove(store, stmt.name); remove_err.kind != .None do return {}, remove_err
 		return Sql_Result{kind = .Ack, commit_seq = store.commit_seq}, ERROR_NONE
 	}
