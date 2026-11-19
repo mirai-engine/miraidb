@@ -21,7 +21,22 @@ import "core:sync"
 // sqlite_pragma_statement reports whether the text is a PRAGMA and returns its
 // body (the part after the keyword).
 sqlite_pragma_statement :: proc(sql: string) -> (body: string, is_pragma: bool) {
+	// Comments may come first, as SQLite reads them: `-- note` on a line of
+	// its own, or `/* note */`, before PRAGMA.
 	trimmed := strings.trim_space(sql)
+	for {
+		if strings.has_prefix(trimmed, "--") {
+			end := strings.index_byte(trimmed, '\n')
+			if end < 0 do return "", false
+			trimmed = strings.trim_space(trimmed[end + 1:])
+		} else if strings.has_prefix(trimmed, "/*") {
+			end := strings.index(trimmed[2:], "*/")
+			if end < 0 do return "", false
+			trimmed = strings.trim_space(trimmed[end + 4:])
+		} else {
+			break
+		}
+	}
 	upper := strings.to_upper(trimmed, context.temp_allocator)
 	if !strings.has_prefix(upper, "PRAGMA") do return "", false
 	if len(trimmed) > 6 {
@@ -528,6 +543,9 @@ sql_exec_pragma :: proc(store: ^Store, body: string, locked: bool, tx: ^Tx = nil
 	case "page_size":
 		// The engine is a log, not a page file; this is the page size an export
 		// uses, which is what a client reading it before a dump wants to know.
+		// Setting it answers no row, as in SQLite; the file keeps 4096-byte
+		// pages (docs/sqlite-semantics.md).
+		if has_argument do return pragma_result([]string{"page_size"}, nil, store.commit_seq), ERROR_NONE
 		return pragma_single("page_size", value_int(SQLITE_WRITE_PAGE_SIZE), store.commit_seq), ERROR_NONE
 	case "encoding":
 		return pragma_single("encoding", pragma_text("UTF-8"), store.commit_seq), ERROR_NONE
