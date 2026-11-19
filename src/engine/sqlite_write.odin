@@ -439,6 +439,8 @@ sqlite_write_index_tree :: proc(
 	index: Index_Schema,
 	rows: []Sqlite_Export_Row,
 	alloc: mem.Allocator,
+	store: ^Store = nil,
+	text := "",
 ) -> int {
 	if len(index.columns) == 0 do return 0
 	// A partial index holds only its rows, and an expression index the values of
@@ -491,7 +493,20 @@ sqlite_write_index_tree :: proc(
 		}
 		append(&keys, values)
 	}
-	slice.sort_by(keys[:], sqlite_entry_less)
+	// The entries go in the index's own order: a DESC part backwards, and a
+	// text by its collation (the part's COLLATE, else its column's), or
+	// SQLite's integrity check finds the rows missing from the index.
+	order := Sqlite_Index_Order{store = store}
+	order.desc, order.collations = sqlite_index_part_order(text, len(index.columns), context.temp_allocator)
+	for column, part in index.columns {
+		if len(order.collations[part]) == 0 && column >= 0 && column < len(table.schema.columns) {
+			order.collations[part] = table.schema.columns[column].collation
+		}
+	}
+	context.user_ptr = &order
+	slice.sort_by(keys[:], proc(a, b: []Value) -> bool {
+		return sqlite_entry_compare(a, b, (^Sqlite_Index_Order)(context.user_ptr)) < 0
+	})
 
 	payloads := make([][]u8, len(keys), alloc)
 	defer {
@@ -500,6 +515,72 @@ sqlite_write_index_tree :: proc(
 	}
 	for values, i in keys do payloads[i] = sqlite_encode_record(values, -1, alloc)
 	return sqlite_index_btree(w, payloads, alloc)
+}
+
+// Sqlite_Index_Order is how one index orders its entries: per key part,
+// backwards or not and the collation of a text.
+@(private)
+Sqlite_Index_Order :: struct {
+	store:      ^Store,
+	desc:       []bool,
+	collations: []string,
+}
+
+// sqlite_entry_compare orders two index entries value by value, in SQLite's
+// order of storage classes, with each key part's direction and collation.
+@(private)
+sqlite_entry_compare :: proc(a, b: []Value, order: ^Sqlite_Index_Order) -> int {
+	for i in 0 ..< min(len(a), len(b)) {
+		result := 0
+		collation := i < len(order.collations) ? order.collations[i] : ""
+		if a[i].kind == .String && b[i].kind == .String && len(collation) > 0 && !strings.equal_fold(collation, "binary") {
+			if compared, known := collation_compare(order.store, collation, a[i].s, b[i].s); known do result = compared
+		} else if compared, ok := value_compare(a[i], b[i]); ok {
+			result = compared == .Less ? -1 : (compared == .Greater ? 1 : 0)
+		}
+		if result == 0 do continue
+		if i < len(order.desc) && order.desc[i] do result = -result
+		return result
+	}
+	return len(a) < len(b) ? -1 : (len(a) > len(b) ? 1 : 0)
+}
+
+// sqlite_index_part_order reads each key part's DESC and COLLATE from a
+// CREATE INDEX text; without a text every part is ascending, with no
+// collation of its own.
+@(private)
+sqlite_index_part_order :: proc(text: string, parts: int, alloc: mem.Allocator) -> (desc: []bool, collations: []string) {
+	desc = make([]bool, parts, alloc)
+	collations = make([]string, parts, alloc)
+	if len(text) == 0 do return
+	tokens := sql_text_tokens(text)
+	// The key list is the first parenthesis after ON.
+	at := 0
+	for at < len(tokens) && !strings.equal_fold(tokens[at].text, "on") do at += 1
+	for at < len(tokens) && tokens[at].text != "(" do at += 1
+	if at >= len(tokens) do return
+	at += 1
+	part, depth := 0, 0
+	previous := ""
+	for ; at < len(tokens) && part < parts; at += 1 {
+		token := tokens[at].text
+		switch {
+		case token == "(":
+			depth += 1
+		case token == ")" && depth == 0:
+			return
+		case token == ")":
+			depth -= 1
+		case token == "," && depth == 0:
+			part += 1
+		case depth == 0 && strings.equal_fold(token, "desc"):
+			desc[part] = true
+		case depth == 0 && strings.equal_fold(previous, "collate"):
+			collations[part] = strings.trim(token, "\"'`[]")
+		}
+		previous = token
+	}
+	return
 }
 
 // sqlite_entry_less orders index entries value by value, in SQLite's order of
@@ -1024,7 +1105,7 @@ sqlite_file_image :: proc(store: ^Store, alloc := context.allocator) -> (image: 
 				index, found := sqlite_index_by_name(&table.schema, index_name)
 				if !found do continue
 				if sqlite_is_table_key(table, &index) do continue
-				index_root := sqlite_write_index_tree(&w, table, index, exported[:], alloc)
+				index_root := sqlite_write_index_tree(&w, table, index, exported[:], alloc, store)
 				if index_root == 0 do continue
 				row := make([]Value, 5, alloc)
 				row[0] = value_string("index")
@@ -1047,7 +1128,9 @@ sqlite_file_image :: proc(store: ^Store, alloc := context.allocator) -> (image: 
 			if index.implicit && len(index.columns) == 1 && index.columns[0] == alias do continue
 			if sqlite_is_table_key(table, &index) do continue
 			if keep_text && sqlite_name_in(original.key_indexes, index.name) do continue
-			index_root := sqlite_write_index_tree(&w, table, index, exported[:], alloc)
+			index_text := texts[index.name] or_else ""
+			if kept, imported := store_mirror_kept_lookup(store, index.name); imported && len(index_text) == 0 do index_text = kept.sql
+			index_root := sqlite_write_index_tree(&w, table, index, exported[:], alloc, store, index_text)
 			if index_root == 0 do continue
 			implied := !keep_text && index.unique && len(table.schema.primary_key) > 0 &&
 				schema_index_matches(&index, table.schema.primary_key)
