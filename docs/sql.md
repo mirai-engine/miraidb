@@ -28,6 +28,7 @@ CREATE TABLE [IF NOT EXISTS] name (
     [, [CONSTRAINT name] PRIMARY KEY (column [, ...])]
     [, [CONSTRAINT name] UNIQUE (column [, ...])]
 )
+CREATE TABLE [IF NOT EXISTS] name AS SELECT ...
 DROP TABLE [IF EXISTS] name
 
 CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (column [, ...])
@@ -45,8 +46,9 @@ An outer join answers `NULL` for every column of the side that did not match, on
 whichever side that is: `LEFT` keeps the unmatched rows of the table before it,
 `RIGHT` those of the table after it, and `FULL` both. A `RIGHT` or `FULL` join
 does not use the index probe the others get, because it has to know which inner
-rows matched at all. `NATURAL` joins are refused by the parser, and so is
-`JOIN … USING (col)`; write the condition in `ON` instead.
+rows matched at all. `JOIN … USING (col)` and `NATURAL JOIN` share their
+columns: an unqualified one is the join's, the left side's value or, where an
+outer join left it NULL, the right side's.
 [WHERE expr]
 [GROUP BY expr [, ...]]
 [HAVING expr]

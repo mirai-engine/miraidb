@@ -27,9 +27,23 @@ CPython's own tests of its `sqlite3` module run on the facade
 (`scripts/python_sqlite3.py`, a gate of `scripts/ci.py`): every test that
 passes with SQLite has to pass here, and every one does: the list of known
 differences in the script is empty. SQLite's own shell does too, line for line
-against SQLite 3.54.1 (`scripts/sqlite_shell.py`), save the text of a `WITHOUT
-ROWID` table (S7). The last two were an attached database that
-could not be written and a full-text table without SQLite's shadow tables.
+against SQLite 3.54.1 (`scripts/sqlite_shell.py`), with no known difference.
+The last ones were the text of a `WITHOUT ROWID` table, an attached database
+that could not be written and a full-text table without SQLite's shadow tables.
+
+Under SQLite's rules the errors SQLite gives at prepare are given at prepare,
+in its words, and `sqlite3_error_offset` points at the name they are about: a
+column two relations of the query have (`ambiguous column name: a`; a `USING`
+or `NATURAL` column is the join's, and a real column wins over `rowid`), a
+function SQLite does not have (`no such function: f`) or a count of arguments
+its function does not take (`wrong number of arguments to function abs()`,
+read from SQLite 3.54.1's own functions by `scripts/function_table.py`), a
+second trigger of one name, and `RENAME TO` a name another table, view or index
+has. A bare column beside `min()` or `max()` reads the row they chose. Two
+cases are left: `SELECT *` over one table named twice without an alias, which
+SQLite refuses (`ambiguous column name: main.v.a`), and an alias equal to an
+ambiguous column (`SELECT a AS a FROM v, w`), which the engine refuses only
+when the row is read.
 
 The switch is one flag on the store, `sqlite_rules`, set by `sqlite3_open` and
 by opening a SQLite file. Foreign keys follow the same split: off until

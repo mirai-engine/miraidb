@@ -122,7 +122,7 @@ the gaps are named rather than left to be discovered.
 ### Tooling
 
 - `python3 scripts/ci.py` runs every gate in one command and reports each one;
-  it is what "green" means. 33 gates (`--list` prints them): the suite, the
+  it is what "green" means. 36 gates (`--list` prints them): the suite, the
   corpus, the smokes, CPython's own sqlite3 tests on the facade, the
   measurements, the SQLite surface count, the heap sanitizer and the
   document check.
@@ -151,7 +151,7 @@ the gaps are named rather than left to be discovered.
   `linux_arm64` and `darwin_arm64`. The POSIX lock is the reason it is checked:
   it carried a missing `core:sys/posix` import and two wrong integer types until
   this round, so the code that a Linux build would run had never been compiled.
-- 374 integration tests covering CRUD, recovery, constraints, transactions,
+- 390 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
@@ -322,9 +322,15 @@ than 1000 bytes cannot be indexed and the insert says so.
   full-text table's set of new documents was grown through a copy of its map,
   so the transaction kept pointing at storage the growth had freed.
   `src/tests/memory_test.odin` runs each of these under a tracking allocator of
-  its own and fails on any block left. The largest remainder is test code (the
-  strings a test formats, results `run()` hands back and nobody destroys); the
-  rest has not been attributed one by one.
+  its own and fails on any block left. Then the tests stopped leaking their own
+  results (a result no test reads is freed, a scalar and a formatted string
+  live in the test's temporary memory), a failed SELECT frees what it built,
+  and a JSON function, a variable and a PRAGMA no longer lower a name into the
+  heap: 5,554 lines a run. **Still open:** a scalar function that answers a new
+  text (`upper('abc')`, `json_quote(1)`) leaks that text, once per call: the
+  projection copies the value and nobody frees the original. The fix is to
+  answer it in the statement's memory, which needs the functions that keep
+  state on the store (a variable, a sequence) to keep it there on purpose.
 - **Schema changes.** `ALTER TABLE` renames the table, adds and drops columns,
   and renames a column (keeping the rows and the indexes); the CHECK
   constraints, views, trigger bodies and `UPDATE OF` lists that name the table
@@ -389,8 +395,9 @@ than 1000 bytes cannot be indexed and the insert says so.
   strips `child`. A table whose declaration SQLite backs with an automatic index
   — a `UNIQUE` column, a text or composite `PRIMARY KEY` — keeps its text too:
   the rewrite writes those indexes with the number the declaration gives them,
-  which is what a rebuild could not do. Only the table the DDL itself changed, a
-  `GENERATED` column and a `WITHOUT ROWID` table are rebuilt, and
+  which is what a rebuild could not do. Only the table the DDL itself changed and a
+  `GENERATED` column are rebuilt (a `WITHOUT ROWID` table keeps its text and
+  is written as SQLite stores it, an index b-tree keyed by its primary key), and
   `--mirror-report` prints a `mirror-lost:` line naming each. The file keeps its
   rows and its integrity; a rebuilt table loses the rules it had, loudly.
 - **A written file carries the keys the model holds.** A primary key is declared
