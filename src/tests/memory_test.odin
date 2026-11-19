@@ -275,3 +275,14 @@ test_json_function_names_leave_nothing :: proc(t: ^testing.T) {
 		"SELECT json_extract('{\"a\": 1}', '$.a'), json_valid('[1]')",
 	})
 }
+
+@(test)
+test_a_failed_select_leaves_nothing :: proc(t: ^testing.T) {
+	// A projection that fails partway: the rows already made, their sort keys,
+	// the sources still pending and the column names all go back.
+	expect_nothing_left(t, .Memory, "_test_memory_failed_select", {
+		"CREATE TABLE t (a INT)",
+		"INSERT INTO t VALUES (1), (2), (3), (4)",
+		"SELECT a, CASE WHEN a < 3 THEN a ELSE json('{') END FROM t ORDER BY a",
+	}, fails = true)
+}

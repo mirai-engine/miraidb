@@ -2925,7 +2925,29 @@ window_row_cells :: proc(
 
 @(private)
 free_values_over_rows :: proc(rows: ^[dynamic]Output_Row) {
-	for row in rows do free_values(row.values)
+	for &row in rows {
+		free_values(row.values)
+		delete(row.sort_key)
+		row.sort_key = nil
+	}
+}
+
+// select_drop_rows frees what a SELECT built before it failed: its rows, and
+// the window state they were waiting on.
+@(private)
+select_drop_rows :: proc(
+	output: ^[dynamic]Output_Row,
+	window_cells: ^[dynamic][dynamic]Window_Cell,
+	window_sources: ^[dynamic][]Source,
+	group_keep: ^[dynamic][dynamic][]Source,
+) {
+	free_values_over_rows(output)
+	delete(output^)
+	window_cell_rows_destroy(window_cells)
+	for sources in window_sources do delete(sources)
+	delete(window_sources^)
+	for kept in group_keep do delete(kept)
+	delete(group_keep^)
 }
 
 // window_cells_destroy frees one cell list: the keys it holds and the list itself.
@@ -4137,6 +4159,13 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		}
 	}
 	columns := make([dynamic]string, 0, len(stmt.projections))
+	// The names are the statement's until the result copies them: a statement
+	// that fails on the way frees them here.
+	columns_kept := true
+	defer if columns_kept {
+		for column in columns do delete(column)
+		delete(columns)
+	}
 	expanded := expand_projections(star_sources[:], stmt.joins, stmt.projections, &columns, tx.alloc)
 	// The GROUP BY list is resolved here, while the sources are still around: it
 	// may name a projection alias, and telling an alias from a column needs them.
@@ -4403,7 +4432,9 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			cells, cells_err := window_row_cells(&ctx, window_nodes[:], has_windows)
 			if cells_err.kind != .None {
 				free_values(values)
-				free_partials(&filtered)
+				for pending in filtered[index:] do delete(pending)
+				delete(filtered)
+				select_drop_rows(&output, &window_cells, &window_sources, &group_keep)
 				return {}, cells_err
 			}
 			for expr, i in expanded {
@@ -4417,9 +4448,11 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 				if eval_err.kind != .None {
 					free_values(values)
 					// Earlier rows already released their sources, so only the
-					// pending ones are freed here.
+					// pending ones are freed here, with the rows already made.
 					for pending in filtered[index:] do delete(pending)
 					delete(filtered)
+					delete(cells)
+					select_drop_rows(&output, &window_cells, &window_sources, &group_keep)
 					return {}, eval_err
 				}
 				values[i] = value_clone(value, context.allocator)
@@ -4458,6 +4491,8 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 				for kept in group_keep do delete(kept)
 				delete(group_keep)
 				delete(output)
+				// The rows the scan did not reach still hold their sources.
+				for pending in filtered[index + 1:] do delete(pending)
 				delete(filtered)
 				return {}, errf(
 					.Quota_Exceeded,
@@ -4639,6 +4674,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		delete(column)
 	}
 	delete(columns)
+	columns_kept = false
 	rows_out := make([dynamic][]Value, 0, len(output))
 	ids_out := make([dynamic]Row_Id, 0, len(output))
 	for row, i in output {
