@@ -160,6 +160,33 @@ sqlite_text_to_real :: proc(text: string) -> f64 {
 	return parsed
 }
 
+// sqlite_sum_operand is what sum(), total() and avg() add for a value under
+// SQLite's rules (sumStep): a boolean is its integer; a text or a blob that
+// reads whole as an integer is that integer, and any other is the real its
+// numeric prefix makes, 0.0 for none, which turns the sum into a real.
+sqlite_sum_operand :: proc(v: Value) -> Value {
+	#partial switch v.kind {
+	case .Bool:
+		return value_int(v.b ? 1 : 0)
+	case .String, .Bytes:
+		text := v.kind == .String ? v.s : string(v.bytes)
+		trimmed := strings.trim_space(text)
+		number, integer := sqlite_numeric_prefix(trimmed)
+		// An integer past 64 bits is a real, as SQLite reads it.
+		if integer && len(number) == len(trimmed) {
+			digits := strings.trim_left(number, "+-")
+			negative := strings.has_prefix(number, "-")
+			digits = strings.trim_left(digits, "0")
+			limit := negative ? "9223372036854775808" : "9223372036854775807"
+			if len(digits) < len(limit) || (len(digits) == len(limit) && digits <= limit) {
+				return value_int(sqlite_text_to_int(number))
+			}
+		}
+		return value_float(sqlite_text_to_real(text))
+	}
+	return v
+}
+
 // sqlite_cast is SQLite's CAST: the target is read by its affinity.
 sqlite_cast :: proc(v: Value, type_name: string) -> Value {
 	if v.kind == .Null do return value_null()

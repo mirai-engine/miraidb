@@ -2678,7 +2678,9 @@ eval_aggregate_values :: proc(ctx: ^Eval_Ctx, call: Call_Expr, values: []Value) 
 	sum_int: i64
 	sum_float: f64
 	sum_128: i128
-	uses_float: bool
+	// total() adds as reals from the first value, as SQLite's does: it never
+	// overflows and is never an integer.
+	uses_float := name == "total"
 	uses_128: bool
 	keys: map[string]bool
 	if call.is_distinct do keys = make(map[string]bool)
@@ -2714,27 +2716,29 @@ eval_aggregate_values :: proc(ctx: ^Eval_Ctx, call: Call_Expr, values: []Value) 
 				if order == .Greater do accumulator = value
 			}
 		case "sum", "total", "avg":
-			if !value_is_numeric(value) {
+			// SQLite adds a boolean as its integer and a text by its number.
+			operand := sqlite_rules_on() ? sqlite_sum_operand(value) : value
+			if !value_is_numeric(operand) {
 				return {}, errf(.Invalid_Type, "%s() expects numbers", name)
 			}
-			if value.kind == .Float {
+			if operand.kind == .Float {
 				uses_float = true
-				number, _ := value_to_f64(value)
+				number, _ := value_to_f64(operand)
 				sum_float += number
-			} else if value.kind == .Int128 || value.kind == .Uint128 {
+			} else if operand.kind == .Int128 || operand.kind == .Uint128 {
 				if !uses_128 {
 					uses_128 = true
 					sum_128 = i128(sum_int)
 				}
-				sum_128 += value_as_i128(value)
+				sum_128 += value_as_i128(operand)
 			} else if uses_float {
-				number, _ := value_to_f64(value)
+				number, _ := value_to_f64(operand)
 				sum_float += number
 			} else if uses_128 {
-				number, _ := value_to_i64(value)
+				number, _ := value_to_i64(operand)
 				sum_128 += i128(number)
 			} else {
-				number, _ := value_to_i64(value)
+				number, _ := value_to_i64(operand)
 				// A sum that leaves 64 bits is an error, as in SQLite: it used to wrap.
 				total, overflow := intrinsics.overflow_add(sum_int, number)
 				if overflow do return {}, integer_overflow_error()
@@ -2745,7 +2749,9 @@ eval_aggregate_values :: proc(ctx: ^Eval_Ctx, call: Call_Expr, values: []Value) 
 	switch name {
 	case "min", "max":
 		return value_clone(accumulator, context.allocator), ERROR_NONE
-	case "sum", "total":
+	case "total":
+		return value_float(sum_float), ERROR_NONE
+	case "sum":
 		if seen == 0 do return value_null(), ERROR_NONE
 		if uses_float do return value_float(sum_float), ERROR_NONE
 		if uses_128 do return value_int128(sum_128), ERROR_NONE
@@ -3235,27 +3241,29 @@ agg_stream_add :: proc(row_ctx: ^Eval_Ctx, stream: ^Agg_Stream) -> Error {
 				}
 			}
 		case "sum", "total", "avg":
-			if !value_is_numeric(value) {
+			// SQLite adds a boolean as its integer and a text by its number.
+			operand := sqlite_rules_on() ? sqlite_sum_operand(value) : value
+			if !value_is_numeric(operand) {
 				return errf(.Invalid_Type, "%s() expects numbers", acc.name)
 			}
-			if value.kind == .Float {
+			if operand.kind == .Float {
 				acc.uses_float = true
-				number, _ := value_to_f64(value)
+				number, _ := value_to_f64(operand)
 				acc.sum_float += number
-			} else if value.kind == .Int128 || value.kind == .Uint128 {
+			} else if operand.kind == .Int128 || operand.kind == .Uint128 {
 				if !acc.uses_128 {
 					acc.uses_128 = true
 					acc.sum_128 = i128(acc.sum_int)
 				}
-				acc.sum_128 += value_as_i128(value)
+				acc.sum_128 += value_as_i128(operand)
 			} else if acc.uses_float {
-				number, _ := value_to_f64(value)
+				number, _ := value_to_f64(operand)
 				acc.sum_float += number
 			} else if acc.uses_128 {
-				number, _ := value_to_i64(value)
+				number, _ := value_to_i64(operand)
 				acc.sum_128 += i128(number)
 			} else {
-				number, _ := value_to_i64(value)
+				number, _ := value_to_i64(operand)
 				total, overflow := intrinsics.overflow_add(acc.sum_int, number)
 				if overflow do return integer_overflow_error()
 				acc.sum_int = total
@@ -3293,7 +3301,9 @@ agg_stream_value :: proc(acc: ^Agg_Acc) -> (Value, Error) {
 		return value_int(i64(acc.seen)), ERROR_NONE
 	case "min", "max":
 		return value_clone(acc.best, context.allocator), ERROR_NONE
-	case "sum", "total":
+	case "total":
+		return value_float(acc.sum_float), ERROR_NONE
+	case "sum":
 		if acc.seen == 0 do return value_null(), ERROR_NONE
 		if acc.uses_float do return value_float(acc.sum_float), ERROR_NONE
 		if acc.uses_128 do return value_int128(acc.sum_128), ERROR_NONE
@@ -3486,6 +3496,7 @@ sql_exec_stream_select :: proc(
 		}
 		aggregate = true
 		acc := Agg_Acc{call = call, name = strings.to_lower(call.name), fold_distinct = call.is_distinct}
+		acc.uses_float = acc.name == "total"
 		if acc.fold_distinct do acc.keys = make(map[string]bool)
 		append(&stream.accs, acc)
 	}
@@ -7762,7 +7773,7 @@ eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 	sum_float := f64(0)
 	sum_int := i64(0)
 	sum_128 := i128(0)
-	uses_float := false
+	uses_float := name == "total"
 	uses_128 := false
 	keys: map[string]bool
 	if call.is_distinct do keys = make(map[string]bool)
@@ -7805,27 +7816,29 @@ eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 				if order == .Greater do accumulator = value
 			}
 		case "sum", "total", "avg":
-			if !value_is_numeric(value) {
+			// SQLite adds a boolean as its integer and a text by its number.
+			operand := sqlite_rules_on() ? sqlite_sum_operand(value) : value
+			if !value_is_numeric(operand) {
 				return {}, errf(.Invalid_Type, "%s() expects numbers", name)
 			}
-			if value.kind == .Float {
+			if operand.kind == .Float {
 				uses_float = true
-				number, _ := value_to_f64(value)
+				number, _ := value_to_f64(operand)
 				sum_float += number
-			} else if value.kind == .Int128 || value.kind == .Uint128 {
+			} else if operand.kind == .Int128 || operand.kind == .Uint128 {
 				if !uses_128 {
 					uses_128 = true
 					sum_128 = i128(sum_int)
 				}
-				sum_128 += value_as_i128(value)
+				sum_128 += value_as_i128(operand)
 			} else if uses_float {
-				number, _ := value_to_f64(value)
+				number, _ := value_to_f64(operand)
 				sum_float += number
 			} else if uses_128 {
-				number, _ := value_to_i64(value)
+				number, _ := value_to_i64(operand)
 				sum_128 += i128(number)
 			} else {
-				number, _ := value_to_i64(value)
+				number, _ := value_to_i64(operand)
 				// A sum that leaves 64 bits is an error, as in SQLite: it used to wrap.
 				total, overflow := intrinsics.overflow_add(sum_int, number)
 				if overflow do return {}, integer_overflow_error()
@@ -7836,7 +7849,9 @@ eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 	switch name {
 	case "min", "max":
 		return value_clone(accumulator, context.allocator), ERROR_NONE
-	case "sum", "total":
+	case "total":
+		return value_float(sum_float), ERROR_NONE
+	case "sum":
 		if seen == 0 do return value_null(), ERROR_NONE
 		if uses_float do return value_float(sum_float), ERROR_NONE
 		if uses_128 do return value_int128(sum_128), ERROR_NONE
