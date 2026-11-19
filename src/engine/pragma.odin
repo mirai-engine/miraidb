@@ -693,7 +693,7 @@ sql_exec_pragma :: proc(store: ^Store, body: string, locked: bool, tx: ^Tx = nil
 
 // pragma_sync_level maps a PRAGMA synchronous word to the durability it means.
 pragma_sync_level :: proc(word: string) -> (Durability, bool) {
-	switch strings.to_lower(strings.trim_space(word)) {
+	switch strings.to_lower(strings.trim_space(word), context.temp_allocator) {
 	case "0", "off", "none": return .None, true
 	case "1", "normal", "batched": return .Batched, true
 	case "2", "full", "3", "extra": return .Full, true

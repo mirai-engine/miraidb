@@ -649,7 +649,7 @@ json_call :: proc(name: string, given: []Value) -> (Value, bool, Error) {
 	   !strings.equal_fold(name, "json_object") && !strings.equal_fold(name, "json_quote") {
 		return value_null(), true, ERROR_NONE
 	}
-	switch strings.to_lower(name) {
+	switch strings.to_lower(name, context.temp_allocator) {
 	case "json_valid":
 		if len(args) != 1 do return {}, true, errf(.Invalid_Argument, "json_valid() takes one argument")
 		if args[0].kind != .String do return value_int(0), true, ERROR_NONE

@@ -152,7 +152,7 @@ http_bearer_token :: proc(request: []u8) -> (string, bool) {
 	end := start
 	for end < len(text) && text[end] != '\r' && text[end] != '\n' do end += 1
 	value := strings.trim_space(text[start:end])
-	if !strings.has_prefix(strings.to_lower(value), "bearer ") do return "", false
+	if !strings.has_prefix(strings.to_lower(value, context.temp_allocator), "bearer ") do return "", false
 	return strings.trim_space(value[len("bearer "):]), true
 }
 

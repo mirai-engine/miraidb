@@ -975,13 +975,14 @@ store_set_variable_locked :: proc(store: ^Store, name: string, value: Value) -> 
 	if len(name) == 0 {
 		return errf(.Invalid_Argument, "a variable needs a name")
 	}
-	key := strings.to_lower(name)
-	if existing, found := store.variables[key]; found {
+	// A name set again keeps the key the map already holds.
+	lookup := strings.to_lower(name, context.temp_allocator)
+	if existing, found := store.variables[lookup]; found {
 		value_deep_free(existing, context.allocator)
-		delete(key)
-		key = strings.to_lower(name)
+		store.variables[lookup] = value_clone(value, context.allocator)
+		return ERROR_NONE
 	}
-	store.variables[key] = value_clone(value, context.allocator)
+	store.variables[strings.clone(lookup)] = value_clone(value, context.allocator)
 	return ERROR_NONE
 }
 
@@ -993,7 +994,7 @@ store_get_variable :: proc(store: ^Store, name: string) -> (Value, bool) {
 
 // store_get_variable_locked is store_get_variable for a locked caller.
 store_get_variable_locked :: proc(store: ^Store, name: string) -> (Value, bool) {
-	value, found := store.variables[strings.to_lower(name)]
+	value, found := store.variables[strings.to_lower(name, context.temp_allocator)]
 	if !found do return {}, false
 	return value_clone(value, context.allocator), true
 }

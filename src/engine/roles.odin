@@ -98,7 +98,7 @@ sql_exec_grant :: proc(tx: ^Tx, stmt: Grant_Stmt) -> (Sql_Result, Error) {
 	}
 	// Table permissions.
 	if len(stmt.action) == 0 do return {}, errf(.Sql_Syntax, "GRANT ... ON needs an action")
-	action := strings.to_lower(stmt.action)
+	action := strings.to_lower(stmt.action, context.temp_allocator)
 	switch action {
 	case "select", "insert", "update", "delete", "all", "*":
 	case:

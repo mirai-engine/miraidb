@@ -266,3 +266,12 @@ test_catalog_pragmas_leave_nothing :: proc(t: ^testing.T) {
 		"SELECT rowid, name FROM sqlite_schema",
 	})
 }
+
+@(test)
+test_json_function_names_leave_nothing :: proc(t: ^testing.T) {
+	// Each JSON function lowered its name into the heap to pick itself, and
+	// never gave it back; so did reading a variable and a PRAGMA's word.
+	expect_nothing_left(t, .Memory, "_test_memory_json", {
+		"SELECT json_extract('{\"a\": 1}', '$.a'), json_valid('[1]')",
+	})
+}
