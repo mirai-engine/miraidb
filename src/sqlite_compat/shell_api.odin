@@ -502,6 +502,44 @@ sqlite3_stmt_explain :: proc "c" (handle: rawptr, mode: c.int) -> c.int {
 	return SQLITE_OK
 }
 
+// COMPILE_OPTIONS are the options this library answers as built with, in
+// SQLite's order (sorted), without the SQLITE_ prefix: what the facade does,
+// not how it was compiled, since it is not compiled from SQLite's source.
+@(private)
+COMPILE_OPTIONS := [?]cstring{
+	"COMPILER=odin",
+	"ENABLE_COLUMN_METADATA",
+	"ENABLE_FTS4",
+	"ENABLE_FTS5",
+	"ENABLE_MATH_FUNCTIONS",
+	"ENABLE_PERCENTILE",
+	"ENABLE_RTREE",
+	"THREADSAFE=1",
+}
+
+// sqlite3_compileoption_get is the Nth option, NULL past the last.
+@(export)
+sqlite3_compileoption_get :: proc "c" (n: c.int) -> cstring {
+	if n < 0 || int(n) >= len(COMPILE_OPTIONS) do return nil
+	return COMPILE_OPTIONS[n]
+}
+
+// sqlite3_compileoption_used says whether an option is set: the name, with or
+// without SQLITE_, matched without regard to case up to an `=`.
+@(export)
+sqlite3_compileoption_used :: proc "c" (name: cstring) -> c.int {
+	context = runtime.default_context()
+	if name == nil do return 0
+	wanted := string(name)
+	if len(wanted) >= 7 && strings.equal_fold(wanted[:7], "SQLITE_") do wanted = wanted[7:]
+	for option in COMPILE_OPTIONS {
+		text := string(option)
+		if len(text) < len(wanted) || !strings.equal_fold(text[:len(wanted)], wanted) do continue
+		if len(text) == len(wanted) || text[len(wanted)] == '=' do return 1
+	}
+	return 0
+}
+
 // sqlite3_table_column_metadata answers a column's declared type, collation,
 // NOT NULL, primary key and AUTOINCREMENT. A NULL column only asks whether the
 // table exists.

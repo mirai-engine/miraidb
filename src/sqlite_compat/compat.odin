@@ -95,6 +95,12 @@ Database :: struct {
 	trace_mask:      c.uint,
 	trace_hook:      Trace_Callback,
 	trace_arg:       rawptr,
+	// trace_legacy is sqlite3_trace's callback: the text of each statement
+	// as it starts.
+	trace_legacy:    Legacy_Trace_Callback,
+	// busy_hook and busy_arg are sqlite3_busy_handler's callback.
+	busy_hook:       Busy_Callback,
+	busy_arg:        rawptr,
 	authorizer:      Authorizer_Callback,
 	authorizer_arg:  rawptr,
 	// last_error16 is the message sqlite3_errmsg16 handed out last.
@@ -1488,12 +1494,40 @@ sqlite3_shutdown :: proc "c" () -> c.int {
 	return SQLITE_OK
 }
 
+Busy_Callback :: #type proc "c" (arg: rawptr, count: c.int) -> c.int
+
+// sqlite3_busy_handler has `callback` decide whether a statement kept from a
+// lock by another connection tries again, in place of a busy timeout; a NULL
+// callback fails at once.
+@(export)
+sqlite3_busy_handler :: proc "c" (handle: rawptr, callback: Busy_Callback, arg: rawptr) -> c.int {
+	context = runtime.default_context()
+	db := db_of(handle)
+	if db == nil || db.conn == nil do return SQLITE_MISUSE
+	db.busy_hook, db.busy_arg = callback, arg
+	if callback == nil {
+		engine.embed_set_busy_timeout(db.conn, 0)
+		return SQLITE_OK
+	}
+	engine.embed_set_busy_handler(db.conn, busy_bridge, rawptr(db))
+	return SQLITE_OK
+}
+
+@(private)
+busy_bridge :: proc(user: rawptr, count: int) -> bool {
+	db := (^Database)(user)
+	if db.busy_hook == nil do return false
+	return db.busy_hook(db.busy_arg, c.int(count)) != 0
+}
+
 @(export)
 sqlite3_busy_timeout :: proc "c" (handle: rawptr, milliseconds: c.int) -> c.int {
 	context = runtime.default_context()
 	db := db_of(handle)
 	if db == nil || db.conn == nil do return SQLITE_MISUSE
-	// A write waits this long for another connection on the same file.
+	// A write waits this long for another connection on the same file; the
+	// timeout takes the place of a busy handler.
+	db.busy_hook, db.busy_arg = nil, nil
 	engine.embed_set_busy_timeout(db.conn, int(milliseconds))
 	return SQLITE_OK
 }

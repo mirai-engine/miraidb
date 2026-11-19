@@ -132,6 +132,28 @@ SQLITE_TRACE_ROW :: c.uint(0x04)
 SQLITE_TRACE_CLOSE :: c.uint(0x08)
 
 Trace_Callback :: #type proc "c" (event: c.uint, ctx: rawptr, p: rawptr, x: rawptr) -> c.int
+Legacy_Trace_Callback :: #type proc "c" (ctx: rawptr, sql: cstring)
+
+// SQLITE_TRACE_LEGACY marks the mask sqlite3_trace set: the STMT event goes
+// to its callback, with the statement's text.
+@(private)
+SQLITE_TRACE_LEGACY :: c.uint(0x40)
+
+// sqlite3_trace is the older trace: `callback` gets the text of each
+// statement as it starts. It replaces sqlite3_trace_v2's callback, and
+// answers the argument the previous one had.
+@(export)
+sqlite3_trace :: proc "c" (handle: rawptr, callback: Legacy_Trace_Callback, ctx: rawptr) -> rawptr {
+	context = runtime.default_context()
+	db := db_of(handle)
+	if db == nil do return nil
+	previous := db.trace_arg
+	db.trace_hook = nil
+	db.trace_legacy = callback
+	db.trace_arg = ctx
+	db.trace_mask = callback == nil ? 0 : SQLITE_TRACE_STMT | SQLITE_TRACE_LEGACY
+	return previous
+}
 
 // sqlite3_trace_v2 reports the events `mask` names: STMT when a statement
 // starts running (with its text), ROW for each row, PROFILE when it ends (with
@@ -145,6 +167,7 @@ sqlite3_trace_v2 :: proc "c" (handle: rawptr, mask: c.uint, callback: Trace_Call
 	if callback == nil do db.trace_mask = 0
 	else do db.trace_mask = mask
 	db.trace_hook = callback
+	db.trace_legacy = nil
 	db.trace_arg = ctx
 	return SQLITE_OK
 }
@@ -155,7 +178,9 @@ trace_start :: proc(stmt: ^Statement) {
 	if db.trace_mask == 0 || stmt.traced do return
 	stmt.traced = true
 	stmt.started = time.now()._nsec
-	if db.trace_mask & SQLITE_TRACE_STMT != 0 {
+	if db.trace_mask & SQLITE_TRACE_LEGACY != 0 {
+		db.trace_legacy(db.trace_arg, stmt.sql_text)
+	} else if db.trace_mask & SQLITE_TRACE_STMT != 0 {
 		db.trace_hook(SQLITE_TRACE_STMT, db.trace_arg, rawptr(stmt), rawptr(stmt.sql_text))
 	}
 }
