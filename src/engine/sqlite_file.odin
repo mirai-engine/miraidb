@@ -14,6 +14,7 @@ package engine
 import "core:fmt"
 import "core:mem"
 import "core:os"
+import "core:slice"
 import "core:strings"
 
 SQLITE_MAGIC :: "SQLite format 3\x00"
@@ -100,6 +101,9 @@ Sqlite_File :: struct {
 	index_trees: []Sqlite_Index_Tree,
 	// sequence_root is sqlite_sequence's root page, 0 when the file has none.
 	sequence_root: u32,
+	// catalog names every object with a CREATE text in sqlite_master's
+	// order, which is the order SQLite lists them in.
+	catalog: []string,
 	// wal_pages holds the images a write-ahead log carries; the reader consults
 	// them before the database file. wal_committed is the database size at the
 	// last commit frame (0 when the log has no commit).
@@ -485,6 +489,7 @@ Sqlite_Master_Ctx :: struct {
 	others:  [dynamic]Sqlite_Object,
 	trees:   [dynamic]Sqlite_Index_Tree,
 	sequence_root: u32,
+	catalog: [dynamic]string,
 }
 
 @(private)
@@ -501,6 +506,9 @@ sqlite_master_visit :: proc(user: rawptr, rowid: i64, payload: []u8) -> bool {
 	kind := values[0]
 	name := values[1]
 	sql := values[4]
+	if name.kind == .String && sql.kind == .String && len(sql.s) > 0 {
+		append(&ctx.catalog, strings.clone(name.s, ctx.file.alloc))
+	}
 	if kind.kind == .String && strings.equal_fold(kind.s, "index") {
 		if name.kind == .String && values[3].kind == .Int && values[3].i > 0 {
 			append(
@@ -928,6 +936,7 @@ sqlite_file_parse :: proc(
 	file.others = ctx.others[:]
 	file.index_trees = ctx.trees[:]
 	file.sequence_root = ctx.sequence_root
+	file.catalog = ctx.catalog[:]
 	return file, ERROR_NONE
 }
 
@@ -967,6 +976,8 @@ sqlite_file_destroy :: proc(file: ^Sqlite_File) {
 		delete(tree.table, file.alloc)
 	}
 	delete(file.index_trees, file.alloc)
+	for name in file.catalog do delete(name, file.alloc)
+	delete(file.catalog)
 	delete(file.tables, file.alloc)
 	delete(file.data, file.alloc)
 	file^ = {}
@@ -1238,6 +1249,12 @@ sqlite_import_tx :: proc(
 		if _, create_err := sql_execute_in_tx(tx, strings.to_string(create)); create_err.kind != .None {
 			return tables, rows, create_err
 		}
+		// The table's text is the file's, as the program wrote it, not the
+		// engine's rendering the import ran: PRAGMA table_info and the declared
+		// types read it, and an ALTER edits it.
+		if len(table.sql) > 0 {
+			if text_err := sql_text_set(tx, table.name, table.sql); text_err.kind != .None do return tables, rows, text_err
+		}
 		tables += 1
 		insert := strings.builder_make(alloc)
 		defer strings.builder_destroy(&insert)
@@ -1290,6 +1307,7 @@ sqlite_import_tx :: proc(
 			sql_result_destroy(&created)
 		}
 	}
+	if order_err := sqlite_import_text_order(file, tx); order_err.kind != .None do return tables, rows, order_err
 	// The integers SQLite keeps in the header for the program.
 	page_one := sqlite_page(file, 1)
 	if len(page_one) >= 72 {
@@ -1326,6 +1344,25 @@ sqlite_import_finish :: proc(file: ^Sqlite_File, store: ^Store) {
 	// Remember the catalog the file spelled, now that the tables exist in the
 	// store: a rewrite re-emits it for every object it does not change (D27).
 	store_mirror_keep(store, file)
+}
+
+// sqlite_import_text_order stores the catalog's texts again in the order
+// sqlite_master has them: the import makes the tables first and the indexes,
+// views and triggers after, but SQLite lists what was made in the order it
+// was made, and the row a text has is that order (sqlite_schema_order).
+@(private)
+sqlite_import_text_order :: proc(file: ^Sqlite_File, tx: ^Tx) -> Error {
+	texts := tx_sql_texts(tx, context.temp_allocator)
+	if len(texts) == 0 do return ERROR_NONE
+	names := make([dynamic]string, 0, len(texts), context.temp_allocator)
+	for name in file.catalog do if name in texts do append(&names, name)
+	rest := make([dynamic]string, 0, len(texts), context.temp_allocator)
+	for name in texts do if !slice.contains(names[:], name) do append(&rest, name)
+	slice.sort(rest[:])
+	append(&names, ..rest[:])
+	for name in names do if err := sql_text_forget(tx, name); err.kind != .None do return err
+	for name in names do if err := sql_text_set(tx, name, texts[name]); err.kind != .None do return err
+	return ERROR_NONE
 }
 
 // sqlite_import_order lists the file's tables so that a table comes after the
