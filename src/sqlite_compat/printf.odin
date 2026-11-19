@@ -60,12 +60,12 @@ cstring_bytes :: proc(z: cstring) -> []u8 {
 
 @(private)
 va_int :: proc(user: rawptr) -> i64 {
-	return i64(intrinsics.c_va_arg((^Va_Source)(user).list, c.int))
+	return i64(intrinsics.c_va_arg((^intrinsics.c_va_list)(user), c.int))
 }
 
 @(private)
 va_integer :: proc(user: rawptr, long_flag: int, signed: bool) -> u64 {
-	list := (^Va_Source)(user).list
+	list := (^intrinsics.c_va_list)(user)
 	if signed {
 		switch long_flag {
 		case 2:
@@ -86,12 +86,12 @@ va_integer :: proc(user: rawptr, long_flag: int, signed: bool) -> u64 {
 
 @(private)
 va_double :: proc(user: rawptr) -> f64 {
-	return intrinsics.c_va_arg((^Va_Source)(user).list, f64)
+	return intrinsics.c_va_arg((^intrinsics.c_va_list)(user), f64)
 }
 
 @(private)
 va_text :: proc(user: rawptr) -> (text: []u8, present: bool, pointer: rawptr) {
-	z := intrinsics.c_va_arg((^Va_Source)(user).list, cstring)
+	z := intrinsics.c_va_arg((^intrinsics.c_va_list)(user), cstring)
 	return cstring_bytes(z), z != nil, rawptr(z)
 }
 
@@ -102,7 +102,7 @@ va_free :: proc(pointer: rawptr) {
 
 @(private)
 va_counter :: proc(user: rawptr) -> ^i32 {
-	return (^i32)(intrinsics.c_va_arg((^Va_Source)(user).list, ^c.int))
+	return (^i32)(intrinsics.c_va_arg((^intrinsics.c_va_list)(user), ^c.int))
 }
 
 // str_vappendf appends `format` with the arguments `args` reads, as
@@ -110,9 +110,10 @@ va_counter :: proc(user: rawptr) -> ^i32 {
 @(private)
 str_vappendf :: proc(s: ^Sqlite_Str, format: cstring, args: Va_Source) {
 	if format == nil || s.error != 0 do return
-	source := args
 	reader := engine.Printf_Args {
-		user      = &source,
+		// The va_list itself: reading it through a pointer to a struct that
+		// holds it read garbage on System V.
+		user      = rawptr(args.list),
 		c_int     = va_int,
 		c_integer = va_integer,
 		c_double  = va_double,
