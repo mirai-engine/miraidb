@@ -110,6 +110,7 @@ void        sqlite3_interrupt(sqlite3 *db);
 int         sqlite3_changes(sqlite3 *db);
 int         sqlite3_total_changes(sqlite3 *db);
 int         sqlite3_busy_timeout(sqlite3 *db, int milliseconds);
+int         sqlite3_busy_handler(sqlite3 *db, int (*callback)(void *, int), void *arg);
 int         sqlite3_extended_result_codes(sqlite3 *db, int onoff);
 int         sqlite3_exec(sqlite3 *db, const char *sql, sqlite3_callback callback,
                          void *arg, char **errmsg);
@@ -540,6 +541,8 @@ int sqlite3_set_authorizer(sqlite3 *db,
 int sqlite3_trace_v2(sqlite3 *db, unsigned int mask,
                      int (*callback)(unsigned int, void *, void *, void *),
                      void *ctx);
+/* The older trace: the text of each statement as it starts. */
+void *sqlite3_trace(sqlite3 *db, void (*callback)(void *, const char *), void *ctx);
 
 /* A placeholder for name/nArg that fails with "unable to use function ... in
 ** the requested context", unless this connection registered one. */
@@ -637,6 +640,8 @@ int  sqlite3_strlike(const char *pattern, const char *text, unsigned int escape)
 const char *sqlite3_libversion(void);
 int         sqlite3_libversion_number(void);
 const char *sqlite3_sourceid(void);
+const char *sqlite3_compileoption_get(int n);
+int         sqlite3_compileoption_used(const char *name);
 int         sqlite3_initialize(void);
 int         sqlite3_shutdown(void);
 
