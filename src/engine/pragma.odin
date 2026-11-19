@@ -246,6 +246,34 @@ pragma_text :: proc(value: string) -> Value {
 	return value_string(strings.clone(value))
 }
 
+// pragma_attached splits `schema.rest` off a PRAGMA body when `schema` names
+// a database attached to `store`; main and temp were taken off before.
+@(private)
+pragma_attached :: proc(store: ^Store, body: string) -> (schema, rest: string, attached: ^Store) {
+	if len(store.attached) == 0 do return "", body, nil
+	end := len(body)
+	if open := strings.index_any(body, "(="); open >= 0 do end = open
+	dot := -1
+	if len(body) > 0 && (body[0] == '"' || body[0] == '`' || body[0] == '[') {
+		closing := body[0] == '[' ? u8(']') : body[0]
+		quote_end := strings.index_byte(body[1:], closing)
+		if quote_end < 0 do return "", body, nil
+		schema = body[1:1 + quote_end]
+		after := strings.trim_left_space(body[2 + quote_end:])
+		if !strings.has_prefix(after, ".") do return "", body, nil
+		rest = strings.trim_space(after[1:])
+	} else {
+		dot = strings.index_byte(body[:end], '.')
+		if dot < 0 do return "", body, nil
+		schema = strings.trim_space(body[:dot])
+		rest = strings.trim_space(body[dot + 1:])
+	}
+	for name, candidate in store.attached {
+		if strings.equal_fold(name, schema) do return name, rest, candidate
+	}
+	return "", body, nil
+}
+
 @(private)
 pragma_result :: proc(columns: []string, rows: [][]Value, commit_seq: u64) -> Sql_Result {
 	result := Sql_Result{kind = .Rows, commit_seq = commit_seq}
@@ -272,6 +300,24 @@ pragma_single :: proc(column: string, value: Value, commit_seq: u64) -> Sql_Resu
 // the store lock (a transaction does); `tx` is the transaction it runs in, if
 // any.
 sql_exec_pragma :: proc(store: ^Store, body: string, locked: bool, tx: ^Tx = nil) -> (Sql_Result, Error) {
+	// `PRAGMA aux.name` asks the attached database: through the transaction
+	// that writes it, when there is one, as SQLite reads it there.
+	if schema, rest, attached := pragma_attached(store, body); attached != nil {
+		if tx != nil {
+			if writer, open := tx.attached_txs[schema]; open do return sql_exec_pragma(attached, rest, writer.locked, writer)
+		}
+		// One that describes the schema reads it in a transaction of that
+		// database, where the declared text is.
+		end := len(rest)
+		if open := strings.index_any(rest, "(="); open >= 0 do end = open
+		switch strings.to_lower(strings.trim_space(rest[:end]), context.temp_allocator) {
+		case "table_info", "table_xinfo", "index_list", "index_info", "index_xinfo", "foreign_key_list":
+			reader := tx_begin_read(attached)
+			defer tx_end(reader)
+			return sql_exec_pragma(attached, rest, reader.locked, reader)
+		}
+		return sql_exec_pragma(attached, rest, false)
+	}
 	name := body
 	argument := ""
 	has_argument := false
