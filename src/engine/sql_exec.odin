@@ -6779,7 +6779,9 @@ eval_call_body :: proc(ctx: ^Eval_Ctx, call: Call_Expr, args: []Value, outer: me
 			}
 			moment, ok := db_time_parse(args[1:])
 			if !ok do return value_null(), ERROR_NONE
-			return value_string(db_time_strftime(args[0].s, moment)), ERROR_NONE
+			text, known := db_time_strftime(args[0].s, moment)
+			if !known do return value_null(), ERROR_NONE
+			return value_string(text), ERROR_NONE
 		}
 		value, _ := db_time_call(call.name, args[:])
 		return value, ERROR_NONE

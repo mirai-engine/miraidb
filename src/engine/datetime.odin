@@ -2,6 +2,7 @@ package engine
 
 import "core:fmt"
 import "core:math"
+import "core:strconv"
 import "core:strings"
 
 // SQLite's date and time functions work in Julian days: a day starts at noon,
@@ -46,6 +47,11 @@ db_time_parse :: proc(args: []Value) -> (Db_Time, bool) {
 			moment = db_time_now()
 			parsed = true
 		} else if db_time_parse_text(text, &moment) {
+			parsed = true
+		} else if number, is_number := strconv.parse_f64(text); is_number {
+			// A text that is a number is that number, as SQLite reads it: a
+			// Julian day, or seconds with 'unixepoch'.
+			moment = Db_Time{jd = unix ? JD_UNIX_EPOCH + number / SECONDS_PER_DAY : number}
 			parsed = true
 		}
 	case .Int, .Float, .Uint:
@@ -258,21 +264,23 @@ db_days_in_month :: proc(year, month: int) -> int {
 }
 
 db_time_civil :: proc(t: Db_Time) -> (year, month, day, hour, minute, second: int) {
-	days := i64(math.floor(t.jd - JD_UNIX_EPOCH))
-	fraction := (t.jd - JD_UNIX_EPOCH) - f64(days)
-	if fraction < 0 {
-		fraction += 1
-		days -= 1
-	}
+	days, day_ms := db_time_split(t)
 	year, month, day = db_civil_from_days(days)
-	total := int(fraction * SECONDS_PER_DAY + 0.5)
-	if total >= 86400 {
-		total -= 86400
-		day, month, year = db_civil_from_days(days + 1)
-	}
-	hour = total / 3600
-	minute = (total % 3600) / 60
-	second = total % 60
+	hour = int(day_ms / 3_600_000)
+	minute = int(day_ms / 60_000 % 60)
+	second = int(day_ms / 1000 % 60)
+	return
+}
+
+// db_time_split reads a time in whole milliseconds, as SQLite keeps it (the
+// Julian day rounded to the millisecond): the days since 1970-01-01 and the
+// milliseconds into that day. A second is never rounded up into the next.
+db_time_split :: proc(t: Db_Time) -> (days: i64, day_ms: i64) {
+	ms := i64(t.jd * 86_400_000 + 0.5)
+	unix_ms := ms - 210_866_760_000_000 // the epoch is Julian day 2440587.5
+	days = unix_ms / 86_400_000
+	if unix_ms % 86_400_000 < 0 do days -= 1
+	day_ms = unix_ms - days * 86_400_000
 	return
 }
 
@@ -325,58 +333,115 @@ db_time_unix :: proc(t: Db_Time) -> i64 {
 	return i64(math.round((t.jd - JD_UNIX_EPOCH) * SECONDS_PER_DAY))
 }
 
-// db_time_strftime implements the strftime codes SQLite supports most often.
-db_time_strftime :: proc(format: string, t: Db_Time) -> string {
-	year, month, day, hour, minute, second := db_time_civil(t)
-	day_of_year := int(db_days_from_civil(year, month, day) - db_days_from_civil(year, 1, 1)) + 1
+// db_time_strftime is SQLite's strftime over every code it knows; `ok` is
+// false for a code it does not, which makes the whole answer NULL, as in
+// SQLite. The time is read in whole milliseconds, as SQLite keeps it, so the
+// seconds are truncated and %f carries the milliseconds.
+db_time_strftime :: proc(format: string, t: Db_Time) -> (out: string, ok: bool) {
+	ms := i64(t.jd * 86_400_000 + 0.5)
+	days, day_ms := db_time_split(t)
+	year, month, day := db_civil_from_days(days)
+	hour := int(day_ms / 3_600_000)
+	minute := int(day_ms / 60_000 % 60)
+	second := int(day_ms / 1000 % 60)
+	day_of_year := int(days - db_days_from_civil(year, 1, 1)) // 0-based
+	// 0 is Sunday; 1970-01-01 was a Thursday.
+	weekday := int((days % 7 + 7 + 4) % 7)
+	// The ISO 8601 week and its year: the week with the year's first Thursday
+	// is week 1.
+	iso_week_year := year
+	monday_based := (weekday + 6) % 7
+	thursday := days - i64(monday_based) + 3
+	iso_week_year, _, _ = db_civil_from_days(thursday)
+	iso_week := int((thursday - db_days_from_civil(iso_week_year, 1, 1)) / 7) + 1
 	builder := strings.builder_make()
+	defer if !ok do strings.builder_destroy(&builder)
 	i := 0
 	for i < len(format) {
 		c := format[i]
-		if c != '%' || i + 1 >= len(format) {
+		if c != '%' {
 			strings.write_byte(&builder, c)
 			i += 1
 			continue
 		}
+		if i + 1 >= len(format) do return "", false
 		code := format[i + 1]
 		i += 2
 		switch code {
-		case 'Y':
-			fmt.sbprintf(&builder, "%04d", year)
-		case 'm':
-			fmt.sbprintf(&builder, "%02d", month)
 		case 'd':
 			fmt.sbprintf(&builder, "%02d", day)
-		case 'H':
-			fmt.sbprintf(&builder, "%02d", hour)
-		case 'M':
-			fmt.sbprintf(&builder, "%02d", minute)
-		case 'S':
-			fmt.sbprintf(&builder, "%02d", second)
-		case 'j':
-			fmt.sbprintf(&builder, "%03d", day_of_year)
-		case 's':
-			fmt.sbprintf(&builder, "%d", db_time_unix(t))
-		case 'J':
-			fmt.sbprintf(&builder, "%.6f", t.jd)
-		case 'w':
-			// 0 is Sunday; the epoch was a Thursday (4).
-			weekday := i64(math.mod(math.floor(t.jd + 1.5), 7))
-			fmt.sbprintf(&builder, "%d", weekday)
+		case 'e':
+			db_time_space_pad(&builder, day)
+		case 'f':
+			fmt.sbprintf(&builder, "%02d.%03d", second, int(day_ms % 1000))
 		case 'F':
 			fmt.sbprintf(&builder, "%04d-%02d-%02d", year, month, day)
+		case 'G':
+			fmt.sbprintf(&builder, "%04d", iso_week_year)
+		case 'g':
+			fmt.sbprintf(&builder, "%02d", iso_week_year % 100)
+		case 'H':
+			fmt.sbprintf(&builder, "%02d", hour)
+		case 'k':
+			db_time_space_pad(&builder, hour)
+		case 'I', 'l':
+			h12 := hour % 12
+			if h12 == 0 do h12 = 12
+			if code == 'I' do fmt.sbprintf(&builder, "%02d", h12)
+			else do db_time_space_pad(&builder, h12)
+		case 'j':
+			fmt.sbprintf(&builder, "%03d", day_of_year + 1)
+		case 'J':
+			// SQLite writes the day number with %.16g.
+			digits, sign, _ := sqlite_format_double('g', f64(ms) / 86_400_000, 0, false, false, false, false, 16, context.temp_allocator)
+			if sign != 0 do strings.write_byte(&builder, sign)
+			strings.write_string(&builder, string(digits))
+		case 'm':
+			fmt.sbprintf(&builder, "%02d", month)
+		case 'M':
+			fmt.sbprintf(&builder, "%02d", minute)
+		case 'p':
+			strings.write_string(&builder, hour >= 12 ? "PM" : "AM")
+		case 'P':
+			strings.write_string(&builder, hour >= 12 ? "pm" : "am")
+		case 'R':
+			fmt.sbprintf(&builder, "%02d:%02d", hour, minute)
+		case 's':
+			fmt.sbprintf(&builder, "%d", ms / 1000 - 210_866_760_000)
+		case 'S':
+			fmt.sbprintf(&builder, "%02d", second)
 		case 'T':
 			fmt.sbprintf(&builder, "%02d:%02d:%02d", hour, minute, second)
+		case 'u':
+			fmt.sbprintf(&builder, "%d", weekday == 0 ? 7 : weekday)
+		case 'w':
+			fmt.sbprintf(&builder, "%d", weekday)
+		case 'U':
+			fmt.sbprintf(&builder, "%02d", (day_of_year + 7 - weekday) / 7)
+		case 'W':
+			fmt.sbprintf(&builder, "%02d", (day_of_year + 7 - monday_based) / 7)
+		case 'V':
+			fmt.sbprintf(&builder, "%02d", iso_week)
+		case 'Y':
+			fmt.sbprintf(&builder, "%04d", year)
 		case '%':
 			strings.write_byte(&builder, '%')
 		case:
-			strings.write_byte(&builder, '%')
-			strings.write_byte(&builder, code)
+			return "", false
 		}
 	}
-	out := strings.clone(strings.to_string(builder))
+	ok = true
+	out = strings.clone(strings.to_string(builder))
 	strings.builder_destroy(&builder)
-	return out
+	return
+}
+
+// db_time_space_pad writes a number under 100 in two places, a space before
+// one digit (%e, %k, %l).
+@(private)
+db_time_space_pad :: proc(builder: ^strings.Builder, n: int) {
+	if n < 10 do strings.write_byte(builder, ' ')
+	fmt.sbprintf(builder, "%d", n)
 }
 
 // datetime_call evaluates the date and time functions. It returns a NULL value
