@@ -4,6 +4,7 @@ package tests
 // and S2). Each answer here is the one SQLite gives; scripts/differential.py
 // asks SQLite itself for the same shapes.
 
+import "core:mem"
 import "core:testing"
 
 import db "../engine"
@@ -497,6 +498,44 @@ test_unique_allows_many_nulls :: proc(t: ^testing.T) {
 	run_done(t, store, "DELETE FROM n WHERE id = 1")
 	expect_ints(t, store, "SELECT id FROM n WHERE x IS NULL ORDER BY id", {2, 3})
 	run_done(t, store, "INSERT INTO n VALUES (6, 5, NULL, NULL)")
+}
+
+@(test)
+test_unique_null_check_allocates_nothing :: proc(t: ^testing.T) {
+	// Every write asks each UNIQUE index whether the row's key has a NULL. For an
+	// index over plain columns that is a look at the columns: encoding the key
+	// into a heap buffer to find out made updates 40% slower.
+	store := fresh_db(t, "unique_null_alloc")
+	if store == nil do return
+	defer cleanup_db(store, "unique_null_alloc")
+
+	run_done(t, store, "CREATE TABLE n (id INTEGER PRIMARY KEY, a INTEGER, b TEXT, UNIQUE (a, b))")
+	run_done(t, store, "CREATE UNIQUE INDEX n_e ON n (a + 1)")
+	reader := db.tx_begin_read(store)
+	defer db.tx_end(reader)
+	table := db.tx_table_probe(reader, "n")
+	if !testing.expect(t, table != nil) do return
+	plain, expression := -1, -1
+	for index, i in table.indexes {
+		if index.schema.name == "n_e" do expression = i
+		else if len(index.schema.columns) == 2 do plain = i
+	}
+	if !testing.expect(t, plain >= 0 && expression >= 0) do return
+
+	full := []db.Value{db.value_int(1), db.value_int(2), db.value_string("x")}
+	half := []db.Value{db.value_int(1), db.value_int(2), db.value_null()}
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	{
+		context.allocator = mem.tracking_allocator(&track)
+		testing.expect(t, !db.index_key_has_null(table, plain, full))
+		testing.expect(t, db.index_key_has_null(table, plain, half))
+	}
+	testing.expect_value(t, track.total_allocation_count, 0)
+	// An expression part is still evaluated: a + 1 over a NULL is NULL.
+	testing.expect(t, !db.index_key_has_null(table, expression, full))
+	testing.expect(t, db.index_key_has_null(table, expression, []db.Value{db.value_int(1), db.value_null(), db.value_string("x")}))
 }
 
 @(test)

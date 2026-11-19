@@ -199,7 +199,14 @@ table_index_position :: proc(t: ^Table, name: string) -> (int, bool) {
 }
 
 // index_key_has_null reports whether a row's key for an index has a NULL part.
+// A plain index answers from the row's columns; only an expression part has to
+// be evaluated, and so encoded.
 index_key_has_null :: proc(t: ^Table, index: int, values: []Value) -> bool {
+	exprs := t.indexes[index].exprs
+	if exprs == nil || len(exprs.parts) == 0 {
+		for col in t.indexes[index].schema.columns do if values[col].kind == .Null do return true
+		return false
+	}
 	w: Byte_Writer
 	bw_init(&w)
 	defer bw_destroy(&w)
