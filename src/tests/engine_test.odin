@@ -47,6 +47,16 @@ run :: proc(t: ^testing.T, store: ^db.Store, sql: string) -> db.Sql_Result {
 	return result
 }
 
+// run_done runs a statement whose result the test does not read, and
+// frees it.
+@(private)
+run_done :: proc(t: ^testing.T, store: ^db.Store, sql: string, loc := #caller_location) {
+	result, err := db.sql_execute(store, sql)
+	testing.expectf(t, db.error_ok(err), "%s failed: %s", sql, err.message, loc = loc)
+	db.error_free(&err)
+	db.sql_result_destroy(&result)
+}
+
 @(private)
 run_error :: proc(t: ^testing.T, store: ^db.Store, sql: string) -> db.Error {
 	result, err := db.sql_execute(store, sql)
@@ -61,7 +71,8 @@ scalar :: proc(t: ^testing.T, store: ^db.Store, sql: string) -> db.Value {
 	if !testing.expectf(t, len(result.rows) == 1 && len(result.rows[0]) >= 1, "%s returned no row", sql) {
 		return {}
 	}
-	return db.value_clone(result.rows[0][0], context.allocator)
+	// The value outlives the result in the test's temporary memory.
+	return db.value_clone(result.rows[0][0], context.temp_allocator)
 }
 
 // --- Tests -----------------------------------------------------------------
@@ -71,8 +82,8 @@ test_crud_and_replay :: proc(t: ^testing.T) {
 	store := fresh_db(t, "crud")
 	if store == nil do return
 
-	run(t, store, "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, score DOUBLE DEFAULT 1.5)")
-	run(t, store, "INSERT INTO users (name) VALUES ('ana'), ('luis')")
+	run_done(t, store, "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, score DOUBLE DEFAULT 1.5)")
+	run_done(t, store, "INSERT INTO users (name) VALUES ('ana'), ('luis')")
 
 	count := scalar(t, store, "SELECT count(*) FROM users")
 	testing.expect_value(t, count.i, i64(2))
@@ -83,11 +94,11 @@ test_crud_and_replay :: proc(t: ^testing.T) {
 	testing.expect_value(t, row.rows[0][2].f, f64(1.5))
 	db.sql_result_destroy(&row)
 
-	run(t, store, "UPDATE users SET score = 10 WHERE name = 'ana'")
+	run_done(t, store, "UPDATE users SET score = 10 WHERE name = 'ana'")
 	value := scalar(t, store, "SELECT score FROM users WHERE name = 'ana'")
 	testing.expect_value(t, value.f, f64(10))
 
-	run(t, store, "DELETE FROM users WHERE name = 'luis'")
+	run_done(t, store, "DELETE FROM users WHERE name = 'luis'")
 	remaining := scalar(t, store, "SELECT count(*) FROM users")
 	testing.expect_value(t, remaining.i, i64(1))
 
@@ -113,8 +124,8 @@ test_constraints :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "constraints")
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL)")
-	run(t, store, "INSERT INTO t VALUES (1, 'a')")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL)")
+	run_done(t, store, "INSERT INTO t VALUES (1, 'a')")
 
 	duplicate_pk := run_error(t, store, "INSERT INTO t VALUES (1, 'b')")
 	testing.expect_value(t, duplicate_pk.kind, db.Error_Kind.Duplicate_Primary_Key)
@@ -138,7 +149,7 @@ test_transactions :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "tx")
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, value INTEGER NOT NULL)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, value INTEGER NOT NULL)")
 
 	tx := db.tx_begin_write(store)
 	_, insert_err := db.sql_execute_in_tx(tx, "INSERT INTO t (value) VALUES (1)")
@@ -169,8 +180,8 @@ test_aggregates_and_order :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "agg")
 
-	run(t, store, "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, amount DOUBLE NOT NULL)")
-	run(t, store, "INSERT INTO events (kind, amount) VALUES ('a', 1.0), ('a', 2.0), ('b', 5.0)")
+	run_done(t, store, "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, amount DOUBLE NOT NULL)")
+	run_done(t, store, "INSERT INTO events (kind, amount) VALUES ('a', 1.0), ('a', 2.0), ('b', 5.0)")
 
 	grouped := run(t, store, "SELECT kind, count(*), sum(amount) FROM events GROUP BY kind ORDER BY kind")
 	testing.expect_value(t, len(grouped.rows), 2)
@@ -203,7 +214,7 @@ test_reducers :: proc(t: ^testing.T) {
 	defer db.host_destroy(host)
 	defer cleanup_db(store, "reducer")
 
-	run(t, store, "CREATE TABLE counter (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)")
+	run_done(t, store, "CREATE TABLE counter (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)")
 
 	add :: proc(ctx: ^db.Reducer_Ctx, args: []db.Value) -> db.Error {
 		amount, _ := db.value_to_i64(args[0])
@@ -221,7 +232,7 @@ test_reducers :: proc(t: ^testing.T) {
 	testing.expect(t, db.error_ok(db.host_register(host, "add", []db.Column_Type{db.type_int}, add)))
 	testing.expect(t, db.error_ok(db.host_register(host, "boom", nil, failing)))
 
-	run(t, store, "INSERT INTO counter (id, value) VALUES (0, 0)")
+	run_done(t, store, "INSERT INTO counter (id, value) VALUES (0, 0)")
 	testing.expect(t, db.error_ok(db.host_call(host, "add", []db.Value{db.value_int(1)})))
 	testing.expect(t, db.error_ok(db.host_call(host, "add", []db.Value{db.value_int(1)})))
 	value := scalar(t, store, "SELECT value FROM counter WHERE id = 0")
@@ -245,8 +256,8 @@ test_subscriptions :: proc(t: ^testing.T) {
 	defer db.host_destroy(host)
 	defer cleanup_db(store, "subs")
 
-	run(t, store, "CREATE TABLE items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)")
-	run(t, store, "INSERT INTO items (name) VALUES ('one')")
+	run_done(t, store, "CREATE TABLE items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)")
+	run_done(t, store, "INSERT INTO items (name) VALUES ('one')")
 
 	id, snapshot, err := db.host_subscribe(host, "SELECT id, name FROM items")
 	if !testing.expectf(t, db.error_ok(err), "subscribe failed: %s", err.message) {
@@ -266,12 +277,12 @@ test_subscriptions :: proc(t: ^testing.T) {
 	host.on_update = on_update
 	host.on_update_ctx = seen
 
-	run(t, store, "INSERT INTO items (name) VALUES ('two')")
+	run_done(t, store, "INSERT INTO items (name) VALUES ('two')")
 	testing.expect_value(t, seen[0], 1)
 	testing.expect_value(t, seen[1], 0)
 
 	seen[0] = 0
-	run(t, store, "DELETE FROM items WHERE name = 'two'")
+	run_done(t, store, "DELETE FROM items WHERE name = 'two'")
 	testing.expect_value(t, seen[0], 0)
 	testing.expect_value(t, seen[1], 1)
 
@@ -304,8 +315,8 @@ test_torn_log_tail :: proc(t: ^testing.T) {
 	store := fresh_db(t, "torn")
 	if store == nil do return
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, value INTEGER NOT NULL)")
-	run(t, store, "INSERT INTO t (value) VALUES (1)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, value INTEGER NOT NULL)")
+	run_done(t, store, "INSERT INTO t (value) VALUES (1)")
 	db.store_close(store)
 
 	// Append garbage to the log: replay must keep the valid prefix and cut the
@@ -364,10 +375,10 @@ test_time_budget_note :: proc(t: ^testing.T) {
 	store := fresh_db(t, "perf")
 	if store == nil do return
 	defer cleanup_db(store, "perf")
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER NOT NULL)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER NOT NULL)")
 	for i in 0 ..< 200 {
 		sql := fmt.tprintf("INSERT INTO t (v) VALUES (%d)", i)
-		run(t, store, sql)
+		run_done(t, store, sql)
 	}
 	count := scalar(t, store, "SELECT count(*) FROM t")
 	testing.expect_value(t, count.i, i64(200))
@@ -381,7 +392,7 @@ test_bind_parameters :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "params")
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, score INTEGER NOT NULL)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, score INTEGER NOT NULL)")
 
 	insert, insert_err := db.sql_execute_params(
 		store,
@@ -420,10 +431,10 @@ test_index_ddl_and_ranges :: proc(t: ^testing.T) {
 	store := fresh_db(t, "indexddl")
 	if store == nil do return
 
-	run(t, store, "CREATE TABLE item (id INTEGER PRIMARY KEY AUTOINCREMENT, score INTEGER NOT NULL, tag TEXT NOT NULL)")
+	run_done(t, store, "CREATE TABLE item (id INTEGER PRIMARY KEY AUTOINCREMENT, score INTEGER NOT NULL, tag TEXT NOT NULL)")
 	for value in ([]int{30, 10, 20, 40, 5}) {
 		statement := fmt.tprintf("INSERT INTO item (score, tag) VALUES (%d, 'v%d')", value, value)
-		run(t, store, statement)
+		run_done(t, store, statement)
 	}
 
 	// No index on score yet: full scan, correct answer.
@@ -433,7 +444,7 @@ test_index_ddl_and_ranges :: proc(t: ^testing.T) {
 	testing.expect_value(t, plain.rows[1][0].i, i64(30))
 	db.sql_result_destroy(&plain)
 
-	run(t, store, "CREATE INDEX item_score ON item (score)")
+	run_done(t, store, "CREATE INDEX item_score ON item (score)")
 
 	ranged := run(t, store, "SELECT score FROM item WHERE score >= 20 AND score < 40 ORDER BY score")
 	testing.expect_value(t, len(ranged.rows), 2)
@@ -459,8 +470,8 @@ test_index_ddl_and_ranges :: proc(t: ^testing.T) {
 	testing.expect_value(t, after.rows[0][0].i, i64(2))
 	db.sql_result_destroy(&after)
 
-	run(t, reopened, "DROP INDEX item_score")
-	run(t, reopened, "DROP INDEX IF EXISTS item_score")
+	run_done(t, reopened, "DROP INDEX item_score")
+	run_done(t, reopened, "DROP INDEX IF EXISTS item_score")
 	cleanup_db(reopened, "indexddl")
 }
 
@@ -470,9 +481,9 @@ test_unique_index_from_ddl :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "uniqueidx")
 
-	run(t, store, "CREATE TABLE u (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT NOT NULL)")
-	run(t, store, "CREATE UNIQUE INDEX u_code ON u (code)")
-	run(t, store, "INSERT INTO u (code) VALUES ('a')")
+	run_done(t, store, "CREATE TABLE u (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT NOT NULL)")
+	run_done(t, store, "CREATE UNIQUE INDEX u_code ON u (code)")
+	run_done(t, store, "INSERT INTO u (code) VALUES ('a')")
 
 	duplicate := run_error(t, store, "INSERT INTO u (code) VALUES ('a')")
 	testing.expect_value(t, duplicate.kind, db.Error_Kind.Duplicate_Unique)
@@ -487,8 +498,8 @@ test_having :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "having")
 
-	run(t, store, "CREATE TABLE sale (id INTEGER PRIMARY KEY AUTOINCREMENT, shop TEXT NOT NULL, amount INTEGER NOT NULL)")
-	run(t, store, "INSERT INTO sale (shop, amount) VALUES ('a', 5), ('a', 7), ('b', 2), ('c', 20)")
+	run_done(t, store, "CREATE TABLE sale (id INTEGER PRIMARY KEY AUTOINCREMENT, shop TEXT NOT NULL, amount INTEGER NOT NULL)")
+	run_done(t, store, "INSERT INTO sale (shop, amount) VALUES ('a', 5), ('a', 7), ('b', 2), ('c', 20)")
 
 	result := run(t, store, "SELECT shop, sum(amount) AS total FROM sale GROUP BY shop HAVING sum(amount) > 15 ORDER BY shop")
 	testing.expect_value(t, len(result.rows), 1)
@@ -505,11 +516,11 @@ test_compaction :: proc(t: ^testing.T) {
 	store := fresh_db(t, "compact")
 	if store == nil do return
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT NOT NULL)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT NOT NULL)")
 	for i in 0 ..< 50 {
-		run(t, store, fmt.tprintf("INSERT INTO t (v) VALUES ('row%d')", i))
+		run_done(t, store, fmt.tprintf("INSERT INTO t (v) VALUES ('row%d')", i))
 	}
-	run(t, store, "DELETE FROM t WHERE id < 10")
+	run_done(t, store, "DELETE FROM t WHERE id < 10")
 	sequence := store.commit_seq
 
 	path := "_test_compact/log"
@@ -529,7 +540,7 @@ test_compaction :: proc(t: ^testing.T) {
 	)
 
 	// A commit after compaction keeps working and keeps the sequence.
-	run(t, store, "INSERT INTO t (v) VALUES ('after')")
+	run_done(t, store, "INSERT INTO t (v) VALUES ('after')")
 	testing.expect_value(t, store.commit_seq, sequence + 1)
 	count := scalar(t, store, "SELECT count(*) FROM t")
 	testing.expect_value(t, count.i, i64(42)) // 50 - 9 + 1
@@ -551,10 +562,10 @@ test_ordered_index_scan_bounds :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "bounds")
 
-	run(t, store, "CREATE TABLE n (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER NOT NULL)")
-	run(t, store, "CREATE INDEX n_v ON n (v)")
+	run_done(t, store, "CREATE TABLE n (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER NOT NULL)")
+	run_done(t, store, "CREATE INDEX n_v ON n (v)")
 	for value in ([]int{-5, -1, 0, 1, 5, 100}) {
-		run(t, store, fmt.tprintf("INSERT INTO n (v) VALUES (%d)", value))
+		run_done(t, store, fmt.tprintf("INSERT INTO n (v) VALUES (%d)", value))
 	}
 	cases := []struct {
 		sql:   string,
@@ -583,8 +594,8 @@ test_scheduler :: proc(t: ^testing.T) {
 	defer db.host_destroy(host)
 	defer cleanup_db(store, "scheduler")
 
-	run(t, store, "CREATE TABLE counter (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)")
-	run(t, store, "INSERT INTO counter (id, value) VALUES (0, 0)")
+	run_done(t, store, "CREATE TABLE counter (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)")
+	run_done(t, store, "INSERT INTO counter (id, value) VALUES (0, 0)")
 
 	bump :: proc(ctx: ^db.Reducer_Ctx, args: []db.Value) -> db.Error {
 		amount, _ := db.value_to_i64(args[0])
@@ -624,10 +635,10 @@ test_scheduler :: proc(t: ^testing.T) {
 
 @(private)
 join_fixture :: proc(t: ^testing.T, store: ^db.Store) {
-	run(t, store, "CREATE TABLE author (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)")
-	run(t, store, "CREATE TABLE book (id INTEGER PRIMARY KEY AUTOINCREMENT, author_id INTEGER NOT NULL, title TEXT NOT NULL)")
-	run(t, store, "INSERT INTO author (name) VALUES ('ana'), ('luis'), ('zoe')")
-	run(t, store, "INSERT INTO book (author_id, title) VALUES (1, 'a1'), (1, 'a2'), (2, 'b1'), (9, 'orphan')")
+	run_done(t, store, "CREATE TABLE author (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)")
+	run_done(t, store, "CREATE TABLE book (id INTEGER PRIMARY KEY AUTOINCREMENT, author_id INTEGER NOT NULL, title TEXT NOT NULL)")
+	run_done(t, store, "INSERT INTO author (name) VALUES ('ana'), ('luis'), ('zoe')")
+	run_done(t, store, "INSERT INTO book (author_id, title) VALUES (1, 'a1'), (1, 'a2'), (2, 'b1'), (9, 'orphan')")
 }
 
 @(test)
@@ -717,7 +728,7 @@ test_join_subscription :: proc(t: ^testing.T) {
 	host.on_update_ctx = &counters
 
 	// A change in the joined table must refresh the subscription.
-	run(t, store, "INSERT INTO book (author_id, title) VALUES (2, 'z1')")
+	run_done(t, store, "INSERT INTO book (author_id, title) VALUES (2, 'z1')")
 	testing.expect_value(t, counters[0], 1)
 	testing.expect_value(t, counters[1], 0)
 	inserted = counters[0]
@@ -865,9 +876,9 @@ test_join_subscription_walks_the_planned_order :: proc(t: ^testing.T) {
 	defer db.host_destroy(host)
 	defer cleanup_db(store, "joinsub_order")
 
-	run(t, store, "CREATE TABLE author (id INTEGER PRIMARY KEY, name TEXT)")
-	run(t, store, "CREATE TABLE book (id INTEGER PRIMARY KEY, author_id INTEGER, title TEXT)")
-	run(t, store, "CREATE INDEX book_author ON book (author_id)")
+	run_done(t, store, "CREATE TABLE author (id INTEGER PRIMARY KEY, name TEXT)")
+	run_done(t, store, "CREATE TABLE book (id INTEGER PRIMARY KEY, author_id INTEGER, title TEXT)")
+	run_done(t, store, "CREATE INDEX book_author ON book (author_id)")
 	authors := 5
 	books := 1000
 	insert_authors := strings.builder_make()
@@ -877,7 +888,7 @@ test_join_subscription_walks_the_planned_order :: proc(t: ^testing.T) {
 		if i > 0 do strings.write_string(&insert_authors, ", ")
 		fmt.sbprintf(&insert_authors, "(%d, 'a%d')", i + 1, i + 1)
 	}
-	run(t, store, strings.to_string(insert_authors))
+	run_done(t, store, strings.to_string(insert_authors))
 	insert_books := strings.builder_make()
 	defer strings.builder_destroy(&insert_books)
 	strings.write_string(&insert_books, "INSERT INTO book (id, author_id, title) VALUES ")
@@ -885,8 +896,8 @@ test_join_subscription_walks_the_planned_order :: proc(t: ^testing.T) {
 		if i > 0 do strings.write_string(&insert_books, ", ")
 		fmt.sbprintf(&insert_books, "(%d, %d, 'b%d')", i + 1, (i % authors) + 1, i + 1)
 	}
-	run(t, store, strings.to_string(insert_books))
-	run(t, store, "ANALYZE")
+	run_done(t, store, strings.to_string(insert_books))
+	run_done(t, store, "ANALYZE")
 
 	// Written big-first: the plan still starts with the five authors.
 	big_first := "SELECT author.name, book.title FROM book JOIN author ON author.id = book.author_id"
@@ -932,10 +943,10 @@ test_join_subscription_walks_the_planned_order :: proc(t: ^testing.T) {
 	defer free(deltas)
 	host.on_update = join_delta_capture
 	host.on_update_ctx = deltas
-	run(t, store, "INSERT INTO book (author_id, title) VALUES (3, 'new')")
+	run_done(t, store, "INSERT INTO book (author_id, title) VALUES (3, 'new')")
 	inserts, deletes := join_deltas_clear(deltas)
 	testing.expectf(t, inserts >= 1 && deletes == 0, "insert published %d/%d", inserts, deletes)
-	run(t, store, "UPDATE author SET name = 'renamed' WHERE id = 3")
+	run_done(t, store, "UPDATE author SET name = 'renamed' WHERE id = 3")
 	inserts, deletes = join_deltas_clear(deltas)
 	testing.expectf(t, inserts >= 1 && inserts == deletes, "rename published %d/%d", inserts, deletes)
 
@@ -953,9 +964,9 @@ test_join_probes_the_inner_index :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "join_probe")
 
-	run(t, store, "CREATE TABLE author (id INTEGER PRIMARY KEY, name TEXT)")
-	run(t, store, "CREATE TABLE book (id INTEGER PRIMARY KEY, author_id INTEGER, title TEXT)")
-	run(t, store, "CREATE INDEX book_author ON book (author_id)")
+	run_done(t, store, "CREATE TABLE author (id INTEGER PRIMARY KEY, name TEXT)")
+	run_done(t, store, "CREATE TABLE book (id INTEGER PRIMARY KEY, author_id INTEGER, title TEXT)")
+	run_done(t, store, "CREATE INDEX book_author ON book (author_id)")
 	authors := 200
 	books := 1000
 	insert_authors := strings.builder_make()
@@ -965,7 +976,7 @@ test_join_probes_the_inner_index :: proc(t: ^testing.T) {
 		if i > 0 do strings.write_string(&insert_authors, ", ")
 		fmt.sbprintf(&insert_authors, "(%d, 'a%d')", i + 1, i + 1)
 	}
-	run(t, store, strings.to_string(insert_authors))
+	run_done(t, store, strings.to_string(insert_authors))
 	insert_books := strings.builder_make()
 	defer strings.builder_destroy(&insert_books)
 	strings.write_string(&insert_books, "INSERT INTO book (id, author_id, title) VALUES ")
@@ -973,7 +984,7 @@ test_join_probes_the_inner_index :: proc(t: ^testing.T) {
 		if i > 0 do strings.write_string(&insert_books, ", ")
 		fmt.sbprintf(&insert_books, "(%d, %d, 'b%d')", i + 1, (i % authors) + 1, i + 1)
 	}
-	run(t, store, strings.to_string(insert_books))
+	run_done(t, store, strings.to_string(insert_books))
 
 	db.store_reset_rows_scanned(store)
 	junction, err := db.sql_execute(store, `
@@ -1008,7 +1019,7 @@ test_join_probes_the_inner_index :: proc(t: ^testing.T) {
 
 	// A LEFT join keeps the outer row that matched nothing, with or without the
 	// probe.
-	run(t, store, "INSERT INTO author (id, name) VALUES (999, 'lonely')")
+	run_done(t, store, "INSERT INTO author (id, name) VALUES (999, 'lonely')")
 	left, left_err := db.sql_execute(store, `
 		SELECT author.name, book.title
 		FROM author LEFT JOIN book ON author.id = book.author_id
@@ -1078,7 +1089,7 @@ test_incremental_join_subscription :: proc(t: ^testing.T) {
 		{"UPDATE book SET author_id = 1 WHERE title = 'n1'", 1, 1},
 	}
 	for step in steps {
-		run(t, store, step.sql)
+		run_done(t, store, step.sql)
 		join_set_apply(t, &set, deltas, 2)
 		inserts, deletes := join_deltas_clear(deltas)
 		testing.expectf(
@@ -1098,10 +1109,10 @@ test_incremental_join_subscription :: proc(t: ^testing.T) {
 
 	// A DDL statement falls back to the full evaluation and re-indexes, so the
 	// next row change is incremental again.
-	run(t, store, "CREATE INDEX book_title ON book (title)")
+	run_done(t, store, "CREATE INDEX book_title ON book (title)")
 	inserts, deletes := join_deltas_clear(deltas)
 	testing.expectf(t, inserts == 0 && deletes == 0, "DDL published %d/%d deltas", inserts, deletes)
-	run(t, store, "INSERT INTO book (author_id, title) VALUES (9, 'n2')")
+	run_done(t, store, "INSERT INTO book (author_id, title) VALUES (9, 'n2')")
 	join_set_apply(t, &set, deltas, 2)
 	inserts, deletes = join_deltas_clear(deltas)
 	testing.expect_value(t, inserts, 1)
@@ -1124,7 +1135,7 @@ test_incremental_join_subscription :: proc(t: ^testing.T) {
 		{"DELETE FROM book WHERE title = 'n1'", 0, 2},
 	}
 	for step in dup_steps {
-		run(t, store, step.sql)
+		run_done(t, store, step.sql)
 		join_set_apply(t, &set, deltas, 2)
 		inserts, deletes = join_deltas_clear(deltas)
 		testing.expectf(
@@ -1155,8 +1166,8 @@ test_join_subscription_probes_the_join_key :: proc(t: ^testing.T) {
 	defer db.host_destroy(host)
 	defer cleanup_db(store, "joinsub_probe")
 
-	run(t, store, "CREATE TABLE author (id INTEGER PRIMARY KEY, name TEXT)")
-	run(t, store, "CREATE TABLE book (id INTEGER PRIMARY KEY, author_id INTEGER, title TEXT)")
+	run_done(t, store, "CREATE TABLE author (id INTEGER PRIMARY KEY, name TEXT)")
+	run_done(t, store, "CREATE TABLE book (id INTEGER PRIMARY KEY, author_id INTEGER, title TEXT)")
 	authors := 200
 	books := 900
 	insert_authors := strings.builder_make()
@@ -1166,7 +1177,7 @@ test_join_subscription_probes_the_join_key :: proc(t: ^testing.T) {
 		if i > 0 do strings.write_string(&insert_authors, ", ")
 		fmt.sbprintf(&insert_authors, "(%d, 'a%d')", i + 1, i + 1)
 	}
-	run(t, store, strings.to_string(insert_authors))
+	run_done(t, store, strings.to_string(insert_authors))
 	insert_books := strings.builder_make()
 	defer strings.builder_destroy(&insert_books)
 	strings.write_string(&insert_books, "INSERT INTO book (id, author_id, title) VALUES ")
@@ -1174,7 +1185,7 @@ test_join_subscription_probes_the_join_key :: proc(t: ^testing.T) {
 		if i > 0 do strings.write_string(&insert_books, ", ")
 		fmt.sbprintf(&insert_books, "(%d, %d, 'b%d')", i + 1, (i % authors) + 1, i + 1)
 	}
-	run(t, store, strings.to_string(insert_books))
+	run_done(t, store, strings.to_string(insert_books))
 
 	sql := "SELECT author.name, book.title FROM author JOIN book ON author.id = book.author_id"
 	id, snapshot, sub_err := db.host_subscribe(host, sql)
@@ -1191,7 +1202,7 @@ test_join_subscription_probes_the_join_key :: proc(t: ^testing.T) {
 
 	// A new book probes its author: one candidate, not `authors` of them.
 	before := db.host_join_rows_walked(host)
-	run(t, store, "INSERT INTO book (author_id, title) VALUES (7, 'n1')")
+	run_done(t, store, "INSERT INTO book (author_id, title) VALUES (7, 'n1')")
 	walked := db.host_join_rows_walked(host) - before
 	join_set_apply(t, &set, deltas, 2)
 	inserts, deletes := join_deltas_clear(deltas)
@@ -1201,7 +1212,7 @@ test_join_subscription_probes_the_join_key :: proc(t: ^testing.T) {
 	// A change on the base side probes the books of that author: the five that
 	// point at it, not all 900 books.
 	before = db.host_join_rows_walked(host)
-	run(t, store, "UPDATE author SET name = 'renamed' WHERE id = 7")
+	run_done(t, store, "UPDATE author SET name = 'renamed' WHERE id = 7")
 	walked = db.host_join_rows_walked(host) - before
 	join_set_apply(t, &set, deltas, 2)
 	inserts, deletes = join_deltas_clear(deltas)
@@ -1211,7 +1222,7 @@ test_join_subscription_probes_the_join_key :: proc(t: ^testing.T) {
 
 	// Moving a book to another author takes it out of the old key and files it
 	// under the new one, so both sides answer correctly afterwards.
-	run(t, store, "UPDATE book SET author_id = 1 WHERE id = 8")
+	run_done(t, store, "UPDATE book SET author_id = 1 WHERE id = 8")
 	join_set_apply(t, &set, deltas, 2)
 	inserts, deletes = join_deltas_clear(deltas)
 	testing.expectf(t, inserts == 1 && deletes == 1, "move published %d/%d", inserts, deletes)
@@ -1226,7 +1237,7 @@ test_join_subscription_probes_the_join_key :: proc(t: ^testing.T) {
 		for row in expr_snapshot do db.free_values(row)
 		delete(expr_snapshot)
 		updates_before := deltas.updates
-		run(t, store, "INSERT INTO book (author_id, title) VALUES (3, 'n2')")
+		run_done(t, store, "INSERT INTO book (author_id, title) VALUES (3, 'n2')")
 		testing.expect(t, deltas.updates > updates_before)
 		join_deltas_clear(deltas)
 		db.host_unsubscribe(host, expr_id)
@@ -1242,8 +1253,8 @@ test_incremental_aggregate_subscription :: proc(t: ^testing.T) {
 	host := db.host_init(store)
 	defer db.host_destroy(host)
 	defer cleanup_db(store, "aggsub_inc")
-	run(t, store, "CREATE TABLE sales (id INTEGER PRIMARY KEY AUTOINCREMENT, region TEXT NOT NULL, amount INTEGER NOT NULL)")
-	run(t, store, "INSERT INTO sales (region, amount) VALUES ('east', 10), ('east', 5), ('west', 3)")
+	run_done(t, store, "CREATE TABLE sales (id INTEGER PRIMARY KEY AUTOINCREMENT, region TEXT NOT NULL, amount INTEGER NOT NULL)")
+	run_done(t, store, "INSERT INTO sales (region, amount) VALUES ('east', 10), ('east', 5), ('west', 3)")
 
 	sql := "SELECT region, count(*), sum(amount) FROM sales GROUP BY region"
 	id, snapshot, err := db.host_subscribe(host, sql)
@@ -1291,7 +1302,7 @@ test_incremental_aggregate_subscription :: proc(t: ^testing.T) {
 		{"DELETE FROM sales WHERE region = 'east'", 1, 2},
 	}
 	for step in steps {
-		run(t, store, step.sql)
+		run_done(t, store, step.sql)
 		join_set_apply(t, &set, deltas, 3)
 		join_set_apply(t, &total_set, deltas, 1)
 		inserts, deletes := join_deltas_clear(deltas)
@@ -1319,10 +1330,10 @@ test_unsupported_joins_are_refused :: proc(t: ^testing.T) {
 	store := fresh_db(t, "join_refused")
 	if store == nil do return
 	defer cleanup_db(store, "join_refused")
-	run(t, store, "CREATE TABLE a (id INTEGER PRIMARY KEY)")
-	run(t, store, "CREATE TABLE b (id INTEGER PRIMARY KEY)")
-	run(t, store, "INSERT INTO a (id) VALUES (1), (2), (3)")
-	run(t, store, "INSERT INTO b (id) VALUES (2), (3), (4)")
+	run_done(t, store, "CREATE TABLE a (id INTEGER PRIMARY KEY)")
+	run_done(t, store, "CREATE TABLE b (id INTEGER PRIMARY KEY)")
+	run_done(t, store, "INSERT INTO a (id) VALUES (1), (2), (3)")
+	run_done(t, store, "INSERT INTO b (id) VALUES (2), (3), (4)")
 
 	// NATURAL is not an alias for the preceding table: it joins on the shared
 	// id (two rows here, not the nine of a cross join).
@@ -1348,11 +1359,11 @@ test_integrity_and_latency_stats :: proc(t: ^testing.T) {
 	store := fresh_db(t, "integrity")
 	if store == nil do return
 	defer cleanup_db(store, "integrity")
-	run(t, store, "CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT UNIQUE)")
-	run(t, store, "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER, amount INTEGER, FOREIGN KEY (parent_id) REFERENCES parent (id))")
-	run(t, store, "CREATE INDEX child_amount ON child (amount)")
-	run(t, store, "INSERT INTO parent (id, name) VALUES (1, 'one'), (2, 'two')")
-	run(t, store, "INSERT INTO child (id, parent_id, amount) VALUES (1, 1, 10), (2, 2, 20), (3, 1, 30)")
+	run_done(t, store, "CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT UNIQUE)")
+	run_done(t, store, "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER, amount INTEGER, FOREIGN KEY (parent_id) REFERENCES parent (id))")
+	run_done(t, store, "CREATE INDEX child_amount ON child (amount)")
+	run_done(t, store, "INSERT INTO parent (id, name) VALUES (1, 'one'), (2, 'two')")
+	run_done(t, store, "INSERT INTO child (id, parent_id, amount) VALUES (1, 1, 10), (2, 2, 20), (3, 1, 30)")
 
 	// A healthy database answers `ok` and has no orphans.
 	healthy := run(t, store, "PRAGMA integrity_check")
@@ -1373,7 +1384,7 @@ test_integrity_and_latency_stats :: proc(t: ^testing.T) {
 	testing.expect(t, db.error_ok(apply_err), "the raw insert must apply")
 	// A raw apply does not retire the cached read snapshot (only a commit
 	// does), so a commit has to follow for the checker to see the row.
-	run(t, store, "INSERT INTO parent (id, name) VALUES (3, 'three')")
+	run_done(t, store, "INSERT INTO parent (id, name) VALUES (3, 'three')")
 	broken := run(t, store, "PRAGMA foreign_key_check")
 	testing.expect_value(t, len(broken.rows), 1)
 	testing.expect_value(t, broken.rows[0][0].s, "child")
@@ -1429,8 +1440,8 @@ test_errors_mid_scan_are_clean :: proc(t: ^testing.T) {
 	store := fresh_db(t, "midscan")
 	if store == nil do return
 	defer cleanup_db(store, "midscan")
-	run(t, store, "CREATE TABLE entry (id INTEGER PRIMARY KEY, amount INTEGER, memo TEXT)")
-	run(t, store, "INSERT INTO entry VALUES (1, 1, NULL), (2, 2, 'x'), (3, 3, 'y')")
+	run_done(t, store, "CREATE TABLE entry (id INTEGER PRIMARY KEY, amount INTEGER, memo TEXT)")
+	run_done(t, store, "INSERT INTO entry VALUES (1, 1, NULL), (2, 2, 'x'), (3, 3, 'y')")
 
 	// The first row passes the filter (NULL keeps the row out), the second
 	// raises an error: 'x' is not JSON.
@@ -1498,7 +1509,7 @@ test_soak_workload :: proc(t: ^testing.T) {
 	store := fresh_db(t, "soak")
 	if store == nil do return
 	defer cleanup_db(store, "soak")
-	run(t, store, "CREATE TABLE s (id INTEGER PRIMARY KEY AUTOINCREMENT, level TEXT NOT NULL, message TEXT NOT NULL, amount INTEGER NOT NULL)")
+	run_done(t, store, "CREATE TABLE s (id INTEGER PRIMARY KEY AUTOINCREMENT, level TEXT NOT NULL, message TEXT NOT NULL, amount INTEGER NOT NULL)")
 	for round in 0 ..< 40 {
 		for step in 0 ..< 10 {
 			switch step % 4 {
@@ -1510,9 +1521,9 @@ test_soak_workload :: proc(t: ^testing.T) {
 					round * 7 - step,
 				))
 			case 1:
-				run(t, store, fmt.tprintf("UPDATE s SET amount = amount + %d WHERE id = %d", step, round * 3 + 1))
+				run_done(t, store, fmt.tprintf("UPDATE s SET amount = amount + %d WHERE id = %d", step, round * 3 + 1))
 			case 2:
-				run(t, store, fmt.tprintf("DELETE FROM s WHERE id = %d", round * 2 + step))
+				run_done(t, store, fmt.tprintf("DELETE FROM s WHERE id = %d", round * 2 + step))
 			case 3:
 				grouped := run(t, store, "SELECT level, count(*), sum(amount) FROM s GROUP BY level")
 				db.sql_result_destroy(&grouped)
@@ -1537,8 +1548,8 @@ test_snapshot_shares_values_safely :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "snapshot_share")
 
-	run(t, store, "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT NOT NULL)")
-	run(t, store, "INSERT INTO items (id, label) VALUES (1, 'one'), (2, 'two'), (3, 'three')")
+	run_done(t, store, "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT NOT NULL)")
+	run_done(t, store, "INSERT INTO items (id, label) VALUES (1, 'one'), (2, 'two'), (3, 'three')")
 
 	// A reader freezes the table while a writer updates and truncates it.
 	reader := db.tx_begin_read(store)
@@ -1588,7 +1599,7 @@ test_work_budget :: proc(t: ^testing.T) {
 	defer db.host_destroy(host)
 	defer cleanup_db(store, "budget")
 
-	run(t, store, "CREATE TABLE numbers (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)")
+	run_done(t, store, "CREATE TABLE numbers (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)")
 	builder := strings.builder_make()
 	defer strings.builder_destroy(&builder)
 	strings.write_string(&builder, "INSERT INTO numbers (id, value) VALUES ")
@@ -1596,7 +1607,7 @@ test_work_budget :: proc(t: ^testing.T) {
 		if i > 1 do strings.write_string(&builder, ", ")
 		fmt.sbprintf(&builder, "(%d, %d)", i, i)
 	}
-	run(t, store, strings.to_string(builder))
+	run_done(t, store, strings.to_string(builder))
 
 	sweep :: proc(ctx: ^db.Reducer_Ctx, args: []db.Value) -> db.Error {
 		_, err := db.sql_execute_in_tx(ctx.tx, "UPDATE numbers SET value = value + 1")
@@ -1644,8 +1655,8 @@ test_durability_after_restart :: proc(t: ^testing.T) {
 	store, open_err := db.store_open(path, {persistent = true, create = true, durable = false})
 	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
 	host := db.host_init(store)
-	run(t, store, "CREATE TABLE counter (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)")
-	run(t, store, "INSERT INTO counter (id, value) VALUES (0, 0)")
+	run_done(t, store, "CREATE TABLE counter (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)")
+	run_done(t, store, "INSERT INTO counter (id, value) VALUES (0, 0)")
 	testing.expect(t, db.error_ok(db.host_register(host, "bump", nil, bump)))
 
 	request := []u8{9, 9, 9}
@@ -1691,8 +1702,8 @@ test_idempotent_calls :: proc(t: ^testing.T) {
 	defer db.host_destroy(host)
 	defer cleanup_db(store, "idempotent")
 
-	run(t, store, "CREATE TABLE counter (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)")
-	run(t, store, "INSERT INTO counter (id, value) VALUES (0, 0)")
+	run_done(t, store, "CREATE TABLE counter (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)")
+	run_done(t, store, "INSERT INTO counter (id, value) VALUES (0, 0)")
 
 	incr :: proc(ctx: ^db.Reducer_Ctx, args: []db.Value) -> db.Error {
 		amount, _ := db.value_to_i64(args[0])
@@ -1740,7 +1751,7 @@ test_integer_widths :: proc(t: ^testing.T) {
 		f DOUBLE NOT NULL
 	)`)
 
-	run(t, store, "INSERT INTO nums (a, b, c, d, e, f) VALUES (-128, -32768, -2147483648, 255, 0.1, 0.1)")
+	run_done(t, store, "INSERT INTO nums (a, b, c, d, e, f) VALUES (-128, -32768, -2147483648, 255, 0.1, 0.1)")
 
 	row := run(t, store, "SELECT a, b, c, d, e, f FROM nums")
 	testing.expect_value(t, row.rows[0][0].i, i64(-128))
@@ -1782,8 +1793,8 @@ test_cast_to_narrow_types :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "cast")
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, a TINYINT NOT NULL)")
-	run(t, store, "INSERT INTO t (a) VALUES (CAST(100 AS TINYINT))")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, a TINYINT NOT NULL)")
+	run_done(t, store, "INSERT INTO t (a) VALUES (CAST(100 AS TINYINT))")
 	value := scalar(t, store, "SELECT a FROM t")
 	testing.expect_value(t, value.i, i64(100))
 
@@ -1802,7 +1813,7 @@ test_composite_primary_key :: proc(t: ^testing.T) {
 		value TEXT NOT NULL,
 		PRIMARY KEY (a, b)
 	)`)
-	run(t, store, "INSERT INTO kv (a, b, value) VALUES (1, 'x', 'one-x'), (1, 'y', 'one-y'), (2, 'x', 'two-x')")
+	run_done(t, store, "INSERT INTO kv (a, b, value) VALUES (1, 'x', 'one-x'), (1, 'y', 'one-y'), (2, 'x', 'two-x')")
 
 	duplicate := run_error(t, store, "INSERT INTO kv (a, b, value) VALUES (1, 'x', 'again')")
 	testing.expect_value(t, duplicate.kind, db.Error_Kind.Duplicate_Primary_Key)
@@ -1846,16 +1857,16 @@ test_named_unique_constraints :: proc(t: ^testing.T) {
 		y INT NOT NULL,
 		CONSTRAINT pair_xy UNIQUE (x, y)
 	)`)
-	run(t, store, "INSERT INTO pair (x, y) VALUES (1, 2)")
+	run_done(t, store, "INSERT INTO pair (x, y) VALUES (1, 2)")
 
 	duplicate := run_error(t, store, "INSERT INTO pair (x, y) VALUES (1, 2)")
 	testing.expect_value(t, duplicate.kind, db.Error_Kind.Duplicate_Unique)
-	run(t, store, "INSERT INTO pair (x, y) VALUES (1, 3)")
+	run_done(t, store, "INSERT INTO pair (x, y) VALUES (1, 3)")
 
 	// A constraint index is a normal index and can be dropped explicitly.
 	drop := run_error(t, store, "DROP INDEX pair_xy")
 	testing.expect_value(t, drop.kind, db.Error_Kind.None)
-	run(t, store, "INSERT INTO pair (x, y) VALUES (1, 2)")
+	run_done(t, store, "INSERT INTO pair (x, y) VALUES (1, 2)")
 }
 
 @(test)
@@ -1863,12 +1874,12 @@ test_128_bit_integers :: proc(t: ^testing.T) {
 	store := fresh_db(t, "int128")
 	if store == nil do return
 
-	run(t, store, "CREATE TABLE big (id INTEGER PRIMARY KEY AUTOINCREMENT, a INT128 NOT NULL, b UINT128 NOT NULL)")
+	run_done(t, store, "CREATE TABLE big (id INTEGER PRIMARY KEY AUTOINCREMENT, a INT128 NOT NULL, b UINT128 NOT NULL)")
 	max_i := i128(170141183460469231731687303715884105727)
 	min_i := i128(-170141183460469231731687303715884105728)
 	max_u := u128(340282366920938463463374607431768211455)
 
-	run(t, store, "INSERT INTO big (a, b) VALUES (170141183460469231731687303715884105727, 340282366920938463463374607431768211455), (-170141183460469231731687303715884105728, 0)")
+	run_done(t, store, "INSERT INTO big (a, b) VALUES (170141183460469231731687303715884105727, 340282366920938463463374607431768211455), (-170141183460469231731687303715884105728, 0)")
 
 	row := run(t, store, "SELECT a, b FROM big ORDER BY a")
 	testing.expect_value(t, row.rows[0][0].kind, db.Value_Kind.Int128)
@@ -1890,7 +1901,7 @@ test_128_bit_integers :: proc(t: ^testing.T) {
 	testing.expect_value(t, db.value_as_i128(plus), min_i + 1)
 
 	// The index encodes and orders 128-bit keys.
-	run(t, store, "CREATE INDEX big_a ON big (a)")
+	run_done(t, store, "CREATE INDEX big_a ON big (a)")
 	positive := scalar(t, store, "SELECT count(*) FROM big WHERE a > 0")
 	testing.expect_value(t, positive.i, i64(1))
 	negative := scalar(t, store, "SELECT count(*) FROM big WHERE a < 0")
@@ -1919,7 +1930,7 @@ test_domain_types :: proc(t: ^testing.T) {
 	)`)
 	identity_text := "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
 	insert := fmt.tprintf("INSERT INTO dom (d, who, conn) VALUES (1500000, '%s', 42)", identity_text)
-	run(t, store, insert)
+	run_done(t, store, insert)
 
 	row := run(t, store, "SELECT d, who, conn FROM dom")
 	testing.expect_value(t, row.rows[0][0].kind, db.Value_Kind.Duration)
@@ -1932,7 +1943,7 @@ test_domain_types :: proc(t: ^testing.T) {
 
 	// A 32-byte blob and a negative duration are accepted.
 	blob := "x'ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100'"
-	run(t, store, fmt.tprintf("INSERT INTO dom (d, who, conn) VALUES (-5, %s, 0)", blob))
+	run_done(t, store, fmt.tprintf("INSERT INTO dom (d, who, conn) VALUES (-5, %s, 0)", blob))
 
 	// Anything else is rejected.
 	bad_identity := run_error(t, store, "INSERT INTO dom (d, who, conn) VALUES (0, 'abcd', 0)")
@@ -1963,7 +1974,7 @@ test_sequences :: proc(t: ^testing.T) {
 		id INTEGER PRIMARY KEY AUTOINCREMENT START 100 INCREMENT 5,
 		v TEXT NOT NULL
 	)`)
-	run(t, store, "INSERT INTO seq (v) VALUES ('a'), ('b')")
+	run_done(t, store, "INSERT INTO seq (v) VALUES ('a'), ('b')")
 
 	rows := run(t, store, "SELECT id FROM seq ORDER BY id")
 	testing.expect_value(t, rows.rows[0][0].i, i64(100))
@@ -1971,8 +1982,8 @@ test_sequences :: proc(t: ^testing.T) {
 	db.sql_result_destroy(&rows)
 
 	// An explicit value moves the sequence past it.
-	run(t, store, "INSERT INTO seq (id, v) VALUES (200, 'c')")
-	run(t, store, "INSERT INTO seq (v) VALUES ('d')")
+	run_done(t, store, "INSERT INTO seq (id, v) VALUES (200, 'c')")
+	run_done(t, store, "INSERT INTO seq (v) VALUES ('d')")
 	next := scalar(t, store, "SELECT id FROM seq WHERE v = 'd'")
 	testing.expect_value(t, next.i, i64(205))
 
@@ -1981,7 +1992,7 @@ test_sequences :: proc(t: ^testing.T) {
 	if !testing.expectf(t, db.error_ok(open_err), "reopen: %s", open_err.message) {
 		return
 	}
-	run(t, reopened, "INSERT INTO seq (v) VALUES ('e')")
+	run_done(t, reopened, "INSERT INTO seq (v) VALUES ('e')")
 	after := scalar(t, reopened, "SELECT id FROM seq WHERE v = 'e'")
 	testing.expect_value(t, after.i, i64(210))
 
@@ -1990,7 +2001,7 @@ test_sequences :: proc(t: ^testing.T) {
 		id INTEGER PRIMARY KEY AUTOINCREMENT START 1 INCREMENT 1 MAXVALUE 2,
 		v TEXT NOT NULL
 	)`)
-	run(t, reopened, "INSERT INTO bounded (v) VALUES ('a'), ('b')")
+	run_done(t, reopened, "INSERT INTO bounded (v) VALUES ('a'), ('b')")
 	exhausted := run_error(t, reopened, "INSERT INTO bounded (v) VALUES ('c')")
 	testing.expect(t, exhausted.kind != .None)
 
@@ -2009,11 +2020,11 @@ test_indexed_dml_and_offsets :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "indexeddml")
 
-	run(t, store, "CREATE TABLE item (id INTEGER PRIMARY KEY AUTOINCREMENT, score INTEGER NOT NULL, tag TEXT NOT NULL)")
+	run_done(t, store, "CREATE TABLE item (id INTEGER PRIMARY KEY AUTOINCREMENT, score INTEGER NOT NULL, tag TEXT NOT NULL)")
 	for value in ([]int{30, 10, 20, 40, 5}) {
-		run(t, store, fmt.tprintf("INSERT INTO item (score, tag) VALUES (%d, 'v')", value))
+		run_done(t, store, fmt.tprintf("INSERT INTO item (score, tag) VALUES (%d, 'v')", value))
 	}
-	run(t, store, "CREATE INDEX item_score ON item (score)")
+	run_done(t, store, "CREATE INDEX item_score ON item (score)")
 
 	insert_result := run(t, store, fmt.tprintf("INSERT INTO item (score, tag) VALUES (7, 'v')"))
 	testing.expect(t, insert_result.commit_seq > 0)
@@ -2054,8 +2065,8 @@ test_like_escape :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "likeescape")
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, s TEXT NOT NULL)")
-	run(t, store, "INSERT INTO t (s) VALUES ('a%b'), ('axb'), ('a_b'), ('a.b'), ('50%'), ('100')")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, s TEXT NOT NULL)")
+	run_done(t, store, "INSERT INTO t (s) VALUES ('a%b'), ('axb'), ('a_b'), ('a.b'), ('50%'), ('100')")
 
 	cases := []struct {
 		sql:   string,
@@ -2094,7 +2105,7 @@ test_set_and_show :: proc(t: ^testing.T) {
 	}
 	db.sql_result_destroy(&shown)
 
-	run(t, store, "SET n = 1 + 2")
+	run_done(t, store, "SET n = 1 + 2")
 	number := run(t, store, "SHOW n")
 	testing.expect_value(t, number.rows[0][1].i, i64(3))
 	db.sql_result_destroy(&number)
@@ -2113,8 +2124,8 @@ test_explain :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "explain")
 
-	run(t, store, "CREATE TABLE item (id INTEGER PRIMARY KEY AUTOINCREMENT, score INTEGER NOT NULL, tag TEXT NOT NULL)")
-	run(t, store, "CREATE INDEX item_score ON item (score)")
+	run_done(t, store, "CREATE TABLE item (id INTEGER PRIMARY KEY AUTOINCREMENT, score INTEGER NOT NULL, tag TEXT NOT NULL)")
+	run_done(t, store, "CREATE INDEX item_score ON item (score)")
 
 	by_key := run(t, store, "EXPLAIN SELECT * FROM item WHERE id = 1")
 	testing.expect(t, len(by_key.rows) >= 1)
@@ -2157,12 +2168,12 @@ test_snapshot_restore :: proc(t: ^testing.T) {
 
 	store, err := db.store_open(path, {persistent = true, create = true, durable = false})
 	if !testing.expectf(t, db.error_ok(err), "open failed: %s", err.message) do return
-	run(t, store, "CREATE TABLE item (id INTEGER PRIMARY KEY AUTOINCREMENT, score INTEGER NOT NULL)")
-	run(t, store, "CREATE INDEX item_score ON item (score)")
-	run(t, store, "INSERT INTO item (score) VALUES (10), (20)")
+	run_done(t, store, "CREATE TABLE item (id INTEGER PRIMARY KEY AUTOINCREMENT, score INTEGER NOT NULL)")
+	run_done(t, store, "CREATE INDEX item_score ON item (score)")
+	run_done(t, store, "INSERT INTO item (score) VALUES (10), (20)")
 	testing.expect(t, db.error_ok(db.store_snapshot(store)))
 	// This record lands after the snapshot and must be replayed on top of it.
-	run(t, store, "INSERT INTO item (score) VALUES (30)")
+	run_done(t, store, "INSERT INTO item (score) VALUES (30)")
 	db.store_close(store)
 
 	store, err = db.store_open(path, {persistent = true, durable = false})
@@ -2184,7 +2195,7 @@ test_snapshot_restore :: proc(t: ^testing.T) {
 	defer db.store_close(store)
 	if !testing.expectf(t, db.error_ok(err), "reopen after compact failed: %s", err.message) do return
 	testing.expect_value(t, store.commit_seq, u64(4))
-	run(t, store, "INSERT INTO item (score) VALUES (40)")
+	run_done(t, store, "INSERT INTO item (score) VALUES (40)")
 	testing.expect_value(t, store.commit_seq, u64(5))
 	ids := run(t, store, "SELECT id FROM item ORDER BY id")
 	testing.expect_value(t, len(ids.rows), 4)
@@ -2198,9 +2209,9 @@ test_table_memory :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "memory")
 
-	run(t, store, "CREATE TABLE item (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, score INTEGER NOT NULL)")
-	run(t, store, "CREATE INDEX item_score ON item (score)")
-	run(t, store, "INSERT INTO item (name, score) VALUES ('ana', 10), ('luis', 20)")
+	run_done(t, store, "CREATE TABLE item (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, score INTEGER NOT NULL)")
+	run_done(t, store, "CREATE INDEX item_score ON item (score)")
+	run_done(t, store, "INSERT INTO item (name, score) VALUES ('ana', 10), ('luis', 20)")
 
 	memory, err := db.store_table_memory(store, "item")
 	testing.expect(t, db.error_ok(err))
@@ -2219,9 +2230,9 @@ test_views :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "views")
 
-	run(t, store, "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, score INTEGER NOT NULL)")
-	run(t, store, "INSERT INTO users (name, score) VALUES ('ana', 20), ('luis', 12), ('eva', 30)")
-	run(t, store, "CREATE VIEW adults AS SELECT id, name, score FROM users WHERE score >= 18")
+	run_done(t, store, "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, score INTEGER NOT NULL)")
+	run_done(t, store, "INSERT INTO users (name, score) VALUES ('ana', 20), ('luis', 12), ('eva', 30)")
+	run_done(t, store, "CREATE VIEW adults AS SELECT id, name, score FROM users WHERE score >= 18")
 
 	rows := run(t, store, "SELECT name FROM adults ORDER BY name")
 	testing.expect_value(t, len(rows.rows), 2)
@@ -2232,9 +2243,9 @@ test_views :: proc(t: ^testing.T) {
 	filtered := scalar(t, store, "SELECT count(*) FROM adults WHERE score > 25")
 	testing.expect_value(t, filtered.i, i64(1))
 
-	run(t, store, "CREATE TABLE teams (user_id INTEGER NOT NULL, team TEXT NOT NULL)")
-	run(t, store, "INSERT INTO teams (user_id, team) VALUES (1, 'red'), (3, 'blue')")
-	run(t, store, "CREATE VIEW adult_teams AS SELECT a.name AS player, t.team AS team FROM adults a JOIN teams t ON a.id = t.user_id")
+	run_done(t, store, "CREATE TABLE teams (user_id INTEGER NOT NULL, team TEXT NOT NULL)")
+	run_done(t, store, "INSERT INTO teams (user_id, team) VALUES (1, 'red'), (3, 'blue')")
+	run_done(t, store, "CREATE VIEW adult_teams AS SELECT a.name AS player, t.team AS team FROM adults a JOIN teams t ON a.id = t.user_id")
 	joined := run(t, store, "SELECT player, team FROM adult_teams ORDER BY player")
 	testing.expect_value(t, len(joined.rows), 2)
 	testing.expect_value(t, joined.rows[0][0].s, "ana")
@@ -2243,15 +2254,15 @@ test_views :: proc(t: ^testing.T) {
 	testing.expect_value(t, joined.rows[1][1].s, "blue")
 	db.sql_result_destroy(&joined)
 
-	run(t, store, "CREATE VIEW IF NOT EXISTS adults AS SELECT 1 FROM users")
+	run_done(t, store, "CREATE VIEW IF NOT EXISTS adults AS SELECT 1 FROM users")
 	duplicate := run_error(t, store, "CREATE VIEW adults AS SELECT 1 FROM users")
 	testing.expect_value(t, duplicate.kind, db.Error_Kind.Table_Exists)
 
-	run(t, store, "CREATE VIEW loop AS SELECT * FROM loop")
+	run_done(t, store, "CREATE VIEW loop AS SELECT * FROM loop")
 	recursive := run_error(t, store, "SELECT * FROM loop")
 	testing.expect_value(t, recursive.kind, db.Error_Kind.Sql_Unsupported)
 
-	run(t, store, "DROP VIEW IF EXISTS loop")
+	run_done(t, store, "DROP VIEW IF EXISTS loop")
 	missing := run_error(t, store, "DROP VIEW loop")
 	testing.expect_value(t, missing.kind, db.Error_Kind.Table_Not_Found)
 	gone := run_error(t, store, "SELECT * FROM loop")
@@ -2266,9 +2277,9 @@ test_view_persistence :: proc(t: ^testing.T) {
 
 	store, err := db.store_open(path, {persistent = true, create = true, durable = false})
 	if !testing.expectf(t, db.error_ok(err), "open failed: %s", err.message) do return
-	run(t, store, "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)")
-	run(t, store, "INSERT INTO users (name) VALUES ('ana'), ('luis')")
-	run(t, store, "CREATE VIEW everyone AS SELECT id, name FROM users")
+	run_done(t, store, "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)")
+	run_done(t, store, "INSERT INTO users (name) VALUES ('ana'), ('luis')")
+	run_done(t, store, "CREATE VIEW everyone AS SELECT id, name FROM users")
 	db.store_close(store)
 
 	store, err = db.store_open(path, {persistent = true, durable = false})
@@ -2288,8 +2299,8 @@ test_schedule_interval :: proc(t: ^testing.T) {
 	defer db.host_destroy(host)
 	defer cleanup_db(store, "interval")
 
-	run(t, store, "CREATE TABLE counter (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)")
-	run(t, store, "INSERT INTO counter (id, value) VALUES (0, 0)")
+	run_done(t, store, "CREATE TABLE counter (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)")
+	run_done(t, store, "INSERT INTO counter (id, value) VALUES (0, 0)")
 
 	bump :: proc(ctx: ^db.Reducer_Ctx, args: []db.Value) -> db.Error {
 		amount, _ := db.value_to_i64(args[0])
@@ -2348,8 +2359,8 @@ test_schedule_migration :: proc(t: ^testing.T) {
 	defer cleanup_db(store, "schedmigrate")
 
 	// The internal schema as written before intervals existed.
-	run(t, store, "CREATE TABLE _schedule (id INTEGER PRIMARY KEY AUTOINCREMENT, reducer TEXT NOT NULL, at_us INTEGER NOT NULL, args BLOB NOT NULL)")
-	run(t, store, "INSERT INTO _schedule (reducer, at_us, args) VALUES ('noop', 0, x'00')")
+	run_done(t, store, "CREATE TABLE _schedule (id INTEGER PRIMARY KEY AUTOINCREMENT, reducer TEXT NOT NULL, at_us INTEGER NOT NULL, args BLOB NOT NULL)")
+	run_done(t, store, "INSERT INTO _schedule (reducer, at_us, args) VALUES ('noop', 0, x'00')")
 
 	noop :: proc(ctx: ^db.Reducer_Ctx, args: []db.Value) -> db.Error {
 		return {}
@@ -2376,17 +2387,17 @@ test_policies :: proc(t: ^testing.T) {
 	ana := "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
 	luis := "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
 
-	run(t, store, "CREATE TABLE note (id INTEGER PRIMARY KEY AUTOINCREMENT, owner IDENTITY NOT NULL, body TEXT NOT NULL)")
+	run_done(t, store, "CREATE TABLE note (id INTEGER PRIMARY KEY AUTOINCREMENT, owner IDENTITY NOT NULL, body TEXT NOT NULL)")
 	insert := fmt.tprintf(
 		"INSERT INTO note (owner, body) VALUES ('%s', 'a1'), ('%s', 'a2'), ('%s', 'l1')",
 		ana,
 		ana,
 		luis,
 	)
-	run(t, store, insert)
-	run(t, store, "CREATE POLICY note_owner ON note USING (owner = current_identity())")
+	run_done(t, store, insert)
+	run_done(t, store, "CREATE POLICY note_owner ON note USING (owner = current_identity())")
 
-	run(t, store, fmt.tprintf("SET identity = '%s'", ana))
+	run_done(t, store, fmt.tprintf("SET identity = '%s'", ana))
 	visible := scalar(t, store, "SELECT count(*) FROM note")
 	testing.expect_value(t, visible.i, i64(2))
 
@@ -2396,29 +2407,29 @@ test_policies :: proc(t: ^testing.T) {
 	db.sql_result_destroy(&invisible)
 
 	// A CHECK policy rejects writes the caller may not make.
-	run(t, store, "CREATE POLICY note_check ON note CHECK (owner = current_identity())")
+	run_done(t, store, "CREATE POLICY note_check ON note CHECK (owner = current_identity())")
 	bad := run_error(t, store, fmt.tprintf("INSERT INTO note (owner, body) VALUES ('%s', 'bad')", luis))
 	testing.expect_value(t, bad.kind, db.Error_Kind.Permission_Denied)
-	run(t, store, fmt.tprintf("INSERT INTO note (owner, body) VALUES ('%s', 'ok')", ana))
+	run_done(t, store, fmt.tprintf("INSERT INTO note (owner, body) VALUES ('%s', 'ok')", ana))
 	denied := run_error(t, store, fmt.tprintf("UPDATE note SET owner = '%s' WHERE body = 'a1'", luis))
 	testing.expect_value(t, denied.kind, db.Error_Kind.Permission_Denied)
 
 	// Without the CHECK policy the same UPDATE is allowed and moves the row out
 	// of the original owner's view.
-	run(t, store, "DROP POLICY note_check")
+	run_done(t, store, "DROP POLICY note_check")
 	moved := run(t, store, fmt.tprintf("UPDATE note SET owner = '%s' WHERE body = 'a1'", luis))
 	testing.expect_value(t, moved.affected, 1)
 	db.sql_result_destroy(&moved)
 
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM note").i, i64(2))
-	run(t, store, fmt.tprintf("SET identity = '%s'", luis))
+	run_done(t, store, fmt.tprintf("SET identity = '%s'", luis))
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM note").i, i64(2))
 
 	shown := run(t, store, "SHOW identity")
 	testing.expect_value(t, shown.rows[0][1].kind, db.Value_Kind.Identity)
 	db.sql_result_destroy(&shown)
 
-	run(t, store, "DROP POLICY note_owner")
+	run_done(t, store, "DROP POLICY note_owner")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM note").i, i64(4))
 
 	bad_identity := run_error(t, store, "SET identity = 'not-hex'")
@@ -2434,8 +2445,8 @@ test_durability_modes :: proc(t: ^testing.T) {
 	store, err := db.store_open(path, {persistent = true, create = true, durable = true, durability = .Batched})
 	if !testing.expectf(t, db.error_ok(err), "open: %s", err.message) do return
 	testing.expect_value(t, store.log.durability, db.Durability.Batched)
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER NOT NULL)")
-	run(t, store, "INSERT INTO t (v) VALUES (1), (2), (3)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER NOT NULL)")
+	run_done(t, store, "INSERT INTO t (v) VALUES (1), (2), (3)")
 	db.store_close(store)
 
 	store, err = db.store_open(path, {persistent = true, durable = true, durability = .None})
@@ -2459,8 +2470,8 @@ test_log_offset_index :: proc(t: ^testing.T) {
 
 	store, err := db.store_open(path, {persistent = true, create = true, durable = false})
 	if !testing.expectf(t, db.error_ok(err), "open: %s", err.message) do return
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER NOT NULL)")
-	run(t, store, "INSERT INTO t (v) VALUES (1), (2), (3)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER NOT NULL)")
+	run_done(t, store, "INSERT INTO t (v) VALUES (1), (2), (3)")
 	db.store_close(store)
 
 	index_path := fmt.aprintf("%s/log.index", path)
@@ -2478,7 +2489,7 @@ test_log_offset_index :: proc(t: ^testing.T) {
 	if !testing.expectf(t, db.error_ok(err), "reopen: %s", err.message) do return
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t").i, i64(3))
 	testing.expect(t, db.error_ok(db.store_snapshot(store)))
-	run(t, store, "INSERT INTO t (v) VALUES (4)")
+	run_done(t, store, "INSERT INTO t (v) VALUES (4)")
 	db.store_close(store)
 
 	store, err = db.store_open(path, {persistent = true, durable = false})
@@ -2495,8 +2506,8 @@ test_in_memory_log :: proc(t: ^testing.T) {
 	if !testing.expectf(t, db.error_ok(err), "open: %s", err.message) do return
 	defer db.store_close(store)
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER NOT NULL)")
-	run(t, store, "INSERT INTO t (v) VALUES (1), (2), (3)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER NOT NULL)")
+	run_done(t, store, "INSERT INTO t (v) VALUES (1), (2), (3)")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t").i, i64(3))
 	testing.expect(t, store.log.memory_mode)
 	testing.expect(t, store.log.size > i64(db.LOG_HEADER_LEN))
@@ -2517,13 +2528,13 @@ test_log_segments :: proc(t: ^testing.T) {
 
 	store, err := db.store_open(path, {persistent = true, create = true, durable = false})
 	if !testing.expectf(t, db.error_ok(err), "open: %s", err.message) do return
-	run(t, store, "CREATE TABLE doc (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL)")
+	run_done(t, store, "CREATE TABLE doc (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL)")
 	// About 410 KB of records rotate the 256 KiB segment at least once.
 	filler := make([]u8, 1000)
 	defer delete(filler)
 	for i in 0 ..< len(filler) do filler[i] = u8('a' + (i % 26))
 	for _ in 0 ..< 400 {
-		run(t, store, fmt.tprintf("INSERT INTO doc (body) VALUES ('%s')", string(filler)))
+		run_done(t, store, fmt.tprintf("INSERT INTO doc (body) VALUES ('%s')", string(filler)))
 	}
 	second := fmt.aprintf("%s/log.1", path)
 	testing.expectf(t, os.exists(second), "the log did not rotate")
@@ -2534,7 +2545,7 @@ test_log_segments :: proc(t: ^testing.T) {
 	store, err = db.store_open(path, {persistent = true, durable = false})
 	if !testing.expectf(t, db.error_ok(err), "reopen: %s", err.message) do return
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM doc").i, i64(400))
-	run(t, store, "INSERT INTO doc (body) VALUES ('tail')")
+	run_done(t, store, "INSERT INTO doc (body) VALUES ('tail')")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM doc").i, i64(401))
 
 	// A checkpoint collapses every segment back into the first one.
@@ -2557,9 +2568,9 @@ test_show_tables :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "showtables")
 
-	run(t, store, "CREATE TABLE alpha (id INTEGER PRIMARY KEY AUTOINCREMENT)")
-	run(t, store, "CREATE TABLE beta (id INTEGER PRIMARY KEY AUTOINCREMENT)")
-	run(t, store, "CREATE VIEW gamma AS SELECT id FROM alpha")
+	run_done(t, store, "CREATE TABLE alpha (id INTEGER PRIMARY KEY AUTOINCREMENT)")
+	run_done(t, store, "CREATE TABLE beta (id INTEGER PRIMARY KEY AUTOINCREMENT)")
+	run_done(t, store, "CREATE VIEW gamma AS SELECT id FROM alpha")
 
 	shown := run(t, store, "SHOW tables")
 	testing.expect_value(t, len(shown.columns), 1)
@@ -2577,10 +2588,10 @@ test_subscription_set :: proc(t: ^testing.T) {
 	defer db.host_destroy(host)
 	defer cleanup_db(store, "subset")
 
-	run(t, store, "CREATE TABLE alpha (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT NOT NULL)")
-	run(t, store, "CREATE TABLE beta (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT NOT NULL)")
-	run(t, store, "INSERT INTO alpha (v) VALUES ('a1')")
-	run(t, store, "INSERT INTO beta (v) VALUES ('b1')")
+	run_done(t, store, "CREATE TABLE alpha (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT NOT NULL)")
+	run_done(t, store, "CREATE TABLE beta (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT NOT NULL)")
+	run_done(t, store, "INSERT INTO alpha (v) VALUES ('a1')")
+	run_done(t, store, "INSERT INTO beta (v) VALUES ('b1')")
 
 	id, snapshots, err := db.host_subscribe_many(
 		host,
@@ -2603,14 +2614,14 @@ test_subscription_set :: proc(t: ^testing.T) {
 	host.on_update = on_update
 	host.on_update_ctx = seen
 
-	run(t, store, "INSERT INTO beta (v) VALUES ('b2')")
+	run_done(t, store, "INSERT INTO beta (v) VALUES ('b2')")
 	testing.expect_value(t, seen[0], 1)
 	testing.expect_value(t, seen[1], 0)
 	testing.expect_value(t, seen[2], 1) // only the second query changed
 
 	seen[0] = 0
 	seen[2] = -1
-	run(t, store, "DELETE FROM alpha WHERE v = 'a1'")
+	run_done(t, store, "DELETE FROM alpha WHERE v = 'a1'")
 	testing.expect_value(t, seen[0], 0)
 	testing.expect_value(t, seen[1], 1)
 	testing.expect_value(t, seen[2], 0)
@@ -2632,8 +2643,8 @@ test_wire_messages :: proc(t: ^testing.T) {
 	defer db.host_destroy(host)
 	defer cleanup_db(store, "wire")
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER NOT NULL)")
-	run(t, store, "INSERT INTO t (v) VALUES (5)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER NOT NULL)")
+	run_done(t, store, "INSERT INTO t (v) VALUES (5)")
 
 	// One-off query over the wire.
 	response := db.wire_request(host, db.wire_encode_query("SELECT v FROM t", nil))
@@ -2706,12 +2717,12 @@ test_background_compaction :: proc(t: ^testing.T) {
 	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
 	defer db.store_close(store)
 
-	run(t, store, "CREATE TABLE log_rows (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL)")
+	run_done(t, store, "CREATE TABLE log_rows (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL)")
 	// Without a threshold there is nothing to do.
 	testing.expect(t, !db.store_background_compact_step(store))
 
 	for _ in 0 ..< 120 {
-		run(t, store, fmt.tprintf("INSERT INTO log_rows (body) VALUES ('%s')", strings.repeat("x", 200)))
+		run_done(t, store, fmt.tprintf("INSERT INTO log_rows (body) VALUES ('%s')", strings.repeat("x", 200)))
 	}
 	grown := db.store_log_bytes(store)
 	testing.expect(t, grown > 24 << 10)
@@ -2738,7 +2749,7 @@ test_background_compaction :: proc(t: ^testing.T) {
 	store.compact_floor = 0
 	before_rewrites := store.compact_count
 	for _ in 0 ..< 60 {
-		run(t, store, fmt.tprintf("INSERT INTO log_rows (body) VALUES ('%s')", strings.repeat("z", 200)))
+		run_done(t, store, fmt.tprintf("INSERT INTO log_rows (body) VALUES ('%s')", strings.repeat("z", 200)))
 	}
 	started := time.now()
 	compacted_by_worker := false
@@ -2839,8 +2850,8 @@ test_http_layer :: proc(t: ^testing.T) {
 	defer db.host_destroy(host)
 	defer cleanup_db(store, "http")
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER NOT NULL)")
-	run(t, store, "INSERT INTO t (v) VALUES (7)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER NOT NULL)")
+	run_done(t, store, "INSERT INTO t (v) VALUES (7)")
 
 	wire := db.wire_encode_query("SELECT v FROM t", nil)
 	head := fmt.aprintf("POST /query HTTP/1.1\r\nHost: localhost\r\nContent-Length: %d\r\n\r\n", len(wire))
@@ -2990,8 +3001,8 @@ test_cancellation :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "cancel")
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER NOT NULL)")
-	run(t, store, "INSERT INTO t (v) VALUES (1), (2), (3)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER NOT NULL)")
+	run_done(t, store, "INSERT INTO t (v) VALUES (1), (2), (3)")
 
 	db.store_cancel(store)
 	cancelled := run_error(t, store, "SELECT * FROM t")
@@ -3007,7 +3018,7 @@ test_cancellation :: proc(t: ^testing.T) {
 
 	db.store_clear_cancel(store)
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t").i, i64(3))
-	run(t, store, "UPDATE t SET v = 0")
+	run_done(t, store, "UPDATE t SET v = 0")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t WHERE v = 0").i, i64(3))
 }
 
@@ -3017,8 +3028,8 @@ test_describe :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "describe")
 
-	run(t, store, "CREATE TABLE item (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, score DOUBLE DEFAULT 1.5)")
-	run(t, store, "CREATE INDEX item_score ON item (score)")
+	run_done(t, store, "CREATE TABLE item (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, score DOUBLE DEFAULT 1.5)")
+	run_done(t, store, "CREATE INDEX item_score ON item (score)")
 
 	described := run(t, store, "DESCRIBE item")
 	testing.expect_value(t, len(described.columns), 6)
@@ -3057,8 +3068,8 @@ test_subscription_owners :: proc(t: ^testing.T) {
 	defer db.host_destroy(host)
 	defer cleanup_db(store, "owners")
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER NOT NULL)")
-	run(t, store, "INSERT INTO t (v) VALUES (1)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER NOT NULL)")
+	run_done(t, store, "INSERT INTO t (v) VALUES (1)")
 
 	owner := u64(77)
 	owned, snapshot, owned_err := db.host_subscribe_many_owned(host, []string{"SELECT v FROM t"}, owner)
@@ -3090,7 +3101,7 @@ test_procedures :: proc(t: ^testing.T) {
 	defer db.host_destroy(host)
 	defer cleanup_db(store, "procedures")
 
-	run(t, store, "CREATE TABLE log (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER NOT NULL)")
+	run_done(t, store, "CREATE TABLE log (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER NOT NULL)")
 
 	step :: proc(ctx: ^db.Procedure_Ctx, args: []db.Value) -> db.Error {
 		_, err := db.sql_execute_in_tx(ctx.tx, "INSERT INTO log (v) VALUES (1)")
@@ -3135,10 +3146,10 @@ test_store_memory :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "storemem")
 
-	run(t, store, "CREATE TABLE a (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT NOT NULL)")
-	run(t, store, "CREATE TABLE b (id INTEGER PRIMARY KEY AUTOINCREMENT, n INTEGER NOT NULL)")
-	run(t, store, "INSERT INTO a (v) VALUES ('one'), ('two')")
-	run(t, store, "INSERT INTO b (n) VALUES (3)")
+	run_done(t, store, "CREATE TABLE a (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT NOT NULL)")
+	run_done(t, store, "CREATE TABLE b (id INTEGER PRIMARY KEY AUTOINCREMENT, n INTEGER NOT NULL)")
+	run_done(t, store, "INSERT INTO a (v) VALUES ('one'), ('two')")
+	run_done(t, store, "INSERT INTO b (n) VALUES (3)")
 
 	a_memory, a_err := db.store_table_memory(store, "a")
 	testing.expect(t, db.error_ok(a_err))
@@ -3214,12 +3225,12 @@ test_commit_ops_hook :: proc(t: ^testing.T) {
 	store.on_commit = hook
 	store.on_commit_ctx = seen
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER NOT NULL)")
-	run(t, store, "INSERT INTO t (v) VALUES (5)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER NOT NULL)")
+	run_done(t, store, "INSERT INTO t (v) VALUES (5)")
 	testing.expect_value(t, seen[0], 1)
-	run(t, store, "UPDATE t SET v = 6")
+	run_done(t, store, "UPDATE t SET v = 6")
 	testing.expect_value(t, seen[1], 1)
-	run(t, store, "DELETE FROM t")
+	run_done(t, store, "DELETE FROM t")
 	testing.expect_value(t, seen[2], 1)
 	store.on_commit = nil
 }
@@ -3232,10 +3243,10 @@ test_log_bit_flip :: proc(t: ^testing.T) {
 
 	store, err := db.store_open(path, {persistent = true, create = true, durable = false})
 	if !testing.expectf(t, db.error_ok(err), "open: %s", err.message) do return
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER NOT NULL)")
-	run(t, store, "INSERT INTO t (v) VALUES (1)")
-	run(t, store, "INSERT INTO t (v) VALUES (2)")
-	run(t, store, "INSERT INTO t (v) VALUES (3)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER NOT NULL)")
+	run_done(t, store, "INSERT INTO t (v) VALUES (1)")
+	run_done(t, store, "INSERT INTO t (v) VALUES (2)")
+	run_done(t, store, "INSERT INTO t (v) VALUES (3)")
 	db.store_close(store)
 
 	// Flip one bit in the last record's payload: the CRC must reject it and the
@@ -3263,7 +3274,7 @@ test_log_bit_flip :: proc(t: ^testing.T) {
 	if !testing.expectf(t, db.error_ok(err), "reopen: %s", err.message) do return
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t").i, i64(2))
 	// The tail was repaired, so appending keeps working.
-	run(t, store, "INSERT INTO t (v) VALUES (4)")
+	run_done(t, store, "INSERT INTO t (v) VALUES (4)")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t").i, i64(3))
 }
 
@@ -3273,8 +3284,8 @@ test_sql_functions_and_truncate :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "funcs")
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, s TEXT NOT NULL, n INTEGER NOT NULL, f DOUBLE NOT NULL)")
-	run(t, store, "INSERT INTO t (s, n, f) VALUES ('  Hello  ', 7, 2.6), ('world', -3, -1.4)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, s TEXT NOT NULL, n INTEGER NOT NULL, f DOUBLE NOT NULL)")
+	run_done(t, store, "INSERT INTO t (s, n, f) VALUES ('  Hello  ', 7, 2.6), ('world', -3, -1.4)")
 
 	checks := []struct {
 		sql:      string,
@@ -3369,8 +3380,8 @@ test_schema_reflection :: proc(t: ^testing.T) {
 	defer db.host_destroy(host)
 	defer cleanup_db(store, "reflect")
 
-	run(t, store, "CREATE TABLE thing (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
-	run(t, store, "CREATE INDEX thing_name ON thing (name)")
+	run_done(t, store, "CREATE TABLE thing (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+	run_done(t, store, "CREATE INDEX thing_name ON thing (name)")
 	text := db.host_schema_text(host, context.allocator)
 	testing.expect(t, strings_contains(text, "table thing"))
 	testing.expect(t, strings_contains(text, "name TEXT"))
@@ -3391,12 +3402,12 @@ test_schema_validation :: proc(t: ^testing.T) {
 	testing.expect(t, !db.error_ok(duplicated))
 	_, bad_default := db.sql_execute(store, "CREATE TABLE bad_default (a INTEGER NOT NULL DEFAULT NULL)")
 	testing.expect(t, !db.error_ok(bad_default))
-	run(t, store, "CREATE TABLE good (a INTEGER, b TEXT)")
+	run_done(t, store, "CREATE TABLE good (a INTEGER, b TEXT)")
 	_, repeated := db.sql_execute(store, "CREATE INDEX twice ON good (a, a)")
 	testing.expect(t, !db.error_ok(repeated))
-	run(t, store, "CREATE INDEX once ON good (a, b)")
+	run_done(t, store, "CREATE INDEX once ON good (a, b)")
 
-	run(t, store, "INSERT INTO good (a, b) VALUES (1, 'x')")
+	run_done(t, store, "INSERT INTO good (a, b) VALUES (1, 'x')")
 	testing.expect_value(t, scalar(t, store, "SELECT b FROM good").s, "x")
 }
 
@@ -3430,7 +3441,7 @@ test_fixture_helpers :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer destroy_host(store, host, "fixture")
 
-	run(t, store, "CREATE TABLE f (id INTEGER PRIMARY KEY, name TEXT)")
+	run_done(t, store, "CREATE TABLE f (id INTEGER PRIMARY KEY, name TEXT)")
 	insert := run_params(t, store, "INSERT INTO f (name) VALUES (?)", []db.Value{db.value_string("ok")})
 	defer db.sql_result_destroy(&insert)
 	testing.expect_value(t, scalar(t, store, "SELECT name FROM f").s, "ok")
@@ -3442,7 +3453,7 @@ test_codegen :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer destroy_host(store, host, "codegen")
 
-	run(t, store, "CREATE TABLE person (id INTEGER PRIMARY KEY, name TEXT NOT NULL, score REAL)")
+	run_done(t, store, "CREATE TABLE person (id INTEGER PRIMARY KEY, name TEXT NOT NULL, score REAL)")
 	code := db.codegen_odin(host, context.allocator)
 	testing.expect(t, strings_contains(code, "package generated"))
 	testing.expect(t, strings_contains(code, "Row_person :: struct {"))
@@ -3458,9 +3469,9 @@ test_export_sql :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer destroy_host(store, host, "export")
 
-	run(t, store, "CREATE TABLE item (id INTEGER PRIMARY KEY, label TEXT, qty INTEGER)")
-	run(t, store, "INSERT INTO item (id, label, qty) VALUES (1, 'it''s ok', 3)")
-	run(t, store, "INSERT INTO item (id, label, qty) VALUES (2, 'plain', 0)")
+	run_done(t, store, "CREATE TABLE item (id INTEGER PRIMARY KEY, label TEXT, qty INTEGER)")
+	run_done(t, store, "INSERT INTO item (id, label, qty) VALUES (1, 'it''s ok', 3)")
+	run_done(t, store, "INSERT INTO item (id, label, qty) VALUES (2, 'plain', 0)")
 	text := db.export_sql(host, context.allocator)
 	testing.expect(t, strings_contains(text, "INSERT INTO item VALUES (1, 'it''s ok', 3);"))
 	testing.expect(t, strings_contains(text, "INSERT INTO item VALUES (2, 'plain', 0);"))
@@ -3541,8 +3552,8 @@ test_show_indexes :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "show_indexes")
 
-	run(t, store, "CREATE TABLE thing (id INTEGER PRIMARY KEY, name TEXT)")
-	run(t, store, "CREATE INDEX thing_name ON thing (name)")
+	run_done(t, store, "CREATE TABLE thing (id INTEGER PRIMARY KEY, name TEXT)")
+	run_done(t, store, "CREATE INDEX thing_name ON thing (name)")
 	result := run(t, store, "SHOW indexes")
 	if testing.expect(t, len(result.rows) >= 1) {
 		found := false
@@ -3562,10 +3573,10 @@ test_semijoins :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "semijoins")
 
-	run(t, store, "CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)")
-	run(t, store, "CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)")
-	run(t, store, "INSERT INTO a (id, v) VALUES (1, 10), (2, 20), (3, 30)")
-	run(t, store, "INSERT INTO b (id, v) VALUES (1, 20), (2, 40)")
+	run_done(t, store, "CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)")
+	run_done(t, store, "CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)")
+	run_done(t, store, "INSERT INTO a (id, v) VALUES (1, 10), (2, 20), (3, 30)")
+	run_done(t, store, "INSERT INTO b (id, v) VALUES (1, 20), (2, 40)")
 
 	in_result := run(t, store, "SELECT id FROM a WHERE v IN (SELECT v FROM b) ORDER BY id")
 	testing.expect_value(t, len(in_result.rows), 1)
@@ -3610,8 +3621,8 @@ test_system_tables :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "system_tables")
 
-	run(t, store, "CREATE TABLE thing (id INTEGER PRIMARY KEY, name TEXT NOT NULL, qty INTEGER DEFAULT 0)")
-	run(t, store, "CREATE INDEX thing_name ON thing (name)")
+	run_done(t, store, "CREATE TABLE thing (id INTEGER PRIMARY KEY, name TEXT NOT NULL, qty INTEGER DEFAULT 0)")
+	run_done(t, store, "CREATE INDEX thing_name ON thing (name)")
 
 	tables := run(t, store, "SELECT name FROM _tables ORDER BY name")
 	testing.expect_value(t, len(tables.rows), 1)
@@ -3660,8 +3671,8 @@ test_alter_table_add_column :: proc(t: ^testing.T) {
 	store := fresh_db(t, "alter")
 	if store == nil do return
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
-	run(t, store, "INSERT INTO t (id, name) VALUES (1, 'a'), (2, 'b')")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+	run_done(t, store, "INSERT INTO t (id, name) VALUES (1, 'a'), (2, 'b')")
 	alter := run(t, store, "ALTER TABLE t ADD COLUMN qty INTEGER NOT NULL DEFAULT 7")
 	testing.expect_value(t, alter.kind, db.Sql_Result_Kind.Ack)
 
@@ -3670,7 +3681,7 @@ test_alter_table_add_column :: proc(t: ^testing.T) {
 	testing.expect_value(t, after.rows[0][1].i, i64(7))
 	testing.expect_value(t, after.rows[1][1].i, i64(7))
 
-	run(t, store, "INSERT INTO t (id, name) VALUES (3, 'c')")
+	run_done(t, store, "INSERT INTO t (id, name) VALUES (3, 'c')")
 	fresh := scalar(t, store, "SELECT qty FROM t WHERE id = 3")
 	testing.expect_value(t, fresh.i, i64(7))
 
@@ -3694,9 +3705,9 @@ test_create_or_replace_view :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "replace_view")
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
-	run(t, store, "INSERT INTO t (id) VALUES (1), (2)")
-	run(t, store, "CREATE VIEW v AS SELECT id FROM t")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+	run_done(t, store, "INSERT INTO t (id) VALUES (1), (2)")
+	run_done(t, store, "CREATE VIEW v AS SELECT id FROM t")
 
 	total := scalar(t, store, "SELECT count(*) FROM v")
 	testing.expect_value(t, total.i, i64(2))
@@ -3704,7 +3715,7 @@ test_create_or_replace_view :: proc(t: ^testing.T) {
 	_, duplicate := db.sql_execute(store, "CREATE VIEW v AS SELECT id FROM t WHERE id = 1")
 	testing.expect(t, !db.error_ok(duplicate))
 
-	run(t, store, "CREATE OR REPLACE VIEW v AS SELECT id FROM t WHERE id = 2")
+	run_done(t, store, "CREATE OR REPLACE VIEW v AS SELECT id FROM t WHERE id = 2")
 	after := run(t, store, "SELECT id FROM v")
 	testing.expect_value(t, len(after.rows), 1)
 	testing.expect_value(t, after.rows[0][0].i, i64(2))
@@ -3813,7 +3824,7 @@ test_procedure_logs_and_timers :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer destroy_host(store, host, "proc_logs")
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
 	handler := proc(ctx: ^db.Procedure_Ctx, args: []db.Value) -> db.Error {
 		db.procedure_log(ctx, "phase one")
 		_, first := db.sql_execute_in_tx(ctx.tx, "INSERT INTO t (id) VALUES (1)")
@@ -3841,7 +3852,7 @@ test_module_abi :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer destroy_host(store, host, "modules")
 
-	run(t, store, "CREATE TABLE ledger (id INTEGER PRIMARY KEY, amount INTEGER)")
+	run_done(t, store, "CREATE TABLE ledger (id INTEGER PRIMARY KEY, amount INTEGER)")
 
 	counting := proc(h: ^db.Host, reducer: string, args: []db.Value) -> (db.Value, db.Error) {
 		if reducer != "deposit" do return {}, db.errf(.Invalid_Argument, "unknown reducer %s", reducer)
@@ -3889,7 +3900,7 @@ test_module_data_access :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer destroy_host(store, host, "module_data")
 
-	run(t, store, "CREATE TABLE item (id INTEGER PRIMARY KEY, name TEXT)")
+	run_done(t, store, "CREATE TABLE item (id INTEGER PRIMARY KEY, name TEXT)")
 	ids: [3]db.Row_Id
 	for index in 1 ..= 3 {
 		id, insert_err := db.module_insert(
@@ -3954,8 +3965,8 @@ test_ephemeral_tables :: proc(t: ^testing.T) {
 	store := fresh_db(t, "ephemeral")
 	if store == nil do return
 
-	run(t, store, "CREATE TEMPORARY TABLE scratch (id INTEGER PRIMARY KEY, v TEXT)")
-	run(t, store, "INSERT INTO scratch (id, v) VALUES (1, 'a'), (2, 'b')")
+	run_done(t, store, "CREATE TEMPORARY TABLE scratch (id INTEGER PRIMARY KEY, v TEXT)")
+	run_done(t, store, "INSERT INTO scratch (id, v) VALUES (1, 'a'), (2, 'b')")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM scratch").i, i64(2))
 
 	// Temporary rows survive their own commit in this session.
@@ -3965,7 +3976,7 @@ test_ephemeral_tables :: proc(t: ^testing.T) {
 	testing.expect_value(t, store.commit_seq, u64(0))
 
 	// A durable table makes a logged commit.
-	run(t, store, "CREATE TABLE durable (id INTEGER PRIMARY KEY)")
+	run_done(t, store, "CREATE TABLE durable (id INTEGER PRIMARY KEY)")
 	testing.expect(t, store.commit_seq >= 1)
 
 	db.store_close(store)
@@ -3984,9 +3995,9 @@ test_transaction_read_set :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "read_set")
 
-	run(t, store, "CREATE TABLE a (id INTEGER PRIMARY KEY)")
-	run(t, store, "CREATE TABLE b (id INTEGER PRIMARY KEY)")
-	run(t, store, "INSERT INTO a (id) VALUES (1)")
+	run_done(t, store, "CREATE TABLE a (id INTEGER PRIMARY KEY)")
+	run_done(t, store, "CREATE TABLE b (id INTEGER PRIMARY KEY)")
+	run_done(t, store, "INSERT INTO a (id) VALUES (1)")
 	start_seq := store.commit_seq
 
 	tx := db.tx_begin_write(store)
@@ -4021,8 +4032,8 @@ test_checksum_modes :: proc(t: ^testing.T) {
 	store, open_err := db.store_open(path, {persistent = true, create = true, durable = false, checksum = db.Checksum.None})
 	testing.expect(t, db.error_ok(open_err))
 	testing.expect_value(t, store.log.checksum, db.Checksum.None)
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
-	run(t, store, "INSERT INTO t (id) VALUES (1)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+	run_done(t, store, "INSERT INTO t (id) VALUES (1)")
 	db.store_close(store)
 
 	// The header records the algorithm, so a default open still replays.
@@ -4045,8 +4056,8 @@ test_event_tables :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer destroy_host(store, host, "events")
 
-	run(t, store, "CREATE EVENT TABLE audit (id INTEGER PRIMARY KEY AUTOINCREMENT, message TEXT)")
-	run(t, store, "INSERT INTO audit (message) VALUES ('one'), ('two')")
+	run_done(t, store, "CREATE EVENT TABLE audit (id INTEGER PRIMARY KEY AUTOINCREMENT, message TEXT)")
+	run_done(t, store, "INSERT INTO audit (message) VALUES ('one'), ('two')")
 
 	// Append-only: updates, deletes and truncates are rejected.
 	_, update_err := db.sql_execute(store, "UPDATE audit SET message = 'x'")
@@ -4068,7 +4079,7 @@ test_event_tables :: proc(t: ^testing.T) {
 	testing.expect_value(t, after[0].values[1].s, "two")
 
 	// SHOW events lists the table; ordinary tables are not event tables.
-	run(t, store, "CREATE TABLE ordinary (id INTEGER PRIMARY KEY)")
+	run_done(t, store, "CREATE TABLE ordinary (id INTEGER PRIMARY KEY)")
 	shown := run(t, store, "SHOW events")
 	testing.expect_value(t, len(shown.rows), 1)
 	testing.expect_value(t, shown.rows[0][0].s, "audit")
@@ -4080,8 +4091,8 @@ test_row_quota :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "quota")
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
-	run(t, store, "INSERT INTO t (id) VALUES (1), (2), (3)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+	run_done(t, store, "INSERT INTO t (id) VALUES (1), (2), (3)")
 
 	testing.expect_value(t, db.store_row_quota(store), u64(0))
 	db.store_set_row_quota(store, 2)
@@ -4113,9 +4124,9 @@ test_view_parameters :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "view_params")
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
-	run(t, store, "INSERT INTO t (id) VALUES (1), (2), (3)")
-	run(t, store, "CREATE VIEW above AS SELECT id FROM t WHERE id > ?")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+	run_done(t, store, "INSERT INTO t (id) VALUES (1), (2), (3)")
+	run_done(t, store, "CREATE VIEW above AS SELECT id FROM t WHERE id > ?")
 
 	two := run(t, store, "SELECT id FROM above(1) ORDER BY id")
 	testing.expect_value(t, len(two.rows), 2)
@@ -4275,7 +4286,7 @@ test_deterministic_simulation :: proc(t: ^testing.T) {
 		store, host := fresh_host(t, name)
 		if store == nil do return 0, 0, 0
 		defer destroy_host(store, host, name)
-		run(t, store, "CREATE TABLE ticks (v INTEGER)")
+		run_done(t, store, "CREATE TABLE ticks (v INTEGER)")
 		testing.expect(t, db.error_ok(db.host_register(host, "tick", nil, simulation_tick)))
 		sim := db.simulation_init(host, i64(1_000_000_000))
 		_, schedule_err := db.host_schedule_every(host, "tick", i64(10_000_000), nil)
@@ -4312,10 +4323,10 @@ test_commit_time :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "commit_time")
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
 	first := db.store_last_commit_us(store)
 	testing.expect(t, first > 0)
-	run(t, store, "INSERT INTO t (id) VALUES (1)")
+	run_done(t, store, "INSERT INTO t (id) VALUES (1)")
 	second := db.store_last_commit_us(store)
 	testing.expect(t, second >= first)
 }
@@ -4342,8 +4353,8 @@ test_client_sdk :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "sdk")
 	if store == nil do return
 	defer destroy_host(store, host, "sdk")
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
-	run(t, store, "INSERT INTO t (id) VALUES (1)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+	run_done(t, store, "INSERT INTO t (id) VALUES (1)")
 	testing.expect(t, db.error_ok(db.host_register(host, "add", nil, sdk_insert)))
 
 	session := sdk.client_init(sdk_route, host)
@@ -4392,7 +4403,7 @@ test_log_stream_reader :: proc(t: ^testing.T) {
 	defer os.remove_all(path)
 	store := fresh_db(t, "stream")
 	if store == nil do return
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
 	for index in 1 ..= 3 do run(t, store, fmt.tprintf("INSERT INTO t (id) VALUES (%d)", index))
 	expected := store.commit_seq
 	db.store_close(store)
@@ -4440,8 +4451,8 @@ test_row_size_hint :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "row_bytes")
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)")
-	run(t, store, "INSERT INTO t (id, label) VALUES (1, 'hello'), (2, 'world!')")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)")
+	run_done(t, store, "INSERT INTO t (id, label) VALUES (1, 'hello'), (2, 'world!')")
 
 	result := run(t, store, "SELECT id, label FROM t")
 	testing.expect(t, result.row_bytes >= u64(len("hello") + len("world!")))
@@ -4522,8 +4533,8 @@ test_http_compression :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "http_zip")
 	if store == nil do return
 	defer destroy_host(store, host, "http_zip")
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
-	run(t, store, "INSERT INTO t (id) VALUES (1)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+	run_done(t, store, "INSERT INTO t (id) VALUES (1)")
 
 	message := db.wire_encode_query("SELECT id FROM t", nil)
 	defer delete(message)
@@ -4582,8 +4593,8 @@ test_prepared_commit_group :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "prepared")
 
-	run(t, store, "CREATE TABLE a (id INTEGER PRIMARY KEY)")
-	run(t, store, "CREATE TABLE b (id INTEGER PRIMARY KEY)")
+	run_done(t, store, "CREATE TABLE a (id INTEGER PRIMARY KEY)")
+	run_done(t, store, "CREATE TABLE b (id INTEGER PRIMARY KEY)")
 	start_seq := store.commit_seq
 
 	first := db.tx_begin_write(store)
@@ -4673,13 +4684,13 @@ test_named_types :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "named_types")
 	if store == nil do return
 
-	run(t, store, "CREATE TYPE email AS TEXT")
+	run_done(t, store, "CREATE TYPE email AS TEXT")
 	_, again := db.sql_execute(store, "CREATE TYPE email AS TEXT")
 	testing.expect(t, !db.error_ok(again))
-	run(t, store, "CREATE TYPE IF NOT EXISTS email AS TEXT")
+	run_done(t, store, "CREATE TYPE IF NOT EXISTS email AS TEXT")
 
-	run(t, store, "CREATE TABLE users (id INTEGER PRIMARY KEY, address email)")
-	run(t, store, "INSERT INTO users (id, address) VALUES (1, 'a@b.c')")
+	run_done(t, store, "CREATE TABLE users (id INTEGER PRIMARY KEY, address email)")
+	run_done(t, store, "INSERT INTO users (id, address) VALUES (1, 'a@b.c')")
 	testing.expect_value(t, scalar(t, store, "SELECT address FROM users").s, "a@b.c")
 
 	described := run(t, store, "SELECT type FROM _columns WHERE table = 'users'")
@@ -4774,8 +4785,8 @@ test_postgres_wire :: proc(t: ^testing.T) {
 	defer delete(ready)
 	testing.expect_value(t, ready[0], u8('Z'))
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)")
-	run(t, store, "INSERT INTO t (id, label) VALUES (1, 'one')")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)")
+	run_done(t, store, "INSERT INTO t (id, label) VALUES (1, 'one')")
 
 	query := pg_build_query("SELECT id, label FROM t")
 	defer delete(query)
@@ -4812,8 +4823,8 @@ test_structural_types :: proc(t: ^testing.T) {
 	// The store and the host are closed below and reopened; the cleanup at the
 	// end closes the reopen, and nothing may close the first pair twice.
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, u UNIT, o OPTION(INT), r RESULT(INT, TEXT))")
-	run(t, store, "INSERT INTO t (id, u, o, r) VALUES (1, NULL, 5, NULL)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, u UNIT, o OPTION(INT), r RESULT(INT, TEXT))")
+	run_done(t, store, "INSERT INTO t (id, u, o, r) VALUES (1, NULL, 5, NULL)")
 	testing.expect_value(t, scalar(t, store, "SELECT o FROM t").i, i64(5))
 
 	unit_err: db.Error
@@ -4851,9 +4862,9 @@ test_structural_types :: proc(t: ^testing.T) {
 	testing.expect(t, !db.error_ok(both_err))
 
 	// A named type may itself be structural, and UNIT cannot be NOT NULL.
-	run(t, store, "CREATE TYPE maybe_count AS OPTION(INT)")
-	run(t, store, "CREATE TABLE named (id INTEGER PRIMARY KEY, n maybe_count)")
-	run(t, store, "INSERT INTO named (id, n) VALUES (1, 3)")
+	run_done(t, store, "CREATE TYPE maybe_count AS OPTION(INT)")
+	run_done(t, store, "CREATE TABLE named (id INTEGER PRIMARY KEY, n maybe_count)")
+	run_done(t, store, "INSERT INTO named (id, n) VALUES (1, 3)")
 	testing.expect_value(t, scalar(t, store, "SELECT n FROM named").i, i64(3))
 	_, unit_not_null := db.sql_execute(store, "CREATE TABLE bad_unit (u UNIT NOT NULL)")
 	testing.expect(t, !db.error_ok(unit_not_null))
@@ -4873,11 +4884,11 @@ test_statement_work_budget :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer destroy_host(store, host, "work")
 
-	run(t, store, "CREATE TABLE e (id INTEGER PRIMARY KEY, label TEXT)")
+	run_done(t, store, "CREATE TABLE e (id INTEGER PRIMARY KEY, label TEXT)")
 	for i in 1 ..= 3 {
 		statement := fmt.aprintf("INSERT INTO e (id, label) VALUES (%d, 'row%d')", i, i)
 		defer delete(statement)
-		run(t, store, statement)
+		run_done(t, store, statement)
 	}
 	selected := run(t, store, "SELECT id, label FROM e")
 	testing.expect(t, selected.work >= 3)
@@ -4914,13 +4925,13 @@ test_row_versions :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer destroy_host(store, host, "mvcc")
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)")
-	run(t, store, "INSERT INTO t (id, label) VALUES (1, 'one')")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)")
+	run_done(t, store, "INSERT INTO t (id, label) VALUES (1, 'one')")
 	first := store.commit_seq
-	run(t, store, "UPDATE t SET label = 'two' WHERE id = 1")
+	run_done(t, store, "UPDATE t SET label = 'two' WHERE id = 1")
 	second := store.commit_seq
 	testing.expect(t, second > first)
-	run(t, store, "DELETE FROM t WHERE id = 1")
+	run_done(t, store, "DELETE FROM t WHERE id = 1")
 	third := store.commit_seq
 
 	// The pinned snapshot still sees the first value.
@@ -4960,13 +4971,13 @@ test_hash_and_direct_indexes :: proc(t: ^testing.T) {
 	if store == nil do return
 	// Closed and reopened below: one owner per handle.
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, code TEXT, label TEXT)")
-	run(t, store, "CREATE INDEX t_label_hash ON t USING HASH (label)")
-	run(t, store, "CREATE UNIQUE INDEX t_code_direct ON t USING DIRECT (code)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, code TEXT, label TEXT)")
+	run_done(t, store, "CREATE INDEX t_label_hash ON t USING HASH (label)")
+	run_done(t, store, "CREATE UNIQUE INDEX t_code_direct ON t USING DIRECT (code)")
 	for i in 1 ..= 3 {
 		statement := fmt.aprintf("INSERT INTO t (id, code, label) VALUES (%d, 'c%d', 'same')", i, i)
 		defer delete(statement)
-		run(t, store, statement)
+		run_done(t, store, statement)
 	}
 	// The hash index answers an equality lookup over a non-unique key.
 	matched := run(t, store, "SELECT id FROM t WHERE label = 'same' ORDER BY id")
@@ -4980,10 +4991,10 @@ test_hash_and_direct_indexes :: proc(t: ^testing.T) {
 	testing.expect(t, !db.error_ok(not_direct))
 
 	// Updates move the bucket, deletes empty it.
-	run(t, store, "UPDATE t SET label = 'moved' WHERE id = 2")
+	run_done(t, store, "UPDATE t SET label = 'moved' WHERE id = 2")
 	testing.expect_value(t, len(run(t, store, "SELECT id FROM t WHERE label = 'same'").rows), 2)
 	testing.expect_value(t, len(run(t, store, "SELECT id FROM t WHERE label = 'moved'").rows), 1)
-	run(t, store, "DELETE FROM t WHERE id = 3")
+	run_done(t, store, "DELETE FROM t WHERE id = 3")
 	testing.expect_value(t, len(run(t, store, "SELECT id FROM t WHERE label = 'same'").rows), 1)
 	testing.expect_value(t, len(run(t, store, "SELECT id FROM t WHERE code = 'c3'").rows), 0)
 
@@ -5024,8 +5035,8 @@ test_postgres_extended_query :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer destroy_host(store, host, "pgext")
 
-	run(t, store, "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
-	run(t, store, "INSERT INTO items (id, name) VALUES (1, 'one')")
+	run_done(t, store, "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
+	run_done(t, store, "INSERT INTO items (id, name) VALUES (1, 'one')")
 
 	session := db.pg_session_init()
 	defer db.pg_session_destroy(session)
@@ -5155,10 +5166,10 @@ test_postgres_dialect :: proc(t: ^testing.T) {
 			ratio DOUBLE PRECISION
 		)`,
 	)
-	run(t, store, "INSERT INTO person (name, born) VALUES ('ana', '2020-01-01'), ('luis', NULL)")
+	run_done(t, store, "INSERT INTO person (name, born) VALUES ('ana', '2020-01-01'), ('luis', NULL)")
 	testing.expect_value(t, scalar(t, store, "SELECT max(id) FROM person").i, i64(2))
-	run(t, store, "CREATE TABLE tag (id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, label TEXT)")
-	run(t, store, "INSERT INTO tag (label) VALUES ('a'), ('b')")
+	run_done(t, store, "CREATE TABLE tag (id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, label TEXT)")
+	run_done(t, store, "INSERT INTO tag (label) VALUES ('a'), ('b')")
 	testing.expect_value(t, scalar(t, store, "SELECT max(id) FROM tag").i, i64(2))
 
 	// `::` binds tighter than any operator and takes a precision.
@@ -5287,7 +5298,7 @@ test_array_and_product_types :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "containers")
 	if store == nil do return
 
-	run(t, store, "CREATE TABLE c (id INTEGER PRIMARY KEY, tags ARRAY(TEXT), pair PRODUCT(INT, TEXT))")
+	run_done(t, store, "CREATE TABLE c (id INTEGER PRIMARY KEY, tags ARRAY(TEXT), pair PRODUCT(INT, TEXT))")
 	described := run(t, store, "SELECT name, type FROM _columns WHERE table = 'c'")
 	types := map[string]string{}
 	defer delete(types)
@@ -5322,8 +5333,8 @@ test_array_and_product_types :: proc(t: ^testing.T) {
 	testing.expect(t, !db.error_ok(triple_err))
 
 	// A named type may name an array, and the schema round-trips both kinds.
-	run(t, store, "CREATE TYPE labels AS ARRAY(TEXT)")
-	run(t, store, "CREATE TABLE named (id INTEGER PRIMARY KEY, l labels)")
+	run_done(t, store, "CREATE TYPE labels AS ARRAY(TEXT)")
+	run_done(t, store, "CREATE TABLE named (id INTEGER PRIMARY KEY, l labels)")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM named").i, i64(0))
 
 	db.host_destroy(host)
@@ -5348,8 +5359,8 @@ test_named_type_references :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "named_refs")
 	if store == nil do return
 
-	run(t, store, "CREATE TYPE labels AS ARRAY(TEXT)")
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, l labels, plain TEXT)")
+	run_done(t, store, "CREATE TYPE labels AS ARRAY(TEXT)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, l labels, plain TEXT)")
 	row := run(t, store, "SELECT name, type, named FROM _columns WHERE table = 't' AND name = 'l'")
 	testing.expect_value(t, len(row.rows), 1)
 	testing.expect_value(t, row.rows[0][1].s, "ARRAY(TEXT)")
@@ -5382,8 +5393,8 @@ test_postgres_binary_and_describe :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer destroy_host(store, host, "pgbin")
 
-	run(t, store, "CREATE TABLE n (id INTEGER PRIMARY KEY, score DOUBLE, flag BOOLEAN)")
-	run(t, store, "INSERT INTO n (id, score, flag) VALUES (1, 2.5, true)")
+	run_done(t, store, "CREATE TABLE n (id INTEGER PRIMARY KEY, score DOUBLE, flag BOOLEAN)")
+	run_done(t, store, "INSERT INTO n (id, score, flag) VALUES (1, 2.5, true)")
 
 	session := db.pg_session_init()
 	defer db.pg_session_destroy(session)
@@ -5495,7 +5506,7 @@ test_product_arity :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "product_arity")
 	if store == nil do return
 
-	run(t, store, "CREATE TABLE p (id INTEGER PRIMARY KEY, triple PRODUCT(INT, TEXT, BOOLEAN))")
+	run_done(t, store, "CREATE TABLE p (id INTEGER PRIMARY KEY, triple PRODUCT(INT, TEXT, BOOLEAN))")
 	described := run(t, store, "SELECT type FROM _columns WHERE table = 'p' AND name = 'triple'")
 	testing.expect_value(t, described.rows[0][0].s, "PRODUCT(BIGINT, TEXT, BOOLEAN)")
 
@@ -5570,14 +5581,14 @@ test_snapshot_reads_do_not_block_writers :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer destroy_host(store, host, "snapshot_reads")
 
-	run(t, store, "CREATE TABLE s (id INTEGER PRIMARY KEY, label TEXT)")
-	run(t, store, "INSERT INTO s (id, label) VALUES (1, 'before')")
+	run_done(t, store, "CREATE TABLE s (id INTEGER PRIMARY KEY, label TEXT)")
+	run_done(t, store, "INSERT INTO s (id, label) VALUES (1, 'before')")
 
 	// A read transaction is open while a writer commits: with snapshot reads the
 	// commit does not wait for the reader.
 	reader := db.tx_begin_read(store)
-	run(t, store, "INSERT INTO s (id, label) VALUES (2, 'after')")
-	run(t, store, "UPDATE s SET label = 'changed' WHERE id = 1")
+	run_done(t, store, "INSERT INTO s (id, label) VALUES (2, 'after')")
+	run_done(t, store, "UPDATE s SET label = 'changed' WHERE id = 1")
 
 	// The open reader keeps its view of the data.
 	old, old_err := db.sql_execute_in_tx(reader, "SELECT count(*) FROM s")
@@ -5614,9 +5625,9 @@ test_result_row_ids :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer destroy_host(store, host, "row_ids")
 
-	run(t, store, "CREATE TABLE r (id INTEGER PRIMARY KEY, label TEXT)")
-	run(t, store, "INSERT INTO r (id, label) VALUES (10, 'a')")
-	run(t, store, "INSERT INTO r (id, label) VALUES (20, 'b')")
+	run_done(t, store, "CREATE TABLE r (id INTEGER PRIMARY KEY, label TEXT)")
+	run_done(t, store, "INSERT INTO r (id, label) VALUES (10, 'a')")
+	run_done(t, store, "INSERT INTO r (id, label) VALUES (20, 'b')")
 
 	result := run(t, store, "SELECT label FROM r ORDER BY id")
 	testing.expect_value(t, len(result.row_ids), 2)
@@ -5625,7 +5636,7 @@ test_result_row_ids :: proc(t: ^testing.T) {
 	testing.expect_value(t, u64(result.row_ids[1]), u64(2))
 	db.sql_result_destroy(&result)
 
-	run(t, store, "DELETE FROM r WHERE id = 10")
+	run_done(t, store, "DELETE FROM r WHERE id = 10")
 	after := run(t, store, "SELECT label FROM r")
 	testing.expect_value(t, len(after.row_ids), 1)
 	testing.expect_value(t, u64(after.row_ids[0]), u64(2))
@@ -5653,7 +5664,7 @@ test_limited_scan_row_ids_are_stored :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "scan_ids")
 
-	run(t, store, "CREATE TABLE s (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+	run_done(t, store, "CREATE TABLE s (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
 	for i in 1 ..= 400 do run(t, store, fmt.tprintf("INSERT INTO s (id, name) VALUES (%d, 'n%d')", i, i))
 
 	limited := run(t, store, "SELECT id, name FROM s WHERE id % 7 = 0 ORDER BY id DESC LIMIT 5")
@@ -5681,8 +5692,8 @@ test_incremental_subscriptions :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer destroy_host(store, host, "incremental")
 
-	run(t, store, "CREATE TABLE inc (id INTEGER PRIMARY KEY, label TEXT)")
-	run(t, store, "INSERT INTO inc (id, label) VALUES (2, 'two')")
+	run_done(t, store, "CREATE TABLE inc (id INTEGER PRIMARY KEY, label TEXT)")
+	run_done(t, store, "INSERT INTO inc (id, label) VALUES (2, 'two')")
 
 	id, snapshot, err := db.host_subscribe(host, "SELECT id, label FROM inc WHERE id > 1")
 	if !testing.expectf(t, db.error_ok(err), "subscribe failed: %s", err.message) do return
@@ -5700,7 +5711,7 @@ test_incremental_subscriptions :: proc(t: ^testing.T) {
 	host.on_update_ctx = counters
 
 	// A matching insert becomes one incremental insert.
-	run(t, store, "INSERT INTO inc (id, label) VALUES (3, 'three')")
+	run_done(t, store, "INSERT INTO inc (id, label) VALUES (3, 'three')")
 	testing.expect_value(t, counters[0], 1)
 	testing.expect_value(t, counters[1], 0)
 	testing.expect_value(t, counters[2], 3)
@@ -5709,28 +5720,28 @@ test_incremental_subscriptions :: proc(t: ^testing.T) {
 	// A non-matching insert changes nothing.
 	counters[0] = 0
 	counters[1] = 0
-	run(t, store, "INSERT INTO inc (id, label) VALUES (1, 'one')")
+	run_done(t, store, "INSERT INTO inc (id, label) VALUES (1, 'one')")
 	testing.expect_value(t, counters[0], 0)
 	testing.expect_value(t, counters[1], 0)
 
 	// An update that keeps the row matching is a delete plus an insert.
 	counters[0] = 0
 	counters[1] = 0
-	run(t, store, "UPDATE inc SET label = 'TWO' WHERE id = 2")
+	run_done(t, store, "UPDATE inc SET label = 'TWO' WHERE id = 2")
 	testing.expect_value(t, counters[0], 1)
 	testing.expect_value(t, counters[1], 1)
 
 	// An update that moves a row out of the filter is a delete only.
 	counters[0] = 0
 	counters[1] = 0
-	run(t, store, "UPDATE inc SET id = 0 WHERE id = 3")
+	run_done(t, store, "UPDATE inc SET id = 0 WHERE id = 3")
 	testing.expect_value(t, counters[0], 0)
 	testing.expect_value(t, counters[1], 1)
 
 	// A delete removes the cached row.
 	counters[0] = 0
 	counters[1] = 0
-	run(t, store, "DELETE FROM inc WHERE id = 2")
+	run_done(t, store, "DELETE FROM inc WHERE id = 2")
 	testing.expect_value(t, counters[0], 0)
 	testing.expect_value(t, counters[1], 1)
 
@@ -5746,7 +5757,7 @@ test_foreign_key_catalog :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "fk_catalog")
 	if store == nil do return
 
-	run(t, store, "CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT)")
+	run_done(t, store, "CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT)")
 	run(
 		t,
 		store,
@@ -5799,35 +5810,35 @@ test_foreign_key_enforcement :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer destroy_host(store, host, "fk_enforce")
 
-	run(t, store, "CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT)")
-	run(t, store, "CREATE TABLE books (id INTEGER PRIMARY KEY, author INTEGER, title TEXT, FOREIGN KEY (author) REFERENCES authors (id))")
-	run(t, store, "CREATE TABLE reviews (id INTEGER PRIMARY KEY, book INTEGER, FOREIGN KEY (book) REFERENCES books (id) ON DELETE CASCADE)")
-	run(t, store, "INSERT INTO authors (id, name) VALUES (1, 'a')")
+	run_done(t, store, "CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT)")
+	run_done(t, store, "CREATE TABLE books (id INTEGER PRIMARY KEY, author INTEGER, title TEXT, FOREIGN KEY (author) REFERENCES authors (id))")
+	run_done(t, store, "CREATE TABLE reviews (id INTEGER PRIMARY KEY, book INTEGER, FOREIGN KEY (book) REFERENCES books (id) ON DELETE CASCADE)")
+	run_done(t, store, "INSERT INTO authors (id, name) VALUES (1, 'a')")
 
 	// A child needs its parent.
 	_, missing := db.sql_execute(store, "INSERT INTO books (id, author, title) VALUES (1, 9, 'x')")
 	testing.expect_value(t, missing.kind, db.Error_Kind.Foreign_Key_Violation)
 	testing.expect_value(t, missing.message, "FOREIGN KEY constraint failed")
-	run(t, store, "INSERT INTO books (id, author, title) VALUES (1, 1, 'x')")
+	run_done(t, store, "INSERT INTO books (id, author, title) VALUES (1, 1, 'x')")
 	// NULL keys are not enforced.
-	run(t, store, "INSERT INTO books (id, author, title) VALUES (2, NULL, 'y')")
+	run_done(t, store, "INSERT INTO books (id, author, title) VALUES (2, NULL, 'y')")
 
 	// RESTRICT (the default) refuses to delete a referenced parent.
 	_, restricted := db.sql_execute(store, "DELETE FROM authors WHERE id = 1")
 	testing.expect_value(t, restricted.kind, db.Error_Kind.Foreign_Key_Violation)
 
 	// A cascade chains through grandchildren.
-	run(t, store, "INSERT INTO reviews (id, book) VALUES (1, 1)")
-	run(t, store, "DELETE FROM books WHERE id = 1")
+	run_done(t, store, "INSERT INTO reviews (id, book) VALUES (1, 1)")
+	run_done(t, store, "DELETE FROM books WHERE id = 1")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM reviews").i, i64(0))
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM books").i, i64(1))
 
 	// ON UPDATE CASCADE rewrites the children's key.
-	run(t, store, "CREATE TABLE profiles (id INTEGER PRIMARY KEY, bio TEXT)")
-	run(t, store, "CREATE TABLE owners (id INTEGER PRIMARY KEY, profile INTEGER, FOREIGN KEY (profile) REFERENCES profiles (id) ON DELETE CASCADE ON UPDATE CASCADE)")
-	run(t, store, "INSERT INTO profiles (id, bio) VALUES (5, 'b')")
-	run(t, store, "INSERT INTO owners (id, profile) VALUES (1, 5)")
-	run(t, store, "UPDATE profiles SET id = 6 WHERE id = 5")
+	run_done(t, store, "CREATE TABLE profiles (id INTEGER PRIMARY KEY, bio TEXT)")
+	run_done(t, store, "CREATE TABLE owners (id INTEGER PRIMARY KEY, profile INTEGER, FOREIGN KEY (profile) REFERENCES profiles (id) ON DELETE CASCADE ON UPDATE CASCADE)")
+	run_done(t, store, "INSERT INTO profiles (id, bio) VALUES (5, 'b')")
+	run_done(t, store, "INSERT INTO owners (id, profile) VALUES (1, 5)")
+	run_done(t, store, "UPDATE profiles SET id = 6 WHERE id = 5")
 	testing.expect_value(t, scalar(t, store, "SELECT profile FROM owners WHERE id = 1").i, i64(6))
 
 	// ON UPDATE RESTRICT reports the reference.
@@ -5934,8 +5945,8 @@ test_client_call_and_poll :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer destroy_host(store, host, "cli_poll")
 
-	run(t, store, "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)")
-	run(t, store, "INSERT INTO items (id, label) VALUES (1, 'one')")
+	run_done(t, store, "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)")
+	run_done(t, store, "INSERT INTO items (id, label) VALUES (1, 'one')")
 
 	insert_one :: proc(ctx: ^db.Reducer_Ctx, args: []db.Value) -> db.Error {
 		_, err := db.sql_execute_in_tx(ctx.tx, "INSERT INTO items (id, label) VALUES (2, 'two')")
@@ -5956,8 +5967,8 @@ test_client_call_and_poll :: proc(t: ^testing.T) {
 	testing.expect(t, db.error_ok(first_err))
 	testing.expect_value(t, len(first.rows), 2)
 
-	run(t, store, "INSERT INTO items (id, label) VALUES (3, 'three')")
-	run(t, store, "DELETE FROM items WHERE id = 1")
+	run_done(t, store, "INSERT INTO items (id, label) VALUES (3, 'three')")
+	run_done(t, store, "DELETE FROM items WHERE id = 1")
 	second, second_err := sdk.client_query(&session, "SELECT id, label FROM items", context.allocator)
 	testing.expect(t, db.error_ok(second_err))
 
@@ -5984,8 +5995,8 @@ test_postgres_describe_plans_only :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer destroy_host(store, host, "pgplan")
 
-	run(t, store, "CREATE TABLE d (id INTEGER PRIMARY KEY, label TEXT)")
-	run(t, store, "INSERT INTO d (id, label) VALUES (1, 'x')")
+	run_done(t, store, "CREATE TABLE d (id INTEGER PRIMARY KEY, label TEXT)")
+	run_done(t, store, "INSERT INTO d (id, label) VALUES (1, 'x')")
 
 	session := db.pg_session_init()
 	defer db.pg_session_destroy(session)
@@ -6073,10 +6084,10 @@ test_delete_releases_versions :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "delete_versions")
 	if store == nil do return
 
-	run(t, store, "CREATE TABLE d (id INTEGER PRIMARY KEY, label TEXT)")
-	run(t, store, "INSERT INTO d (id, label) VALUES (1, 'one')")
-	run(t, store, "UPDATE d SET label = 'two' WHERE id = 1")
-	run(t, store, "DELETE FROM d WHERE id = 1")
+	run_done(t, store, "CREATE TABLE d (id INTEGER PRIMARY KEY, label TEXT)")
+	run_done(t, store, "INSERT INTO d (id, label) VALUES (1, 'one')")
+	run_done(t, store, "UPDATE d SET label = 'two' WHERE id = 1")
+	run_done(t, store, "DELETE FROM d WHERE id = 1")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM d").i, i64(0))
 
 	// Pruning the tombstone and closing the store must free every value once.
@@ -6089,7 +6100,7 @@ test_delete_releases_versions :: proc(t: ^testing.T) {
 	defer db.store_close(reopened)
 	testing.expect_value(t, scalar(t, reopened, "SELECT count(*) FROM d").i, i64(0))
 	// Replay of the delete must leave the same state, and the table stays usable.
-	run(t, reopened, "INSERT INTO d (id, label) VALUES (2, 'again')")
+	run_done(t, reopened, "INSERT INTO d (id, label) VALUES (2, 'again')")
 	testing.expect_value(t, scalar(t, reopened, "SELECT label FROM d").s, "again")
 }
 
@@ -6105,7 +6116,7 @@ dump_database :: proc(t: ^testing.T, store: ^db.Store) -> string {
 		strings.write_string(&builder, "table ")
 		strings.write_string(&builder, name)
 		strings.write_string(&builder, "\n")
-		columns := run(t, store, fmt.aprintf("SELECT name, type, named FROM _columns WHERE table = '%s' ORDER BY name", name))
+		columns := run(t, store, fmt.tprintf("SELECT name, type, named FROM _columns WHERE table = '%s' ORDER BY name", name))
 		for column in columns.rows {
 			strings.write_string(&builder, "  col ")
 			strings.write_string(&builder, column[0].s)
@@ -6115,7 +6126,7 @@ dump_database :: proc(t: ^testing.T, store: ^db.Store) -> string {
 			strings.write_string(&builder, column[2].s)
 			strings.write_string(&builder, "]\n")
 		}
-		indexes := run(t, store, fmt.aprintf("SELECT name, columns FROM _indexes WHERE table = '%s' ORDER BY name", name))
+		indexes := run(t, store, fmt.tprintf("SELECT name, columns FROM _indexes WHERE table = '%s' ORDER BY name", name))
 		for index in indexes.rows {
 			strings.write_string(&builder, "  idx ")
 			strings.write_string(&builder, index[0].s)
@@ -6124,7 +6135,7 @@ dump_database :: proc(t: ^testing.T, store: ^db.Store) -> string {
 			strings.write_string(&builder, ")\n")
 		}
 		// SELECT without ORDER BY has no defined order, so the dump sorts by id.
-		rows := run(t, store, fmt.aprintf("SELECT * FROM %s ORDER BY id", name))
+		rows := run(t, store, fmt.tprintf("SELECT * FROM %s ORDER BY id", name))
 		for row_cells in rows.rows {
 			strings.write_string(&builder, "  row")
 			for value in row_cells {
@@ -6147,7 +6158,7 @@ test_kitchen_sink_replay :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "kitchen_sink")
 	if store == nil do return
 
-	run(t, store, "CREATE TYPE tags AS ARRAY(TEXT)")
+	run_done(t, store, "CREATE TYPE tags AS ARRAY(TEXT)")
 	run(
 		t,
 		store,
@@ -6158,18 +6169,18 @@ test_kitchen_sink_replay :: proc(t: ^testing.T) {
 		store,
 		"CREATE TABLE children (id INTEGER PRIMARY KEY, code TEXT, parent INTEGER, CONSTRAINT children_parent FOREIGN KEY (parent) REFERENCES parents (id) ON DELETE CASCADE)",
 	)
-	run(t, store, "CREATE UNIQUE INDEX children_code ON children USING DIRECT (code)")
-	run(t, store, "CREATE INDEX children_parent_idx ON children USING HASH (parent)")
-	run(t, store, "CREATE TABLE log_events (id INTEGER PRIMARY KEY, note TEXT) ")
-	run(t, store, "CREATE EVENT TABLE audit (id INTEGER PRIMARY KEY, what TEXT)")
-	run(t, store, "CREATE VIEW child_codes AS SELECT code FROM children WHERE code IS NOT NULL")
-	run(t, store, "INSERT INTO parents (id, name, maybe) VALUES (1, 'p', 7)")
-	run(t, store, "INSERT INTO children (id, code, parent) VALUES (1, 'c1', 1)")
-	run(t, store, "INSERT INTO children (id, code, parent) VALUES (2, 'c2', 1)")
-	run(t, store, "UPDATE children SET code = 'c2b' WHERE id = 2")
-	run(t, store, "DELETE FROM children WHERE id = 1")
-	run(t, store, "ALTER TABLE parents ADD COLUMN extra TEXT")
-	run(t, store, "INSERT INTO parents (id, name, extra) VALUES (2, 'q', 'e')")
+	run_done(t, store, "CREATE UNIQUE INDEX children_code ON children USING DIRECT (code)")
+	run_done(t, store, "CREATE INDEX children_parent_idx ON children USING HASH (parent)")
+	run_done(t, store, "CREATE TABLE log_events (id INTEGER PRIMARY KEY, note TEXT) ")
+	run_done(t, store, "CREATE EVENT TABLE audit (id INTEGER PRIMARY KEY, what TEXT)")
+	run_done(t, store, "CREATE VIEW child_codes AS SELECT code FROM children WHERE code IS NOT NULL")
+	run_done(t, store, "INSERT INTO parents (id, name, maybe) VALUES (1, 'p', 7)")
+	run_done(t, store, "INSERT INTO children (id, code, parent) VALUES (1, 'c1', 1)")
+	run_done(t, store, "INSERT INTO children (id, code, parent) VALUES (2, 'c2', 1)")
+	run_done(t, store, "UPDATE children SET code = 'c2b' WHERE id = 2")
+	run_done(t, store, "DELETE FROM children WHERE id = 1")
+	run_done(t, store, "ALTER TABLE parents ADD COLUMN extra TEXT")
+	run_done(t, store, "INSERT INTO parents (id, name, extra) VALUES (2, 'q', 'e')")
 
 	before := dump_database(t, store)
 	defer delete(before)
@@ -6178,7 +6189,7 @@ test_kitchen_sink_replay :: proc(t: ^testing.T) {
 
 	// Snapshot, compact, close and reopen: the dump must not change.
 	db.store_snapshot(store)
-	run(t, store, "INSERT INTO log_events (id, note) VALUES (1, 'x')")
+	run_done(t, store, "INSERT INTO log_events (id, note) VALUES (1, 'x')")
 	delete(before)
 	before = dump_database(t, store)
 	db.host_destroy(host)
@@ -6201,18 +6212,18 @@ test_index_matches_full_scan :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer destroy_host(store, host, "index_scan")
 
-	run(t, store, "CREATE TABLE indexed (id INTEGER PRIMARY KEY, grp TEXT, n INTEGER)")
-	run(t, store, "CREATE TABLE plain (id INTEGER PRIMARY KEY, grp TEXT, n INTEGER)")
-	run(t, store, "CREATE INDEX indexed_grp ON indexed USING HASH (grp)")
+	run_done(t, store, "CREATE TABLE indexed (id INTEGER PRIMARY KEY, grp TEXT, n INTEGER)")
+	run_done(t, store, "CREATE TABLE plain (id INTEGER PRIMARY KEY, grp TEXT, n INTEGER)")
+	run_done(t, store, "CREATE INDEX indexed_grp ON indexed USING HASH (grp)")
 	for i in 1 ..= 20 {
 		grp := i % 3 == 0 ? "b" : "a"
-		run(t, store, fmt.aprintf("INSERT INTO indexed (id, grp, n) VALUES (%d, '%s', %d)", i, grp, i))
-		run(t, store, fmt.aprintf("INSERT INTO plain (id, grp, n) VALUES (%d, '%s', %d)", i, grp, i))
+		run_done(t, store, fmt.tprintf("INSERT INTO indexed (id, grp, n) VALUES (%d, '%s', %d)", i, grp, i))
+		run_done(t, store, fmt.tprintf("INSERT INTO plain (id, grp, n) VALUES (%d, '%s', %d)", i, grp, i))
 	}
-	run(t, store, "UPDATE indexed SET grp = 'c' WHERE id = 4")
-	run(t, store, "UPDATE plain SET grp = 'c' WHERE id = 4")
-	run(t, store, "DELETE FROM indexed WHERE id = 7")
-	run(t, store, "DELETE FROM plain WHERE id = 7")
+	run_done(t, store, "UPDATE indexed SET grp = 'c' WHERE id = 4")
+	run_done(t, store, "UPDATE plain SET grp = 'c' WHERE id = 4")
+	run_done(t, store, "DELETE FROM indexed WHERE id = 7")
+	run_done(t, store, "DELETE FROM plain WHERE id = 7")
 
 	predicates := []string{
 		"grp = 'a'",
@@ -6225,8 +6236,8 @@ test_index_matches_full_scan :: proc(t: ^testing.T) {
 		"grp IS NULL",
 	}
 	for predicate in predicates {
-		indexed := run(t, store, fmt.aprintf("SELECT id, grp, n FROM indexed WHERE %s ORDER BY id", predicate))
-		plain := run(t, store, fmt.aprintf("SELECT id, grp, n FROM plain WHERE %s ORDER BY id", predicate))
+		indexed := run(t, store, fmt.tprintf("SELECT id, grp, n FROM indexed WHERE %s ORDER BY id", predicate))
+		plain := run(t, store, fmt.tprintf("SELECT id, grp, n FROM plain WHERE %s ORDER BY id", predicate))
 		testing.expect_value(t, len(indexed.rows), len(plain.rows))
 		for row, i in indexed.rows {
 			for value, j in row {
@@ -6253,21 +6264,21 @@ test_soak_update_delete_prune :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "soak_prune")
 	if store == nil do return
 
-	run(t, store, "CREATE TABLE soak (id INTEGER PRIMARY KEY, n INTEGER)")
+	run_done(t, store, "CREATE TABLE soak (id INTEGER PRIMARY KEY, n INTEGER)")
 	expected := make(map[i64]bool)
 	defer delete(expected)
 	for i in 1 ..= 50 {
-		run(t, store, fmt.aprintf("INSERT INTO soak (id, n) VALUES (%d, %d)", i, i))
+		run_done(t, store, fmt.tprintf("INSERT INTO soak (id, n) VALUES (%d, %d)", i, i))
 		expected[i64(i)] = true
 	}
 	// Churn: updates, deletes and reinserts keep the version chains busy.
 	for round in 0 ..< 40 {
 		id := i64(round % 25 + 1)
-		run(t, store, fmt.aprintf("UPDATE soak SET n = n + 1 WHERE id = %d", id))
+		run_done(t, store, fmt.tprintf("UPDATE soak SET n = n + 1 WHERE id = %d", id))
 		if round % 3 == 0 {
-			run(t, store, fmt.aprintf("DELETE FROM soak WHERE id = %d", id))
+			run_done(t, store, fmt.tprintf("DELETE FROM soak WHERE id = %d", id))
 			delete_key(&expected, id)
-			run(t, store, fmt.aprintf("INSERT INTO soak (id, n) VALUES (%d, %d)", id, round))
+			run_done(t, store, fmt.tprintf("INSERT INTO soak (id, n) VALUES (%d, %d)", id, round))
 			expected[id] = true
 		}
 		if round % 10 == 0 do db.store_prune_versions(store, store.commit_seq)
@@ -6303,7 +6314,7 @@ test_sqlite_read_fixture :: proc(t: ^testing.T) {
 	testing.expect_value(t, file.tables[1].name, "tags")
 	testing.expect(t, file.tables[1].without_rowid)
 
-	rows, rows_err := db.sqlite_table_rows(&file, &file.tables[0], context.allocator)
+	rows, rows_err := db.sqlite_table_rows(&file, &file.tables[0], context.temp_allocator)
 	if !testing.expectf(t, db.error_ok(rows_err), "rows: %s", rows_err.message) do return
 	testing.expect_value(t, len(rows), 4)
 	// Integer primary key, text, real and blob values.
@@ -6321,7 +6332,7 @@ test_sqlite_read_fixture :: proc(t: ^testing.T) {
 	testing.expect_value(t, rows[3][0].i, i64(9))
 	testing.expect_value(t, rows[3][1].s, "Lin")
 
-	tag_rows, tag_err := db.sqlite_table_rows(&file, &file.tables[1], context.allocator)
+	tag_rows, tag_err := db.sqlite_table_rows(&file, &file.tables[1], context.temp_allocator)
 	if !testing.expectf(t, db.error_ok(tag_err), "tags: %s", tag_err.message) do return
 	testing.expect_value(t, len(tag_rows), 3)
 	testing.expect_value(t, tag_rows[0][0].s, "a")
@@ -6411,8 +6422,8 @@ test_sqlite_write_index_pages :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "sqlite_write_index_pages")
 	if store == nil do return
 	defer destroy_host(store, host, "sqlite_write_index_pages")
-	run(t, store, "CREATE TABLE t (a INT PRIMARY KEY, b TEXT)")
-	run(t, store, "CREATE INDEX tb ON t (b)")
+	run_done(t, store, "CREATE TABLE t (a INT PRIMARY KEY, b TEXT)")
+	run_done(t, store, "CREATE INDEX tb ON t (b)")
 	tx := db.tx_begin_write(store)
 	for i in 1 ..= 3000 {
 		_, err := db.sql_execute_in_tx_params(
@@ -6441,10 +6452,10 @@ test_sqlite_write_without_rowid :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "sqlite_write_without_rowid")
 	if store == nil do return
 	defer destroy_host(store, host, "sqlite_write_without_rowid")
-	run(t, store, "CREATE TABLE w (b, a TEXT PRIMARY KEY, c INT) WITHOUT ROWID")
-	run(t, store, "CREATE INDEX wc ON w (c)")
-	run(t, store, "CREATE TABLE n (id INTEGER PRIMARY KEY, v TEXT) WITHOUT ROWID")
-	run(t, store, "INSERT INTO w VALUES (1, 'x', 3), (2, 'a', 30), (NULL, 'm', -1)")
+	run_done(t, store, "CREATE TABLE w (b, a TEXT PRIMARY KEY, c INT) WITHOUT ROWID")
+	run_done(t, store, "CREATE INDEX wc ON w (c)")
+	run_done(t, store, "CREATE TABLE n (id INTEGER PRIMARY KEY, v TEXT) WITHOUT ROWID")
+	run_done(t, store, "INSERT INTO w VALUES (1, 'x', 3), (2, 'a', 30), (NULL, 'm', -1)")
 	tx := db.tx_begin_write(store)
 	for i in 1 ..= 2000 {
 		_, err := db.sql_execute_in_tx_params(tx, "INSERT INTO n VALUES (?, ?)", []db.Value{db.value_int(i64(2001 - i)), db.value_string(fmt.tprintf("v%d", i))})
@@ -6484,8 +6495,8 @@ test_sqlite_write_empty_index :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "sqlite_write_empty_index")
 	if store == nil do return
 	defer destroy_host(store, host, "sqlite_write_empty_index")
-	run(t, store, "CREATE TABLE t (a INT PRIMARY KEY, b TEXT)")
-	run(t, store, "CREATE INDEX tb ON t (b)")
+	run_done(t, store, "CREATE TABLE t (a INT PRIMARY KEY, b TEXT)")
+	run_done(t, store, "CREATE INDEX tb ON t (b)")
 
 	path := "_test_sqlite_empty_index.db"
 	defer os.remove(path)
@@ -6506,12 +6517,12 @@ test_sqlite_write_roundtrip :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "sqlite_write")
 	if store == nil do return
 	defer destroy_host(store, host, "sqlite_write")
-	run(t, store, "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, score FLOAT, blob_col BLOB, note TEXT)")
-	run(t, store, "CREATE INDEX people_score ON people (score)")
+	run_done(t, store, "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, score FLOAT, blob_col BLOB, note TEXT)")
+	run_done(t, store, "CREATE INDEX people_score ON people (score)")
 	run_params(t, store, "INSERT INTO people (id, name, score, blob_col, note) VALUES (?, ?, ?, ?, ?)", []db.Value{
 		db.value_int(1), db.value_string("Ada"), db.value_float(9.5), db.value_bytes([]u8{0x61, 0x62, 0x63}), db.value_string("first"),
 	})
-	run(t, store, "INSERT INTO people (id, name, score) VALUES (2, 'Grace', -1.25)")
+	run_done(t, store, "INSERT INTO people (id, name, score) VALUES (2, 'Grace', -1.25)")
 	// A text longer than a page exercises the overflow chain on the way out.
 	long: string
 	{
@@ -6539,7 +6550,7 @@ test_sqlite_write_roundtrip :: proc(t: ^testing.T) {
 	// The exported file carries the secondary index; the reader still parses the
 	// schema (index b-trees are read by SQLite, not by the importer).
 	testing.expect_value(t, len(file.tables[0].columns), 5)
-	read, read_err := db.sqlite_table_rows(&file, &file.tables[0], context.allocator)
+	read, read_err := db.sqlite_table_rows(&file, &file.tables[0], context.temp_allocator)
 	if !testing.expectf(t, db.error_ok(read_err), "read: %s", read_err.message) do return
 	testing.expect_value(t, len(read), 3)
 	testing.expect_value(t, read[0][0].i, i64(1))
@@ -6558,13 +6569,13 @@ test_sqlite_write_many_rows :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "sqlite_write_many")
 	if store == nil do return
 	defer destroy_host(store, host, "sqlite_write_many")
-	run(t, store, "CREATE TABLE big (id INTEGER PRIMARY KEY, name TEXT, score FLOAT)")
+	run_done(t, store, "CREATE TABLE big (id INTEGER PRIMARY KEY, name TEXT, score FLOAT)")
 	tx := db.tx_begin_write(store)
 	for i in 1 ..= 300 {
 		_, insert_err := db.sql_execute_in_tx_params(
 			tx,
 			"INSERT INTO big (id, name, score) VALUES (?, ?, ?)",
-			[]db.Value{db.value_int(i64(i)), db.value_string(fmt.aprintf("row%d", i)), db.value_float(f64(i) / 2)},
+			[]db.Value{db.value_int(i64(i)), db.value_string(fmt.tprintf("row%d", i)), db.value_float(f64(i) / 2)},
 		)
 		testing.expect(t, db.error_ok(insert_err))
 	}
@@ -6580,7 +6591,7 @@ test_sqlite_write_many_rows :: proc(t: ^testing.T) {
 	file, open_err := db.sqlite_file_open(path)
 	if !testing.expectf(t, db.error_ok(open_err), "reopen: %s", open_err.message) do return
 	defer db.sqlite_file_destroy(&file)
-	read, read_err := db.sqlite_table_rows(&file, &file.tables[0], context.allocator)
+	read, read_err := db.sqlite_table_rows(&file, &file.tables[0], context.temp_allocator)
 	if !testing.expectf(t, db.error_ok(read_err), "read: %s", read_err.message) do return
 	testing.expect_value(t, len(read), 300)
 	testing.expect_value(t, read[0][0].i, i64(1))
@@ -6666,8 +6677,8 @@ test_not_null_survives_replay :: proc(t: ^testing.T) {
 	defer os.remove_all(path)
 	store, host := fresh_host(t, "not_null_replay")
 	if store == nil do return
-	run(t, store, "CREATE TABLE strict (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
-	run(t, store, "INSERT INTO strict (id, name) VALUES (1, 'ok')")
+	run_done(t, store, "CREATE TABLE strict (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+	run_done(t, store, "INSERT INTO strict (id, name) VALUES (1, 'ok')")
 	_, insert_err := db.sql_execute(store, "INSERT INTO strict (id, name) VALUES (2, NULL)")
 	testing.expect_value(t, insert_err.kind, db.Error_Kind.Not_Null_Violation)
 	db.host_destroy(host)
@@ -6694,8 +6705,8 @@ test_pragma_and_sqlite_functions :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "pragma")
 	if store == nil do return
 	defer destroy_host(store, host, "pragma")
-	run(t, store, "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER)")
-	run(t, store, "CREATE INDEX people_age ON people (age)")
+	run_done(t, store, "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER)")
+	run_done(t, store, "CREATE INDEX people_age ON people (age)")
 
 	info := run(t, store, "PRAGMA table_info(people)")
 	testing.expect_value(t, len(info.rows), 3)
@@ -6736,7 +6747,7 @@ test_glob_operator :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "glob")
 	if store == nil do return
 	defer destroy_host(store, host, "glob")
-	run(t, store, "CREATE TABLE files (id INTEGER PRIMARY KEY, name TEXT)")
+	run_done(t, store, "CREATE TABLE files (id INTEGER PRIMARY KEY, name TEXT)")
 	for name in ([]string{"alpha.txt", "beta.txt", "gamma.log", "Alpha.txt", "a1.txt", "a2.txt"}) {
 		run_params(t, store, "INSERT INTO files (name) VALUES (?)", []db.Value{db.value_string(name)})
 	}
@@ -6751,7 +6762,7 @@ test_glob_operator :: proc(t: ^testing.T) {
 		{"name LIKE 'a%'", 4},
 	}
 	for item in cases {
-		result := run(t, store, fmt.aprintf("SELECT count(*) FROM files WHERE %s", item.predicate))
+		result := run(t, store, fmt.tprintf("SELECT count(*) FROM files WHERE %s", item.predicate))
 		testing.expectf(t, result.rows[0][0].i == item.expected, "%s: expected %d, got %d", item.predicate, item.expected, result.rows[0][0].i)
 	}
 	testing.expect_value(t, run(t, store, "SELECT name FROM files WHERE name GLOB 'a[0-9].txt' ORDER BY name").rows[0][0].s, "a1.txt")
@@ -6764,7 +6775,7 @@ test_returning_clause :: proc(t: ^testing.T) {
 	defer os.remove_all(path)
 	store, host := fresh_host(t, "returning")
 	if store == nil do return
-	run(t, store, "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)")
+	run_done(t, store, "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)")
 
 	inserted := run(t, store, "INSERT INTO items (name, qty) VALUES ('a', 1), ('b', 2) RETURNING id, name, qty")
 	testing.expect_value(t, inserted.kind, db.Sql_Result_Kind.Rows)
@@ -6798,8 +6809,8 @@ test_upsert :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "upsert")
 	if store == nil do return
 	defer destroy_host(store, host, "upsert")
-	run(t, store, "CREATE TABLE stock (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)")
-	run(t, store, "INSERT INTO stock (id, name, qty) VALUES (1, 'a', 5)")
+	run_done(t, store, "CREATE TABLE stock (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)")
+	run_done(t, store, "INSERT INTO stock (id, name, qty) VALUES (1, 'a', 5)")
 
 	// DO UPDATE runs the assignments over the stored row and reports it.
 	updated := run(t, store, "INSERT INTO stock (id, name, qty) VALUES (1, 'a', 7) ON CONFLICT (id) DO UPDATE SET qty = qty + 1 RETURNING *")
@@ -6812,7 +6823,7 @@ test_upsert :: proc(t: ^testing.T) {
 	testing.expect_value(t, ignored.affected, 0)
 	testing.expect_value(t, scalar(t, store, "SELECT qty FROM stock WHERE id = 1").i, i64(6))
 	// ...and inserts normally when there is no collision.
-	run(t, store, "INSERT INTO stock (id, name, qty) VALUES (2, 'b', 9) ON CONFLICT DO NOTHING")
+	run_done(t, store, "INSERT INTO stock (id, name, qty) VALUES (2, 'b', 9) ON CONFLICT DO NOTHING")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM stock").i, i64(2))
 	testing.expect_value(t, scalar(t, store, "SELECT qty FROM stock WHERE id = 2").i, i64(9))
 }
@@ -6821,12 +6832,12 @@ test_upsert :: proc(t: ^testing.T) {
 test_any_column_affinity :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "any_column")
 	if store == nil do return
-	run(t, store, "CREATE TABLE mixed (id INTEGER PRIMARY KEY, v ANY)")
-	run(t, store, "INSERT INTO mixed (id, v) VALUES (1, 10)")
-	run(t, store, "INSERT INTO mixed (id, v) VALUES (2, 'text')")
-	run(t, store, "INSERT INTO mixed (id, v) VALUES (3, 1.5)")
+	run_done(t, store, "CREATE TABLE mixed (id INTEGER PRIMARY KEY, v ANY)")
+	run_done(t, store, "INSERT INTO mixed (id, v) VALUES (1, 10)")
+	run_done(t, store, "INSERT INTO mixed (id, v) VALUES (2, 'text')")
+	run_done(t, store, "INSERT INTO mixed (id, v) VALUES (3, 1.5)")
 	run_params(t, store, "INSERT INTO mixed (id, v) VALUES (?, ?)", []db.Value{db.value_int(4), db.value_bytes([]u8{1, 2})})
-	run(t, store, "INSERT INTO mixed (id, v) VALUES (5, NULL)")
+	run_done(t, store, "INSERT INTO mixed (id, v) VALUES (5, NULL)")
 
 	kinds := run(t, store, "SELECT v, typeof(v) FROM mixed ORDER BY id")
 	testing.expect_value(t, len(kinds.rows), 5)
@@ -6902,7 +6913,7 @@ test_prepared_statement_reuse :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "prepared_host")
 	if store == nil do return
 	defer destroy_host(store, host, "prepared_host")
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
 
 	insert, prepare_err := db.sql_prepare(store, "INSERT INTO t (name) VALUES (?)")
 	if !testing.expectf(t, db.error_ok(prepare_err), "prepare: %s", prepare_err.message) do return
@@ -7024,7 +7035,7 @@ test_remote_module :: proc(t: ^testing.T) {
 	module_store, module_host := fresh_host(t, "remote_mod")
 	if module_store == nil do return
 	defer destroy_host(module_store, module_host, "remote_mod")
-	run(t, module_store, "CREATE TABLE hits (id INTEGER PRIMARY KEY AUTOINCREMENT, note TEXT NOT NULL, at INTEGER NOT NULL)")
+	run_done(t, module_store, "CREATE TABLE hits (id INTEGER PRIMARY KEY AUTOINCREMENT, note TEXT NOT NULL, at INTEGER NOT NULL)")
 	note :: proc(ctx: ^db.Reducer_Ctx, args: []db.Value) -> db.Error {
 		// The clock is the caller's, which is what makes a call reproducible.
 		statement := fmt.tprintf("INSERT INTO hits (note, at) VALUES ('from the host', %d)", ctx.now_us)
@@ -7087,7 +7098,7 @@ test_spatial_rtree :: proc(t: ^testing.T) {
 	store, open_err := db.store_open(path, {persistent = true, create = true, durable = false})
 	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
 
-	run(t, store, "CREATE VIRTUAL TABLE places USING rtree(id, minx, maxx, miny, maxy)")
+	run_done(t, store, "CREATE VIRTUAL TABLE places USING rtree(id, minx, maxx, miny, maxy)")
 	run(
 		t,
 		store,
@@ -7103,22 +7114,22 @@ test_spatial_rtree :: proc(t: ^testing.T) {
 	testing.expect_value(t, rows.rows[0][0].i, i64(3))
 	db.sql_result_destroy(&rows)
 	// Coordinates are REAL, so fractional boxes work.
-	run(t, store, "INSERT INTO places (id, minx, maxx, miny, maxy) VALUES (4, 5.5, 6.5, 5.5, 6.5)")
+	run_done(t, store, "INSERT INTO places (id, minx, maxx, miny, maxy) VALUES (4, 5.5, 6.5, 5.5, 6.5)")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM places WHERE id = 4 AND maxx = 6.5").i, i64(1))
 	// Moving a box moves it out of the window.
-	run(t, store, "UPDATE places SET minx = 100, maxx = 110, miny = 100, maxy = 110 WHERE id = 3")
+	run_done(t, store, "UPDATE places SET minx = 100, maxx = 110, miny = 100, maxy = 110 WHERE id = 3")
 	window_count := strings.concatenate({"SELECT count(*) FROM places WHERE minx <= 12 AND maxx >= 12 AND miny <= 12 AND maxy >= 12"})
 	testing.expect_value(t, scalar(t, store, window_count).i, i64(0))
 	// Deleting removes it from every query.
-	run(t, store, "DELETE FROM places WHERE id = 4")
+	run_done(t, store, "DELETE FROM places WHERE id = 4")
 	testing.expect_value(t, scalar(t, store, point).i, i64(1))
 
 	// A shape that is not a set of min/max pairs is refused.
 	_, bad_shape := db.sql_execute(store, "CREATE VIRTUAL TABLE broken USING rtree(id, minx, maxx, miny)")
 	testing.expect_value(t, bad_shape.kind, db.Error_Kind.Invalid_Argument)
 	// rtree_i32 stores integers.
-	run(t, store, "CREATE VIRTUAL TABLE grid USING rtree_i32(id, minx, maxx, miny, maxy)")
-	run(t, store, "INSERT INTO grid (id, minx, maxx, miny, maxy) VALUES (1, 0, 2, 0, 2)")
+	run_done(t, store, "CREATE VIRTUAL TABLE grid USING rtree_i32(id, minx, maxx, miny, maxy)")
+	run_done(t, store, "INSERT INTO grid (id, minx, maxx, miny, maxy) VALUES (1, 0, 2, 0, 2)")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM grid WHERE maxx >= 1 AND minx <= 1").i, i64(1))
 	// MATCH is a full-text operator: asking an rtree for it fails instead of
 	// silently returning nothing.
@@ -7134,7 +7145,7 @@ test_spatial_rtree :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM _virtual").i, i64(2))
 
 	// Dropping the virtual table forgets it.
-	run(t, store, "DROP TABLE grid")
+	run_done(t, store, "DROP TABLE grid")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM _virtual").i, i64(1))
 	db.store_close(store)
 }
@@ -7152,7 +7163,7 @@ test_extension_load :: proc(t: ^testing.T) {
 	module_store, module_host := fresh_host(t, "ext_module")
 	if module_store == nil do return
 	defer destroy_host(module_store, module_host, "ext_module")
-	run(t, module_store, "CREATE TABLE hits (id INTEGER PRIMARY KEY AUTOINCREMENT, note TEXT NOT NULL)")
+	run_done(t, module_store, "CREATE TABLE hits (id INTEGER PRIMARY KEY AUTOINCREMENT, note TEXT NOT NULL)")
 	note :: proc(ctx: ^db.Reducer_Ctx, args: []db.Value) -> db.Error {
 		_, err := db.sql_execute_in_tx(ctx.tx, "INSERT INTO hits (note) VALUES ('from an extension')")
 		return err
@@ -7175,7 +7186,7 @@ test_extension_load :: proc(t: ^testing.T) {
 	store, open_err := db.store_open(path, {persistent = true, create = true, durable = false})
 	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
 	host := db.host_init(store)
-	run(t, store, "CREATE TABLE before_load (id INTEGER PRIMARY KEY)")
+	run_done(t, store, "CREATE TABLE before_load (id INTEGER PRIMARY KEY)")
 
 	// The address is required and must carry a usable port.
 	_, no_port := db.sql_execute(store, "LOAD EXTENSION broken AT '127.0.0.1'")
@@ -7185,7 +7196,7 @@ test_extension_load :: proc(t: ^testing.T) {
 	defer delete(address)
 	load_sql := fmt.aprintf("LOAD EXTENSION notes AT '%s' USING note", address)
 	defer delete(load_sql)
-	run(t, store, load_sql)
+	run_done(t, store, load_sql)
 	testing.expect_value(t, len(db.host_remote_module_names(host, context.temp_allocator)), 1)
 
 	// A call crosses the socket and lands in the extension's own database.
@@ -7198,16 +7209,16 @@ test_extension_load :: proc(t: ^testing.T) {
 	testing.expect_value(t, unknown.kind, db.Error_Kind.Sql_Unsupported)
 
 	// Unloading forgets both the module and the catalog row.
-	run(t, store, "UNLOAD EXTENSION notes")
+	run_done(t, store, "UNLOAD EXTENSION notes")
 	testing.expect_value(t, len(db.host_remote_module_names(host, context.temp_allocator)), 0)
 	_, gone := db.host_call_module(host, "notes", "note", nil)
 	testing.expect_value(t, gone.kind, db.Error_Kind.Invalid_Argument)
 	_, unload_again := db.sql_execute(store, "UNLOAD EXTENSION notes")
 	testing.expect_value(t, unload_again.kind, db.Error_Kind.Invalid_Argument)
-	run(t, store, "UNLOAD EXTENSION IF EXISTS notes")
+	run_done(t, store, "UNLOAD EXTENSION IF EXISTS notes")
 
 	// A restart registers what the database remembers.
-	run(t, store, load_sql)
+	run_done(t, store, load_sql)
 	db.host_destroy(host)
 	db.store_close(store)
 	store, open_err = db.store_open(path, {persistent = true, create = true, durable = false})
@@ -7232,8 +7243,8 @@ test_full_text_search :: proc(t: ^testing.T) {
 	store, open_err := db.store_open(path, {persistent = true, create = true, durable = false})
 	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
 
-	run(t, store, "CREATE VIRTUAL TABLE docs USING fts5(body)")
-	run(t, store, "INSERT INTO docs (body) VALUES ('the quick brown fox'), ('a lazy dog sleeps')")
+	run_done(t, store, "CREATE VIRTUAL TABLE docs USING fts5(body)")
+	run_done(t, store, "INSERT INTO docs (body) VALUES ('the quick brown fox'), ('a lazy dog sleeps')")
 	// Plain projection returns the stored columns, not the tokens.
 	rows := run(t, store, "SELECT body FROM docs WHERE docs MATCH 'fox'")
 	testing.expect_value(t, len(rows.rows), 1)
@@ -7251,14 +7262,14 @@ test_full_text_search :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM docs WHERE docs MATCH 'the NOT fox'").i, i64(0))
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM docs WHERE docs MATCH 'a NOT fox'").i, i64(1))
 	// The index follows updates and deletes.
-	run(t, store, "UPDATE docs SET body = 'a fast cat' WHERE body = 'the quick brown fox'")
+	run_done(t, store, "UPDATE docs SET body = 'a fast cat' WHERE body = 'the quick brown fox'")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM docs WHERE docs MATCH 'fox'").i, i64(0))
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM docs WHERE docs MATCH 'cat'").i, i64(1))
-	run(t, store, "DELETE FROM docs WHERE body = 'a lazy dog sleeps'")
+	run_done(t, store, "DELETE FROM docs WHERE body = 'a lazy dog sleeps'")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM docs WHERE docs MATCH 'cat OR dog'").i, i64(1))
 	// A second virtual table has its own index.
-	run(t, store, "CREATE VIRTUAL TABLE notes USING fts5(text)")
-	run(t, store, "INSERT INTO notes (text) VALUES ('cat cat')")
+	run_done(t, store, "CREATE VIRTUAL TABLE notes USING fts5(text)")
+	run_done(t, store, "INSERT INTO notes (text) VALUES ('cat cat')")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM notes WHERE notes MATCH 'cat'").i, i64(1))
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM docs WHERE docs MATCH 'cat'").i, i64(1))
 	// An unknown module is refused rather than silently creating a plain table.
@@ -7273,7 +7284,7 @@ test_full_text_search :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM notes WHERE notes MATCH 'cat'").i, i64(1))
 
 	// Dropping the virtual table drops the shadow table with it.
-	run(t, store, "DROP TABLE docs")
+	run_done(t, store, "DROP TABLE docs")
 	_, gone := db.sql_execute(store, "SELECT count(*) FROM _fts_docs_terms")
 	testing.expect_value(t, gone.kind, db.Error_Kind.Table_Not_Found)
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM _virtual").i, i64(1))
@@ -7289,8 +7300,8 @@ test_sqlite_live_mirror :: proc(t: ^testing.T) {
 
 	store := fresh_db(t, "mirror_source")
 	if store == nil do return
-	run(t, store, "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
-	run(t, store, "INSERT INTO items (id, name) VALUES (1, 'one')")
+	run_done(t, store, "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+	run_done(t, store, "INSERT INTO items (id, name) VALUES (1, 'one')")
 	_, _, export_err := db.sqlite_file_write(store, path)
 	testing.expect(t, db.error_ok(export_err))
 	db.store_close(store)
@@ -7338,12 +7349,12 @@ test_keys_cross_a_sqlite_file_both_ways :: proc(t: ^testing.T) {
 	os.remove(path)
 	source := fresh_db(t, "keys_source")
 	if source == nil do return
-	run(t, source, "CREATE TABLE k (code TEXT PRIMARY KEY, v INTEGER)")
-	run(t, source, "INSERT INTO k (code, v) VALUES ('a', 1)")
-	run(t, source, "CREATE TABLE u (id INTEGER PRIMARY KEY, code TEXT UNIQUE)")
-	run(t, source, "INSERT INTO u (id, code) VALUES (1, 'x')")
-	run(t, source, "CREATE TABLE cp (a INTEGER, b INTEGER, PRIMARY KEY (a, b))")
-	run(t, source, "INSERT INTO cp (a, b) VALUES (1, 2)")
+	run_done(t, source, "CREATE TABLE k (code TEXT PRIMARY KEY, v INTEGER)")
+	run_done(t, source, "INSERT INTO k (code, v) VALUES ('a', 1)")
+	run_done(t, source, "CREATE TABLE u (id INTEGER PRIMARY KEY, code TEXT UNIQUE)")
+	run_done(t, source, "INSERT INTO u (id, code) VALUES (1, 'x')")
+	run_done(t, source, "CREATE TABLE cp (a INTEGER, b INTEGER, PRIMARY KEY (a, b))")
+	run_done(t, source, "INSERT INTO cp (a, b) VALUES (1, 2)")
 	_, _, export_err := db.sqlite_file_write(source, path)
 	testing.expect(t, db.error_ok(export_err))
 	db.store_close(source)
@@ -7466,7 +7477,7 @@ test_limit_stops_the_scan :: proc(t: ^testing.T) {
 	store := fresh_db(t, "limit_scan")
 	if store == nil do return
 	defer cleanup_db(store, "limit_scan")
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
 	{
 		tx := db.tx_begin_write(store)
 		builder := strings.builder_make()
@@ -7527,11 +7538,11 @@ test_limit_stops_the_scan :: proc(t: ^testing.T) {
 	db.sql_result_destroy(&filtered)
 
 	// And the join stops once it has its rows rather than building the product.
-	run(t, store, "CREATE TABLE u (id INTEGER PRIMARY KEY)")
+	run_done(t, store, "CREATE TABLE u (id INTEGER PRIMARY KEY)")
 	{
 		tx := db.tx_begin_write(store)
 		for i in 1 ..= 200 {
-			_, insert_err := db.sql_execute_in_tx(tx, fmt.aprintf("INSERT INTO u (id) VALUES (%d)", i))
+			_, insert_err := db.sql_execute_in_tx(tx, fmt.tprintf("INSERT INTO u (id) VALUES (%d)", i))
 			testing.expect(t, db.error_ok(insert_err))
 		}
 		testing.expect(t, db.error_ok(db.tx_commit(tx)))
@@ -7555,14 +7566,14 @@ test_row_quota_stops_a_cross_join :: proc(t: ^testing.T) {
 	store := fresh_db(t, "quota_join")
 	if store == nil do return
 	defer cleanup_db(store, "quota_join")
-	run(t, store, "CREATE TABLE a (id INTEGER PRIMARY KEY)")
-	run(t, store, "CREATE TABLE b (id INTEGER PRIMARY KEY)")
+	run_done(t, store, "CREATE TABLE a (id INTEGER PRIMARY KEY)")
+	run_done(t, store, "CREATE TABLE b (id INTEGER PRIMARY KEY)")
 	{
 		tx := db.tx_begin_write(store)
 		for i in 1 ..= 200 {
-			_, insert_a := db.sql_execute_in_tx(tx, fmt.aprintf("INSERT INTO a (id) VALUES (%d)", i))
+			_, insert_a := db.sql_execute_in_tx(tx, fmt.tprintf("INSERT INTO a (id) VALUES (%d)", i))
 			testing.expect(t, db.error_ok(insert_a))
-			_, insert_b := db.sql_execute_in_tx(tx, fmt.aprintf("INSERT INTO b (id) VALUES (%d)", i))
+			_, insert_b := db.sql_execute_in_tx(tx, fmt.tprintf("INSERT INTO b (id) VALUES (%d)", i))
 			testing.expect(t, db.error_ok(insert_b))
 		}
 		testing.expect(t, db.error_ok(db.tx_commit(tx)))
@@ -7654,14 +7665,14 @@ test_mirror_patches_only_the_pages_it_touched :: proc(t: ^testing.T) {
 	// Build a database and export it, then open it the way a caller would.
 	source := fresh_db(t, "mirror_patch_source")
 	if source == nil do return
-	run(t, source, "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)")
+	run_done(t, source, "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)")
 	{
 		tx := db.tx_begin_write(source)
 		for i in 1 ..= 400 {
 			_, insert_err := db.sql_execute_in_tx_params(
 				tx,
 				"INSERT INTO items (id, name, score) VALUES (?, ?, ?)",
-				[]db.Value{db.value_int(i64(i)), db.value_string(fmt.aprintf("row%d", i)), db.value_int(i64(i % 10))},
+				[]db.Value{db.value_int(i64(i)), db.value_string(fmt.tprintf("row%d", i)), db.value_int(i64(i % 10))},
 			)
 			testing.expect(t, db.error_ok(insert_err))
 		}
@@ -7739,14 +7750,14 @@ test_mirror_survives_a_torn_commit :: proc(t: ^testing.T) {
 
 	source := fresh_db(t, "mirror_torn_source")
 	if source == nil do return
-	run(t, source, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+	run_done(t, source, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
 	{
 		tx := db.tx_begin_write(source)
 		for i in 1 ..= 200 {
 			_, err := db.sql_execute_in_tx_params(
 				tx,
 				"INSERT INTO t (id, v) VALUES (?, ?)",
-				[]db.Value{db.value_int(i64(i)), db.value_string(fmt.aprintf("v%d", i))},
+				[]db.Value{db.value_int(i64(i)), db.value_string(fmt.tprintf("v%d", i))},
 			)
 			testing.expect(t, db.error_ok(err))
 		}
@@ -7826,17 +7837,17 @@ test_mirror_grows_and_reopens :: proc(t: ^testing.T) {
 	os.remove(path)
 	source := fresh_db(t, "mirror_grow_source")
 	if source == nil do return
-	run(t, source, "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)")
-	run(t, source, "CREATE TABLE others (id INTEGER PRIMARY KEY, tag TEXT)")
-	run(t, source, "CREATE TABLE indexed (id INTEGER PRIMARY KEY, code INTEGER)")
-	run(t, source, "CREATE INDEX indexed_code ON indexed (code)")
+	run_done(t, source, "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)")
+	run_done(t, source, "CREATE TABLE others (id INTEGER PRIMARY KEY, tag TEXT)")
+	run_done(t, source, "CREATE TABLE indexed (id INTEGER PRIMARY KEY, code INTEGER)")
+	run_done(t, source, "CREATE INDEX indexed_code ON indexed (code)")
 	{
 		tx := db.tx_begin_write(source)
 		for i in 1 ..= 400 {
 			_, err := db.sql_execute_in_tx_params(
 				tx,
 				"INSERT INTO items (id, name, score) VALUES (?, ?, ?)",
-				[]db.Value{db.value_int(i64(i)), db.value_string(fmt.aprintf("row%d", i)), db.value_int(i64(i % 10))},
+				[]db.Value{db.value_int(i64(i)), db.value_string(fmt.tprintf("row%d", i)), db.value_int(i64(i % 10))},
 			)
 			testing.expect(t, db.error_ok(err))
 		}
@@ -7844,7 +7855,7 @@ test_mirror_grows_and_reopens :: proc(t: ^testing.T) {
 			_, err := db.sql_execute_in_tx_params(
 				tx,
 				"INSERT INTO others (id, tag) VALUES (?, ?)",
-				[]db.Value{db.value_int(i64(i)), db.value_string(fmt.aprintf("tag%d", i))},
+				[]db.Value{db.value_int(i64(i)), db.value_string(fmt.tprintf("tag%d", i))},
 			)
 			testing.expect(t, db.error_ok(err))
 		}
@@ -7877,7 +7888,7 @@ test_mirror_grows_and_reopens :: proc(t: ^testing.T) {
 			_, err := db.sql_execute_in_tx_params(
 				tx,
 				"INSERT INTO items (id, name, score) VALUES (?, ?, ?)",
-				[]db.Value{db.value_int(i64(i)), db.value_string(fmt.aprintf("bulk%d", i)), db.value_int(i64(i % 7))},
+				[]db.Value{db.value_int(i64(i)), db.value_string(fmt.tprintf("bulk%d", i)), db.value_int(i64(i % 7))},
 			)
 			testing.expect(t, db.error_ok(err))
 		}
@@ -7961,8 +7972,8 @@ test_column_collation_and_generated :: proc(t: ^testing.T) {
 	store, open_err := db.store_open(path, {persistent = true, create = true, durable = false})
 	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
 
-	run(t, store, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE UNIQUE, tag TEXT)")
-	run(t, store, "INSERT INTO users (id, name, tag) VALUES (1, 'Alice', 'A'), (2, 'bob', 'B')")
+	run_done(t, store, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE UNIQUE, tag TEXT)")
+	run_done(t, store, "INSERT INTO users (id, name, tag) VALUES (1, 'Alice', 'A'), (2, 'bob', 'B')")
 
 	// The column's collation applies without an explicit COLLATE.
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM users WHERE name = 'alice'").i, i64(1))
@@ -7979,10 +7990,10 @@ test_column_collation_and_generated :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM users WHERE tag = 'a'").i, i64(0))
 
 	// GENERATED columns are computed on write, from the row being stored.
-	run(t, store, "CREATE TABLE lines (id INTEGER PRIMARY KEY, qty INTEGER NOT NULL, price INTEGER NOT NULL, total INTEGER GENERATED ALWAYS AS (qty * price) STORED)")
-	run(t, store, "INSERT INTO lines (id, qty, price) VALUES (1, 2, 5)")
+	run_done(t, store, "CREATE TABLE lines (id INTEGER PRIMARY KEY, qty INTEGER NOT NULL, price INTEGER NOT NULL, total INTEGER GENERATED ALWAYS AS (qty * price) STORED)")
+	run_done(t, store, "INSERT INTO lines (id, qty, price) VALUES (1, 2, 5)")
 	testing.expect_value(t, scalar(t, store, "SELECT total FROM lines WHERE id = 1").i, i64(10))
-	run(t, store, "UPDATE lines SET qty = 3 WHERE id = 1")
+	run_done(t, store, "UPDATE lines SET qty = 3 WHERE id = 1")
 	testing.expect_value(t, scalar(t, store, "SELECT total FROM lines WHERE id = 1").i, i64(15))
 	// A generated column cannot be written directly.
 	_, direct_insert := db.sql_execute(store, "INSERT INTO lines (id, qty, price, total) VALUES (2, 1, 1, 99)")
@@ -7996,7 +8007,7 @@ test_column_collation_and_generated :: proc(t: ^testing.T) {
 	if !testing.expectf(t, db.error_ok(reopen_err), "reopen: %s", reopen_err.message) do return
 	testing.expect_value(t, scalar(t, reopened, "SELECT count(*) FROM users WHERE name = 'ALiCe'").i, i64(1))
 	testing.expect_value(t, scalar(t, reopened, "SELECT total FROM lines WHERE id = 1").i, i64(15))
-	run(t, reopened, "UPDATE lines SET price = 10 WHERE id = 1")
+	run_done(t, reopened, "UPDATE lines SET price = 10 WHERE id = 1")
 	testing.expect_value(t, scalar(t, reopened, "SELECT total FROM lines WHERE id = 1").i, i64(30))
 	db.store_close(reopened)
 }
@@ -8009,10 +8020,10 @@ test_using_column_is_the_joins :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "using_column")
 	if store == nil do return
 	defer destroy_host(store, host, "using_column")
-	run(t, store, "CREATE TABLE v (a INT, b INT)")
-	run(t, store, "CREATE TABLE w (a INT, c INT)")
-	run(t, store, "INSERT INTO v VALUES (1, 2), (5, 6)")
-	run(t, store, "INSERT INTO w VALUES (1, 3), (7, 8)")
+	run_done(t, store, "CREATE TABLE v (a INT, b INT)")
+	run_done(t, store, "CREATE TABLE w (a INT, c INT)")
+	run_done(t, store, "INSERT INTO v VALUES (1, 2), (5, 6)")
+	run_done(t, store, "INSERT INTO w VALUES (1, 3), (7, 8)")
 	testing.expect_value(t, scalar(t, store, "SELECT a FROM v JOIN w USING (a)").i, i64(1))
 	testing.expect_value(t, scalar(t, store, "SELECT a FROM v NATURAL JOIN w").i, i64(1))
 	full := run(t, store, "SELECT a FROM v FULL JOIN w USING (a) ORDER BY a").rows
@@ -8197,11 +8208,11 @@ test_scalar_subquery_text_outlives_it :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "scalar_subquery_text")
 	if store == nil do return
 	defer destroy_host(store, host, "scalar_subquery_text")
-	run(t, store, "CREATE TABLE s (k INTEGER PRIMARY KEY, label TEXT)")
-	run(t, store, "INSERT INTO s VALUES (1, 'a'), (2, 'zz-the-largest-label-of-all-of-them'), (3, 'm')")
+	run_done(t, store, "CREATE TABLE s (k INTEGER PRIMARY KEY, label TEXT)")
+	run_done(t, store, "INSERT INTO s VALUES (1, 'a'), (2, 'zz-the-largest-label-of-all-of-them'), (3, 'm')")
 	testing.expect_value(t, scalar(t, store, "SELECT (SELECT max(label) FROM s) || '!'").s, "zz-the-largest-label-of-all-of-them!")
-	run(t, store, "UPDATE s SET label = (SELECT upper(max(label)) FROM s) WHERE k = 1")
-	run(t, store, "INSERT INTO s VALUES (4, 'filler-' || hex(randomblob(64)))")
+	run_done(t, store, "UPDATE s SET label = (SELECT upper(max(label)) FROM s) WHERE k = 1")
+	run_done(t, store, "INSERT INTO s VALUES (4, 'filler-' || hex(randomblob(64)))")
 	testing.expect_value(t, scalar(t, store, "SELECT label FROM s WHERE k = 1").s, "ZZ-THE-LARGEST-LABEL-OF-ALL-OF-THEM")
 }
 
@@ -8212,15 +8223,15 @@ test_attach_and_detach :: proc(t: ^testing.T) {
 	os.remove_all(other_path)
 	other, open_err := db.store_open(other_path, {persistent = true, create = true, durable = false})
 	if !testing.expectf(t, db.error_ok(open_err), "open other: %s", open_err.message) do return
-	run(t, other, "CREATE TABLE other_items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
-	run(t, other, "INSERT INTO other_items (id, name) VALUES (1, 'one'), (2, 'two')")
+	run_done(t, other, "CREATE TABLE other_items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+	run_done(t, other, "INSERT INTO other_items (id, name) VALUES (1, 'one'), (2, 'two')")
 	db.store_close(other)
 
 	store, host := fresh_host(t, "attach_principal")
 	if store == nil do return
 	// Closed below for the reopen, so the handles are released explicitly.
-	run(t, store, "CREATE TABLE mine (id INTEGER PRIMARY KEY, label TEXT NOT NULL)")
-	run(t, store, "INSERT INTO mine (id, label) VALUES (10, 'ten')")
+	run_done(t, store, "CREATE TABLE mine (id INTEGER PRIMARY KEY, label TEXT NOT NULL)")
+	run_done(t, store, "INSERT INTO mine (id, label) VALUES (10, 'ten')")
 
 	// A table of the attached database is readable through `name.table`.
 	attach_sql := fmt.aprintf("ATTACH '%s' AS side", other_path)
@@ -8255,19 +8266,19 @@ test_attach_and_detach :: proc(t: ^testing.T) {
 	// A write to one database reads the others, as SQLite resolves names
 	// across the connection: main's rows into side, side's into main, and
 	// side's own rows into side, all in the statement's transaction.
-	run(t, store, "CREATE TABLE side.copied (id INTEGER PRIMARY KEY, label TEXT)")
-	run(t, store, "INSERT INTO side.copied SELECT id, label FROM mine")
+	run_done(t, store, "CREATE TABLE side.copied (id INTEGER PRIMARY KEY, label TEXT)")
+	run_done(t, store, "INSERT INTO side.copied SELECT id, label FROM mine")
 	testing.expect_value(t, scalar(t, store, "SELECT label FROM side.copied WHERE id = 10").s, "ten")
-	run(t, store, "INSERT INTO side.copied SELECT id + 100, name FROM side.other_items WHERE id = 1")
+	run_done(t, store, "INSERT INTO side.copied SELECT id + 100, name FROM side.other_items WHERE id = 1")
 	testing.expect_value(t, scalar(t, store, "SELECT label FROM side.copied WHERE id = 101").s, "one")
-	run(t, store, "UPDATE side.copied SET label = (SELECT max(label) FROM mine) WHERE id = 101")
+	run_done(t, store, "UPDATE side.copied SET label = (SELECT max(label) FROM mine) WHERE id = 101")
 	testing.expect_value(t, scalar(t, store, "SELECT label FROM side.copied WHERE id = 101").s, "ten")
-	run(t, store, "INSERT INTO mine SELECT id + 1000, name FROM side.other_items")
+	run_done(t, store, "INSERT INTO mine SELECT id + 1000, name FROM side.other_items")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM mine").i, i64(4))
-	run(t, store, "DELETE FROM side.copied WHERE id IN (SELECT id FROM mine)")
+	run_done(t, store, "DELETE FROM side.copied WHERE id IN (SELECT id FROM mine)")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM side.copied").i, i64(1))
-	run(t, store, "DROP TABLE side.copied")
-	run(t, store, "DELETE FROM mine WHERE id > 1000")
+	run_done(t, store, "DROP TABLE side.copied")
+	run_done(t, store, "DELETE FROM mine WHERE id > 1000")
 
 	// The catalog survives a reopen of the principal.
 	db.store_close(store)
@@ -8346,8 +8357,8 @@ test_json_table_functions :: proc(t: ^testing.T) {
 	db.sql_result_destroy(&tree)
 
 	// The argument may be a column of a real table, materialized per statement.
-	run(t, store, "CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)")
-	run(t, store, `INSERT INTO docs (id, body) VALUES (1, '[10, 20]')`)
+	run_done(t, store, "CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)")
+	run_done(t, store, `INSERT INTO docs (id, body) VALUES (1, '[10, 20]')`)
 	joined := run(t, store, "SELECT docs.id, json_each.value FROM docs, json_each(docs.body) ORDER BY json_each.value")
 	testing.expect_value(t, len(joined.rows), 2)
 	testing.expect_value(t, joined.rows[0][1].i, i64(10))
@@ -8425,8 +8436,8 @@ test_like_glob_functions :: proc(t: ^testing.T) {
 	testing.expect(t, !row[3].b)
 	testing.expect(t, db.value_is_null(row[4]))
 	// The function form accepts columns and patterns from the table.
-	run(t, store, "CREATE TABLE files (name TEXT)")
-	run(t, store, "INSERT INTO files (name) VALUES ('alpha.txt'), ('beta.log')")
+	run_done(t, store, "CREATE TABLE files (name TEXT)")
+	run_done(t, store, "INSERT INTO files (name) VALUES ('alpha.txt'), ('beta.log')")
 	count := scalar(t, store, "SELECT count(*) FROM files WHERE glob('*.txt', name)")
 	testing.expect_value(t, count.i, i64(1))
 }
@@ -8436,9 +8447,9 @@ test_insert_select :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "insert_select")
 	if store == nil do return
 	defer destroy_host(store, host, "insert_select")
-	run(t, store, "CREATE TABLE src (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)")
-	run(t, store, "INSERT INTO src (name, qty) VALUES ('a', 1), ('b', 2), ('c', 3)")
-	run(t, store, "CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)")
+	run_done(t, store, "CREATE TABLE src (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)")
+	run_done(t, store, "INSERT INTO src (name, qty) VALUES ('a', 1), ('b', 2), ('c', 3)")
+	run_done(t, store, "CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)")
 	inserted := run(t, store, "INSERT INTO dst (name, qty) SELECT name, qty FROM src WHERE qty > 1")
 	testing.expect_value(t, inserted.affected, 2)
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM dst").i, i64(2))
@@ -8459,18 +8470,18 @@ test_upsert_excluded :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "upsert_excluded")
 	if store == nil do return
 	defer destroy_host(store, host, "upsert_excluded")
-	run(t, store, "CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT, hits INTEGER)")
-	run(t, store, "INSERT INTO u (name, hits) VALUES ('a', 1)")
+	run_done(t, store, "CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT, hits INTEGER)")
+	run_done(t, store, "INSERT INTO u (name, hits) VALUES ('a', 1)")
 	// `excluded.col` is the proposed row; `u.col` and a bare `col` are stored.
-	run(t, store, "INSERT INTO u (id, name, hits) VALUES (1, 'b', 5) ON CONFLICT (id) DO UPDATE SET name = excluded.name, hits = u.hits + excluded.hits")
+	run_done(t, store, "INSERT INTO u (id, name, hits) VALUES (1, 'b', 5) ON CONFLICT (id) DO UPDATE SET name = excluded.name, hits = u.hits + excluded.hits")
 	row := run(t, store, "SELECT name, hits FROM u").rows[0]
 	testing.expect_value(t, row[0].s, "b")
 	testing.expect_value(t, row[1].i, i64(6))
 	// A bare column still means the stored value.
-	run(t, store, "INSERT INTO u (id, name, hits) VALUES (1, 'c', 10) ON CONFLICT DO UPDATE SET hits = hits + 1")
+	run_done(t, store, "INSERT INTO u (id, name, hits) VALUES (1, 'c', 10) ON CONFLICT DO UPDATE SET hits = hits + 1")
 	testing.expect_value(t, scalar(t, store, "SELECT hits FROM u").i, i64(7))
 	// The proposed row is available to functions and operators.
-	run(t, store, "INSERT INTO u (id, name, hits) VALUES (1, 'd', 2) ON CONFLICT (id) DO UPDATE SET name = upper(excluded.name) || '!', hits = excluded.hits * 2")
+	run_done(t, store, "INSERT INTO u (id, name, hits) VALUES (1, 'd', 2) ON CONFLICT (id) DO UPDATE SET name = upper(excluded.name) || '!', hits = excluded.hits * 2")
 	row = run(t, store, "SELECT name, hits FROM u").rows[0]
 	testing.expect_value(t, row[0].s, "D!")
 	testing.expect_value(t, row[1].i, i64(4))
@@ -8481,8 +8492,8 @@ test_text_and_blob_functions :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "text_functions")
 	if store == nil do return
 	defer destroy_host(store, host, "text_functions")
-	run(t, store, "CREATE TABLE g (k TEXT, v INTEGER)")
-	run(t, store, "INSERT INTO g (k, v) VALUES ('a', 1), ('a', 2), ('b', NULL), ('b', 3)")
+	run_done(t, store, "CREATE TABLE g (k TEXT, v INTEGER)")
+	run_done(t, store, "INSERT INTO g (k, v) VALUES ('a', 1), ('a', 2), ('b', NULL), ('b', 3)")
 	// group_concat joins the non-null values of each group, in row order.
 	grouped := run(t, store, "SELECT k, group_concat(v), group_concat(v, '|') FROM g GROUP BY k ORDER BY k")
 	testing.expect_value(t, grouped.rows[0][1].s, "1,2")
@@ -8602,8 +8613,8 @@ test_open_in_memory_the_way_sqlite_does :: proc(t: ^testing.T) {
 			continue
 		}
 		testing.expect_value(t, store.persistent, false)
-		run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
-		run(t, store, "INSERT INTO t (id, v) VALUES (1, 'a')")
+		run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+		run_done(t, store, "INSERT INTO t (id, v) VALUES (1, 'a')")
 		testing.expect_value(t, scalar(t, store, "SELECT v FROM t WHERE id = 1").s, "a")
 		db.store_close(store)
 		// Nothing was written where a directory could have been made.
@@ -8613,7 +8624,7 @@ test_open_in_memory_the_way_sqlite_does :: proc(t: ^testing.T) {
 	}
 	// A database opened as memory is a fresh one each time.
 	first, _ := db.store_open(":memory:", {persistent = true, create = true})
-	run(t, first, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+	run_done(t, first, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
 	db.store_close(first)
 	second, _ := db.store_open(":memory:", {persistent = true, create = true})
 	defer db.store_close(second)
@@ -8693,8 +8704,8 @@ test_text_truth_is_numeric :: proc(t: ^testing.T) {
 	}
 	// CASE WHEN asks the same question, and so does a stored column.
 	testing.expect_value(t, scalar(t, store, `SELECT CASE WHEN 'a' THEN 1 ELSE 0 END`).i, i64(0))
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)")
-	run(t, store, "INSERT INTO t (id, s) VALUES (1, '1'), (2, 'a'), (3, '0')")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)")
+	run_done(t, store, "INSERT INTO t (id, s) VALUES (1, '1'), (2, 'a'), (3, '0')")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t WHERE s").i, i64(1))
 	// A number and a text are different storage classes: they are not equal,
 	// as in SQLite, unless a column's affinity converts one of them first.
@@ -8736,8 +8747,8 @@ test_insert_or_replace :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "replace")
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, u TEXT UNIQUE, v TEXT)")
-	run(t, store, "INSERT INTO t VALUES (1, 'a', 'x'), (2, 'b', 'y')")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, u TEXT UNIQUE, v TEXT)")
+	run_done(t, store, "INSERT INTO t VALUES (1, 'a', 'x'), (2, 'b', 'y')")
 
 	// A collision on the primary key replaces that row.
 	result := run(t, store, "INSERT OR REPLACE INTO t VALUES (1, 'c', 'z')")
@@ -8749,14 +8760,14 @@ test_insert_or_replace :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT changes()").i, i64(1))
 
 	// A collision on a unique index deletes the row that held the value.
-	run(t, store, "INSERT OR REPLACE INTO t VALUES (3, 'b', 'w')")
+	run_done(t, store, "INSERT OR REPLACE INTO t VALUES (3, 'b', 'w')")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t").i, i64(2))
 	testing.expect_value(t, scalar(t, store, "SELECT id FROM t WHERE u = 'b'").i, i64(3))
 
 	// A row can collide under two indexes at once: both rows go, one arrives.
-	run(t, store, "CREATE TABLE two (id INTEGER PRIMARY KEY, u TEXT UNIQUE, v TEXT)")
-	run(t, store, "INSERT INTO two VALUES (1, 'a', 'x'), (2, 'b', 'y')")
-	run(t, store, "INSERT OR REPLACE INTO two VALUES (1, 'b', 'z')")
+	run_done(t, store, "CREATE TABLE two (id INTEGER PRIMARY KEY, u TEXT UNIQUE, v TEXT)")
+	run_done(t, store, "INSERT INTO two VALUES (1, 'a', 'x'), (2, 'b', 'y')")
+	run_done(t, store, "INSERT OR REPLACE INTO two VALUES (1, 'b', 'z')")
 	rows := run(t, store, "SELECT id, u, v FROM two")
 	testing.expect_value(t, len(rows.rows), 1)
 	testing.expect_value(t, rows.rows[0][0].i, i64(1))
@@ -8772,13 +8783,13 @@ test_insert_or_replace :: proc(t: ^testing.T) {
 
 	// A delete trigger does not fire for the rows REPLACE removes, which is
 	// SQLite's behaviour with recursive triggers off.
-	run(t, store, "CREATE TABLE audited (id INTEGER PRIMARY KEY, v TEXT)")
-	run(t, store, "CREATE TABLE audit (note TEXT)")
+	run_done(t, store, "CREATE TABLE audited (id INTEGER PRIMARY KEY, v TEXT)")
+	run_done(t, store, "CREATE TABLE audit (note TEXT)")
 	run(t, store, `
 		CREATE TRIGGER audited_del BEFORE DELETE ON audited
 		BEGIN INSERT INTO audit (note) VALUES ('deleted'); END`)
-	run(t, store, "INSERT INTO audited VALUES (1, 'old')")
-	run(t, store, "INSERT OR REPLACE INTO audited VALUES (1, 'new')")
+	run_done(t, store, "INSERT INTO audited VALUES (1, 'old')")
+	run_done(t, store, "INSERT OR REPLACE INTO audited VALUES (1, 'new')")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM audit").i, i64(0))
 	testing.expect_value(t, scalar(t, store, "SELECT v FROM audited WHERE id = 1").s, "new")
 
@@ -8833,19 +8844,19 @@ test_changes_and_last_insert_rowid :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "changes_rowid")
 	if store == nil do return
 	defer destroy_host(store, host, "changes_rowid")
-	run(t, store, "CREATE TABLE c (id INTEGER PRIMARY KEY, n TEXT)")
-	run(t, store, "INSERT INTO c (n) VALUES ('a'), ('b'), ('c')")
+	run_done(t, store, "CREATE TABLE c (id INTEGER PRIMARY KEY, n TEXT)")
+	run_done(t, store, "INSERT INTO c (n) VALUES ('a'), ('b'), ('c')")
 	testing.expect_value(t, scalar(t, store, "SELECT changes()").i, i64(3))
 	testing.expect_value(t, scalar(t, store, "SELECT last_insert_rowid()").i, i64(3))
 	testing.expect_value(t, scalar(t, store, "SELECT total_changes()").i, i64(3))
 	// An update reports its own count and leaves the last row id alone.
-	run(t, store, "UPDATE c SET n = 'z' WHERE id <= 2")
+	run_done(t, store, "UPDATE c SET n = 'z' WHERE id <= 2")
 	testing.expect_value(t, scalar(t, store, "SELECT changes()").i, i64(2))
 	testing.expect_value(t, scalar(t, store, "SELECT last_insert_rowid()").i, i64(3))
 	testing.expect_value(t, scalar(t, store, "SELECT total_changes()").i, i64(5))
 	// A select does not reset the count.
 	testing.expect_value(t, scalar(t, store, "SELECT changes()").i, i64(2))
-	run(t, store, "DELETE FROM c")
+	run_done(t, store, "DELETE FROM c")
 	testing.expect_value(t, scalar(t, store, "SELECT changes()").i, i64(3))
 	testing.expect_value(t, scalar(t, store, "SELECT total_changes()").i, i64(8))
 }
@@ -8855,7 +8866,7 @@ test_savepoints :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "savepoints")
 	if store == nil do return
 	defer destroy_host(store, host, "savepoints")
-	run(t, store, "CREATE TABLE s (id INTEGER PRIMARY KEY, n TEXT)")
+	run_done(t, store, "CREATE TABLE s (id INTEGER PRIMARY KEY, n TEXT)")
 
 	count_in :: proc(t: ^testing.T, tx: ^db.Tx, sql: string) -> i64 {
 		result, err := db.sql_execute_in_tx(tx, sql)
@@ -8903,8 +8914,8 @@ test_common_table_expressions :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "ctes")
 	if store == nil do return
 	defer destroy_host(store, host, "ctes")
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, n TEXT, v INTEGER)")
-	run(t, store, "INSERT INTO t (n, v) VALUES ('a', 1), ('b', 2), ('c', 3)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, n TEXT, v INTEGER)")
+	run_done(t, store, "INSERT INTO t (n, v) VALUES ('a', 1), ('b', 2), ('c', 3)")
 
 	big := run(t, store, "WITH big AS (SELECT * FROM t WHERE v > 1) SELECT n FROM big ORDER BY n")
 	testing.expect_value(t, len(big.rows), 2)
@@ -8932,8 +8943,8 @@ test_union_queries :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "union")
 	if store == nil do return
 	defer destroy_host(store, host, "union")
-	run(t, store, "CREATE TABLE a (x INTEGER)")
-	run(t, store, "INSERT INTO a (x) VALUES (1), (2), (3)")
+	run_done(t, store, "CREATE TABLE a (x INTEGER)")
+	run_done(t, store, "INSERT INTO a (x) VALUES (1), (2), (3)")
 
 	// UNION drops duplicates; UNION ALL keeps them.
 	deduped := run(t, store, "SELECT x FROM a WHERE x <= 2 UNION SELECT x FROM a WHERE x >= 2")
@@ -8976,8 +8987,8 @@ test_collate_expressions :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "collate")
 	if store == nil do return
 	defer destroy_host(store, host, "collate")
-	run(t, store, "CREATE TABLE p (name TEXT)")
-	run(t, store, "INSERT INTO p (name) VALUES ('Alice'), ('alice'), ('ALICE'), ('Bob'), ('pad '), ('pad')")
+	run_done(t, store, "CREATE TABLE p (name TEXT)")
+	run_done(t, store, "INSERT INTO p (name) VALUES ('Alice'), ('alice'), ('ALICE'), ('Bob'), ('pad '), ('pad')")
 
 	// BINARY is the default: it compares bytes, so case matters.
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM p WHERE name = 'alice'").i, i64(1))
@@ -9005,22 +9016,22 @@ test_collate_expressions :: proc(t: ^testing.T) {
 test_alter_table_rename :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "rename_table")
 	if store == nil do return
-	run(t, store, "CREATE TABLE old (id INTEGER PRIMARY KEY, n TEXT)")
-	run(t, store, "INSERT INTO old (n) VALUES ('a'), ('b')")
-	run(t, store, "ALTER TABLE old RENAME TO fresh")
+	run_done(t, store, "CREATE TABLE old (id INTEGER PRIMARY KEY, n TEXT)")
+	run_done(t, store, "INSERT INTO old (n) VALUES ('a'), ('b')")
+	run_done(t, store, "ALTER TABLE old RENAME TO fresh")
 
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM fresh").i, i64(2))
 	_, missing := db.sql_execute(store, "SELECT * FROM old")
 	testing.expect_value(t, missing.kind, db.Error_Kind.Table_Not_Found)
 	// A second rename continues from the new name.
-	run(t, store, "ALTER TABLE fresh RENAME TO again")
+	run_done(t, store, "ALTER TABLE fresh RENAME TO again")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM again").i, i64(2))
 	// A name in use is rejected.
-	run(t, store, "CREATE TABLE other (x INTEGER)")
+	run_done(t, store, "CREATE TABLE other (x INTEGER)")
 	_, clash := db.sql_execute(store, "ALTER TABLE again RENAME TO other")
 	testing.expect_value(t, clash.kind, db.Error_Kind.Table_Exists)
 	// The renamed table keeps inserting and numbering rows.
-	run(t, store, "INSERT INTO again (n) VALUES ('c')")
+	run_done(t, store, "INSERT INTO again (n) VALUES ('c')")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM again").i, i64(3))
 
 	// The rename survives a reopen through the log.
@@ -9039,10 +9050,10 @@ test_update_from_delete_using :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "update_from")
 	if store == nil do return
 	defer destroy_host(store, host, "update_from")
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, price INTEGER, tag TEXT)")
-	run(t, store, "CREATE TABLE src (id INTEGER, factor INTEGER, note TEXT)")
-	run(t, store, "INSERT INTO t (price, tag) VALUES (10, 'a'), (20, 'b'), (30, 'c')")
-	run(t, store, "INSERT INTO src (id, factor, note) VALUES (1, 2, 'x'), (3, 4, 'y')")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, price INTEGER, tag TEXT)")
+	run_done(t, store, "CREATE TABLE src (id INTEGER, factor INTEGER, note TEXT)")
+	run_done(t, store, "INSERT INTO t (price, tag) VALUES (10, 'a'), (20, 'b'), (30, 'c')")
+	run_done(t, store, "INSERT INTO src (id, factor, note) VALUES (1, 2, 'x'), (3, 4, 'y')")
 
 	// The joined row feeds both the WHERE and the assignments.
 	updated := run(t, store, "UPDATE t SET price = price * src.factor, tag = src.note FROM src WHERE t.id = src.id")
@@ -9098,8 +9109,8 @@ test_date_time_functions :: proc(t: ^testing.T) {
 	testing.expect(t, db.value_is_null(scalar(t, store, "SELECT date('not a date')")))
 	testing.expect(t, db.value_is_null(scalar(t, store, "SELECT date(NULL)")))
 	// The functions read columns too.
-	run(t, store, "CREATE TABLE events (at TEXT)")
-	run(t, store, "INSERT INTO events (at) VALUES ('2024-03-05 14:23:07'), ('2023-12-31')")
+	run_done(t, store, "CREATE TABLE events (at TEXT)")
+	run_done(t, store, "INSERT INTO events (at) VALUES ('2024-03-05 14:23:07'), ('2023-12-31')")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM events WHERE date(at) = '2023-12-31'").i, i64(1))
 	testing.expect_value(t, scalar(t, store, "SELECT max(strftime('%Y', at)) FROM events").s, "2024")
 }
@@ -9200,8 +9211,8 @@ test_json_functions :: proc(t: ^testing.T) {
 	_, malformed := db.sql_execute(store, `SELECT json('{bad')`)
 	testing.expect_value(t, malformed.kind, db.Error_Kind.Invalid_Argument)
 	// The functions read columns.
-	run(t, store, "CREATE TABLE docs (body TEXT)")
-	run(t, store, `INSERT INTO docs (body) VALUES ('{"n":1}'), ('{"n":2}')`)
+	run_done(t, store, "CREATE TABLE docs (body TEXT)")
+	run_done(t, store, `INSERT INTO docs (body) VALUES ('{"n":1}'), ('{"n":2}')`)
 	testing.expect_value(t, scalar(t, store, `SELECT sum(json_extract(body, '$.n')) FROM docs`).i, i64(3))
 	// Mutators: set, replace (only existing paths) and remove.
 	testing.expect_value(t, scalar(t, store, `SELECT json_set('{"a":1}', '$.a', 2, '$.b', 'x')`).s, `{"a":2,"b":"x"}`)
@@ -9222,29 +9233,29 @@ test_strict_table_option :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer destroy_host(store, host, "strict_tables")
 	// STRICT is accepted; the declared types are already enforced.
-	run(t, store, "CREATE TABLE s (id INTEGER PRIMARY KEY, n TEXT NOT NULL) STRICT")
-	run(t, store, "INSERT INTO s (n) VALUES ('x')")
+	run_done(t, store, "CREATE TABLE s (id INTEGER PRIMARY KEY, n TEXT NOT NULL) STRICT")
+	run_done(t, store, "INSERT INTO s (n) VALUES ('x')")
 	testing.expect_value(t, scalar(t, store, "SELECT n FROM s").s, "x")
 	_, not_null := db.sql_execute(store, "INSERT INTO s (n) VALUES (NULL)")
 	testing.expect_value(t, not_null.kind, db.Error_Kind.Not_Null_Violation)
 	// A STRICT table refuses a value its column cannot convert, in SQLite's words.
-	run(t, store, "CREATE TABLE si (i INTEGER) STRICT")
+	run_done(t, store, "CREATE TABLE si (i INTEGER) STRICT")
 	refused := run_error(t, store, "INSERT INTO si VALUES ('abc')")
 	testing.expect_value(t, refused.kind, db.Error_Kind.Check_Violation)
 	testing.expect(t, strings.contains(refused.message, "cannot store TEXT value in INTEGER column si.i"))
 	_, unknown := db.sql_execute(store, "CREATE TABLE sv (x VARCHAR) STRICT")
 	testing.expect(t, !db.error_ok(unknown))
 	// WITHOUT ROWID: the primary key is the identity, and rowid names nothing.
-	run(t, store, "CREATE TABLE w (id INTEGER PRIMARY KEY, v TEXT) WITHOUT ROWID")
-	run(t, store, "INSERT INTO w VALUES (2, 'b'), (1, 'a')")
+	run_done(t, store, "CREATE TABLE w (id INTEGER PRIMARY KEY, v TEXT) WITHOUT ROWID")
+	run_done(t, store, "INSERT INTO w VALUES (2, 'b'), (1, 'a')")
 	testing.expect_value(t, scalar(t, store, "SELECT v FROM w WHERE id = 1").s, "a")
 	_, rowid := db.sql_execute(store, "SELECT rowid FROM w")
 	testing.expect_value(t, rowid.kind, db.Error_Kind.Column_Not_Found)
 	_, keyless := db.sql_execute(store, "CREATE TABLE nk (v TEXT) WITHOUT ROWID")
 	testing.expect(t, !db.error_ok(keyless))
 	// SQLite walks a WITHOUT ROWID table in its key's order, so does a scan here.
-	run(t, store, "CREATE TABLE z (x, y, z, PRIMARY KEY (z, x)) WITHOUT ROWID")
-	run(t, store, "INSERT INTO z VALUES ('x1', 'y1', 2), ('x0', 'y2', 2), ('x9', 'y3', 1)")
+	run_done(t, store, "CREATE TABLE z (x, y, z, PRIMARY KEY (z, x)) WITHOUT ROWID")
+	run_done(t, store, "INSERT INTO z VALUES ('x1', 'y1', 2), ('x0', 'y2', 2), ('x9', 'y3', 1)")
 	scanned := run(t, store, "SELECT x FROM z").rows
 	testing.expect_value(t, len(scanned), 3)
 	if len(scanned) == 3 {
@@ -9262,22 +9273,22 @@ test_create_table_as_select :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "create_table_as")
 	if store == nil do return
 	defer destroy_host(store, host, "create_table_as")
-	run(t, store, "CREATE TABLE t (a INTEGER, b TEXT, c REAL, d, e NUMERIC)")
-	run(t, store, "INSERT INTO t VALUES (1, 'x', 1.5, 'any', 3), (2, 'y', 2.5, 7, 4)")
-	run(t, store, "CREATE TABLE v AS SELECT a, b FROM t")
+	run_done(t, store, "CREATE TABLE t (a INTEGER, b TEXT, c REAL, d, e NUMERIC)")
+	run_done(t, store, "INSERT INTO t VALUES (1, 'x', 1.5, 'any', 3), (2, 'y', 2.5, 7, 4)")
+	run_done(t, store, "CREATE TABLE v AS SELECT a, b FROM t")
 	testing.expect_value(t, scalar(t, store, "SELECT sql FROM sqlite_schema WHERE name = 'v'").s, "CREATE TABLE v(a INT,b TEXT)")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM v").i, i64(2))
-	run(t, store, "CREATE TABLE w AS SELECT *, a + 1 AS plus, CAST(a AS TEXT) AS ct, a AS \"select\", b AS a FROM t WHERE a = 2")
+	run_done(t, store, "CREATE TABLE w AS SELECT *, a + 1 AS plus, CAST(a AS TEXT) AS ct, a AS \"select\", b AS a FROM t WHERE a = 2")
 	testing.expect_value(
 		t,
 		scalar(t, store, "SELECT sql FROM sqlite_schema WHERE name = 'w'").s,
 		"CREATE TABLE w(\n  a INT,\n  b TEXT,\n  c REAL,\n  d,\n  e NUM,\n  plus,\n  ct TEXT,\n  \"select\" INT,\n  \"a:1\" TEXT\n)",
 	)
 	testing.expect_value(t, scalar(t, store, "SELECT \"a:1\" FROM w").s, "y")
-	run(t, store, "CREATE TABLE e AS SELECT a FROM t WHERE 0")
+	run_done(t, store, "CREATE TABLE e AS SELECT a FROM t WHERE 0")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM e").i, i64(0))
 	// IF NOT EXISTS leaves an existing table alone; without it, the name is taken.
-	run(t, store, "CREATE TABLE IF NOT EXISTS v AS SELECT 1")
+	run_done(t, store, "CREATE TABLE IF NOT EXISTS v AS SELECT 1")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM v").i, i64(2))
 	_, taken := db.sql_execute(store, "CREATE TABLE v AS SELECT 1")
 	testing.expect_value(t, taken.kind, db.Error_Kind.Table_Exists)
@@ -9291,8 +9302,8 @@ test_bare_columns_follow_min_max :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "bare_min_max")
 	if store == nil do return
 	defer destroy_host(store, host, "bare_min_max")
-	run(t, store, "CREATE TABLE t (g INT, a INT, b TEXT)")
-	run(t, store, "INSERT INTO t VALUES (1, 1, 'x'), (1, 5, 'y'), (1, 3, 'z'), (2, NULL, 'n'), (2, 7, 'q'), (2, 7, 'r'), (3, NULL, 'o1'), (3, NULL, 'o2')")
+	run_done(t, store, "CREATE TABLE t (g INT, a INT, b TEXT)")
+	run_done(t, store, "INSERT INTO t VALUES (1, 1, 'x'), (1, 5, 'y'), (1, 3, 'z'), (2, NULL, 'n'), (2, 7, 'q'), (2, 7, 'r'), (3, NULL, 'o1'), (3, NULL, 'o2')")
 	testing.expect_value(t, scalar(t, store, "SELECT b FROM (SELECT max(a), b FROM t)").s, "q")
 	testing.expect_value(t, scalar(t, store, "SELECT b FROM (SELECT min(a), b FROM t)").s, "x")
 	grouped := run(t, store, "SELECT g, max(a), b FROM t GROUP BY g ORDER BY g").rows
@@ -9312,9 +9323,9 @@ test_bare_columns_follow_min_max :: proc(t: ^testing.T) {
 test_alter_table_drop_column :: proc(t: ^testing.T) {
 	store, host := fresh_host(t, "drop_column")
 	if store == nil do return
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INTEGER, c TEXT)")
-	run(t, store, "INSERT INTO t (a, b, c) VALUES ('x', 10, 'y'), ('z', 20, 'w')")
-	run(t, store, "ALTER TABLE t DROP COLUMN b")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INTEGER, c TEXT)")
+	run_done(t, store, "INSERT INTO t (a, b, c) VALUES ('x', 10, 'y'), ('z', 20, 'w')")
+	run_done(t, store, "ALTER TABLE t DROP COLUMN b")
 	rows := run(t, store, "SELECT id, a, c FROM t ORDER BY id").rows
 	testing.expect_value(t, len(rows), 2)
 	testing.expect_value(t, rows[0][1].s, "x")
@@ -9322,7 +9333,7 @@ test_alter_table_drop_column :: proc(t: ^testing.T) {
 	testing.expect_value(t, rows[1][1].s, "z")
 	testing.expect_value(t, rows[1][2].s, "w")
 	// The table keeps working with the new shape.
-	run(t, store, "INSERT INTO t (a, c) VALUES ('q', 'r')")
+	run_done(t, store, "INSERT INTO t (a, c) VALUES ('q', 'r')")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t").i, i64(3))
 	testing.expect_value(t, scalar(t, store, "SELECT c FROM t WHERE a = 'q'").s, "r")
 	// Key and unique columns cannot be dropped.
@@ -9330,9 +9341,9 @@ test_alter_table_drop_column :: proc(t: ^testing.T) {
 	testing.expect_value(t, key_err.kind, db.Error_Kind.Sql_Unsupported)
 	// An index on other columns stays, as in SQLite; one on the column blocks
 	// the drop.
-	run(t, store, "CREATE TABLE indexed (id INTEGER PRIMARY KEY, a TEXT, b TEXT)")
-	run(t, store, "CREATE UNIQUE INDEX indexed_a ON indexed (a)")
-	run(t, store, "INSERT INTO indexed (id, a, b) VALUES (1, 'x', 'y')")
+	run_done(t, store, "CREATE TABLE indexed (id INTEGER PRIMARY KEY, a TEXT, b TEXT)")
+	run_done(t, store, "CREATE UNIQUE INDEX indexed_a ON indexed (a)")
+	run_done(t, store, "INSERT INTO indexed (id, a, b) VALUES (1, 'x', 'y')")
 	_, indexed_err := db.sql_execute(store, "ALTER TABLE indexed DROP COLUMN b")
 	testing.expect_value(t, indexed_err.kind, db.Error_Kind.None)
 	testing.expect_value(t, run_error(t, store, "INSERT INTO indexed (id, a) VALUES (2, 'x')").kind, db.Error_Kind.Duplicate_Unique)
@@ -9356,11 +9367,11 @@ test_alter_table_drop_column :: proc(t: ^testing.T) {
 test_vacuum_into :: proc(t: ^testing.T) {
 	store := fresh_db(t, "vacuum_source")
 	if store == nil do return
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)")
-	run(t, store, "INSERT INTO t (a) VALUES ('x'), ('y'), ('z')")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)")
+	run_done(t, store, "INSERT INTO t (a) VALUES ('x'), ('y'), ('z')")
 	target := "_test_vacuum_copy"
 	os.remove_all(target)
-	run(t, store, "VACUUM INTO './_test_vacuum_copy'")
+	run_done(t, store, "VACUUM INTO './_test_vacuum_copy'")
 	// The copy is a database of its own: it reads and takes new commits.
 	copy_store, open_err := db.store_open(target, {persistent = true, create = false, durable = false})
 	if !testing.expectf(t, db.error_ok(open_err), "open the copy failed: %s", open_err.message) {
@@ -9369,14 +9380,14 @@ test_vacuum_into :: proc(t: ^testing.T) {
 	}
 	testing.expect_value(t, scalar(t, copy_store, "SELECT count(*) FROM t").i, i64(3))
 	testing.expect_value(t, scalar(t, copy_store, "SELECT a FROM t WHERE id = 3").s, "z")
-	run(t, copy_store, "INSERT INTO t (a) VALUES ('copy')")
+	run_done(t, copy_store, "INSERT INTO t (a) VALUES ('copy')")
 	testing.expect_value(t, scalar(t, copy_store, "SELECT count(*) FROM t").i, i64(4))
 	// The original is untouched, and an existing target is refused.
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t").i, i64(3))
 	_, exists_err := db.sql_execute(store, "VACUUM INTO './_test_vacuum_copy'")
 	testing.expect_value(t, exists_err.kind, db.Error_Kind.Io)
 	// A plain VACUUM compacts the live log and keeps the data.
-	run(t, store, "VACUUM")
+	run_done(t, store, "VACUUM")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t").i, i64(3))
 	cleanup_db(copy_store, "vacuum_copy")
 	cleanup_db(store, "vacuum_source")
@@ -9386,10 +9397,10 @@ test_vacuum_into :: proc(t: ^testing.T) {
 test_sqlite_export_deterministic :: proc(t: ^testing.T) {
 	store := fresh_db(t, "export_det")
 	if store == nil do return
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INTEGER, c REAL, d BLOB)")
-	run(t, store, "CREATE UNIQUE INDEX t_a ON t (a)")
-	run(t, store, "INSERT INTO t (a, b, c, d) VALUES ('x', 1, 1.5, x'00ff'), ('y', NULL, -2.25, NULL)")
-	run(t, store, "INSERT INTO t (a, b) VALUES ('z', 9223372036854775807)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INTEGER, c REAL, d BLOB)")
+	run_done(t, store, "CREATE UNIQUE INDEX t_a ON t (a)")
+	run_done(t, store, "INSERT INTO t (a, b, c, d) VALUES ('x', 1, 1.5, x'00ff'), ('y', NULL, -2.25, NULL)")
+	run_done(t, store, "INSERT INTO t (a, b) VALUES ('z', 9223372036854775807)")
 
 	first := "_test_export_a.sqlite"
 	second := "_test_export_b.sqlite"
@@ -9431,8 +9442,8 @@ test_sqlite_export_deterministic :: proc(t: ^testing.T) {
 test_window_functions :: proc(t: ^testing.T) {
 	store := fresh_db(t, "windows")
 	if store == nil do return
-	run(t, store, "CREATE TABLE s (id INTEGER PRIMARY KEY, g TEXT, n INTEGER)")
-	run(t, store, "INSERT INTO s (g, n) VALUES ('a', 10), ('a', 20), ('b', 5), ('b', 5), ('b', 7)")
+	run_done(t, store, "CREATE TABLE s (id INTEGER PRIMARY KEY, g TEXT, n INTEGER)")
+	run_done(t, store, "INSERT INTO s (g, n) VALUES ('a', 10), ('a', 20), ('b', 5), ('b', 5), ('b', 7)")
 
 	// row_number follows the window ORDER BY, which may be descending.
 	numbered := run(t, store, "SELECT id, row_number() OVER (ORDER BY id DESC) AS rn FROM s ORDER BY id").rows
@@ -9509,57 +9520,57 @@ test_window_functions :: proc(t: ^testing.T) {
 test_triggers :: proc(t: ^testing.T) {
 	store := fresh_db(t, "triggers")
 	if store == nil do return
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)")
-	run(t, store, "CREATE TABLE audit (id INTEGER PRIMARY KEY, note TEXT)")
-	run(t, store, "CREATE TRIGGER t_ins AFTER INSERT ON t FOR EACH ROW BEGIN INSERT INTO audit (note) VALUES ('in:' || NEW.a); INSERT INTO audit (note) VALUES ('count:' || (SELECT count(*) FROM t)); END")
-	run(t, store, "CREATE TRIGGER t_upd AFTER UPDATE ON t BEGIN INSERT INTO audit (note) VALUES (OLD.a || '>' || NEW.a); END")
-	run(t, store, "CREATE TRIGGER t_del AFTER DELETE ON t BEGIN INSERT INTO audit (note) VALUES ('del:' || OLD.a); END")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)")
+	run_done(t, store, "CREATE TABLE audit (id INTEGER PRIMARY KEY, note TEXT)")
+	run_done(t, store, "CREATE TRIGGER t_ins AFTER INSERT ON t FOR EACH ROW BEGIN INSERT INTO audit (note) VALUES ('in:' || NEW.a); INSERT INTO audit (note) VALUES ('count:' || (SELECT count(*) FROM t)); END")
+	run_done(t, store, "CREATE TRIGGER t_upd AFTER UPDATE ON t BEGIN INSERT INTO audit (note) VALUES (OLD.a || '>' || NEW.a); END")
+	run_done(t, store, "CREATE TRIGGER t_del AFTER DELETE ON t BEGIN INSERT INTO audit (note) VALUES ('del:' || OLD.a); END")
 
-	run(t, store, "INSERT INTO t (a) VALUES ('x'), ('y')")
+	run_done(t, store, "INSERT INTO t (a) VALUES ('x'), ('y')")
 	notes := run(t, store, "SELECT note FROM audit ORDER BY id").rows
 	testing.expect_value(t, len(notes), 4)
 	testing.expect_value(t, notes[0][0].s, "in:x")
 	testing.expect_value(t, notes[1][0].s, "count:1")
 	testing.expect_value(t, notes[2][0].s, "in:y")
 	testing.expect_value(t, notes[3][0].s, "count:2")
-	run(t, store, "UPDATE t SET a = 'z' WHERE id = 1")
-	run(t, store, "DELETE FROM t WHERE id = 2")
+	run_done(t, store, "UPDATE t SET a = 'z' WHERE id = 1")
+	run_done(t, store, "DELETE FROM t WHERE id = 2")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM audit").i, i64(6))
 	testing.expect_value(t, scalar(t, store, "SELECT note FROM audit WHERE id = 5").s, "x>z")
 	testing.expect_value(t, scalar(t, store, "SELECT note FROM audit WHERE id = 6").s, "del:y")
 
 	// Dropping the trigger stops it.
-	run(t, store, "DROP TRIGGER t_ins")
-	run(t, store, "INSERT INTO t (a) VALUES ('quiet')")
+	run_done(t, store, "DROP TRIGGER t_ins")
+	run_done(t, store, "INSERT INTO t (a) VALUES ('quiet')")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM audit").i, i64(6))
 	missing := run_error(t, store, "DROP TRIGGER t_ins")
 	testing.expect_value(t, missing.kind, db.Error_Kind.Table_Not_Found)
-	run(t, store, "DROP TRIGGER IF EXISTS t_ins")
+	run_done(t, store, "DROP TRIGGER IF EXISTS t_ins")
 
 	// BEFORE triggers are modelled too (their order is covered by test_before_triggers);
 	// this one is created and dropped before it can fire, so the counts below stay.
 	before := run_error(t, store, "CREATE TRIGGER b BEFORE INSERT ON t BEGIN INSERT INTO audit (note) VALUES ('no'); END")
 	testing.expect(t, db.error_ok(before))
-	run(t, store, "DROP TRIGGER b")
+	run_done(t, store, "DROP TRIGGER b")
 	// WHEN is accepted (the condition itself is covered by test_trigger_when).
-	run(t, store, "CREATE TRIGGER w AFTER INSERT ON t WHEN NEW.a = 'x' BEGIN INSERT INTO audit (note) VALUES ('when'); END")
-	run(t, store, "DROP TRIGGER w")
+	run_done(t, store, "CREATE TRIGGER w AFTER INSERT ON t WHEN NEW.a = 'x' BEGIN INSERT INTO audit (note) VALUES ('when'); END")
+	run_done(t, store, "DROP TRIGGER w")
 
 	// Triggers live in the log, so a reopen keeps them.
 	db.store_close(store)
 	reopened, open_err := db.store_open("_test_triggers", {persistent = true, create = false, durable = false})
 	if !testing.expectf(t, db.error_ok(open_err), "reopen failed: %s", open_err.message) do return
 	// The insert trigger was dropped, so a new row only fires the update one.
-	run(t, reopened, "INSERT INTO t (a) VALUES ('after')")
+	run_done(t, reopened, "INSERT INTO t (a) VALUES ('after')")
 	testing.expect_value(t, scalar(t, reopened, "SELECT count(*) FROM audit").i, i64(6))
-	run(t, reopened, "UPDATE t SET a = 'after2' WHERE a = 'after'")
+	run_done(t, reopened, "UPDATE t SET a = 'after2' WHERE a = 'after'")
 	testing.expect_value(t, scalar(t, reopened, "SELECT count(*) FROM audit").i, i64(7))
 	testing.expect_value(t, scalar(t, reopened, "SELECT note FROM audit WHERE id = 7").s, "after>after2")
 
 	// A trigger that fires itself is stopped by the depth limit, and the whole
 	// statement rolls back.
-	run(t, reopened, "CREATE TABLE r (id INTEGER PRIMARY KEY, n INTEGER)")
-	run(t, reopened, "CREATE TRIGGER r_self AFTER INSERT ON r BEGIN INSERT INTO r (n) VALUES (NEW.n + 1); END")
+	run_done(t, reopened, "CREATE TABLE r (id INTEGER PRIMARY KEY, n INTEGER)")
+	run_done(t, reopened, "CREATE TRIGGER r_self AFTER INSERT ON r BEGIN INSERT INTO r (n) VALUES (NEW.n + 1); END")
 	recursive := run_error(t, reopened, "INSERT INTO r (n) VALUES (0)")
 	testing.expect_value(t, recursive.kind, db.Error_Kind.Sql_Unsupported)
 	testing.expect_value(t, scalar(t, reopened, "SELECT count(*) FROM r").i, i64(0))
@@ -9580,8 +9591,8 @@ test_log_on_memory_vfs :: proc(t: ^testing.T) {
 	}
 	store, open_err := db.store_open("virtual/memdb", options)
 	if !testing.expectf(t, db.error_ok(open_err), "open failed: %s", open_err.message) do return
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)")
-	run(t, store, "INSERT INTO t (a) VALUES ('x'), ('y')")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)")
+	run_done(t, store, "INSERT INTO t (a) VALUES ('x'), ('y')")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t").i, i64(2))
 	db.store_close(store)
 
@@ -9621,23 +9632,23 @@ test_log_on_memory_vfs :: proc(t: ^testing.T) {
 test_roles_and_permissions :: proc(t: ^testing.T) {
 	store := fresh_db(t, "roles")
 	if store == nil do return
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)")
 	// Without a grant catalog every write stays open.
-	run(t, store, "INSERT INTO t (a) VALUES ('one')")
+	run_done(t, store, "INSERT INTO t (a) VALUES ('one')")
 
-	run(t, store, "GRANT insert ON t TO writer")
+	run_done(t, store, "GRANT insert ON t TO writer")
 	denied := run_error(t, store, "INSERT INTO t (a) VALUES ('two')")
 	testing.expect_value(t, denied.kind, db.Error_Kind.Permission_Denied)
-	run(t, store, "GRANT writer TO '*'")
-	run(t, store, "INSERT INTO t (a) VALUES ('two')")
-	run(t, store, "REVOKE writer FROM '*'")
+	run_done(t, store, "GRANT writer TO '*'")
+	run_done(t, store, "INSERT INTO t (a) VALUES ('two')")
+	run_done(t, store, "REVOKE writer FROM '*'")
 	again := run_error(t, store, "INSERT INTO t (a) VALUES ('three')")
 	testing.expect_value(t, again.kind, db.Error_Kind.Permission_Denied)
 
 	// Each action needs its own grant.
-	run(t, store, "GRANT update ON t TO editor")
-	run(t, store, "GRANT editor TO '*'")
-	run(t, store, "UPDATE t SET a = 'changed' WHERE a = 'two'")
+	run_done(t, store, "GRANT update ON t TO editor")
+	run_done(t, store, "GRANT editor TO '*'")
+	run_done(t, store, "UPDATE t SET a = 'changed' WHERE a = 'two'")
 	no_delete := run_error(t, store, "DELETE FROM t WHERE a = 'changed'")
 	testing.expect_value(t, no_delete.kind, db.Error_Kind.Permission_Denied)
 	testing.expect_value(t, scalar(t, store, "SELECT has_role('editor')").b, true)
@@ -9646,7 +9657,7 @@ test_roles_and_permissions :: proc(t: ^testing.T) {
 	// A role granted to one identity only matches that identity.
 	identity := db.Identity{}
 	db.store_set_identity(store, identity)
-	run(t, store, "GRANT admin TO '0000000000000000000000000000000000000000000000000000000000000000'")
+	run_done(t, store, "GRANT admin TO '0000000000000000000000000000000000000000000000000000000000000000'")
 	testing.expect_value(t, scalar(t, store, "SELECT has_role('admin')").b, true)
 	other: db.Identity
 	other[0] = 1
@@ -9716,11 +9727,11 @@ test_value_layout :: proc(t: ^testing.T) {
 		i  IDENTITY,
 		a  ANY
 	)`)
-	run(t, store, "INSERT INTO v (id, u) VALUES (1, '00010203-0405-0607-0809-0a0b0c0d0e0f')")
-	run(t, store, "INSERT INTO v (id, b) VALUES (2, 170141183460469231731687303715884105727)")
-	run(t, store, "INSERT INTO v (id, n) VALUES (3, 340282366920938463463374607431768211455)")
-	run(t, store, "INSERT INTO v (id, i) VALUES (4, '000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f')")
-	run(t, store, "INSERT INTO v (id, a) VALUES (5, 5), (6, 'seis'), (7, 7.5), (8, x'00ff')")
+	run_done(t, store, "INSERT INTO v (id, u) VALUES (1, '00010203-0405-0607-0809-0a0b0c0d0e0f')")
+	run_done(t, store, "INSERT INTO v (id, b) VALUES (2, 170141183460469231731687303715884105727)")
+	run_done(t, store, "INSERT INTO v (id, n) VALUES (3, 340282366920938463463374607431768211455)")
+	run_done(t, store, "INSERT INTO v (id, i) VALUES (4, '000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f')")
+	run_done(t, store, "INSERT INTO v (id, a) VALUES (5, 5), (6, 'seis'), (7, 7.5), (8, x'00ff')")
 
 	stored_uuid := scalar(t, store, "SELECT u FROM v WHERE id = 1")
 	testing.expect_value(t, stored_uuid.kind, db.Value_Kind.Uuid)
@@ -9808,8 +9819,8 @@ test_commit_queue :: proc(t: ^testing.T) {
 	// Then a real group commit through the queue.
 	store := fresh_db(t, "commit_queue")
 	if store == nil do return
-	run(t, store, "CREATE TABLE a (id INTEGER PRIMARY KEY)")
-	run(t, store, "CREATE TABLE b (id INTEGER PRIMARY KEY)")
+	run_done(t, store, "CREATE TABLE a (id INTEGER PRIMARY KEY)")
+	run_done(t, store, "CREATE TABLE b (id INTEGER PRIMARY KEY)")
 	start_seq := store.commit_seq
 
 	first_tx := db.tx_begin_write(store)
@@ -9975,8 +9986,8 @@ test_fault_injection :: proc(t: ^testing.T) {
 		defer delete(path)
 		store, open_err := db.store_open(path, {persistent = true, create = true, durable = false, vfs = memory})
 		if !testing.expectf(t, db.error_ok(open_err), "seed open: %s", open_err.message) do return
-		run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
-		run(t, store, "INSERT INTO t (id) VALUES (1)")
+		run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+		run_done(t, store, "INSERT INTO t (id) VALUES (1)")
 		db.store_close(store)
 
 		db.vfs_fault_arm(fault, .Read, 1)
@@ -10006,8 +10017,8 @@ test_ddl_in_transaction :: proc(t: ^testing.T) {
 	store := fresh_db(t, "ddl_in_tx")
 	if store == nil do return
 	defer cleanup_db(store, "ddl_in_tx")
-	run(t, store, "CREATE TABLE t (a INTEGER NOT NULL, b TEXT)")
-	run(t, store, "INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y')")
+	run_done(t, store, "CREATE TABLE t (a INTEGER NOT NULL, b TEXT)")
+	run_done(t, store, "INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y')")
 
 	// Rows changed and an index created in the same transaction.
 	tx := db.tx_begin_write(store)
@@ -10071,11 +10082,11 @@ test_full_text_ranking :: proc(t: ^testing.T) {
 	store := fresh_db(t, "fts_rank")
 	if store == nil do return
 	defer cleanup_db(store, "fts_rank")
-	run(t, store, "CREATE VIRTUAL TABLE docs USING fts5(body)")
+	run_done(t, store, "CREATE VIRTUAL TABLE docs USING fts5(body)")
 
 	// `common` appears in every document; `rare` in one. Both documents have the
 	// same length, so only the document frequency decides the order.
-	run(t, store, "INSERT INTO docs (body) VALUES ('common words here'), ('common rare words')")
+	run_done(t, store, "INSERT INTO docs (body) VALUES ('common words here'), ('common rare words')")
 	rows := run(
 		t,
 		store,
@@ -10087,8 +10098,8 @@ test_full_text_ranking :: proc(t: ^testing.T) {
 
 	// At equal frequency, the shorter document wins: same term, one token versus
 	// eight.
-	run(t, store, "DELETE FROM docs")
-	run(t, store, "INSERT INTO docs (body) VALUES ('target'), ('target a b c d e f g')")
+	run_done(t, store, "DELETE FROM docs")
+	run_done(t, store, "INSERT INTO docs (body) VALUES ('target'), ('target a b c d e f g')")
 	rows = run(
 		t,
 		store,
@@ -10102,8 +10113,8 @@ test_full_text_ranking :: proc(t: ^testing.T) {
 	db.sql_result_destroy(&rows)
 
 	// The token count matters: repeating a term raises its score, not its length.
-	run(t, store, "DELETE FROM docs")
-	run(t, store, "INSERT INTO docs (body) VALUES ('alpha alpha alpha beta'), ('alpha beta gamma delta')")
+	run_done(t, store, "DELETE FROM docs")
+	run_done(t, store, "INSERT INTO docs (body) VALUES ('alpha alpha alpha beta'), ('alpha beta gamma delta')")
 	rows = run(t, store, "SELECT body FROM docs WHERE docs MATCH 'alpha' ORDER BY rank LIMIT 1")
 	testing.expect_value(t, rows.rows[0][0].s, "alpha alpha alpha beta")
 	db.sql_result_destroy(&rows)
@@ -10114,8 +10125,8 @@ test_full_text_ranking :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM docs WHERE docs MATCH 'gamma OR beta'").i, i64(2))
 
 	// snippet and highlight mark the tokens the pattern asks for.
-	run(t, store, "DELETE FROM docs")
-	run(t, store, "INSERT INTO docs (body) VALUES ('the quick brown fox jumps over the lazy dog')")
+	run_done(t, store, "DELETE FROM docs")
+	run_done(t, store, "INSERT INTO docs (body) VALUES ('the quick brown fox jumps over the lazy dog')")
 	highlight := scalar(t, store, "SELECT highlight(body, 'fox') FROM docs").s
 	testing.expectf(t, strings.contains(highlight, "[fox]"), "highlight marks the word: %s", highlight)
 	snippet := scalar(t, store, "SELECT snippet(body, 'lazy') FROM docs").s
@@ -10127,8 +10138,8 @@ test_full_text_ranking :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM docs WHERE docs MATCH 'quick'").i, i64(1))
 
 	// A plain table has no rank, and asking for it is an error rather than a zero.
-	run(t, store, "CREATE TABLE plain (body TEXT)")
-	run(t, store, "INSERT INTO plain (body) VALUES ('nothing to rank')")
+	run_done(t, store, "CREATE TABLE plain (body TEXT)")
+	run_done(t, store, "INSERT INTO plain (body) VALUES ('nothing to rank')")
 	_, rank_err := db.sql_execute(store, "SELECT rank FROM plain")
 	testing.expect_value(t, rank_err.kind, db.Error_Kind.Column_Not_Found)
 }
@@ -10141,7 +10152,7 @@ test_full_text_phrase_prefix_and_column :: proc(t: ^testing.T) {
 	store := fresh_db(t, "fts_ops")
 	if store == nil do return
 	defer cleanup_db(store, "fts_ops")
-	run(t, store, "CREATE VIRTUAL TABLE notes USING fts5(title, body)")
+	run_done(t, store, "CREATE VIRTUAL TABLE notes USING fts5(title, body)")
 	run(
 		t,
 		store,
@@ -10204,8 +10215,8 @@ test_insert_caches_follow_the_catalog :: proc(t: ^testing.T) {
 	store := fresh_db(t, "insert_caches")
 	if store == nil do return
 	defer cleanup_db(store, "insert_caches")
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
-	run(t, store, "CREATE TABLE log (msg TEXT)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+	run_done(t, store, "CREATE TABLE log (msg TEXT)")
 
 	tx := db.tx_begin_write(store)
 	step :: proc(t: ^testing.T, tx: ^db.Tx, sql: string) -> bool {
@@ -10265,7 +10276,7 @@ test_scans_come_out_in_row_id_order :: proc(t: ^testing.T) {
 	store := fresh_db(t, "row_order")
 	if store == nil do return
 	defer cleanup_db(store, "row_order")
-	run(t, store, "CREATE TABLE t (n INTEGER NOT NULL)")
+	run_done(t, store, "CREATE TABLE t (n INTEGER NOT NULL)")
 	for batch in 0 ..< 3 {
 		tx := db.tx_begin_write(store)
 		for i in 0 ..< 200 {
@@ -10291,7 +10302,7 @@ test_scans_come_out_in_row_id_order :: proc(t: ^testing.T) {
 	}
 	ascending(t, store, 600, "after three batches")
 
-	run(t, store, "DELETE FROM t WHERE n % 3 = 0")
+	run_done(t, store, "DELETE FROM t WHERE n % 3 = 0")
 	ascending(t, store, 400, "after deletes, history kept")
 	db.store_prune_history(store)
 	ascending(t, store, 400, "after the history is pruned")
@@ -10299,7 +10310,7 @@ test_scans_come_out_in_row_id_order :: proc(t: ^testing.T) {
 	// A reader holds the table while a commit changes it: the commit copies the
 	// table, and both the reader's view and the new one stay ordered.
 	reader := db.tx_begin_read(store)
-	run(t, store, "INSERT INTO t (n) VALUES (1000), (1001)")
+	run_done(t, store, "INSERT INTO t (n) VALUES (1000), (1001)")
 	{
 		table := db.tx_table_probe(reader, "t")
 		rows := make([dynamic]db.Row)
@@ -10310,13 +10321,13 @@ test_scans_come_out_in_row_id_order :: proc(t: ^testing.T) {
 	db.tx_end(reader)
 	ascending(t, store, 402, "after a commit under a reader")
 
-	run(t, store, "DELETE FROM t")
-	run(t, store, "INSERT INTO t (n) VALUES (1), (2), (3)")
+	run_done(t, store, "DELETE FROM t")
+	run_done(t, store, "INSERT INTO t (n) VALUES (1), (2), (3)")
 	db.store_prune_history(store)
 	ascending(t, store, 3, "after emptying and refilling")
-	run(t, store, "TRUNCATE t")
+	run_done(t, store, "TRUNCATE t")
 	ascending(t, store, 0, "after a truncate")
-	run(t, store, "INSERT INTO t (n) VALUES (7)")
+	run_done(t, store, "INSERT INTO t (n) VALUES (7)")
 	ascending(t, store, 1, "after a truncate and an insert")
 
 	// Ids that arrive out of order (a replay, an explicit row id) are placed.
@@ -10395,7 +10406,7 @@ test_full_text_cost :: proc(t: ^testing.T) {
 	store := fresh_db(t, "fts_cost")
 	if store == nil do return
 	defer cleanup_db(store, "fts_cost")
-	run(t, store, "CREATE VIRTUAL TABLE docs USING fts5(body)")
+	run_done(t, store, "CREATE VIRTUAL TABLE docs USING fts5(body)")
 	insert, prepare_err := db.sql_prepare(store, "INSERT INTO docs (body) VALUES (?)")
 	if !testing.expectf(t, db.error_ok(prepare_err), "prepare: %s", prepare_err.message) do return
 	tx := db.tx_begin_write(store)
@@ -10467,8 +10478,8 @@ test_idempotent_result :: proc(t: ^testing.T) {
 	host := db.host_init(store)
 	defer db.host_destroy(host)
 	defer cleanup_db(store, "idem_result")
-	run(t, store, "CREATE TABLE counter (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)")
-	run(t, store, "INSERT INTO counter (id, value) VALUES (0, 0)")
+	run_done(t, store, "CREATE TABLE counter (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)")
+	run_done(t, store, "INSERT INTO counter (id, value) VALUES (0, 0)")
 
 	runs := 0
 	tally :: proc(ctx: ^db.Reducer_Ctx, args: []db.Value) -> db.Error {
@@ -10672,14 +10683,14 @@ test_as_of :: proc(t: ^testing.T) {
 	store := fresh_db(t, "as_of")
 	if store == nil do return
 	defer cleanup_db(store, "as_of")
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
-	run(t, store, "INSERT INTO t (id, v) VALUES (1, 'one'), (2, 'two')")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+	run_done(t, store, "INSERT INTO t (id, v) VALUES (1, 'one'), (2, 'two')")
 	first := store.commit_seq
-	run(t, store, "UPDATE t SET v = 'ONE' WHERE id = 1")
+	run_done(t, store, "UPDATE t SET v = 'ONE' WHERE id = 1")
 	second := store.commit_seq
-	run(t, store, "DELETE FROM t WHERE id = 2")
+	run_done(t, store, "DELETE FROM t WHERE id = 2")
 	third := store.commit_seq
-	run(t, store, "INSERT INTO t (id, v) VALUES (3, 'three')")
+	run_done(t, store, "INSERT INTO t (id, v) VALUES (3, 'three')")
 	testing.expect(t, first < second && second < third)
 
 	// Now: one updated, one deleted, one added.
@@ -10720,7 +10731,7 @@ test_as_of :: proc(t: ^testing.T) {
 
 	// A sequence beyond the log is clamped to the latest commit, and a view is
 	// refused rather than half read.
-	run(t, store, "CREATE VIEW v AS SELECT id FROM t")
+	run_done(t, store, "CREATE VIEW v AS SELECT id FROM t")
 	_, view_err := db.sql_execute(store, "SELECT * FROM v AS OF 1")
 	testing.expect_value(t, view_err.kind, db.Error_Kind.Sql_Unsupported)
 }
@@ -10732,8 +10743,8 @@ test_window_frames :: proc(t: ^testing.T) {
 	store := fresh_db(t, "window_frames")
 	if store == nil do return
 	defer cleanup_db(store, "window_frames")
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
-	run(t, store, "INSERT INTO t (id, v) VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
+	run_done(t, store, "INSERT INTO t (id, v) VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)")
 	column :: proc(t: ^testing.T, store: ^db.Store, sql: string) -> [dynamic]i64 {
 		result := run(t, store, sql)
 		out := make([dynamic]i64, 0, len(result.rows))
@@ -10878,24 +10889,24 @@ test_before_triggers :: proc(t: ^testing.T) {
 	store := fresh_db(t, "trigger_before")
 	if store == nil do return
 	defer cleanup_db(store, "trigger_before")
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
-	run(t, store, "CREATE TABLE log (id INTEGER PRIMARY KEY AUTOINCREMENT, note TEXT NOT NULL)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
+	run_done(t, store, "CREATE TABLE log (id INTEGER PRIMARY KEY AUTOINCREMENT, note TEXT NOT NULL)")
 	run(t, store, `
 		CREATE TRIGGER t_before BEFORE INSERT ON t
 		BEGIN INSERT INTO log (note) VALUES ('before ' || NEW.v); END`)
 	run(t, store, `
 		CREATE TRIGGER t_after AFTER INSERT ON t
 		BEGIN INSERT INTO log (note) VALUES ('after ' || NEW.v); END`)
-	run(t, store, "INSERT INTO t (id, v) VALUES (1, 10)")
+	run_done(t, store, "INSERT INTO t (id, v) VALUES (1, 10)")
 
 	run(t, store, `
 		CREATE TRIGGER t_update BEFORE UPDATE ON t
 		BEGIN INSERT INTO log (note) VALUES ('upd ' || OLD.v || '->' || NEW.v); END`)
-	run(t, store, "UPDATE t SET v = 11 WHERE id = 1")
+	run_done(t, store, "UPDATE t SET v = 11 WHERE id = 1")
 	run(t, store, `
 		CREATE TRIGGER t_delete BEFORE DELETE ON t
 		BEGIN INSERT INTO log (note) VALUES ('del ' || OLD.v); END`)
-	run(t, store, "DELETE FROM t WHERE id = 1")
+	run_done(t, store, "DELETE FROM t WHERE id = 1")
 
 	expected := [4]string{"before 10", "after 10", "upd 10->11", "del 11"}
 	log_result, log_err := db.sql_execute(store, "SELECT note FROM log ORDER BY id")
@@ -10909,7 +10920,7 @@ test_before_triggers :: proc(t: ^testing.T) {
 
 	// A BEFORE trigger whose body fails stops the insert, and the rows its body
 	// wrote are gone with the statement.
-	run(t, store, "CREATE TABLE guard (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
+	run_done(t, store, "CREATE TABLE guard (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
 	run(t, store, `
 		CREATE TRIGGER guard_stop BEFORE INSERT ON guard WHEN NEW.v > 0
 		BEGIN INSERT INTO log (note) VALUES ('refused'); INSERT INTO nope (x) VALUES (1); END`)
@@ -10930,17 +10941,17 @@ test_trigger_when :: proc(t: ^testing.T) {
 	store := fresh_db(t, "trigger_when")
 	if store == nil do return
 	defer cleanup_db(store, "trigger_when")
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
-	run(t, store, "CREATE TABLE audit (id INTEGER PRIMARY KEY AUTOINCREMENT, note TEXT NOT NULL)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
+	run_done(t, store, "CREATE TABLE audit (id INTEGER PRIMARY KEY AUTOINCREMENT, note TEXT NOT NULL)")
 
 	run(
 		t,
 		store,
 		"CREATE TRIGGER big_insert AFTER INSERT ON t WHEN NEW.v > 10 BEGIN INSERT INTO audit (note) VALUES ('insert') END",
 	)
-	run(t, store, "INSERT INTO t (id, v) VALUES (1, 5)")
+	run_done(t, store, "INSERT INTO t (id, v) VALUES (1, 5)")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM audit").i, i64(0))
-	run(t, store, "INSERT INTO t (id, v) VALUES (2, 20)")
+	run_done(t, store, "INSERT INTO t (id, v) VALUES (2, 20)")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM audit").i, i64(1))
 
 	// UPDATE sees both rows: only a real increase is audited.
@@ -10949,9 +10960,9 @@ test_trigger_when :: proc(t: ^testing.T) {
 		store,
 		"CREATE TRIGGER rise AFTER UPDATE ON t WHEN OLD.v < NEW.v BEGIN INSERT INTO audit (note) VALUES ('rise') END",
 	)
-	run(t, store, "UPDATE t SET v = 4 WHERE id = 2")
+	run_done(t, store, "UPDATE t SET v = 4 WHERE id = 2")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM audit").i, i64(1))
-	run(t, store, "UPDATE t SET v = 30 WHERE id = 2")
+	run_done(t, store, "UPDATE t SET v = 30 WHERE id = 2")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM audit").i, i64(2))
 
 	// DELETE has OLD only.
@@ -10960,19 +10971,19 @@ test_trigger_when :: proc(t: ^testing.T) {
 		store,
 		"CREATE TRIGGER gone AFTER DELETE ON t WHEN OLD.v >= 10 BEGIN INSERT INTO audit (note) VALUES ('gone') END",
 	)
-	run(t, store, "DELETE FROM t WHERE id = 1")
+	run_done(t, store, "DELETE FROM t WHERE id = 1")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM audit").i, i64(2))
-	run(t, store, "DELETE FROM t WHERE id = 2")
+	run_done(t, store, "DELETE FROM t WHERE id = 2")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM audit").i, i64(3))
 
 	// A condition that is not a boolean still decides: NULL and 0 do not fire.
-	run(t, store, "INSERT INTO t (id, v) VALUES (3, 50)")
+	run_done(t, store, "INSERT INTO t (id, v) VALUES (3, 50)")
 	run(
 		t,
 		store,
 		"CREATE TRIGGER never AFTER INSERT ON t WHEN NULL BEGIN INSERT INTO audit (note) VALUES ('never') END",
 	)
-	run(t, store, "INSERT INTO t (id, v) VALUES (4, 60)")
+	run_done(t, store, "INSERT INTO t (id, v) VALUES (4, 60)")
 	// big_insert fired for both rows; the NULL condition did not.
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM audit WHERE note = 'insert'").i, i64(3))
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM audit WHERE note = 'never'").i, i64(0))
@@ -10985,15 +10996,15 @@ test_trigger_when :: proc(t: ^testing.T) {
 	testing.expect(t, !db.error_ok(bad))
 
 	// A catalog written before WHEN existed gets the column on first use.
-	run(t, store, "DROP TRIGGER big_insert")
-	run(t, store, "DROP TABLE _triggers")
-	run(t, store, "CREATE TABLE _triggers (name TEXT PRIMARY KEY NOT NULL, table_name TEXT NOT NULL, event TEXT NOT NULL, timing TEXT NOT NULL, body TEXT NOT NULL)")
+	run_done(t, store, "DROP TRIGGER big_insert")
+	run_done(t, store, "DROP TABLE _triggers")
+	run_done(t, store, "CREATE TABLE _triggers (name TEXT PRIMARY KEY NOT NULL, table_name TEXT NOT NULL, event TEXT NOT NULL, timing TEXT NOT NULL, body TEXT NOT NULL)")
 	run(
 		t,
 		store,
 		"CREATE TRIGGER migrated AFTER INSERT ON t WHEN NEW.v > 100 BEGIN INSERT INTO audit (note) VALUES ('migrated') END",
 	)
-	run(t, store, "INSERT INTO t (id, v) VALUES (5, 200)")
+	run_done(t, store, "INSERT INTO t (id, v) VALUES (5, 200)")
 	testing.expect_value(
 		t,
 		scalar(t, store, "SELECT count(*) FROM audit WHERE note = 'migrated'").i,
@@ -11008,14 +11019,14 @@ test_alter_rename_column :: proc(t: ^testing.T) {
 	store := fresh_db(t, "rename_column")
 	if store == nil do return
 	defer os.remove_all("_test_rename_column")
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT NOT NULL, score INTEGER)")
-	run(t, store, "CREATE UNIQUE INDEX t_label ON t (label)")
-	run(t, store, "INSERT INTO t (id, label, score) VALUES (1, 'a', 10), (2, 'b', 20)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT NOT NULL, score INTEGER)")
+	run_done(t, store, "CREATE UNIQUE INDEX t_label ON t (label)")
+	run_done(t, store, "INSERT INTO t (id, label, score) VALUES (1, 'a', 10), (2, 'b', 20)")
 
-	run(t, store, "ALTER TABLE t RENAME COLUMN label TO name")
+	run_done(t, store, "ALTER TABLE t RENAME COLUMN label TO name")
 	testing.expect_value(t, scalar(t, store, "SELECT name FROM t WHERE id = 1").s, "a")
 	// The optional COLUMN and the missing COLUMN spelling are the same statement.
-	run(t, store, "ALTER TABLE t RENAME score TO points")
+	run_done(t, store, "ALTER TABLE t RENAME score TO points")
 	testing.expect_value(t, scalar(t, store, "SELECT sum(points) FROM t").i, i64(30))
 	// The unique index still rejects a duplicate through the new name.
 	_, duplicate := db.sql_execute(store, "INSERT INTO t (id, name, points) VALUES (3, 'a', 30)")
@@ -11031,7 +11042,7 @@ test_alter_rename_column :: proc(t: ^testing.T) {
 	testing.expect_value(t, missing.kind, db.Error_Kind.Column_Not_Found)
 
 	// A virtual table keeps the column names its index was built with.
-	run(t, store, "CREATE VIRTUAL TABLE docs USING fts5(body)")
+	run_done(t, store, "CREATE VIRTUAL TABLE docs USING fts5(body)")
 	_, virtual := db.sql_execute(store, "ALTER TABLE docs RENAME COLUMN body TO text")
 	testing.expect_value(t, virtual.kind, db.Error_Kind.Sql_Unsupported)
 
@@ -11052,13 +11063,13 @@ test_connection_identity :: proc(t: ^testing.T) {
 	defer destroy_host(store, host, "conn_identity")
 	ana := "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
 	luis := "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
-	run(t, store, "CREATE TABLE note (id INTEGER PRIMARY KEY AUTOINCREMENT, owner IDENTITY NOT NULL, body TEXT NOT NULL)")
+	run_done(t, store, "CREATE TABLE note (id INTEGER PRIMARY KEY AUTOINCREMENT, owner IDENTITY NOT NULL, body TEXT NOT NULL)")
 	insert := fmt.tprintf(
 		"INSERT INTO note (owner, body) VALUES ('%s', 'a1'), ('%s', 'a2'), ('%s', 'l1')",
 		ana, ana, luis,
 	)
-	run(t, store, insert)
-	run(t, store, "CREATE POLICY note_owner ON note USING (owner = current_identity())")
+	run_done(t, store, insert)
+	run_done(t, store, "CREATE POLICY note_owner ON note USING (owner = current_identity())")
 
 	ana_identity, _ := db.identity_parse(ana)
 	luis_identity, _ := db.identity_parse(luis)
@@ -11134,7 +11145,7 @@ test_paged_table_roundtrip :: proc(t: ^testing.T) {
 	closed := false
 	defer if !closed do db.store_close(store)
 
-	run(t, store, "CREATE TABLE item (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)")
+	run_done(t, store, "CREATE TABLE item (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)")
 	body: strings.Builder
 	strings.builder_init(&body)
 	defer strings.builder_destroy(&body)
@@ -11143,7 +11154,7 @@ test_paged_table_roundtrip :: proc(t: ^testing.T) {
 		if i > 0 do strings.write_string(&body, ", ")
 		fmt.sbprintf(&body, "(%d, 'name-%d', %d)", i, i, i)
 	}
-	run(t, store, strings.to_string(body))
+	run_done(t, store, strings.to_string(body))
 
 	table, table_err := db.store_table(store, "item")
 	testing.expect(t, db.error_ok(table_err))
@@ -11158,11 +11169,11 @@ test_paged_table_roundtrip :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT name FROM item WHERE id = 150").s, "name-150")
 	testing.expect_value(t, scalar(t, store, "SELECT max(qty) FROM item").i, i64(399))
 
-	run(t, store, "UPDATE item SET qty = 999 WHERE id = 150")
+	run_done(t, store, "UPDATE item SET qty = 999 WHERE id = 150")
 	testing.expect_value(t, scalar(t, store, "SELECT qty FROM item WHERE id = 150").i, i64(999))
 	testing.expect_value(t, scalar(t, store, "SELECT qty FROM item WHERE id = 151").i, i64(151))
 
-	run(t, store, "DELETE FROM item WHERE id = 150")
+	run_done(t, store, "DELETE FROM item WHERE id = 150")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM item").i, i64(399))
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM item WHERE id = 150").i, i64(0))
 
@@ -11282,7 +11293,7 @@ test_paged_table_churn :: proc(t: ^testing.T) {
 	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
 	defer db.store_close(store)
 
-	run(t, store, "CREATE TABLE c (id INTEGER PRIMARY KEY, v TEXT, n INTEGER)")
+	run_done(t, store, "CREATE TABLE c (id INTEGER PRIMARY KEY, v TEXT, n INTEGER)")
 	body: strings.Builder
 	strings.builder_init(&body)
 	defer strings.builder_destroy(&body)
@@ -11291,7 +11302,7 @@ test_paged_table_churn :: proc(t: ^testing.T) {
 		if id > 0 do strings.write_string(&body, ", ")
 		fmt.sbprintf(&body, "(%d, 'round-0-%d', %d)", id, id, id)
 	}
-	run(t, store, strings.to_string(body))
+	run_done(t, store, strings.to_string(body))
 
 	for round in 1 ..< 7 {
 		tx := db.tx_begin_write(store)
@@ -11465,8 +11476,8 @@ test_paged_index_pages :: proc(t: ^testing.T) {
 	closed := false
 	defer if !closed do db.store_close(store)
 
-	run(t, store, "CREATE TABLE doc (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, body TEXT)")
-	run(t, store, "CREATE INDEX doc_slug ON doc (slug)")
+	run_done(t, store, "CREATE TABLE doc (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, body TEXT)")
+	run_done(t, store, "CREATE INDEX doc_slug ON doc (slug)")
 	total :: 3000
 	body: strings.Builder
 	strings.builder_init(&body)
@@ -11482,7 +11493,7 @@ test_paged_index_pages :: proc(t: ^testing.T) {
 		if i > 0 do strings.write_string(&body, ", ")
 		fmt.sbprintf(&body, "(%d, 'slug-%05d', 'body %d')", i, scrambled, i)
 	}
-	run(t, store, strings.to_string(body))
+	run_done(t, store, strings.to_string(body))
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM doc").i, i64(total))
 
 	table, table_err := db.store_table(store, "doc")
@@ -11512,26 +11523,26 @@ test_paged_index_pages :: proc(t: ^testing.T) {
 	testing.expect_value(t, duplicate.kind, db.Error_Kind.Duplicate_Primary_Key)
 
 	// An update moves the entry: the old key stops matching and the new one works.
-	run(t, store, "UPDATE doc SET slug = 'slug-99999' WHERE id = 77")
+	run_done(t, store, "UPDATE doc SET slug = 'slug-99999' WHERE id = 77")
 	testing.expect_value(t, scalar(t, store, fmt.tprintf("SELECT count(*) FROM doc WHERE slug = '%s'", old_slug)).i, i64(0))
 	testing.expect_value(t, scalar(t, store, "SELECT id FROM doc WHERE slug = 'slug-99999'").i, i64(77))
 
 	// A delete removes it from both indexes.
-	run(t, store, "DELETE FROM doc WHERE id = 77")
+	run_done(t, store, "DELETE FROM doc WHERE id = 77")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM doc WHERE slug = 'slug-99999'").i, i64(0))
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM doc WHERE id = 77").i, i64(0))
 
 	// TRUNCATE empties the index files and the table answers again afterwards.
-	run(t, store, "TRUNCATE TABLE doc")
+	run_done(t, store, "TRUNCATE TABLE doc")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM doc").i, i64(0))
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM doc WHERE slug = 'slug-00001'").i, i64(0))
-	run(t, store, "INSERT INTO doc (id, slug, body) VALUES (1, 'slug-00001', 'reborn')")
+	run_done(t, store, "INSERT INTO doc (id, slug, body) VALUES (1, 'slug-00001', 'reborn')")
 	testing.expect_value(t, scalar(t, store, "SELECT id FROM doc WHERE slug = 'slug-00001'").i, i64(1))
-	run(t, store, "DELETE FROM doc WHERE id = 1")
+	run_done(t, store, "DELETE FROM doc WHERE id = 1")
 
 	// Reopen: the index files are discarded with the table pages and rebuilt by
 	// the replay, so a lookup must find the rows the log holds.
-	run(t, store, "INSERT INTO doc (id, slug, body) VALUES (5, 'kept', 'x')")
+	run_done(t, store, "INSERT INTO doc (id, slug, body) VALUES (5, 'kept', 'x')")
 	db.store_close(store)
 	closed = true
 	reopened, reopen_err := db.store_open(path, options)
@@ -11542,7 +11553,7 @@ test_paged_index_pages :: proc(t: ^testing.T) {
 
 	// An index created after a reopen walks rows that the replay put in pages: the
 	// visitor needs the table pointer, which the first version left unset.
-	run(t, reopened, "CREATE INDEX doc_body ON doc (body)")
+	run_done(t, reopened, "CREATE INDEX doc_body ON doc (body)")
 	testing.expect_value(t, scalar(t, reopened, "SELECT id FROM doc WHERE body = 'x'").i, i64(5))
 
 	// Dropping the index closes its file and the table keeps answering by scan.
@@ -11550,7 +11561,7 @@ test_paged_index_pages :: proc(t: ^testing.T) {
 	if testing.expect(t, db.error_ok(reopened_err)) {
 		testing.expect_value(t, db.table_index_count(reopened_table, 1), u64(1))
 	}
-	run(t, reopened, "DROP INDEX doc_slug")
+	run_done(t, reopened, "DROP INDEX doc_slug")
 	testing.expect_value(t, scalar(t, reopened, "SELECT id FROM doc WHERE slug = 'kept'").i, i64(5))
 }
 
@@ -11570,10 +11581,10 @@ test_replay_streams_the_log :: proc(t: ^testing.T) {
 	}
 	store, open_err := db.store_open(path, options)
 	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
 	total :: 3000
 	for i in 0 ..< total {
-		run(t, store, fmt.tprintf("INSERT INTO t (id, v) VALUES (%d, %d)", i, i))
+		run_done(t, store, fmt.tprintf("INSERT INTO t (id, v) VALUES (%d, %d)", i, i))
 	}
 	db.store_close(store)
 
@@ -11611,7 +11622,7 @@ test_replay_streams_the_log :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, torn, "SELECT count(*) FROM t").i, i64(total - 1))
 	testing.expect_value(t, torn.commit_seq, u64(total))
 	// The append works again and the record after the tear is the one we just wrote.
-	run(t, torn, "INSERT INTO t (id, v) VALUES (9999, 9999)")
+	run_done(t, torn, "INSERT INTO t (id, v) VALUES (9999, 9999)")
 	db.store_close(torn)
 	again, again_err := db.store_open(path, options)
 	if !testing.expectf(t, db.error_ok(again_err), "reopen after the repair: %s", again_err.message) do return
@@ -11702,8 +11713,8 @@ test_read_only_opens_beside_a_writer :: proc(t: ^testing.T) {
 	if !testing.expectf(t, db.error_ok(open_err), "writer: %s", open_err.message) do return
 	writer_open := true
 	defer if writer_open do db.store_close(writer)
-	run(t, writer, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
-	run(t, writer, "INSERT INTO t (id, v) VALUES (1, 10), (2, 20)")
+	run_done(t, writer, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+	run_done(t, writer, "INSERT INTO t (id, v) VALUES (1, 10), (2, 20)")
 
 	reader, reader_err := db.store_open(path, {
 		persistent = true,
@@ -11718,7 +11729,7 @@ test_read_only_opens_beside_a_writer :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, reader, "SELECT v FROM t WHERE id = 2").i, i64(20))
 
 	// A reader is a snapshot of the state at open, and it cannot write.
-	run(t, writer, "INSERT INTO t (id, v) VALUES (3, 30)")
+	run_done(t, writer, "INSERT INTO t (id, v) VALUES (3, 30)")
 	testing.expect_value(t, scalar(t, reader, "SELECT count(*) FROM t").i, i64(2))
 	insert_err := run_error(t, reader, "INSERT INTO t (id, v) VALUES (4, 40)")
 	testing.expect_value(t, insert_err.kind, db.Error_Kind.Transaction_Read_Only)
@@ -11729,7 +11740,7 @@ test_read_only_opens_beside_a_writer :: proc(t: ^testing.T) {
 
 	// The writer can keep writing, but it cannot rewrite the log while a reader
 	// holds the reader byte.
-	run(t, writer, "INSERT INTO t (id, v) VALUES (4, 40)")
+	run_done(t, writer, "INSERT INTO t (id, v) VALUES (4, 40)")
 	testing.expect_value(t, scalar(t, writer, "SELECT count(*) FROM t").i, i64(4))
 	writer_compact := db.store_compact(writer)
 	testing.expect_value(t, writer_compact.kind, db.Error_Kind.Locked)
@@ -11778,19 +11789,19 @@ test_trusted_open_skips_the_replay :: proc(t: ^testing.T) {
 	}
 	store, open_err := db.store_open(path, options)
 	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
-	run(t, store, "CREATE TABLE item (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
-	run(t, store, "CREATE INDEX item_name ON item (name)")
+	run_done(t, store, "CREATE TABLE item (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+	run_done(t, store, "CREATE INDEX item_name ON item (name)")
 	// A view, a trigger and the CREATE texts live in the engine's own tables,
 	// which have no page file: the catalog carries their rows, so they no
 	// longer force a replay.
-	run(t, store, "CREATE VIEW item_names AS SELECT name FROM item")
-	run(t, store, "CREATE TABLE item_log (n INTEGER)")
-	run(t, store, "CREATE TRIGGER item_logged AFTER DELETE ON item BEGIN INSERT INTO item_log VALUES (old.id); END")
+	run_done(t, store, "CREATE VIEW item_names AS SELECT name FROM item")
+	run_done(t, store, "CREATE TABLE item_log (n INTEGER)")
+	run_done(t, store, "CREATE TRIGGER item_logged AFTER DELETE ON item BEGIN INSERT INTO item_log VALUES (old.id); END")
 	for i in 0 ..< 200 {
-		run(t, store, fmt.tprintf("INSERT INTO item (id, name) VALUES (%d, 'n%03d')", i, i))
+		run_done(t, store, fmt.tprintf("INSERT INTO item (id, name) VALUES (%d, 'n%03d')", i, i))
 	}
-	run(t, store, "DELETE FROM item WHERE id = 7")
-	run(t, store, "UPDATE item SET name = 'changed' WHERE id = 8")
+	run_done(t, store, "DELETE FROM item WHERE id = 7")
+	run_done(t, store, "UPDATE item SET name = 'changed' WHERE id = 8")
 	closed_seq := store.commit_seq
 	db.store_close(store)
 
@@ -11824,7 +11835,7 @@ test_trusted_open_skips_the_replay :: proc(t: ^testing.T) {
 
 	// A commit after a trusted open continues the sequence, and the next open
 	// trusts again.
-	run(t, reopened, "INSERT INTO item (id, name) VALUES (500, 'later')")
+	run_done(t, reopened, "INSERT INTO item (id, name) VALUES (500, 'later')")
 	testing.expect_value(t, reopened.commit_seq, closed_seq + 1)
 	db.store_close(reopened)
 
@@ -11865,11 +11876,11 @@ test_analyze_and_plan_estimates :: proc(t: ^testing.T) {
 	store := fresh_db(t, "analyze")
 	if store == nil do return
 	defer cleanup_db(store, "analyze")
-	run(t, store, "CREATE TABLE ev (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, amount INTEGER)")
-	run(t, store, "CREATE INDEX ev_kind ON ev (kind)")
-	run(t, store, "CREATE INDEX ev_amount ON ev (amount)")
+	run_done(t, store, "CREATE TABLE ev (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, amount INTEGER)")
+	run_done(t, store, "CREATE INDEX ev_kind ON ev (kind)")
+	run_done(t, store, "CREATE INDEX ev_amount ON ev (amount)")
 	for i in 0 ..< 400 {
-		run(t, store, fmt.tprintf("INSERT INTO ev (id, kind, amount) VALUES (%d, 'k%d', %d)", i, i % 2, i))
+		run_done(t, store, fmt.tprintf("INSERT INTO ev (id, kind, amount) VALUES (%d, 'k%d', %d)", i, i % 2, i))
 	}
 
 	// Without statistics the plan falls back to the table's row count — the index
@@ -11925,7 +11936,7 @@ test_analyze_and_plan_estimates :: proc(t: ^testing.T) {
 	// measured instead of leaving a plan for a table nobody can read.
 	_, missing := db.sql_execute(reopened, "ANALYZE nope")
 	testing.expect_value(t, missing.kind, db.Error_Kind.Table_Not_Found)
-	run(t, reopened, "DROP TABLE ev")
+	run_done(t, reopened, "DROP TABLE ev")
 	gone := run(t, reopened, "EXPLAIN SELECT * FROM ev WHERE amount = 42")
 	testing.expect(t, strings_contains(gone.rows[0][0].s, "scan ev"))
 	testing.expect(t, !strings_contains(gone.rows[0][0].s, "est."))
@@ -11957,21 +11968,21 @@ test_explain_announces_stale_statistics :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "stale_stats")
 
-	run(t, store, "CREATE TABLE s (id INTEGER PRIMARY KEY, v INTEGER)")
-	run(t, store, "INSERT INTO s (v) VALUES (1), (2), (3)")
+	run_done(t, store, "CREATE TABLE s (id INTEGER PRIMARY KEY, v INTEGER)")
+	run_done(t, store, "INSERT INTO s (v) VALUES (1), (2), (3)")
 
 	// Nothing measured yet: the plan is a guess and says so.
 	note := explain_note(t, store, "EXPLAIN SELECT * FROM s WHERE v = 2")
 	testing.expectf(t, strings.has_prefix(note, "note: no statistics"), "fresh note: %s", note)
 	delete(note)
 
-	run(t, store, "ANALYZE s")
+	run_done(t, store, "ANALYZE s")
 	note = explain_note(t, store, "EXPLAIN SELECT * FROM s WHERE v = 2")
 	testing.expectf(t, len(note) == 0, "a measured plan carried a note: %s", note)
 	delete(note)
 
 	// A commit after the measurement makes the numbers older than the data.
-	run(t, store, "INSERT INTO s (v) VALUES (4)")
+	run_done(t, store, "INSERT INTO s (v) VALUES (4)")
 	note = explain_note(t, store, "EXPLAIN SELECT * FROM s WHERE v = 2")
 	testing.expectf(
 		t,
@@ -11983,7 +11994,7 @@ test_explain_announces_stale_statistics :: proc(t: ^testing.T) {
 	delete(note)
 
 	// Measuring again clears it.
-	run(t, store, "ANALYZE s")
+	run_done(t, store, "ANALYZE s")
 	note = explain_note(t, store, "EXPLAIN SELECT * FROM s WHERE v = 2")
 	testing.expectf(t, len(note) == 0, "a re-measured plan carried a note: %s", note)
 	delete(note)
@@ -12027,7 +12038,7 @@ test_plan_reads_a_range_written_as_two_comparisons :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "range_plan")
 
-	run(t, store, "CREATE TABLE r (id INTEGER PRIMARY KEY, n INTEGER)")
+	run_done(t, store, "CREATE TABLE r (id INTEGER PRIMARY KEY, n INTEGER)")
 	insert := strings.builder_make()
 	defer strings.builder_destroy(&insert)
 	strings.write_string(&insert, "INSERT INTO r (n) VALUES ")
@@ -12035,9 +12046,9 @@ test_plan_reads_a_range_written_as_two_comparisons :: proc(t: ^testing.T) {
 		if i > 0 do strings.write_string(&insert, ", ")
 		fmt.sbprintf(&insert, "(%d)", i + 1)
 	}
-	run(t, store, strings.to_string(insert))
-	run(t, store, "CREATE INDEX r_n ON r (n)")
-	run(t, store, "ANALYZE r")
+	run_done(t, store, strings.to_string(insert))
+	run_done(t, store, "CREATE INDEX r_n ON r (n)")
+	run_done(t, store, "ANALYZE r")
 
 	range_plan := plan_line_of(t, store, "EXPLAIN SELECT * FROM r WHERE n >= 100 AND n < 150")
 	between_plan := plan_line_of(t, store, "EXPLAIN SELECT * FROM r WHERE n BETWEEN 100 AND 149")
@@ -12102,7 +12113,7 @@ test_plan_reads_a_bound_value :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "bound_plan")
 
-	run(t, store, "CREATE TABLE b (id INTEGER PRIMARY KEY, n INTEGER)")
+	run_done(t, store, "CREATE TABLE b (id INTEGER PRIMARY KEY, n INTEGER)")
 	insert := strings.builder_make()
 	defer strings.builder_destroy(&insert)
 	strings.write_string(&insert, "INSERT INTO b (n) VALUES ")
@@ -12110,8 +12121,8 @@ test_plan_reads_a_bound_value :: proc(t: ^testing.T) {
 		if i > 0 do strings.write_string(&insert, ", ")
 		fmt.sbprintf(&insert, "(%d)", i + 1)
 	}
-	run(t, store, strings.to_string(insert))
-	run(t, store, "ANALYZE b")
+	run_done(t, store, strings.to_string(insert))
+	run_done(t, store, "ANALYZE b")
 
 	literal := plan_estimate(t, store, "EXPLAIN SELECT * FROM b WHERE n < 50", nil)
 	bound := plan_estimate(
@@ -12129,7 +12140,7 @@ test_plan_reads_a_bound_value :: proc(t: ^testing.T) {
 
 	// The bound value also decides the access: 1 of 400 rows probes the index,
 	// 380 of 400 keeps the scan.
-	run(t, store, "CREATE INDEX b_n ON b (n)")
+	run_done(t, store, "CREATE INDEX b_n ON b (n)")
 	narrow, narrow_err := db.sql_execute_params(
 		store,
 		"EXPLAIN SELECT * FROM b WHERE n = ?",
@@ -12161,8 +12172,8 @@ test_order_by_comes_from_the_index :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "order_index")
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
-	run(t, store, "CREATE TABLE u (id INTEGER PRIMARY KEY, n INTEGER)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
+	run_done(t, store, "CREATE TABLE u (id INTEGER PRIMARY KEY, n INTEGER)")
 	insert_t := strings.builder_make()
 	defer strings.builder_destroy(&insert_t)
 	insert_u := strings.builder_make()
@@ -12180,9 +12191,9 @@ test_order_by_comes_from_the_index :: proc(t: ^testing.T) {
 		fmt.sbprintf(&insert_t, "(%d)", ((i * 7) % 50) + 1)
 		fmt.sbprintf(&insert_u, "(%d)", ((i * 7) % 50) + 1)
 	}
-	run(t, store, strings.to_string(insert_t))
-	run(t, store, strings.to_string(insert_u))
-	run(t, store, "CREATE INDEX t_n ON t (n)")
+	run_done(t, store, strings.to_string(insert_t))
+	run_done(t, store, strings.to_string(insert_u))
+	run_done(t, store, "CREATE INDEX t_n ON t (n)")
 
 	check_plan_marker(t, store, "EXPLAIN SELECT * FROM t ORDER BY id", "order by (index t_pkey)")
 	check_plan_marker(t, store, "EXPLAIN SELECT * FROM t ORDER BY id DESC", "order by (index t_pkey)")
@@ -12217,7 +12228,7 @@ test_order_by_comes_from_the_index :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(ascending), rows)
 	if len(ascending) == rows {
 		testing.expect_value(t, ascending[0], "1")
-		testing.expect_value(t, ascending[rows - 1], fmt.aprintf("%d", rows))
+		testing.expect_value(t, ascending[rows - 1], fmt.tprintf("%d", rows))
 	}
 	for key in ascending do delete(key)
 	delete(ascending)
@@ -12225,8 +12236,8 @@ test_order_by_comes_from_the_index :: proc(t: ^testing.T) {
 	descending := order_sequence(t, store, "SELECT id FROM t ORDER BY id DESC LIMIT 3")
 	testing.expect_value(t, len(descending), 3)
 	if len(descending) == 3 {
-		testing.expect_value(t, descending[0], fmt.aprintf("%d", rows))
-		testing.expect_value(t, descending[2], fmt.aprintf("%d", rows - 2))
+		testing.expect_value(t, descending[0], fmt.tprintf("%d", rows))
+		testing.expect_value(t, descending[2], fmt.tprintf("%d", rows - 2))
 	}
 	for key in descending do delete(key)
 	delete(descending)
@@ -12275,7 +12286,7 @@ test_plan_prices_a_view_from_its_own_from :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "view_plan")
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
 	insert := strings.builder_make()
 	defer strings.builder_destroy(&insert)
 	strings.write_string(&insert, "INSERT INTO t (n) VALUES ")
@@ -12283,10 +12294,10 @@ test_plan_prices_a_view_from_its_own_from :: proc(t: ^testing.T) {
 		if i > 0 do strings.write_string(&insert, ", ")
 		fmt.sbprintf(&insert, "(%d)", i + 1)
 	}
-	run(t, store, strings.to_string(insert))
-	run(t, store, "ANALYZE t")
-	run(t, store, "CREATE VIEW v AS SELECT * FROM t WHERE n < 100")
-	run(t, store, "CREATE VIEW w AS SELECT * FROM v")
+	run_done(t, store, strings.to_string(insert))
+	run_done(t, store, "ANALYZE t")
+	run_done(t, store, "CREATE VIEW v AS SELECT * FROM t WHERE n < 100")
+	run_done(t, store, "CREATE VIEW w AS SELECT * FROM v")
 
 	estimate := plan_estimate(t, store, "EXPLAIN SELECT * FROM v", nil)
 	testing.expectf(t, estimate > 80 && estimate < 130, "a view estimated %d rows", estimate)
@@ -12305,9 +12316,9 @@ test_plan_prices_a_view_from_its_own_from :: proc(t: ^testing.T) {
 
 	// The estimate is what the plan decides with: over 400 rows a join to the view
 	// must not treat it as empty.
-	run(t, store, "CREATE TABLE other (id INTEGER PRIMARY KEY, n INTEGER)")
-	run(t, store, "INSERT INTO other (n) VALUES (1), (2), (3)")
-	run(t, store, "ANALYZE other")
+	run_done(t, store, "CREATE TABLE other (id INTEGER PRIMARY KEY, n INTEGER)")
+	run_done(t, store, "INSERT INTO other (n) VALUES (1), (2), (3)")
+	run_done(t, store, "ANALYZE other")
 	order, order_err := db.sql_execute(store, `
 		EXPLAIN SELECT * FROM other JOIN v ON other.n = v.n`)
 	if testing.expectf(t, db.error_ok(order_err), "explain failed: %s", order_err.message) {
@@ -12356,9 +12367,9 @@ test_star_lists_the_written_columns_after_a_reorder :: proc(t: ^testing.T) {
 	store := fresh_db(t, "star_reorder")
 	if store == nil do return
 	defer cleanup_db(store, "star_reorder")
-	run(t, store, "CREATE TABLE small (id INTEGER PRIMARY KEY, label TEXT)")
-	run(t, store, "CREATE TABLE big (id INTEGER PRIMARY KEY, small_id INTEGER, note TEXT)")
-	run(t, store, "INSERT INTO small (id, label) VALUES (1, 'a'), (2, 'b')")
+	run_done(t, store, "CREATE TABLE small (id INTEGER PRIMARY KEY, label TEXT)")
+	run_done(t, store, "CREATE TABLE big (id INTEGER PRIMARY KEY, small_id INTEGER, note TEXT)")
+	run_done(t, store, "INSERT INTO small (id, label) VALUES (1, 'a'), (2, 'b')")
 	for start := 0; start < 200; start += 50 {
 		builder := strings.builder_make()
 		fmt.sbprintf(&builder, "INSERT INTO big (id, small_id, note) VALUES ")
@@ -12366,10 +12377,10 @@ test_star_lists_the_written_columns_after_a_reorder :: proc(t: ^testing.T) {
 			if i > start do fmt.sbprintf(&builder, ",")
 			fmt.sbprintf(&builder, "(%d,%d,'n%d')", i, i % 2 + 1, i)
 		}
-		run(t, store, strings.to_string(builder))
+		run_done(t, store, strings.to_string(builder))
 		strings.builder_destroy(&builder)
 	}
-	run(t, store, "ANALYZE")
+	run_done(t, store, "ANALYZE")
 
 	// The small relation runs first, so the plan is reordered.
 	plan := run(t, store, "EXPLAIN SELECT * FROM big JOIN small ON small.id = big.small_id")
@@ -12399,7 +12410,7 @@ test_window_range_and_groups_frames :: proc(t: ^testing.T) {
 	store := fresh_db(t, "window_frames_offsets")
 	if store == nil do return
 	defer cleanup_db(store, "window_frames_offsets")
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT, n INTEGER, v REAL)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT, n INTEGER, v REAL)")
 	run(t, store, `
 		INSERT INTO t (id, g, n, v) VALUES
 		 (1,'a',10,1.5),(2,'a',20,2.5),(3,'a',20,2.5),(4,'a',40,4.5),
@@ -12487,17 +12498,17 @@ test_join_using :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "join_using")
 
-	run(t, store, "CREATE TABLE dept (id INTEGER PRIMARY KEY, name TEXT)")
-	run(t, store, "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept INTEGER, salary INTEGER)")
+	run_done(t, store, "CREATE TABLE dept (id INTEGER PRIMARY KEY, name TEXT)")
+	run_done(t, store, "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept INTEGER, salary INTEGER)")
 	// The employee table is the big one, so the planner starts at the departments
 	// and `SELECT *` has to keep writing the columns in the order the query did.
 	for i in 0 ..< 300 {
-		run(t, store, fmt.tprintf("INSERT INTO emp (id, name, dept, salary) VALUES (%d, 'e%d', %d, %d)", i, i, i % 3 + 1, i * 10))
+		run_done(t, store, fmt.tprintf("INSERT INTO emp (id, name, dept, salary) VALUES (%d, 'e%d', %d, %d)", i, i, i % 3 + 1, i * 10))
 	}
 	// One employee in a department that does not exist, for the outer row.
-	run(t, store, "INSERT INTO emp (id, name, dept, salary) VALUES (300, 'gone', 9, 5)")
-	run(t, store, "INSERT INTO dept (id, name) VALUES (0, 'eng'), (1, 'ops'), (2, 'hr'), (3, 'new')")
-	run(t, store, "ANALYZE")
+	run_done(t, store, "INSERT INTO emp (id, name, dept, salary) VALUES (300, 'gone', 9, 5)")
+	run_done(t, store, "INSERT INTO dept (id, name) VALUES (0, 'eng'), (1, 'ops'), (2, 'hr'), (3, 'new')")
+	run_done(t, store, "ANALYZE")
 
 	result, err := db.sql_execute(store, "SELECT * FROM emp JOIN dept USING (id) WHERE emp.id < 3 ORDER BY emp.id")
 	if testing.expectf(t, db.error_ok(err), "%s", err.message) {
@@ -12593,13 +12604,13 @@ test_plan_does_not_cross_join_before_it_can_filter :: proc(t: ^testing.T) {
 	store := fresh_db(t, "plan_cross")
 	if store == nil do return
 	defer cleanup_db(store, "plan_cross")
-	run(t, store, "CREATE TABLE authors (id INTEGER PRIMARY KEY)")
-	run(t, store, "CREATE TABLE publishers (id INTEGER PRIMARY KEY)")
-	run(t, store, "CREATE TABLE books (id INTEGER PRIMARY KEY, author_id INTEGER, publisher_id INTEGER)")
-	run(t, store, "CREATE INDEX books_author ON books (author_id)")
-	run(t, store, "CREATE INDEX books_publisher ON books (publisher_id)")
+	run_done(t, store, "CREATE TABLE authors (id INTEGER PRIMARY KEY)")
+	run_done(t, store, "CREATE TABLE publishers (id INTEGER PRIMARY KEY)")
+	run_done(t, store, "CREATE TABLE books (id INTEGER PRIMARY KEY, author_id INTEGER, publisher_id INTEGER)")
+	run_done(t, store, "CREATE INDEX books_author ON books (author_id)")
+	run_done(t, store, "CREATE INDEX books_publisher ON books (publisher_id)")
 	for i in 0 ..< 5 {
-		run(t, store, fmt.tprintf("INSERT INTO publishers (id) VALUES (%d)", i))
+		run_done(t, store, fmt.tprintf("INSERT INTO publishers (id) VALUES (%d)", i))
 	}
 	for start := 0; start < 200; start += 50 {
 		builder := strings.builder_make()
@@ -12608,7 +12619,7 @@ test_plan_does_not_cross_join_before_it_can_filter :: proc(t: ^testing.T) {
 			if i > start do fmt.sbprintf(&builder, ",")
 			fmt.sbprintf(&builder, "(%d)", i)
 		}
-		run(t, store, strings.to_string(builder))
+		run_done(t, store, strings.to_string(builder))
 		strings.builder_destroy(&builder)
 	}
 	for start := 0; start < 2000; start += 200 {
@@ -12618,10 +12629,10 @@ test_plan_does_not_cross_join_before_it_can_filter :: proc(t: ^testing.T) {
 			if i > start do fmt.sbprintf(&builder, ",")
 			fmt.sbprintf(&builder, "(%d,%d,%d)", i, i % 200, i % 5)
 		}
-		run(t, store, strings.to_string(builder))
+		run_done(t, store, strings.to_string(builder))
 		strings.builder_destroy(&builder)
 	}
-	run(t, store, "ANALYZE")
+	run_done(t, store, "ANALYZE")
 
 	plan := run(
 		t,
@@ -12712,19 +12723,19 @@ test_plan_reorders_a_join :: proc(t: ^testing.T) {
 	store := fresh_db(t, "plan_join")
 	if store == nil do return
 	defer cleanup_db(store, "plan_join")
-	run(t, store, "CREATE TABLE a (id INTEGER PRIMARY KEY, name TEXT)")
-	run(t, store, "CREATE TABLE b (id INTEGER PRIMARY KEY, code INTEGER)")
-	run(t, store, "CREATE TABLE c (id INTEGER PRIMARY KEY, num INTEGER)")
+	run_done(t, store, "CREATE TABLE a (id INTEGER PRIMARY KEY, name TEXT)")
+	run_done(t, store, "CREATE TABLE b (id INTEGER PRIMARY KEY, code INTEGER)")
+	run_done(t, store, "CREATE TABLE c (id INTEGER PRIMARY KEY, num INTEGER)")
 	for i in 0 ..< 10 {
-		run(t, store, fmt.tprintf("INSERT INTO a (id, name) VALUES (%d, 'a%d')", i, i))
+		run_done(t, store, fmt.tprintf("INSERT INTO a (id, name) VALUES (%d, 'a%d')", i, i))
 	}
 	// b is large and its code column has 10 distinct values: each outer row
 	// matches 100 rows, so joining it early multiplies everything after it.
 	for i in 0 ..< 1000 {
-		run(t, store, fmt.tprintf("INSERT INTO b (id, code) VALUES (%d, %d)", i, i % 10))
+		run_done(t, store, fmt.tprintf("INSERT INTO b (id, code) VALUES (%d, %d)", i, i % 10))
 	}
-	run(t, store, "INSERT INTO c (id, num) VALUES (1, 1), (2, 2)")
-	run(t, store, "ANALYZE")
+	run_done(t, store, "INSERT INTO c (id, num) VALUES (1, 1), (2, 2)")
+	run_done(t, store, "ANALYZE")
 
 	plan := run(t, store, "EXPLAIN SELECT count(*) FROM a JOIN b ON a.id = b.code JOIN c ON a.id = c.num")
 	testing.expect(t, strings_contains(plan.rows[0][0].s, "scan c"))
@@ -12781,8 +12792,8 @@ test_in_and_not_in_with_null :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "in_null")
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
-	run(t, store, "INSERT INTO t VALUES (1, 1), (2, 2), (3, NULL)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+	run_done(t, store, "INSERT INTO t VALUES (1, 1), (2, 2), (3, NULL)")
 
 	testing.expect_value(t, scalar(t, store, "SELECT 2 IN (1, NULL)").kind, db.Value_Kind.Null)
 	testing.expect_value(t, scalar(t, store, "SELECT 2 NOT IN (1, NULL)").kind, db.Value_Kind.Null)
@@ -12813,8 +12824,8 @@ test_aggregate_distinct :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "agg_distinct")
 
-	run(t, store, "CREATE TABLE d (id INTEGER PRIMARY KEY, x INTEGER, label TEXT)")
-	run(t, store, "INSERT INTO d (id, x, label) VALUES (1, 1, 'a'), (2, 1, 'a'), (3, 2, 'b'), (4, 3, 'b'), (5, 3, 'b'), (6, NULL, NULL)")
+	run_done(t, store, "CREATE TABLE d (id INTEGER PRIMARY KEY, x INTEGER, label TEXT)")
+	run_done(t, store, "INSERT INTO d (id, x, label) VALUES (1, 1, 'a'), (2, 1, 'a'), (3, 2, 'b'), (4, 3, 'b'), (5, 3, 'b'), (6, NULL, NULL)")
 
 	testing.expect_value(t, scalar(t, store, "SELECT count(x) FROM d").i, i64(5))
 	testing.expect_value(t, scalar(t, store, "SELECT count(DISTINCT x) FROM d").i, i64(3))
@@ -12825,8 +12836,8 @@ test_aggregate_distinct :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT count(DISTINCT label) FROM d").i, i64(2))
 	testing.expect_value(t, scalar(t, store, "SELECT group_concat(DISTINCT label) FROM d").s, "a,b")
 	// 1 and 1.0 compare equal, so a DISTINCT aggregate folds them once.
-	run(t, store, "CREATE TABLE mixed (x ANY)")
-	run(t, store, "INSERT INTO mixed VALUES (1), (1.0), (2), ('1')")
+	run_done(t, store, "CREATE TABLE mixed (x ANY)")
+	run_done(t, store, "INSERT INTO mixed VALUES (1), (1.0), (2), ('1')")
 	testing.expect_value(t, scalar(t, store, "SELECT count(DISTINCT x) FROM mixed").i, i64(3))
 
 	// A grouped DISTINCT aggregate and the streaming path (paged tables) agree
@@ -12847,8 +12858,8 @@ test_aggregate_distinct :: proc(t: ^testing.T) {
 	})
 	if !testing.expectf(t, db.error_ok(open_err), "open paged: %s", open_err.message) do return
 	defer db.store_close(paged)
-	run(t, paged, "CREATE TABLE p (id INTEGER PRIMARY KEY, x INTEGER)")
-	run(t, paged, "INSERT INTO p VALUES (1, 1), (2, 1), (3, 2), (4, 2), (5, 3)")
+	run_done(t, paged, "CREATE TABLE p (id INTEGER PRIMARY KEY, x INTEGER)")
+	run_done(t, paged, "INSERT INTO p VALUES (1, 1), (2, 1), (3, 2), (4, 2), (5, 3)")
 	testing.expect_value(t, scalar(t, paged, "SELECT count(DISTINCT x) FROM p").i, i64(3))
 	testing.expect_value(t, scalar(t, paged, "SELECT sum(DISTINCT x) FROM p").i, i64(6))
 
@@ -12856,7 +12867,7 @@ test_aggregate_distinct :: proc(t: ^testing.T) {
 	// would be overwritten by the next allocation, and the same aggregate would
 	// answer differently from run to run: 40 distinct values, twenty times, with
 	// string work in between to reuse whatever was freed.
-	run(t, store, "CREATE TABLE wide (x INTEGER)")
+	run_done(t, store, "CREATE TABLE wide (x INTEGER)")
 	body: strings.Builder
 	strings.builder_init(&body)
 	defer strings.builder_destroy(&body)
@@ -12865,7 +12876,7 @@ test_aggregate_distinct :: proc(t: ^testing.T) {
 		if i > 0 do strings.write_string(&body, ", ")
 		fmt.sbprintf(&body, "(%d)", i % 40 + 1)
 	}
-	run(t, store, strings.to_string(body))
+	run_done(t, store, strings.to_string(body))
 	for _ in 0 ..< 20 {
 		testing.expect_value(t, scalar(t, store, "SELECT sum(DISTINCT x) FROM wide").i, i64(820))
 		testing.expect_value(t, scalar(t, store, "SELECT upper(concat('a', 'b', 'c') || 'd')").s, "ABCD")
@@ -12882,8 +12893,8 @@ test_order_by_ties_follow_the_row_id :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "order_ties")
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
-	run(t, store, "INSERT INTO t (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'a'), (4, 'a'), (5, 'b')")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+	run_done(t, store, "INSERT INTO t (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'a'), (4, 'a'), (5, 'b')")
 
 	for _ in 0 ..< 3 {
 		desc := run(t, store, "SELECT id FROM t ORDER BY name DESC")
@@ -12932,8 +12943,8 @@ test_scalar_minmax_and_trim_sets :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT trim(NULL)").kind, db.Value_Kind.Null)
 
 	// The aggregate forms are unchanged: min(x) still folds a column.
-	run(t, store, "CREATE TABLE m (x INTEGER)")
-	run(t, store, "INSERT INTO m VALUES (5), (2), (9)")
+	run_done(t, store, "CREATE TABLE m (x INTEGER)")
+	run_done(t, store, "INSERT INTO m VALUES (5), (2), (9)")
 	testing.expect_value(t, scalar(t, store, "SELECT min(x) FROM m").i, i64(2))
 	testing.expect_value(t, scalar(t, store, "SELECT max(x) FROM m").i, i64(9))
 }
@@ -12947,8 +12958,8 @@ test_group_by_a_projection_alias :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "group_alias")
 
-	run(t, store, "CREATE TABLE emp (id INTEGER PRIMARY KEY, dept INTEGER, salary INTEGER)")
-	run(t, store, "INSERT INTO emp (dept, salary) VALUES (1, 10), (1, 20), (2, 30)")
+	run_done(t, store, "CREATE TABLE emp (id INTEGER PRIMARY KEY, dept INTEGER, salary INTEGER)")
+	run_done(t, store, "INSERT INTO emp (dept, salary) VALUES (1, 10), (1, 20), (2, 30)")
 
 	Check :: struct {
 		sql:    string,
@@ -12978,8 +12989,8 @@ test_group_by_a_projection_alias :: proc(t: ^testing.T) {
 
 	// The same alias in a join, where the name it stands for belongs to another
 	// table than the one the row comes from.
-	run(t, store, "CREATE TABLE dept (id INTEGER PRIMARY KEY, name TEXT)")
-	run(t, store, "INSERT INTO dept (id, name) VALUES (1, 'eng'), (2, 'ops')")
+	run_done(t, store, "CREATE TABLE dept (id INTEGER PRIMARY KEY, name TEXT)")
+	run_done(t, store, "INSERT INTO dept (id, name) VALUES (1, 'eng'), (2, 'ops')")
 	result, err := db.sql_execute(store, `
 		SELECT dept.name AS team, count(*) AS n
 		FROM emp JOIN dept ON dept.id = emp.dept
@@ -13004,8 +13015,8 @@ test_case_expressions :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "case_expr")
 
-	run(t, store, "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept INTEGER, salary REAL)")
-	run(t, store, "INSERT INTO emp VALUES (1, 'ana', 1, 100.5), (2, 'luis', 1, NULL), (3, 'maria', 2, 90.0), (4, NULL, NULL, 75.25)")
+	run_done(t, store, "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept INTEGER, salary REAL)")
+	run_done(t, store, "INSERT INTO emp VALUES (1, 'ana', 1, 100.5), (2, 'luis', 1, NULL), (3, 'maria', 2, 90.0), (4, NULL, NULL, 75.25)")
 
 	searched := run(t, store, "SELECT id, CASE WHEN salary IS NULL THEN 'none' WHEN salary > 90 THEN 'high' ELSE 'low' END AS band FROM emp ORDER BY id")
 	testing.expect_value(t, len(searched.rows), 4)
@@ -13044,9 +13055,9 @@ test_snapshot_indexes_are_its_own :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "snapshot_index")
 
-	run(t, store, "CREATE TABLE item (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)")
-	run(t, store, "CREATE INDEX item_qty ON item (qty)")
-	run(t, store, "INSERT INTO item (id, name, qty) VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)")
+	run_done(t, store, "CREATE TABLE item (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)")
+	run_done(t, store, "CREATE INDEX item_qty ON item (qty)")
+	run_done(t, store, "INSERT INTO item (id, name, qty) VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)")
 
 	tx := db.tx_begin_read(store)
 	frozen, frozen_err := db.tx_table(tx, "item")
@@ -13063,9 +13074,9 @@ test_snapshot_indexes_are_its_own :: proc(t: ^testing.T) {
 		return
 	}
 
-	run(t, store, "UPDATE item SET qty = 99 WHERE id = 1")
-	run(t, store, "DELETE FROM item WHERE id = 2")
-	run(t, store, "INSERT INTO item (id, name, qty) VALUES (4, 'd', 40)")
+	run_done(t, store, "UPDATE item SET qty = 99 WHERE id = 1")
+	run_done(t, store, "DELETE FROM item WHERE id = 2")
+	run_done(t, store, "INSERT INTO item (id, name, qty) VALUES (4, 'd', 40)")
 
 	testing.expect_value(t, db.table_row_count(frozen), 3)
 	// The probe carries every column of the row: an index names its columns by
@@ -13102,9 +13113,9 @@ test_snapshot_survives_dropping_the_source :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "snapshot_drop")
 
-	run(t, store, "CREATE TABLE item (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)")
-	run(t, store, "CREATE INDEX item_qty ON item (qty)")
-	run(t, store, "INSERT INTO item (id, name, qty) VALUES (1, 'a', 10), (2, 'b', 20)")
+	run_done(t, store, "CREATE TABLE item (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)")
+	run_done(t, store, "CREATE INDEX item_qty ON item (qty)")
+	run_done(t, store, "INSERT INTO item (id, name, qty) VALUES (1, 'a', 10), (2, 'b', 20)")
 
 	tx := db.tx_begin_read(store)
 	frozen, frozen_err := db.tx_table(tx, "item")
@@ -13112,7 +13123,7 @@ test_snapshot_survives_dropping_the_source :: proc(t: ^testing.T) {
 		db.tx_end(tx)
 		return
 	}
-	run(t, store, "DROP TABLE item")
+	run_done(t, store, "DROP TABLE item")
 
 	testing.expect_value(t, db.table_row_count(frozen), 2)
 	position := -1
@@ -13137,10 +13148,10 @@ test_a_commit_copies_the_table_a_reader_holds :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "cow")
 
-	run(t, store, "CREATE TABLE c (id INTEGER PRIMARY KEY, v INTEGER)")
-	run(t, store, "CREATE TABLE other (id INTEGER PRIMARY KEY, w INTEGER)")
-	run(t, store, "INSERT INTO c (id, v) VALUES (1, 10)")
-	run(t, store, "INSERT INTO other (id, w) VALUES (1, 20)")
+	run_done(t, store, "CREATE TABLE c (id INTEGER PRIMARY KEY, v INTEGER)")
+	run_done(t, store, "CREATE TABLE other (id INTEGER PRIMARY KEY, w INTEGER)")
+	run_done(t, store, "INSERT INTO c (id, v) VALUES (1, 10)")
+	run_done(t, store, "INSERT INTO other (id, w) VALUES (1, 20)")
 
 	before, before_err := db.store_table(store, "c")
 	if !testing.expect(t, db.error_ok(before_err)) do return
@@ -13157,7 +13168,7 @@ test_a_commit_copies_the_table_a_reader_holds :: proc(t: ^testing.T) {
 	testing.expect_value(t, shared_b, before)
 	testing.expect_value(t, before.refs, 3)
 
-	run(t, store, "UPDATE c SET v = 11 WHERE id = 1")
+	run_done(t, store, "UPDATE c SET v = 11 WHERE id = 1")
 	after, after_err := db.store_table(store, "c")
 	if !testing.expect(t, db.error_ok(after_err)) {
 		db.tx_end(first)
@@ -13181,7 +13192,7 @@ test_a_commit_copies_the_table_a_reader_holds :: proc(t: ^testing.T) {
 	// With no reader open a commit writes the table in place.
 	committed, committed_err := db.store_table(store, "c")
 	if testing.expect(t, db.error_ok(committed_err)) {
-		run(t, store, "UPDATE c SET v = 12 WHERE id = 1")
+		run_done(t, store, "UPDATE c SET v = 12 WHERE id = 1")
 		again, _ := db.store_table(store, "c")
 		testing.expect_value(t, again, committed)
 	}
@@ -13225,8 +13236,8 @@ test_subscription_knows_its_connection :: proc(t: ^testing.T) {
 	host := db.host_init(store)
 	defer db.host_destroy(host)
 
-	run(t, store, "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
-	run(t, store, "INSERT INTO items (name) VALUES ('one')")
+	run_done(t, store, "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
+	run_done(t, store, "INSERT INTO items (name) VALUES ('one')")
 
 	first, snapshot, err := db.host_subscribe_many_owned(host, []string{"SELECT id, name FROM items"}, 7)
 	testing.expectf(t, db.error_ok(err), "subscribe failed: %s", err.message)
@@ -13261,7 +13272,7 @@ test_host_statements_need_host_access :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "hostaccess")
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
 	testing.expect(t, db.store_host_access(store))
 
 	// The file the two statements would name. ATTACH checks that it exists, so a
@@ -13301,8 +13312,8 @@ test_host_statements_need_host_access :: proc(t: ^testing.T) {
 	testing.expect_value(t, store.commit_seq, before)
 
 	// Reading, writing and DDL stay available: they are the database, not the host.
-	run(t, store, "INSERT INTO t (v) VALUES ('still here')")
-	run(t, store, "CREATE TABLE other (id INTEGER)")
+	run_done(t, store, "INSERT INTO t (v) VALUES ('still here')")
+	run_done(t, store, "CREATE TABLE other (id INTEGER)")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t").i, i64(1))
 
 	// Turning it back on restores the statement: the switch is a policy, not a
@@ -13376,7 +13387,7 @@ test_row_quota_refuses_while_producing :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "quota_work")
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
 	builder := strings.builder_make()
 	defer strings.builder_destroy(&builder)
 	strings.write_string(&builder, "INSERT INTO t (id, v) VALUES ")
@@ -13384,7 +13395,7 @@ test_row_quota_refuses_while_producing :: proc(t: ^testing.T) {
 		if i > 1 do strings.write_string(&builder, ", ")
 		fmt.sbprintf(&builder, "(%d, %d)", i, i)
 	}
-	run(t, store, strings.to_string(builder))
+	run_done(t, store, strings.to_string(builder))
 
 	db.store_set_row_quota(store, 10)
 	defer db.store_set_row_quota(store, 0)
@@ -13429,10 +13440,10 @@ test_imported_indexes_are_planned_and_droppable :: proc(t: ^testing.T) {
 	// `index` exactly as SQLite does.
 	source := fresh_db(t, "indexes_source")
 	if source == nil do return
-	run(t, source, "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)")
-	run(t, source, "CREATE UNIQUE INDEX people_name ON people (name)")
-	run(t, source, "CREATE INDEX people_age ON people (age)")
-	run(t, source, "INSERT INTO people (id, name, age) VALUES (1, 'ana', 30), (2, 'bo', 40)")
+	run_done(t, source, "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)")
+	run_done(t, source, "CREATE UNIQUE INDEX people_name ON people (name)")
+	run_done(t, source, "CREATE INDEX people_age ON people (age)")
+	run_done(t, source, "INSERT INTO people (id, name, age) VALUES (1, 'ana', 30), (2, 'bo', 40)")
 	_, _, export_err := db.sqlite_file_write(source, path)
 	testing.expectf(t, db.error_ok(export_err), "export: %s", export_err.message)
 	db.store_close(source)
@@ -13492,9 +13503,9 @@ test_empty_export_is_a_readable_file :: proc(t: ^testing.T) {
 
 	store := fresh_db(t, "empty_export")
 	if store == nil do return
-	run(t, store, "CREATE TABLE only_one (id INTEGER PRIMARY KEY, v TEXT)")
-	run(t, store, "INSERT INTO only_one (id, v) VALUES (1, 'x')")
-	run(t, store, "DROP TABLE only_one")
+	run_done(t, store, "CREATE TABLE only_one (id INTEGER PRIMARY KEY, v TEXT)")
+	run_done(t, store, "INSERT INTO only_one (id, v) VALUES (1, 'x')")
+	run_done(t, store, "DROP TABLE only_one")
 	_, _, export_err := db.sqlite_file_write(store, path)
 	testing.expectf(t, db.error_ok(export_err), "export: %s", export_err.message)
 	db.store_close(store)
@@ -13574,11 +13585,11 @@ test_alter_column_type :: proc(t: ^testing.T) {
 	if store == nil do return
 	path := fmt.aprintf("_test_%s", "alter_type")
 	defer delete(path)
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
-	run(t, store, "INSERT INTO t (id, v) VALUES (1, 10), (2, 20)")
-	run(t, store, "CREATE INDEX t_v ON t (v)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+	run_done(t, store, "INSERT INTO t (id, v) VALUES (1, 10), (2, 20)")
+	run_done(t, store, "CREATE INDEX t_v ON t (v)")
 
-	run(t, store, "ALTER TABLE t ALTER COLUMN v TYPE REAL")
+	run_done(t, store, "ALTER TABLE t ALTER COLUMN v TYPE REAL")
 	testing.expect_value(t, scalar(t, store, "SELECT typeof(v) FROM t WHERE id = 1").s, "real")
 	testing.expect_value(t, scalar(t, store, "SELECT v FROM t WHERE id = 2").f, 20.0)
 	// The index survived the rewrite and still answers through the new type.
@@ -13586,11 +13597,11 @@ test_alter_column_type :: proc(t: ^testing.T) {
 
 	// Real to Text, then a text that is not a number: the downgrade is refused as
 	// a whole and every row keeps the type it had.
-	run(t, store, "INSERT INTO t (id, v) VALUES (3, 30)")
-	run(t, store, "ALTER TABLE t ALTER COLUMN v TYPE TEXT")
+	run_done(t, store, "INSERT INTO t (id, v) VALUES (3, 30)")
+	run_done(t, store, "ALTER TABLE t ALTER COLUMN v TYPE TEXT")
 	testing.expect_value(t, scalar(t, store, "SELECT typeof(v) FROM t WHERE id = 1").s, "text")
 	testing.expect_value(t, scalar(t, store, "SELECT v FROM t WHERE id = 2").s, "20")
-	run(t, store, "UPDATE t SET v = 'thirty' WHERE id = 3")
+	run_done(t, store, "UPDATE t SET v = 'thirty' WHERE id = 3")
 	_, bad := db.sql_execute(store, "ALTER TABLE t ALTER COLUMN v TYPE INTEGER")
 	testing.expect(t, !db.error_ok(bad), "a text that is not a number cannot become an integer")
 	if !db.error_ok(bad) {
@@ -13600,19 +13611,19 @@ test_alter_column_type :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT typeof(v) FROM t WHERE id = 1").s, "text")
 
 	// Two values that collide under the new type are refused by the rebuilt table.
-	run(t, store, "CREATE TABLE u (id INTEGER PRIMARY KEY, k TEXT UNIQUE)")
-	run(t, store, "INSERT INTO u (id, k) VALUES (1, '1'), (2, '01')")
+	run_done(t, store, "CREATE TABLE u (id INTEGER PRIMARY KEY, k TEXT UNIQUE)")
+	run_done(t, store, "INSERT INTO u (id, k) VALUES (1, '1'), (2, '01')")
 	_, collide := db.sql_execute(store, "ALTER TABLE u ALTER COLUMN k TYPE INTEGER")
 	testing.expect(t, !db.error_ok(collide), "a type change cannot merge unique keys")
 	testing.expect_value(t, scalar(t, store, "SELECT typeof(k) FROM u WHERE id = 2").s, "text")
 
 	// The standard's other spelling, and an unchanged type as a no-op.
-	run(t, store, "ALTER TABLE u ALTER k SET DATA TYPE TEXT")
-	run(t, store, "ALTER TABLE u ALTER COLUMN k TYPE TEXT")
+	run_done(t, store, "ALTER TABLE u ALTER k SET DATA TYPE TEXT")
+	run_done(t, store, "ALTER TABLE u ALTER COLUMN k TYPE TEXT")
 
 	// A generated column is refused, because SQLite recomputes it from its
 	// expression and a type would not survive a trip through the mirror.
-	run(t, store, "CREATE TABLE g (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2))")
+	run_done(t, store, "CREATE TABLE g (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2))")
 	_, generated := db.sql_execute(store, "ALTER TABLE g ALTER COLUMN b TYPE REAL")
 	testing.expect(t, !db.error_ok(generated))
 	testing.expect_value(t, generated.kind, db.Error_Kind.Sql_Unsupported)
@@ -13635,12 +13646,12 @@ test_windows_beside_group_by :: proc(t: ^testing.T) {
 	store := fresh_db(t, "window_group")
 	if store == nil do return
 	defer cleanup_db(store, "window_group")
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT, v INTEGER)")
-	run(t, store, "INSERT INTO t (id, k, v) VALUES (1, 'a', 1), (2, 'a', 2), (3, 'b', 3), (4, 'b', 4), (5, 'c', 5)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT, v INTEGER)")
+	run_done(t, store, "INSERT INTO t (id, k, v) VALUES (1, 'a', 1), (2, 'a', 2), (3, 'b', 3), (4, 'b', 4), (5, 'c', 5)")
 
 	// The percentage-of-total shape: the window total is 5, the same number the
 	// same groups answer through a subquery.
-	run(t, store, "SELECT k, count(*) AS n, sum(count(*)) OVER () AS total FROM t GROUP BY k")
+	run_done(t, store, "SELECT k, count(*) AS n, sum(count(*)) OVER () AS total FROM t GROUP BY k")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t").i, 5)
 	result := run(t, store, "SELECT k, count(*) AS n, sum(count(*)) OVER () AS total FROM t GROUP BY k ORDER BY k")
 	testing.expect_value(t, len(result.rows), 3)
@@ -13711,8 +13722,8 @@ test_windows_beside_group_by :: proc(t: ^testing.T) {
 	// DISTINCT inside a window used to be parsed and dropped, so the window counted
 	// every row: 2, 2 and 1 became three values instead of two.
 	testing.expect_value(t, scalar(t, store, "SELECT count(DISTINCT count(*)) OVER () FROM t GROUP BY k LIMIT 1").i, 2)
-	run(t, store, "CREATE TABLE d (id INTEGER PRIMARY KEY, v INTEGER)")
-	run(t, store, "INSERT INTO d (id, v) VALUES (1, 1), (2, 1), (3, 2)")
+	run_done(t, store, "CREATE TABLE d (id INTEGER PRIMARY KEY, v INTEGER)")
+	run_done(t, store, "INSERT INTO d (id, v) VALUES (1, 1), (2, 1), (3, 2)")
 	testing.expect_value(t, scalar(t, store, "SELECT count(DISTINCT v) OVER () FROM d LIMIT 1").i, 2)
 }
 
@@ -13725,8 +13736,8 @@ test_host_functions :: proc(t: ^testing.T) {
 	store := fresh_db(t, "host_functions")
 	if store == nil do return
 	defer cleanup_db(store, "host_functions")
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT, v INTEGER)")
-	run(t, store, "INSERT INTO t (id, k, v) VALUES (1, 'a', 1), (2, 'a', 2), (3, 'b', 3)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT, v INTEGER)")
+	run_done(t, store, "INSERT INTO t (id, k, v) VALUES (1, 'a', 1), (2, 'a', 2), (3, 'b', 3)")
 
 	prefix := "id:"
 	twice :: proc(args: []db.Value, user: rawptr) -> (db.Value, db.Error) {
@@ -13740,7 +13751,7 @@ test_host_functions :: proc(t: ^testing.T) {
 	labelled :: proc(args: []db.Value, user: rawptr) -> (db.Value, db.Error) {
 		tag := cast(^string)user
 		text := args[0].kind == .String ? args[0].s : ""
-		return db.value_string(fmt.aprintf("%s%s", tag^, text)), db.ERROR_NONE
+		return db.value_string(fmt.tprintf("%s%s", tag^, text)), db.ERROR_NONE
 	}
 	refuse :: proc(args: []db.Value, user: rawptr) -> (db.Value, db.Error) {
 		return {}, db.errf(db.Error_Kind.Invalid_Argument, "refuse() was called with %d", len(args))
@@ -13791,8 +13802,8 @@ test_windows_inside_expressions :: proc(t: ^testing.T) {
 	store := fresh_db(t, "window_nested")
 	if store == nil do return
 	defer cleanup_db(store, "window_nested")
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT, v INTEGER)")
-	run(t, store, "INSERT INTO t (id, k, v) VALUES (1, 'a', 1), (2, 'a', 2), (3, 'b', 3), (4, 'b', 4), (5, 'c', 5)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT, v INTEGER)")
+	run_done(t, store, "INSERT INTO t (id, k, v) VALUES (1, 'a', 1), (2, 'a', 2), (3, 'b', 3), (4, 'b', 4), (5, 'c', 5)")
 
 	// The list is 15 and its maximum 5.
 	testing.expect_value(t, scalar(t, store, "SELECT sum(v) OVER () + 1 FROM t LIMIT 1").i, 16)
@@ -13842,10 +13853,10 @@ test_prune_history_respects_a_pin :: proc(t: ^testing.T) {
 	store := fresh_db(t, "prune_history")
 	if store == nil do return
 	defer cleanup_db(store, "prune_history")
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)")
-	run(t, store, "INSERT INTO t (id, label) VALUES (1, 'one')")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)")
+	run_done(t, store, "INSERT INTO t (id, label) VALUES (1, 'one')")
 	first := store.commit_seq
-	run(t, store, "UPDATE t SET label = 'two' WHERE id = 1")
+	run_done(t, store, "UPDATE t SET label = 'two' WHERE id = 1")
 	testing.expect_value(t, len(store.pinned_reads), 0)
 
 	// With a pinned read at the first commit the history it needs survives a prune,
@@ -13884,7 +13895,7 @@ test_error_free_releases_the_message :: proc(t: ^testing.T) {
 	store := fresh_db(t, "error_free")
 	if store == nil do return
 	defer cleanup_db(store, "error_free")
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
 
 	_, missing := db.sql_execute(store, "SELECT * FROM nope")
 	testing.expect(t, !db.error_ok(missing))
@@ -13896,8 +13907,8 @@ test_error_free_releases_the_message :: proc(t: ^testing.T) {
 	// The same for an error that a statement answers with and the caller drops: a
 	// REPLACE that collides is not a failure, and its first attempt's message is
 	// freed where it is swallowed.
-	run(t, store, "INSERT INTO t (id, v) VALUES (1, 1)")
-	run(t, store, "INSERT OR REPLACE INTO t (id, v) VALUES (1, 2)")
+	run_done(t, store, "INSERT INTO t (id, v) VALUES (1, 1)")
+	run_done(t, store, "INSERT OR REPLACE INTO t (id, v) VALUES (1, 2)")
 	replaced, replaced_err := db.sql_execute(store, "SELECT v FROM t WHERE id = 1")
 	testing.expect(t, db.error_ok(replaced_err))
 	testing.expect_value(t, replaced.rows[0][0].i, 2)
@@ -13930,7 +13941,7 @@ test_host_collations :: proc(t: ^testing.T) {
 	store := fresh_db(t, "host_collation")
 	if store == nil do return
 	defer cleanup_db(store, "host_collation")
-	run(t, store, "CREATE TABLE w (name TEXT)")
+	run_done(t, store, "CREATE TABLE w (name TEXT)")
 
 	// A name nobody registered is refused, as SQLite refuses it: a comparison that
 	// falls back to BINARY answers a question nobody asked.
@@ -13943,7 +13954,7 @@ test_host_collations :: proc(t: ^testing.T) {
 	reserved := db.store_register_collation(store, "NOCASE", collation_by_length)
 	testing.expect_value(t, reserved.kind, db.Error_Kind.Invalid_Argument)
 
-	run(t, store, "INSERT INTO w (name) VALUES ('ab'), ('abc'), ('xy'), ('abcd')")
+	run_done(t, store, "INSERT INTO w (name) VALUES ('ab'), ('abc'), ('xy'), ('abcd')")
 	// Equality and ordering ask the host comparison: 'ab' and 'xy' have the same
 	// length and are ordered by bytes, 'abc' is longer.
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM w WHERE name = 'ab' COLLATE by_length").i, i64(1))
@@ -13999,13 +14010,13 @@ test_host_collations :: proc(t: ^testing.T) {
 	// A column may carry one: its comparisons, its ORDER BY and its keys
 	// follow it. An index on it is kept and not read, so a lookup still
 	// compares with the collation.
-	run(t, store, "CREATE TABLE lc (x TEXT COLLATE by_length)")
-	run(t, store, "INSERT INTO lc VALUES ('abc'), ('ab'), ('xy')")
+	run_done(t, store, "CREATE TABLE lc (x TEXT COLLATE by_length)")
+	run_done(t, store, "INSERT INTO lc VALUES ('abc'), ('ab'), ('xy')")
 	testing.expect_value(t, scalar(t, store, "SELECT x FROM lc ORDER BY x LIMIT 1").s, "ab")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM lc WHERE x < 'aaa'").i, i64(2))
 	_, keyed := db.sql_execute(store, "CREATE TABLE keyed (x TEXT COLLATE by_length UNIQUE)")
 	testing.expect_value(t, keyed.kind, db.Error_Kind.None)
-	run(t, store, "INSERT INTO keyed VALUES ('ab')")
+	run_done(t, store, "INSERT INTO keyed VALUES ('ab')")
 	testing.expect_value(t, run_error(t, store, "INSERT INTO keyed VALUES ('ab')").kind, db.Error_Kind.Duplicate_Unique)
 	_, indexed := db.sql_execute(store, "CREATE INDEX lc_x ON lc (x)")
 	testing.expect_value(t, indexed.kind, db.Error_Kind.None)
@@ -14069,8 +14080,8 @@ test_window_inside_an_expression_is_one_column :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "window_columns")
 
-	run(t, store, "CREATE TABLE t (v INTEGER)")
-	run(t, store, "INSERT INTO t VALUES (1), (2), (3), (4)")
+	run_done(t, store, "CREATE TABLE t (v INTEGER)")
+	run_done(t, store, "INSERT INTO t VALUES (1), (2), (3), (4)")
 
 	plain := run(t, store, "SELECT sum(v) OVER () + 1 AS s FROM t")
 	defer db.sql_result_destroy(&plain)
@@ -14104,8 +14115,8 @@ test_rowid_spellings :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "rowid_spellings")
 
-	run(t, store, "CREATE TABLE plain (a INTEGER)")
-	run(t, store, "INSERT INTO plain VALUES (10), (20)")
+	run_done(t, store, "CREATE TABLE plain (a INTEGER)")
+	run_done(t, store, "INSERT INTO plain VALUES (10), (20)")
 	rows := run(t, store, "SELECT rowid, a FROM plain ORDER BY rowid")
 	defer db.sql_result_destroy(&rows)
 	testing.expect_value(t, len(rows.rows), 2)
@@ -14116,14 +14127,14 @@ test_rowid_spellings :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT oid FROM plain WHERE rowid = 2").i, i64(2))
 
 	// The INTEGER PRIMARY KEY is the rowid, and last_insert_rowid agrees.
-	run(t, store, "CREATE TABLE keyed (id INTEGER PRIMARY KEY, v TEXT)")
-	run(t, store, "INSERT INTO keyed VALUES (7, 'a')")
+	run_done(t, store, "CREATE TABLE keyed (id INTEGER PRIMARY KEY, v TEXT)")
+	run_done(t, store, "INSERT INTO keyed VALUES (7, 'a')")
 	testing.expect_value(t, scalar(t, store, "SELECT rowid FROM keyed").i, i64(7))
 	testing.expect_value(t, scalar(t, store, "SELECT last_insert_rowid()").i, i64(7))
 
 	// A column with that name wins over the alias.
-	run(t, store, "CREATE TABLE shadow (rowid TEXT, a INTEGER)")
-	run(t, store, "INSERT INTO shadow VALUES ('x', 1)")
+	run_done(t, store, "CREATE TABLE shadow (rowid TEXT, a INTEGER)")
+	run_done(t, store, "INSERT INTO shadow VALUES ('x', 1)")
 	testing.expect_value(t, scalar(t, store, "SELECT rowid FROM shadow").s, "x")
 
 	// Two tables make an unqualified rowid ambiguous, and qualifying answers.
@@ -14144,8 +14155,8 @@ test_update_keeps_the_row_in_place :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "update_in_place")
 
-	run(t, store, "CREATE TABLE t (v INTEGER, note TEXT)")
-	run(t, store, "INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+	run_done(t, store, "CREATE TABLE t (v INTEGER, note TEXT)")
+	run_done(t, store, "INSERT INTO t VALUES (1, 'a'), (2, 'b')")
 
 	before := run(t, store, "SELECT rowid, v, note FROM t ORDER BY rowid")
 	testing.expect_value(t, len(before.rows), 2)
@@ -14154,7 +14165,7 @@ test_update_keeps_the_row_in_place :: proc(t: ^testing.T) {
 	second_rowid := before.rows[1][0].i
 	db.sql_result_destroy(&before)
 
-	run(t, store, "UPDATE t SET note = 'z' WHERE v = 2")
+	run_done(t, store, "UPDATE t SET note = 'z' WHERE v = 2")
 
 	after := run(t, store, "SELECT rowid, v, note FROM t ORDER BY rowid")
 	defer db.sql_result_destroy(&after)
@@ -14180,8 +14191,8 @@ test_log_format_is_negotiated :: proc(t: ^testing.T) {
 
 	store, err := db.store_open(path, {persistent = true, create = true, durable = false})
 	if !testing.expectf(t, db.error_ok(err), "open: %s", err.message) do return
-	run(t, store, "CREATE TABLE t (v INTEGER)")
-	run(t, store, "INSERT INTO t VALUES (1)")
+	run_done(t, store, "CREATE TABLE t (v INTEGER)")
+	run_done(t, store, "INSERT INTO t VALUES (1)")
 	db.store_close(store)
 
 	log_path := fmt.aprintf("%s/log", path)
@@ -14220,7 +14231,7 @@ test_procedure_over_the_wire :: proc(t: ^testing.T) {
 	defer db.host_destroy(host)
 	defer cleanup_db(store, "wire_procedure")
 
-	run(t, store, "CREATE TABLE log (v INTEGER NOT NULL)")
+	run_done(t, store, "CREATE TABLE log (v INTEGER NOT NULL)")
 
 	step :: proc(ctx: ^db.Procedure_Ctx, args: []db.Value) -> db.Error {
 		_, err := db.sql_execute_in_tx(ctx.tx, "INSERT INTO log (v) VALUES (7)")
@@ -14251,8 +14262,8 @@ test_schedule_now :: proc(t: ^testing.T) {
 	defer db.host_destroy(host)
 	defer cleanup_db(store, "schedule_now")
 
-	run(t, store, "CREATE TABLE counter (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)")
-	run(t, store, "INSERT INTO counter (id, value) VALUES (0, 0)")
+	run_done(t, store, "CREATE TABLE counter (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)")
+	run_done(t, store, "INSERT INTO counter (id, value) VALUES (0, 0)")
 
 	bump :: proc(ctx: ^db.Reducer_Ctx, args: []db.Value) -> db.Error {
 		amount, _ := db.value_to_i64(args[0])
@@ -14284,10 +14295,10 @@ test_right_and_full_joins :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "outer_joins")
 
-	run(t, store, "CREATE TABLE a (id INTEGER PRIMARY KEY, x TEXT)")
-	run(t, store, "CREATE TABLE b (id INTEGER PRIMARY KEY, y TEXT)")
-	run(t, store, "INSERT INTO a VALUES (1, 'a'), (2, 'b')")
-	run(t, store, "INSERT INTO b VALUES (2, 'y'), (3, 'z')")
+	run_done(t, store, "CREATE TABLE a (id INTEGER PRIMARY KEY, x TEXT)")
+	run_done(t, store, "CREATE TABLE b (id INTEGER PRIMARY KEY, y TEXT)")
+	run_done(t, store, "INSERT INTO a VALUES (1, 'a'), (2, 'b')")
+	run_done(t, store, "INSERT INTO b VALUES (2, 'y'), (3, 'z')")
 
 	right := run(t, store, "SELECT a.id, a.x, b.id, b.y FROM a RIGHT JOIN b ON a.id = b.id ORDER BY b.id")
 	defer db.sql_result_destroy(&right)
@@ -14316,7 +14327,7 @@ test_right_and_full_joins :: proc(t: ^testing.T) {
 
 	// A left side with no rows at all still answers every row of the right side,
 	// with every column of the left one NULL.
-	run(t, store, "DELETE FROM a")
+	run_done(t, store, "DELETE FROM a")
 	empty := run(t, store, "SELECT b.id, a.x FROM a RIGHT JOIN b ON a.id = b.id ORDER BY b.id")
 	defer db.sql_result_destroy(&empty)
 	testing.expect_value(t, len(empty.rows), 2)
@@ -14348,12 +14359,10 @@ test_array_syntax_and_operators :: proc(t: ^testing.T) {
 	testing.expect_value(t, literal.kind, db.Value_Kind.Array)
 	testing.expect_value(t, len(literal.list), 3)
 	testing.expect_value(t, literal.list[2].i, i64(3))
-	db.value_deep_free(literal, context.allocator)
 
 	empty := scalar(t, store, "SELECT ARRAY[]")
 	testing.expect_value(t, empty.kind, db.Value_Kind.Array)
 	testing.expect_value(t, len(empty.list), 0)
-	db.value_deep_free(empty, context.allocator)
 
 	// One-based, as in PostgreSQL, and out of range is NULL rather than an error.
 	testing.expect_value(t, scalar(t, store, "SELECT (ARRAY[10, 20, 30])[2]").i, i64(20))
@@ -14366,13 +14375,10 @@ test_array_syntax_and_operators :: proc(t: ^testing.T) {
 	joined := scalar(t, store, "SELECT ARRAY[1,2] || ARRAY[3]")
 	testing.expect_value(t, len(joined.list), 3)
 	testing.expect_value(t, joined.list[2].i, i64(3))
-	db.value_deep_free(joined, context.allocator)
 	appended := scalar(t, store, "SELECT ARRAY[1,2] || 3")
 	testing.expect_value(t, len(appended.list), 3)
-	db.value_deep_free(appended, context.allocator)
 	prepended := scalar(t, store, "SELECT 0 || ARRAY[1]")
 	testing.expect_value(t, prepended.list[0].i, i64(0))
-	db.value_deep_free(prepended, context.allocator)
 
 	// The set operators, and SQL's two quantified comparisons.
 	testing.expect_value(t, scalar(t, store, "SELECT ARRAY[1,2,3] @> ARRAY[2]").b, true)
@@ -14387,8 +14393,8 @@ test_array_syntax_and_operators :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT 1 <> ALL(ARRAY[1,2])").b, false)
 
 	// A column declared with the PostgreSQL spelling stores and answers one.
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, tags TEXT[])")
-	run(t, store, "INSERT INTO t VALUES (1, ARRAY['a','b']), (2, ARRAY[])")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, tags TEXT[])")
+	run_done(t, store, "INSERT INTO t VALUES (1, ARRAY['a','b']), (2, ARRAY[])")
 	stored := run(t, store, "SELECT id, tags, cardinality(tags) FROM t ORDER BY id")
 	defer db.sql_result_destroy(&stored)
 	testing.expect_value(t, stored.rows[0][1].kind, db.Value_Kind.Array)
@@ -14404,19 +14410,18 @@ test_array_syntax_and_operators :: proc(t: ^testing.T) {
 	// The cast spelling, and the refusal that keeps an array of arrays out.
 	casted := scalar(t, store, "SELECT ARRAY['x']::TEXT[]")
 	testing.expect_value(t, casted.kind, db.Value_Kind.Array)
-	db.value_deep_free(casted, context.allocator)
 	refused := run_error(t, store, "CREATE TABLE deep (a INT[][])")
 	testing.expect_value(t, refused.kind, db.Error_Kind.Sql_Unsupported)
 
 	// `array` is still a column name: the bracket is what makes it a constructor.
-	run(t, store, "CREATE TABLE named (array INTEGER)")
-	run(t, store, "INSERT INTO named VALUES (7)")
+	run_done(t, store, "CREATE TABLE named (array INTEGER)")
+	run_done(t, store, "INSERT INTO named VALUES (7)")
 	testing.expect_value(t, scalar(t, store, "SELECT array FROM named").i, i64(7))
 
 	// array_agg is how a query builds one: NULLs are elements, an empty group is
 	// NULL, and DISTINCT keeps one of each.
-	run(t, store, "CREATE TABLE g (k TEXT, v INTEGER)")
-	run(t, store, "INSERT INTO g VALUES ('a', 1), ('a', 2), ('b', 3), ('b', NULL)")
+	run_done(t, store, "CREATE TABLE g (k TEXT, v INTEGER)")
+	run_done(t, store, "INSERT INTO g VALUES ('a', 1), ('a', 2), ('b', 3), ('b', NULL)")
 	grouped := run(t, store, "SELECT k, array_agg(v) FROM g GROUP BY k ORDER BY k")
 	defer db.sql_result_destroy(&grouped)
 	testing.expect_value(t, len(grouped.rows), 2)
@@ -14426,7 +14431,6 @@ test_array_syntax_and_operators :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT array_agg(v) FROM g WHERE k = 'z'").kind, db.Value_Kind.Null)
 	one_of_each := scalar(t, store, "SELECT array_agg(DISTINCT k) FROM g")
 	testing.expect_value(t, len(one_of_each.list), 2)
-	db.value_deep_free(one_of_each, context.allocator)
 	testing.expect_value(t, scalar(t, store, "SELECT cardinality(array_agg(v)) FROM g").i, i64(4))
 }
 
@@ -14444,11 +14448,9 @@ test_array_text_form :: proc(t: ^testing.T) {
 	testing.expect_value(t, casted.kind, db.Value_Kind.Array)
 	testing.expect_value(t, len(casted.list), 3)
 	testing.expect_value(t, casted.list[0].i, i64(1))
-	db.value_deep_free(casted, context.allocator)
 
 	empty := scalar(t, store, "SELECT '{}'::TEXT[]")
 	testing.expect_value(t, len(empty.list), 0)
-	db.value_deep_free(empty, context.allocator)
 
 	// Quoted elements keep their separators, an unquoted NULL is the null
 	// element, and a quoted "NULL" is the word.
@@ -14458,10 +14460,9 @@ test_array_text_form :: proc(t: ^testing.T) {
 	testing.expect_value(t, quoted.list[1].s, "c d")
 	testing.expect_value(t, quoted.list[2].kind, db.Value_Kind.Null)
 	testing.expect_value(t, quoted.list[3].s, "NULL")
-	db.value_deep_free(quoted, context.allocator)
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, tags TEXT[])")
-	run(t, store, "INSERT INTO t VALUES (1, '{a,b}')")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, tags TEXT[])")
+	run_done(t, store, "INSERT INTO t VALUES (1, '{a,b}')")
 	stored := run(t, store, "SELECT tags FROM t WHERE id = 1")
 	defer db.sql_result_destroy(&stored)
 	testing.expect_value(t, len(stored.rows[0][0].list), 2)
@@ -14487,8 +14488,8 @@ test_drop_and_create_in_one_transaction :: proc(t: ^testing.T) {
 	store, open_err := db.store_open(path, {persistent = true, create = true, durable = false})
 	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
 
-	run(t, store, "CREATE TABLE t (a INTEGER)")
-	run(t, store, "INSERT INTO t VALUES (1)")
+	run_done(t, store, "CREATE TABLE t (a INTEGER)")
+	run_done(t, store, "INSERT INTO t VALUES (1)")
 
 	// Drop, recreate with another shape, write, and commit in one transaction.
 	tx := db.tx_begin_write(store)

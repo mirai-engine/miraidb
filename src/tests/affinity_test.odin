@@ -14,8 +14,8 @@ test_affinity_and_untyped_columns :: proc(t: ^testing.T) {
 	// crosses a .sqlite export with its values' classes.
 	store := fresh_db(t, "affinity")
 	if store == nil do return
-	run(t, store, "CREATE TABLE m (x, n NUMBERISH, i INTEGER, t TEXT, u UNSIGNED BIG INT)")
-	run(t, store, "INSERT INTO m VALUES (1, '7', '12', 34, '9'), ('a', '1.5', 3.0, 1.5, 2), (x'00', 'z', 4, 'w', NULL), (NULL, 2.0, 5, NULL, 1)")
+	run_done(t, store, "CREATE TABLE m (x, n NUMBERISH, i INTEGER, t TEXT, u UNSIGNED BIG INT)")
+	run_done(t, store, "INSERT INTO m VALUES (1, '7', '12', 34, '9'), ('a', '1.5', 3.0, 1.5, 2), (x'00', 'z', 4, 'w', NULL), (NULL, 2.0, 5, NULL, 1)")
 	testing.expect_value(t, scalar(t, store, "SELECT group_concat(typeof(x), ',') FROM m").s, "integer,text,blob,null")
 	testing.expect_value(t, scalar(t, store, "SELECT group_concat(typeof(n), ',') FROM m").s, "integer,real,text,integer")
 	testing.expect_value(t, scalar(t, store, "SELECT group_concat(typeof(i), ',') FROM m").s, "integer,integer,integer,integer")
@@ -27,9 +27,9 @@ test_affinity_and_untyped_columns :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM m WHERE i = '12'").i, i64(1))
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM m WHERE t = 34").i, i64(1))
 
-	run(t, store, "CREATE TABLE s (i INTEGER, b BLOB) STRICT")
-	run(t, store, "CREATE TABLE w (k TEXT PRIMARY KEY, v) WITHOUT ROWID")
-	run(t, store, "INSERT INTO w VALUES ('a', 1)")
+	run_done(t, store, "CREATE TABLE s (i INTEGER, b BLOB) STRICT")
+	run_done(t, store, "CREATE TABLE w (k TEXT PRIMARY KEY, v) WITHOUT ROWID")
+	run_done(t, store, "INSERT INTO w VALUES ('a', 1)")
 	db.store_close(store)
 
 	reopened, open_err := db.store_open("_test_affinity", {persistent = true, create = true, durable = false})

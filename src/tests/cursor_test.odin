@@ -12,8 +12,8 @@ test_cursors :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "cursor")
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
-	run(t, store, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+	run_done(t, store, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')")
 
 	tx := db.tx_begin_write(store)
 	if !testing.expect(t, tx != nil) do return

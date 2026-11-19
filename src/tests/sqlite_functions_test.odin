@@ -170,8 +170,8 @@ test_json_mutators_and_aggregates :: proc(t: ^testing.T) {
 
 	// The aggregates build one document from the group, and an empty group is
 	// NULL, as SQLite answers it.
-	run(t, store, "CREATE TABLE t (k TEXT, v INTEGER)")
-	run(t, store, "INSERT INTO t VALUES ('a', 1), ('b', 2), ('c', 3)")
+	run_done(t, store, "CREATE TABLE t (k TEXT, v INTEGER)")
+	run_done(t, store, "INSERT INTO t VALUES ('a', 1), ('b', 2), ('c', 3)")
 	array := run(t, store, "SELECT json_group_array(v) FROM t")
 	testing.expect_value(t, array.rows[0][0].s, "[1,2,3]")
 	db.sql_result_destroy(&array)
@@ -196,8 +196,8 @@ test_percentile_aggregates :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "percentile")
 
-	run(t, store, "CREATE TABLE t (v REAL)")
-	run(t, store, "INSERT INTO t VALUES (1), (2), (3), (4), (10)")
+	run_done(t, store, "CREATE TABLE t (v REAL)")
+	run_done(t, store, "INSERT INTO t VALUES (1), (2), (3), (4), (10)")
 
 	rows := run(
 		t,
@@ -238,8 +238,8 @@ test_explain_query_plan :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "query_plan")
 
-	run(t, store, "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept INTEGER)")
-	run(t, store, "CREATE INDEX by_dept ON emp (dept)")
+	run_done(t, store, "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept INTEGER)")
+	run_done(t, store, "CREATE INDEX by_dept ON emp (dept)")
 
 	plan := run(t, store, "EXPLAIN QUERY PLAN SELECT * FROM emp WHERE dept = 1 ORDER BY name")
 	defer db.sql_result_destroy(&plan)
@@ -275,9 +275,9 @@ test_reindex_and_index_hints :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "reindex")
 
-	run(t, store, "CREATE TABLE t (a INTEGER, b TEXT)")
-	run(t, store, "INSERT INTO t VALUES (1, 'x'), (2, 'y')")
-	run(t, store, "CREATE INDEX by_a ON t (a)")
+	run_done(t, store, "CREATE TABLE t (a INTEGER, b TEXT)")
+	run_done(t, store, "INSERT INTO t VALUES (1, 'x'), (2, 'y')")
+	run_done(t, store, "CREATE INDEX by_a ON t (a)")
 
 	// REINDEX is accepted: every index is rebuilt from the log when the database
 	// opens, so nothing here is out of date. A name it cannot find is refused.

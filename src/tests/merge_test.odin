@@ -14,10 +14,10 @@ test_merge_updates_inserts_and_deletes :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "merge")
 
-	run(t, store, "CREATE TABLE stock (id INTEGER PRIMARY KEY, qty INTEGER, note TEXT)")
-	run(t, store, "INSERT INTO stock VALUES (1, 5, 'a'), (2, 0, 'b'), (3, 9, 'c')")
-	run(t, store, "CREATE TABLE feed (id INTEGER PRIMARY KEY, qty INTEGER)")
-	run(t, store, "INSERT INTO feed VALUES (1, 10), (3, 1), (4, 7)")
+	run_done(t, store, "CREATE TABLE stock (id INTEGER PRIMARY KEY, qty INTEGER, note TEXT)")
+	run_done(t, store, "INSERT INTO stock VALUES (1, 5, 'a'), (2, 0, 'b'), (3, 9, 'c')")
+	run_done(t, store, "CREATE TABLE feed (id INTEGER PRIMARY KEY, qty INTEGER)")
+	run_done(t, store, "INSERT INTO feed VALUES (1, 10), (3, 1), (4, 7)")
 
 	// One clause updates what matched and one inserts what did not.
 	result := run(
@@ -52,8 +52,8 @@ test_merge_updates_inserts_and_deletes :: proc(t: ^testing.T) {
 
 	// Two source rows for one target would change it twice: refused, and nothing
 	// is written.
-	run(t, store, "CREATE TABLE twice (k INTEGER, qty INTEGER)")
-	run(t, store, "INSERT INTO twice VALUES (1, 100), (1, 200)")
+	run_done(t, store, "CREATE TABLE twice (k INTEGER, qty INTEGER)")
+	run_done(t, store, "INSERT INTO twice VALUES (1, 100), (1, 200)")
 	double := run_error(
 		t,
 		store,

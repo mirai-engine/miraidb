@@ -14,8 +14,8 @@ test_correlated_subqueries :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "correlated")
 
-	run(t, store, "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept INTEGER, salary INTEGER)")
-	run(t, store, "INSERT INTO emp VALUES (1, 'a', 1, 100), (2, 'b', 1, 200), (3, 'c', 2, 150)")
+	run_done(t, store, "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept INTEGER, salary INTEGER)")
+	run_done(t, store, "INSERT INTO emp VALUES (1, 'a', 1, 100), (2, 'b', 1, 200), (3, 'c', 2, 150)")
 
 	// A scalar subquery compared against the row it belongs to.
 	rows := run(
@@ -66,10 +66,10 @@ test_lateral_subqueries :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "lateral")
 
-	run(t, store, "CREATE TABLE dept (id INTEGER PRIMARY KEY, name TEXT)")
-	run(t, store, "INSERT INTO dept VALUES (1, 'eng'), (2, 'sales'), (3, 'empty')")
-	run(t, store, "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept INTEGER, salary INTEGER)")
-	run(t, store, "INSERT INTO emp VALUES (1, 'a', 1, 100), (2, 'b', 1, 200), (3, 'c', 2, 150)")
+	run_done(t, store, "CREATE TABLE dept (id INTEGER PRIMARY KEY, name TEXT)")
+	run_done(t, store, "INSERT INTO dept VALUES (1, 'eng'), (2, 'sales'), (3, 'empty')")
+	run_done(t, store, "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept INTEGER, salary INTEGER)")
+	run_done(t, store, "INSERT INTO emp VALUES (1, 'a', 1, 100), (2, 'b', 1, 200), (3, 'c', 2, 150)")
 
 	// One evaluation per department: the aggregates differ per row.
 	rows := run(

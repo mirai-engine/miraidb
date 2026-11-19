@@ -30,8 +30,8 @@ test_is_compares_null_as_a_value :: proc(t: ^testing.T) {
 	expect_true(t, store, "SELECT 1 IS DISTINCT FROM NULL", true)
 	expect_true(t, store, "SELECT 2 IS NOT DISTINCT FROM 2", true)
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
-	run(t, store, "INSERT INTO t VALUES (1, 1), (2, NULL), (3, 2)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+	run_done(t, store, "INSERT INTO t VALUES (1, 1), (2, NULL), (3, 2)")
 	// `v != 1` drops the NULL row; `v IS NOT 1` keeps it.
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t WHERE v != 1").i, i64(1))
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t WHERE v IS NOT 1").i, i64(2))
@@ -98,8 +98,8 @@ test_limit_with_a_comma :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "limit_comma")
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
-	run(t, store, "INSERT INTO t VALUES (1), (2), (3), (4), (5), (6)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+	run_done(t, store, "INSERT INTO t VALUES (1), (2), (3), (4), (5), (6)")
 	// `LIMIT 2, 3` is `LIMIT 3 OFFSET 2`.
 	result := run(t, store, "SELECT id FROM t ORDER BY id LIMIT 2, 3")
 	defer db.sql_result_destroy(&result)
@@ -118,8 +118,8 @@ test_a_failed_statement_is_undone_in_a_transaction :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "stmt_abort")
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE)")
-	run(t, store, "INSERT INTO t VALUES (100, 1000)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE)")
+	run_done(t, store, "INSERT INTO t VALUES (100, 1000)")
 	tx := db.tx_begin_write(store)
 	ok := func_exec(t, tx, "INSERT INTO t VALUES (1, 10)")
 	testing.expect(t, ok)
@@ -167,15 +167,15 @@ test_insert_conflict_resolutions :: proc(t: ^testing.T) {
 	}
 
 	// OR IGNORE skips the rows that break a key or NOT NULL and keeps the rest.
-	run(t, store, "CREATE TABLE a (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
-	run(t, store, "INSERT INTO a VALUES (1, 'a')")
-	run(t, store, "INSERT OR IGNORE INTO a VALUES (1, 'x'), (2, 'b'), (3, NULL), (4, 'd')")
+	run_done(t, store, "CREATE TABLE a (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+	run_done(t, store, "INSERT INTO a VALUES (1, 'a')")
+	run_done(t, store, "INSERT OR IGNORE INTO a VALUES (1, 'x'), (2, 'b'), (3, NULL), (4, 'd')")
 	testing.expect_value(t, count(t, store, "a"), i64(3))
 	testing.expect_value(t, scalar(t, store, "SELECT v FROM a WHERE id = 1").s, "a")
 
 	// OR FAIL stops at the failing row and keeps the rows before it.
-	run(t, store, "CREATE TABLE b (id INTEGER PRIMARY KEY)")
-	run(t, store, "INSERT INTO b VALUES (5)")
+	run_done(t, store, "CREATE TABLE b (id INTEGER PRIMARY KEY)")
+	run_done(t, store, "INSERT INTO b VALUES (5)")
 	failed := run_error(t, store, "INSERT OR FAIL INTO b VALUES (1), (2), (5), (3)")
 	testing.expect_value(t, failed.kind, db.Error_Kind.Duplicate_Primary_Key)
 	testing.expect_value(t, count(t, store, "b"), i64(3))
@@ -184,7 +184,7 @@ test_insert_conflict_resolutions :: proc(t: ^testing.T) {
 	// OR ROLLBACK in a statement that owns its transaction is ABORT; inside a
 	// transaction the caller opened, a broken constraint ends that transaction,
 	// as in SQLite: its earlier work goes too.
-	run(t, store, "CREATE TABLE c (id INTEGER PRIMARY KEY)")
+	run_done(t, store, "CREATE TABLE c (id INTEGER PRIMARY KEY)")
 	testing.expect_value(t, run_error(t, store, "INSERT OR ROLLBACK INTO c VALUES (1), (1)").kind, db.Error_Kind.Duplicate_Primary_Key)
 	testing.expect_value(t, count(t, store, "c"), i64(0))
 	{
@@ -198,7 +198,7 @@ test_insert_conflict_resolutions :: proc(t: ^testing.T) {
 	testing.expect_value(t, count(t, store, "c"), i64(0))
 
 	// REPLACE INTO is INSERT OR REPLACE.
-	run(t, store, "REPLACE INTO a VALUES (1, 'z'), (9, 'n')")
+	run_done(t, store, "REPLACE INTO a VALUES (1, 'z'), (9, 'n')")
 	testing.expect_value(t, scalar(t, store, "SELECT v FROM a WHERE id = 1").s, "z")
 	testing.expect_value(t, count(t, store, "a"), i64(4))
 }
@@ -226,8 +226,8 @@ test_compound_operators :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "compound_ops")
 
-	run(t, store, "CREATE TABLE n (x INTEGER)")
-	run(t, store, "INSERT INTO n VALUES (1), (2), (2), (3), (NULL)")
+	run_done(t, store, "CREATE TABLE n (x INTEGER)")
+	run_done(t, store, "INSERT INTO n VALUES (1), (2), (2), (3), (NULL)")
 	expect_ints(t, store, "SELECT x FROM n INTERSECT SELECT 2 ORDER BY 1", {2})
 	expect_ints(t, store, "SELECT x FROM n EXCEPT SELECT 2 ORDER BY 1", {-1, 1, 3})
 	// Left to right: the UNION removes the duplicate, the UNION ALL after it adds one.
@@ -242,9 +242,9 @@ test_nulls_first_and_last :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "nulls_order")
 
-	run(t, store, "CREATE TABLE n (id INTEGER PRIMARY KEY, x INTEGER)")
-	run(t, store, "CREATE INDEX n_x ON n (x)")
-	run(t, store, "INSERT INTO n VALUES (1, 2), (2, NULL), (3, 1)")
+	run_done(t, store, "CREATE TABLE n (id INTEGER PRIMARY KEY, x INTEGER)")
+	run_done(t, store, "CREATE INDEX n_x ON n (x)")
+	run_done(t, store, "INSERT INTO n VALUES (1, 2), (2, NULL), (3, 1)")
 	// The defaults: NULL is the smallest value.
 	expect_ints(t, store, "SELECT x FROM n ORDER BY x", {-1, 1, 2})
 	expect_ints(t, store, "SELECT x FROM n ORDER BY x DESC", {2, 1, -1})
@@ -264,8 +264,8 @@ test_derived_tables_and_values :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "derived")
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
-	run(t, store, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+	run_done(t, store, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
 	expect_ints(t, store, "SELECT s.v FROM (SELECT v FROM t WHERE v > 10) AS s ORDER BY s.v", {20, 30})
 	expect_ints(t, store, "SELECT count(*) FROM (SELECT id FROM t UNION SELECT 7)", {4})
 	expect_ints(t, store, "SELECT column1 FROM (VALUES (5, 'a'), (6, 'b'))", {5, 6})
@@ -293,8 +293,8 @@ test_row_values :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "row_values")
 
-	run(t, store, "CREATE TABLE p (a INTEGER, b TEXT)")
-	run(t, store, "INSERT INTO p VALUES (1, 'x'), (2, 'y'), (2, 'z'), (3, NULL)")
+	run_done(t, store, "CREATE TABLE p (a INTEGER, b TEXT)")
+	run_done(t, store, "INSERT INTO p VALUES (1, 'x'), (2, 'y'), (2, 'z'), (3, NULL)")
 	expect_ints(t, store, "SELECT a FROM p WHERE (a, b) = (2, 'y')", {2})
 	expect_ints(t, store, "SELECT a FROM p WHERE (a, b) > (2, 'y') ORDER BY a", {2, 3})
 	expect_ints(t, store, "SELECT a FROM p WHERE (a, b) IN ((1, 'x'), (2, 'z')) ORDER BY a", {1, 2})
@@ -319,19 +319,19 @@ test_check_constraints :: proc(t: ^testing.T) {
 		name TEXT CONSTRAINT name_len CHECK (length(name) > 1),
 		qty INTEGER CHECK (qty >= 0),
 		CHECK (qty < 100 OR name = 'big'))`)
-	run(t, store, "INSERT INTO p VALUES (1, 'ab', 5)")
+	run_done(t, store, "INSERT INTO p VALUES (1, 'ab', 5)")
 	named := run_error(t, store, "INSERT INTO p VALUES (2, 'a', 5)")
 	testing.expect_value(t, named.kind, db.Error_Kind.Check_Violation)
 	testing.expect_value(t, named.message, "CHECK constraint failed: name_len")
 	unnamed := run_error(t, store, "INSERT INTO p VALUES (3, 'cd', -1)")
 	testing.expect_value(t, unnamed.message, "CHECK constraint failed: qty >= 0")
 	testing.expect_value(t, run_error(t, store, "INSERT INTO p VALUES (4, 'cd', 500)").kind, db.Error_Kind.Check_Violation)
-	run(t, store, "INSERT INTO p VALUES (5, 'big', 500)")
+	run_done(t, store, "INSERT INTO p VALUES (5, 'big', 500)")
 	// NULL passes a CHECK, as in SQL.
-	run(t, store, "INSERT INTO p VALUES (6, NULL, NULL)")
+	run_done(t, store, "INSERT INTO p VALUES (6, NULL, NULL)")
 	testing.expect_value(t, run_error(t, store, "UPDATE p SET qty = -5 WHERE id = 1").kind, db.Error_Kind.Check_Violation)
 	// OR IGNORE skips a row a CHECK refuses.
-	run(t, store, "INSERT OR IGNORE INTO p VALUES (7, 'x', 1), (8, 'xy', 1)")
+	run_done(t, store, "INSERT OR IGNORE INTO p VALUES (7, 'x', 1), (8, 'xy', 1)")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM p").i, i64(4))
 	// A malformed CHECK is refused with the table.
 	testing.expect(t, run_error(t, store, "CREATE TABLE bad (x INTEGER CHECK (x >))").kind != .None)
@@ -342,16 +342,16 @@ test_check_constraints :: proc(t: ^testing.T) {
 	testing.expect(t, db.error_ok(err))
 	defer cleanup_db(reopened, "checks")
 	testing.expect_value(t, run_error(t, reopened, "INSERT INTO p VALUES (9, 'z', 1)").kind, db.Error_Kind.Check_Violation)
-	run(t, reopened, "INSERT INTO p VALUES (10, 'zz', 1)")
+	run_done(t, reopened, "INSERT INTO p VALUES (10, 'zz', 1)")
 
 	// A column's own CHECK goes with the column; one that names it from the
 	// table blocks the drop, and a rename rewrites the CHECK, as in SQLite.
-	run(t, reopened, "CREATE TABLE d (id INTEGER PRIMARY KEY, q INTEGER CHECK (q > 0), r INTEGER, CHECK (r < 10))")
-	run(t, reopened, "ALTER TABLE d DROP COLUMN q")
+	run_done(t, reopened, "CREATE TABLE d (id INTEGER PRIMARY KEY, q INTEGER CHECK (q > 0), r INTEGER, CHECK (r < 10))")
+	run_done(t, reopened, "ALTER TABLE d DROP COLUMN q")
 	testing.expect_value(t, run_error(t, reopened, "ALTER TABLE d DROP COLUMN r").kind, db.Error_Kind.Sql_Unsupported)
-	run(t, reopened, "ALTER TABLE d RENAME COLUMN r TO s")
+	run_done(t, reopened, "ALTER TABLE d RENAME COLUMN r TO s")
 	testing.expect_value(t, run_error(t, reopened, "INSERT INTO d VALUES (1, 50)").kind, db.Error_Kind.Check_Violation)
-	run(t, reopened, "INSERT INTO d (id, s) VALUES (2, 5)")
+	run_done(t, reopened, "INSERT INTO d (id, s) VALUES (2, 5)")
 }
 
 @(test)
@@ -359,41 +359,41 @@ test_column_references_and_defaults :: proc(t: ^testing.T) {
 	store := fresh_db(t, "col_refs")
 	if store == nil do return
 
-	run(t, store, "CREATE TABLE p (id INTEGER PRIMARY KEY)")
-	run(t, store, "INSERT INTO p VALUES (1)")
+	run_done(t, store, "CREATE TABLE p (id INTEGER PRIMARY KEY)")
+	run_done(t, store, "INSERT INTO p VALUES (1)")
 	// A column-level REFERENCES, with the parent's key implied.
-	run(t, store, "CREATE TABLE c (id INTEGER PRIMARY KEY, pid INTEGER CONSTRAINT to_p REFERENCES p ON DELETE CASCADE, note TEXT DEFAULT 'none')")
-	run(t, store, "INSERT INTO c (id, pid) VALUES (1, 1)")
+	run_done(t, store, "CREATE TABLE c (id INTEGER PRIMARY KEY, pid INTEGER CONSTRAINT to_p REFERENCES p ON DELETE CASCADE, note TEXT DEFAULT 'none')")
+	run_done(t, store, "INSERT INTO c (id, pid) VALUES (1, 1)")
 	testing.expect(t, run_error(t, store, "INSERT INTO c (id, pid) VALUES (2, 99)").kind != .None)
 	testing.expect_value(t, scalar(t, store, "SELECT note FROM c WHERE id = 1").s, "none")
-	run(t, store, "DELETE FROM p WHERE id = 1")
+	run_done(t, store, "DELETE FROM p WHERE id = 1")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM c").i, i64(0))
 	// A table may reference itself.
-	run(t, store, "CREATE TABLE tree (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES tree (id))")
-	run(t, store, "INSERT INTO tree VALUES (1, NULL), (2, 1)")
+	run_done(t, store, "CREATE TABLE tree (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES tree (id))")
+	run_done(t, store, "INSERT INTO tree VALUES (1, NULL), (2, 1)")
 	testing.expect(t, run_error(t, store, "INSERT INTO tree VALUES (3, 42)").kind != .None)
 
 	// CURRENT_TIMESTAMP and its siblings, as values and as a per-row DEFAULT.
 	testing.expect_value(t, scalar(t, store, "SELECT length(CURRENT_TIMESTAMP)").i, i64(19))
 	testing.expect_value(t, scalar(t, store, "SELECT length(CURRENT_DATE)").i, i64(10))
 	testing.expect_value(t, scalar(t, store, "SELECT length(CURRENT_TIME)").i, i64(8))
-	run(t, store, "CREATE TABLE stamps (id INTEGER PRIMARY KEY, at TEXT DEFAULT CURRENT_TIMESTAMP, n INTEGER DEFAULT (1 + 1))")
-	run(t, store, "INSERT INTO stamps (id) VALUES (1)")
+	run_done(t, store, "CREATE TABLE stamps (id INTEGER PRIMARY KEY, at TEXT DEFAULT CURRENT_TIMESTAMP, n INTEGER DEFAULT (1 + 1))")
+	run_done(t, store, "INSERT INTO stamps (id) VALUES (1)")
 	testing.expect(t, db.value_is_truthy(scalar(t, store, "SELECT at = datetime('now') OR at < datetime('now') FROM stamps")))
 	testing.expect_value(t, scalar(t, store, "SELECT n FROM stamps").i, i64(2))
 
 	// Index and key columns may carry a direction.
-	run(t, store, "CREATE INDEX stamps_at ON stamps (at DESC, id ASC)")
-	run(t, store, "CREATE TABLE k (a INTEGER, b INTEGER, PRIMARY KEY (a DESC, b))")
+	run_done(t, store, "CREATE INDEX stamps_at ON stamps (at DESC, id ASC)")
+	run_done(t, store, "CREATE TABLE k (a INTEGER, b INTEGER, PRIMARY KEY (a DESC, b))")
 	// ON CONFLICT on a constraint is accepted (test_constraint_on_conflict).
-	run(t, store, "CREATE TABLE oc (x INTEGER UNIQUE ON CONFLICT REPLACE)")
+	run_done(t, store, "CREATE TABLE oc (x INTEGER UNIQUE ON CONFLICT REPLACE)")
 
 	// The per-row default survives a reopen.
 	db.store_close(store)
 	reopened, err := db.store_open("_test_col_refs", {persistent = true, create = false, durable = false})
 	testing.expect(t, db.error_ok(err))
 	defer cleanup_db(reopened, "col_refs")
-	run(t, reopened, "INSERT INTO stamps (id) VALUES (2)")
+	run_done(t, reopened, "INSERT INTO stamps (id) VALUES (2)")
 	testing.expect_value(t, scalar(t, reopened, "SELECT length(at) FROM stamps WHERE id = 2").i, i64(19))
 }
 
@@ -403,8 +403,8 @@ test_deferred_foreign_keys :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "deferred_fk")
 
-	run(t, store, "CREATE TABLE p (id INTEGER PRIMARY KEY)")
-	run(t, store, "CREATE TABLE c (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p (id) DEFERRABLE INITIALLY DEFERRED)")
+	run_done(t, store, "CREATE TABLE p (id INTEGER PRIMARY KEY)")
+	run_done(t, store, "CREATE TABLE c (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p (id) DEFERRABLE INITIALLY DEFERRED)")
 	// The child may come first; the commit finds its parent.
 	tx := db.tx_begin_write(store)
 	testing.expect(t, func_exec(t, tx, "INSERT INTO c VALUES (1, 10)"))
@@ -425,7 +425,7 @@ test_deferred_foreign_keys :: proc(t: ^testing.T) {
 	// In autocommit the statement is the transaction: checked at its end.
 	testing.expect(t, run_error(t, store, "INSERT INTO c VALUES (3, 30)").kind != .None)
 	// NOT DEFERRABLE and INITIALLY IMMEDIATE check at once, as before.
-	run(t, store, "CREATE TABLE i (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p (id) DEFERRABLE INITIALLY IMMEDIATE)")
+	run_done(t, store, "CREATE TABLE i (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p (id) DEFERRABLE INITIALLY IMMEDIATE)")
 	tx = db.tx_begin_write(store)
 	_, now := db.sql_execute_in_tx(tx, "INSERT INTO i VALUES (1, 77)")
 	testing.expect(t, now.kind != .None)
@@ -438,31 +438,31 @@ test_partial_and_expression_indexes :: proc(t: ^testing.T) {
 	store := fresh_db(t, "partial_idx")
 	if store == nil do return
 
-	run(t, store, "CREATE TABLE u (id INTEGER PRIMARY KEY, email TEXT, deleted INTEGER DEFAULT 0)")
-	run(t, store, "INSERT INTO u (id, email) VALUES (1, 'A@x.io'), (2, 'b@x.io'), (3, NULL), (4, NULL)")
+	run_done(t, store, "CREATE TABLE u (id INTEGER PRIMARY KEY, email TEXT, deleted INTEGER DEFAULT 0)")
+	run_done(t, store, "INSERT INTO u (id, email) VALUES (1, 'A@x.io'), (2, 'b@x.io'), (3, NULL), (4, NULL)")
 	// Unique over an expression, among the live rows only.
-	run(t, store, "CREATE UNIQUE INDEX u_live ON u (lower(email)) WHERE deleted = 0")
+	run_done(t, store, "CREATE UNIQUE INDEX u_live ON u (lower(email)) WHERE deleted = 0")
 	testing.expect_value(t, run_error(t, store, "INSERT INTO u (id, email) VALUES (5, 'a@X.io')").kind, db.Error_Kind.Duplicate_Unique)
-	run(t, store, "UPDATE u SET deleted = 1 WHERE id = 1")
-	run(t, store, "INSERT INTO u (id, email) VALUES (5, 'a@X.io')")
+	run_done(t, store, "UPDATE u SET deleted = 1 WHERE id = 1")
+	run_done(t, store, "INSERT INTO u (id, email) VALUES (5, 'a@X.io')")
 	// A row outside the index is not constrained by it, and moving it back in is.
-	run(t, store, "INSERT INTO u (id, email, deleted) VALUES (6, 'b@x.io', 1)")
+	run_done(t, store, "INSERT INTO u (id, email, deleted) VALUES (6, 'b@x.io', 1)")
 	testing.expect_value(t, run_error(t, store, "UPDATE u SET deleted = 0 WHERE id = 1").kind, db.Error_Kind.Duplicate_Unique)
 	// OR IGNORE and REPLACE see the index, the defaults of the row included.
-	run(t, store, "INSERT OR IGNORE INTO u (id, email) VALUES (8, 'B@x.io'), (9, 'c@x.io')")
-	run(t, store, "REPLACE INTO u (id, email) VALUES (10, 'C@X.IO')")
+	run_done(t, store, "INSERT OR IGNORE INTO u (id, email) VALUES (8, 'B@x.io'), (9, 'c@x.io')")
+	run_done(t, store, "REPLACE INTO u (id, email) VALUES (10, 'C@X.IO')")
 	expect_ints(t, store, "SELECT id FROM u ORDER BY id", {1, 2, 3, 4, 5, 6, 10})
 	// Queries answer from the rows, whatever the index holds.
 	expect_ints(t, store, "SELECT id FROM u WHERE lower(email) = 'b@x.io' ORDER BY id", {2, 6})
 	expect_ints(t, store, "SELECT id FROM u WHERE deleted = 0 ORDER BY id", {2, 3, 4, 5, 10})
 
 	// A UNIQUE index the rows already break is refused, plain or not.
-	run(t, store, "CREATE TABLE d (id INTEGER PRIMARY KEY, x INTEGER)")
-	run(t, store, "INSERT INTO d VALUES (1, 5), (2, 5), (3, 6)")
+	run_done(t, store, "CREATE TABLE d (id INTEGER PRIMARY KEY, x INTEGER)")
+	run_done(t, store, "INSERT INTO d VALUES (1, 5), (2, 5), (3, 6)")
 	testing.expect_value(t, run_error(t, store, "CREATE UNIQUE INDEX d_x ON d (x)").kind, db.Error_Kind.Duplicate_Unique)
 	expect_ints(t, store, "SELECT count(*) FROM d WHERE x = 5", {2})
-	run(t, store, "CREATE UNIQUE INDEX d_pair ON d (x, id % 2)")
-	run(t, store, "CREATE UNIQUE INDEX d_six ON d (x) WHERE x > 5")
+	run_done(t, store, "CREATE UNIQUE INDEX d_pair ON d (x, id % 2)")
+	run_done(t, store, "CREATE UNIQUE INDEX d_six ON d (x) WHERE x > 5")
 	// What changes between evaluations cannot key an index.
 	testing.expect_value(t, run_error(t, store, "CREATE INDEX d_r ON d (random())").kind, db.Error_Kind.Sql_Unsupported)
 	testing.expect_value(t, run_error(t, store, "CREATE INDEX d_n ON d (x) WHERE x > (SELECT 1)").kind, db.Error_Kind.Sql_Unsupported)
@@ -474,10 +474,10 @@ test_partial_and_expression_indexes :: proc(t: ^testing.T) {
 	testing.expect(t, db.error_ok(err))
 	defer cleanup_db(reopened, "partial_idx")
 	testing.expect_value(t, run_error(t, reopened, "INSERT INTO u (id, email) VALUES (11, 'B@X.IO')").kind, db.Error_Kind.Duplicate_Unique)
-	run(t, reopened, "INSERT INTO u (id, email, deleted) VALUES (12, 'B@X.IO', 1)")
+	run_done(t, reopened, "INSERT INTO u (id, email, deleted) VALUES (12, 'B@X.IO', 1)")
 	testing.expect_value(t, run_error(t, reopened, "INSERT INTO d VALUES (4, 6)").kind, db.Error_Kind.Duplicate_Unique)
-	run(t, reopened, "DROP INDEX d_six")
-	run(t, reopened, "INSERT INTO d VALUES (4, 6)")
+	run_done(t, reopened, "DROP INDEX d_six")
+	run_done(t, reopened, "INSERT INTO d VALUES (4, 6)")
 }
 
 @(test)
@@ -488,15 +488,15 @@ test_unique_allows_many_nulls :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "unique_nulls")
 
-	run(t, store, "CREATE TABLE n (id INTEGER PRIMARY KEY, x INTEGER UNIQUE, a INTEGER, b INTEGER, UNIQUE (a, b))")
-	run(t, store, "INSERT INTO n VALUES (1, NULL, 1, NULL), (2, NULL, 1, NULL), (3, 5, 1, 2)")
+	run_done(t, store, "CREATE TABLE n (id INTEGER PRIMARY KEY, x INTEGER UNIQUE, a INTEGER, b INTEGER, UNIQUE (a, b))")
+	run_done(t, store, "INSERT INTO n VALUES (1, NULL, 1, NULL), (2, NULL, 1, NULL), (3, 5, 1, 2)")
 	testing.expect_value(t, run_error(t, store, "INSERT INTO n VALUES (4, 5, 9, 9)").kind, db.Error_Kind.Duplicate_Unique)
 	testing.expect_value(t, run_error(t, store, "INSERT INTO n VALUES (5, 7, 1, 2)").kind, db.Error_Kind.Duplicate_Unique)
 	expect_ints(t, store, "SELECT count(*) FROM n WHERE x IS NULL", {2})
-	run(t, store, "UPDATE n SET x = NULL WHERE id = 3")
-	run(t, store, "DELETE FROM n WHERE id = 1")
+	run_done(t, store, "UPDATE n SET x = NULL WHERE id = 3")
+	run_done(t, store, "DELETE FROM n WHERE id = 1")
 	expect_ints(t, store, "SELECT id FROM n WHERE x IS NULL ORDER BY id", {2, 3})
-	run(t, store, "INSERT INTO n VALUES (6, 5, NULL, NULL)")
+	run_done(t, store, "INSERT INTO n VALUES (6, 5, NULL, NULL)")
 }
 
 @(test)

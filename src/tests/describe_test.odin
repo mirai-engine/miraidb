@@ -55,7 +55,7 @@ test_empty_aggregate_bare_column :: proc(t: ^testing.T) {
 	store := fresh_db(t, "empty_aggregate")
 	if store == nil do return
 	defer cleanup_db(store, "empty_aggregate")
-	run(t, store, "CREATE TABLE p (id INTEGER PRIMARY KEY, score REAL)")
+	run_done(t, store, "CREATE TABLE p (id INTEGER PRIMARY KEY, score REAL)")
 
 	// An aggregate over no row answers one row, and a bare column in it is
 	// NULL: it used to fail with "column id does not exist" until the table had
@@ -78,7 +78,7 @@ test_expression_column_names :: proc(t: ^testing.T) {
 	store := fresh_db(t, "expression_names")
 	if store == nil do return
 	defer cleanup_db(store, "expression_names")
-	run(t, store, "CREATE TABLE p (id INTEGER PRIMARY KEY, score REAL)")
+	run_done(t, store, "CREATE TABLE p (id INTEGER PRIMARY KEY, score REAL)")
 
 	// An unaliased expression is ?column? by default, and named by its text
 	// when the store asks for SQLite's names.

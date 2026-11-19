@@ -15,8 +15,8 @@ test_update_or_resolutions :: proc(t: ^testing.T) {
 	store := fresh_db(t, "update_or")
 	if store == nil do return
 	defer cleanup_db(store, "update_or")
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE)")
-	run(t, store, "INSERT INTO t (id, u) VALUES (1, 1), (2, 2), (3, 3)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE)")
+	run_done(t, store, "INSERT INTO t (id, u) VALUES (1, 1), (2, 2), (3, 3)")
 	MOVES :: "SET u = CASE id WHEN 1 THEN 100 WHEN 2 THEN 3 END WHERE id <= 2"
 
 	_ = run_error(t, store, "UPDATE OR ABORT t " + MOVES)
@@ -25,9 +25,9 @@ test_update_or_resolutions :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT u FROM t WHERE id = 1").i, i64(100))
 	testing.expect_value(t, scalar(t, store, "SELECT u FROM t WHERE id = 2").i, i64(2))
 
-	run(t, store, "UPDATE OR IGNORE t SET u = 3 WHERE id = 2")
+	run_done(t, store, "UPDATE OR IGNORE t SET u = 3 WHERE id = 2")
 	testing.expect_value(t, scalar(t, store, "SELECT u FROM t WHERE id = 2").i, i64(2))
-	run(t, store, "UPDATE OR REPLACE t SET u = 3 WHERE id = 2")
+	run_done(t, store, "UPDATE OR REPLACE t SET u = 3 WHERE id = 2")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t").i, i64(2))
 	testing.expect_value(t, scalar(t, store, "SELECT u FROM t WHERE id = 2").i, i64(3))
 
@@ -48,8 +48,8 @@ test_constraint_on_conflict :: proc(t: ^testing.T) {
 	// when the statement names no resolution, and it survives a reopen.
 	store := fresh_db(t, "on_conflict")
 	if store == nil do return
-	run(t, store, "CREATE TABLE c (id INTEGER PRIMARY KEY, u INTEGER UNIQUE ON CONFLICT FAIL, n TEXT NOT NULL ON CONFLICT IGNORE, r INTEGER, UNIQUE (r) ON CONFLICT ROLLBACK)")
-	run(t, store, "INSERT INTO c VALUES (1, 1, 'a', 1)")
+	run_done(t, store, "CREATE TABLE c (id INTEGER PRIMARY KEY, u INTEGER UNIQUE ON CONFLICT FAIL, n TEXT NOT NULL ON CONFLICT IGNORE, r INTEGER, UNIQUE (r) ON CONFLICT ROLLBACK)")
+	run_done(t, store, "INSERT INTO c VALUES (1, 1, 'a', 1)")
 	db.store_close(store)
 	reopened, open_err := db.store_open("_test_on_conflict", {persistent = true, create = true, durable = false})
 	if !testing.expectf(t, db.error_ok(open_err), "reopen: %s", open_err.message) do return
@@ -59,7 +59,7 @@ test_constraint_on_conflict :: proc(t: ^testing.T) {
 	_ = run_error(t, reopened, "INSERT INTO c VALUES (2, 2, 'b', 2), (3, 1, 'c', 3)")
 	testing.expect_value(t, scalar(t, reopened, "SELECT count(*) FROM c").i, i64(2))
 	// IGNORE skips a row that leaves n NULL.
-	run(t, reopened, "INSERT INTO c VALUES (4, 4, NULL, 4)")
+	run_done(t, reopened, "INSERT INTO c VALUES (4, 4, NULL, 4)")
 	testing.expect_value(t, scalar(t, reopened, "SELECT count(*) FROM c").i, i64(2))
 	// An explicit OR wins over the declared one.
 	_ = run_error(t, reopened, "INSERT OR ABORT INTO c VALUES (5, 5, NULL, 5)")
@@ -82,12 +82,12 @@ test_natural_joins :: proc(t: ^testing.T) {
 	store := fresh_db(t, "natural")
 	if store == nil do return
 	defer cleanup_db(store, "natural")
-	run(t, store, "CREATE TABLE a (id INTEGER, k TEXT, x INTEGER)")
-	run(t, store, "CREATE TABLE b (id INTEGER, k TEXT, y INTEGER)")
-	run(t, store, "CREATE TABLE c (z INTEGER)")
-	run(t, store, "INSERT INTO a VALUES (1, 'p', 10), (2, 'q', 20), (3, 'r', 30)")
-	run(t, store, "INSERT INTO b VALUES (1, 'p', 100), (2, 'x', 200)")
-	run(t, store, "INSERT INTO c VALUES (7), (8)")
+	run_done(t, store, "CREATE TABLE a (id INTEGER, k TEXT, x INTEGER)")
+	run_done(t, store, "CREATE TABLE b (id INTEGER, k TEXT, y INTEGER)")
+	run_done(t, store, "CREATE TABLE c (z INTEGER)")
+	run_done(t, store, "INSERT INTO a VALUES (1, 'p', 10), (2, 'q', 20), (3, 'r', 30)")
+	run_done(t, store, "INSERT INTO b VALUES (1, 'p', 100), (2, 'x', 200)")
+	run_done(t, store, "INSERT INTO c VALUES (7), (8)")
 	star := run(t, store, "SELECT * FROM a NATURAL JOIN b")
 	testing.expect_value(t, len(star.columns), 4)
 	testing.expect_value(t, len(star.rows), 1)
@@ -203,8 +203,8 @@ test_window_filter_over_groups :: proc(t: ^testing.T) {
 	store := fresh_db(t, "window_filter_groups")
 	if store == nil do return
 	defer cleanup_db(store, "window_filter_groups")
-	run(t, store, "CREATE TABLE w (g INTEGER, n INTEGER)")
-	run(t, store, "INSERT INTO w VALUES (1, 10), (1, 5), (2, 7), (3, 1), (3, 2), (3, 3)")
+	run_done(t, store, "CREATE TABLE w (g INTEGER, n INTEGER)")
+	run_done(t, store, "INSERT INTO w VALUES (1, 10), (1, 5), (2, 7), (3, 1), (3, 2), (3, 3)")
 	answer :: proc(t: ^testing.T, store: ^db.Store, sql: string) -> string {
 		return scalar(t, store, strings.concatenate({"SELECT group_concat(coalesce(x, 'null'), ',') FROM (", sql, ")"}, context.temp_allocator)).s
 	}
@@ -220,8 +220,8 @@ test_sum_overflow :: proc(t: ^testing.T) {
 	store := fresh_db(t, "sum_overflow")
 	if store == nil do return
 	defer cleanup_db(store, "sum_overflow")
-	run(t, store, "CREATE TABLE g (k INTEGER, n INTEGER)")
-	run(t, store, "INSERT INTO g VALUES (1, 9223372036854775807), (1, 1), (2, 5)")
+	run_done(t, store, "CREATE TABLE g (k INTEGER, n INTEGER)")
+	run_done(t, store, "INSERT INTO g VALUES (1, 9223372036854775807), (1, 1), (2, 5)")
 	testing.expect_value(t, run_error(t, store, "SELECT sum(n) FROM g WHERE k = 1").message, "integer overflow")
 	testing.expect_value(t, run_error(t, store, "SELECT k, sum(n) FROM g GROUP BY k").message, "integer overflow")
 	testing.expect_value(t, scalar(t, store, "SELECT sum(n) FROM g WHERE k = 2").i, i64(5))
@@ -234,8 +234,8 @@ test_having_alias :: proc(t: ^testing.T) {
 	store := fresh_db(t, "having_alias")
 	if store == nil do return
 	defer cleanup_db(store, "having_alias")
-	run(t, store, "CREATE TABLE g (k INTEGER, n INTEGER)")
-	run(t, store, "INSERT INTO g VALUES (1, 1), (1, 2), (2, 5), (3, 1)")
+	run_done(t, store, "CREATE TABLE g (k INTEGER, n INTEGER)")
+	run_done(t, store, "INSERT INTO g VALUES (1, 1), (1, 2), (2, 5), (3, 1)")
 	testing.expect_value(t, scalar(t, store, "SELECT group_concat(k, ',') FROM (SELECT k, count(*) AS c FROM g GROUP BY k HAVING c > 1 ORDER BY k)").s, "1")
 	testing.expect_value(t, scalar(t, store, "SELECT group_concat(k, ',') FROM (SELECT k, sum(n) AS s FROM g GROUP BY k HAVING s > 2 AND k < 3 ORDER BY k)").s, "1,2")
 	testing.expect_value(t, scalar(t, store, "SELECT group_concat(k, ',') FROM (SELECT k, sum(n) AS n FROM g GROUP BY k HAVING n > 2 ORDER BY k)").s, "2")
@@ -249,8 +249,8 @@ test_sqlite_rules :: proc(t: ^testing.T) {
 	store := fresh_db(t, "sqlite_rules")
 	if store == nil do return
 	defer cleanup_db(store, "sqlite_rules")
-	run(t, store, "CREATE TABLE g (k INTEGER, n INTEGER)")
-	run(t, store, "INSERT INTO g VALUES (2, 5), (2, 6)")
+	run_done(t, store, "CREATE TABLE g (k INTEGER, n INTEGER)")
+	run_done(t, store, "INSERT INTO g VALUES (2, 5), (2, 6)")
 	testing.expect_value(t, run_error(t, store, "SELECT 1 / 0").message, "division by zero")
 	testing.expect_value(t, run_error(t, store, "SELECT 9223372036854775807 + 1").message, "integer overflow")
 
@@ -350,13 +350,13 @@ test_sqlite_schema_catalog :: proc(t: ^testing.T) {
 	store := fresh_db(t, "sqlite_schema")
 	if store == nil do return
 	defer cleanup_db(store, "sqlite_schema")
-	run(t, store, "CREATE TABLE main.p (id INTEGER PRIMARY KEY, k TEXT UNIQUE, n INT)")
-	run(t, store, "CREATE INDEX main.p_n ON p (n)")
-	run(t, store, "CREATE TABLE log (m)")
-	run(t, store, "CREATE VIEW v AS SELECT k FROM p")
-	run(t, store, "CREATE TRIGGER tr AFTER INSERT ON p BEGIN INSERT INTO log VALUES (new.k); END")
-	run(t, store, "INSERT INTO main.p (k, n) VALUES ('a', 1)")
-	run(t, store, "UPDATE main.p SET n = 2")
+	run_done(t, store, "CREATE TABLE main.p (id INTEGER PRIMARY KEY, k TEXT UNIQUE, n INT)")
+	run_done(t, store, "CREATE INDEX main.p_n ON p (n)")
+	run_done(t, store, "CREATE TABLE log (m)")
+	run_done(t, store, "CREATE VIEW v AS SELECT k FROM p")
+	run_done(t, store, "CREATE TRIGGER tr AFTER INSERT ON p BEGIN INSERT INTO log VALUES (new.k); END")
+	run_done(t, store, "INSERT INTO main.p (k, n) VALUES ('a', 1)")
+	run_done(t, store, "UPDATE main.p SET n = 2")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM main.p WHERE n = 2").i, i64(1))
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM log").i, i64(1))
 
@@ -384,7 +384,7 @@ test_sqlite_schema_catalog :: proc(t: ^testing.T) {
 	db.embed_finalize(stmt)
 	testing.expect(t, db.error_drop(db.embed_exec(conn, "ROLLBACK")))
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM sqlite_master WHERE name IN ('fresh', 'log')").i, i64(1))
-	run(t, store, "DROP TABLE main.log")
+	run_done(t, store, "DROP TABLE main.log")
 	info := run(t, store, "PRAGMA main.table_info(p)")
 	testing.expect_value(t, len(info.rows), 3)
 	db.sql_result_destroy(&info)
@@ -399,8 +399,8 @@ test_user_version_is_stored :: proc(t: ^testing.T) {
 	store := fresh_db(t, "user_version")
 	if store == nil do return
 	testing.expect_value(t, scalar(t, store, "PRAGMA user_version").i, i64(0))
-	run(t, store, "PRAGMA main.user_version = 7")
-	run(t, store, "PRAGMA application_id = -5")
+	run_done(t, store, "PRAGMA main.user_version = 7")
+	run_done(t, store, "PRAGMA application_id = -5")
 	version := scalar(t, store, "PRAGMA user_version")
 	testing.expect_value(t, version.kind, db.Value_Kind.Int)
 	testing.expect_value(t, version.i, i64(7))
@@ -424,7 +424,7 @@ test_user_version_is_stored :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, reopened, "PRAGMA user_version").i, i64(7))
 	testing.expect_value(t, scalar(t, reopened, "PRAGMA application_id").i, i64(-5))
 	for text in ([]string{"4294967297", "'abc'", "2147483648"}) {
-		run(t, reopened, strings.concatenate({"PRAGMA user_version = ", text}, context.temp_allocator))
+		run_done(t, reopened, strings.concatenate({"PRAGMA user_version = ", text}, context.temp_allocator))
 		testing.expectf(t, scalar(t, reopened, "PRAGMA user_version").i == 0, "%s", text)
 	}
 	testing.expect_value(t, scalar(t, reopened, "SELECT count(*) FROM sqlite_master").i, i64(0))
@@ -437,16 +437,16 @@ test_pragma_table_functions :: proc(t: ^testing.T) {
 	store := fresh_db(t, "pragma_functions")
 	if store == nil do return
 	defer cleanup_db(store, "pragma_functions")
-	run(t, store, "CREATE TABLE p (id INTEGER PRIMARY KEY, k TEXT NOT NULL, n INT)")
-	run(t, store, "CREATE TABLE q (a TEXT, b TEXT)")
-	run(t, store, "CREATE INDEX q_b ON q (b)")
+	run_done(t, store, "CREATE TABLE p (id INTEGER PRIMARY KEY, k TEXT NOT NULL, n INT)")
+	run_done(t, store, "CREATE TABLE q (a TEXT, b TEXT)")
+	run_done(t, store, "CREATE INDEX q_b ON q (b)")
 	testing.expect_value(t, scalar(t, store, "SELECT group_concat(name, ',') FROM pragma_table_info('p')").s, "id,k,n")
 	testing.expect_value(t, scalar(t, store, "SELECT \"notnull\" FROM pragma_table_info('p') WHERE name = 'id'").i, i64(0))
 	testing.expect_value(t, scalar(t, store, "SELECT \"notnull\" FROM pragma_table_info('p') WHERE name = 'k'").i, i64(1))
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM sqlite_master m JOIN pragma_table_info(m.name) c WHERE m.type = 'table'").i, i64(5))
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM pragma_index_list('q') WHERE name = 'q_b'").i, i64(1))
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM pragma_table_info('nosuch')").i, i64(0))
-	run(t, store, "PRAGMA user_version = 12")
+	run_done(t, store, "PRAGMA user_version = 12")
 	testing.expect_value(t, scalar(t, store, "SELECT user_version FROM pragma_user_version").i, i64(12))
 	// The hidden columns arg and schema, and the argument a term gives.
 	testing.expect_value(t, scalar(t, store, "SELECT group_concat(arg, ',') FROM pragma_table_info('q')").s, "q,q")
@@ -564,11 +564,11 @@ test_constraint_messages :: proc(t: ^testing.T) {
 	store := fresh_db(t, "constraint_messages")
 	if store == nil do return
 	defer cleanup_db(store, "constraint_messages")
-	run(t, store, "CREATE TABLE k (a TEXT PRIMARY KEY, b INTEGER UNIQUE, c INT NOT NULL DEFAULT 0, d INT, e INT, UNIQUE (d, e))")
-	run(t, store, "CREATE TABLE r (id INTEGER PRIMARY KEY)")
-	run(t, store, "INSERT INTO k (a, b, d, e) VALUES ('x', 1, 1, 1)")
-	run(t, store, "INSERT INTO r VALUES (1)")
-	run(t, store, "INSERT INTO k (a, b) VALUES ('m', 2)")
+	run_done(t, store, "CREATE TABLE k (a TEXT PRIMARY KEY, b INTEGER UNIQUE, c INT NOT NULL DEFAULT 0, d INT, e INT, UNIQUE (d, e))")
+	run_done(t, store, "CREATE TABLE r (id INTEGER PRIMARY KEY)")
+	run_done(t, store, "INSERT INTO k (a, b, d, e) VALUES ('x', 1, 1, 1)")
+	run_done(t, store, "INSERT INTO r VALUES (1)")
+	run_done(t, store, "INSERT INTO k (a, b) VALUES ('m', 2)")
 	cases := [][2]string {
 		{"INSERT INTO k (a, b) VALUES ('x', 2)", "UNIQUE constraint failed: k.a"},
 		{"INSERT INTO k (a, b) VALUES ('y', 1)", "UNIQUE constraint failed: k.b"},
@@ -637,10 +637,10 @@ test_create_text_is_kept :: proc(t: ^testing.T) {
 	testing.expect(t, db.error_drop(db.embed_exec(conn, "CREATE TABLE gone (q)")))
 	testing.expect(t, db.error_drop(db.embed_exec(conn, "ROLLBACK")))
 	db.embed_close(conn)
-	run(t, store, "CREATE TABLE gone (q REAL)")
+	run_done(t, store, "CREATE TABLE gone (q REAL)")
 	testing.expect_value(t, scalar(t, store, "SELECT sql FROM sqlite_master WHERE name = 'gone'").s, "CREATE TABLE gone (q REAL)")
-	run(t, store, "DROP TABLE gone")
-	run(t, store, "CREATE TABLE gone (r)")
+	run_done(t, store, "DROP TABLE gone")
+	run_done(t, store, "CREATE TABLE gone (r)")
 	testing.expect_value(t, scalar(t, store, "SELECT sql FROM sqlite_master WHERE name = 'gone'").s, "CREATE TABLE gone (r)")
 
 	db.store_close(store)
@@ -718,9 +718,9 @@ test_mirror_patches_sqlite_sequence :: proc(t: ^testing.T) {
 	store := fresh_db(t, "mirror_sequence")
 	if store == nil do return
 	defer cleanup_db(store, "mirror_sequence")
-	run(t, store, "CREATE TABLE s (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER)")
-	run(t, store, "CREATE TABLE n (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER)")
-	run(t, store, "INSERT INTO s (v) VALUES (1)")
+	run_done(t, store, "CREATE TABLE s (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER)")
+	run_done(t, store, "CREATE TABLE n (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER)")
+	run_done(t, store, "INSERT INTO s (v) VALUES (1)")
 	path := "_test_mirror_sequence.sqlite"
 	os.remove(path)
 	defer os.remove(path)
@@ -751,10 +751,10 @@ test_sqlite_file_foreign_keys :: proc(t: ^testing.T) {
 	store := fresh_db(t, "file_foreign_keys")
 	if store == nil do return
 	defer cleanup_db(store, "file_foreign_keys")
-	run(t, store, "CREATE TABLE parent (id INTEGER PRIMARY KEY, n INTEGER)")
-	run(t, store, "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent (id) ON DELETE CASCADE)")
-	run(t, store, "INSERT INTO parent VALUES (1, 1)")
-	run(t, store, "INSERT INTO child VALUES (1, 1)")
+	run_done(t, store, "CREATE TABLE parent (id INTEGER PRIMARY KEY, n INTEGER)")
+	run_done(t, store, "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent (id) ON DELETE CASCADE)")
+	run_done(t, store, "INSERT INTO parent VALUES (1, 1)")
+	run_done(t, store, "INSERT INTO child VALUES (1, 1)")
 	path := "_test_file_foreign_keys.sqlite"
 	os.remove(path)
 	defer os.remove(path)

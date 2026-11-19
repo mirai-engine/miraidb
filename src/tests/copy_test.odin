@@ -28,19 +28,19 @@ test_copy_text_and_csv_roundtrip :: proc(t: ^testing.T) {
 	defer os.remove("_test_copy.txt")
 	defer os.remove("_test_copy.csv")
 
-	run(t, store, "CREATE TABLE src (id INTEGER PRIMARY KEY, name TEXT, n REAL, ok BOOLEAN)")
+	run_done(t, store, "CREATE TABLE src (id INTEGER PRIMARY KEY, name TEXT, n REAL, ok BOOLEAN)")
 	// A tab, a backslash, an empty string and NULLs: the four things a text dump
 	// has to escape or mark.
-	run(t, store, "INSERT INTO src VALUES (1, 'plain', 1.5, true)")
-	run(t, store, "INSERT INTO src VALUES (2, 'tab\there\\and', 0, false)")
-	run(t, store, "INSERT INTO src VALUES (3, '', NULL, NULL)")
-	run(t, store, "INSERT INTO src VALUES (4, NULL, NULL, NULL)")
+	run_done(t, store, "INSERT INTO src VALUES (1, 'plain', 1.5, true)")
+	run_done(t, store, "INSERT INTO src VALUES (2, 'tab\there\\and', 0, false)")
+	run_done(t, store, "INSERT INTO src VALUES (3, '', NULL, NULL)")
+	run_done(t, store, "INSERT INTO src VALUES (4, NULL, NULL, NULL)")
 
 	// Text: out to a file, back into a table of the same shape.
 	result := run(t, store, "COPY src TO '_test_copy.txt'")
 	testing.expect_value(t, result.affected, 4)
 	db.sql_result_destroy(&result)
-	run(t, store, "CREATE TABLE round (id INTEGER PRIMARY KEY, name TEXT, n REAL, ok BOOLEAN)")
+	run_done(t, store, "CREATE TABLE round (id INTEGER PRIMARY KEY, name TEXT, n REAL, ok BOOLEAN)")
 	result = run(t, store, "COPY round FROM '_test_copy.txt'")
 	testing.expect_value(t, result.affected, 4)
 	db.sql_result_destroy(&result)
@@ -59,7 +59,7 @@ test_copy_text_and_csv_roundtrip :: proc(t: ^testing.T) {
 	result = run(t, store, "COPY src TO '_test_copy.csv' (FORMAT csv, HEADER)")
 	testing.expect_value(t, result.affected, 4)
 	db.sql_result_destroy(&result)
-	run(t, store, "CREATE TABLE round_csv (id INTEGER PRIMARY KEY, name TEXT, n REAL, ok BOOLEAN)")
+	run_done(t, store, "CREATE TABLE round_csv (id INTEGER PRIMARY KEY, name TEXT, n REAL, ok BOOLEAN)")
 	result = run(t, store, "COPY round_csv FROM '_test_copy.csv' (FORMAT csv, HEADER)")
 	testing.expect_value(t, result.affected, 4)
 	db.sql_result_destroy(&result)
@@ -90,7 +90,7 @@ test_copy_options_and_column_lists :: proc(t: ^testing.T) {
 
 	// A column list leaves the others to their defaults, and DELIMITER and NULL
 	// spell the format differently.
-	run(t, store, "CREATE TABLE t (a INTEGER, b TEXT DEFAULT 'dflt', c INTEGER DEFAULT 7)")
+	run_done(t, store, "CREATE TABLE t (a INTEGER, b TEXT DEFAULT 'dflt', c INTEGER DEFAULT 7)")
 	if write_err := os.write_entire_file("_test_copy_opts.txt", "10;NA\n11;x\n"); write_err != nil {
 		testing.expectf(t, false, "cannot write the fixture: %v", write_err)
 		return
@@ -115,7 +115,7 @@ test_copy_refuses_a_bad_row :: proc(t: ^testing.T) {
 	defer os.remove_all("_test_copy_db_bad")
 	defer os.remove("_test_copy_bad.txt")
 
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
 
 	// A field that is not the column's type names the row and the column.
 	_ = os.write_entire_file("_test_copy_bad.txt", "1\tok\nnope\tx\n")
@@ -169,7 +169,7 @@ test_grouping_sets :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "grouping")
 
-	run(t, store, "CREATE TABLE sales (region TEXT, product TEXT, amount INTEGER)")
+	run_done(t, store, "CREATE TABLE sales (region TEXT, product TEXT, amount INTEGER)")
 	run(
 		t,
 		store,

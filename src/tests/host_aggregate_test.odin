@@ -42,8 +42,8 @@ test_host_aggregates_and_arities :: proc(t: ^testing.T) {
 	store := fresh_db(t, "host_aggregates")
 	if store == nil do return
 	defer cleanup_db(store, "host_aggregates")
-	run(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT, v INTEGER)")
-	run(t, store, "INSERT INTO t (id, k, v) VALUES (1, 'a', 1), (2, 'a', 2), (3, 'b', 3), (4, 'b', 3)")
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT, v INTEGER)")
+	run_done(t, store, "INSERT INTO t (id, k, v) VALUES (1, 'a', 1), (2, 'a', 2), (3, 'b', 3), (4, 'b', 3)")
 
 	finals := 0
 	testing.expect(t, db.error_ok(db.store_register_aggregate(store, "sum_squares", 1, squares_step, squares_final, &finals)))
@@ -62,8 +62,8 @@ test_host_aggregates_and_arities :: proc(t: ^testing.T) {
 
 	// A step that fails is the statement's error, and the final still runs so
 	// the state is released.
-	run(t, store, "CREATE TABLE s (x TEXT)")
-	run(t, store, "INSERT INTO s (x) VALUES ('2'), ('boom')")
+	run_done(t, store, "CREATE TABLE s (x TEXT)")
+	run_done(t, store, "INSERT INTO s (x) VALUES ('2'), ('boom')")
 	before = finals
 	refused := run_error(t, store, "SELECT sum_squares(x) FROM s")
 	testing.expect(t, strings_contains(refused.message, "sum_squares() refused a row"))
