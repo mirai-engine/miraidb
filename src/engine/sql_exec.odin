@@ -1889,8 +1889,17 @@ sql_exec_compound :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_R
 	name := fmt.aprintf("_union_%d", len(tx.temp_tables), allocator = tx.alloc)
 	columns := make([]Column, len(first.columns), tx.alloc)
 	for column_name, i in first.columns {
+		// Two columns may share a name (`SELECT NULL, NULL`): the table's
+		// columns are kept apart, and the answer takes the names back below.
+		unique := column_name
+		for other in first.columns[:i] {
+			if strings.equal_fold(other, column_name) {
+				unique = fmt.aprintf("%s:%d", column_name, i + 1, allocator = tx.alloc)
+				break
+			}
+		}
 		columns[i] = Column {
-			name = strings.clone(column_name, tx.alloc),
+			name = strings.clone(unique, tx.alloc),
 			type = view_column_type(rows[:], i),
 		}
 	}
@@ -1912,7 +1921,14 @@ sql_exec_compound :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_R
 		offset      = stmt.offset,
 	}
 	outer.projections[0] = Select_Item{star = true}
-	return sql_exec_select(tx, outer, params)
+	result, outer_err := sql_exec_select(tx, outer, params)
+	if outer_err.kind != .None do return result, outer_err
+	for column, i in first.columns {
+		if i >= len(result.columns) || result.columns[i] == column do continue
+		delete(result.columns[i])
+		result.columns[i] = strings.clone(column)
+	}
+	return result, ERROR_NONE
 }
 
 // recursion_limit bounds WITH RECURSIVE: a query that never stops adding rows
