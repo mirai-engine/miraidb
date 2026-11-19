@@ -169,6 +169,49 @@ What would close the rest, in order of payoff:
    insert, measured; the ownership has to survive savepoints, `ALTER` and
    rollback, so it is last).
 
+## Measured again (2026-11-19), after the SQLite blocks
+
+Both suites rebuilt from their sources of the day (this engine at `75d2f8f`)
+and run one after the other, with the same Criterion settings. The reference
+ran faster than on 2026-11-16 on most writes (the same machine, another day),
+so the engine was also rebuilt at round four's commit (`f0ce943`) and the two
+builds run interleaved, three times each, to tell the code from the machine.
+
+In memory, best median of three runs:
+
+| Workload | Round 4 build | Today's build | Change | Reference | SQLite | Today ÷ reference |
+|---|---:|---:|---:|---:|---:|---:|
+| empty transaction | 0.50 | 0.50 | 0% | 0.53 | 0.55 | 0.9× |
+| insert_bulk u32_u64_str unique_0 | 675 | 745 | **+10%** | 231 | 127 | 3.2× |
+| insert_bulk u32_u64_str btree_each_column | 812 | 861 | +6% | 534 | 801 | 1.6× |
+| insert_bulk u32_u64_u64 unique_0 | 516 | 639 | **+24%** | 186 | 121 | 3.4× |
+| insert_bulk u32_u64_u64 btree_each_column | 684 | 698 | +2% | 363 | 482 | 1.9× |
+| update_bulk u32_u64_str | 944 | 1 328 | **+41%** | 349 | 51.2 | 3.8× |
+| update_bulk u32_u64_u64 | 832 | 1 155 | **+39%** | 313 | 42.9 | 3.7× |
+| iterate 256 rows (u32_u64_str) | 4.8 | 4.8 | 0% | 1.33 | 25.0 | 3.6× |
+| iterate 256 rows (u32_u64_u64) | 4.8 | 4.9 | +2% | 1.99 | 22.6 | 2.5× |
+| filter, string index | 13.2 | 13.6 | +3% | 3.25 | 90.5 | 4.2× |
+| filter, u64 index | 12.9 | 12.9 | 0% | 3.28 | 72.3 | 3.9× |
+
+On disk (this engine's minimum of 60 runs, as above; its medians moved by 50%
+between runs):
+
+| Workload | Today's build | Reference | SQLite | ÷ reference |
+|---|---:|---:|---:|---:|
+| empty transaction | 0.60 | 0.53 | 0.58 | 1.1× |
+| insert_bulk u32_u64_str unique_0 | 1 448 | 335 | 181 | 4.3× |
+| insert_bulk u32_u64_u64 unique_0 | 1 164 | 208 | 317 | 5.6× |
+| update_bulk u32_u64_str | 1 840 | 417 | 85.8 | 4.4× |
+| update_bulk u32_u64_u64 | 1 768 | 352 | 120 | 5.0× |
+| iterate 256 rows (u32_u64_str) | 4.6 | 1.41 | 30.4 | 3.3× |
+| filter, string index | 10.0 | 3.29 | 175 | 3.0× |
+
+Scans, filters and the empty transaction did not move. **Updates are about 40%
+slower and inserts into a table with one unique index 10–24% slower than at
+round four**: something between `f0ce943` and `75d2f8f` added work to the
+write path. That regression is the first thing to find, before any of the
+four items above.
+
 To reproduce:
 
 ```sh
