@@ -151,7 +151,7 @@ the gaps are named rather than left to be discovered.
   `linux_arm64` and `darwin_arm64`. The POSIX lock is the reason it is checked:
   it carried a missing `core:sys/posix` import and two wrong integer types until
   this round, so the code that a Linux build would run had never been compiled.
-- 390 integration tests covering CRUD, recovery, constraints, transactions,
+- 391 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
@@ -326,11 +326,13 @@ than 1000 bytes cannot be indexed and the insert says so.
   results (a result no test reads is freed, a scalar and a formatted string
   live in the test's temporary memory), a failed SELECT frees what it built,
   and a JSON function, a variable and a PRAGMA no longer lower a name into the
-  heap: 5,554 lines a run. **Still open:** a scalar function that answers a new
-  text (`upper('abc')`, `json_quote(1)`) leaks that text, once per call: the
-  projection copies the value and nobody frees the original. The fix is to
-  answer it in the statement's memory, which needs the functions that keep
-  state on the store (a variable, a sequence) to keep it there on purpose.
+  heap. Last, what a function, an operator (`||`) or a `CAST` answers lives in
+  the transaction's memory, as SQLite's result lives in its statement: the
+  caller copies what it keeps, and `upper('abc')` no longer leaves its text in
+  the heap once per call. A program's function, and anything that opens a
+  module's table or reads the catalog, still runs in the caller's memory,
+  since it may keep what it makes. 5,104 lines a run, the rest test code; in a
+  long explicit transaction the answers accumulate until it ends.
 - **Schema changes.** `ALTER TABLE` renames the table, adds and drops columns,
   and renames a column (keeping the rows and the indexes); the CHECK
   constraints, views, trigger bodies and `UPDATE OF` lists that name the table
