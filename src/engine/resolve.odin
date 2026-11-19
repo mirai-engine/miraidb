@@ -2,6 +2,7 @@ package engine
 
 import "core:mem"
 import "core:strings"
+import "core:sync"
 
 // --- Names are resolved before a statement runs (D37) ----------------------
 //
@@ -315,8 +316,23 @@ res_ref :: proc(walk: ^Res_Walk, scope: ^Res_Scope, ref: ^Table_Ref) {
 		source.known = cte.known
 		return
 	}
-	if len(ref.schema) == 0 || strings.equal_fold(ref.schema, "main") || strings.equal_fold(ref.schema, "temp") do res_canonical(walk, &ref.name)
-	if len(ref.schema) > 0 || is_json_table_function(ref.name) || is_pragma_function(ref.name) || is_system_table(ref.name) do return
+	own_schema := len(ref.schema) == 0 || strings.equal_fold(ref.schema, "main") || strings.equal_fold(ref.schema, "temp")
+	if own_schema do res_canonical(walk, &ref.name)
+	if !own_schema {
+		// A table of an attached database is listed like one of main, so a
+		// WHERE can tell its columns from the select list's aliases.
+		if table := res_attached_table(walk.tx, ref.schema, ref.name); table != nil {
+			source = res_table_source(table, ref.alias)
+			// The executor reads it as `schema.table`, and so may a column.
+			source.name = strings.concatenate({ref.schema, ".", table.schema.name}, walk.alloc)
+		} else if res_attached_exists(walk.tx, ref.schema) {
+			if is_schema, _ := sqlite_schema_name(ref.name); !is_schema {
+				res_fail(walk, .Table_Not_Found, "no such table: %s.%s", ref.schema, ref.name)
+			}
+		}
+		return
+	}
+	if is_json_table_function(ref.name) || is_pragma_function(ref.name) || is_system_table(ref.name) do return
 	if strings.equal_fold(ref.name, "sqlite_sequence") && tx_table_probe(walk.tx, ref.name) == nil && sqlite_sequence_exists(walk.tx) {
 		source.columns = SEQUENCE_COLUMNS
 		source.known = true
@@ -513,6 +529,37 @@ res_column :: proc(walk: ^Res_Walk, column: Column_Expr) {
 		return
 	}
 	res_no_column(walk, column)
+}
+
+// res_attached_table is table `name` of attached database `schema` as the
+// transaction would read it, or nil: through the transaction that writes
+// that database, else the database's own committed table.
+@(private)
+res_attached_table :: proc(tx: ^Tx, schema, name: string) -> ^Table {
+	for attached_name, writer in tx.attached_txs {
+		if !strings.equal_fold(attached_name, schema) do continue
+		for candidate in tx_table_names(writer, context.temp_allocator) {
+			if strings.equal_fold(candidate, name) do return tx_table_probe(writer, candidate)
+		}
+		return nil
+	}
+	for attached_name, attached in tx.store.attached {
+		if !strings.equal_fold(attached_name, schema) || attached == nil do continue
+		sync.shared_lock(&attached.mutex)
+		defer sync.shared_unlock(&attached.mutex)
+		for candidate, table in attached.tables {
+			if strings.equal_fold(candidate, name) && !strings.has_prefix(candidate, "_") do return table
+		}
+		return nil
+	}
+	return nil
+}
+
+// res_attached_exists says `schema` names an attached database.
+@(private)
+res_attached_exists :: proc(tx: ^Tx, schema: string) -> bool {
+	for name in tx.store.attached do if strings.equal_fold(name, schema) do return true
+	return false
 }
 
 // res_where_alias replaces a WHERE's reference to a select-list alias with
