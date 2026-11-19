@@ -5144,7 +5144,14 @@ outer_column :: proc(ctx: ^Eval_Ctx, name, table: string) -> (Value, bool) {
 				continue
 			}
 			index, exists := schema_column_index(&source.table.schema, name)
-			if !exists do continue
+			if !exists {
+				// `alias.rowid` of an enclosing query is that row's rowid, as it
+				// is in the query itself.
+				if len(table) > 0 && rowid_alias_name(name) {
+					if rowid, has_rowid := rowid_value(source); has_rowid do return rowid, true
+				}
+				continue
+			}
 			if found {
 				// Ambiguous in this frame: the caller answers with its own error.
 				return {}, false
