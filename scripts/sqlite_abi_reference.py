@@ -283,6 +283,17 @@ def observe(lib) -> dict[str, object]:
     for sql in (b"SELEC 1", b"SELECT 1 2", b"SELECT 1 +", b"  SELECT (1"):
         code = lib.sqlite3_prepare_v2(db, sql, -1, ctypes.byref(failed), None)
         seen[f"prepare {sql!r}: code, offset"] = (code, lib.sqlite3_error_offset(db))
+    # An error about a name says it in SQLite's words, at prepare, and points
+    # at the name: the column, the function, the object that already exists.
+    exec_(b"CREATE TABLE other (id INTEGER PRIMARY KEY, label TEXT)")
+    for sql in (b"SELECT nope FROM people", b"SELECT people.nope FROM people", b"SELECT id FROM people, other",
+                b"SELECT nofunc(1)", b"SELECT abs()", b"SELECT substr('x')", b"SELECT coalesce(1)",
+                b"CREATE TABLE people (x)", b"CREATE TABLE  other AS SELECT 1", b"UPDATE people SET nope = 1",
+                b"SELECT * FROM missing"):
+        code = lib.sqlite3_prepare_v2(db, sql, -1, ctypes.byref(failed), None)
+        seen[f"name error {sql!r}: code, errmsg, offset"] = (code, lib.sqlite3_errmsg(db), lib.sqlite3_error_offset(db))
+        lib.sqlite3_finalize(failed)
+        failed = c_void_p()
     lib.sqlite3_prepare_v2(db, b"SELECT 1", -1, ctypes.byref(failed), None)
     seen["after a prepare that works: offset, errmsg"] = (lib.sqlite3_error_offset(db), lib.sqlite3_errmsg(db))
     lib.sqlite3_finalize(failed)

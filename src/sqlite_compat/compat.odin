@@ -847,6 +847,104 @@ sqlite_token_at :: proc(text: string, offset: int) -> string {
 	return rest[:1]
 }
 
+// name_error_offset finds where in `text` the name a prepare error names
+// starts, as SQLite points at it (sqlite3_error_offset): the column of "no such
+// column" or "ambiguous column name", the function of "no such function" or
+// "wrong number of arguments", the name a CREATE says already exists. -1 for
+// the errors SQLite gives no position, or a name not found.
+@(private)
+name_error_offset :: proc(message: string, text: string) -> int {
+	Token :: struct {
+		text:  string,
+		at:    int,
+		ident: bool,
+	}
+	tokens := make([dynamic]Token, 0, 32, context.temp_allocator)
+	for at := 0; at < len(text); {
+		c := text[at]
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' {
+			at += 1
+			continue
+		}
+		if strings.has_prefix(text[at:], "--") {
+			newline := strings.index_byte(text[at:], '\n')
+			if newline < 0 do break
+			at += newline + 1
+			continue
+		}
+		if strings.has_prefix(text[at:], "/*") {
+			close := strings.index(text[at + 2:], "*/")
+			if close < 0 do break
+			at += close + 4
+			continue
+		}
+		token := sqlite_token_at(text, at)
+		if len(token) == 0 do break
+		ident := false
+		name := token
+		switch token[0] {
+		case '"', '`':
+			ident = len(token) >= 2
+			if ident do name = token[1:len(token) - 1]
+		case '[':
+			ident = len(token) >= 2
+			if ident do name = token[1:len(token) - 1]
+		case '\'':
+		case:
+			b := token[0]
+			ident = (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || b == '_' || b >= 0x80
+		}
+		append(&tokens, Token{text = name, at = at, ident = ident})
+		at += len(token)
+	}
+	is_punct :: proc(tokens: []Token, k: int, punct: string) -> bool {
+		return k >= 0 && k < len(tokens) && !tokens[k].ident && tokens[k].text == punct
+	}
+	after :: proc(message, prefix: string) -> (string, bool) {
+		if !strings.has_prefix(message, prefix) do return "", false
+		return message[len(prefix):], true
+	}
+	if name, ok := after(message, "no such column: "); ok || strings.has_prefix(message, "ambiguous column name: ") {
+		if !ok do name = message[len("ambiguous column name: "):]
+		parts := strings.split(name, ".", context.temp_allocator)
+		for k in 0 ..< len(tokens) {
+			if is_punct(tokens[:], k - 1, ".") do continue
+			matched := true
+			for part, j in parts {
+				at := k + 2 * j
+				if at >= len(tokens) || !tokens[at].ident || !strings.equal_fold(tokens[at].text, part) || (j > 0 && !is_punct(tokens[:], at - 1, ".")) {
+					matched = false
+					break
+				}
+			}
+			last := k + 2 * (len(parts) - 1)
+			if !matched || is_punct(tokens[:], last + 1, ".") do continue
+			// The column an UPDATE's SET assigns is named without a position.
+			if is_punct(tokens[:], last + 1, "=") && len(tokens) > 0 && strings.equal_fold(tokens[0].text, "update") do return -1
+			return tokens[k].at
+		}
+		return -1
+	}
+	function := ""
+	if name, ok := after(message, "no such function: "); ok do function = name
+	if name, ok := after(message, "wrong number of arguments to function "); ok do function = strings.trim_suffix(name, "()")
+	if len(function) > 0 {
+		for k in 0 ..< len(tokens) {
+			if tokens[k].ident && strings.equal_fold(tokens[k].text, function) && is_punct(tokens[:], k + 1, "(") do return tokens[k].at
+		}
+		return -1
+	}
+	for kind in ([]string{"table ", "view ", "trigger "}) {
+		name, ok := after(message, kind)
+		if !ok || !strings.has_suffix(name, " already exists") do continue
+		name = strings.trim_suffix(name, " already exists")
+		for token in tokens {
+			if token.ident && strings.equal_fold(token.text, name) do return token.at
+		}
+	}
+	return -1
+}
+
 // error_offset_of reads "line L, column C" from a parse error and turns it into a
 // byte offset in `text`, or -1 when the message carries no position.
 @(private)
@@ -909,6 +1007,9 @@ prepare :: proc(handle: rawptr, sql: cstring, nByte: c.int, ppStmt: ^rawptr, pzT
 		offset := error_offset_of(engine.embed_error(db.conn), head)
 		if offset >= 0 && int(offset) < len(head) && leading >= 0 {
 			db.error_offset = offset + c.int(leading)
+		} else if offset < 0 && leading >= 0 && db.conn.store.sqlite_rules {
+			// An error about a name points at the name, as SQLite's does.
+			if at := name_error_offset(engine.embed_error(db.conn), head); at >= 0 do db.error_offset = c.int(at + leading)
 		}
 		// fail_connection records the message again, under another kind: the
 		// kind is read first.
