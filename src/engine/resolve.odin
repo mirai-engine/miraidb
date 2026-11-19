@@ -754,7 +754,11 @@ res_canonical_index :: proc(walk: ^Res_Walk, name: ^string) {
 @(private)
 res_index_exists :: proc(walk: ^Res_Walk, name: string) -> bool {
 	found := false
-	for _, table in walk.tx.store.tables {
+	// The tables as the transaction sees them: one it dropped takes its
+	// indexes with it, and one it made or altered has its own.
+	for table_name in tx_table_names(walk.tx, context.temp_allocator) {
+		table := tx_table_probe(walk.tx, table_name)
+		if table == nil do continue
 		for index in table.schema.indexes do if strings.equal_fold(index.name, name) do found = true
 	}
 	for op in walk.tx.state.index_ops {
