@@ -487,12 +487,20 @@ res_column :: proc(walk: ^Res_Walk, column: Column_Expr) {
 	}
 	for i := len(walk.scopes) - 1; i >= 0; i -= 1 {
 		scope := walk.scopes[i]
-		matches := 0
+		// A real column wins over a row id's name (rowid, oid, _rowid_) and a
+		// full-text table's own names: only one of a kind can be ambiguous.
+		matches, real := 0, 0
 		for source in scope.sources {
 			if source.qualified_only do continue
 			if !source.known do return
-			if res_has_column(source, column.name) do matches += 1
+			if !res_has_column(source, column.name) do continue
+			matches += 1
+			for name in source.columns do if strings.equal_fold(name, column.name) {
+				real += 1
+				break
+			}
 		}
+		if real > 0 do matches = real
 		for alias in scope.aliases do if strings.equal_fold(alias, column.name) do return
 		if matches == 0 do continue
 		// Two relations of one query that both have the name make it ambiguous

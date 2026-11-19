@@ -8040,7 +8040,8 @@ test_ambiguous_column_at_prepare :: proc(t: ^testing.T) {
 		testing.expect(t, strings.has_prefix(db.embed_error(conn), "ambiguous column name: "))
 	}
 	testing.expect(t, db.error_drop(db.embed_exec(conn, "CREATE TABLE k (a PRIMARY KEY, n)")))
-	for sql in ([]string{"SELECT a FROM v JOIN w USING (a)", "SELECT a FROM v NATURAL JOIN w", "SELECT b, c FROM v, w", "INSERT INTO k VALUES (1, 1) ON CONFLICT (a) DO UPDATE SET n = n + excluded.n"}) {
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "CREATE TABLE o (oid, d)")))
+	for sql in ([]string{"SELECT a FROM v JOIN w USING (a)", "SELECT a FROM v NATURAL JOIN w", "SELECT b, c FROM v, w", "INSERT INTO k VALUES (1, 1) ON CONFLICT (a) DO UPDATE SET n = n + excluded.n", "SELECT oid FROM v, o"}) {
 		stmt := db.embed_prepare(conn, sql)
 		testing.expectf(t, stmt != nil, "%s: %s", sql, db.embed_error(conn))
 		if stmt != nil do db.embed_finalize(stmt)
