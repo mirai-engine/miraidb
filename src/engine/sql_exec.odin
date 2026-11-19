@@ -1745,6 +1745,79 @@ compound_apply :: proc(rows: ^[dynamic][]Value, term: [][]Value, op: Compound_Op
 	rows^ = kept
 }
 
+// sqlite_compound_sort puts distinct compound rows in the order SQLite's
+// temporary index holds them: column by column, NULL first, then numbers by
+// value, texts by the column's collation (the first COLLATE a term writes),
+// then blobs by their bytes.
+@(private)
+sqlite_compound_sort :: proc(store: ^Store, rows: [][]Value, stmt: Select_Stmt) {
+	Ctx :: struct {
+		store:      ^Store,
+		collations: []string,
+	}
+	// A column's collation is the first term's that writes one, left to
+	// right, as SQLite picks it (multiSelectCollSeq).
+	collations := make([]string, len(stmt.projections), context.temp_allocator)
+	take :: proc(collations: []string, items: []Select_Item) {
+		for item, i in items {
+			if i >= len(collations) || len(collations[i]) > 0 || item.expr == nil do continue
+			if name, ok := collate_name(item.expr); ok do collations[i] = name
+		}
+	}
+	take(collations, stmt.projections)
+	for part in stmt.compound do take(collations, part.select_stmt.projections)
+	class :: proc(v: Value) -> int {
+		#partial switch v.kind {
+		case .Null:
+			return 0
+		case .Int, .Uint, .Float, .Bool, .Int128, .Uint128:
+			return 1
+		case .Bytes:
+			return 3
+		}
+		return 2
+	}
+	compare :: proc(a, b: []Value, ctx: ^Ctx) -> int {
+		for i in 0 ..< min(len(a), len(b)) {
+			left, right := a[i], b[i]
+			left_class, right_class := class(left), class(right)
+			if left_class != right_class do return left_class < right_class ? -1 : 1
+			switch left_class {
+			case 1:
+				if left.kind == .Int && right.kind == .Int {
+					if left.i != right.i do return left.i < right.i ? -1 : 1
+					continue
+				}
+				x, _ := value_to_f64(left)
+				y, _ := value_to_f64(right)
+				if x != y do return x < y ? -1 : 1
+			case 2:
+				if left.kind != .String || right.kind != .String {
+					order, _ := value_compare(left, right)
+					if order != .Equal do return order == .Less ? -1 : 1
+					continue
+				}
+				collation := i < len(ctx.collations) ? ctx.collations[i] : ""
+				if len(collation) > 0 {
+					if compared, known := collation_compare(ctx.store, collation, left.s, right.s); known {
+						if compared != 0 do return compared
+						continue
+					}
+				}
+				if order := strings.compare(left.s, right.s); order != 0 do return order
+			case 3:
+				if order := strings.compare(string(left.bytes), string(right.bytes)); order != 0 do return order
+			}
+		}
+		return 0
+	}
+	ctx := Ctx{store = store, collations = collations}
+	context.user_ptr = &ctx
+	slice.stable_sort_by(rows, proc(a, b: []Value) -> bool {
+		return compare(a, b, (^Ctx)(context.user_ptr)) < 0
+	})
+}
+
 // sql_exec_compound evaluates a compound query left to right, as SQLite does:
 // `a UNION b` keeps the distinct rows of both, `a UNION ALL b` appends b,
 // `a INTERSECT b` keeps the distinct rows of a that b has, and `a EXCEPT b` the
@@ -1790,6 +1863,9 @@ sql_exec_compound :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_R
 		}
 		compound_apply(&rows, result.rows, part.op)
 		sql_result_destroy(&result)
+		// SQLite answers a UNION, INTERSECT or EXCEPT from the temporary index
+		// it builds, so in that index's order; a UNION ALL after it appends.
+		if part.op != .Union_All && sqlite_rules_on() do sqlite_compound_sort(tx.store, rows[:], stmt)
 	}
 
 	if len(stmt.order_by) == 0 && stmt.limit == nil && stmt.offset == nil {
