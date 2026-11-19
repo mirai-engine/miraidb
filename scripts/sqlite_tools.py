@@ -298,8 +298,13 @@ def compare_mptest(built: dict[str, tuple[str, str]], sqlite_src: str, problems:
                 problems.append(f"mptest {script}: SQLite itself fails it ({ref_errors} errors): {ref_output[-300:]}")
             elif errors != 0 or tests != ref_tests or code != 0:
                 failed = [line for line in output.splitlines() if "ERROR" in line or "FATAL" in line][:6]
+                # The whole run is kept: a count short with no error line is
+                # a client whose tests the main process never read.
+                kept = os.path.join(shell.CACHE, f"mptest_{script}.log")
+                os.makedirs(shell.CACHE, exist_ok=True)
+                open(kept, "w", encoding="utf-8").write(output)
                 problems.append(f"mptest {script}: {errors} errors in {tests} tests (SQLite runs {ref_tests}), exit {code}"
-                                + "".join(f"\n    {line}" for line in failed))
+                                + "".join(f"\n    {line}" for line in failed) + f"\n    the run's output: {kept}")
     return len(scripts)
 
 
