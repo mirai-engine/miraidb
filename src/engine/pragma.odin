@@ -432,28 +432,12 @@ sql_exec_pragma :: proc(store: ^Store, body: string, locked: bool, tx: ^Tx = nil
 			result.rows[i] = row
 		}
 		return result, ERROR_NONE
-	case "index_info":
-		for _, table in store.tables {
-			for index in table.schema.indexes {
-				if !strings.equal_fold(index.name, argument) do continue
-				result := Sql_Result{kind = .Rows, commit_seq = store.commit_seq}
-				result.columns = pragma_columns("seqno", "cid", "name")
-				result.rows = make([][]Value, len(index.columns))
-				for column, i in index.columns {
-					row := make([]Value, 3)
-					row[0] = value_int(i64(i))
-					row[1] = value_int(i64(column))
-					if column >= 0 && column < len(table.schema.columns) {
-						row[2] = pragma_text(table.schema.columns[column].name)
-					} else {
-						row[2] = value_null()
-					}
-					result.rows[i] = row
-				}
-				return result, ERROR_NONE
-			}
-		}
-		return pragma_result([]string{"seqno", "cid", "name"}, nil, store.commit_seq), ERROR_NONE
+	case "index_info", "index_xinfo":
+		extended := name == "index_xinfo"
+		columns := extended ? []string{"seqno", "cid", "name", "desc", "coll", "key"} : []string{"seqno", "cid", "name"}
+		table, position, found := pragma_find_index(store, tx, argument)
+		if !found do return pragma_result(columns, nil, store.commit_seq), ERROR_NONE
+		return pragma_index_info(table, position, extended, columns, store.commit_seq), ERROR_NONE
 	case "foreign_key_list":
 		table, found := pragma_table(store, tx, argument)
 		if !found {
@@ -1082,6 +1066,74 @@ pragma_unquote :: proc(text: string) -> string {
 
 // pragma_table is a table as the pragma's transaction sees it, so a table the
 // connection created and has not committed is there, as in SQLite.
+// pragma_find_index finds an index by the name SQLite gives it
+// (sqlite_autoindex_T_N for one a constraint made) or by its own name.
+@(private)
+pragma_find_index :: proc(store: ^Store, tx: ^Tx, name: string) -> (^Table, int, bool) {
+	reader := tx
+	if reader == nil do reader = tx_begin_read(store)
+	defer if tx == nil do tx_end(reader)
+	for table_name in tx_table_names(reader, context.temp_allocator) {
+		table := tx_table_probe(reader, table_name)
+		if table == nil do continue
+		if store.sqlite_rules {
+			for entry in sqlite_index_list(reader, table, context.temp_allocator) {
+				if strings.equal_fold(entry.name, name) do return table, entry.index, true
+			}
+			continue
+		}
+		for index, i in table.schema.indexes do if strings.equal_fold(index.name, name) do return table, i, true
+	}
+	return nil, 0, false
+}
+
+// pragma_index_info is PRAGMA index_info, or index_xinfo when `extended`: the
+// key columns, then (xinfo) what the index entry carries after the key, the
+// rowid or, without one, the primary key columns the key leaves out (all the
+// other columns, for the primary key's own index).
+@(private)
+pragma_index_info :: proc(table: ^Table, position: int, extended: bool, columns: []string, commit_seq: u64) -> Sql_Result {
+	schema := &table.schema
+	index := &schema.indexes[position]
+	rows := make([dynamic][]Value, 0, len(index.columns) + 1)
+	add :: proc(rows: ^[dynamic][]Value, schema: ^Table_Schema, column: int, extended, key: bool) {
+		row := make([]Value, extended ? 6 : 3)
+		row[0] = value_int(i64(len(rows)))
+		row[1] = value_int(i64(column))
+		row[2] = value_null()
+		collation := "BINARY"
+		if column >= 0 && column < len(schema.columns) {
+			row[2] = pragma_text(schema.columns[column].name)
+			// SQLite answers the collation as the declaration spells it.
+			if declared := schema.columns[column].collation; len(declared) > 0 do collation = declared
+		}
+		if extended {
+			row[3] = value_int(0)
+			row[4] = pragma_text(collation)
+			row[5] = value_int(key ? 1 : 0)
+		}
+		append(rows, row)
+	}
+	for column, i in index.columns {
+		part := column
+		if i < len(index.exprs) && len(index.exprs[i]) > 0 do part = -2
+		add(&rows, schema, part, extended, true)
+	}
+	if extended {
+		if !schema.without_rowid {
+			add(&rows, schema, -1, extended, false)
+		} else {
+			is_primary := len(schema.primary_key) > 0 && schema_index_matches(index, schema.primary_key)
+			if is_primary {
+				for _, column in schema.columns do if !slice.contains(index.columns, column) do add(&rows, schema, column, extended, false)
+			} else {
+				for column in schema.primary_key do if !slice.contains(index.columns, column) do add(&rows, schema, column, extended, false)
+			}
+		}
+	}
+	return pragma_result(columns, rows[:], commit_seq)
+}
+
 @(private)
 pragma_table :: proc(store: ^Store, tx: ^Tx, name: string) -> (^Table, bool) {
 	if tx != nil {

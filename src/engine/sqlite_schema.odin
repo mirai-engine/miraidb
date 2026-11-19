@@ -490,6 +490,7 @@ Sqlite_Index_Entry :: struct {
 	unique:  bool,
 	origin:  string, // "c" CREATE INDEX, "u" UNIQUE, "pk" PRIMARY KEY
 	partial: bool,
+	index:   int, // its place in the table's schema.indexes
 }
 
 // sqlite_index_list is PRAGMA index_list as SQLite answers it: the rowid
@@ -524,7 +525,7 @@ sqlite_index_list :: proc(tx: ^Tx, table: ^Table, alloc: mem.Allocator) -> []Sql
 	for k := len(schema.indexes) - 1; k >= 0; k -= 1 {
 		index := &schema.indexes[k]
 		if index.implicit && len(index.columns) == 1 && index.columns[0] == alias do continue
-		entry := Sqlite_Index_Entry{unique = index.unique, partial = len(index.where_sql) > 0, origin = "c"}
+		entry := Sqlite_Index_Entry{unique = index.unique, partial = len(index.where_sql) > 0, origin = "c", index = k}
 		if number := constraint_number(schema, &original, keep_text, alias, index); number > 0 {
 			is_pk := len(schema.primary_key) > 0 && schema_index_matches(index, schema.primary_key)
 			entry.origin = is_pk ? "pk" : "u"
