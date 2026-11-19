@@ -156,7 +156,7 @@ sqlite_share_leave :: proc(conn: ^Embed_Conn) {
 @(private)
 sqlite_share_acquire :: proc(conn: ^Embed_Conn) -> bool {
 	share := conn.share
-	deadline := time.tick_add(time.tick_now(), time.Duration(conn.busy_timeout_ms) * time.Millisecond)
+	wait := busy_wait_begin(conn)
 	for {
 		sync.lock(&sqlite_shares_mutex)
 		taken := share.writer == nil || share.writer == conn
@@ -171,9 +171,35 @@ sqlite_share_acquire :: proc(conn: ^Embed_Conn) -> bool {
 		}
 		sync.unlock(&sqlite_shares_mutex)
 		if taken do return true
-		if time.tick_diff(time.tick_now(), deadline) <= 0 do return false
-		time.sleep(time.Millisecond)
+		if !busy_wait_again(conn, &wait) do return false
 	}
+}
+
+// Busy_Wait is one wait for a lock: until a deadline, or for as long as the
+// connection's busy handler says to try again.
+@(private)
+Busy_Wait :: struct {
+	deadline: time.Tick,
+	count:    int,
+}
+
+@(private)
+busy_wait_begin :: proc(conn: ^Embed_Conn) -> Busy_Wait {
+	return Busy_Wait{deadline = time.tick_add(time.tick_now(), time.Duration(max(conn.busy_timeout_ms, 0)) * time.Millisecond)}
+}
+
+// busy_wait_again says whether to try the lock once more, after waiting: the
+// handler waits as it likes (SQLite's sleeps), the timeout a millisecond.
+@(private)
+busy_wait_again :: proc(conn: ^Embed_Conn, wait: ^Busy_Wait) -> bool {
+	if conn.busy_handler != nil {
+		again := conn.busy_handler(conn.busy_user, wait.count)
+		wait.count += 1
+		return again
+	}
+	if time.tick_diff(time.tick_now(), wait.deadline) <= 0 do return false
+	time.sleep(time.Millisecond)
+	return true
 }
 
 @(private)
@@ -205,12 +231,12 @@ sqlite_share_os_unreserve :: proc(share: ^Sqlite_Share) {
 }
 
 // sqlite_share_read_begin takes SHARED for a read of the file, waiting up to
-// `wait_ms` while another process commits (it holds PENDING or EXCLUSIVE). The
+// the connection's busy timeout or handler while another process commits (it holds PENDING or EXCLUSIVE). The
 // reads of this process share one lock.
 @(private)
-sqlite_share_read_begin :: proc(share: ^Sqlite_Share, wait_ms: int) -> bool {
+sqlite_share_read_begin :: proc(share: ^Sqlite_Share, conn: ^Embed_Conn) -> bool {
 	if !share.has_handle do return true
-	deadline := time.tick_add(time.tick_now(), time.Duration(wait_ms) * time.Millisecond)
+	wait := busy_wait_begin(conn)
 	for {
 		sync.lock(&sqlite_shares_mutex)
 		taken := share.readers > 0
@@ -223,8 +249,7 @@ sqlite_share_read_begin :: proc(share: ^Sqlite_Share, wait_ms: int) -> bool {
 		if taken do share.readers += 1
 		sync.unlock(&sqlite_shares_mutex)
 		if taken do return true
-		if time.tick_diff(time.tick_now(), deadline) <= 0 do return false
-		time.sleep(time.Millisecond)
+		if !busy_wait_again(conn, &wait) do return false
 	}
 }
 
@@ -293,38 +318,43 @@ sqlite_share_mirror_guard :: proc(ctx: rawptr, begin: bool) {
 // since this one last read or wrote it: one of this process (the generation
 // moved) or of any other (the file's change counter moved).
 @(private)
-sqlite_share_refresh :: proc(conn: ^Embed_Conn) {
+sqlite_share_refresh :: proc(conn: ^Embed_Conn) -> Error {
 	share := conn.share
 	sync.lock(&sqlite_shares_mutex)
 	generation := share.generation
 	sync.unlock(&sqlite_shares_mutex)
-	if generation == conn.share_generation && !share.has_handle do return
+	if generation == conn.share_generation && !share.has_handle do return ERROR_NONE
 	// A statement of this thread that holds the file (a function that runs a
 	// statement on another connection mid-commit) leaves the read for later.
-	if !sync.rw_mutex_try_shared_lock(&share.file) do return
+	if !sync.rw_mutex_try_shared_lock(&share.file) do return ERROR_NONE
 	defer sync.rw_mutex_shared_unlock(&share.file)
 	store := conn.store
 	mirror := strings.clone(store.sqlite_mirror, context.temp_allocator)
-	if len(mirror) == 0 do return
-	if !sqlite_share_read_begin(share, max(conn.busy_timeout_ms, 0)) do return
+	if len(mirror) == 0 do return ERROR_NONE
+	// Another process committing past the wait is SQLite's BUSY: reading what
+	// the store held before would answer from an older database.
+	if !sqlite_share_read_begin(share, conn) do return errf(.Locked, "database is locked")
 	defer sqlite_share_read_end(share)
 	counter, counted := sqlite_share_counter(share)
-	if generation == conn.share_generation && (!counted || counter == conn.share_counter) do return
+	if generation == conn.share_generation && (!counted || counter == conn.share_counter) do return ERROR_NONE
 	image, read_ok := sqlite_share_read_file(share, mirror)
-	if !read_ok do return
+	if !read_ok do return errf(.Io, "disk I/O error")
 	defer delete(image)
 	// What the connection set for itself stays; the content is the file's.
 	foreign_keys_off, sqlite_rules := store.foreign_keys_off, store.sqlite_rules
 	last_changes, total_changes, last_row_id := store.last_changes, store.total_changes, store.last_row_id
 	if replace_err := store_replace_content(store, image, true); replace_err.kind != .None {
-		error_free(&replace_err)
-		return
+		// The store keeps what it had and stays the file's, so the next
+		// statement tries again; this one fails rather than read it.
+		store_set_sqlite_mirror(store, mirror)
+		return replace_err
 	}
 	store_set_sqlite_mirror(store, mirror)
 	store.foreign_keys_off, store.sqlite_rules = foreign_keys_off, sqlite_rules
 	store.last_changes, store.total_changes, store.last_row_id = last_changes, total_changes, last_row_id
 	conn.share_generation = generation
 	if counted do conn.share_counter = counter
+	return ERROR_NONE
 }
 
 // embed_statement_writes reports a statement that needs the write lock: one
@@ -350,7 +380,10 @@ embed_run_shared :: proc(conn: ^Embed_Conn, prepared: ^Stmt_Prepared, params: []
 		if embed_statement_writes(prepared) && !sqlite_share_acquire(conn) {
 			return {}, errf(.Locked, "database is locked")
 		}
-		sqlite_share_refresh(conn)
+		if refresh_err := sqlite_share_refresh(conn); refresh_err.kind != .None {
+			if share.writer == conn && conn.tx == nil do sqlite_share_release(conn)
+			return {}, refresh_err
+		}
 	}
 	holds := share.writer == conn
 	if holds do sync.rw_mutex_lock(&share.file)

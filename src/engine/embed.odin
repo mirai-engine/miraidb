@@ -83,7 +83,19 @@ Embed_Conn :: struct {
 	// busy_timeout_ms is how long a write waits for another connection's write
 	// lock before it fails with "database is locked" (sqlite3_busy_timeout).
 	busy_timeout_ms:  int,
+	// busy_handler, when set, decides instead of the timeout whether a
+	// connection kept waiting tries again (sqlite3_busy_handler): it is
+	// asked with how many times it has been asked for this wait.
+	busy_handler:     Busy_Handler,
+	busy_user:        rawptr,
+	// share_depth counts the statements of this connection running on its
+	// shared file: one a function runs inside another (`eval()`) runs under
+	// the locks the outer one took.
+	share_depth:      int,
 }
+
+// Busy_Handler answers whether to try again; `count` starts at 0.
+Busy_Handler :: #type proc(user: rawptr, count: int) -> bool
 
 // embed_open opens the engine format, or imports a SQLite file into memory.
 embed_open :: proc(path: string, options := Store_Options{persistent = true, create = true, durable = true}) -> (^Embed_Conn, Error) {
@@ -141,7 +153,17 @@ embed_open :: proc(path: string, options := Store_Options{persistent = true, cre
 // embed_set_busy_timeout sets how long a write waits for another connection
 // on the same file (sqlite3_busy_timeout); zero fails at once.
 embed_set_busy_timeout :: proc(conn: ^Embed_Conn, milliseconds: int) {
-	if conn != nil do conn.busy_timeout_ms = max(milliseconds, 0)
+	if conn == nil do return
+	conn.busy_timeout_ms = max(milliseconds, 0)
+	conn.busy_handler, conn.busy_user = nil, nil
+}
+
+// embed_set_busy_handler makes `handler` decide whether a wait goes on, in
+// place of the timeout: a connection has one or the other, as in SQLite.
+embed_set_busy_handler :: proc(conn: ^Embed_Conn, handler: Busy_Handler, user: rawptr) {
+	if conn == nil do return
+	conn.busy_handler, conn.busy_user = handler, user
+	conn.busy_timeout_ms = 0
 }
 
 // embed_wrap builds a connection over an existing store without taking
@@ -453,7 +475,9 @@ embed_exec_params :: proc(conn: ^Embed_Conn, sql: string, params: []Value) -> Er
 	store_clear_cancel(conn.store)
 	// The names a statement uses are checked against the file as it is now, as
 	// embed_prepare checks them.
-	if conn.share != nil && conn.tx == nil do sqlite_share_refresh(conn)
+	if conn.share != nil && conn.tx == nil {
+		if refresh_err := sqlite_share_refresh(conn); refresh_err.kind != .None do return embed_fail(conn, refresh_err)
+	}
 	prepared, prepare_err := sql_prepare(conn.store, sql)
 	if prepare_err.kind != .None do return embed_fail(conn, prepare_err)
 	defer stmt_prepared_destroy(prepared)
@@ -474,8 +498,11 @@ embed_exec_params :: proc(conn: ^Embed_Conn, sql: string, params: []Value) -> Er
 
 embed_prepare :: proc(conn: ^Embed_Conn, sql: string) -> ^Embed_Statement {
 	if conn == nil do return nil
-	// The names a statement uses are checked against the file as it is now.
-	if conn.share != nil && conn.tx == nil do sqlite_share_refresh(conn)
+	// The names a statement uses are checked against the file as it is now;
+	// a file it cannot read yet is read again when the statement runs.
+	if conn.share != nil && conn.tx == nil {
+		if refresh_err := sqlite_share_refresh(conn); refresh_err.kind != .None do error_free(&refresh_err)
+	}
 	// Parse now rather than at the first step: it is the same work, it reports a
 	// syntax error where a caller expects one, and it is what makes the parameter
 	// count known before the first bind, so index 99 can be refused (D29).
