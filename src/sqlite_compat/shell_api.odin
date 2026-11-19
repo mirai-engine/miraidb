@@ -521,7 +521,7 @@ sqlite3_table_column_metadata :: proc "c" (
 	db := db_of(handle)
 	if db == nil || table == nil do return SQLITE_MISUSE
 	column_name := column == nil ? "" : string(column)
-	meta, has_table, has_column := engine.embed_column_metadata(db.conn, string(table), column_name)
+	meta, has_table, has_column := engine.embed_column_metadata(db.conn, schema == nil ? "" : string(schema), string(table), column_name)
 	if has_table && column == nil do return SQLITE_OK
 	if !has_column {
 		set_error(db, strings.concatenate({"no such table column: ", string(table), ".", column_name}, context.temp_allocator))

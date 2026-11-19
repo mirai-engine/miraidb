@@ -159,15 +159,36 @@ Column_Metadata :: struct {
 // its transaction when it has one). The rowid of a table that has no column of
 // that name answers as SQLite's does: INTEGER, BINARY, the primary key. The
 // strings live in the temporary allocator.
-embed_column_metadata :: proc(conn: ^Embed_Conn, table_name: string, column_name: string) -> (meta: Column_Metadata, has_table: bool, has_column: bool) {
+embed_column_metadata :: proc(conn: ^Embed_Conn, schema, table_name, column_name: string) -> (meta: Column_Metadata, has_table: bool, has_column: bool) {
 	if conn == nil || conn.store == nil do return {}, false, false
-	tx := conn.tx
-	if tx == nil {
-		tx = tx_begin_read(conn.store)
-		defer tx_end(tx)
-		return column_metadata_in(tx, table_name, column_name)
+	// A schema names the database to look in; without one, main is first and
+	// then each attached database, as SQLite searches.
+	if len(schema) == 0 || strings.equal_fold(schema, "main") || strings.equal_fold(schema, "temp") {
+		tx := conn.tx
+		if tx == nil {
+			tx = tx_begin_read(conn.store)
+			defer tx_end(tx)
+			meta, has_table, has_column = column_metadata_in(tx, table_name, column_name)
+		} else {
+			meta, has_table, has_column = column_metadata_in(tx, table_name, column_name)
+		}
+		if has_table || len(schema) > 0 do return
 	}
-	return column_metadata_in(tx, table_name, column_name)
+	for name, attached in conn.store.attached {
+		if len(schema) > 0 && !strings.equal_fold(name, schema) do continue
+		if conn.tx != nil {
+			if writer, open := conn.tx.attached_txs[name]; open {
+				meta, has_table, has_column = column_metadata_in(writer, table_name, column_name)
+				if has_table do return
+				continue
+			}
+		}
+		reader := tx_begin_read(attached)
+		meta, has_table, has_column = column_metadata_in(reader, table_name, column_name)
+		tx_end(reader)
+		if has_table do return
+	}
+	return {}, false, false
 }
 
 @(private)
