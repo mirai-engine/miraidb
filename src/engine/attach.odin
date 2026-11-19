@@ -348,6 +348,7 @@ tx_materialize_attached :: proc(tx: ^Tx, schema, name: string) -> (^Table, Error
 	// Inside a transaction that wrote the database, it is read through that
 	// transaction, which sees its own writes.
 	if writer, open := tx.attached_txs[schema]; open {
+		if attach_is_catalog(writer, name) do return attach_copy_catalog(tx, writer, schema, name)
 		source, source_err := tx_table(writer, name)
 		if source_err.kind != .None {
 			error_free(&source_err)
@@ -362,6 +363,13 @@ tx_materialize_attached :: proc(tx: ^Tx, schema, name: string) -> (^Table, Error
 	if attached == nil {
 		return nil, errf(.Table_Not_Found, "database %s is not attached", schema)
 	}
+	if is_schema, temp := sqlite_schema_name(name); is_schema && !temp {
+		if _, real := attached.tables[name]; !real {
+			reader := tx_begin_read(attached)
+			defer tx_end(reader)
+			return attach_copy_catalog(tx, reader, schema, name)
+		}
+	}
 	sync.shared_lock(&attached.mutex)
 	defer sync.shared_unlock(&attached.mutex)
 	source, found := attached.tables[name]
@@ -372,6 +380,27 @@ tx_materialize_attached :: proc(tx: ^Tx, schema, name: string) -> (^Table, Error
 	table_collect(source, &rows, max(u64))
 	defer table_collect_release(source, &rows)
 	return attach_copy_table(tx, schema, name, source, rows[:])
+}
+
+// attach_is_catalog says `name` is SQLite's catalog in the database `reader`
+// reads, rather than a table of that name.
+@(private)
+attach_is_catalog :: proc(reader: ^Tx, name: string) -> bool {
+	is_schema, temp := sqlite_schema_name(name)
+	return is_schema && !temp && tx_table_probe(reader, name) == nil
+}
+
+// attach_copy_catalog is `schema.sqlite_schema`: the attached database's
+// catalog, built in `reader` (a transaction of that database) and copied into
+// one `tx` owns, as an attached table is.
+@(private)
+attach_copy_catalog :: proc(tx, reader: ^Tx, schema, name: string) -> (^Table, Error) {
+	catalog, catalog_err := tx_materialize_sqlite_schema(reader, name, false)
+	if catalog_err.kind != .None do return nil, catalog_err
+	rows := make([dynamic]Row)
+	table_collect(catalog, &rows, max(u64))
+	defer table_collect_release(catalog, &rows)
+	return attach_copy_table(tx, schema, name, catalog, rows[:])
 }
 
 // attach_copy_table copies an attached table into one the transaction owns and
