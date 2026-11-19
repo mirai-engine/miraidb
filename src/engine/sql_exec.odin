@@ -113,7 +113,13 @@ sql_run_statement :: proc(store: ^Store, statement: Statement, params: []Value) 
 		// even here, where a plain failure simply discards the transaction.
 		fail_mode := statement_fails_partially(stmt)
 		mark := fail_mode ? tx_statement_begin(tx) : 0
+		// A statement a function runs on this connection meanwhile runs in
+		// this transaction, as SQLite runs it: waiting for its lock waited on
+		// this very thread.
+		outer_tx, outer_thread := store.statement_tx, store.statement_thread
+		store.statement_tx, store.statement_thread = tx, sync.current_thread_id()
 		result, exec_err := sql_exec_mutation(tx, stmt, params)
+		store.statement_tx, store.statement_thread = outer_tx, outer_thread
 		if fail_mode do tx_statement_end(tx, mark, false)
 		if exec_err.kind != .None {
 			// A constraint's ON CONFLICT FAIL keeps the rows before the failing

@@ -192,6 +192,11 @@ Store :: struct {
 	// it on first use, and PRAGMA database_list lists it from then on.
 	temp_used:           bool,
 	mirror_guard_ctx:    rawptr,
+	// statement_tx is the transaction a write outside BEGIN runs in, and
+	// statement_thread the thread running it: a function that runs SQL on
+	// its connection mid-statement runs it there (sql_run_statement).
+	statement_tx:        ^Tx,
+	statement_thread:    int,
 	// foreign_keys_off is PRAGMA foreign_keys = OFF: the keys are declared and
 	// listed but not enforced. The engine enforces them unless told; the
 	// SQLite face opens with them off, as SQLite does.

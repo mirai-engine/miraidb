@@ -409,6 +409,12 @@ embed_statement_writes :: proc(prepared: ^Stmt_Prepared) -> bool {
 @(private)
 embed_run_shared :: proc(conn: ^Embed_Conn, prepared: ^Stmt_Prepared, params: []Value) -> (Sql_Result, Error) {
 	share := conn.share
+	// A statement a function runs in the middle of another on this
+	// connection: the outer one holds the file (taking it again waited on
+	// this very thread) and lets it go when it ends.
+	if conn.share_depth > 0 do return embed_run_statement(conn, prepared, params)
+	conn.share_depth += 1
+	defer conn.share_depth -= 1
 	if conn.tx == nil {
 		if embed_statement_writes(prepared) && !sqlite_share_acquire(conn) {
 			return {}, errf(.Locked, "database is locked")

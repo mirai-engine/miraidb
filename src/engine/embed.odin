@@ -30,6 +30,7 @@ package engine
 import "core:mem/virtual"
 import "core:os"
 import "core:strings"
+import "core:sync"
 import "core:time"
 
 EMBED_OK :: Error_Kind.None
@@ -320,13 +321,22 @@ embed_in_transaction :: proc(conn: ^Embed_Conn) -> bool {
 	return conn != nil && conn.tx != nil
 }
 
+// embed_current_tx is the transaction a statement of the connection runs in
+// now: its BEGIN's, or the write this thread is in the middle of outside one
+// (a function running SQL mid-statement), or nil.
+embed_current_tx :: proc(conn: ^Embed_Conn) -> ^Tx {
+	if conn.tx != nil do return conn.tx
+	if conn.store.statement_tx != nil && conn.store.statement_thread == sync.current_thread_id() do return conn.store.statement_tx
+	return nil
+}
+
 // embed_authorize checks the names a statement just prepared uses (D37) and
 // asks the store's authorizer about it, reading the catalog the connection
 // sees.
 @(private)
 embed_authorize :: proc(conn: ^Embed_Conn, prepared: ^Stmt_Prepared) -> Error {
 	if prepared.is_pragma do return embed_authorize_only(conn, prepared)
-	tx := conn.tx
+	tx := embed_current_tx(conn)
 	own := tx == nil
 	if own do tx = tx_begin_read(conn.store)
 	defer if own do tx_end(tx)
@@ -340,7 +350,7 @@ embed_authorize :: proc(conn: ^Embed_Conn, prepared: ^Stmt_Prepared) -> Error {
 @(private)
 embed_authorize_only :: proc(conn: ^Embed_Conn, prepared: ^Stmt_Prepared) -> Error {
 	if conn.store.hooks.authorizer == nil do return ERROR_NONE
-	tx := conn.tx
+	tx := embed_current_tx(conn)
 	own := tx == nil
 	if own do tx = tx_begin_read(conn.store)
 	defer if own do tx_end(tx)
@@ -411,6 +421,11 @@ embed_run_statement :: proc(conn: ^Embed_Conn, prepared: ^Stmt_Prepared, params:
 	// The triggers it fires give again the Ignore answers kept about them.
 	saved := auth_replay_begin(prepared)
 	defer auth_replay_end(saved)
+	// Inside a write this thread runs outside BEGIN (a function's SQL): the
+	// statement is part of that write's transaction.
+	if conn.tx == nil {
+		if running := embed_current_tx(conn); running != nil do return prepared_execute_in_tx(running, prepared, params)
+	}
 	if conn.tx != nil {
 		result, err := prepared_execute_in_tx(conn.tx, prepared, params)
 		// A constraint's ON CONFLICT ROLLBACK ends the transaction it broke in.
