@@ -209,8 +209,26 @@ between runs):
 Scans, filters and the empty transaction did not move. **Updates are about 40%
 slower and inserts into a table with one unique index 10–24% slower than at
 round four**: something between `f0ce943` and `75d2f8f` added work to the
-write path. That regression is the first thing to find, before any of the
-four items above.
+write path.
+
+A bisect over the 191 engine commits between them found it in `7f7cd01`
+(partial and expression indexes, NULLs in a UNIQUE column). Every write asked
+each UNIQUE index whether the row's key held a NULL, four times per row
+(staging, the key registry in both directions, the table's own check), and
+answered by encoding the whole key into a heap buffer. A plain index now looks
+at its columns; only an expression part is evaluated. Measured interleaved
+with the round-four build, best median of three:
+
+| Workload | Round 4 | Before the fix | After |
+|---|---:|---:|---:|
+| insert_bulk u32_u64_str unique_0 | 675 | 745 | 689 |
+| insert_bulk u32_u64_u64 unique_0 | 516 | 639 | 542 |
+| update_bulk u32_u64_str | 944 | 1 328 | 1 009 |
+| update_bulk u32_u64_u64 | 832 | 1 155 | 864 |
+
+What is left (2–7%) is within the spread of the runs and the WHERE a partial
+index has to be asked. `test_unique_null_check_allocates_nothing` fails if the
+check allocates again.
 
 To reproduce:
 
