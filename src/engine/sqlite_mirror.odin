@@ -531,22 +531,27 @@ mirror_split_payload :: proc(
 		return out, true
 	}
 	capacity := m.usable - 4
-	remaining := payload[local:]
-	previous := -1
-	for len(remaining) > 0 {
+	rest := payload[local:]
+	// The chain's pages first, then each is staged with the next one's number:
+	// a page written only into the image never reaches the file.
+	pages := make([dynamic]int, 0, (len(rest) + capacity - 1) / capacity, m.alloc)
+	defer delete(pages)
+	for taken := 0; taken < len(rest); taken += capacity {
 		page_no := mirror_alloc_page(m)
 		if page_no == 0 do return nil, false
-		block := mirror_page(m, page_no)
-		take := min(capacity, len(remaining))
-		copy(block[4:4 + take], remaining[:take])
-		if previous >= 0 {
-			mirror_put_be32(mirror_page(m, previous), 0, u32(page_no))
-		} else {
-			append(overflow, page_no)
-		}
-		previous = page_no
-		remaining = remaining[take:]
+		append(&pages, page_no)
 	}
+	block := make([]u8, m.page_size, m.alloc)
+	defer delete(block, m.alloc)
+	for page_no, i in pages {
+		for k in 0 ..< len(block) do block[k] = 0
+		mirror_put_be32(block, 0, u32(i + 1 < len(pages) ? pages[i + 1] : 0))
+		take := min(capacity, len(rest))
+		copy(block[4:4 + take], rest[:take])
+		rest = rest[take:]
+		if !mirror_stage(m, page_no, block) do return nil, false
+	}
+	append(overflow, pages[0])
 	out := make([]u8, local + 4, m.alloc)
 	copy(out[:local], payload[:local])
 	mirror_put_be32(out, local, u32(overflow[0]))
@@ -588,9 +593,21 @@ mirror_pack_leaf :: proc(m: ^Sqlite_Mirror, cells: []Mirror_Cell, base: int) -> 
 	page[base] = 13
 	content := m.usable
 	for cell, i in cells {
-		overflow := make([dynamic]int, 0, 4, m.alloc)
-		body, ok := mirror_split_payload(m, cell.payload, true, &overflow)
-		delete(overflow)
+		// A cell read from the file keeps the overflow chain it has: its
+		// payload did not change, and a new chain per rewrite of its leaf
+		// left the old pages unreachable ("never used").
+		body: []u8
+		ok := true
+		if len(cell.overflow) > 0 {
+			local := sqlite_local_size(len(cell.payload), m.usable, true)
+			body = make([]u8, local + 4, m.alloc)
+			copy(body[:local], cell.payload[:local])
+			mirror_put_be32(body, local, u32(cell.overflow[0]))
+		} else {
+			overflow := make([dynamic]int, 0, 4, m.alloc)
+			body, ok = mirror_split_payload(m, cell.payload, true, &overflow)
+			delete(overflow)
+		}
 		if !ok {
 			delete(page)
 			return nil, false
@@ -1244,6 +1261,9 @@ mirror_write_master :: proc(m: ^Sqlite_Mirror) -> bool {
 	if !ok do return false
 	defer delete(packed)
 	// Page 1 keeps the 100-byte file header, and its cell pointers are absolute.
+	// The packed page starts blank, so the header is the one there now: a new
+	// root used to leave the file without one.
+	copy(packed[:SQLITE_HEADER_MIN], mirror_page(m, 1)[:SQLITE_HEADER_MIN])
 	if !mirror_stage(m, 1, packed) do return false
 	m.master_dirty = false
 	return true
