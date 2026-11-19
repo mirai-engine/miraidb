@@ -45,6 +45,22 @@ SQLite refuses (`ambiguous column name: main.v.a`), and an alias equal to an
 ambiguous column (`SELECT a AS a FROM v, w`), which the engine refuses only
 when the row is read.
 
+SQLite's own tools found the rest of what this section lists as SQLite's
+(`scripts/sqlite_tools.py` runs sqldiff, dbhash and mptest on the facade):
+`sum()` adds a boolean as its integer and a text as its number, `total()` is
+always a real (0.0 over no rows); UNION, INTERSECT and EXCEPT answer in the
+order of SQLite's temporary index (NULL, numbers, texts by the first COLLATE a
+term writes, blobs); `strftime` knows every code of 3.54 and answers NULL for
+one it does not; a time is read in whole milliseconds and never rounded into
+the next second; `printf()`/`format()` are SQLite's printf, the one
+`sqlite3_mprintf` answers with; `quote()` of a real is `%!0.17g`; a literal
+past a double's range is infinity; a REAL column keeps `-0.0` as `0.0`; a
+PRAGMA may follow a comment; `PRAGMA page_size = N` answers no row. Two
+differences are left, each a known one of the gate: a connection opened
+read-only cannot make a TEMP table (SQLite's temp database is writable when
+main is not; the facade keeps temp tables in main), and the file keeps
+4096-byte pages whatever `PRAGMA page_size` and `VACUUM` ask for.
+
 The switch is one flag on the store, `sqlite_rules`, set by `sqlite3_open` and
 by opening a SQLite file. Foreign keys follow the same split: off until
 `PRAGMA foreign_keys = ON` under SQLite's rules, on under the engine's.
