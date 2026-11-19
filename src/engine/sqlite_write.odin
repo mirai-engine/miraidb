@@ -456,10 +456,16 @@ sqlite_write_index_tree :: proc(
 	}
 	width := len(index.columns) + (table.schema.without_rowid ? len(suffix) : 1)
 	keys := make([dynamic][]Value, 0, len(rows), alloc)
-	// A plain key borrows the row's values; an expression's are its own.
+	// A plain key borrows the row's values; an expression's are its own. In an
+	// index that mixes them (`b COLLATE rtrim, a`) only the expressions' are:
+	// freeing the column's was a double free.
 	defer {
 		for key in keys {
-			if !plain do for value in key[:len(index.columns)] do value_deep_free(value, alloc)
+			if !plain {
+				for value, part in key[:len(index.columns)] {
+					if part < len(index.exprs) && len(index.exprs[part]) > 0 do value_deep_free(value, alloc)
+				}
+			}
 			delete(key, alloc)
 		}
 		delete(keys)
