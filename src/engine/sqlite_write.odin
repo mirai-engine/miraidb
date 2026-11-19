@@ -1124,6 +1124,8 @@ sqlite_file_image :: proc(store: ^Store, alloc := context.allocator) -> (image: 
 		append(&master_rows, Sqlite_Export_Row{rowid = i64(len(master_rows) + 1), values = sequence_row})
 	}
 
+	sqlite_master_order(store, master_rows[:])
+
 	// sqlite_master: build the tree with page 1 as its root.
 	master_cells := make([][]u8, len(master_rows), alloc)
 	master_keys := make([]i64, len(master_rows), alloc)
@@ -1196,6 +1198,61 @@ sqlite_file_image :: proc(store: ^Store, alloc := context.allocator) -> (image: 
 		copy(file[i * w.page_size:], page)
 	}
 	return file, tables, rows, ERROR_NONE
+}
+
+// sqlite_master_order puts the catalog rows in the order their objects were
+// made, which is the order SQLite keeps them in (and lists, and dumps): each
+// object's place is the row its CREATE text has in _sqlite_sql, an automatic
+// index follows its table, sqlite_sequence the first table that counts, and
+// an object without a text keeps its place after the rest. The rowids follow.
+@(private)
+sqlite_master_order :: proc(store: ^Store, rows: []Sqlite_Export_Row) {
+	created := make(map[string]f64, len(rows), context.temp_allocator)
+	if table, found := store.tables[SQL_TEXT_TABLE]; found {
+		stored := make([dynamic]Row, context.temp_allocator)
+		table_collect(table, &stored, max(u64))
+		defer table_collect_release(table, &stored)
+		for row in stored {
+			if len(row.values) > 0 && row.values[0].kind == .String do created[row.values[0].s] = f64(row.id)
+		}
+	}
+	text_of :: proc(v: Value) -> string {
+		return v.kind == .String ? v.s : ""
+	}
+	Keyed :: struct {
+		key: f64,
+		row: Sqlite_Export_Row,
+	}
+	keyed := make([]Keyed, len(rows), context.temp_allocator)
+	last := f64(1e15)
+	for row, i in rows {
+		kind, name, owner := text_of(row.values[0]), text_of(row.values[1]), text_of(row.values[2])
+		key, found := created[name]
+		switch {
+		case found:
+		case kind == "index" && row.values[4].kind == .Null:
+			key = (created[owner] or_else last + f64(i)) + 0.25
+		case name == "sqlite_sequence":
+			key = last + f64(i)
+			for other in rows {
+				other_name := text_of(other.values[1])
+				if table, has := store.tables[other_name]; has && table.schema.auto_increment_column >= 0 {
+					if at, has_text := created[other_name]; has_text {
+						key = at + 0.5
+						break
+					}
+				}
+			}
+		case:
+			key = last + f64(i)
+		}
+		keyed[i] = Keyed{key = key, row = row}
+	}
+	slice.stable_sort_by(keyed, proc(a, b: Keyed) -> bool { return a.key < b.key })
+	for item, i in keyed {
+		rows[i] = item.row
+		rows[i].rowid = i64(i + 1)
+	}
 }
 
 // sqlite_move_to_page_one copies a built root page into page 1, shifting the

@@ -7459,8 +7459,9 @@ test_import_keeps_the_keys_sqlite_declared :: proc(t: ^testing.T) {
 	}
 	// The table text comes back exactly as the fixture spelled it, and since every
 	// key it declares is carried by an automatic index, no named index row is
-	// written at all: the declaration and its number are enough.
-	testing.expect_value(t, strings.to_string(summary), "cp:2/0 cu:0/1 k:0/1pk t3:0/1 u:0/1 ")
+	// written at all: the declaration and its number are enough. The tables
+	// keep the order the fixture made them in, which is SQLite's.
+	testing.expect_value(t, strings.to_string(summary), "k:0/1pk u:0/1 cu:0/1 cp:2/0 t3:0/1 ")
 	testing.expect_value(t, len(written.indexes), 0)
 	for table in written.tables {
 		for original in file.tables {
