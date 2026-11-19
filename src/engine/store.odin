@@ -756,7 +756,7 @@ store_sqlite_mirror_flush :: proc(store: ^Store, ops: []Store_Op = nil) -> Error
 	sync.shared_lock(&store.mutex)
 	defer sync.shared_unlock(&store.mutex)
 	if store.mirror == nil {
-		built, build_err := mirror_build(store, store.sqlite_mirror)
+		built, build_err := mirror_build(store, store.sqlite_mirror, true)
 		if build_err.kind != .None {
 			delete(store.mirror_reason)
 			store.mirror_reason = strings.clone(build_err.message)
@@ -798,7 +798,7 @@ store_sqlite_mirror_rewrite :: proc(store: ^Store) -> Error {
 	store.mirror = nil
 	_, _, write_err := sqlite_file_write(store, store.sqlite_mirror)
 	if write_err.kind != .None do return write_err
-	built, build_err := mirror_build(store, store.sqlite_mirror)
+	built, build_err := mirror_build(store, store.sqlite_mirror, true)
 	if build_err.kind != .None do return build_err
 	store.mirror = built
 	store.mirror_bytes_written += u64(store.mirror.page_count * store.mirror.page_size)

@@ -378,9 +378,11 @@ mirror_rowid_column :: proc(schema: Table_Schema) -> int {
 }
 
 // mirror_build reads a mirrored file and returns the map a commit patches.
+// `recover` is for a caller about to write the file (sqlite_file_open): a
+// reader must leave a journal alone, which may be a live writer's.
 @(private)
-mirror_build :: proc(store: ^Store, path: string, alloc := context.allocator) -> (^Sqlite_Mirror, Error) {
-	file, open_err := sqlite_file_open(path, alloc, true)
+mirror_build :: proc(store: ^Store, path: string, recover := false, alloc := context.allocator) -> (^Sqlite_Mirror, Error) {
+	file, open_err := sqlite_file_open(path, alloc, recover)
 	if open_err.kind != .None {
 		defer error_free(&open_err)
 		return nil, errf(.Io, "cannot read %s: %v", path, open_err.message)

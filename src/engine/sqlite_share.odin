@@ -102,6 +102,13 @@ sqlite_share_key :: proc(path: string) -> string {
 
 // sqlite_share_join makes the connection one of the file's.
 sqlite_share_join :: proc(conn: ^Embed_Conn, path: string) {
+	sqlite_share_attach(conn, sqlite_share_take(path))
+}
+
+// sqlite_share_take is the file's share, made the first time, with one more
+// reference: what an open reads the file under before its connection exists.
+@(private)
+sqlite_share_take :: proc(path: string) -> ^Sqlite_Share {
 	key := sqlite_share_key(path)
 	context.allocator = runtime.heap_allocator()
 	sync.lock(&sqlite_shares_mutex)
@@ -120,6 +127,15 @@ sqlite_share_join :: proc(conn: ^Embed_Conn, path: string) {
 		}
 	}
 	share.refs += 1
+	return share
+}
+
+// sqlite_share_attach makes the connection one of the share's, which already
+// counts it.
+@(private)
+sqlite_share_attach :: proc(conn: ^Embed_Conn, share: ^Sqlite_Share) {
+	sync.lock(&sqlite_shares_mutex)
+	defer sync.unlock(&sqlite_shares_mutex)
 	conn.share = share
 	conn.share_generation = share.generation
 	conn.store.mirror_guard = sqlite_share_mirror_guard
@@ -138,12 +154,29 @@ sqlite_share_leave :: proc(conn: ^Embed_Conn) {
 		share.writer = nil
 		sqlite_share_os_unreserve(share)
 	}
-	share.refs -= 1
 	conn.share = nil
 	if conn.store != nil {
 		conn.store.mirror_guard = nil
 		conn.store.mirror_guard_ctx = nil
 	}
+	sqlite_share_unref(share)
+}
+
+// sqlite_share_drop gives back a reference sqlite_share_take took for an
+// open that failed.
+@(private)
+sqlite_share_drop :: proc(share: ^Sqlite_Share) {
+	context.allocator = runtime.heap_allocator()
+	sync.lock(&sqlite_shares_mutex)
+	defer sync.unlock(&sqlite_shares_mutex)
+	sqlite_share_unref(share)
+}
+
+// sqlite_share_unref lets one reference go; the last closes the handle. The
+// caller holds the registry mutex.
+@(private)
+sqlite_share_unref :: proc(share: ^Sqlite_Share) {
+	share.refs -= 1
 	if share.refs > 0 do return
 	if share.has_handle do lock_os_close(share.handle)
 	delete_key(&sqlite_shares, share.path)

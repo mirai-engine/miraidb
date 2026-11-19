@@ -28,6 +28,7 @@ package engine
 // returned error can still ask the connection what went wrong.
 
 import "core:mem/virtual"
+import "core:os"
 import "core:strings"
 import "core:time"
 
@@ -101,42 +102,26 @@ Busy_Handler :: #type proc(user: rawptr, count: int) -> bool
 embed_open :: proc(path: string, options := Store_Options{persistent = true, create = true, durable = true}) -> (^Embed_Conn, Error) {
 	conn := new(Embed_Conn)
 	store: ^Store
-	// An existing file of zero bytes is an empty SQLite database, as SQLite
-	// reads it (what `sqlite3.connect` or `touch` leaves): the first commit
-	// writes the file.
-	if len(path) > 0 && sqlite_is_empty_file(path) {
-		opened, open_err := store_open("", {persistent = false})
+	// A SQLite file is read under SHARED, as SQLite reads one: another
+	// process's commit is never read half written, and the file and the map
+	// its commits patch are the same commit's.
+	// The engine's own format is a directory: a file is SQLite's (an empty one
+	// included), and the header is read only under the lock.
+	if len(path) > 0 && os.is_file(path) {
+		share := sqlite_share_take(path)
+		waiter := Embed_Conn{busy_timeout_ms = SQLITE_EXCLUSIVE_WAIT_MS}
+		locked := sqlite_share_read_begin(share, &waiter)
+		opened, open_err := embed_open_sqlite(conn, path)
+		if locked do sqlite_share_read_end(share)
 		if open_err.kind != .None {
+			sqlite_share_drop(share)
 			free(conn)
 			return nil, open_err
 		}
-		store_set_sqlite_mirror(opened, path)
-		conn.store = opened
-		conn.owns_store = true
-		sqlite_share_join(conn, path)
-		return conn, ERROR_NONE
+		sqlite_share_attach(opened, share)
+		return opened, ERROR_NONE
 	}
-	if len(path) > 0 && sqlite_is_file(path) {
-		file, file_err := sqlite_file_open(path)
-		if file_err.kind != .None {
-			free(conn)
-			return nil, file_err
-		}
-		defer sqlite_file_destroy(&file)
-		opened, open_err := store_open("", {persistent = false})
-		if open_err.kind != .None {
-			free(conn)
-			return nil, open_err
-		}
-		if _, _, import_err := sqlite_import(&file, opened); import_err.kind != .None {
-			store_close(opened)
-			free(conn)
-			return nil, import_err
-		}
-		store = opened
-		// The file stays the user's database: every commit mirrors back to it.
-		store_set_sqlite_mirror(store, path)
-	} else {
+	{
 		opened, open_err := store_open(path, options)
 		if open_err.kind != .None {
 			free(conn)
@@ -147,6 +132,36 @@ embed_open :: proc(path: string, options := Store_Options{persistent = true, cre
 	conn.store = store
 	conn.owns_store = true
 	if len(store.sqlite_mirror) > 0 do sqlite_share_join(conn, path)
+	return conn, ERROR_NONE
+}
+
+// embed_open_sqlite reads a SQLite file into a store that mirrors back to
+// it. An existing file of zero bytes is an empty SQLite database, as SQLite
+// reads it (what `sqlite3.connect` or `touch` leaves): the first commit
+// writes the file.
+@(private)
+embed_open_sqlite :: proc(conn: ^Embed_Conn, path: string) -> (^Embed_Conn, Error) {
+	if sqlite_is_empty_file(path) {
+		opened, open_err := store_open("", {persistent = false})
+		if open_err.kind != .None do return nil, open_err
+		store_set_sqlite_mirror(opened, path)
+		conn.store = opened
+		conn.owns_store = true
+		return conn, ERROR_NONE
+	}
+	file, file_err := sqlite_file_open(path)
+	if file_err.kind != .None do return nil, file_err
+	defer sqlite_file_destroy(&file)
+	opened, open_err := store_open("", {persistent = false})
+	if open_err.kind != .None do return nil, open_err
+	if _, _, import_err := sqlite_import(&file, opened); import_err.kind != .None {
+		store_close(opened)
+		return nil, import_err
+	}
+	// The file stays the user's database: every commit mirrors back to it.
+	store_set_sqlite_mirror(opened, path)
+	conn.store = opened
+	conn.owns_store = true
 	return conn, ERROR_NONE
 }
 
