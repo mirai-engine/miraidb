@@ -286,3 +286,20 @@ test_a_failed_select_leaves_nothing :: proc(t: ^testing.T) {
 		"SELECT a, CASE WHEN a < 3 THEN a ELSE json('{') END FROM t ORDER BY a",
 	}, fails = true)
 }
+
+@(test)
+test_function_answers_leave_nothing :: proc(t: ^testing.T) {
+	// A function that answers a new text or blob left it in the heap once per
+	// call: the projection copied the value and nobody freed the original.
+	expect_nothing_left(t, .Memory, "_test_memory_functions", {
+		"CREATE TABLE t (a TEXT, n INT)",
+		"INSERT INTO t VALUES ('one', 1), ('two', 2), ('three', 3)",
+		"SELECT upper(a), lower(a), substr(a, 2), replace(a, 'o', '0'), hex(a), printf('%s-%d', a, n), quote(a) FROM t",
+		"SELECT json_quote(a), json_array(a, n), json_object('k', a), json_set('{}', '$.x', n) FROM t",
+		"SELECT date('2026-11-19', '+1 day'), datetime(0, 'unixepoch'), randomblob(4), zeroblob(2), char(65, 66) FROM t",
+		"SELECT upper(a) FROM t ORDER BY upper(a)",
+		"UPDATE t SET a = upper(a) || '!' WHERE n > 1",
+		"SELECT count(*) FROM t WHERE lower(a) LIKE 't%'",
+		"SELECT CAST(n AS TEXT), CAST(n AS REAL), -n, ~n, a || n, CASE WHEN n > 1 THEN upper(a) ELSE lower(a) END FROM t",
+	})
+}

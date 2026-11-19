@@ -5261,11 +5261,27 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 		case .Eq, .Ne, .Lt, .Le, .Gt, .Ge, .Is, .Is_Not:
 			left, right = comparison_affinity(ctx, e.left, e.right, left, right)
 		}
-		return eval_binary(e.op, left, right, collation, ctx.tx != nil ? ctx.tx.store : nil)
+		if ctx.tx == nil do return eval_binary(e.op, left, right, collation, nil)
+		// An operator's answer (the text `||` makes) lives in the statement's
+		// memory, as a function's does (eval_call).
+		outer := context.allocator
+		value: Value
+		err: Error
+		{
+			context.allocator = ctx.tx.alloc
+			value, err = eval_binary(e.op, left, right, collation, ctx.tx.store)
+		}
+		if len(err.message) > 0 do err.message = strings.clone(err.message, outer)
+		return value, err
 	case Unary_Expr:
 		operand, operand_err := eval_expr(ctx, e.operand)
 		if operand_err.kind != .None do return {}, operand_err
-		return eval_unary(e.op, operand)
+		// The answer lives in the statement's memory (eval_call).
+		outer := context.allocator
+		context.allocator = ctx.tx != nil ? ctx.tx.alloc : outer
+		value, err := eval_unary(e.op, operand)
+		if len(err.message) > 0 do err.message = strings.clone(err.message, outer)
+		return value, err
 	case Is_Null_Expr:
 		operand, operand_err := eval_expr(ctx, e.operand)
 		if operand_err.kind != .None do return {}, operand_err
@@ -5382,8 +5398,13 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 	case Cast_Expr:
 		operand, operand_err := eval_expr(ctx, e.operand)
 		if operand_err.kind != .None do return {}, operand_err
+		// The converted value lives in the statement's memory (eval_call).
+		outer := context.allocator
+		context.allocator = ctx.tx != nil ? ctx.tx.alloc : outer
 		if sqlite_rules_on() && len(e.type_name) > 0 do return sqlite_cast(operand, e.type_name), ERROR_NONE
-		return value_cast(operand, e.target)
+		value, err := value_cast(operand, e.target)
+		if len(err.message) > 0 do err.message = strings.clone(err.message, outer)
+		return value, err
 	case Param_Expr:
 		if e.index < 0 || e.index >= len(ctx.params) {
 			return {}, errf(
@@ -6609,15 +6630,42 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		if arg_err.kind != .None do return {}, arg_err
 		append(&args, value)
 	}
+	if ctx.tx == nil do return eval_call_body(ctx, call, args[:], context.allocator)
+	// What a function answers lives in the statement's memory, as SQLite's
+	// result lives in its statement: the caller copies what it keeps, and the
+	// text a function made for one row no longer stays behind in the heap
+	// (`upper('abc')` leaked its answer once per call). The arguments are
+	// evaluated outside, so a subquery among them keeps its own allocator; an
+	// error's message is copied back out, since its reader frees it.
+	outer := context.allocator
+	value: Value
+	err: Error
+	{
+		context.allocator = ctx.tx.alloc
+		value, err = eval_call_body(ctx, call, args[:], outer)
+	}
+	if len(err.message) > 0 do err.message = strings.clone(err.message, outer)
+	return value, err
+}
+
+// eval_call_body answers a scalar function once its arguments are known. A
+// program's function runs with `outer`, the caller's allocator: it may do
+// anything (open a transaction, keep state), and what it makes is its own.
+@(private)
+eval_call_body :: proc(ctx: ^Eval_Ctx, call: Call_Expr, args: []Value, outer: mem.Allocator) -> (Value, Error) {
 	// A virtual table's module may overload a function for a call whose first
 	// argument is one of its columns (xFindFunction).
 	if ctx.tx != nil && ctx.tx.store != nil && len(ctx.tx.store.vtab_modules) > 0 && len(call.args) > 0 {
+		// Finding the overload may open the module's table: the store keeps it.
+		context.allocator = outer
 		if fn, user, overloaded := vtab_overload(ctx, call); overloaded do return fn(args[:], user)
+		context.allocator = ctx.tx != nil ? ctx.tx.alloc : outer
 	}
 	// A host function registered to override a builtin answers before it, which
 	// is how SQLite treats an application-defined function with a builtin's name.
 	if ctx.tx != nil && ctx.tx.store != nil && len(ctx.tx.store.functions) > 0 {
 		if def, found, _ := store_function(ctx.tx.store, call.name, len(args)); found && def.overrides {
+			context.allocator = outer
 			return def.handler(args[:], def.user)
 		}
 	}
@@ -7046,6 +7094,8 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 			return {}, errf(.Invalid_Type, "has_role() expects a role name")
 		}
 		if ctx.tx == nil do return value_bool(false), ERROR_NONE
+		// A nested statement reads the catalog: it runs in the caller's memory.
+		context.allocator = outer
 		holds, role_err := has_role(ctx.tx, args[0].s)
 		if role_err.kind != .None do return {}, role_err
 		return value_bool(holds), ERROR_NONE
@@ -7251,7 +7301,10 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 	// the caller's mistake, in SQLite's words.
 	if ctx.tx != nil && ctx.tx.store != nil {
 		def, found, named := store_function(ctx.tx.store, call.name, len(args))
-		if found do return def.handler(args[:], def.user)
+		if found {
+			context.allocator = outer
+			return def.handler(args[:], def.user)
+		}
 		if named do return {}, errf(.Invalid_Argument, "wrong number of arguments to function %s()", call.name)
 	}
 	return {}, errf(.Sql_Unsupported, "unknown function %s", call.name)
