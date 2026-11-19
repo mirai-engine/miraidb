@@ -248,3 +248,33 @@ test_a_function_may_run_sql_inside_a_write_to_a_shared_file :: proc(t: ^testing.
 	tools_ok(t, conn, "INSERT INTO t VALUES (rows_now())")
 	tools_expect(t, conn, "SELECT x FROM t", "1 1")
 }
+
+@(test)
+test_a_step_that_met_busy_runs_again :: proc(t: ^testing.T) {
+	path := "_test_tools_busy.sqlite"
+	os.remove(path)
+	defer os.remove(path)
+	_ = os.write_entire_file(path, []u8{})
+	first, first_err := db.embed_open(path)
+	if !testing.expect(t, db.error_ok(first_err)) do return
+	defer db.embed_close(first)
+	second, second_err := db.embed_open(path)
+	if !testing.expect(t, db.error_ok(second_err)) do return
+	defer db.embed_close(second)
+	tools_ok(t, first, "CREATE TABLE c (n)")
+	tools_ok(t, first, "BEGIN")
+	tools_ok(t, first, "INSERT INTO c VALUES (1)")
+	stmt := db.embed_prepare(second, "INSERT INTO c VALUES (2)")
+	if !testing.expect(t, stmt != nil) do return
+	defer db.embed_finalize(stmt)
+	_, busy := db.embed_step(stmt)
+	testing.expect_value(t, busy.kind, db.Error_Kind.Locked)
+	db.error_free(&busy)
+	tools_ok(t, first, "COMMIT")
+	// The same statement, stepped again, runs: it used to answer DONE without
+	// running, and mptest lost the counts it read that way.
+	_, again := db.embed_step(stmt)
+	testing.expectf(t, db.error_ok(again), "second step: %s", again.message)
+	db.error_free(&again)
+	tools_expect(t, second, "SELECT n FROM c ORDER BY n", "1 2")
+}

@@ -759,7 +759,9 @@ embed_start :: proc(stmt: ^Embed_Statement) -> Error {
 	}
 	result, exec_err := embed_run(stmt.conn, stmt.prepared, stmt.params[:])
 	if exec_err.kind != .None {
-		stmt.done = true
+		// BUSY leaves the statement to run again: SQLite's next step retries
+		// it (mptest steps its last read until the lock lets go).
+		if exec_err.kind != .Locked do stmt.done = true
 		return embed_fail(stmt.conn, exec_err)
 	}
 	stmt.result = result
