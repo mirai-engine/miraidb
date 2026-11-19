@@ -8829,8 +8829,17 @@ test_format_flags_and_precision :: proc(t: ^testing.T) {
 		{`SELECT printf('%g', 1000000.0)`, "1e+06"},
 		{`SELECT printf('%c', 'Hello')`, "H"},
 		{`SELECT printf('%10.4f|', 3.14159265)`, "    3.1416|"},
-		// An unknown conversion is written as it came, not dropped.
-		{`SELECT printf('%z', 1)`, "%z"},
+		// SQL's %z is %s, as in SQLite (the C form frees its argument).
+		{`SELECT printf('%z', 1)`, "1"},
+		// SQLite's own printf, shared with sqlite3_mprintf: `*` reads the width
+		// or precision from the arguments, %Q quotes, %w doubles `"`, and an
+		// unknown conversion ends the text.
+		{`SELECT printf('%.*c', 3, 'xy')`, "xxx"},
+		{`SELECT printf('%*d|', 5, 42)`, "   42|"},
+		{`SELECT printf('%Q %Q %w', 'it''s', NULL, 'a"b')`, "'it''s' NULL a\"\"b"},
+		{`SELECT printf('%,d %r %!.3s', 1234567, 22, 'ñandú')`, "1,234,567 22nd ñan"},
+		{`SELECT printf('%d%hhd', 5, 6)`, "5"},
+		{`SELECT printf('%s', x'414243')`, "ABC"},
 		{`SELECT format('%d/%d', 3, 4)`, "3/4"},
 	}
 	for check in checks {
