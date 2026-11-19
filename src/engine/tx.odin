@@ -1763,7 +1763,9 @@ tx_check_unique :: proc(
 				return unique_violation(table, i)
 			}
 		}
-		if committed, ok := tx.store.tables[name]; ok {
+		// A table this transaction dropped (and perhaps made again) has no
+		// committed rows left to collide with.
+		if committed, ok := tx.store.tables[name]; ok && !tx.state.dropped[name] {
 			if tx_committed_key_taken(tx, committed, i, values, ignore, writes) {
 				return unique_violation(table, i)
 			}
