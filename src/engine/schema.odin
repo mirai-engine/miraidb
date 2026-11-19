@@ -1655,6 +1655,9 @@ value_coerce_into :: proc(v: Value, schema: ^Table_Schema, index: int) -> (Value
 	out, err := value_coerce(v, column.type)
 	// A stored value has no subtype, as in SQLite.
 	out.subtype = 0
+	// SQLite keeps a REAL column's whole numbers as integers in the record, so
+	// -0.0 comes back as 0.0: the sign does not survive the column.
+	if err.kind == .None && out.kind == .Float && out.f == 0 && column.type.kind == .Float && sqlite_rules_on() do out.f = 0
 	if !schema.strict do return out, err
 	if err.kind == .None && column.type.kind == .Int && v.kind == .String {
 		// '1.5' reads as a real, which an INTEGER column of a STRICT table refuses.

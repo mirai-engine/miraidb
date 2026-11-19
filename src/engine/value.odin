@@ -946,7 +946,13 @@ value_parse_number :: proc(text: string) -> (Value, bool) {
 	}
 	if is_float {
 		f, ok := strconv.parse_f64(clean)
-		if !ok do return {}, false
+		// A number past the range of a double is infinity (or zero), as
+		// SQLite reads `9e999`; anything else that is not one stays refused.
+		if !ok {
+			number, _ := sqlite_numeric_prefix(clean)
+			if len(number) == 0 || len(number) != len(clean) do return {}, false
+			return value_float(sqlite_text_to_real(clean)), true
+		}
 		return value_float(f), true
 	}
 	negative := len(clean) > 0 && clean[0] == '-'

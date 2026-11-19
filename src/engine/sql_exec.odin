@@ -6276,7 +6276,10 @@ sq_literal :: proc(value: Value) -> string {
 	case .Uint:
 		return fmt.aprintf("%d", value.u)
 	case .Float:
-		return fmt.aprintf("%.15g", value.f)
+		// SQLite's quote() writes a real with %!0.17g, which reads back as the
+		// same double (sqlite3QuoteValue).
+		text, _ := sqlite_printf_values("%!0.17g", []Value{value})
+		return text
 	case .Bool:
 		return value.b ? "1" : "0"
 	case .Bytes:
