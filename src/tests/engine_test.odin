@@ -8048,6 +8048,42 @@ test_ambiguous_column_at_prepare :: proc(t: ^testing.T) {
 	}
 }
 
+// Under SQLite's rules a call is checked at prepare, as SQLite checks it: a
+// function no one has is "no such function", a count of arguments it does
+// not take "wrong number of arguments". A program's function takes what it
+// registered; a function only the engine has is not refused for being unknown.
+@(test)
+test_function_calls_checked_at_prepare :: proc(t: ^testing.T) {
+	conn, open_err := db.embed_open(":memory:")
+	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
+	defer db.embed_close(conn)
+	conn.store.sqlite_names = true
+	one :: proc(args: []db.Value, user: rawptr) -> (db.Value, db.Error) {
+		return db.value_int(1), db.ERROR_NONE
+	}
+	testing.expect(t, db.error_ok(db.store_register_function(conn.store, "mine", 1, one)))
+	refused := []struct {
+		sql, message: string,
+	} {
+		{"SELECT nofunc(1)", "no such function: nofunc"},
+		{"SELECT abs()", "wrong number of arguments to function abs()"},
+		{"SELECT substr('x')", "wrong number of arguments to function substr()"},
+		{"SELECT coalesce(1)", "wrong number of arguments to function coalesce()"},
+		{"SELECT mine(1, 2)", "wrong number of arguments to function mine()"},
+	}
+	for case_ in refused {
+		stmt := db.embed_prepare(conn, case_.sql)
+		testing.expectf(t, stmt == nil, "%s was prepared", case_.sql)
+		if stmt != nil do db.embed_finalize(stmt)
+		testing.expect_value(t, db.embed_error(conn), case_.message)
+	}
+	for sql in ([]string{"SELECT abs(1), substr('x', 1), coalesce(1, 2), count(*)", "SELECT mine(1)", "SELECT max(1, 2, 3), iif(1, 2)", "SELECT array_length(NULL)"}) {
+		stmt := db.embed_prepare(conn, sql)
+		testing.expectf(t, stmt != nil, "%s: %s", sql, db.embed_error(conn))
+		if stmt != nil do db.embed_finalize(stmt)
+	}
+}
+
 // A table renamed to a name another table, view or index has is refused, in
 // SQLite's words (renaming over a view left two objects of one name); under
 // SQLite's rules a trigger's name is taken once, whatever its case.

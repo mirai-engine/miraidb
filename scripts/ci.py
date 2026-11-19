@@ -222,6 +222,9 @@ def build_gates(args: argparse.Namespace) -> list[Gate]:
     # A library with symbols and no header is not an API: this compares each
     # header with what its package exports, and compiles both on their own.
     gates.append(Gate("ABI headers", [sys.executable, "scripts/abi_header.py"]))
+    # The SQLite face checks a call against SQLite's functions at prepare; the
+    # table it reads lists the engine's own names too, and goes stale with them.
+    gates.append(Gate("function table", [sys.executable, "scripts/function_table.py", "--check"]))
     gates.append(Gate("documentation consistency", [sys.executable, "scripts/docs_check.py"]))
     gates.append(Gate("roadmap is consistent", [sys.executable, "scripts/roadmap.py", "--check"]))
     return gates

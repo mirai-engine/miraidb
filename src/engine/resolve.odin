@@ -587,6 +587,7 @@ res_expr :: proc(walk: ^Res_Walk, expr: ^Expr) {
 		if limit := walk.tx.store.function_arg_limit; limit > 0 && len(e.args) > limit && walk.err.kind == .None {
 			walk.err = errf(.Invalid_Argument, "too many arguments on function %s", e.name)
 		}
+		if walk.tx.store.sqlite_names && walk.err.kind == .None do res_function(walk, e)
 		for arg in e.args do res_expr(walk, arg)
 		res_expr(walk, e.filter)
 		for item in e.order_by do res_expr(walk, item.expr)
@@ -626,6 +627,54 @@ res_expr :: proc(walk: ^Res_Walk, expr: ^Expr) {
 		}
 		res_expr(walk, e.fallback)
 	}
+}
+
+// Sqlite_Function_Arity is one row of SQLITE_FUNCTION_ARITIES.
+Sqlite_Function_Arity :: struct {
+	name:   string,
+	counts: u16,
+}
+
+// sqlite_function_arity looks a lower-case name up in SQLite's functions.
+sqlite_function_arity :: proc(name: string) -> (counts: u16, known: bool) {
+	low, high := 0, len(SQLITE_FUNCTION_ARITIES)
+	for low < high {
+		middle := (low + high) / 2
+		order := strings.compare(SQLITE_FUNCTION_ARITIES[middle].name, name)
+		if order == 0 do return SQLITE_FUNCTION_ARITIES[middle].counts, true
+		if order < 0 {
+			low = middle + 1
+		} else {
+			high = middle
+		}
+	}
+	return 0, false
+}
+
+// res_function refuses at prepare, as SQLite does, a call to a function no
+// one has and a call with a count of arguments its function does not take:
+// SQLite's functions take the counts SQLite's do (function_table.odin), a
+// program's the counts it registered, and a function only the engine has
+// whatever its own check allows when it runs.
+@(private)
+res_function :: proc(walk: ^Res_Walk, e: Call_Expr) {
+	store := walk.tx.store
+	count := e.star ? 0 : len(e.args)
+	if _, found, _ := store_function(store, e.name, count); found do return
+	if _, found := store_aggregate(store, e.name, count); found do return
+	lower := strings.to_lower(e.name, context.temp_allocator)
+	if mask, known := sqlite_function_arity(lower); known {
+		bit := u16(1) << uint(min(count, 8))
+		if mask & bit == 0 do walk.err = errf(.Invalid_Argument, "wrong number of arguments to function %s()", e.name)
+		return
+	}
+	if function_named(store, e.name) {
+		walk.err = errf(.Invalid_Argument, "wrong number of arguments to function %s()", e.name)
+		return
+	}
+	for name in ENGINE_FUNCTION_NAMES do if name == lower do return
+	if builtin_aggregate_name(lower) do return
+	walk.err = errf(.Sql_Unsupported, "no such function: %s", e.name)
 }
 
 // --- DDL -------------------------------------------------------------------
