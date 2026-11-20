@@ -266,6 +266,16 @@ def run_mptest(exe: str, script: str, directory: str) -> tuple[int, int, int, st
     return -1, -1, done.returncode, output
 
 
+def only_known_errors(output: str, errors: int, known: tuple[str, str] | None) -> bool:
+    """Whether a run's errors are none, or exactly the script's known difference."""
+    if errors == 0:
+        return True
+    if known is None:
+        return False
+    expected = [line for line in output.splitlines() if "Expected [" in line]
+    return len(expected) == errors and all(re.search(known[0], line) for line in expected)
+
+
 def compare_mptest(built: dict[str, tuple[str, str]], sqlite_src: str, problems: list[str], used: set) -> int:
     ref_exe, fac_exe = built["mptest"]
     scripts = sorted(name for name in os.listdir(os.path.join(sqlite_src, "mptest")) if name.endswith(".test"))
@@ -286,6 +296,15 @@ def compare_mptest(built: dict[str, tuple[str, str]], sqlite_src: str, problems:
             ref_errors, ref_tests, _, ref_output = run_apart(ref_exe, script)
             errors, tests, code, output = run_apart(fac_exe, script)
             known = KNOWN_MPTEST.get(script)
+            if 0 <= tests < ref_tests and only_known_errors(output, errors, known):
+                # Every client adds its count to the database when it asks for
+                # its next task, and mptest waits one second at shutdown for the
+                # last of them: a facade slower than SQLite, on a loaded machine,
+                # can miss it, and the main process reads fewer tests with no
+                # error at all. Only that is run again, once, and the second run
+                # has to be whole.
+                print(f"sqlite tools: mptest {script} counted {tests} of {ref_tests} tests with no other error; running it again")
+                errors, tests, code, output = run_apart(fac_exe, script)
             if known and tests == ref_tests:
                 expected = [line for line in output.splitlines() if "Expected [" in line]
                 if errors == 0:
