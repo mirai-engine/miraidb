@@ -171,6 +171,41 @@ test_insert_select_leaves_nothing :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_a_file_read_into_another_allocator_leaves_nothing :: proc(t: ^testing.T) {
+	// A file read with an allocator of its own keeps its lists there: the
+	// catalog lists grew with the caller's context.allocator instead, and the
+	// file's destroy freed them with its own.
+	path := "_test_memory_validate.sqlite"
+	os.remove(path)
+	defer os.remove(path)
+	_ = os.write_entire_file(path, []u8{})
+	{
+		conn, err := db.embed_open(path)
+		if !testing.expect(t, db.error_ok(err)) do return
+		for sql in ([]string{"CREATE TABLE t (a INTEGER PRIMARY KEY, b)", "CREATE INDEX i ON t (b)", "INSERT INTO t VALUES (1, 'x')"}) {
+			exec_err := db.embed_exec(conn, sql)
+			testing.expect(t, db.error_ok(exec_err))
+			db.error_free(&exec_err)
+		}
+		db.embed_close(conn)
+	}
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	{
+		context.allocator = mem.tracking_allocator(&track)
+		ok, reason := db.sqlite_mirror_validate(path, context.temp_allocator)
+		testing.expectf(t, ok, "malformed: %s", reason)
+	}
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "%d bytes left from %v", entry.size, entry.location)
+	}
+	for entry in track.bad_free_array {
+		testing.expectf(t, false, "bad free of %p at %v", entry.memory, entry.location)
+	}
+}
+
+@(test)
 test_replay_leaves_nothing :: proc(t: ^testing.T) {
 	// Opening a directory replays its log: every operation is decoded, applied
 	// and dropped.

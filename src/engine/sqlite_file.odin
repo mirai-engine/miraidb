@@ -926,7 +926,18 @@ sqlite_file_parse :: proc(
 		delete(data, alloc)
 		return {}, errf(.Sql_Unsupported, "%s uses a non-UTF-8 text encoding", path)
 	}
-	ctx := Sqlite_Master_Ctx{file = &file}
+	// The lists become the file's, which sqlite_file_destroy frees with the
+	// file's allocator: an empty [dynamic] would grow with the caller's
+	// context.allocator instead, and a file read into a temporary allocator
+	// left them behind.
+	ctx := Sqlite_Master_Ctx {
+		file    = &file,
+		tables  = make([dynamic]Sqlite_Table, file.alloc),
+		indexes = make([dynamic]Sqlite_Index, file.alloc),
+		others  = make([dynamic]Sqlite_Object, file.alloc),
+		trees   = make([dynamic]Sqlite_Index_Tree, file.alloc),
+		catalog = make([dynamic]string, file.alloc),
+	}
 	if !sqlite_walk(&file, 1, true, sqlite_master_visit, &ctx, 0) {
 		delete(data, alloc)
 		return {}, errf(.Corrupt_Log, "%s has a malformed sqlite_master", path)
@@ -977,7 +988,7 @@ sqlite_file_destroy :: proc(file: ^Sqlite_File) {
 	}
 	delete(file.index_trees, file.alloc)
 	for name in file.catalog do delete(name, file.alloc)
-	delete(file.catalog)
+	delete(file.catalog, file.alloc)
 	delete(file.tables, file.alloc)
 	delete(file.data, file.alloc)
 	file^ = {}
