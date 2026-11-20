@@ -642,3 +642,38 @@ wire_message_kind :: proc(message: []u8) -> u32 {
 	if len(message) < 4 do return 0
 	return u32(message[0]) | u32(message[1]) << 8 | u32(message[2]) << 16 | u32(message[3]) << 24
 }
+
+@(test)
+test_a_streamed_aggregate_leaves_nothing :: proc(t: ^testing.T) {
+	// An aggregate over a paged table streams its rows; it cloned its column
+	// names and kept them.
+	path := "_test_memory_stream"
+	os.remove_all(path)
+	defer os.remove_all(path)
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	{
+		context.allocator = mem.tracking_allocator(&track)
+		store, open_err := db.store_open(path, {persistent = true, create = true, durable = false, paged_tables = true})
+		if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
+		for sql in ([]string{
+			"CREATE TABLE item (id INTEGER PRIMARY KEY, qty INTEGER)",
+			"INSERT INTO item VALUES (1, 2), (2, 3), (3, 0)",
+			"SELECT count(*), sum(qty) AS total FROM item WHERE qty > 0",
+		}) {
+			result, err := db.sql_execute(store, sql)
+			testing.expectf(t, db.error_ok(err), "%s: %s", sql, err.message)
+			db.error_free(&err)
+			db.sql_result_destroy(&result)
+		}
+		db.store_close(store)
+		free_all(context.temp_allocator)
+	}
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "%d bytes left from %v", entry.size, entry.location)
+	}
+	for entry in track.bad_free_array {
+		testing.expectf(t, false, "bad free of %p at %v", entry.memory, entry.location)
+	}
+}

@@ -3311,6 +3311,8 @@ agg_stream_destroy :: proc(stream: ^Agg_Stream) {
 		if acc.builder.buf != nil do strings.builder_destroy(&acc.builder)
 		if acc.sep_owned do delete(acc.separator)
 		agg_distinct_destroy(&acc.keys)
+		// The lowered name the stream made for it.
+		delete(acc.name)
 	}
 	delete(stream.accs)
 	free_values(stream.first_values)
@@ -3587,6 +3589,8 @@ sql_exec_stream_select :: proc(
 	probe[0] = Source{table = base, alias = stmt.from.alias}
 	columns := make([dynamic]string, 0, len(stmt.projections), tx.alloc)
 	expanded := expand_projections(probe, stmt.joins, stmt.projections, &columns, tx.alloc)
+	// The names are cloned in the heap and the result clones them again.
+	defer for column in columns do delete(column)
 	if len(expanded) == 0 do return {}, false, ERROR_NONE
 	aggregate := false
 	for expr in expanded {
