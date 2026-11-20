@@ -1096,6 +1096,8 @@ mirror_apply_leaf :: proc(m: ^Sqlite_Mirror, table: ^Mirror_Table, leaf_index: i
 		// The page to free has to be read before the list shifts: removing the
 		// entry moves every leaf after it.
 		empty_page := leaf.page
+		// The entry goes, and its (empty) rowid list with it.
+		delete(leaf.rowids)
 		mirror_list_remove(&table.leaves, leaf_index)
 		if !mirror_free_page(m, empty_page) {
 			m.fallback_reason = "free empty leaf"
@@ -1541,13 +1543,17 @@ mirror_apply_commit :: proc(store: ^Store, m: ^Sqlite_Mirror, ops: []Store_Op) -
 	// Apply one table at a time, highest leaf first: a split inserts a leaf after
 	// the one it filled, so the leaves still to be visited keep their indices.
 	for group in tables {
-		table := m.tables[group.name]
+		// The map's own entry, not a copy: a copy shares the leaf list's buffer
+		// but not its length, so a leaf removed from it and then a failed apply
+		// left the map naming a list already freed. A failure destroys this
+		// mirror, which then frees the table as it is.
+		table := &m.tables[group.name]
 		edits := group.edits
 		// Resolve each edit's leaf now, before any leaf moves.
 		leaves := make([]int, len(edits), m.alloc)
 		defer delete(leaves, m.alloc)
 		for edit, i in edits {
-			index := mirror_leaf_index(&table, edit.rowid)
+			index := mirror_leaf_index(table, edit.rowid)
 			if index < 0 {
 				m.fallback_reason = "no leaf"
 				return true, ERROR_NONE
@@ -1573,13 +1579,12 @@ mirror_apply_commit :: proc(store: ^Store, m: ^Sqlite_Mirror, ops: []Store_Op) -
 				append(&batch, edits[order[i].index])
 				i += 1
 			}
-			applied := mirror_apply_leaf(m, &table, leaf_index, batch[:])
+			applied := mirror_apply_leaf(m, table, leaf_index, batch[:])
 			delete(batch)
 			if !applied {
 				if len(m.fallback_reason) == 0 do m.fallback_reason = "leaf"
-				// Give up without touching the map: the caller re-encodes the
-				// whole file and destroys this mirror, so freeing the table's
-				// buffers here would free them twice.
+				// Give up: the caller re-encodes the whole file and destroys
+				// this mirror, table and all.
 				return true, ERROR_NONE
 			}
 		}
@@ -1605,7 +1610,6 @@ mirror_apply_commit :: proc(store: ^Store, m: ^Sqlite_Mirror, ops: []Store_Op) -
 			case .Create_Table, .Truncate, .Drop_Table, .Create_Index, .Drop_Index, .Alter_Table:
 			}
 		}
-		m.tables[group.name] = table
 	}
 	if !mirror_write_master(m) {
 		m.fallback_reason = "master"

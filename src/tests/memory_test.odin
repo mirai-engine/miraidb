@@ -206,6 +206,57 @@ test_a_file_read_into_another_allocator_leaves_nothing :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_two_connections_on_a_file_leave_nothing :: proc(t: ^testing.T) {
+	// One connection catching up with the other's commits, table by table and
+	// whole (a schema change): the hashes it keeps, the rows it reloads, the
+	// names of what its own commits touched.
+	path := "_test_memory_two.sqlite"
+	os.remove(path)
+	defer os.remove(path)
+	_ = os.write_entire_file(path, []u8{})
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	{
+		context.allocator = mem.tracking_allocator(&track)
+		a, a_err := db.embed_open(path)
+		if !testing.expect(t, db.error_ok(a_err)) do return
+		b, b_err := db.embed_open(path)
+		if !testing.expect(t, db.error_ok(b_err)) do return
+		for step in ([]struct {
+				conn: ^db.Embed_Conn,
+				sql:  string,
+			}{
+				{a, "CREATE TABLE t1 (k INTEGER PRIMARY KEY, v)"},
+				{a, "CREATE TABLE t2 (k INTEGER PRIMARY KEY AUTOINCREMENT, v)"},
+				{a, "INSERT INTO t1 VALUES (1, zeroblob(3000)), (2, 'b')"},
+				{b, "SELECT count(*) FROM t1"},
+				{a, "UPDATE t1 SET v = 'B' WHERE k = 2"},
+				{b, "SELECT v FROM t1 WHERE k = 2"},
+				{b, "INSERT INTO t2 (v) VALUES ('x')"},
+				{a, "SELECT count(*) FROM t2"},
+				{a, "DELETE FROM t1 WHERE k = 1"},
+				{b, "SELECT count(*) FROM t1"},
+				{a, "CREATE TABLE t3 (z)"},
+				{b, "SELECT count(*) FROM t3"},
+			}) {
+			err := db.embed_exec(step.conn, step.sql)
+			testing.expectf(t, db.error_ok(err), "%s: %s", step.sql, err.message)
+			db.error_free(&err)
+		}
+		db.embed_close(b)
+		db.embed_close(a)
+		free_all(context.temp_allocator)
+	}
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "%d bytes left from %v", entry.size, entry.location)
+	}
+	for entry in track.bad_free_array {
+		testing.expectf(t, false, "bad free of %p at %v", entry.memory, entry.location)
+	}
+}
+
+@(test)
 test_replay_leaves_nothing :: proc(t: ^testing.T) {
 	// Opening a directory replays its log: every operation is decoded, applied
 	// and dropped.
@@ -287,6 +338,30 @@ test_a_sqlite_file_leaves_nothing :: proc(t: ^testing.T) {
 		"INSERT INTO u (b) VALUES ('x')",
 		"CREATE TRIGGER g AFTER INSERT ON t BEGIN SELECT 1; END",
 		"UPDATE t SET v = 'zz' WHERE id = 1",
+	})
+	// Rows past a page: leaves split into many, overflow chains, a select
+	// that reads them back.
+	expect_nothing_left(t, .Sqlite_File, "_test_memory_big.sqlite", {
+		"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b)",
+		"INSERT INTO t1 VALUES (1, zeroblob(2000)), (2, zeroblob(1000))",
+		"INSERT INTO t1 SELECT a + 2, zeroblob(1500) FROM t1",
+		"INSERT INTO t1 SELECT a + 4, zeroblob(1500) FROM t1",
+		"INSERT INTO t1 SELECT a + 8, zeroblob(5000) FROM t1",
+		"UPDATE t1 SET b = 'x' || a || 'y'",
+		"SELECT count(*), sum(length(b)) FROM t1",
+		"DELETE FROM t1 WHERE a > 10",
+	})
+	// A root that splits into a new root, rows that grow and shrink their
+	// overflow chains, a row deleted from the first leaf.
+	expect_nothing_left(t, .Sqlite_File, "_test_memory_root.sqlite", {
+		"CREATE TABLE x (q)",
+		"INSERT INTO x VALUES (1)",
+		"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b)",
+		"INSERT INTO t1 VALUES (1, zeroblob(3000))",
+		"INSERT INTO t1 VALUES (2, zeroblob(3000))",
+		"INSERT INTO t1 VALUES (3, zeroblob(9000)), (4, zeroblob(20000))",
+		"UPDATE t1 SET b = zeroblob(7000) WHERE a = 2",
+		"DELETE FROM t1 WHERE a = 1",
 	})
 }
 
