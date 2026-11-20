@@ -41,6 +41,7 @@ cleanup_db :: proc(store: ^db.Store, name: string) {
 @(private)
 run :: proc(t: ^testing.T, store: ^db.Store, sql: string) -> db.Sql_Result {
 	result, err := db.sql_execute(store, sql)
+	defer db.error_free(&err)
 	if !testing.expectf(t, db.error_ok(err), "%s failed: %s", sql, err.message) {
 		return {}
 	}
@@ -271,6 +272,7 @@ test_reducers :: proc(t: ^testing.T) {
 	testing.expect_value(t, value2.i, i64(2))
 
 	missing := db.host_call(host, "nope", nil)
+	defer db.error_free(&missing)
 	testing.expect_value(t, missing.kind, db.Error_Kind.Invalid_Argument)
 }
 
@@ -1652,6 +1654,7 @@ test_work_budget :: proc(t: ^testing.T) {
 	// With a budget below the cost, the call is refused and nothing changes.
 	db.host_set_work_budget(host, 50)
 	refused := db.host_call_once(host, []u8{2}, "sweep", nil)
+	defer db.error_free(&refused)
 	testing.expect_value(t, refused.kind, db.Error_Kind.Quota_Exceeded)
 	testing.expect_value(t, scalar(t, store, "SELECT max(value) FROM numbers").i, i64(201))
 	// A call inside the budget still runs.
@@ -2249,6 +2252,7 @@ test_table_memory :: proc(t: ^testing.T) {
 	testing.expect(t, memory.index_bytes > 0)
 
 	_, missing := db.store_table_memory(store, "nope")
+	defer db.error_free(&missing)
 	testing.expect_value(t, missing.kind, db.Error_Kind.Table_Not_Found)
 }
 
@@ -2343,6 +2347,7 @@ test_schedule_interval :: proc(t: ^testing.T) {
 	_, schedule_err := db.host_schedule_every(host, "bump", 1_000_000, []db.Value{db.value_int(2)})
 	testing.expectf(t, db.error_ok(schedule_err), "schedule: %s", schedule_err.message)
 	_, bad_interval := db.host_schedule_every(host, "bump", 0, nil)
+	defer db.error_free(&bad_interval)
 	testing.expect_value(t, bad_interval.kind, db.Error_Kind.Invalid_Argument)
 
 	ran, tick_err := db.host_tick(host, now)
@@ -2543,8 +2548,10 @@ test_in_memory_log :: proc(t: ^testing.T) {
 	// The commit path is exercised, but there is nothing on disk to compact or
 	// snapshot.
 	compact := db.store_compact(store)
+	defer db.error_free(&compact)
 	testing.expect_value(t, compact.kind, db.Error_Kind.Invalid_Argument)
 	snapshot := db.store_snapshot(store)
+	defer db.error_free(&snapshot)
 	testing.expect_value(t, snapshot.kind, db.Error_Kind.Invalid_Argument)
 }
 
@@ -2823,6 +2830,7 @@ test_transport_caps :: proc(t: ^testing.T) {
 	long_header := fmt.aprintf("GET /health HTTP/1.1\r\nX: %s\r\n\r\n", strings.repeat("a", 200))
 	defer delete(long_header)
 	_, _, header_err := db.http_parse_request_within(transmute([]u8)long_header, 64, 1024)
+	defer db.error_free(&header_err)
 	testing.expect_value(t, header_err.kind, db.Error_Kind.Quota_Exceeded)
 
 	// A declared Content-Length over the body cap is refused before the body
@@ -2832,6 +2840,7 @@ test_transport_caps :: proc(t: ^testing.T) {
 		1024,
 		1024,
 	)
+	defer db.error_free(&body_err)
 	testing.expect_value(t, body_err.kind, db.Error_Kind.Quota_Exceeded)
 
 	// An overflowing Content-Length does not wrap into a small positive number.
@@ -2840,6 +2849,7 @@ test_transport_caps :: proc(t: ^testing.T) {
 		1024,
 		1024,
 	)
+	defer db.error_free(&overflow_err)
 	testing.expect_value(t, overflow_err.kind, db.Error_Kind.Quota_Exceeded)
 
 	// A small request still parses, and the host cap answers 413 rather than
@@ -2849,6 +2859,8 @@ test_transport_caps :: proc(t: ^testing.T) {
 		1024,
 		1024,
 	)
+	defer db.http_request_destroy(&small)
+	defer db.error_free(&small_err)
 	testing.expect(t, db.error_ok(small_err))
 	testing.expect_value(t, string(small.body), "abcd")
 
@@ -2859,10 +2871,12 @@ test_transport_caps :: proc(t: ^testing.T) {
 	defer cleanup_db(store, "caps")
 	db.host_set_request_limits(host, 2, 1024)
 	capped := db.http_handle(host, small)
+	defer delete(capped)
 	testing.expect(t, strings_contains(string(capped), "413 Payload Too Large"))
 
 	db.host_set_request_limits(host, 1 << 20, 1024)
 	allowed := db.http_handle(host, small)
+	defer delete(allowed)
 	testing.expect(t, !strings_contains(string(allowed), "413"))
 
 	// WebSocket frames are checked before the payload is allocated.
@@ -2870,8 +2884,10 @@ test_transport_caps :: proc(t: ^testing.T) {
 	frame := db.ws_frame(big)
 	defer delete(frame)
 	_, _, _, frame_err := db.ws_read_frame_within(frame, 128)
+	defer db.error_free(&frame_err)
 	testing.expect_value(t, frame_err.kind, db.Error_Kind.Quota_Exceeded)
 	_, _, _, ok_err := db.ws_read_frame_within(frame, 1024)
+	defer db.error_free(&ok_err)
 	testing.expect(t, db.error_ok(ok_err))
 
 	// A 64-bit length with the top bit set must not wrap into a negative size.
@@ -2881,6 +2897,7 @@ test_transport_caps :: proc(t: ^testing.T) {
 	forged[2] = 0xff
 	forged[3] = 0xff
 	_, _, _, forged_err := db.ws_read_frame_within(forged, 1024)
+	defer db.error_free(&forged_err)
 	testing.expect(t, !db.error_ok(forged_err))
 	delete(big)
 }
@@ -2906,6 +2923,8 @@ test_http_layer :: proc(t: ^testing.T) {
 	defer delete(head)
 
 	request, consumed, parse_err := db.http_parse_request(request_bytes)
+	defer db.http_request_destroy(&request)
+	defer db.error_free(&parse_err)
 	testing.expect(t, db.error_ok(parse_err))
 	testing.expect_value(t, consumed, len(request_bytes))
 	testing.expect_value(t, request.method, "POST")
@@ -2913,6 +2932,7 @@ test_http_layer :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(request.body), len(wire))
 
 	response := db.http_handle(host, request)
+	defer delete(response)
 	testing.expect(t, strings_contains(string(response), "HTTP/1.1 200 OK"))
 	testing.expect(t, strings_contains(string(response), "Content-Type: application/octet-stream"))
 	// The body after the blank line is the wire result.
@@ -2922,13 +2942,19 @@ test_http_layer :: proc(t: ^testing.T) {
 	testing.expect_value(t, result.rows[0][0].i, i64(7))
 	db.sql_result_destroy(&result)
 
-	health, _, _ := db.http_parse_request(http_bytes_of("GET /health HTTP/1.1\r\n\r\n"))
+	health, _, dropped_parse_err_2925 := db.http_parse_request(http_bytes_of("GET /health HTTP/1.1\r\n\r\n"))
+	defer db.http_request_destroy(&health)
+	defer db.error_free(&dropped_parse_err_2925)
 	health_response := db.http_handle(host, health)
+	defer delete(health_response)
 	testing.expect(t, strings_contains(string(health_response), "200 OK"))
 	testing.expect(t, strings_contains(string(health_response), "ok"))
 
-	missing, _, _ := db.http_parse_request(http_bytes_of("POST /nope HTTP/1.1\r\nContent-Length: 0\r\n\r\n"))
+	missing, _, dropped_parse_err_2930 := db.http_parse_request(http_bytes_of("POST /nope HTTP/1.1\r\nContent-Length: 0\r\n\r\n"))
+	defer db.http_request_destroy(&missing)
+	defer db.error_free(&dropped_parse_err_2930)
 	missing_response := db.http_handle(host, missing)
+	defer delete(missing_response)
 	testing.expect(t, strings_contains(string(missing_response), "404 Not Found"))
 
 	// A single reader is enough for the socket loop later: two requests back to
@@ -2937,6 +2963,7 @@ test_http_layer :: proc(t: ^testing.T) {
 	copy(combined, request_bytes)
 	copy(combined[len(request_bytes):], "abc")
 	_, first, first_err := db.http_parse_request(combined)
+	defer db.error_free(&first_err)
 	testing.expect(t, db.error_ok(first_err))
 	testing.expect_value(t, first, len(request_bytes))
 }
@@ -3246,6 +3273,7 @@ test_reducer_catalog :: proc(t: ^testing.T) {
 
 	// Duplicate registration is rejected before touching the catalog.
 	duplicate := db.host_register(host, "bump", []db.Column_Type{db.type_string}, bump)
+	defer db.error_free(&duplicate)
 	testing.expect_value(t, duplicate.kind, db.Error_Kind.Invalid_Argument)
 	count := scalar(t, store, "SELECT count(*) FROM _reducer")
 	testing.expect_value(t, count.i, i64(2))
@@ -3390,8 +3418,11 @@ test_meta_and_metrics :: proc(t: ^testing.T) {
 	testing.expect_value(t, host.metric_requests, u64(2))
 	testing.expect_value(t, host.metric_errors, u64(1))
 
-	request, _, _ := db.http_parse_request(http_bytes_of("GET /metrics HTTP/1.1\r\n\r\n"))
+	request, _, dropped_parse_err_3393 := db.http_parse_request(http_bytes_of("GET /metrics HTTP/1.1\r\n\r\n"))
+	defer db.http_request_destroy(&request)
+	defer db.error_free(&dropped_parse_err_3393)
 	response := db.http_handle(host, request)
+	defer delete(response)
 	body := string(response)
 	testing.expect(t, strings_contains(body, "miraidb_requests_total 2"))
 	testing.expect(t, strings_contains(body, "miraidb_errors_total 1"))
@@ -3441,8 +3472,11 @@ test_schema_reflection :: proc(t: ^testing.T) {
 	testing.expect(t, strings_contains(text, "name TEXT"))
 	testing.expect(t, strings_contains(text, "thing_name"))
 
-	request, _, _ := db.http_parse_request(http_bytes_of("GET /schema HTTP/1.1\r\n\r\n"))
+	request, _, dropped_parse_err_3444 := db.http_parse_request(http_bytes_of("GET /schema HTTP/1.1\r\n\r\n"))
+	defer db.http_request_destroy(&request)
+	defer db.error_free(&dropped_parse_err_3444)
 	response := db.http_handle(host, request)
+	defer delete(response)
 	testing.expect(t, strings_contains(string(response), "table thing"))
 }
 
@@ -3457,7 +3491,9 @@ test_schema_validation :: proc(t: ^testing.T) {
 	_, bad_default := db.sql_execute(store, "CREATE TABLE bad_default (a INTEGER NOT NULL DEFAULT NULL)")
 	testing.expect(t, !db.error_ok(bad_default))
 	run_done(t, store, "CREATE TABLE good (a INTEGER, b TEXT)")
-	_, repeated := db.sql_execute(store, "CREATE INDEX twice ON good (a, a)")
+	dropped_result_3483, repeated := db.sql_execute(store, "CREATE INDEX twice ON good (a, a)")
+	defer db.error_free(&repeated)
+	defer db.sql_result_destroy(&dropped_result_3483)
 	testing.expect(t, !db.error_ok(repeated))
 	run_done(t, store, "CREATE INDEX once ON good (a, b)")
 
@@ -3562,8 +3598,11 @@ test_client_registry :: proc(t: ^testing.T) {
 	testing.expect(t, db.host_client_over_budget(host, 3, 0))
 	testing.expect(t, !db.host_client_over_budget(host, 3, 1 << 20))
 
-	request, _, _ := db.http_parse_request(http_bytes_of("GET /metrics HTTP/1.1\r\n\r\n"))
+	request, _, dropped_parse_err_3565 := db.http_parse_request(http_bytes_of("GET /metrics HTTP/1.1\r\n\r\n"))
+	defer db.http_request_destroy(&request)
+	defer db.error_free(&dropped_parse_err_3565)
 	response := db.http_handle(host, request)
+	defer delete(response)
 	testing.expect(t, strings_contains(string(response), "miraidb_clients 2"))
 }
 
@@ -3945,11 +3984,13 @@ test_module_abi :: proc(t: ^testing.T) {
 	testing.expect_value(t, names[1], "bank")
 
 	duplicate := db.host_register_module(host, module)
+	defer db.error_free(&duplicate)
 	testing.expect(t, !db.error_ok(duplicate))
 	bad_abi := module
 	bad_abi.name = "bad"
 	bad_abi.abi_version = 99
 	rejected := db.host_register_module(host, bad_abi)
+	defer db.error_free(&rejected)
 	testing.expect(t, !db.error_ok(rejected))
 
 	result, call_err := db.host_call_module(host, "bank", "deposit", []db.Value{db.value_int(100)})
@@ -3958,6 +3999,7 @@ test_module_abi :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT amount FROM ledger WHERE id = 1").i, i64(100))
 
 	_, unknown := db.host_call_module(host, "ghost", "deposit", nil)
+	defer db.error_free(&unknown)
 	testing.expect(t, !db.error_ok(unknown))
 	_, bad_reducer := db.host_call_module(host, "bank", "withdraw", nil)
 	testing.expect(t, !db.error_ok(bad_reducer))
@@ -4135,7 +4177,9 @@ test_event_tables :: proc(t: ^testing.T) {
 	testing.expect(t, !db.error_ok(update_err))
 	_, delete_err := db.sql_execute(store, "DELETE FROM audit")
 	testing.expect(t, !db.error_ok(delete_err))
-	_, truncate_err := db.sql_execute(store, "TRUNCATE TABLE audit")
+	dropped_result_4164, truncate_err := db.sql_execute(store, "TRUNCATE TABLE audit")
+	defer db.error_free(&truncate_err)
+	defer db.sql_result_destroy(&dropped_result_4164)
 	testing.expect(t, !db.error_ok(truncate_err))
 
 	// The outbox cursor reads only newer rows.
@@ -4170,7 +4214,9 @@ test_row_quota :: proc(t: ^testing.T) {
 	db.store_set_row_quota(store, 2)
 	testing.expect_value(t, db.store_row_quota(store), u64(2))
 
-	_, over := db.sql_execute(store, "SELECT id FROM t")
+	dropped_result_4199, over := db.sql_execute(store, "SELECT id FROM t")
+	defer db.error_free(&over)
+	defer db.sql_result_destroy(&dropped_result_4199)
 	testing.expect(t, !db.error_ok(over))
 	testing.expect_value(t, over.kind, db.Error_Kind.Quota_Exceeded)
 
@@ -4183,7 +4229,9 @@ test_row_quota :: proc(t: ^testing.T) {
 	// window_sources instead of the row loop. Both shapes used to free a row a
 	// second time, which a release build reports as exit 116 with no message; the
 	// gate that catches it is `scripts/shell_smoke.py` ("row quota refuses").
-	_, window := db.sql_execute(store, "SELECT row_number() OVER () FROM t")
+	dropped_result_4212, window := db.sql_execute(store, "SELECT row_number() OVER () FROM t")
+	defer db.error_free(&window)
+	defer db.sql_result_destroy(&dropped_result_4212)
 	testing.expect_value(t, window.kind, db.Error_Kind.Quota_Exceeded)
 
 	db.store_set_row_quota(store, 0)
@@ -4216,7 +4264,9 @@ test_view_parameters :: proc(t: ^testing.T) {
 	testing.expect_value(t, bound.rows[0][0].i, i64(3))
 
 	// A normal table rejects parameters.
-	_, bad := db.sql_execute(store, "SELECT * FROM t(1)")
+	dropped_result_4245, bad := db.sql_execute(store, "SELECT * FROM t(1)")
+	defer db.error_free(&bad)
+	defer db.sql_result_destroy(&dropped_result_4245)
 	testing.expect(t, !db.error_ok(bad))
 }
 
@@ -4261,10 +4311,10 @@ test_module_hot_swap :: proc(t: ^testing.T) {
 	// A swap for an unknown module and one with a bad ABI are rejected.
 	ghost := second
 	ghost.name = "ghost"
-	testing.expect(t, !db.error_ok(db.host_swap_module(host, ghost)))
+	testing.expect(t, !db.error_drop(db.host_swap_module(host, ghost)))
 	bad_abi := second
 	bad_abi.abi_version = 99
-	testing.expect(t, !db.error_ok(db.host_swap_module(host, bad_abi)))
+	testing.expect(t, !db.error_drop(db.host_swap_module(host, bad_abi)))
 	still, still_err := db.host_call_module(host, "shop", "ping", nil)
 	testing.expect(t, db.error_ok(still_err))
 	testing.expect_value(t, still.s, "two")
@@ -4339,16 +4389,20 @@ test_http_client :: proc(t: ^testing.T) {
 	testing.expect_value(t, string(missing.body), "missing")
 
 	_, scheme := db.http_get_via(http_fake_ok, nil, "https://example.test/greet", context.allocator)
+	defer db.error_free(&scheme)
 	testing.expect(t, !db.error_ok(scheme))
 	_, malformed := db.http_get_via(http_fake_garbage, nil, "http://example.test/greet", context.allocator)
+	defer db.error_free(&malformed)
 	testing.expect(t, !db.error_ok(malformed))
 	_, no_transport := db.http_get_via(nil, nil, "http://example.test/", context.allocator)
+	defer db.error_free(&no_transport)
 	testing.expect(t, !db.error_ok(no_transport))
 
 	// A body shorter than Content-Length is rejected.
 	short_text := "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nab"
 	short := transmute([]u8)short_text
 	_, short_err := db.http_parse_response(short)
+	defer db.error_free(&short_err)
 	testing.expect(t, !db.error_ok(short_err))
 }
 
@@ -4389,6 +4443,7 @@ test_deterministic_simulation :: proc(t: ^testing.T) {
 	defer destroy_host(store, host, "sim_clock")
 	sim := db.simulation_init(host, i64(5_000))
 	_, before := db.simulation_advance(&sim, -1)
+	defer db.error_free(&before)
 	testing.expect(t, !db.error_ok(before))
 	testing.expect_value(t, db.simulation_now(&sim), i64(5_000))
 }
@@ -4411,6 +4466,8 @@ test_commit_time :: proc(t: ^testing.T) {
 sdk_route :: proc(ctx: rawptr, request: []u8, alloc: mem.Allocator) -> ([]u8, db.Error) {
 	host := (^db.Host)(ctx)
 	parsed, _, parse_err := db.http_parse_request(request)
+	defer db.http_request_destroy(&parsed)
+	defer db.error_free(&parse_err)
 	if !db.error_ok(parse_err) do return nil, parse_err
 	if token, has_token := db.http_bearer_token(request); has_token {
 		if identity, valid := db.host_authenticate(host, token); valid {
@@ -4625,9 +4682,12 @@ test_http_compression :: proc(t: ^testing.T) {
 	raw := strings.concatenate({head, transmute(string)message})
 	defer delete(raw)
 	request, _, parse_err := db.http_parse_request(transmute([]u8)raw)
+	defer db.http_request_destroy(&request)
+	defer db.error_free(&parse_err)
 	testing.expect(t, db.error_ok(parse_err))
 	testing.expect(t, request.accepts_zlib)
 	response := db.http_handle(host, request)
+	defer delete(response)
 	testing.expect(t, strings_contains(string(response), "Content-Encoding: zlib"))
 	parsed, response_err := db.http_parse_response(response)
 	testing.expect(t, db.error_ok(response_err))
@@ -4653,9 +4713,12 @@ test_http_compression :: proc(t: ^testing.T) {
 	raw2 := strings.concatenate({head2, transmute(string)compressed})
 	defer delete(raw2)
 	request2, _, parse2_err := db.http_parse_request(transmute([]u8)raw2)
+	defer db.http_request_destroy(&request2)
+	defer db.error_free(&parse2_err)
 	testing.expect(t, db.error_ok(parse2_err))
 	testing.expect(t, request2.zlib_body)
 	response2 := db.http_handle(host, request2)
+	defer delete(response2)
 	parsed2, parse3_err := db.http_parse_response(response2)
 	testing.expect(t, db.error_ok(parse3_err))
 	testing.expect(t, !parsed2.zlib)
@@ -4701,6 +4764,7 @@ test_prepared_commit_group :: proc(t: ^testing.T) {
 	// A read transaction cannot be prepared.
 	read := db.tx_begin_read(store)
 	_, read_err := db.tx_prepare(read)
+	defer db.error_free(&read_err)
 	testing.expect(t, !db.error_ok(read_err))
 }
 
@@ -4742,6 +4806,7 @@ test_schema_migrations :: proc(t: ^testing.T) {
 		},
 	}
 	_, broken_err := db.host_migrate(host, broken)
+	defer db.error_free(&broken_err)
 	testing.expect(t, !db.error_ok(broken_err))
 	testing.expect_value(t, db.host_schema_version(host), u32(3))
 	testing.expect_value(t, len(run_temp(t, store, "SELECT name FROM _tables WHERE name = 'oops'").rows), 0)
@@ -4749,6 +4814,7 @@ test_schema_migrations :: proc(t: ^testing.T) {
 	// A version gap is rejected before running anything.
 	gap := []db.Migration{{version = 6, sql = []string{"CREATE TABLE six (id INTEGER PRIMARY KEY)"}}}
 	_, gap_err := db.host_migrate(host, gap)
+	defer db.error_free(&gap_err)
 	testing.expect(t, !db.error_ok(gap_err))
 	testing.expect_value(t, len(run_temp(t, store, "SELECT name FROM _tables WHERE name = 'six'").rows), 0)
 }
@@ -4762,7 +4828,9 @@ test_named_types :: proc(t: ^testing.T) {
 	if store == nil do return
 
 	run_done(t, store, "CREATE TYPE email AS TEXT")
-	_, again := db.sql_execute(store, "CREATE TYPE email AS TEXT")
+	dropped_result_4799, again := db.sql_execute(store, "CREATE TYPE email AS TEXT")
+	defer db.error_free(&again)
+	defer db.sql_result_destroy(&dropped_result_4799)
 	testing.expect(t, !db.error_ok(again))
 	run_done(t, store, "CREATE TYPE IF NOT EXISTS email AS TEXT")
 
@@ -4943,6 +5011,7 @@ test_structural_types :: proc(t: ^testing.T) {
 	testing.expect_value(t, err_coerced.list[1].s, "boom")
 	both := db.Value{kind = .Product, list = []db.Value{db.value_int(1), db.value_string("x")}}
 	_, both_err := db.value_coerce(both, ready)
+	defer db.error_free(&both_err)
 	testing.expect(t, !db.error_ok(both_err))
 
 	// A named type may itself be structural, and UNIT cannot be NOT NULL.
@@ -4982,7 +5051,9 @@ test_statement_work_budget :: proc(t: ^testing.T) {
 	// A budget below the cost refuses the statement.
 	db.store_set_work_budget(store, 1)
 	testing.expect_value(t, db.store_work_budget(store), u64(1))
-	_, over := db.sql_execute(store, "SELECT id, label FROM e")
+	dropped_result_5019, over := db.sql_execute(store, "SELECT id, label FROM e")
+	defer db.error_free(&over)
+	defer db.sql_result_destroy(&dropped_result_5019)
 	testing.expect_value(t, over.kind, db.Error_Kind.Quota_Exceeded)
 	// The message names the work the statement actually spent: it used to say 0,
 	// because the count was read after the result had been destroyed.
@@ -5074,7 +5145,9 @@ test_hash_and_direct_indexes :: proc(t: ^testing.T) {
 	// The direct index is unique: a duplicate key is rejected.
 	_, duplicate := db.sql_execute(store, "INSERT INTO t (id, code, label) VALUES (4, 'c1', 'other')")
 	testing.expect(t, !db.error_ok(duplicate))
-	_, not_direct := db.sql_execute(store, "CREATE INDEX bad ON t USING DIRECT (label)")
+	dropped_result_5111, not_direct := db.sql_execute(store, "CREATE INDEX bad ON t USING DIRECT (label)")
+	defer db.error_free(&not_direct)
+	defer db.sql_result_destroy(&dropped_result_5111)
 	testing.expect(t, !db.error_ok(not_direct))
 
 	// Updates move the bucket, deletes empty it.
@@ -5404,9 +5477,11 @@ test_array_and_product_types :: proc(t: ^testing.T) {
 
 	wrong := db.Value{kind = .Array, list = []db.Value{db.value_bytes([]u8{1})}}
 	_, wrong_err := db.value_coerce(wrong, array_type)
+	defer db.error_free(&wrong_err)
 	testing.expect(t, !db.error_ok(wrong_err))
 	not_array := db.value_int(3)
 	_, shape_err := db.value_coerce(not_array, array_type)
+	defer db.error_free(&shape_err)
 	testing.expect(t, !db.error_ok(shape_err))
 
 	pair_type := db.Column_Type {
@@ -5419,6 +5494,7 @@ test_array_and_product_types :: proc(t: ^testing.T) {
 	testing.expect_value(t, coerced_pair.list[0].i, i64(7))
 	triple := db.Value{kind = .Product, list = []db.Value{db.value_int(1), db.value_int(2), db.value_int(3)}}
 	_, triple_err := db.value_coerce(triple, pair_type)
+	defer db.error_free(&triple_err)
 	testing.expect(t, !db.error_ok(triple_err))
 
 	// A named type may name an array, and the schema round-trips both kinds.
@@ -5618,6 +5694,7 @@ test_product_arity :: proc(t: ^testing.T) {
 
 	short := db.Value{kind = .Product, list = []db.Value{db.value_int(1), db.value_string("x")}}
 	_, short_err := db.value_coerce(short, triple_type)
+	defer db.error_free(&short_err)
 	testing.expect(t, !db.error_ok(short_err))
 	_, one_component := db.sql_execute(store, "CREATE TABLE bad (x PRODUCT(INT))")
 	testing.expect(t, !db.error_ok(one_component))
@@ -5867,10 +5944,12 @@ test_foreign_key_catalog :: proc(t: ^testing.T) {
 	testing.expect_value(t, fk.on_update, db.Foreign_Key_Action.Restrict)
 
 	// The parent must exist and key its referenced columns uniquely.
-	_, missing := db.sql_execute(
+	dropped_result_5904, missing := db.sql_execute(
 		store,
 		"CREATE TABLE bad (id INTEGER PRIMARY KEY, other INTEGER, FOREIGN KEY (other) REFERENCES ghosts (id))",
 	)
+	defer db.error_free(&missing)
+	defer db.sql_result_destroy(&dropped_result_5904)
 	testing.expect(t, !db.error_ok(missing))
 	// A key naming no unique key of its parent is declared, as SQLite declares
 	// it; enforcing it fails with "foreign key mismatch".
@@ -5881,10 +5960,12 @@ test_foreign_key_catalog :: proc(t: ^testing.T) {
 	testing.expect(t, db.error_ok(not_unique))
 	mismatch := run_error(t, store, "INSERT INTO bad2 VALUES (1, 1)")
 	testing.expect_value(t, mismatch.message, `foreign key mismatch - "bad2" referencing "authors"`)
-	_, bad_column := db.sql_execute(
+	dropped_result_5918, bad_column := db.sql_execute(
 		store,
 		"CREATE TABLE bad3 (id INTEGER PRIMARY KEY, other INTEGER, FOREIGN KEY (other) REFERENCES authors (nope))",
 	)
+	defer db.error_free(&bad_column)
+	defer db.sql_result_destroy(&dropped_result_5918)
 	testing.expect(t, !db.error_ok(bad_column))
 
 	// The constraint survives the schema codec.
@@ -6014,6 +6095,7 @@ test_module_abi_v2 :: proc(t: ^testing.T) {
 
 	// Overrunning the row quota is reported.
 	_, quota_err := db.host_call_module(host, "bounded", "charge", nil)
+	defer db.error_free(&quota_err)
 	testing.expect_value(t, quota_err.kind, db.Error_Kind.Quota_Exceeded)
 
 	// v1 modules still register and run.
@@ -6028,7 +6110,7 @@ test_module_abi_v2 :: proc(t: ^testing.T) {
 
 	// An unknown ABI is rejected.
 	bad := db.Module{abi_version = 7, name = "bad"}
-	testing.expect(t, !db.error_ok(db.host_register_module(host, bad)))
+	testing.expect(t, !db.error_drop(db.host_register_module(host, bad)))
 	names := db.host_module_names(host, context.allocator)
 	defer delete(names)
 	testing.expect_value(t, len(names), 2)
@@ -6760,6 +6842,7 @@ test_embed_statement_lifecycle :: proc(t: ^testing.T) {
 	// Errors land on the connection and do not crash.
 	bad := db.embed_prepare(conn, "SELECT * FROM missing")
 	_, bad_err := db.embed_step(bad)
+	defer db.error_free(&bad_err)
 	testing.expect(t, !db.error_ok(bad_err))
 	testing.expect(t, strings_contains(db.embed_error(conn), "missing"))
 	db.embed_finalize(bad)
@@ -7025,6 +7108,7 @@ test_vfs_memory_and_quota :: proc(t: ^testing.T) {
 	limited, limited_err := quota.ops.open(quota, "b.log", {.Write, .Create})
 	if !testing.expectf(t, db.error_ok(limited_err), "quota open: %s", limited_err.message) do return
 	_, write_err := limited.ops.write(limited, http_bytes_of("abcdef"))
+	defer db.error_free(&write_err)
 	testing.expect_value(t, write_err.kind, db.Error_Kind.Quota_Exceeded)
 	limited.ops.close(limited)
 	testing.expect(t, db.error_ok(quota.ops.remove(quota, "b.log")))
@@ -7247,7 +7331,9 @@ test_spatial_rtree :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, point).i, i64(1))
 
 	// A shape that is not a set of min/max pairs is refused.
-	_, bad_shape := db.sql_execute(store, "CREATE VIRTUAL TABLE broken USING rtree(id, minx, maxx, miny)")
+	dropped_result_7284, bad_shape := db.sql_execute(store, "CREATE VIRTUAL TABLE broken USING rtree(id, minx, maxx, miny)")
+	defer db.error_free(&bad_shape)
+	defer db.sql_result_destroy(&dropped_result_7284)
 	testing.expect_value(t, bad_shape.kind, db.Error_Kind.Invalid_Argument)
 	// rtree_i32 stores integers.
 	run_done(t, store, "CREATE VIRTUAL TABLE grid USING rtree_i32(id, minx, maxx, miny, maxy)")
@@ -7395,7 +7481,9 @@ test_full_text_search :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM notes WHERE notes MATCH 'cat'").i, i64(1))
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM docs WHERE docs MATCH 'cat'").i, i64(1))
 	// An unknown module is refused rather than silently creating a plain table.
-	_, bad := db.sql_execute(store, "CREATE VIRTUAL TABLE bad USING nosuchmodule(id)")
+	dropped_result_7432, bad := db.sql_execute(store, "CREATE VIRTUAL TABLE bad USING nosuchmodule(id)")
+	defer db.error_free(&bad)
+	defer db.sql_result_destroy(&dropped_result_7432)
 	testing.expect_value(t, bad.kind, db.Error_Kind.Sql_Unsupported)
 
 	// The index is data, so it survives a reopen.
@@ -7705,6 +7793,7 @@ test_row_quota_stops_a_cross_join :: proc(t: ^testing.T) {
 	defer db.store_set_row_quota(store, 0)
 	db.store_reset_rows_scanned(store)
 	cross, cross_err := db.sql_execute(store, "SELECT a.id, b.id FROM a, b")
+	defer db.error_free(&cross_err)
 	testing.expect_value(t, cross_err.kind, db.Error_Kind.Quota_Exceeded)
 	db.sql_result_destroy(&cross)
 	// 40 000 combinations exist; the refusal has to arrive while the join builds,
@@ -7722,6 +7811,7 @@ test_row_quota_stops_a_cross_join :: proc(t: ^testing.T) {
 
 	// And the plain quota still refuses a single-table scan that is too wide.
 	wide, wide_err := db.sql_execute(store, "SELECT * FROM a")
+	defer db.error_free(&wide_err)
 	testing.expect_value(t, wide_err.kind, db.Error_Kind.Quota_Exceeded)
 	db.sql_result_destroy(&wide)
 }
@@ -8119,9 +8209,13 @@ test_column_collation_and_generated :: proc(t: ^testing.T) {
 	run_done(t, store, "UPDATE lines SET qty = 3 WHERE id = 1")
 	testing.expect_value(t, scalar(t, store, "SELECT total FROM lines WHERE id = 1").i, i64(15))
 	// A generated column cannot be written directly.
-	_, direct_insert := db.sql_execute(store, "INSERT INTO lines (id, qty, price, total) VALUES (2, 1, 1, 99)")
+	dropped_result_8156, direct_insert := db.sql_execute(store, "INSERT INTO lines (id, qty, price, total) VALUES (2, 1, 1, 99)")
+	defer db.error_free(&direct_insert)
+	defer db.sql_result_destroy(&dropped_result_8156)
 	testing.expect_value(t, direct_insert.kind, db.Error_Kind.Invalid_Argument)
-	_, direct_update := db.sql_execute(store, "UPDATE lines SET total = 0")
+	dropped_result_8158, direct_update := db.sql_execute(store, "UPDATE lines SET total = 0")
+	defer db.error_free(&direct_update)
+	defer db.sql_result_destroy(&dropped_result_8158)
 	testing.expect_value(t, direct_update.kind, db.Error_Kind.Invalid_Argument)
 
 	// Both survive a reopen: the flags and the expression travel in the schema.
@@ -8373,7 +8467,9 @@ test_attach_and_detach :: proc(t: ^testing.T) {
 	db.sql_result_destroy(&joined)
 
 	// Attaching the same name twice is refused.
-	_, twice := db.sql_execute(store, attach_sql)
+	dropped_result_8410, twice := db.sql_execute(store, attach_sql)
+	defer db.error_free(&twice)
+	defer db.sql_result_destroy(&dropped_result_8410)
 	testing.expect_value(t, twice.kind, db.Error_Kind.Invalid_Argument)
 
 	// An unknown database and an unknown table are clean errors.
@@ -8533,20 +8629,26 @@ test_pragma_list_and_accepted_settings :: proc(t: ^testing.T) {
 	testing.expect_value(t, store.log.durability, db.Durability.Batched)
 	testing.expect_value(t, run_temp(t, store, "PRAGMA synchronous = FULL").kind, db.Sql_Result_Kind.Ack)
 	testing.expect_value(t, store.log.durability, db.Durability.Full)
-	_, bad_level := db.sql_execute(store, "PRAGMA synchronous = sometimes")
+	dropped_result_8570, bad_level := db.sql_execute(store, "PRAGMA synchronous = sometimes")
+	defer db.error_free(&bad_level)
+	defer db.sql_result_destroy(&dropped_result_8570)
 	testing.expect_value(t, bad_level.kind, db.Error_Kind.Invalid_Argument)
 
 	// A knob that would change what a statement does cannot be accepted silently:
 	// the read tells the truth and the write is refused.
 	testing.expect_value(t, run_temp(t, store, "PRAGMA query_only").rows[0][0].i, i64(0))
-	_, query_only := db.sql_execute(store, "PRAGMA query_only = ON")
+	dropped_result_8576, query_only := db.sql_execute(store, "PRAGMA query_only = ON")
+	defer db.error_free(&query_only)
+	defer db.sql_result_destroy(&dropped_result_8576)
 	testing.expect_value(t, query_only.kind, db.Error_Kind.Sql_Unsupported)
 
 	// Tuning knobs with no equivalent are still accepted.
 	testing.expect_value(t, run_temp(t, store, "PRAGMA busy_timeout = 5000").kind, db.Sql_Result_Kind.Ack)
 	testing.expect_value(t, run_temp(t, store, "PRAGMA busy_timeout").rows[0][0].i, i64(0))
 
-	_, unknown := db.sql_execute(store, "PRAGMA not_a_pragma")
+	dropped_result_8583, unknown := db.sql_execute(store, "PRAGMA not_a_pragma")
+	defer db.error_free(&unknown)
+	defer db.sql_result_destroy(&dropped_result_8583)
 	testing.expect_value(t, unknown.kind, db.Error_Kind.Sql_Unsupported)
 }
 
@@ -8589,7 +8691,9 @@ test_insert_select :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(back.rows), 1)
 	testing.expect_value(t, back.rows[0][0].s, "c")
 	// An arity mismatch is rejected before anything is written.
-	_, mismatch := db.sql_execute(store, "INSERT INTO dst (name) SELECT name, qty FROM src")
+	dropped_result_8626, mismatch := db.sql_execute(store, "INSERT INTO dst (name) SELECT name, qty FROM src")
+	defer db.error_free(&mismatch)
+	defer db.sql_result_destroy(&dropped_result_8626)
 	testing.expect_value(t, mismatch.kind, db.Error_Kind.Invalid_Argument)
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM dst").i, i64(4))
 }
@@ -8710,6 +8814,7 @@ test_bind_range_and_live_handles :: proc(t: ^testing.T) {
 	testing.expect(t, db.error_ok(db.embed_bind_int(stmt, 0, 1)))
 	testing.expect(t, db.error_ok(db.embed_bind_int(stmt, 1, 2)))
 	out_of_range := db.embed_bind_int(stmt, 2, 3)
+	defer db.error_free(&out_of_range)
 	testing.expect_value(t, out_of_range.kind, db.Error_Kind.Invalid_Argument)
 	testing.expect(t, strings.contains(out_of_range.message, "out of range"))
 	db.embed_finalize(stmt)
@@ -9041,7 +9146,9 @@ test_savepoints :: proc(t: ^testing.T) {
 	_, fourth := db.sql_execute_in_tx(tx, "INSERT INTO s (n) VALUES ('four')")
 	testing.expect(t, db.error_ok(fourth))
 	testing.expect(t, db.error_ok(db.tx_release_savepoint(tx, "a")))
-	testing.expect_value(t, db.tx_release_savepoint(tx, "b").kind, db.Error_Kind.Invalid_Argument)
+	released := db.tx_release_savepoint(tx, "b")
+	testing.expect_value(t, released.kind, db.Error_Kind.Invalid_Argument)
+	db.error_free(&released)
 	testing.expect_value(t, count_in(t, tx, "SELECT count(*) FROM s"), i64(3))
 
 	testing.expect(t, db.error_ok(db.tx_commit(tx)))
@@ -9103,7 +9210,9 @@ test_union_queries :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(limited.rows), 2)
 	testing.expect_value(t, limited.rows[0][0].i, i64(30))
 	// Arity must match.
-	_, mismatch := db.sql_execute(store, "SELECT 1 UNION SELECT 2, 3")
+	dropped_result_9140, mismatch := db.sql_execute(store, "SELECT 1 UNION SELECT 2, 3")
+	defer db.error_free(&mismatch)
+	defer db.sql_result_destroy(&dropped_result_9140)
 	testing.expect_value(t, mismatch.kind, db.Error_Kind.Invalid_Argument)
 }
 
@@ -9123,7 +9232,9 @@ test_recursive_cte :: proc(t: ^testing.T) {
 	// A query that never stops fails at the step quota instead of running away.
 	previous := db.recursion_limit
 	db.recursion_limit = 25
-	_, runaway := db.sql_execute(store, "WITH RECURSIVE r(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM r) SELECT count(*) FROM r")
+	dropped_result_9160, runaway := db.sql_execute(store, "WITH RECURSIVE r(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM r) SELECT count(*) FROM r")
+	defer db.error_free(&runaway)
+	defer db.sql_result_destroy(&dropped_result_9160)
 	db.recursion_limit = previous
 	testing.expect_value(t, runaway.kind, db.Error_Kind.Cancelled)
 }
@@ -9488,7 +9599,9 @@ test_alter_table_drop_column :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t").i, i64(3))
 	testing.expect_value(t, scalar(t, store, "SELECT c FROM t WHERE a = 'q'").s, "r")
 	// Key and unique columns cannot be dropped.
-	_, key_err := db.sql_execute(store, "ALTER TABLE t DROP COLUMN id")
+	dropped_result_9525, key_err := db.sql_execute(store, "ALTER TABLE t DROP COLUMN id")
+	defer db.error_free(&key_err)
+	defer db.sql_result_destroy(&dropped_result_9525)
 	testing.expect_value(t, key_err.kind, db.Error_Kind.Sql_Unsupported)
 	// An index on other columns stays, as in SQLite; one on the column blocks
 	// the drop.
@@ -9498,9 +9611,13 @@ test_alter_table_drop_column :: proc(t: ^testing.T) {
 	_, indexed_err := db.sql_execute(store, "ALTER TABLE indexed DROP COLUMN b")
 	testing.expect_value(t, indexed_err.kind, db.Error_Kind.None)
 	testing.expect_value(t, run_error(t, store, "INSERT INTO indexed (id, a) VALUES (2, 'x')").kind, db.Error_Kind.Duplicate_Unique)
-	_, on_index := db.sql_execute(store, "ALTER TABLE indexed DROP COLUMN a")
+	dropped_result_9535, on_index := db.sql_execute(store, "ALTER TABLE indexed DROP COLUMN a")
+	defer db.error_free(&on_index)
+	defer db.sql_result_destroy(&dropped_result_9535)
 	testing.expect_value(t, on_index.kind, db.Error_Kind.Sql_Unsupported)
-	_, missing := db.sql_execute(store, "ALTER TABLE t DROP COLUMN nope")
+	dropped_result_9537, missing := db.sql_execute(store, "ALTER TABLE t DROP COLUMN nope")
+	defer db.error_free(&missing)
+	defer db.sql_result_destroy(&dropped_result_9537)
 	testing.expect_value(t, missing.kind, db.Error_Kind.Column_Not_Found)
 
 	// The altered shape survives the log replay: the stored rows are remapped
@@ -9535,7 +9652,9 @@ test_vacuum_into :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, copy_store, "SELECT count(*) FROM t").i, i64(4))
 	// The original is untouched, and an existing target is refused.
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t").i, i64(3))
-	_, exists_err := db.sql_execute(store, "VACUUM INTO './_test_vacuum_copy'")
+	dropped_result_9572, exists_err := db.sql_execute(store, "VACUUM INTO './_test_vacuum_copy'")
+	defer db.error_free(&exists_err)
+	defer db.sql_result_destroy(&dropped_result_9572)
 	testing.expect_value(t, exists_err.kind, db.Error_Kind.Io)
 	// A plain VACUUM compacts the live log and keeps the data.
 	run_done(t, store, "VACUUM")
@@ -9756,7 +9875,9 @@ test_log_on_memory_vfs :: proc(t: ^testing.T) {
 	// Compaction needs real files, and says so.
 	compact_store, compact_err := db.store_open("virtual/memdb", options)
 	if testing.expectf(t, db.error_ok(compact_err), "reopen failed: %s", compact_err.message) {
-		_, vacuum_err := db.sql_execute(compact_store, "VACUUM")
+		dropped_result_9793, vacuum_err := db.sql_execute(compact_store, "VACUUM")
+		defer db.error_free(&vacuum_err)
+		defer db.sql_result_destroy(&dropped_result_9793)
 		testing.expect_value(t, vacuum_err.kind, db.Error_Kind.Sql_Unsupported)
 		db.store_close(compact_store)
 	}
@@ -10019,6 +10140,7 @@ test_writer_lock :: proc(t: ^testing.T) {
 	if !testing.expectf(t, db.error_ok(first_err), "first open: %s", first_err.message) do return
 
 	second, second_err := db.store_open(path, {persistent = true, create = true, durable = false})
+	defer db.error_free(&second_err)
 	testing.expect(t, second == nil)
 	testing.expect_value(t, second_err.kind, db.Error_Kind.Locked)
 	testing.expectf(t, strings.contains(second_err.message, path), "refusal names the database: %s", second_err.message)
@@ -10040,6 +10162,7 @@ test_writer_lock :: proc(t: ^testing.T) {
 	defer delete(missing)
 	os.remove_all(missing)
 	_, missing_err := db.store_open(missing, {persistent = true, create = false, durable = false})
+	defer db.error_free(&missing_err)
 	testing.expect_value(t, missing_err.kind, db.Error_Kind.Io)
 }
 
@@ -10301,7 +10424,9 @@ test_full_text_ranking :: proc(t: ^testing.T) {
 	// A plain table has no rank, and asking for it is an error rather than a zero.
 	run_done(t, store, "CREATE TABLE plain (body TEXT)")
 	run_done(t, store, "INSERT INTO plain (body) VALUES ('nothing to rank')")
-	_, rank_err := db.sql_execute(store, "SELECT rank FROM plain")
+	dropped_result_10338, rank_err := db.sql_execute(store, "SELECT rank FROM plain")
+	defer db.error_free(&rank_err)
+	defer db.sql_result_destroy(&dropped_result_10338)
 	testing.expect_value(t, rank_err.kind, db.Error_Kind.Column_Not_Found)
 }
 
@@ -10499,7 +10624,8 @@ test_scans_come_out_in_row_id_order :: proc(t: ^testing.T) {
 		loose, create_err := db.table_create(&schema)
 		if testing.expect(t, db.error_ok(create_err)) {
 			for id in ([]u64{50, 10, 30, 20, 40, 10}) {
-				_ = db.table_insert(loose, db.Row_Id(id), []db.Value{db.value_int(i64(id))})
+				insert_err := db.table_insert(loose, db.Row_Id(id), []db.Value{db.value_int(i64(id))})
+				db.error_free(&insert_err)
 			}
 			rows := make([dynamic]db.Row)
 			db.table_collect(loose, &rows)
@@ -10893,7 +11019,9 @@ test_as_of :: proc(t: ^testing.T) {
 	// A sequence beyond the log is clamped to the latest commit, and a view is
 	// refused rather than half read.
 	run_done(t, store, "CREATE VIEW v AS SELECT id FROM t")
-	_, view_err := db.sql_execute(store, "SELECT * FROM v AS OF 1")
+	dropped_result_10930, view_err := db.sql_execute(store, "SELECT * FROM v AS OF 1")
+	defer db.error_free(&view_err)
+	defer db.sql_result_destroy(&dropped_result_10930)
 	testing.expect_value(t, view_err.kind, db.Error_Kind.Sql_Unsupported)
 }
 
@@ -11197,14 +11325,20 @@ test_alter_rename_column :: proc(t: ^testing.T) {
 	testing.expect_value(t, old_name.kind, db.Error_Kind.Column_Not_Found)
 
 	// Renaming to an existing column, or renaming a missing one, is refused.
-	_, clash := db.sql_execute(store, "ALTER TABLE t RENAME COLUMN name TO points")
+	dropped_result_11234, clash := db.sql_execute(store, "ALTER TABLE t RENAME COLUMN name TO points")
+	defer db.error_free(&clash)
+	defer db.sql_result_destroy(&dropped_result_11234)
 	testing.expect_value(t, clash.kind, db.Error_Kind.Invalid_Argument)
-	_, missing := db.sql_execute(store, "ALTER TABLE t RENAME COLUMN nope TO other")
+	dropped_result_11236, missing := db.sql_execute(store, "ALTER TABLE t RENAME COLUMN nope TO other")
+	defer db.error_free(&missing)
+	defer db.sql_result_destroy(&dropped_result_11236)
 	testing.expect_value(t, missing.kind, db.Error_Kind.Column_Not_Found)
 
 	// A virtual table keeps the column names its index was built with.
 	run_done(t, store, "CREATE VIRTUAL TABLE docs USING fts5(body)")
-	_, virtual := db.sql_execute(store, "ALTER TABLE docs RENAME COLUMN body TO text")
+	dropped_result_11241, virtual := db.sql_execute(store, "ALTER TABLE docs RENAME COLUMN body TO text")
+	defer db.error_free(&virtual)
+	defer db.sql_result_destroy(&dropped_result_11241)
 	testing.expect_value(t, virtual.kind, db.Error_Kind.Sql_Unsupported)
 
 	// The rename is in the log: a reopen sees the new schema.
@@ -11904,6 +12038,7 @@ test_read_only_opens_beside_a_writer :: proc(t: ^testing.T) {
 	create_err := run_error(t, reader, "CREATE TABLE other (id INTEGER PRIMARY KEY)")
 	testing.expect_value(t, create_err.kind, db.Error_Kind.Transaction_Read_Only)
 	compact_err := db.store_compact(reader)
+	defer db.error_free(&compact_err)
 	testing.expect_value(t, compact_err.kind, db.Error_Kind.Transaction_Read_Only)
 
 	// The writer can keep writing, but it cannot rewrite the log while a reader
@@ -11911,10 +12046,12 @@ test_read_only_opens_beside_a_writer :: proc(t: ^testing.T) {
 	run_done(t, writer, "INSERT INTO t (id, v) VALUES (4, 40)")
 	testing.expect_value(t, scalar(t, writer, "SELECT count(*) FROM t").i, i64(4))
 	writer_compact := db.store_compact(writer)
+	defer db.error_free(&writer_compact)
 	testing.expect_value(t, writer_compact.kind, db.Error_Kind.Locked)
 
 	// A second writer is still refused, even though the reader is allowed in.
 	second, second_err := db.store_open(path, {persistent = true, create = false, durable = false})
+	defer db.error_free(&second_err)
 	if !testing.expect(t, !db.error_ok(second_err), "a second writer must be refused") {
 		db.store_close(second)
 	}
@@ -12020,6 +12157,7 @@ test_trusted_open_skips_the_replay :: proc(t: ^testing.T) {
 	testing.expect(t, os.exists(catalog_path))
 	os.remove(catalog_path)
 	replayed, replayed_err := db.store_open(path, reopen_options)
+	defer db.error_free(&replayed_err)
 	if !testing.expectf(t, db.error_ok(replayed_err), "reopen without a catalog: %s", replayed_err.message) do return
 	testing.expect_value(t, replayed.replays_skipped, u64(0))
 	testing.expect(t, replayed.replay_records > 0)
@@ -12102,7 +12240,9 @@ test_analyze_and_plan_estimates :: proc(t: ^testing.T) {
 
 	// A table that is not there is an error, and DROP TABLE forgets what it
 	// measured instead of leaving a plan for a table nobody can read.
-	_, missing := db.sql_execute(reopened, "ANALYZE nope")
+	dropped_result_12139, missing := db.sql_execute(reopened, "ANALYZE nope")
+	defer db.error_free(&missing)
+	defer db.sql_result_destroy(&dropped_result_12139)
 	testing.expect_value(t, missing.kind, db.Error_Kind.Table_Not_Found)
 	run_done(t, reopened, "DROP TABLE ev")
 	gone := run(t, reopened, "EXPLAIN SELECT * FROM ev WHERE amount = 42")
@@ -12489,6 +12629,7 @@ test_plan_prices_a_view_from_its_own_from :: proc(t: ^testing.T) {
 	run_done(t, store, "ANALYZE other")
 	order, order_err := db.sql_execute(store, `
 		EXPLAIN SELECT * FROM other JOIN v ON other.n = v.n`)
+	defer db.error_free(&order_err)
 	if testing.expectf(t, db.error_ok(order_err), "explain failed: %s", order_err.message) {
 		joined := false
 		for row in order.rows {
@@ -13379,6 +13520,7 @@ test_partial_frame_waits_for_the_rest :: proc(t: ^testing.T) {
 	cuts := []int{1, 3, 5, len(frame) - 1}
 	for cut in cuts {
 		_, _, _, err := db.ws_read_frame_within(frame[:cut], 0)
+		defer db.error_free(&err)
 		testing.expectf(t, err.kind == .Incomplete, "cut %d answered %v", cut, err.kind)
 	}
 
@@ -13391,6 +13533,7 @@ test_partial_frame_waits_for_the_rest :: proc(t: ^testing.T) {
 
 	// A frame that claims more than the cap is refused, not awaited.
 	_, _, _, over := db.ws_read_frame_within(frame, len(message) - 1)
+	defer db.error_free(&over)
 	testing.expect_value(t, over.kind, db.Error_Kind.Quota_Exceeded)
 }
 
@@ -13453,6 +13596,7 @@ test_host_statements_need_host_access :: proc(t: ^testing.T) {
 		store,
 		strings.concatenate({"ATTACH '", path, "' AS attached"}),
 	)
+	defer db.error_free(&allowed_err)
 	testing.expectf(t, allowed_err.kind != .None || allowed.commit_seq > 0, "%v", allowed_err)
 
 	db.store_set_host_access(store, false)
@@ -13467,7 +13611,9 @@ test_host_statements_need_host_access :: proc(t: ^testing.T) {
 	}
 	defer os.remove("_test_hostaccess_out.db")
 	for sql in refusals {
-		_, err := db.sql_execute(store, sql)
+		dropped_result_13504, err := db.sql_execute(store, sql)
+		defer db.error_free(&err)
+		defer db.sql_result_destroy(&dropped_result_13504)
 		testing.expectf(t, err.kind == .Permission_Denied, "%s answered %v", sql, err.kind)
 		testing.expectf(
 			t,
@@ -13487,9 +13633,10 @@ test_host_statements_need_host_access :: proc(t: ^testing.T) {
 	// Turning it back on restores the statement: the switch is a policy, not a
 	// schema change.
 	db.store_set_host_access(store, true)
-	if _, again := db.sql_execute(store, strings.concatenate({"ATTACH '", path, "' AS third"})); again.kind == .Permission_Denied {
-		testing.expect(t, false)
-	}
+	attached, again := db.sql_execute(store, strings.concatenate({"ATTACH '", path, "' AS third"}, context.temp_allocator))
+	db.sql_result_destroy(&attached)
+	testing.expect(t, again.kind != .Permission_Denied)
+	db.error_free(&again)
 }
 
 // An expression may nest 100 deep and no deeper. Before this, 166 nested
@@ -13792,7 +13939,9 @@ test_alter_column_type :: proc(t: ^testing.T) {
 	// A generated column is refused, because SQLite recomputes it from its
 	// expression and a type would not survive a trip through the mirror.
 	run_done(t, store, "CREATE TABLE g (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2))")
-	_, generated := db.sql_execute(store, "ALTER TABLE g ALTER COLUMN b TYPE REAL")
+	dropped_result_13829, generated := db.sql_execute(store, "ALTER TABLE g ALTER COLUMN b TYPE REAL")
+	defer db.error_free(&generated)
+	defer db.sql_result_destroy(&dropped_result_13829)
 	testing.expect(t, !db.error_ok(generated))
 	testing.expect_value(t, generated.kind, db.Error_Kind.Sql_Unsupported)
 
@@ -13880,10 +14029,12 @@ test_windows_beside_group_by :: proc(t: ^testing.T) {
 
 	// A RANGE frame with an offset reads the ORDER BY value per row, and beside
 	// GROUP BY that value may be an aggregate the frame can no longer reach.
-	_, range_err := db.sql_execute(
+	dropped_result_13917, range_err := db.sql_execute(
 		store,
 		"SELECT k, sum(count(*)) OVER (ORDER BY k RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t GROUP BY k",
 	)
+	defer db.error_free(&range_err)
+	defer db.sql_result_destroy(&dropped_result_13917)
 	testing.expect(t, !db.error_ok(range_err))
 	testing.expect_value(t, range_err.kind, db.Error_Kind.Sql_Unsupported)
 
@@ -13959,7 +14110,7 @@ test_host_functions :: proc(t: ^testing.T) {
 	testing.expect(t, !db.store_unregister_function(store, "twice"))
 	unknown := run_error(t, store, "SELECT twice(1)")
 	testing.expect_value(t, unknown.kind, db.Error_Kind.Sql_Unsupported)
-	testing.expect(t, !db.error_ok(db.store_register_function(store, "", 0, twice)))
+	testing.expect(t, !db.error_drop(db.store_register_function(store, "", 0, twice)))
 }
 
 // A window can also sit inside a larger projection: its answer gets a hidden slot,
@@ -14120,6 +14271,7 @@ test_host_collations :: proc(t: ^testing.T) {
 	testing.expect_value(t, db.store_collation_count(store), 1)
 	// The three built-in names belong to the engine.
 	reserved := db.store_register_collation(store, "NOCASE", collation_by_length)
+	defer db.error_free(&reserved)
 	testing.expect_value(t, reserved.kind, db.Error_Kind.Invalid_Argument)
 
 	run_done(t, store, "INSERT INTO w (name) VALUES ('ab'), ('abc'), ('xy'), ('abcd')")
@@ -14371,12 +14523,14 @@ test_log_format_is_negotiated :: proc(t: ^testing.T) {
 
 	patch_u32_le(t, log_path, 8, db.LOG_VERSION + 1)
 	newer, newer_err := db.store_open(path, {persistent = true, create = false, durable = false})
+	defer db.error_free(&newer_err)
 	testing.expect(t, !db.error_ok(newer_err))
 	testing.expect_value(t, newer_err.kind, db.Error_Kind.Format_Too_New)
 	if db.error_ok(newer_err) do db.store_close(newer)
 
 	patch_u32_le(t, log_path, 8, db.LOG_VERSION - 1)
 	older, older_err := db.store_open(path, {persistent = true, create = false, durable = false})
+	defer db.error_free(&older_err)
 	testing.expect(t, !db.error_ok(older_err))
 	testing.expect_value(t, older_err.kind, db.Error_Kind.Corrupt_Log)
 	if db.error_ok(older_err) do db.store_close(older)

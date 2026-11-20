@@ -147,6 +147,7 @@ test_ordered_index_rejects_a_key_that_cannot_fit :: proc(t: ^testing.T) {
 	defer db.ordered_close(op)
 	huge := strings.repeat("x", db.INDEX_PAGE_MAX_KEY + 1, context.temp_allocator)
 	put_err := db.ordered_put(op, huge, 1)
+	defer db.error_free(&put_err)
 	testing.expect_value(t, put_err.kind, db.Error_Kind.Quota_Exceeded)
 	testing.expect_value(t, db.ordered_entries(op), u64(0))
 }

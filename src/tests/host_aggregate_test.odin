@@ -98,7 +98,7 @@ test_host_aggregates_and_arities :: proc(t: ^testing.T) {
 
 	// A builtin aggregate keeps its name, and unregistering the aggregate makes
 	// the name unknown again.
-	testing.expect(t, !db.error_ok(db.store_register_aggregate(store, "count", 1, squares_step, squares_final)))
+	testing.expect(t, !db.error_drop(db.store_register_aggregate(store, "count", 1, squares_step, squares_final)))
 	testing.expect(t, db.store_unregister_function(store, "sum_squares"))
 	gone := run_error(t, store, "SELECT sum_squares(v) FROM t")
 	testing.expect_value(t, gone.kind, db.Error_Kind.Sql_Unsupported)
