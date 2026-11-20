@@ -1190,7 +1190,7 @@ sql_exec_explain :: proc(tx: ^Tx, stmt: Explain_Stmt, params: []Value) -> (Sql_R
 			names := make([dynamic]string, 0, len(order.steps))
 			defer delete(names)
 			for step in order.steps do append(&names, step.name)
-			append(&lines, fmt.aprintf("join order: %s", strings.join(names[:], ", ")))
+			append(&lines, fmt.aprintf("join order: %s", strings.join(names[:], ", ", context.temp_allocator)))
 		}
 		if inner.where_clause != nil do append(&lines, result_own("filter"))
 		if len(inner.group_by) > 0 do append(&lines, result_own("group by"))

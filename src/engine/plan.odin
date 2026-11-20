@@ -338,7 +338,7 @@ plan_join_order :: proc(
 		if !ok {
 			identity = true
 		} else {
-			defer delete(dependencies)
+			defer plan_dependencies_free(dependencies)
 			return plan_ordered_join(tx, stmt, relations[:], dependencies, tx.alloc)
 		}
 	}
@@ -397,8 +397,11 @@ plan_ordered_join :: proc(
 	// `for value, index in slice` is value-first in Odin: the loop names the
 	// relation and where it runs.
 	position_of := make([]int, len(relations))
+	defer delete(position_of)
 	for index, position in best_order do position_of[index] = position
+	// The conditions themselves live in `alloc`; the steps keep them.
 	predicates := make([]^Expr, len(relations))
+	defer delete(predicates)
 	for i in 1 ..< len(relations) {
 		if relations[i].on == nil do continue
 		// The condition needs this relation's row too, so it completes at the
@@ -409,7 +412,9 @@ plan_ordered_join :: proc(
 		}
 		predicates[latest] = plan_and(predicates[latest], relations[i].on, alloc)
 	}
-	steps := make([]Plan_Step, len(best_order))
+	// The steps go back to the caller, in the statement's allocator, as the
+	// unordered plan's do.
+	steps := make([]Plan_Step, len(best_order), alloc)
 	partials: f64 = 1
 	bound_names := make(map[string]bool)
 	defer delete(bound_names)
@@ -787,7 +792,7 @@ plan_join_dependencies :: proc(
 		if relations[i].on == nil do continue
 		qualifiers: map[string]bool
 		if !plan_expr_qualifiers(relations[i].on, &qualifiers) {
-			give_up_dependencies(dependencies)
+			plan_dependencies_free(dependencies)
 			return nil, false
 		}
 		list := make([dynamic]int, 0, len(qualifiers))
@@ -802,7 +807,7 @@ plan_join_dependencies :: proc(
 			if matched < 0 {
 				delete(qualifiers)
 				delete(list)
-				give_up_dependencies(dependencies)
+				plan_dependencies_free(dependencies)
 				return nil, false
 			}
 			if matched != i do append(&list, matched)
@@ -813,8 +818,10 @@ plan_join_dependencies :: proc(
 	return dependencies, true
 }
 
+// plan_dependencies_free frees what plan_join_dependencies made: each
+// relation's list and the array that holds them.
 @(private)
-give_up_dependencies :: proc(dependencies: [][]int) {
+plan_dependencies_free :: proc(dependencies: [][]int) {
 	for filled in dependencies do delete(filled)
 	delete(dependencies)
 }

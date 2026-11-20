@@ -470,3 +470,20 @@ test_catalog_reads_leave_nothing :: proc(t: ^testing.T) {
 		"PRAGMA stats",
 	})
 }
+
+@(test)
+test_joins_leave_nothing :: proc(t: ^testing.T) {
+	// Ordering a join kept each relation's dependency list, the positions and
+	// the per-step conditions, and put the steps in the heap instead of the
+	// statement's arena.
+	expect_nothing_left(t, .Memory, "_test_memory_join", {
+		"CREATE TABLE a (id INTEGER PRIMARY KEY, x INT)",
+		"CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INT, x INT)",
+		"CREATE TABLE c (id INTEGER PRIMARY KEY, b_id INT)",
+		"INSERT INTO a VALUES (1, 1), (2, 2)",
+		"INSERT INTO b VALUES (1, 1, 1), (2, 2, 2)",
+		"SELECT a.x, b.x FROM a JOIN b ON b.a_id = a.id",
+		"SELECT * FROM a JOIN b USING (x)",
+		"EXPLAIN SELECT * FROM a, b, c WHERE b.a_id = a.id AND c.b_id = b.id AND a.x = 1",
+	})
+}
