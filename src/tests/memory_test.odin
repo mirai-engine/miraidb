@@ -871,3 +871,20 @@ test_tokens_leave_nothing :: proc(t: ^testing.T) {
 		testing.expectf(t, false, "bad free of %p at %v", entry.memory, entry.location)
 	}
 }
+
+@(test)
+test_plans_and_aggregates_leave_nothing :: proc(t: ^testing.T) {
+	// EXPLAIN QUERY PLAN rewrote each line and kept the original; a builtin
+	// aggregate's text (group_concat, json_group_array) stayed in the heap; an
+	// R-tree's column list was joined twice.
+	expect_nothing_left(t, .Memory, "_test_memory_plans_aggregates", {
+		"CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept INT)",
+		"CREATE INDEX by_dept ON emp (dept)",
+		"INSERT INTO emp VALUES (1, 'a', 1), (2, 'b', 1), (3, 'c', 2)",
+		"EXPLAIN QUERY PLAN SELECT * FROM emp WHERE dept = 1 ORDER BY name",
+		"SELECT group_concat(name, ','), json_group_array(id), json_group_object(name, dept) FROM emp",
+		"SELECT dept, group_concat(name) FROM emp GROUP BY dept ORDER BY dept",
+		"CREATE VIRTUAL TABLE places USING rtree(id, minx, maxx, miny, maxy)",
+		"INSERT INTO places VALUES (1, 0, 10, 0, 10)",
+	})
+}

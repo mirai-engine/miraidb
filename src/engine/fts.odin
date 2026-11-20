@@ -1121,7 +1121,7 @@ rtree_create :: proc(tx: ^Tx, name: string, module: string, columns: []string) -
 	values := []Value {
 		value_string(strings.clone(name, tx.alloc)),
 		value_string(strings.clone(module, tx.alloc)),
-		value_string(strings.clone(strings.join(columns, ","), tx.alloc)),
+		value_string(strings.join(columns, ",", tx.alloc)),
 	}
 	if _, insert_err := tx_insert(tx, VIRTUAL_TABLE, values); insert_err.kind != .None do return insert_err
 	return ERROR_NONE

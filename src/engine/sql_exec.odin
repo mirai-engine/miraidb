@@ -1293,6 +1293,8 @@ sql_exec_explain :: proc(tx: ^Tx, stmt: Explain_Stmt, params: []Value) -> (Sql_R
 			row[2] = value_int(0)
 			row[3] = value_string(explain_query_plan_detail(line))
 			plan.rows[i] = row
+			// The detail is a copy in SQLite's words; this engine's line goes.
+			delete(line)
 		}
 		return plan, ERROR_NONE
 	}
@@ -6594,7 +6596,22 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		return eval_grouping(ctx, call)
 	}
 	if is_aggregate_name(call.name) {
-		return eval_aggregate(ctx, call)
+		// A builtin aggregate's answer lives in its statement, as a scalar
+		// function's does: the caller copies what it keeps, and the text of a
+		// group_concat or a json_group_array no longer stays in the heap. A
+		// program's aggregate keeps the caller's allocator, as its functions do.
+		if ctx.tx == nil || !builtin_aggregate_name(strings.to_lower(call.name, context.temp_allocator)) {
+			return eval_aggregate(ctx, call)
+		}
+		outer := context.allocator
+		value: Value
+		err: Error
+		{
+			context.allocator = ctx.tx.alloc
+			value, err = eval_aggregate(ctx, call)
+		}
+		if len(err.message) > 0 do err.message = strings.clone(err.message, outer)
+		return value, err
 	}
 	args := make([dynamic]Value, 0, len(call.args))
 	defer delete(args)
