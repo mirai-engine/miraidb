@@ -786,3 +786,47 @@ test_http_requests_leave_nothing :: proc(t: ^testing.T) {
 		testing.expectf(t, false, "bad free of %p at %v", entry.memory, entry.location)
 	}
 }
+
+@(test)
+test_pgwire_sessions_leave_nothing :: proc(t: ^testing.T) {
+	// Every message the PostgreSQL face built (a row, a row description, a
+	// command tag, an error, ready-for-query) kept the body it copied.
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	{
+		context.allocator = mem.tracking_allocator(&track)
+		store, open_err := db.store_open("", {persistent = false})
+		if !testing.expect(t, db.error_ok(open_err)) do return
+		host := db.host_init(store)
+		session := db.pg_session_init()
+		for sql in ([]string{
+			"CREATE TABLE k (id INTEGER PRIMARY KEY, v TEXT)",
+			"INSERT INTO k VALUES (1, 'a'), (2, 'b')",
+			"SELECT id, v FROM k ORDER BY id",
+			"BEGIN; UPDATE k SET v = 'z' WHERE id = 1",
+			"SELECT nope FROM k",
+			"COMMIT",
+			"LISTEN ch; NOTIFY ch, 'hi'",
+		}) {
+			body := make([dynamic]u8)
+			append(&body, ..transmute([]u8)sql)
+			append(&body, 0)
+			message := pg_build_frontend('Q', body[:])
+			delete(body)
+			response, _ := db.pg_handle_session_message(host, session, message)
+			delete(message)
+			delete(response)
+		}
+		db.pg_session_destroy(session)
+		db.host_destroy(host)
+		db.store_close(store)
+		free_all(context.temp_allocator)
+	}
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "%d bytes left from %v", entry.size, entry.location)
+	}
+	for entry in track.bad_free_array {
+		testing.expectf(t, false, "bad free of %p at %v", entry.memory, entry.location)
+	}
+}

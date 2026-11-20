@@ -40,6 +40,14 @@ pg_put_cstring :: proc(b: ^[dynamic]u8, text: string) {
 	append(b, 0)
 }
 
+// pg_append adds a message to a response and frees it: every message is built
+// for one response, and appending a copy kept the message.
+@(private)
+pg_append :: proc(out: ^[dynamic]u8, message: []u8) {
+	append(out, ..message)
+	delete(message)
+}
+
 // pg_message wraps a body with its type byte and big-endian length.
 @(private)
 pg_message :: proc(kind: u8, body: []u8) -> []u8 {
@@ -111,12 +119,14 @@ pg_read_cstring :: proc(data: []u8) -> (text: string, consumed: int) {
 
 pg_authentication_ok :: proc() -> []u8 {
 	body: [dynamic]u8
+	defer delete(body)
 	pg_put_i32(&body, 0)
 	return pg_message('R', body[:])
 }
 
 pg_parameter_status :: proc(name, value: string) -> []u8 {
 	body: [dynamic]u8
+	defer delete(body)
 	pg_put_cstring(&body, name)
 	pg_put_cstring(&body, value)
 	return pg_message('S', body[:])
@@ -127,6 +137,7 @@ pg_parameter_status :: proc(name, value: string) -> []u8 {
 // protocol allows a server to say.
 pg_notification_response :: proc(channel, payload: string) -> []u8 {
 	body: [dynamic]u8
+	defer delete(body)
 	pg_put_i32(&body, 0)
 	pg_put_cstring(&body, channel)
 	pg_put_cstring(&body, payload)
@@ -135,6 +146,7 @@ pg_notification_response :: proc(channel, payload: string) -> []u8 {
 
 pg_ready_for_query :: proc(status: u8) -> []u8 {
 	body: [dynamic]u8
+	defer delete(body)
 	append(&body, status)
 	return pg_message('Z', body[:])
 }
@@ -159,12 +171,14 @@ PG_STARTUP_PARAMETERS :: [][2]string {
 
 pg_command_complete :: proc(tag: string) -> []u8 {
 	body: [dynamic]u8
+	defer delete(body)
 	pg_put_cstring(&body, tag)
 	return pg_message('C', body[:])
 }
 
 pg_error_response :: proc(message: string, code := "XX000") -> []u8 {
 	body: [dynamic]u8
+	defer delete(body)
 	append(&body, 'S')
 	pg_put_cstring(&body, "ERROR")
 	// V is the severity that is never translated; C is the SQLSTATE a driver
@@ -237,6 +251,7 @@ pg_sqlstate :: proc(kind: Error_Kind) -> string {
 
 pg_row_description :: proc(columns: []string) -> []u8 {
 	body: [dynamic]u8
+	defer delete(body)
 	pg_put_i16(&body, i16(len(columns)))
 	for column in columns {
 		pg_put_cstring(&body, column)
@@ -296,6 +311,7 @@ pg_text_value :: proc(value: Value, alloc: mem.Allocator) -> string {
 
 pg_data_row :: proc(row: []Value, alloc: mem.Allocator) -> []u8 {
 	body: [dynamic]u8
+	defer delete(body)
 	pg_put_i16(&body, i16(len(row)))
 	for value in row {
 		if value.kind == .Null {
@@ -326,7 +342,7 @@ pg_handle_message :: proc(host: ^Host, data: []u8) -> (response: []u8, close: bo
 		sql, _ := pg_read_cstring(data[5:1 + length])
 		return pg_simple_query(host, sql), false
 	case:
-		return pg_error_response(fmt.aprintf("unsupported message %c", data[0])), true
+		return pg_error_response(fmt.tprintf("unsupported message %c", data[0])), true
 	}
 }
 
@@ -336,21 +352,22 @@ pg_simple_query :: proc(host: ^Host, sql: string) -> []u8 {
 	out := make([dynamic]u8, 0, 256)
 	result, exec_err := sql_execute(host.store, sql)
 	if exec_err.kind != .None {
-		append(&out, ..pg_error_from(exec_err))
-		append(&out, ..pg_ready_for_query('I'))
+		pg_append(&out, pg_error_from(exec_err))
+		error_free(&exec_err)
+		pg_append(&out, pg_ready_for_query('I'))
 		return out[:]
 	}
 	defer sql_result_destroy(&result)
 	if len(result.columns) > 0 {
-		append(&out, ..pg_row_description(result.columns))
+		pg_append(&out, pg_row_description(result.columns))
 		for row in result.rows {
-			append(&out, ..pg_data_row(row, context.temp_allocator))
+			pg_append(&out, pg_data_row(row, context.temp_allocator))
 		}
-		append(&out, ..pg_command_complete(fmt.aprintf("SELECT %d", len(result.rows))))
+		pg_append(&out, pg_command_complete(fmt.tprintf("SELECT %d", len(result.rows))))
 	} else {
-		append(&out, ..pg_command_complete("OK"))
+		pg_append(&out, pg_command_complete("OK"))
 	}
-	append(&out, ..pg_ready_for_query('I'))
+	pg_append(&out, pg_ready_for_query('I'))
 	return out[:]
 }
 
@@ -447,8 +464,8 @@ pg_copy_message :: proc(host: ^Host, session: ^Pg_Session, data: []u8) -> []u8 {
 		session.copy = nil
 		if session.tx != nil do session.failed = true
 		out := make([dynamic]u8, 0, 128)
-		append(&out, ..pg_error_response(fmt.tprintf("COPY from stdin failed: %s", reason), "57014"))
-		append(&out, ..pg_ready_for_query(pg_session_status(session)))
+		pg_append(&out, pg_error_response(fmt.tprintf("COPY from stdin failed: %s", reason), "57014"))
+		pg_append(&out, pg_ready_for_query(pg_session_status(session)))
 		return out[:]
 	case 'c':
 		out := make([dynamic]u8, 0, 128)
@@ -459,21 +476,21 @@ pg_copy_message :: proc(host: ^Host, session: ^Pg_Session, data: []u8) -> []u8 {
 		if insert_err.kind != .None {
 			if session.tx != nil do session.failed = true
 			if own do tx_rollback(tx)
-			append(&out, ..pg_error_from(insert_err))
+			pg_append(&out, pg_error_from(insert_err))
 			error_free(&insert_err)
-			append(&out, ..pg_ready_for_query(pg_session_status(session)))
+			pg_append(&out, pg_ready_for_query(pg_session_status(session)))
 			return out[:]
 		}
 		if own {
 			if commit_err := tx_commit(tx); commit_err.kind != .None {
-				append(&out, ..pg_error_from(commit_err))
+				pg_append(&out, pg_error_from(commit_err))
 				error_free(&commit_err)
-				append(&out, ..pg_ready_for_query(pg_session_status(session)))
+				pg_append(&out, pg_ready_for_query(pg_session_status(session)))
 				return out[:]
 			}
 		}
-		append(&out, ..pg_command_complete(fmt.tprintf("COPY %d", count)))
-		append(&out, ..pg_ready_for_query(pg_session_status(session)))
+		pg_append(&out, pg_command_complete(fmt.tprintf("COPY %d", count)))
+		pg_append(&out, pg_ready_for_query(pg_session_status(session)))
 		return out[:]
 	}
 	return pg_error_response("unexpected message during COPY FROM STDIN")
@@ -520,13 +537,13 @@ pg_copy_start :: proc(host: ^Host, session: ^Pg_Session, out: ^[dynamic]u8, sql:
 	if stmt.from {
 		if session.tx != nil && session.failed {
 			query_destroy(&query)
-			append(out, ..pg_error_response(PG_ABORTED, "25P02"))
+			pg_append(out, pg_error_response(PG_ABORTED, "25P02"))
 			return true
 		}
 		tx, own := pg_copy_tx(host, session)
 		columns := copy_column_count(tx, stmt)
 		if own do tx_end(tx)
-		append(out, ..pg_copy_response('G', columns))
+		pg_append(out, pg_copy_response('G', columns))
 		session.copy = new(Pg_Copy)
 		session.copy.query = query
 		session.copy.stmt = stmt
@@ -539,14 +556,14 @@ pg_copy_start :: proc(host: ^Host, session: ^Pg_Session, out: ^[dynamic]u8, sql:
 	if own do tx_end(tx)
 	query_destroy(&query)
 	if copy_err.kind != .None {
-		append(out, ..pg_error_from(copy_err))
+		pg_append(out, pg_error_from(copy_err))
 		error_free(&copy_err)
 		return true
 	}
-	append(out, ..pg_copy_response('H', columns))
-	append(out, ..pg_message('d', transmute([]u8)text))
-	append(out, ..pg_message('c', nil))
-	append(out, ..pg_command_complete(fmt.tprintf("COPY %d", count)))
+	pg_append(out, pg_copy_response('H', columns))
+	pg_append(out, pg_message('d', transmute([]u8)text))
+	pg_append(out, pg_message('c', nil))
+	pg_append(out, pg_command_complete(fmt.tprintf("COPY %d", count)))
 	return true
 }
 
@@ -764,6 +781,7 @@ pg_type_oid :: proc(v: Value) -> u32 {
 
 pg_parameter_description :: proc(types: []u32) -> []u8 {
 	body: [dynamic]u8
+	defer delete(body)
 	pg_put_i16(&body, i16(len(types)))
 	for oid in types do pg_put_i32(&body, i32(oid))
 	return pg_message('t', body[:])
@@ -866,6 +884,7 @@ pg_column_oids :: proc(columns: []string, rows: [][]Value) -> []u32 {
 
 pg_row_description_typed :: proc(columns: []string, oids: []u32) -> []u8 {
 	body: [dynamic]u8
+	defer delete(body)
 	pg_put_i16(&body, i16(len(columns)))
 	for column, i in columns {
 		oid := i < len(oids) ? oids[i] : u32(25)
@@ -901,6 +920,7 @@ pg_oid_width :: proc(oid: u32) -> i32 {
 // binary encoder falls back to text.
 pg_data_row_binary :: proc(row: []Value, oids: []u32, formats: []i16) -> []u8 {
 	body: [dynamic]u8
+	defer delete(body)
 	pg_put_i16(&body, i16(len(row)))
 	for value, i in row {
 		if value.kind == .Null {
@@ -1000,7 +1020,7 @@ pg_handle_session_message :: proc(
 			sql         = strings.clone(sql),
 			param_types = param_types,
 		}
-		append(&out, ..pg_parse_complete())
+		pg_append(&out, pg_parse_complete())
 	case 'B':
 		portal_name, consumed := pg_read_cstring(body)
 		if consumed == 0 do return pg_error_response("bad Bind"), true
@@ -1009,7 +1029,7 @@ pg_handle_session_message :: proc(
 		if statement_consumed == 0 do return pg_error_response("bad Bind"), true
 		statement, found := session.statements[statement_name]
 		if !found {
-			append(&out, ..pg_error_response(fmt.aprintf("unknown statement %s", statement_name)))
+			pg_append(&out, pg_error_response(fmt.tprintf("unknown statement %s", statement_name)))
 			return out[:], false
 		}
 		cursor := rest[statement_consumed:]
@@ -1036,7 +1056,7 @@ pg_handle_session_message :: proc(
 			decoded, decode_ok := pg_decode_param(cursor[:param_length], binary, var_oid)
 			if !decode_ok {
 				delete(params)
-				return pg_error_response(fmt.aprintf("cannot decode parameter %d (oid %d)", param_index + 1, var_oid)), true
+				return pg_error_response(fmt.tprintf("cannot decode parameter %d (oid %d)", param_index + 1, var_oid)), true
 			}
 			append(&params, decoded)
 			cursor = cursor[param_length:]
@@ -1061,7 +1081,7 @@ pg_handle_session_message :: proc(
 			params  = bound,
 			formats = formats,
 		}
-		append(&out, ..pg_bind_complete())
+		pg_append(&out, pg_bind_complete())
 	case 'D':
 		if len(body) < 2 do return pg_error_response("bad Describe"), true
 		target := body[0]
@@ -1070,11 +1090,11 @@ pg_handle_session_message :: proc(
 		if target == 'S' {
 			statement, known := session.statements[name]
 			if !known {
-				append(&out, ..pg_error_response(fmt.tprintf("unknown statement %s", name)))
+				pg_append(&out, pg_error_response(fmt.tprintf("unknown statement %s", name)))
 				return out[:], false
 			}
-			append(&out, ..pg_parameter_description(pg_statement_param_types(statement)))
-			append(&out, ..pg_describe_select(host, statement.sql))
+			pg_append(&out, pg_parameter_description(pg_statement_param_types(statement)))
+			pg_append(&out, pg_describe_select(host, statement.sql))
 		} else if portal, known := session.portals[name]; known {
 			// A portal has its values, so it can answer exactly: run it now and
 			// keep what Execute will send.
@@ -1093,17 +1113,17 @@ pg_handle_session_message :: proc(
 					session.portals[name] = portal
 				}
 			} else {
-				append(&out, ..pg_no_data())
+				pg_append(&out, pg_no_data())
 			}
 		} else {
-			append(&out, ..pg_error_response(fmt.tprintf("unknown portal %s", name)))
+			pg_append(&out, pg_error_response(fmt.tprintf("unknown portal %s", name)))
 		}
 	case 'E':
 		portal_name, consumed := pg_read_cstring(body)
 		if consumed == 0 do return pg_error_response("bad Execute"), true
 		portal, found := session.portals[portal_name]
 		if !found {
-			append(&out, ..pg_error_response(fmt.aprintf("unknown portal %s", portal_name)))
+			pg_append(&out, pg_error_response(fmt.tprintf("unknown portal %s", portal_name)))
 			return out[:], false
 		}
 		// No ReadyForQuery here: Sync owns it, and a client that pipelines
@@ -1124,7 +1144,7 @@ pg_handle_session_message :: proc(
 		}
 	case 'S':
 		session.skip = false
-		append(&out, ..pg_ready_for_query(pg_session_status(session)))
+		pg_append(&out, pg_ready_for_query(pg_session_status(session)))
 	case 'H':
 		// Flush: the response is already buffered here.
 	case 'C':
@@ -1149,7 +1169,7 @@ pg_handle_session_message :: proc(
 				delete(stored_key)
 			}
 		}
-		append(&out, ..pg_close_complete())
+		pg_append(&out, pg_close_complete())
 	}
 	return out[:], false
 }
@@ -1163,33 +1183,34 @@ pg_portal_run :: proc(host: ^Host, session: ^Pg_Session, portal: Pg_Portal) -> (
 	describe := make([dynamic]u8, 0, 64)
 	out := make([dynamic]u8, 0, 128)
 	if handled := pg_transaction_control(host, session, portal.sql, &out); handled {
-		append(&describe, ..pg_no_data())
+		pg_append(&describe, pg_no_data())
 		return describe[:], out[:]
 	}
 	if session != nil && session.failed {
-		append(&describe, ..pg_no_data())
-		append(&out, ..pg_error_response(PG_ABORTED, "25P02"))
+		pg_append(&describe, pg_no_data())
+		pg_append(&out, pg_error_response(PG_ABORTED, "25P02"))
 		return describe[:], out[:]
 	}
 	result, exec_err := pg_run(host, session, portal.sql, portal.params)
 	if exec_err.kind != .None {
 		if session != nil && session.tx != nil do session.failed = true
-		append(&describe, ..pg_no_data())
-		append(&out, ..pg_error_from(exec_err))
+		pg_append(&describe, pg_no_data())
+		pg_append(&out, pg_error_from(exec_err))
+		error_free(&exec_err)
 		return describe[:], out[:]
 	}
 	defer sql_result_destroy(&result)
 	if len(result.columns) > 0 {
 		oids := pg_column_oids(result.columns, result.rows)
 		defer delete(oids)
-		append(&describe, ..pg_row_description_formats(result.columns, oids, portal.formats))
+		pg_append(&describe, pg_row_description_formats(result.columns, oids, portal.formats))
 		for row in result.rows {
-			append(&out, ..pg_data_row_binary(row, oids, portal.formats))
+			pg_append(&out, pg_data_row_binary(row, oids, portal.formats))
 		}
 	} else {
-		append(&describe, ..pg_no_data())
+		pg_append(&describe, pg_no_data())
 	}
-	append(&out, ..pg_command_complete(pg_command_tag(portal.sql, &result)))
+	pg_append(&out, pg_command_complete(pg_command_tag(portal.sql, &result)))
 	return describe[:], out[:]
 }
 
@@ -1229,6 +1250,7 @@ pg_statement_param_types :: proc(statement: Pg_Statement) -> []u32 {
 @(private)
 pg_row_description_formats :: proc(columns: []string, oids: []u32, formats: []i16) -> []u8 {
 	body: [dynamic]u8
+	defer delete(body)
 	pg_put_i16(&body, i16(len(columns)))
 	for column, i in columns {
 		oid := i < len(oids) ? oids[i] : u32(25)
@@ -1275,14 +1297,14 @@ pg_session_simple_query :: proc(host: ^Host, session: ^Pg_Session, sql: string) 
 	defer delete(statements)
 	if len(statements) == 0 {
 		// An empty query has its own answer.
-		append(&out, ..pg_message('I', nil))
+		pg_append(&out, pg_message('I', nil))
 	}
 	for statement in statements {
 		if handled := pg_transaction_control(host, session, statement, &out); handled {
 			continue
 		}
 		if session.failed {
-			append(&out, ..pg_error_response(PG_ABORTED, "25P02"))
+			pg_append(&out, pg_error_response(PG_ABORTED, "25P02"))
 			break
 		}
 		if pg_copy_start(host, session, &out, statement) {
@@ -1294,23 +1316,24 @@ pg_session_simple_query :: proc(host: ^Host, session: ^Pg_Session, sql: string) 
 		result, exec_err := pg_run(host, session, statement, nil)
 		if exec_err.kind != .None {
 			if session.tx != nil do session.failed = true
-			append(&out, ..pg_error_from(exec_err))
+			pg_append(&out, pg_error_from(exec_err))
+			error_free(&exec_err)
 			break
 		}
 		if len(result.columns) > 0 {
 			// Text values, typed columns: a driver parses `3` as an integer only
 			// when the description says int8.
 			oids := pg_column_oids(result.columns, result.rows)
-			append(&out, ..pg_row_description_typed(result.columns, oids))
+			pg_append(&out, pg_row_description_typed(result.columns, oids))
 			delete(oids)
 			for row in result.rows {
-				append(&out, ..pg_data_row(row, context.temp_allocator))
+				pg_append(&out, pg_data_row(row, context.temp_allocator))
 			}
 		}
-		append(&out, ..pg_command_complete(pg_command_tag(statement, &result)))
+		pg_append(&out, pg_command_complete(pg_command_tag(statement, &result)))
 		sql_result_destroy(&result)
 	}
-	if session.copy == nil do append(&out, ..pg_ready_for_query(pg_session_status(session)))
+	if session.copy == nil do pg_append(&out, pg_ready_for_query(pg_session_status(session)))
 	return out[:]
 }
 
@@ -1333,11 +1356,11 @@ pg_transaction_control :: proc(host: ^Host, session: ^Pg_Session, sql: string, o
 			session.failed = false
 		}
 		// PostgreSQL warns about a nested BEGIN and keeps the open transaction.
-		append(out, ..pg_command_complete("BEGIN"))
+		pg_append(out, pg_command_complete("BEGIN"))
 		return true
 	case "COMMIT", "END":
 		if session.tx == nil {
-			append(out, ..pg_command_complete("COMMIT"))
+			pg_append(out, pg_command_complete("COMMIT"))
 			return true
 		}
 		tx := session.tx
@@ -1346,14 +1369,15 @@ pg_transaction_control :: proc(host: ^Host, session: ^Pg_Session, sql: string, o
 			// COMMIT of an aborted transaction rolls it back and says so.
 			session.failed = false
 			tx_rollback(tx)
-			append(out, ..pg_command_complete("ROLLBACK"))
+			pg_append(out, pg_command_complete("ROLLBACK"))
 			return true
 		}
 		if err := tx_commit(tx); err.kind != .None {
-			append(out, ..pg_error_from(err))
+			pg_append(out, pg_error_from(err))
+			error_free(&err)
 			return true
 		}
-		append(out, ..pg_command_complete("COMMIT"))
+		pg_append(out, pg_command_complete("COMMIT"))
 		return true
 	case "DEALLOCATE", "DISCARD":
 		// Prepared statements are session state, so these never reach the
@@ -1369,7 +1393,7 @@ pg_transaction_control :: proc(host: ^Host, session: ^Pg_Session, sql: string, o
 				delete(key)
 			}
 			clear(&session.statements)
-			append(out, ..pg_command_complete(first == "DISCARD" ? "DISCARD ALL" : "DEALLOCATE ALL"))
+			pg_append(out, pg_command_complete(first == "DISCARD" ? "DISCARD ALL" : "DEALLOCATE ALL"))
 			return true
 		}
 		name := strings.trim_right(words[len(words) - 1], ";")
@@ -1379,7 +1403,7 @@ pg_transaction_control :: proc(host: ^Host, session: ^Pg_Session, sql: string, o
 			stored_key, _ := delete_key(&session.statements, name)
 			delete(stored_key)
 		}
-		append(out, ..pg_command_complete("DEALLOCATE"))
+		pg_append(out, pg_command_complete("DEALLOCATE"))
 		return true
 	case "ROLLBACK", "ABORT":
 		if second == "TO" do return false
@@ -1388,7 +1412,7 @@ pg_transaction_control :: proc(host: ^Host, session: ^Pg_Session, sql: string, o
 			session.tx = nil
 		}
 		session.failed = false
-		append(out, ..pg_command_complete("ROLLBACK"))
+		pg_append(out, pg_command_complete("ROLLBACK"))
 		return true
 	}
 	return false
