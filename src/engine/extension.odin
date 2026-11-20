@@ -23,7 +23,8 @@ EXTENSION_SCHEMA_SQL :: `
 `
 
 extension_ensure :: proc(tx: ^Tx) -> Error {
-	_, err := sql_execute_in_tx(tx, EXTENSION_SCHEMA_SQL)
+	discarded_6, err := sql_execute_in_tx(tx, EXTENSION_SCHEMA_SQL)
+	sql_result_destroy(&discarded_6)
 	return err
 }
 

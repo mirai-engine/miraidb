@@ -170,10 +170,11 @@ tx_attached_rollback :: proc(tx: ^Tx) {
 // attach_ensure creates the catalog on first use.
 attach_ensure :: proc(tx: ^Tx) -> Error {
 	if tx_table_probe(tx, ATTACH_TABLE) != nil do return ERROR_NONE
-	_, create_err := sql_execute_in_tx(
+	discarded_1, create_err := sql_execute_in_tx(
 		tx,
 		"CREATE TABLE _attach (name TEXT PRIMARY KEY NOT NULL, path TEXT NOT NULL)",
 	)
+	sql_result_destroy(&discarded_1)
 	return create_err
 }
 
@@ -502,11 +503,12 @@ sql_exec_detach :: proc(store: ^Store, stmt: Detach_Stmt) -> (Sql_Result, Error)
 	}
 	tx := tx_begin_write(store)
 	if attach_recorded(tx, stmt.name) {
-		_, delete_err := sql_execute_in_tx_params(
+		discarded_2, delete_err := sql_execute_in_tx_params(
 			tx,
 			"DELETE FROM _attach WHERE name = ?",
 			[]Value{value_string(stmt.name)},
 		)
+		sql_result_destroy(&discarded_2)
 		if delete_err.kind != .None {
 			tx_rollback(tx)
 			return {}, delete_err

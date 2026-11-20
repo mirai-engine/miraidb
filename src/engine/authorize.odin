@@ -841,7 +841,8 @@ auth_replay_statement :: proc(tx: ^Tx, name: string, text: string) -> Error {
 	if parse_err.kind != .None do return parse_err
 	defer stmt_prepared_destroy(prepared)
 	if prepared.is_pragma {
-		_, err := sql_execute_in_tx(tx, text)
+		discarded_3, err := sql_execute_in_tx(tx, text)
+		sql_result_destroy(&discarded_3)
 		return err
 	}
 	walk := auth_replay_walk(tx, prepared, name)

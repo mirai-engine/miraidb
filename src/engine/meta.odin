@@ -27,11 +27,12 @@ host_ensure_meta :: proc(host: ^Host) -> Error {
 	found := len(existing.rows) > 0
 	sql_result_destroy(&existing)
 	if found do return ERROR_NONE
-	_, insert_err := sql_execute_params(
+	discarded_16, insert_err := sql_execute_params(
 		host.store,
 		"INSERT INTO _meta (key, value) VALUES (?, ?)",
 		[]Value{value_string("schema_version"), value_string("1")},
 	)
+	sql_result_destroy(&discarded_16)
 	return insert_err
 }
 

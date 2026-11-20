@@ -337,19 +337,21 @@ host_catalog_record :: proc(
 	sql_result_destroy(&existing)
 	values := []Value{value_string(kind), value_string(encoded), value_string(name)}
 	if found {
-		_, update_err := sql_execute_params(
+		discarded_7, update_err := sql_execute_params(
 			host.store,
 			"UPDATE _reducer SET kind = ?, params = ? WHERE name = ?",
 			values,
 		)
+		sql_result_destroy(&discarded_7)
 		return update_err
 	}
 	insert := []Value{value_string(name), value_string(kind), value_string(encoded)}
-	_, insert_err := sql_execute_params(
+	discarded_8, insert_err := sql_execute_params(
 		host.store,
 		"INSERT INTO _reducer (name, kind, params) VALUES (?, ?, ?)",
 		insert,
 	)
+	sql_result_destroy(&discarded_8)
 	return insert_err
 }
 
@@ -2149,13 +2151,15 @@ value_row_clone :: proc(row: []Value) -> []Value {
 
 // reducer_sql runs a statement inside the reducer's transaction.
 reducer_sql :: proc(ctx: ^Reducer_Ctx, sql: string) -> Error {
-	_, exec_err := sql_execute_in_tx(ctx.tx, sql)
+	discarded_9, exec_err := sql_execute_in_tx(ctx.tx, sql)
+	sql_result_destroy(&discarded_9)
 	return exec_err
 }
 
 // reducer_sql_params runs a statement with positional bind parameters.
 reducer_sql_params :: proc(ctx: ^Reducer_Ctx, sql: string, params: []Value) -> Error {
-	_, exec_err := sql_execute_in_tx_params(ctx.tx, sql, params)
+	discarded_10, exec_err := sql_execute_in_tx_params(ctx.tx, sql, params)
+	sql_result_destroy(&discarded_10)
 	return exec_err
 }
 
@@ -2196,7 +2200,7 @@ host_ensure_schedule :: proc(host: ^Host) -> Error {
 		exists = false
 	}
 	if exists do return ERROR_NONE
-	_, create_err := sql_execute(host.store, `
+	discarded_11, create_err := sql_execute(host.store, `
 		CREATE TABLE IF NOT EXISTS _schedule (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			reducer TEXT NOT NULL,
@@ -2204,6 +2208,7 @@ host_ensure_schedule :: proc(host: ^Host) -> Error {
 			interval_us INTEGER NOT NULL DEFAULT 0,
 			args BLOB NOT NULL
 		)`)
+	sql_result_destroy(&discarded_11)
 	return create_err
 }
 
@@ -2264,11 +2269,12 @@ host_schedule_at :: proc(
 	insert[1] = value_int(at_us)
 	insert[2] = value_int(interval_us)
 	insert[3] = value_bytes(payload)
-	_, exec_err := sql_execute_params(
+	discarded_12, exec_err := sql_execute_params(
 		host.store,
 		"INSERT INTO _schedule (reducer, at_us, interval_us, args) VALUES (?, ?, ?, ?)",
 		insert,
 	)
+	sql_result_destroy(&discarded_12)
 	if exec_err.kind != .None do return 0, exec_err
 	result, select_err := sql_execute_params(
 		host.store,
@@ -2377,17 +2383,19 @@ next_schedule_time :: proc(at_us, interval_us, now_us: i64) -> i64 {
 
 @(private)
 delete_schedule_row :: proc(tx: ^Tx, id: i64) -> Error {
-	_, err := sql_execute_in_tx_params(tx, "DELETE FROM _schedule WHERE id = ?", []Value{value_int(id)})
+	discarded_13, err := sql_execute_in_tx_params(tx, "DELETE FROM _schedule WHERE id = ?", []Value{value_int(id)})
+	sql_result_destroy(&discarded_13)
 	return err
 }
 
 @(private)
 reschedule_schedule_row :: proc(tx: ^Tx, id, at_us: i64) -> Error {
-	_, err := sql_execute_in_tx_params(
+	discarded_14, err := sql_execute_in_tx_params(
 		tx,
 		"UPDATE _schedule SET at_us = ? WHERE id = ?",
 		[]Value{value_int(at_us), value_int(id)},
 	)
+	sql_result_destroy(&discarded_14)
 	return err
 }
 
@@ -2441,11 +2449,12 @@ REQUEST_TABLE :: "_request"
 
 host_ensure_request_table :: proc(host: ^Host) -> Error {
 	if _, exists := host.store.tables[REQUEST_TABLE]; exists do return ERROR_NONE
-	_, create_err := sql_execute(host.store, `
+	discarded_15, create_err := sql_execute(host.store, `
 		CREATE TABLE IF NOT EXISTS _request (
 			id BLOB PRIMARY KEY,
 			response BLOB NOT NULL
 		)`)
+	sql_result_destroy(&discarded_15)
 	return create_err
 }
 

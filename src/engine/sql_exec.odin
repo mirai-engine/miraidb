@@ -9069,11 +9069,12 @@ sql_exec_create_type :: proc(tx: ^Tx, stmt: Create_Type_Stmt) -> (Sql_Result, Er
 		return {}, errf(.Table_Exists, "type %s already exists", stmt.name)
 	}
 	base_text := column_type_name(stmt.base)
-	_, insert_err := sql_execute_in_tx_params(
+	discarded_20, insert_err := sql_execute_in_tx_params(
 		tx,
 		"INSERT INTO _type (name, base) VALUES (?, ?)",
 		[]Value{value_string(stmt.name), value_string(base_text)},
 	)
+	sql_result_destroy(&discarded_20)
 	if insert_err.kind != .None do return {}, insert_err
 	return Sql_Result{kind = .Ack, commit_seq = tx.store.commit_seq}, ERROR_NONE
 }

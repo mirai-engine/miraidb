@@ -40,11 +40,12 @@ sql_exec_create_view :: proc(tx: ^Tx, stmt: Create_View_Stmt) -> (Sql_Result, Er
 		return Sql_Result{kind = .Ack, commit_seq = tx.store.commit_seq}, ERROR_NONE
 	}
 	insert_params := []Value{value_string(stmt.name), value_string(stmt.sql)}
-	_, insert_err := sql_execute_in_tx_params(
+	discarded_28, insert_err := sql_execute_in_tx_params(
 		tx,
 		"INSERT INTO _view (name, sql) VALUES (?, ?)",
 		insert_params,
 	)
+	sql_result_destroy(&discarded_28)
 	if insert_err.kind != .None do return {}, insert_err
 	return Sql_Result{kind = .Ack, commit_seq = tx.store.commit_seq}, ERROR_NONE
 }

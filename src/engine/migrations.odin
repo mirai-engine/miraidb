@@ -49,11 +49,12 @@ host_migrate :: proc(host: ^Host, migrations: []Migration) -> (applied: int, err
 			}
 		}
 		version_text := fmt.aprintf("%d", migration.version)
-		_, update_err := sql_execute_in_tx_params(
+		discarded_17, update_err := sql_execute_in_tx_params(
 			tx,
 			"UPDATE _meta SET value = ? WHERE key = 'schema_version'",
 			[]Value{value_string(version_text)},
 		)
+		sql_result_destroy(&discarded_17)
 		if update_err.kind != .None {
 			tx_rollback(tx)
 			return applied, update_err

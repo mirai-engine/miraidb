@@ -1301,7 +1301,9 @@ sqlite_import_tx :: proc(
 		if len(index.sql) == 0 do continue
 		if _, create_err := sql_execute_in_tx(tx, index.sql); create_err.kind == .None do continue
 		if plain, ok := sqlite_index_without_where(index.sql, context.temp_allocator); ok {
-			_, _ = sql_execute_in_tx(tx, plain)
+			discarded_21, discarded_21_err := sql_execute_in_tx(tx, plain)
+			sql_result_destroy(&discarded_21)
+			error_free(&discarded_21_err)
 		}
 	}
 	// The views, then the triggers (an INSTEAD OF trigger needs its view), as

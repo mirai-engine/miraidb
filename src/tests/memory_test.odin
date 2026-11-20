@@ -888,3 +888,17 @@ test_plans_and_aggregates_leave_nothing :: proc(t: ^testing.T) {
 		"INSERT INTO places VALUES (1, 0, 10, 0, 10)",
 	})
 }
+
+@(test)
+test_internal_statements_leave_nothing :: proc(t: ^testing.T) {
+	// Every internal statement whose result was dropped kept it: the CREATE
+	// TABLE IF NOT EXISTS of a system table, a role's grant, a view's row.
+	expect_nothing_left(t, .Memory, "_test_memory_internal_statements", {
+		"CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT)",
+		"GRANT insert ON emp TO writer",
+		"GRANT writer TO '*'",
+		"INSERT INTO emp VALUES (4, 'd')",
+		"CREATE VIEW v AS SELECT name FROM emp",
+		"SELECT * FROM v",
+	})
+}

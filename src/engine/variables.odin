@@ -33,18 +33,20 @@ host_set_module_variable :: proc(host: ^Host, key, value: string) -> Error {
 	found := len(existing.rows) > 0
 	sql_result_destroy(&existing)
 	if found {
-		_, update_err := sql_execute_params(
+		discarded_26, update_err := sql_execute_params(
 			host.store,
 			"UPDATE _var SET value = ? WHERE key = ?",
 			[]Value{value_string(value), value_string(key)},
 		)
+		sql_result_destroy(&discarded_26)
 		return update_err
 	}
-	_, insert_err := sql_execute_params(
+	discarded_27, insert_err := sql_execute_params(
 		host.store,
 		"INSERT INTO _var (key, value) VALUES (?, ?)",
 		[]Value{value_string(key), value_string(value)},
 	)
+	sql_result_destroy(&discarded_27)
 	return insert_err
 }
 

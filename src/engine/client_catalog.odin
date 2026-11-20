@@ -32,18 +32,20 @@ host_register_client :: proc(host: ^Host, identity: Identity, name: string) -> E
 	found := len(existing.rows) > 0
 	sql_result_destroy(&existing)
 	if found {
-		_, update_err := sql_execute_params(
+		discarded_4, update_err := sql_execute_params(
 			host.store,
 			"UPDATE _client SET name = ? WHERE identity = ?",
 			[]Value{value_string(name), value_identity(identity)},
 		)
+		sql_result_destroy(&discarded_4)
 		return update_err
 	}
-	_, insert_err := sql_execute_params(
+	discarded_5, insert_err := sql_execute_params(
 		host.store,
 		"INSERT INTO _client (identity, name, created_us) VALUES (?, ?, ?)",
 		[]Value{value_identity(identity), value_string(name), value_int(host_now(host))},
 	)
+	sql_result_destroy(&discarded_5)
 	return insert_err
 }
 

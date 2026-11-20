@@ -46,22 +46,25 @@ trigger_ensure :: proc(tx: ^Tx) -> Error {
 		// A catalog written before WHEN existed gets the column on first use, so
 		// an older database keeps its triggers instead of failing to open them.
 		if _, found := schema_column_index(&table.schema, "when_text"); !found {
-			_, alter_err := sql_execute_in_tx(tx, "ALTER TABLE _triggers ADD COLUMN when_text TEXT DEFAULT ''")
+			discarded_22, alter_err := sql_execute_in_tx(tx, "ALTER TABLE _triggers ADD COLUMN when_text TEXT DEFAULT ''")
+			sql_result_destroy(&discarded_22)
 			if alter_err.kind != .None do return alter_err
 		}
 		// UPDATE OF's columns came later still, and the same way.
 		if table = tx_table_probe(tx, TRIGGER_TABLE); table != nil {
 			if _, found := schema_column_index(&table.schema, "columns"); !found {
-				_, alter_err := sql_execute_in_tx(tx, "ALTER TABLE _triggers ADD COLUMN columns TEXT DEFAULT ''")
+				discarded_23, alter_err := sql_execute_in_tx(tx, "ALTER TABLE _triggers ADD COLUMN columns TEXT DEFAULT ''")
+				sql_result_destroy(&discarded_23)
 				return alter_err
 			}
 		}
 		return ERROR_NONE
 	}
-	_, create_err := sql_execute_in_tx(
+	discarded_24, create_err := sql_execute_in_tx(
 		tx,
 		"CREATE TABLE _triggers (name TEXT PRIMARY KEY NOT NULL, table_name TEXT NOT NULL, event TEXT NOT NULL, timing TEXT NOT NULL, body TEXT NOT NULL, when_text TEXT DEFAULT '', columns TEXT DEFAULT '')",
 	)
+	sql_result_destroy(&discarded_24)
 	return create_err
 }
 
@@ -151,11 +154,12 @@ trigger_drop :: proc(tx: ^Tx, name: string, if_exists: bool) -> Error {
 		if if_exists do return ERROR_NONE
 		return errf(.Table_Not_Found, "trigger %s does not exist", name)
 	}
-	_, delete_err := sql_execute_in_tx_params(
+	discarded_25, delete_err := sql_execute_in_tx_params(
 		tx,
 		"DELETE FROM _triggers WHERE name = ?",
 		[]Value{value_string(name)},
 	)
+	sql_result_destroy(&discarded_25)
 	return delete_err
 }
 

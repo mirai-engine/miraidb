@@ -40,9 +40,11 @@ identity_text :: proc(identity: Identity) -> string {
 
 @(private)
 roles_ensure_tables :: proc(tx: ^Tx) -> Error {
-	_, role_err := sql_execute_in_tx(tx, ROLE_SCHEMA_SQL)
+	discarded_18, role_err := sql_execute_in_tx(tx, ROLE_SCHEMA_SQL)
+	sql_result_destroy(&discarded_18)
 	if role_err.kind != .None do return role_err
-	_, grant_err := sql_execute_in_tx(tx, GRANT_SCHEMA_SQL)
+	discarded_19, grant_err := sql_execute_in_tx(tx, GRANT_SCHEMA_SQL)
+	sql_result_destroy(&discarded_19)
 	return grant_err
 }
 
@@ -72,11 +74,12 @@ sql_exec_grant :: proc(tx: ^Tx, stmt: Grant_Stmt) -> (Sql_Result, Error) {
 		}
 		identity := strings.trim_space(stmt.identity)
 		if stmt.revoke {
-			_, revoke_err := sql_execute_in_tx_params(
+			dropped_1, revoke_err := sql_execute_in_tx_params(
 				tx,
 				"DELETE FROM _role WHERE role = ? AND identity = ?",
 				[]Value{value_string(stmt.role), value_string(identity)},
 			)
+			sql_result_destroy(&dropped_1)
 			if revoke_err.kind != .None do return {}, revoke_err
 		} else {
 			exists, exists_err := roles_row_exists(
@@ -86,11 +89,12 @@ sql_exec_grant :: proc(tx: ^Tx, stmt: Grant_Stmt) -> (Sql_Result, Error) {
 			)
 			if exists_err.kind != .None do return {}, exists_err
 			if !exists {
-				_, insert_err := sql_execute_in_tx_params(
+				dropped_2, insert_err := sql_execute_in_tx_params(
 					tx,
 					"INSERT INTO _role (role, identity) VALUES (?, ?)",
 					[]Value{value_string(stmt.role), value_string(identity)},
 				)
+				sql_result_destroy(&dropped_2)
 				if insert_err.kind != .None do return {}, insert_err
 			}
 		}
@@ -105,11 +109,12 @@ sql_exec_grant :: proc(tx: ^Tx, stmt: Grant_Stmt) -> (Sql_Result, Error) {
 		return {}, errf(.Invalid_Argument, "unknown permission %q", stmt.action)
 	}
 	if stmt.revoke {
-		_, revoke_err := sql_execute_in_tx_params(
+		dropped_3, revoke_err := sql_execute_in_tx_params(
 			tx,
 			"DELETE FROM _grant WHERE role = ? AND table_name = ? AND action = ?",
 			[]Value{value_string(stmt.role), value_string(stmt.table), value_string(action)},
 		)
+		sql_result_destroy(&dropped_3)
 		if revoke_err.kind != .None do return {}, revoke_err
 	} else {
 		exists, exists_err := roles_row_exists(
@@ -119,11 +124,12 @@ sql_exec_grant :: proc(tx: ^Tx, stmt: Grant_Stmt) -> (Sql_Result, Error) {
 		)
 		if exists_err.kind != .None do return {}, exists_err
 		if !exists {
-			_, insert_err := sql_execute_in_tx_params(
+			dropped_4, insert_err := sql_execute_in_tx_params(
 				tx,
 				"INSERT INTO _grant (role, table_name, action) VALUES (?, ?, ?)",
 				[]Value{value_string(stmt.role), value_string(stmt.table), value_string(action)},
 			)
+			sql_result_destroy(&dropped_4)
 			if insert_err.kind != .None do return {}, insert_err
 		}
 	}
