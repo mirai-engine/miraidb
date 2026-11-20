@@ -568,11 +568,11 @@ stats_save :: proc(store: ^Store) -> Error {
 	defer delete(out)
 	file, open_err := log_file_open(store.vfs, path, {.Read, .Write, .Create, .Trunc})
 	if open_err.kind != .None {
-		return errf(.Io, "cannot write %s: %v", path, open_err.message)
+		return error_wrap(open_err, .Io, "cannot write %s: %v", path, open_err.message)
 	}
 	defer log_file_close(file)
 	if _, write_err := log_file_write(file, out); write_err.kind != .None {
-		return errf(.Io, "cannot write %s: %v", path, write_err.message)
+		return error_wrap(write_err, .Io, "cannot write %s: %v", path, write_err.message)
 	}
 	return ERROR_NONE
 }

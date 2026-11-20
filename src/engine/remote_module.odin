@@ -135,7 +135,7 @@ host_call_remote_module :: proc(
 	}
 	result, decode_err := wire_decode_result(response, context.allocator)
 	if decode_err.kind != .None {
-		return {}, errf(.Internal, "module %s sent an invalid reply: %s", module_name, decode_err.message)
+		return {}, error_wrap(decode_err, .Internal, "module %s sent an invalid reply: %s", module_name, decode_err.message)
 	}
 	defer sql_result_destroy(&result)
 	// A reducer reports success through the call itself; its value stays on the

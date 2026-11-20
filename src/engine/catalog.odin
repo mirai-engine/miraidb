@@ -136,17 +136,17 @@ catalog_write :: proc(store: ^Store, seq: u64) -> Error {
 	defer delete(data)
 	file, open_err := log_file_open(store.vfs, path, {.Read, .Write, .Create, .Trunc})
 	if open_err.kind != .None {
-		return errf(.Io, "cannot write %s: %v", path, open_err.message)
+		return error_wrap(open_err, .Io, "cannot write %s: %v", path, open_err.message)
 	}
 	defer log_file_close(file)
 	if _, write_err := log_file_write(file, data); write_err.kind != .None {
-		return errf(.Io, "cannot write %s: %v", path, write_err.message)
+		return error_wrap(write_err, .Io, "cannot write %s: %v", path, write_err.message)
 	}
 	// Durable after the pages, so a catalog that names a sequence never claims a
 	// page file the disk does not have.
 	if store.log.durability != .None {
 		if sync_err := log_file_sync(file); sync_err.kind != .None {
-			return errf(.Io, "cannot sync %s: %v", path, sync_err.message)
+			return error_wrap(sync_err, .Io, "cannot sync %s: %v", path, sync_err.message)
 		}
 	}
 	return ERROR_NONE

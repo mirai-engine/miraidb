@@ -424,6 +424,8 @@ store_open :: proc(path: string, options: Store_Options) -> (^Store, Error) {
 	if checksum == .Default do checksum = .CRC32C
 	log, log_err := log_open(open_path, settings.create, durability, checksum, settings.vfs)
 	if log_err.kind != .None {
+		// What the open got as far as (its path, at least) goes with it.
+		log_close(&log)
 		db_lock_release(&store.lock)
 		free(store)
 		return nil, log_err
@@ -1041,7 +1043,7 @@ replay_visit :: proc(ctx: rawptr, record: Log_Record) -> bool {
 	// A snapshot already covers everything at or below its base sequence.
 	if record.seq <= replay.store.commit_seq do return true
 	if err := store_apply_payload(replay.store, record.payload, record.seq); err.kind != .None {
-		replay.err = errf(.Corrupt_Log, "commit %d cannot be replayed: %s", record.seq, err.message)
+		replay.err = error_wrap(err, .Corrupt_Log, "commit %d cannot be replayed: %s", record.seq, err.message)
 		return false
 	}
 	replay.store.commit_seq = record.seq
@@ -1076,7 +1078,7 @@ store_replay :: proc(store: ^Store) -> Error {
 				return trunc_err
 			}
 			if _, seek_err := log_file_seek_end(store.log.file); seek_err.kind != .None {
-				return errf(.Io, "cannot seek to the end of the log: %v", seek_err.message)
+				return error_wrap(seek_err, .Io, "cannot seek to the end of the log: %v", seek_err.message)
 			}
 		}
 	}
@@ -1628,7 +1630,10 @@ store_compact :: proc(store: ^Store) -> Error {
 	if os.exists(index_path) do os.remove(index_path)
 	delete(index_path)
 	reopened, open_err := log_open(store.path, false, durability, store.log.checksum)
-	if open_err.kind != .None do return open_err
+	if open_err.kind != .None {
+		log_close(&reopened)
+		return open_err
+	}
 	store.log = reopened
 	// The rewritten log starts with the same payload the snapshot file holds, so
 	// the standalone copy is now redundant. Keeping it doubles the size of a
@@ -1670,6 +1675,9 @@ reopen_after_failure :: proc(store: ^Store, durability: Durability) {
 	reopened, open_err := log_open(store.path, false, durability, store.log.checksum)
 	if open_err.kind == .None {
 		store.log = reopened
+	} else {
+		log_close(&reopened)
+		error_free(&open_err)
 	}
 }
 

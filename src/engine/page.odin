@@ -179,7 +179,7 @@ page_file_create :: proc(
 	system := log_vfs_or_os(vfs)
 	file, open_err := system.ops.open(system, path, {.Read, .Write, .Create})
 	if open_err.kind != .None {
-		return nil, errf(.Io, "cannot create the page file %s: %s", path, open_err.message)
+		return nil, error_wrap(open_err, .Io, "cannot create the page file %s: %s", path, open_err.message)
 	}
 	pf := new(Page_File)
 	pf.vfs = system
@@ -230,7 +230,7 @@ page_file_open :: proc(vfs: ^Vfs, path: string, frames: int) -> (^Page_File, Err
 	system := log_vfs_or_os(vfs)
 	file, open_err := system.ops.open(system, path, {.Read, .Write})
 	if open_err.kind != .None {
-		return nil, errf(.Io, "cannot open the page file %s: %s", path, open_err.message)
+		return nil, error_wrap(open_err, .Io, "cannot open the page file %s: %s", path, open_err.message)
 	}
 	pf := new(Page_File)
 	pf.vfs = system
@@ -311,7 +311,7 @@ page_write_raw :: proc(pf: ^Page_File, id: Page_Id, data: []u8) -> Error {
 		return errf(.Io, "cannot seek to page %d of %s", id, pf.path)
 	}
 	if write_err := vfs_write_all(pf.file, data); write_err.kind != .None {
-		return errf(.Io, "cannot write page %d of %s: %s", id, pf.path, write_err.message)
+		return error_wrap(write_err, .Io, "cannot write page %d of %s: %s", id, pf.path, write_err.message)
 	}
 	pf.writes += 1
 	return ERROR_NONE

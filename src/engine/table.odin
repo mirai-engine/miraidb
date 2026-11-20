@@ -1729,7 +1729,7 @@ table_add_index :: proc(t: ^Table, index: Index_Schema) -> Error {
 	for _, row in t.rows {
 		if row.deleted_seq != 0 do continue
 		if put_err := table_index_put_row(t, position, row.values, row.id); put_err.kind != .None {
-			return errf(put_err.kind, "cannot grow index %s: %s", index.name, put_err.message)
+			return error_wrap(put_err, put_err.kind, "cannot grow index %s: %s", index.name, put_err.message)
 		}
 	}
 	return ERROR_NONE

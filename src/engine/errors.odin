@@ -67,6 +67,19 @@ errf :: proc(kind: Error_Kind, format: string, args: ..any) -> Error {
 	}
 }
 
+// error_wrap builds an error that tells what `inner` interrupted, and frees
+// `inner`: the message is formatted first, so it may quote inner.message. A
+// wrapped error was a leak at every I/O failure that said what it was doing.
+error_wrap :: proc(inner: Error, kind: Error_Kind, format: string, args: ..any) -> Error {
+	out := Error {
+		kind = kind,
+		message = fmt.aprintf(format, ..args),
+	}
+	inner := inner
+	error_free(&inner)
+	return out
+}
+
 // error_free releases the message an error carries. An error that is returned to a
 // caller is the caller's to free; one that is inspected and dropped here is freed
 // where it is dropped.

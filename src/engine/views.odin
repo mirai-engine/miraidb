@@ -229,7 +229,7 @@ tx_materialize_view :: proc(tx: ^Tx, name, sql: string, args: []Value) -> (^Tabl
 	}
 	query, parse_err := sql_parse(sql)
 	if parse_err.kind != .None {
-		return nil, errf(.Corrupt_Log, "view %s holds invalid SQL: %s", name, parse_err.message)
+		return nil, error_wrap(parse_err, .Corrupt_Log, "view %s holds invalid SQL: %s", name, parse_err.message)
 	}
 	defer query_destroy(&query)
 	select_stmt, is_select := query.statement.(Select_Stmt)

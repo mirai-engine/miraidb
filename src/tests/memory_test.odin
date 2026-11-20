@@ -1,5 +1,6 @@
 package tests
 
+import "core:fmt"
 import "core:mem"
 import "core:os"
 import "core:testing"
@@ -690,4 +691,47 @@ test_grouped_windows_leave_nothing :: proc(t: ^testing.T) {
 		"SELECT k, rank() OVER (ORDER BY count(*) DESC) AS r FROM t GROUP BY k ORDER BY k",
 		"SELECT k, count(*), sum(count(*)) OVER () FROM t GROUP BY GROUPING SETS ((k), ())",
 	})
+}
+
+@(test)
+test_failed_writes_leave_nothing :: proc(t: ^testing.T) {
+	// A write that fails at every point of a short workload, on the log and on
+	// the page files: an error wrapped to say what failed kept the one it
+	// wrapped, probing for a log segment kept the "no such file", and a log
+	// that failed to open kept its path.
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	{
+		context.allocator = mem.tracking_allocator(&track)
+		memory := db.vfs_memory_new()
+		fault := db.vfs_fault_new(memory)
+		for n in 1 ..= 30 {
+			for paged in ([]bool{false, true}) {
+				path := fmt.tprintf("_test_memory_fault_%d_%v", n, paged)
+				db.vfs_fault_arm(fault, .Write, u64(n))
+				store, open_err := db.store_open(path, {persistent = true, create = true, durable = true, vfs = fault, paged_tables = paged, page_frames = 2})
+				if !db.error_ok(open_err) {
+					db.error_free(&open_err)
+					continue
+				}
+				for sql in ([]string{"CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", "INSERT INTO t (v) VALUES ('a'), ('b')", "INSERT INTO t (v) VALUES ('c')"}) {
+					result, err := db.sql_execute(store, sql)
+					db.sql_result_destroy(&result)
+					db.error_free(&err)
+				}
+				db.vfs_fault_arm(fault, .Write, 0)
+				db.store_close(store)
+			}
+		}
+		db.vfs_fault_destroy(fault)
+		db.vfs_memory_destroy(memory)
+		free_all(context.temp_allocator)
+	}
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "%d bytes left from %v", entry.size, entry.location)
+	}
+	for entry in track.bad_free_array {
+		testing.expectf(t, false, "bad free of %p at %v", entry.memory, entry.location)
+	}
 }

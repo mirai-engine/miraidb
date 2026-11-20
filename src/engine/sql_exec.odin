@@ -10348,7 +10348,7 @@ generated_plan_make :: proc(tx: ^Tx, table: ^Table) -> (plan: Generated_Plan, er
 		query, expr, parse_err := sql_parse_expression(column.generated_sql)
 		if parse_err.kind != .None {
 			generated_plan_destroy(&plan)
-			return plan, errf(.Corrupt_Log, "generated column %s: %s", column.name, parse_err.message)
+			return plan, error_wrap(parse_err, .Corrupt_Log, "generated column %s: %s", column.name, parse_err.message)
 		}
 		append(&plan.columns, i)
 		append(&plan.queries, query)

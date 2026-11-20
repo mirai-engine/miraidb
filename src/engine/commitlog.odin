@@ -79,7 +79,11 @@ log_vfs_or_os :: proc(vfs: ^Vfs) -> ^Vfs {
 log_file_exists :: proc(vfs: ^Vfs, path: string) -> bool {
 	if vfs == nil do return os.exists(path)
 	file, open_err := vfs.ops.open(vfs, path, {.Read})
-	if open_err.kind != .None do return false
+	if open_err.kind != .None {
+		// Only whether it opened matters; the error said why not, and goes.
+		error_free(&open_err)
+		return false
+	}
 	vfs.ops.close(file)
 	return true
 }
@@ -237,7 +241,7 @@ log_open :: proc(
 		}
 		file, open_err := log_file_open(vfs, path, {.Read, .Write, .Create, .Trunc})
 		if open_err.kind != .None {
-			return log, errf(.Io, "cannot create %s: %v", path, open_err.message)
+			return log, error_wrap(open_err, .Io, "cannot create %s: %v", path, open_err.message)
 		}
 		header: [LOG_HEADER_LEN]u8
 		copy(header[:8], LOG_MAGIC)
@@ -246,12 +250,12 @@ log_open :: proc(
 		put_u64_le(header[16:24], 0)
 		if _, write_err := log_file_write(file, header[:]); write_err.kind != .None {
 			log_file_close(file)
-			return log, errf(.Io, "cannot write the log header: %v", write_err.message)
+			return log, error_wrap(write_err, .Io, "cannot write the log header: %v", write_err.message)
 		}
 		if durability == .Full {
 			if sync_err := log_file_sync(file); sync_err.kind != .None {
 				log_file_close(file)
-				return log, errf(.Io, "cannot sync the log header: %v", sync_err.message)
+				return log, error_wrap(sync_err, .Io, "cannot sync the log header: %v", sync_err.message)
 			}
 		}
 		log.file = file
@@ -261,7 +265,7 @@ log_open :: proc(
 
 	file, open_err := log_file_open(vfs, path, {.Read, .Write})
 	if open_err.kind != .None {
-		return log, errf(.Io, "cannot open %s: %v", path, open_err.message)
+		return log, error_wrap(open_err, .Io, "cannot open %s: %v", path, open_err.message)
 	}
 	header: [LOG_HEADER_LEN]u8
 	n, read_err := log_file_read(file, header[:])
@@ -293,7 +297,7 @@ log_open :: proc(
 	end, seek_err := log_file_seek_end(file)
 	if seek_err.kind != .None {
 		log_file_close(file)
-		return log, errf(.Io, "cannot seek to the end of %s: %v", path, seek_err.message)
+		return log, error_wrap(seek_err, .Io, "cannot seek to the end of %s: %v", path, seek_err.message)
 	}
 	log.file = file
 	log.size = end
@@ -320,7 +324,7 @@ log_rotate :: proc(log: ^Commit_Log, next_seq: u64) -> Error {
 	defer if !kept do delete(new_path)
 	file, open_err := log_file_open(log.vfs, new_path, {.Read, .Write, .Create, .Trunc})
 	if open_err.kind != .None {
-		return errf(.Io, "cannot create %s: %v", new_path, open_err.message)
+		return error_wrap(open_err, .Io, "cannot create %s: %v", new_path, open_err.message)
 	}
 	header: [LOG_HEADER_LEN]u8
 	copy(header[:8], LOG_MAGIC)
@@ -329,12 +333,12 @@ log_rotate :: proc(log: ^Commit_Log, next_seq: u64) -> Error {
 	put_u64_le(header[16:24], next_seq - 1)
 	if _, write_err := log_file_write(file, header[:]); write_err.kind != .None {
 		log_file_close(file)
-		return errf(.Io, "cannot write the segment header: %v", write_err.message)
+		return error_wrap(write_err, .Io, "cannot write the segment header: %v", write_err.message)
 	}
 	if log.durability != .None {
 		if sync_err := log_file_sync(file); sync_err.kind != .None {
 			log_file_close(file)
-			return errf(.Io, "cannot sync the segment header: %v", sync_err.message)
+			return error_wrap(sync_err, .Io, "cannot sync the segment header: %v", sync_err.message)
 		}
 	}
 	log.file = file
@@ -431,11 +435,11 @@ log_append :: proc(log: ^Commit_Log, commit_seq: u64, payload: []u8) -> Error {
 log_rewind :: proc(log: ^Commit_Log, size: i64) -> Error {
 	if log.file == nil do return ERROR_NONE
 	if truncate_err := log_file_truncate(log.file, size); truncate_err.kind != .None {
-		return errf(.Io, "cannot rewind the commit log: %v", truncate_err.message)
+		return error_wrap(truncate_err, .Io, "cannot rewind the commit log: %v", truncate_err.message)
 	}
 	if log.vfs == nil do log_index_truncate(log.path, size)
 	if _, seek_err := log_file_seek(log.file, size); seek_err.kind != .None {
-		return errf(.Io, "cannot seek after rewinding the log: %v", seek_err.message)
+		return error_wrap(seek_err, .Io, "cannot seek after rewinding the log: %v", seek_err.message)
 	}
 	log.size = size
 	return ERROR_NONE
@@ -676,13 +680,13 @@ log_stream_at :: proc(
 ) -> (valid_len: i64, base_seq: u64, err: Error) {
 	file, open_err := log_file_open(vfs, path, {.Read})
 	if open_err.kind != .None {
-		return 0, 0, errf(.Io, "cannot read the commit log %s: %v", path, open_err.message)
+		return 0, 0, error_wrap(open_err, .Io, "cannot read the commit log %s: %v", path, open_err.message)
 	}
 	defer log_file_close(file)
 	header: [LOG_HEADER_LEN]u8
 	header_len, header_err := log_stream_read(file, header[:])
 	if header_err.kind != .None {
-		return 0, 0, errf(.Io, "cannot read the commit log %s: %v", path, header_err.message)
+		return 0, 0, error_wrap(header_err, .Io, "cannot read the commit log %s: %v", path, header_err.message)
 	}
 	if header_len < LOG_HEADER_LEN {
 		return 0, 0, errf(.Corrupt_Log, "%s is shorter than a log header", path)
@@ -819,11 +823,11 @@ log_read_at :: proc(
 log_truncate :: proc(path: string, size: i64, vfs: ^Vfs = nil) -> Error {
 	file, open_err := log_file_open(vfs, path, {.Read, .Write})
 	if open_err.kind != .None {
-		return errf(.Io, "cannot open %s to truncate: %v", path, open_err.message)
+		return error_wrap(open_err, .Io, "cannot open %s to truncate: %v", path, open_err.message)
 	}
 	defer log_file_close(file)
 	if truncate_err := log_file_truncate(file, size); truncate_err.kind != .None {
-		return errf(.Io, "cannot truncate %s: %v", path, truncate_err.message)
+		return error_wrap(truncate_err, .Io, "cannot truncate %s: %v", path, truncate_err.message)
 	}
 	return ERROR_NONE
 }
@@ -833,7 +837,7 @@ log_truncate :: proc(path: string, size: i64, vfs: ^Vfs = nil) -> Error {
 log_write_snapshot :: proc(path: string, base_seq: u64, seq: u64, payload: []u8, vfs: ^Vfs = nil) -> Error {
 	file, open_err := log_file_open(vfs, path, {.Read, .Write, .Create, .Trunc})
 	if open_err.kind != .None {
-		return errf(.Io, "cannot create %s: %v", path, open_err.message)
+		return error_wrap(open_err, .Io, "cannot create %s: %v", path, open_err.message)
 	}
 	header: [LOG_HEADER_LEN]u8
 	copy(header[:8], LOG_MAGIC)
@@ -842,7 +846,7 @@ log_write_snapshot :: proc(path: string, base_seq: u64, seq: u64, payload: []u8,
 	put_u64_le(header[16:24], base_seq)
 	if _, write_err := log_file_write(file, header[:]); write_err.kind != .None {
 		log_file_close(file)
-		return errf(.Io, "cannot write the snapshot header: %v", write_err.message)
+		return error_wrap(write_err, .Io, "cannot write the snapshot header: %v", write_err.message)
 	}
 	record := make([]u8, LOG_RECORD_HEADER_LEN + len(payload))
 	defer delete(record)
@@ -852,15 +856,15 @@ log_write_snapshot :: proc(path: string, base_seq: u64, seq: u64, payload: []u8,
 	copy(record[LOG_RECORD_HEADER_LEN:], payload)
 	if _, write_err := log_file_write(file, record); write_err.kind != .None {
 		log_file_close(file)
-		return errf(.Io, "cannot write the snapshot record: %v", write_err.message)
+		return error_wrap(write_err, .Io, "cannot write the snapshot record: %v", write_err.message)
 	}
 	if sync_err := log_file_sync(file); sync_err.kind != .None {
 		log_file_close(file)
-		return errf(.Io, "cannot sync the snapshot: %v", sync_err.message)
+		return error_wrap(sync_err, .Io, "cannot sync the snapshot: %v", sync_err.message)
 	}
 	if truncate_err := log_file_truncate(file, i64(LOG_HEADER_LEN + len(record))); truncate_err.kind != .None {
 		log_file_close(file)
-		return errf(.Io, "cannot size the snapshot: %v", truncate_err.message)
+		return error_wrap(truncate_err, .Io, "cannot size the snapshot: %v", truncate_err.message)
 	}
 	log_file_close(file)
 	return ERROR_NONE
@@ -914,7 +918,7 @@ Log_Reader :: struct {
 log_reader_open :: proc(path: string, vfs: ^Vfs = nil) -> (^Log_Reader, Error) {
 	file, open_err := log_file_open(vfs, path, {.Read})
 	if open_err.kind != .None {
-		return nil, errf(.Io, "cannot open %s: %v", path, open_err.message)
+		return nil, error_wrap(open_err, .Io, "cannot open %s: %v", path, open_err.message)
 	}
 	header: [LOG_HEADER_LEN]u8
 	n, read_err := log_file_read(file, header[:])
@@ -934,12 +938,12 @@ log_reader_open :: proc(path: string, vfs: ^Vfs = nil) -> (^Log_Reader, Error) {
 	size, seek_err := log_file_seek_end(file)
 	if seek_err.kind != .None {
 		log_file_close(file)
-		return nil, errf(.Io, "cannot seek %s: %v", path, seek_err.message)
+		return nil, error_wrap(seek_err, .Io, "cannot seek %s: %v", path, seek_err.message)
 	}
 	_, rewind_err := log_file_seek(file, LOG_HEADER_LEN)
 	if rewind_err.kind != .None {
 		log_file_close(file)
-		return nil, errf(.Io, "cannot seek %s: %v", path, rewind_err.message)
+		return nil, error_wrap(rewind_err, .Io, "cannot seek %s: %v", path, rewind_err.message)
 	}
 	reader := new(Log_Reader)
 	reader.file = file
@@ -961,7 +965,7 @@ log_reader_next :: proc(reader: ^Log_Reader) -> (record: Log_Record, ok: bool, e
 	}
 	header: [LOG_RECORD_HEADER_LEN]u8
 	if _, seek_err := log_file_seek(reader.file, reader.position); seek_err.kind != .None {
-		return {}, false, errf(.Io, "cannot seek %s: %v", reader.path, seek_err.message)
+		return {}, false, error_wrap(seek_err, .Io, "cannot seek %s: %v", reader.path, seek_err.message)
 	}
 	n, read_err := log_file_read(reader.file, header[:])
 	if read_err.kind != .None || n != LOG_RECORD_HEADER_LEN {
@@ -1015,7 +1019,7 @@ log_flush :: proc(log: ^Commit_Log) -> Error {
 	log.pending = 0
 	if log.durability == .None do return ERROR_NONE
 	if sync_err := log_file_sync(log.file); sync_err.kind != .None {
-		return errf(.Io, "cannot sync the commit log: %v", sync_err.message)
+		return error_wrap(sync_err, .Io, "cannot sync the commit log: %v", sync_err.message)
 	}
 	return ERROR_NONE
 }

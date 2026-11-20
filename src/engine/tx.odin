@@ -2028,7 +2028,7 @@ tx_commit :: proc(tx: ^Tx) -> Error {
 					rewind_err.message,
 				)
 			}
-			return errf(.Internal, "commit %d failed to apply: %s", next_seq, apply_err.message)
+			return error_wrap(apply_err, .Internal, "commit %d failed to apply: %s", next_seq, apply_err.message)
 		}
 	}
 	committed_us := now_microseconds()

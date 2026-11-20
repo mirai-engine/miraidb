@@ -164,7 +164,7 @@ store_load_snapshot :: proc(store: ^Store) -> Error {
 		return errf(.Corrupt_Log, "%s has a corrupt snapshot payload", path)
 	}
 	if apply_err := store_apply_payload(store, payload, store.commit_seq + 1); apply_err.kind != .None {
-		return errf(.Corrupt_Log, "snapshot %s cannot be applied: %s", path, apply_err.message)
+		return error_wrap(apply_err, .Corrupt_Log, "snapshot %s cannot be applied: %s", path, apply_err.message)
 	}
 	store.commit_seq = base_seq
 	return ERROR_NONE
