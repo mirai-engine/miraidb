@@ -33,7 +33,7 @@ that way.
 | 4 | **R4 — hand the staged row to the table** | About 4% of an insert is a copy from the arena to the table. | M | 1 |
 | 5 | **Parity gate** | `scripts/bench.py` gates the parity workloads, measured twice per run, so a regression against the reference fails CI. | S | — |
 | 6 | **D12 — module sandbox** | A module is a process with a work budget; the reference runs modules deterministically with enforced limits. | L | — |
-| 7 | **D16 — generated clients** | Generate the Python binding from the catalog, then a second language. | M | — |
+| 7 | **D16 — generated clients** | Deferred by months: generate the Python binding from the catalog, then a second language. Until then the C ABI, the `sqlite3_*` face and the Python wrapper stay gated, so a binding is a thin layer when it comes ([backlog](backlog.md#d16--clients-generated-from-the-catalog)). | M | — |
 
 ## B. SQLite's features
 

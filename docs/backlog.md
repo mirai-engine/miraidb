@@ -237,6 +237,21 @@ is its gate), and `miraidb codegen` emits Odin structs.
 hand-written one's smoke test; the reference generates clients for several
 languages, so a second language (TypeScript or C#) follows.
 
+**Deferred.** Bindings for other languages (C#, Rust, TypeScript, a generated
+Python) are months away and are not built now. What is kept is the base that
+makes each of them a thin layer, and every change keeps it so:
+
+- one C ABI, `include/miraidb.h`, every export declared and the header compiling
+  on its own (`scripts/abi_header.py` gates both), with errors as codes and
+  messages the caller owns, so any FFI can wrap it without the engine's types;
+- the `sqlite3_*` face, `include/sqlite3_miraidb.h`, so a language whose SQLite
+  driver loads a library by name (CPython's `sqlite3`, Microsoft.Data.Sqlite,
+  rusqlite) can run on the engine with no binding of its own;
+- `sdk/python/miraidb.py`, the hand-written wrapper a generated one has to match
+  (`scripts/sdk_smoke.py`), and `miraidb codegen`, which already walks the
+  catalog to emit Odin structs: a generator for another language is a second
+  emitter over the same walk.
+
 ## D18 — A reader that trusts the pages
 
 **Now.** A writer and read-only readers share a directory (two lock bytes), and
