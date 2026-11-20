@@ -56,7 +56,6 @@ test_correlated_subqueries :: proc(t: ^testing.T) {
 
 	// A column that exists nowhere is still an error, not a crash.
 	missing := run_error(t, store, "SELECT (SELECT nope FROM emp) FROM emp")
-	defer db.error_free(&missing)
 	testing.expect_value(t, missing.kind, db.Error_Kind.Column_Not_Found)
 }
 

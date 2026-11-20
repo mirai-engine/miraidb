@@ -59,7 +59,6 @@ test_merge_updates_inserts_and_deletes :: proc(t: ^testing.T) {
 		store,
 		"MERGE INTO stock USING twice ON stock.id = twice.k WHEN MATCHED THEN UPDATE SET qty = twice.qty",
 	)
-	defer db.error_free(&double)
 	testing.expect_value(t, double.kind, db.Error_Kind.Invalid_Argument)
 	untouched := run(t, store, "SELECT qty FROM stock WHERE id = 1")
 	testing.expect_value(t, untouched.rows[0][0].i, i64(10))
@@ -71,7 +70,6 @@ test_merge_updates_inserts_and_deletes :: proc(t: ^testing.T) {
 		store,
 		"MERGE INTO stock USING feed ON stock.id = feed.id WHEN NOT MATCHED BY SOURCE THEN DELETE",
 	)
-	defer db.error_free(&refused)
 	testing.expect_value(t, refused.kind, db.Error_Kind.Sql_Unsupported)
 
 	// A source column that does not exist is a column error, not a crash.
@@ -80,6 +78,5 @@ test_merge_updates_inserts_and_deletes :: proc(t: ^testing.T) {
 		store,
 		"MERGE INTO stock USING feed ON stock.id = feed.id WHEN MATCHED THEN UPDATE SET nope = feed.qty",
 	)
-	defer db.error_free(&missing)
 	testing.expect_value(t, missing.kind, db.Error_Kind.Column_Not_Found)
 }

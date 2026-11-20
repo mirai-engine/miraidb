@@ -226,7 +226,6 @@ test_percentile_aggregates :: proc(t: ^testing.T) {
 
 	// A fraction outside [0, 1] is refused with SQLite's words.
 	bad := run_error(t, store, "SELECT percentile_cont(v, 1.5) FROM t")
-	defer db.error_free(&bad)
 	testing.expect_value(t, bad.kind, db.Error_Kind.Invalid_Argument)
 }
 
@@ -287,7 +286,6 @@ test_reindex_and_index_hints :: proc(t: ^testing.T) {
 		db.sql_result_destroy(&result)
 	}
 	missing := run_error(t, store, "REINDEX nope")
-	defer db.error_free(&missing)
 	testing.expect_value(t, missing.kind, db.Error_Kind.Index_Not_Found)
 
 	// INDEXED BY and NOT INDEXED are hints: the answer is the same, and the

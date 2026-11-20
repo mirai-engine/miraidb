@@ -315,7 +315,7 @@ test_check_constraints :: proc(t: ^testing.T) {
 	store := fresh_db(t, "checks")
 	if store == nil do return
 
-	run(t, store, `CREATE TABLE p (
+	run_done(t, store, `CREATE TABLE p (
 		id INTEGER PRIMARY KEY,
 		name TEXT CONSTRAINT name_len CHECK (length(name) > 1),
 		qty INTEGER CHECK (qty >= 0),

@@ -89,6 +89,7 @@ test_natural_joins :: proc(t: ^testing.T) {
 	run_done(t, store, "INSERT INTO b VALUES (1, 'p', 100), (2, 'x', 200)")
 	run_done(t, store, "INSERT INTO c VALUES (7), (8)")
 	star := run(t, store, "SELECT * FROM a NATURAL JOIN b")
+	defer db.sql_result_destroy(&star)
 	testing.expect_value(t, len(star.columns), 4)
 	testing.expect_value(t, len(star.rows), 1)
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM a NATURAL LEFT JOIN b").i, i64(3))
@@ -121,7 +122,7 @@ test_generate_series :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT group_concat(value, ',') FROM generate_series(1, 10, -3)").s, "10,7,4,1")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM generate_series WHERE start = 2 AND stop = 4").i, i64(3))
 	testing.expect_value(t, scalar(t, store, "SELECT sum(g.value) FROM (SELECT 3 AS n) AS t, generate_series(1, t.n) AS g").i, i64(6))
-	testing.expect_value(t, len(run(t, store, "SELECT * FROM generate_series(1, 2)").columns), 1)
+	testing.expect_value(t, len(run_temp(t, store, "SELECT * FROM generate_series(1, 2)").columns), 1)
 	_ = run_error(t, store, "SELECT count(*) FROM generate_series")
 }
 

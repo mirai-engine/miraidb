@@ -57,11 +57,37 @@ run_done :: proc(t: ^testing.T, store: ^db.Store, sql: string, loc := #caller_lo
 	db.sql_result_destroy(&result)
 }
 
+// run_error runs a statement expected to fail and answers its error, the
+// message copied into the test's temporary memory: nothing for the test to free.
 @(private)
 run_error :: proc(t: ^testing.T, store: ^db.Store, sql: string) -> db.Error {
 	result, err := db.sql_execute(store, sql)
 	db.sql_result_destroy(&result)
-	return err
+	out := db.Error{kind = err.kind, message = strings.clone(err.message, context.temp_allocator)}
+	db.error_free(&err)
+	return out
+}
+
+// run_temp runs a statement and answers its result copied into the test's
+// temporary memory, the original freed: for a test that reads one field of it
+// (`run_temp(...).rows`) and would otherwise leave the result behind.
+@(private)
+run_temp :: proc(t: ^testing.T, store: ^db.Store, sql: string, loc := #caller_location) -> db.Sql_Result {
+	result, err := db.sql_execute(store, sql)
+	testing.expectf(t, db.error_ok(err), "%s failed: %s", sql, err.message, loc = loc)
+	db.error_free(&err)
+	defer db.sql_result_destroy(&result)
+	out := result
+	out.columns = make([]string, len(result.columns), context.temp_allocator)
+	for column, i in result.columns do out.columns[i] = strings.clone(column, context.temp_allocator)
+	out.rows = make([][]db.Value, len(result.rows), context.temp_allocator)
+	for row, i in result.rows {
+		out.rows[i] = make([]db.Value, len(row), context.temp_allocator)
+		for value, j in row do out.rows[i][j] = db.value_clone(value, context.temp_allocator)
+	}
+	out.row_ids = slice.clone(result.row_ids, context.temp_allocator)
+	out.message = strings.clone(result.message, context.temp_allocator)
+	return out
 }
 
 @(private)
@@ -1514,7 +1540,7 @@ test_soak_workload :: proc(t: ^testing.T) {
 		for step in 0 ..< 10 {
 			switch step % 4 {
 			case 0:
-				run(t, store, fmt.tprintf(
+				run_done(t, store, fmt.tprintf(
 					"INSERT INTO s (level, message, amount) VALUES ('%s', 'line %d', %d)",
 					round % 3 == 0 ? "info" : (round % 3 == 1 ? "warn" : "error"),
 					round * 100 + step,
@@ -1741,7 +1767,7 @@ test_integer_widths :: proc(t: ^testing.T) {
 	if store == nil do return
 	// Closed and reopened below, so the cleanup at the end closes the new store.
 
-	run(t, store, `CREATE TABLE nums (
+	run_done(t, store, `CREATE TABLE nums (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		a TINYINT NOT NULL,
 		b SMALLINT NOT NULL,
@@ -1807,7 +1833,7 @@ test_composite_primary_key :: proc(t: ^testing.T) {
 	store := fresh_db(t, "composite")
 	if store == nil do return
 
-	run(t, store, `CREATE TABLE kv (
+	run_done(t, store, `CREATE TABLE kv (
 		a INT4 NOT NULL,
 		b TEXT NOT NULL,
 		value TEXT NOT NULL,
@@ -1851,7 +1877,7 @@ test_named_unique_constraints :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "namedunique")
 
-	run(t, store, `CREATE TABLE pair (
+	run_done(t, store, `CREATE TABLE pair (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		x INT NOT NULL,
 		y INT NOT NULL,
@@ -1922,7 +1948,7 @@ test_domain_types :: proc(t: ^testing.T) {
 	store := fresh_db(t, "domains")
 	if store == nil do return
 
-	run(t, store, `CREATE TABLE dom (
+	run_done(t, store, `CREATE TABLE dom (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		d DURATION NOT NULL,
 		who IDENTITY NOT NULL,
@@ -1970,7 +1996,7 @@ test_sequences :: proc(t: ^testing.T) {
 	store := fresh_db(t, "sequences")
 	if store == nil do return
 
-	run(t, store, `CREATE TABLE seq (
+	run_done(t, store, `CREATE TABLE seq (
 		id INTEGER PRIMARY KEY AUTOINCREMENT START 100 INCREMENT 5,
 		v TEXT NOT NULL
 	)`)
@@ -1997,7 +2023,7 @@ test_sequences :: proc(t: ^testing.T) {
 	testing.expect_value(t, after.i, i64(210))
 
 	// Bounds are enforced.
-	run(t, reopened, `CREATE TABLE bounded (
+	run_done(t, reopened, `CREATE TABLE bounded (
 		id INTEGER PRIMARY KEY AUTOINCREMENT START 1 INCREMENT 1 MAXVALUE 2,
 		v TEXT NOT NULL
 	)`)
@@ -3555,6 +3581,7 @@ test_show_indexes :: proc(t: ^testing.T) {
 	run_done(t, store, "CREATE TABLE thing (id INTEGER PRIMARY KEY, name TEXT)")
 	run_done(t, store, "CREATE INDEX thing_name ON thing (name)")
 	result := run(t, store, "SHOW indexes")
+	defer db.sql_result_destroy(&result)
 	if testing.expect(t, len(result.rows) >= 1) {
 		found := false
 		for row in result.rows {
@@ -3579,21 +3606,26 @@ test_semijoins :: proc(t: ^testing.T) {
 	run_done(t, store, "INSERT INTO b (id, v) VALUES (1, 20), (2, 40)")
 
 	in_result := run(t, store, "SELECT id FROM a WHERE v IN (SELECT v FROM b) ORDER BY id")
+	defer db.sql_result_destroy(&in_result)
 	testing.expect_value(t, len(in_result.rows), 1)
 	testing.expect_value(t, in_result.rows[0][0].i, i64(2))
 
 	excluded := run(t, store, "SELECT id FROM a WHERE v NOT IN (SELECT v FROM b) ORDER BY id")
+	defer db.sql_result_destroy(&excluded)
 	testing.expect_value(t, len(excluded.rows), 2)
 	testing.expect_value(t, excluded.rows[0][0].i, i64(1))
 	testing.expect_value(t, excluded.rows[1][0].i, i64(3))
 
 	exists := run(t, store, "SELECT id FROM a WHERE EXISTS (SELECT id FROM b WHERE v = 20) ORDER BY id")
+	defer db.sql_result_destroy(&exists)
 	testing.expect_value(t, len(exists.rows), 3)
 
 	missing := run(t, store, "SELECT id FROM a WHERE NOT EXISTS (SELECT id FROM b WHERE v = 999)")
+	defer db.sql_result_destroy(&missing)
 	testing.expect_value(t, len(missing.rows), 3)
 
 	scalar := run(t, store, "SELECT id FROM a WHERE v = (SELECT min(v) FROM b)")
+	defer db.sql_result_destroy(&scalar)
 	testing.expect_value(t, len(scalar.rows), 1)
 	testing.expect_value(t, scalar.rows[0][0].i, i64(2))
 }
@@ -3605,13 +3637,16 @@ test_select_without_from :: proc(t: ^testing.T) {
 	defer cleanup_db(store, "no_from")
 
 	sum := run(t, store, "SELECT 1 + 2 AS s")
+	defer db.sql_result_destroy(&sum)
 	testing.expect_value(t, len(sum.rows), 1)
 	testing.expect_value(t, sum.rows[0][0].i, i64(3))
 
 	text := run(t, store, "SELECT concat('a', 'b') AS joined")
+	defer db.sql_result_destroy(&text)
 	testing.expect_value(t, text.rows[0][0].s, "ab")
 
 	casted := run(t, store, "SELECT CAST('12' AS INTEGER) AS n")
+	defer db.sql_result_destroy(&casted)
 	testing.expect_value(t, casted.rows[0][0].i, i64(12))
 }
 
@@ -3674,9 +3709,11 @@ test_alter_table_add_column :: proc(t: ^testing.T) {
 	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
 	run_done(t, store, "INSERT INTO t (id, name) VALUES (1, 'a'), (2, 'b')")
 	alter := run(t, store, "ALTER TABLE t ADD COLUMN qty INTEGER NOT NULL DEFAULT 7")
+	defer db.sql_result_destroy(&alter)
 	testing.expect_value(t, alter.kind, db.Sql_Result_Kind.Ack)
 
 	after := run(t, store, "SELECT id, qty FROM t ORDER BY id")
+	defer db.sql_result_destroy(&after)
 	testing.expect_value(t, len(after.rows), 2)
 	testing.expect_value(t, after.rows[0][1].i, i64(7))
 	testing.expect_value(t, after.rows[1][1].i, i64(7))
@@ -3696,6 +3733,7 @@ test_alter_table_add_column :: proc(t: ^testing.T) {
 	replayed := scalar(t, reopened, "SELECT qty FROM t WHERE id = 1")
 	testing.expect_value(t, replayed.i, i64(7))
 	columns := run(t, reopened, "SELECT name FROM _columns WHERE table = 't'")
+	defer db.sql_result_destroy(&columns)
 	testing.expect_value(t, len(columns.rows), 3)
 }
 
@@ -3717,6 +3755,7 @@ test_create_or_replace_view :: proc(t: ^testing.T) {
 
 	run_done(t, store, "CREATE OR REPLACE VIEW v AS SELECT id FROM t WHERE id = 2")
 	after := run(t, store, "SELECT id FROM v")
+	defer db.sql_result_destroy(&after)
 	testing.expect_value(t, len(after.rows), 1)
 	testing.expect_value(t, after.rows[0][0].i, i64(2))
 
@@ -4081,6 +4120,7 @@ test_event_tables :: proc(t: ^testing.T) {
 	// SHOW events lists the table; ordinary tables are not event tables.
 	run_done(t, store, "CREATE TABLE ordinary (id INTEGER PRIMARY KEY)")
 	shown := run(t, store, "SHOW events")
+	defer db.sql_result_destroy(&shown)
 	testing.expect_value(t, len(shown.rows), 1)
 	testing.expect_value(t, shown.rows[0][0].s, "audit")
 }
@@ -4104,6 +4144,7 @@ test_row_quota :: proc(t: ^testing.T) {
 
 	// A LIMIT below the quota still works.
 	small := run(t, store, "SELECT id FROM t LIMIT 1")
+	defer db.sql_result_destroy(&small)
 	testing.expect_value(t, len(small.rows), 1)
 
 	// A window query reaches the same refusal with its sources handed to
@@ -4115,6 +4156,7 @@ test_row_quota :: proc(t: ^testing.T) {
 
 	db.store_set_row_quota(store, 0)
 	full := run(t, store, "SELECT id FROM t")
+	defer db.sql_result_destroy(&full)
 	testing.expect_value(t, len(full.rows), 3)
 }
 
@@ -4129,10 +4171,12 @@ test_view_parameters :: proc(t: ^testing.T) {
 	run_done(t, store, "CREATE VIEW above AS SELECT id FROM t WHERE id > ?")
 
 	two := run(t, store, "SELECT id FROM above(1) ORDER BY id")
+	defer db.sql_result_destroy(&two)
 	testing.expect_value(t, len(two.rows), 2)
 	testing.expect_value(t, two.rows[0][0].i, i64(2))
 
 	one := run(t, store, "SELECT count(*) FROM above(2)")
+	defer db.sql_result_destroy(&one)
 	testing.expect_value(t, one.rows[0][0].i, i64(1))
 
 	// Parameters bind through a parameterised statement as well.
@@ -4455,6 +4499,7 @@ test_row_size_hint :: proc(t: ^testing.T) {
 	run_done(t, store, "INSERT INTO t (id, label) VALUES (1, 'hello'), (2, 'world!')")
 
 	result := run(t, store, "SELECT id, label FROM t")
+	defer db.sql_result_destroy(&result)
 	testing.expect(t, result.row_bytes >= u64(len("hello") + len("world!")))
 	testing.expect_value(t, result.rows[0][1].s, "hello")
 
@@ -4648,9 +4693,9 @@ test_schema_migrations :: proc(t: ^testing.T) {
 	testing.expect(t, db.error_ok(migrate_err))
 	testing.expect_value(t, applied, 2)
 	testing.expect_value(t, db.host_schema_version(host), u32(3))
-	testing.expect_value(t, len(run(t, store, "SELECT id FROM users").rows), 0)
-	testing.expect_value(t, len(run(t, store, "SELECT name FROM _columns WHERE table = 'users'").rows), 3)
-	testing.expect_value(t, len(run(t, store, "SELECT name FROM _indexes WHERE name = 'users_email'").rows), 1)
+	testing.expect_value(t, len(run_temp(t, store, "SELECT id FROM users").rows), 0)
+	testing.expect_value(t, len(run_temp(t, store, "SELECT name FROM _columns WHERE table = 'users'").rows), 3)
+	testing.expect_value(t, len(run_temp(t, store, "SELECT name FROM _indexes WHERE name = 'users_email'").rows), 1)
 
 	// Running again applies nothing.
 	again, again_err := db.host_migrate(host, migrations)
@@ -4667,13 +4712,13 @@ test_schema_migrations :: proc(t: ^testing.T) {
 	_, broken_err := db.host_migrate(host, broken)
 	testing.expect(t, !db.error_ok(broken_err))
 	testing.expect_value(t, db.host_schema_version(host), u32(3))
-	testing.expect_value(t, len(run(t, store, "SELECT name FROM _tables WHERE name = 'oops'").rows), 0)
+	testing.expect_value(t, len(run_temp(t, store, "SELECT name FROM _tables WHERE name = 'oops'").rows), 0)
 
 	// A version gap is rejected before running anything.
 	gap := []db.Migration{{version = 6, sql = []string{"CREATE TABLE six (id INTEGER PRIMARY KEY)"}}}
 	_, gap_err := db.host_migrate(host, gap)
 	testing.expect(t, !db.error_ok(gap_err))
-	testing.expect_value(t, len(run(t, store, "SELECT name FROM _tables WHERE name = 'six'").rows), 0)
+	testing.expect_value(t, len(run_temp(t, store, "SELECT name FROM _tables WHERE name = 'six'").rows), 0)
 }
 
 @(test)
@@ -4694,6 +4739,7 @@ test_named_types :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT address FROM users").s, "a@b.c")
 
 	described := run(t, store, "SELECT type FROM _columns WHERE table = 'users'")
+	defer db.sql_result_destroy(&described)
 	found_text := false
 	for row in described.rows {
 		if row[0].s == "TEXT" do found_text = true
@@ -4703,6 +4749,7 @@ test_named_types :: proc(t: ^testing.T) {
 	// A8: the catalog keeps the name the column was declared with next to the
 	// type it resolved to, so a client can rebuild the schema it was written as.
 	named := run(t, store, "SELECT named FROM _columns WHERE table = 'users' AND name = 'address'")
+	defer db.sql_result_destroy(&named)
 	found_named := false
 	for row in named.rows {
 		if row[0].s == "email" do found_named = true
@@ -4710,6 +4757,7 @@ test_named_types :: proc(t: ^testing.T) {
 	testing.expect(t, found_named)
 
 	shown := run(t, store, "SHOW types")
+	defer db.sql_result_destroy(&shown)
 	testing.expect_value(t, len(shown.rows), 1)
 	testing.expect_value(t, shown.rows[0][0].s, "email")
 	testing.expect_value(t, shown.rows[0][1].s, "TEXT")
@@ -4835,6 +4883,7 @@ test_structural_types :: proc(t: ^testing.T) {
 	testing.expect(t, !db.error_ok(option_err))
 
 	described := run(t, store, "SELECT name, type FROM _columns WHERE table = 't'")
+	defer db.sql_result_destroy(&described)
 	types := map[string]string{}
 	defer delete(types)
 	for row in described.rows do types[row[0].s] = row[1].s
@@ -4907,12 +4956,14 @@ test_statement_work_budget :: proc(t: ^testing.T) {
 	// Mutations pay for the rows they affect.
 	db.store_set_work_budget(store, 0)
 	inserted := run(t, store, "INSERT INTO e (id, label) VALUES (9, 'nine')")
+	defer db.sql_result_destroy(&inserted)
 	testing.expect(t, inserted.work >= 1)
 	testing.expect(t, db.store_work_used(store) > first_used)
 
 	// A generous budget passes and reports its price.
 	db.store_set_work_budget(store, 1000)
 	allowed := run(t, store, "SELECT id FROM e")
+	defer db.sql_result_destroy(&allowed)
 	testing.expect(t, allowed.work >= 4)
 
 	db.store_reset_work(store)
@@ -4981,6 +5032,7 @@ test_hash_and_direct_indexes :: proc(t: ^testing.T) {
 	}
 	// The hash index answers an equality lookup over a non-unique key.
 	matched := run(t, store, "SELECT id FROM t WHERE label = 'same' ORDER BY id")
+	defer db.sql_result_destroy(&matched)
 	testing.expect_value(t, len(matched.rows), 3)
 	testing.expect_value(t, matched.rows[0][0].i, i64(1))
 
@@ -4992,11 +5044,11 @@ test_hash_and_direct_indexes :: proc(t: ^testing.T) {
 
 	// Updates move the bucket, deletes empty it.
 	run_done(t, store, "UPDATE t SET label = 'moved' WHERE id = 2")
-	testing.expect_value(t, len(run(t, store, "SELECT id FROM t WHERE label = 'same'").rows), 2)
-	testing.expect_value(t, len(run(t, store, "SELECT id FROM t WHERE label = 'moved'").rows), 1)
+	testing.expect_value(t, len(run_temp(t, store, "SELECT id FROM t WHERE label = 'same'").rows), 2)
+	testing.expect_value(t, len(run_temp(t, store, "SELECT id FROM t WHERE label = 'moved'").rows), 1)
 	run_done(t, store, "DELETE FROM t WHERE id = 3")
-	testing.expect_value(t, len(run(t, store, "SELECT id FROM t WHERE label = 'same'").rows), 1)
-	testing.expect_value(t, len(run(t, store, "SELECT id FROM t WHERE code = 'c3'").rows), 0)
+	testing.expect_value(t, len(run_temp(t, store, "SELECT id FROM t WHERE label = 'same'").rows), 1)
+	testing.expect_value(t, len(run_temp(t, store, "SELECT id FROM t WHERE code = 'c3'").rows), 0)
 
 	// The algorithm and the buckets survive a reopen.
 	db.host_destroy(host)
@@ -5004,8 +5056,8 @@ test_hash_and_direct_indexes :: proc(t: ^testing.T) {
 	reopened, open_err := db.store_open(path, {persistent = true, create = true, durable = false})
 	testing.expect(t, db.error_ok(open_err))
 	defer db.store_close(reopened)
-	testing.expect_value(t, len(run(t, reopened, "SELECT id FROM t WHERE label = 'moved'").rows), 1)
-	testing.expect_value(t, len(run(t, reopened, "SELECT id FROM t WHERE code = 'c1'").rows), 1)
+	testing.expect_value(t, len(run_temp(t, reopened, "SELECT id FROM t WHERE label = 'moved'").rows), 1)
+	testing.expect_value(t, len(run_temp(t, reopened, "SELECT id FROM t WHERE code = 'c1'").rows), 1)
 	indexes := reopened.tables["t"].schema.indexes
 	found_hash := false
 	found_direct := false
@@ -5300,6 +5352,7 @@ test_array_and_product_types :: proc(t: ^testing.T) {
 
 	run_done(t, store, "CREATE TABLE c (id INTEGER PRIMARY KEY, tags ARRAY(TEXT), pair PRODUCT(INT, TEXT))")
 	described := run(t, store, "SELECT name, type FROM _columns WHERE table = 'c'")
+	defer db.sql_result_destroy(&described)
 	types := map[string]string{}
 	defer delete(types)
 	for row in described.rows do types[row[0].s] = row[1].s
@@ -5344,7 +5397,7 @@ test_array_and_product_types :: proc(t: ^testing.T) {
 	defer db.store_close(reopened)
 	types_after := map[string]string{}
 	defer delete(types_after)
-	for row in run(t, reopened, "SELECT name, type FROM _columns WHERE table = 'c'").rows {
+	for row in run_temp(t, reopened, "SELECT name, type FROM _columns WHERE table = 'c'").rows {
 		types_after[row[0].s] = row[1].s
 	}
 	testing.expect_value(t, types_after["tags"], "ARRAY(TEXT)")
@@ -5362,10 +5415,12 @@ test_named_type_references :: proc(t: ^testing.T) {
 	run_done(t, store, "CREATE TYPE labels AS ARRAY(TEXT)")
 	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, l labels, plain TEXT)")
 	row := run(t, store, "SELECT name, type, named FROM _columns WHERE table = 't' AND name = 'l'")
+	defer db.sql_result_destroy(&row)
 	testing.expect_value(t, len(row.rows), 1)
 	testing.expect_value(t, row.rows[0][1].s, "ARRAY(TEXT)")
 	testing.expect_value(t, row.rows[0][2].s, "labels")
 	plain := run(t, store, "SELECT named FROM _columns WHERE table = 't' AND name = 'plain'")
+	defer db.sql_result_destroy(&plain)
 	testing.expect_value(t, plain.rows[0][0].s, "")
 
 	db.host_destroy(host)
@@ -5375,6 +5430,7 @@ test_named_type_references :: proc(t: ^testing.T) {
 	defer db.store_close(reopened)
 	// The reference and the resolved type both survive the schema codec.
 	after := run(t, reopened, "SELECT type, named FROM _columns WHERE table = 't' AND name = 'l'")
+	defer db.sql_result_destroy(&after)
 	testing.expect_value(t, after.rows[0][0].s, "ARRAY(TEXT)")
 	testing.expect_value(t, after.rows[0][1].s, "labels")
 }
@@ -5508,6 +5564,7 @@ test_product_arity :: proc(t: ^testing.T) {
 
 	run_done(t, store, "CREATE TABLE p (id INTEGER PRIMARY KEY, triple PRODUCT(INT, TEXT, BOOLEAN))")
 	described := run(t, store, "SELECT type FROM _columns WHERE table = 'p' AND name = 'triple'")
+	defer db.sql_result_destroy(&described)
 	testing.expect_value(t, described.rows[0][0].s, "PRODUCT(BIGINT, TEXT, BOOLEAN)")
 
 	triple_type := db.Column_Type {
@@ -5538,6 +5595,7 @@ test_product_arity :: proc(t: ^testing.T) {
 	testing.expect(t, db.error_ok(open_err))
 	defer db.store_close(reopened)
 	after := run(t, reopened, "SELECT type FROM _columns WHERE table = 'p' AND name = 'triple'")
+	defer db.sql_result_destroy(&after)
 	testing.expect_value(t, after.rows[0][0].s, "PRODUCT(BIGINT, TEXT, BOOLEAN)")
 	testing.expect_value(t, len(reopened.tables["p"].schema.columns[1].type.components), 3)
 }
@@ -6110,6 +6168,7 @@ dump_database :: proc(t: ^testing.T, store: ^db.Store) -> string {
 	builder := strings.builder_make()
 	defer strings.builder_destroy(&builder)
 	tables := run(t, store, "SHOW tables")
+	defer db.sql_result_destroy(&tables)
 	for row in tables.rows {
 		name := row[0].s
 		if strings.has_prefix(name, "_") do continue
@@ -6117,6 +6176,7 @@ dump_database :: proc(t: ^testing.T, store: ^db.Store) -> string {
 		strings.write_string(&builder, name)
 		strings.write_string(&builder, "\n")
 		columns := run(t, store, fmt.tprintf("SELECT name, type, named FROM _columns WHERE table = '%s' ORDER BY name", name))
+		defer db.sql_result_destroy(&columns)
 		for column in columns.rows {
 			strings.write_string(&builder, "  col ")
 			strings.write_string(&builder, column[0].s)
@@ -6127,6 +6187,7 @@ dump_database :: proc(t: ^testing.T, store: ^db.Store) -> string {
 			strings.write_string(&builder, "]\n")
 		}
 		indexes := run(t, store, fmt.tprintf("SELECT name, columns FROM _indexes WHERE table = '%s' ORDER BY name", name))
+		defer db.sql_result_destroy(&indexes)
 		for index in indexes.rows {
 			strings.write_string(&builder, "  idx ")
 			strings.write_string(&builder, index[0].s)
@@ -6136,6 +6197,7 @@ dump_database :: proc(t: ^testing.T, store: ^db.Store) -> string {
 		}
 		// SELECT without ORDER BY has no defined order, so the dump sorts by id.
 		rows := run(t, store, fmt.tprintf("SELECT * FROM %s ORDER BY id", name))
+		defer db.sql_result_destroy(&rows)
 		for row_cells in rows.rows {
 			strings.write_string(&builder, "  row")
 			for value in row_cells {
@@ -6237,7 +6299,9 @@ test_index_matches_full_scan :: proc(t: ^testing.T) {
 	}
 	for predicate in predicates {
 		indexed := run(t, store, fmt.tprintf("SELECT id, grp, n FROM indexed WHERE %s ORDER BY id", predicate))
+		defer db.sql_result_destroy(&indexed)
 		plain := run(t, store, fmt.tprintf("SELECT id, grp, n FROM plain WHERE %s ORDER BY id", predicate))
+		defer db.sql_result_destroy(&plain)
 		testing.expect_value(t, len(indexed.rows), len(plain.rows))
 		for row, i in indexed.rows {
 			for value, j in row {
@@ -6247,7 +6311,9 @@ test_index_matches_full_scan :: proc(t: ^testing.T) {
 	}
 	// ORDER BY through the index agrees with a sort of the full scan.
 	ordered := run(t, store, "SELECT id FROM indexed ORDER BY grp, id")
+	defer db.sql_result_destroy(&ordered)
 	sorted_plain := run(t, store, "SELECT id FROM plain ORDER BY grp, id")
+	defer db.sql_result_destroy(&sorted_plain)
 	testing.expect_value(t, len(ordered.rows), len(sorted_plain.rows))
 	for row, i in ordered.rows {
 		testing.expect_value(t, row[0].i, sorted_plain.rows[i][0].i)
@@ -6284,6 +6350,7 @@ test_soak_update_delete_prune :: proc(t: ^testing.T) {
 		if round % 10 == 0 do db.store_prune_versions(store, store.commit_seq)
 	}
 	rows := run(t, store, "SELECT id FROM soak ORDER BY id")
+	defer db.sql_result_destroy(&rows)
 	testing.expect_value(t, len(rows.rows), len(expected))
 	for row in rows.rows do testing.expect(t, row[0].i in expected)
 
@@ -6295,6 +6362,7 @@ test_soak_update_delete_prune :: proc(t: ^testing.T) {
 	testing.expect(t, db.error_ok(open_err))
 	defer db.store_close(reopened)
 	again := run(t, reopened, "SELECT id FROM soak ORDER BY id")
+	defer db.sql_result_destroy(&again)
 	testing.expect_value(t, len(again.rows), len(expected))
 }
 
@@ -6354,11 +6422,13 @@ test_sqlite_import_queries :: proc(t: ^testing.T) {
 	testing.expect_value(t, rows, 7)
 
 	names := run(t, store, "SELECT name FROM people WHERE score IS NOT NULL ORDER BY score DESC")
+	defer db.sql_result_destroy(&names)
 	testing.expect_value(t, len(names.rows), 3)
 	testing.expect_value(t, names.rows[0][0].s, "Ada")
 	count := scalar(t, store, "SELECT count(*) FROM tags")
 	testing.expect_value(t, count.i, i64(3))
 	long := run(t, store, "SELECT name FROM people WHERE id = 7")
+	defer db.sql_result_destroy(&long)
 	testing.expect_value(t, len(long.rows[0][0].s), 809)
 }
 
@@ -6379,6 +6449,7 @@ test_sqlite_import_without_rowid_order :: proc(t: ^testing.T) {
 	testing.expect_value(t, rows, 6)
 
 	w := run(t, store, "SELECT b, a, c FROM w ORDER BY a")
+	defer db.sql_result_destroy(&w)
 	testing.expect_value(t, len(w.rows), 3)
 	testing.expect_value(t, w.rows[0][0].i, i64(2))
 	testing.expect_value(t, w.rows[0][1].s, "a")
@@ -6388,6 +6459,7 @@ test_sqlite_import_without_rowid_order :: proc(t: ^testing.T) {
 	testing.expect_value(t, w.rows[2][1].s, "x")
 	testing.expect_value(t, w.rows[2][2].i, i64(3))
 	z := run(t, store, "SELECT x, y, z FROM z ORDER BY y")
+	defer db.sql_result_destroy(&z)
 	testing.expect_value(t, len(z.rows), 3)
 	testing.expect_value(t, z.rows[0][0].s, "x1")
 	testing.expect_value(t, z.rows[0][2].i, i64(2))
@@ -6690,6 +6762,7 @@ test_not_null_survives_replay :: proc(t: ^testing.T) {
 	_, replay_err := db.sql_execute(reopened, "INSERT INTO strict (id, name) VALUES (3, NULL)")
 	testing.expect_value(t, replay_err.kind, db.Error_Kind.Not_Null_Violation)
 	described := run(t, reopened, "DESCRIBE strict")
+	defer db.sql_result_destroy(&described)
 	found := false
 	for row in described.rows {
 		if row[0].s == "column" && row[1].s == "name" {
@@ -6709,19 +6782,23 @@ test_pragma_and_sqlite_functions :: proc(t: ^testing.T) {
 	run_done(t, store, "CREATE INDEX people_age ON people (age)")
 
 	info := run(t, store, "PRAGMA table_info(people)")
+	defer db.sql_result_destroy(&info)
 	testing.expect_value(t, len(info.rows), 3)
 	testing.expect_value(t, info.columns[1], "name")
 	testing.expect_value(t, info.rows[1][1].s, "name")
 	testing.expect_value(t, info.rows[1][3].i, i64(1))
 
 	indexes := run(t, store, "PRAGMA index_list(people)")
+	defer db.sql_result_destroy(&indexes)
 	testing.expect_value(t, len(indexes.rows), 2)
 	fks := run(t, store, "PRAGMA foreign_key_list(people)")
+	defer db.sql_result_destroy(&fks)
 	testing.expect_value(t, len(fks.rows), 0)
 	dbs := run(t, store, "PRAGMA database_list")
+	defer db.sql_result_destroy(&dbs)
 	testing.expect_value(t, dbs.rows[0][1].s, "main")
-	testing.expect_value(t, run(t, store, "PRAGMA page_size").rows[0][0].i, i64(4096))
-	testing.expect_value(t, run(t, store, "PRAGMA integrity_check").rows[0][0].s, "ok")
+	testing.expect_value(t, run_temp(t, store, "PRAGMA page_size").rows[0][0].i, i64(4096))
+	testing.expect_value(t, run_temp(t, store, "PRAGMA integrity_check").rows[0][0].s, "ok")
 
 	functions := run(
 		t,
@@ -6763,9 +6840,10 @@ test_glob_operator :: proc(t: ^testing.T) {
 	}
 	for item in cases {
 		result := run(t, store, fmt.tprintf("SELECT count(*) FROM files WHERE %s", item.predicate))
+		defer db.sql_result_destroy(&result)
 		testing.expectf(t, result.rows[0][0].i == item.expected, "%s: expected %d, got %d", item.predicate, item.expected, result.rows[0][0].i)
 	}
-	testing.expect_value(t, run(t, store, "SELECT name FROM files WHERE name GLOB 'a[0-9].txt' ORDER BY name").rows[0][0].s, "a1.txt")
+	testing.expect_value(t, run_temp(t, store, "SELECT name FROM files WHERE name GLOB 'a[0-9].txt' ORDER BY name").rows[0][0].s, "a1.txt")
 }
 
 @(test)
@@ -6778,18 +6856,21 @@ test_returning_clause :: proc(t: ^testing.T) {
 	run_done(t, store, "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)")
 
 	inserted := run(t, store, "INSERT INTO items (name, qty) VALUES ('a', 1), ('b', 2) RETURNING id, name, qty")
+	defer db.sql_result_destroy(&inserted)
 	testing.expect_value(t, inserted.kind, db.Sql_Result_Kind.Rows)
 	testing.expect_value(t, len(inserted.rows), 2)
 	testing.expect_value(t, inserted.rows[0][1].s, "a")
 	testing.expect_value(t, inserted.rows[1][0].i, i64(2))
 
 	updated := run(t, store, "UPDATE items SET qty = qty + 10 WHERE name = 'a' RETURNING *")
+	defer db.sql_result_destroy(&updated)
 	testing.expect_value(t, len(updated.rows), 1)
 	testing.expect_value(t, updated.rows[0][2].i, i64(11))
 	// The write is visible after the statement, not only in the returning rows.
 	testing.expect_value(t, scalar(t, store, "SELECT qty FROM items WHERE name = 'a'").i, i64(11))
 
 	deleted := run(t, store, "DELETE FROM items WHERE id = 2 RETURNING name")
+	defer db.sql_result_destroy(&deleted)
 	testing.expect_value(t, len(deleted.rows), 1)
 	testing.expect_value(t, deleted.rows[0][0].s, "b")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM items").i, i64(1))
@@ -6814,12 +6895,14 @@ test_upsert :: proc(t: ^testing.T) {
 
 	// DO UPDATE runs the assignments over the stored row and reports it.
 	updated := run(t, store, "INSERT INTO stock (id, name, qty) VALUES (1, 'a', 7) ON CONFLICT (id) DO UPDATE SET qty = qty + 1 RETURNING *")
+	defer db.sql_result_destroy(&updated)
 	testing.expect_value(t, len(updated.rows), 1)
 	testing.expect_value(t, updated.rows[0][2].i, i64(6))
 	testing.expect_value(t, updated.affected, 1)
 
 	// DO NOTHING leaves the row alone on a collision...
 	ignored := run(t, store, "INSERT INTO stock (id, name, qty) VALUES (1, 'a', 100) ON CONFLICT DO NOTHING")
+	defer db.sql_result_destroy(&ignored)
 	testing.expect_value(t, ignored.affected, 0)
 	testing.expect_value(t, scalar(t, store, "SELECT qty FROM stock WHERE id = 1").i, i64(6))
 	// ...and inserts normally when there is no collision.
@@ -6840,6 +6923,7 @@ test_any_column_affinity :: proc(t: ^testing.T) {
 	run_done(t, store, "INSERT INTO mixed (id, v) VALUES (5, NULL)")
 
 	kinds := run(t, store, "SELECT v, typeof(v) FROM mixed ORDER BY id")
+	defer db.sql_result_destroy(&kinds)
 	testing.expect_value(t, len(kinds.rows), 5)
 	testing.expect_value(t, kinds.rows[0][1].s, "integer")
 	testing.expect_value(t, kinds.rows[0][0].i, i64(10))
@@ -6874,6 +6958,7 @@ test_sqlite_import_typeless_column :: proc(t: ^testing.T) {
 	testing.expect(t, db.error_ok(import_err))
 	testing.expect_value(t, rows, 4)
 	kinds := run(t, store, "SELECT typeof(v) FROM mixed ORDER BY id")
+	defer db.sql_result_destroy(&kinds)
 	testing.expect_value(t, kinds.rows[0][0].s, "integer")
 	testing.expect_value(t, kinds.rows[1][0].s, "text")
 	testing.expect_value(t, kinds.rows[2][0].s, "real")
@@ -8027,7 +8112,7 @@ test_using_column_is_the_joins :: proc(t: ^testing.T) {
 	run_done(t, store, "INSERT INTO w VALUES (1, 3), (7, 8)")
 	testing.expect_value(t, scalar(t, store, "SELECT a FROM v JOIN w USING (a)").i, i64(1))
 	testing.expect_value(t, scalar(t, store, "SELECT a FROM v NATURAL JOIN w").i, i64(1))
-	full := run(t, store, "SELECT a FROM v FULL JOIN w USING (a) ORDER BY a").rows
+	full := run_temp(t, store, "SELECT a FROM v FULL JOIN w USING (a) ORDER BY a").rows
 	if testing.expect_value(t, len(full), 3) {
 		testing.expect_value(t, full[0][0].i, i64(1))
 		testing.expect_value(t, full[1][0].i, i64(5))
@@ -8238,6 +8323,7 @@ test_attach_and_detach :: proc(t: ^testing.T) {
 	attach_sql := fmt.aprintf("ATTACH '%s' AS side", other_path)
 	defer delete(attach_sql)
 	attach_result := run(t, store, attach_sql)
+	defer db.sql_result_destroy(&attach_result)
 	testing.expect_value(t, attach_result.kind, db.Sql_Result_Kind.Ack)
 	count := scalar(t, store, "SELECT count(*) FROM side.other_items")
 	testing.expect_value(t, count.i, i64(2))
@@ -8291,6 +8377,7 @@ test_attach_and_detach :: proc(t: ^testing.T) {
 
 	// DETACH forgets it, and a reopen stays detached.
 	detach_result := run(t, reopened, "DETACH side")
+	defer db.sql_result_destroy(&detach_result)
 	testing.expect_value(t, detach_result.kind, db.Sql_Result_Kind.Ack)
 	_, gone := db.sql_execute(reopened, "SELECT * FROM side.other_items")
 	testing.expect_value(t, gone.kind, db.Error_Kind.Table_Not_Found)
@@ -8379,46 +8466,48 @@ test_pragma_list_and_accepted_settings :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer destroy_host(store, host, "pragma_extra")
 	names := run(t, store, "PRAGMA pragma_list")
+	defer db.sql_result_destroy(&names)
 	found := false
 	for row in names.rows {
 		if row[0].s == "table_info" do found = true
 	}
 	testing.expect(t, found)
 	functions := run(t, store, "PRAGMA function_list")
+	defer db.sql_result_destroy(&functions)
 	testing.expect(t, len(functions.rows) > 20)
 	// Settings a client inspects answer what the engine actually does, not a
 	// neutral number: a database that claims WAL or a page cache it does not have
 	// makes a caller build on a guarantee that is not there.
-	testing.expect_value(t, run(t, store, "PRAGMA cache_size").rows[0][0].i, i64(0))
-	testing.expect_value(t, run(t, store, "PRAGMA mmap_size").rows[0][0].i, i64(0))
-	testing.expect_value(t, run(t, store, "PRAGMA page_size").rows[0][0].i, i64(4096))
-	testing.expect_value(t, run(t, store, "PRAGMA encoding").rows[0][0].s, "UTF-8")
-	testing.expect_value(t, run(t, store, "PRAGMA foreign_keys").rows[0][0].i, i64(1))
-	testing.expect_value(t, run(t, store, "PRAGMA journal_mode").rows[0][0].s, "delete")
+	testing.expect_value(t, run_temp(t, store, "PRAGMA cache_size").rows[0][0].i, i64(0))
+	testing.expect_value(t, run_temp(t, store, "PRAGMA mmap_size").rows[0][0].i, i64(0))
+	testing.expect_value(t, run_temp(t, store, "PRAGMA page_size").rows[0][0].i, i64(4096))
+	testing.expect_value(t, run_temp(t, store, "PRAGMA encoding").rows[0][0].s, "UTF-8")
+	testing.expect_value(t, run_temp(t, store, "PRAGMA foreign_keys").rows[0][0].i, i64(1))
+	testing.expect_value(t, run_temp(t, store, "PRAGMA journal_mode").rows[0][0].s, "delete")
 	// fresh_db opens with durable = false, so the honest answer is OFF (0).
-	testing.expect_value(t, run(t, store, "PRAGMA synchronous").rows[0][0].i, i64(0))
-	testing.expect_value(t, run(t, store, "PRAGMA data_version").rows[0][0].i, i64(store.commit_seq))
-	testing.expect_value(t, run(t, store, "PRAGMA freelist_count").rows[0][0].i, i64(0))
-	testing.expect(t, run(t, store, "PRAGMA page_count").rows[0][0].i > 0)
+	testing.expect_value(t, run_temp(t, store, "PRAGMA synchronous").rows[0][0].i, i64(0))
+	testing.expect_value(t, run_temp(t, store, "PRAGMA data_version").rows[0][0].i, i64(store.commit_seq))
+	testing.expect_value(t, run_temp(t, store, "PRAGMA freelist_count").rows[0][0].i, i64(0))
+	testing.expect(t, run_temp(t, store, "PRAGMA page_count").rows[0][0].i > 0)
 
 	// synchronous is a real setting: it moves the durability of the next commit.
-	testing.expect_value(t, run(t, store, "PRAGMA synchronous = NORMAL").kind, db.Sql_Result_Kind.Ack)
-	testing.expect_value(t, run(t, store, "PRAGMA synchronous").rows[0][0].i, i64(1))
+	testing.expect_value(t, run_temp(t, store, "PRAGMA synchronous = NORMAL").kind, db.Sql_Result_Kind.Ack)
+	testing.expect_value(t, run_temp(t, store, "PRAGMA synchronous").rows[0][0].i, i64(1))
 	testing.expect_value(t, store.log.durability, db.Durability.Batched)
-	testing.expect_value(t, run(t, store, "PRAGMA synchronous = FULL").kind, db.Sql_Result_Kind.Ack)
+	testing.expect_value(t, run_temp(t, store, "PRAGMA synchronous = FULL").kind, db.Sql_Result_Kind.Ack)
 	testing.expect_value(t, store.log.durability, db.Durability.Full)
 	_, bad_level := db.sql_execute(store, "PRAGMA synchronous = sometimes")
 	testing.expect_value(t, bad_level.kind, db.Error_Kind.Invalid_Argument)
 
 	// A knob that would change what a statement does cannot be accepted silently:
 	// the read tells the truth and the write is refused.
-	testing.expect_value(t, run(t, store, "PRAGMA query_only").rows[0][0].i, i64(0))
+	testing.expect_value(t, run_temp(t, store, "PRAGMA query_only").rows[0][0].i, i64(0))
 	_, query_only := db.sql_execute(store, "PRAGMA query_only = ON")
 	testing.expect_value(t, query_only.kind, db.Error_Kind.Sql_Unsupported)
 
 	// Tuning knobs with no equivalent are still accepted.
-	testing.expect_value(t, run(t, store, "PRAGMA busy_timeout = 5000").kind, db.Sql_Result_Kind.Ack)
-	testing.expect_value(t, run(t, store, "PRAGMA busy_timeout").rows[0][0].i, i64(0))
+	testing.expect_value(t, run_temp(t, store, "PRAGMA busy_timeout = 5000").kind, db.Sql_Result_Kind.Ack)
+	testing.expect_value(t, run_temp(t, store, "PRAGMA busy_timeout").rows[0][0].i, i64(0))
 
 	_, unknown := db.sql_execute(store, "PRAGMA not_a_pragma")
 	testing.expect_value(t, unknown.kind, db.Error_Kind.Sql_Unsupported)
@@ -8452,12 +8541,14 @@ test_insert_select :: proc(t: ^testing.T) {
 	run_done(t, store, "INSERT INTO src (name, qty) VALUES ('a', 1), ('b', 2), ('c', 3)")
 	run_done(t, store, "CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)")
 	inserted := run(t, store, "INSERT INTO dst (name, qty) SELECT name, qty FROM src WHERE qty > 1")
+	defer db.sql_result_destroy(&inserted)
 	testing.expect_value(t, inserted.affected, 2)
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM dst").i, i64(2))
 	// A query without FROM supplies literal values.
-	testing.expect_value(t, run(t, store, "INSERT INTO dst (name, qty) SELECT 'x', 9").affected, 1)
+	testing.expect_value(t, run_temp(t, store, "INSERT INTO dst (name, qty) SELECT 'x', 9").affected, 1)
 	// RETURNING reports the rows the query supplied.
 	back := run(t, store, "INSERT INTO dst (name, qty) SELECT name, qty FROM src WHERE qty >= 3 RETURNING name")
+	defer db.sql_result_destroy(&back)
 	testing.expect_value(t, len(back.rows), 1)
 	testing.expect_value(t, back.rows[0][0].s, "c")
 	// An arity mismatch is rejected before anything is written.
@@ -8475,7 +8566,7 @@ test_upsert_excluded :: proc(t: ^testing.T) {
 	run_done(t, store, "INSERT INTO u (name, hits) VALUES ('a', 1)")
 	// `excluded.col` is the proposed row; `u.col` and a bare `col` are stored.
 	run_done(t, store, "INSERT INTO u (id, name, hits) VALUES (1, 'b', 5) ON CONFLICT (id) DO UPDATE SET name = excluded.name, hits = u.hits + excluded.hits")
-	row := run(t, store, "SELECT name, hits FROM u").rows[0]
+	row := run_temp(t, store, "SELECT name, hits FROM u").rows[0]
 	testing.expect_value(t, row[0].s, "b")
 	testing.expect_value(t, row[1].i, i64(6))
 	// A bare column still means the stored value.
@@ -8483,7 +8574,7 @@ test_upsert_excluded :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT hits FROM u").i, i64(7))
 	// The proposed row is available to functions and operators.
 	run_done(t, store, "INSERT INTO u (id, name, hits) VALUES (1, 'd', 2) ON CONFLICT (id) DO UPDATE SET name = upper(excluded.name) || '!', hits = excluded.hits * 2")
-	row = run(t, store, "SELECT name, hits FROM u").rows[0]
+	row = run_temp(t, store, "SELECT name, hits FROM u").rows[0]
 	testing.expect_value(t, row[0].s, "D!")
 	testing.expect_value(t, row[1].i, i64(4))
 }
@@ -8497,6 +8588,7 @@ test_text_and_blob_functions :: proc(t: ^testing.T) {
 	run_done(t, store, "INSERT INTO g (k, v) VALUES ('a', 1), ('a', 2), ('b', NULL), ('b', 3)")
 	// group_concat joins the non-null values of each group, in row order.
 	grouped := run(t, store, "SELECT k, group_concat(v), group_concat(v, '|') FROM g GROUP BY k ORDER BY k")
+	defer db.sql_result_destroy(&grouped)
 	testing.expect_value(t, grouped.rows[0][1].s, "1,2")
 	testing.expect_value(t, grouped.rows[0][2].s, "1|2")
 	testing.expect_value(t, grouped.rows[1][1].s, "3")
@@ -8710,7 +8802,7 @@ test_text_truth_is_numeric :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t WHERE s").i, i64(1))
 	// A number and a text are different storage classes: they are not equal,
 	// as in SQLite, unless a column's affinity converts one of them first.
-	testing.expect_value(t, len(run(t, store, `SELECT 1 WHERE 1 = '1'`).rows), 0)
+	testing.expect_value(t, len(run_temp(t, store, `SELECT 1 WHERE 1 = '1'`).rows), 0)
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t WHERE id = '2'").i, i64(1))
 }
 
@@ -8786,7 +8878,7 @@ test_insert_or_replace :: proc(t: ^testing.T) {
 	// SQLite's behaviour with recursive triggers off.
 	run_done(t, store, "CREATE TABLE audited (id INTEGER PRIMARY KEY, v TEXT)")
 	run_done(t, store, "CREATE TABLE audit (note TEXT)")
-	run(t, store, `
+	run_done(t, store, `
 		CREATE TRIGGER audited_del BEFORE DELETE ON audited
 		BEGIN INSERT INTO audit (note) VALUES ('deleted'); END`)
 	run_done(t, store, "INSERT INTO audited VALUES (1, 'old')")
@@ -8928,6 +9020,7 @@ test_common_table_expressions :: proc(t: ^testing.T) {
 	run_done(t, store, "INSERT INTO t (n, v) VALUES ('a', 1), ('b', 2), ('c', 3)")
 
 	big := run(t, store, "WITH big AS (SELECT * FROM t WHERE v > 1) SELECT n FROM big ORDER BY n")
+	defer db.sql_result_destroy(&big)
 	testing.expect_value(t, len(big.rows), 2)
 	testing.expect_value(t, big.rows[0][0].s, "b")
 	testing.expect_value(t, big.rows[1][0].s, "c")
@@ -8958,14 +9051,18 @@ test_union_queries :: proc(t: ^testing.T) {
 
 	// UNION drops duplicates; UNION ALL keeps them.
 	deduped := run(t, store, "SELECT x FROM a WHERE x <= 2 UNION SELECT x FROM a WHERE x >= 2")
+	defer db.sql_result_destroy(&deduped)
 	testing.expect_value(t, len(deduped.rows), 3)
 	all_rows := run(t, store, "SELECT x FROM a WHERE x <= 2 UNION ALL SELECT x FROM a WHERE x >= 2")
+	defer db.sql_result_destroy(&all_rows)
 	testing.expect_value(t, len(all_rows.rows), 4)
 	// Chains and tail clauses apply to the merged result.
 	chained := run(t, store, "SELECT 1 AS v UNION SELECT 2 UNION SELECT 3 ORDER BY v DESC")
+	defer db.sql_result_destroy(&chained)
 	testing.expect_value(t, len(chained.rows), 3)
 	testing.expect_value(t, chained.rows[0][0].i, i64(3))
 	limited := run(t, store, "SELECT x FROM a UNION SELECT x * 10 FROM a ORDER BY x DESC LIMIT 2")
+	defer db.sql_result_destroy(&limited)
 	testing.expect_value(t, len(limited.rows), 2)
 	testing.expect_value(t, limited.rows[0][0].i, i64(30))
 	// Arity must match.
@@ -8979,10 +9076,12 @@ test_recursive_cte :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer destroy_host(store, host, "recursive_cte")
 	counting := run(t, store, "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 10) SELECT count(*), max(x) FROM cnt")
+	defer db.sql_result_destroy(&counting)
 	testing.expect_value(t, counting.rows[0][0].i, i64(10))
 	testing.expect_value(t, counting.rows[0][1].i, i64(10))
 	// The step reads the accumulated rows: 5! = 120.
 	factorial := run(t, store, "WITH RECURSIVE f(n, value) AS (SELECT 1, 1 UNION ALL SELECT n + 1, value * (n + 1) FROM f WHERE n < 5) SELECT value FROM f ORDER BY n DESC LIMIT 1")
+	defer db.sql_result_destroy(&factorial)
 	testing.expect_value(t, factorial.rows[0][0].i, i64(120))
 	// A query that never stops fails at the step quota instead of running away.
 	previous := db.recursion_limit
@@ -9016,9 +9115,11 @@ test_collate_expressions :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM p WHERE name LIKE 'ali%'").i, i64(3))
 	// ORDER BY sorts on the folded key.
 	ordered := run(t, store, "SELECT name FROM p WHERE name <> 'pad' AND name <> 'pad ' ORDER BY name COLLATE NOCASE")
+	defer db.sql_result_destroy(&ordered)
 	testing.expect_value(t, len(ordered.rows), 4)
 	testing.expect_value(t, ordered.rows[3][0].s, "Bob")
 	descending := run(t, store, "SELECT name FROM p WHERE name <> 'pad' AND name <> 'pad ' ORDER BY name COLLATE NOCASE DESC")
+	defer db.sql_result_destroy(&descending)
 	testing.expect_value(t, descending.rows[0][0].s, "Bob")
 }
 
@@ -9067,8 +9168,9 @@ test_update_from_delete_using :: proc(t: ^testing.T) {
 
 	// The joined row feeds both the WHERE and the assignments.
 	updated := run(t, store, "UPDATE t SET price = price * src.factor, tag = src.note FROM src WHERE t.id = src.id")
+	defer db.sql_result_destroy(&updated)
 	testing.expect_value(t, updated.affected, 2)
-	rows := run(t, store, "SELECT id, price, tag FROM t ORDER BY id").rows
+	rows := run_temp(t, store, "SELECT id, price, tag FROM t ORDER BY id").rows
 	testing.expect_value(t, rows[0][1].i, i64(20))
 	testing.expect_value(t, rows[0][2].s, "x")
 	testing.expect_value(t, rows[1][1].i, i64(20))
@@ -9078,12 +9180,14 @@ test_update_from_delete_using :: proc(t: ^testing.T) {
 
 	// DELETE ... USING removes only the targets the join matches.
 	deleted := run(t, store, "DELETE FROM t USING src WHERE t.id = src.id AND src.factor > 3")
+	defer db.sql_result_destroy(&deleted)
 	testing.expect_value(t, deleted.affected, 1)
 	remaining := run(t, store, "SELECT id FROM t ORDER BY id")
+	defer db.sql_result_destroy(&remaining)
 	testing.expect_value(t, len(remaining.rows), 2)
 	testing.expect_value(t, remaining.rows[1][0].i, i64(2))
 	// Without FROM the plain form still works.
-	testing.expect_value(t, run(t, store, "UPDATE t SET price = price + 1").affected, 2)
+	testing.expect_value(t, run_temp(t, store, "UPDATE t SET price = price + 1").affected, 2)
 }
 
 @(test)
@@ -9266,7 +9370,7 @@ test_strict_table_option :: proc(t: ^testing.T) {
 	// SQLite walks a WITHOUT ROWID table in its key's order, so does a scan here.
 	run_done(t, store, "CREATE TABLE z (x, y, z, PRIMARY KEY (z, x)) WITHOUT ROWID")
 	run_done(t, store, "INSERT INTO z VALUES ('x1', 'y1', 2), ('x0', 'y2', 2), ('x9', 'y3', 1)")
-	scanned := run(t, store, "SELECT x FROM z").rows
+	scanned := run_temp(t, store, "SELECT x FROM z").rows
 	testing.expect_value(t, len(scanned), 3)
 	if len(scanned) == 3 {
 		testing.expect_value(t, scanned[0][0].s, "x9")
@@ -9316,16 +9420,16 @@ test_bare_columns_follow_min_max :: proc(t: ^testing.T) {
 	run_done(t, store, "INSERT INTO t VALUES (1, 1, 'x'), (1, 5, 'y'), (1, 3, 'z'), (2, NULL, 'n'), (2, 7, 'q'), (2, 7, 'r'), (3, NULL, 'o1'), (3, NULL, 'o2')")
 	testing.expect_value(t, scalar(t, store, "SELECT b FROM (SELECT max(a), b FROM t)").s, "q")
 	testing.expect_value(t, scalar(t, store, "SELECT b FROM (SELECT min(a), b FROM t)").s, "x")
-	grouped := run(t, store, "SELECT g, max(a), b FROM t GROUP BY g ORDER BY g").rows
+	grouped := run_temp(t, store, "SELECT g, max(a), b FROM t GROUP BY g ORDER BY g").rows
 	testing.expect_value(t, len(grouped), 3)
 	if len(grouped) == 3 {
 		testing.expect_value(t, grouped[0][2].s, "y")
 		testing.expect_value(t, grouped[1][2].s, "q")
 		testing.expect_value(t, grouped[2][2].s, "o2")
 	}
-	both := run(t, store, "SELECT g, max(a), min(a), b FROM t WHERE g = 1 GROUP BY g").rows
+	both := run_temp(t, store, "SELECT g, max(a), min(a), b FROM t WHERE g = 1 GROUP BY g").rows
 	if testing.expect_value(t, len(both), 1) do testing.expect_value(t, both[0][3].s, "x")
-	counted := run(t, store, "SELECT g, count(*), b FROM t WHERE g = 2 GROUP BY g").rows
+	counted := run_temp(t, store, "SELECT g, count(*), b FROM t WHERE g = 2 GROUP BY g").rows
 	if testing.expect_value(t, len(counted), 1) do testing.expect_value(t, counted[0][2].s, "n")
 }
 
@@ -9336,7 +9440,7 @@ test_alter_table_drop_column :: proc(t: ^testing.T) {
 	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INTEGER, c TEXT)")
 	run_done(t, store, "INSERT INTO t (a, b, c) VALUES ('x', 10, 'y'), ('z', 20, 'w')")
 	run_done(t, store, "ALTER TABLE t DROP COLUMN b")
-	rows := run(t, store, "SELECT id, a, c FROM t ORDER BY id").rows
+	rows := run_temp(t, store, "SELECT id, a, c FROM t ORDER BY id").rows
 	testing.expect_value(t, len(rows), 2)
 	testing.expect_value(t, rows[0][1].s, "x")
 	testing.expect_value(t, rows[0][2].s, "y")
@@ -9456,22 +9560,22 @@ test_window_functions :: proc(t: ^testing.T) {
 	run_done(t, store, "INSERT INTO s (g, n) VALUES ('a', 10), ('a', 20), ('b', 5), ('b', 5), ('b', 7)")
 
 	// row_number follows the window ORDER BY, which may be descending.
-	numbered := run(t, store, "SELECT id, row_number() OVER (ORDER BY id DESC) AS rn FROM s ORDER BY id").rows
+	numbered := run_temp(t, store, "SELECT id, row_number() OVER (ORDER BY id DESC) AS rn FROM s ORDER BY id").rows
 	testing.expect_value(t, len(numbered), 5)
 	for row, i in numbered do testing.expect_value(t, row[1].i, i64(5 - i))
 
 	// A partition with no ORDER BY aggregates the whole partition.
-	totals := run(t, store, "SELECT id, sum(n) OVER (PARTITION BY g) AS total FROM s ORDER BY id").rows
+	totals := run_temp(t, store, "SELECT id, sum(n) OVER (PARTITION BY g) AS total FROM s ORDER BY id").rows
 	want_totals := []i64{30, 30, 17, 17, 17}
 	for row, i in totals do testing.expect_value(t, row[1].i, want_totals[i])
 
 	// With ORDER BY the frame runs to the last peer: a running total.
-	running := run(t, store, "SELECT id, sum(n) OVER (PARTITION BY g ORDER BY id) AS r FROM s ORDER BY id").rows
+	running := run_temp(t, store, "SELECT id, sum(n) OVER (PARTITION BY g ORDER BY id) AS r FROM s ORDER BY id").rows
 	want_running := []i64{10, 30, 5, 10, 17}
 	for row, i in running do testing.expect_value(t, row[1].i, want_running[i])
 
 	// Rank and dense_rank share peers but count them differently.
-	ranked := run(t, store, "SELECT id, rank() OVER (ORDER BY n) AS r, dense_rank() OVER (ORDER BY n) AS d FROM s ORDER BY id").rows
+	ranked := run_temp(t, store, "SELECT id, rank() OVER (ORDER BY n) AS r, dense_rank() OVER (ORDER BY n) AS d FROM s ORDER BY id").rows
 	want_rank := []i64{4, 5, 1, 1, 3}
 	want_dense := []i64{3, 4, 1, 1, 2}
 	for row, i in ranked {
@@ -9480,30 +9584,30 @@ test_window_functions :: proc(t: ^testing.T) {
 	}
 
 	// lag and lead read other rows, and lag falls back to its default.
-	shifted := run(t, store, "SELECT id, lag(n, 1, -1) OVER (ORDER BY id) AS prev, lead(n) OVER (ORDER BY id) AS next FROM s ORDER BY id").rows
+	shifted := run_temp(t, store, "SELECT id, lag(n, 1, -1) OVER (ORDER BY id) AS prev, lead(n) OVER (ORDER BY id) AS next FROM s ORDER BY id").rows
 	testing.expect_value(t, shifted[0][1].i, i64(-1))
 	testing.expect_value(t, shifted[0][2].i, i64(20))
 	testing.expect_value(t, shifted[4][1].i, i64(5))
 	testing.expect_value(t, shifted[4][2].kind, db.Value_Kind.Null)
 
 	// count(*) and avg() as windows, and first_value/last_value on the frame.
-	counted := run(t, store, "SELECT id, count(*) OVER (PARTITION BY g) AS c FROM s ORDER BY id").rows
+	counted := run_temp(t, store, "SELECT id, count(*) OVER (PARTITION BY g) AS c FROM s ORDER BY id").rows
 	want_count := []i64{2, 2, 3, 3, 3}
 	for row, i in counted do testing.expect_value(t, row[1].i, want_count[i])
-	edges := run(t, store, "SELECT id, first_value(n) OVER (PARTITION BY g ORDER BY id) AS f, last_value(n) OVER (PARTITION BY g ORDER BY id) AS l FROM s ORDER BY id").rows
+	edges := run_temp(t, store, "SELECT id, first_value(n) OVER (PARTITION BY g ORDER BY id) AS f, last_value(n) OVER (PARTITION BY g ORDER BY id) AS l FROM s ORDER BY id").rows
 	testing.expect_value(t, edges[1][1].i, i64(10))
 	testing.expect_value(t, edges[1][2].i, i64(20))
 	testing.expect_value(t, edges[4][1].i, i64(5))
 	testing.expect_value(t, edges[4][2].i, i64(7))
 
 	// ORDER BY can name the window projection, and LIMIT applies after it.
-	alias_sorted := run(t, store, "SELECT id, row_number() OVER (ORDER BY id DESC) AS rn FROM s ORDER BY rn LIMIT 2").rows
+	alias_sorted := run_temp(t, store, "SELECT id, row_number() OVER (ORDER BY id DESC) AS rn FROM s ORDER BY rn LIMIT 2").rows
 	testing.expect_value(t, len(alias_sorted), 2)
 	testing.expect_value(t, alias_sorted[0][0].i, i64(5))
 	testing.expect_value(t, alias_sorted[1][0].i, i64(4))
 
 	// ntile splits the rows into buckets, larger buckets first.
-	buckets := run(t, store, "SELECT id, ntile(2) OVER (ORDER BY id) AS b FROM s ORDER BY id").rows
+	buckets := run_temp(t, store, "SELECT id, ntile(2) OVER (ORDER BY id) AS b FROM s ORDER BY id").rows
 	want_bucket := []i64{1, 1, 1, 2, 2}
 	for row, i in buckets do testing.expect_value(t, row[1].i, want_bucket[i])
 
@@ -9537,7 +9641,7 @@ test_triggers :: proc(t: ^testing.T) {
 	run_done(t, store, "CREATE TRIGGER t_del AFTER DELETE ON t BEGIN INSERT INTO audit (note) VALUES ('del:' || OLD.a); END")
 
 	run_done(t, store, "INSERT INTO t (a) VALUES ('x'), ('y')")
-	notes := run(t, store, "SELECT note FROM audit ORDER BY id").rows
+	notes := run_temp(t, store, "SELECT note FROM audit ORDER BY id").rows
 	testing.expect_value(t, len(notes), 4)
 	testing.expect_value(t, notes[0][0].s, "in:x")
 	testing.expect_value(t, notes[1][0].s, "count:1")
@@ -9729,7 +9833,7 @@ test_value_layout :: proc(t: ^testing.T) {
 	// decoded on replay and held in rows of the new layout.
 	store := fresh_db(t, "value_layout")
 	if store == nil do return
-	run(t, store, `CREATE TABLE v (
+	run_done(t, store, `CREATE TABLE v (
 		id INTEGER PRIMARY KEY,
 		u  UUID,
 		b  INT128,
@@ -10901,19 +11005,19 @@ test_before_triggers :: proc(t: ^testing.T) {
 	defer cleanup_db(store, "trigger_before")
 	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
 	run_done(t, store, "CREATE TABLE log (id INTEGER PRIMARY KEY AUTOINCREMENT, note TEXT NOT NULL)")
-	run(t, store, `
+	run_done(t, store, `
 		CREATE TRIGGER t_before BEFORE INSERT ON t
 		BEGIN INSERT INTO log (note) VALUES ('before ' || NEW.v); END`)
-	run(t, store, `
+	run_done(t, store, `
 		CREATE TRIGGER t_after AFTER INSERT ON t
 		BEGIN INSERT INTO log (note) VALUES ('after ' || NEW.v); END`)
 	run_done(t, store, "INSERT INTO t (id, v) VALUES (1, 10)")
 
-	run(t, store, `
+	run_done(t, store, `
 		CREATE TRIGGER t_update BEFORE UPDATE ON t
 		BEGIN INSERT INTO log (note) VALUES ('upd ' || OLD.v || '->' || NEW.v); END`)
 	run_done(t, store, "UPDATE t SET v = 11 WHERE id = 1")
-	run(t, store, `
+	run_done(t, store, `
 		CREATE TRIGGER t_delete BEFORE DELETE ON t
 		BEGIN INSERT INTO log (note) VALUES ('del ' || OLD.v); END`)
 	run_done(t, store, "DELETE FROM t WHERE id = 1")
@@ -10931,7 +11035,7 @@ test_before_triggers :: proc(t: ^testing.T) {
 	// A BEFORE trigger whose body fails stops the insert, and the rows its body
 	// wrote are gone with the statement.
 	run_done(t, store, "CREATE TABLE guard (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
-	run(t, store, `
+	run_done(t, store, `
 		CREATE TRIGGER guard_stop BEFORE INSERT ON guard WHEN NEW.v > 0
 		BEGIN INSERT INTO log (note) VALUES ('refused'); INSERT INTO nope (x) VALUES (1); END`)
 	refused := run_error(t, store, "INSERT INTO guard (id, v) VALUES (1, 1)")
@@ -12421,7 +12525,7 @@ test_window_range_and_groups_frames :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "window_frames_offsets")
 	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT, n INTEGER, v REAL)")
-	run(t, store, `
+	run_done(t, store, `
 		INSERT INTO t (id, g, n, v) VALUES
 		 (1,'a',10,1.5),(2,'a',20,2.5),(3,'a',20,2.5),(4,'a',40,4.5),
 		 (5,'b',10,1.5),(6,'b',30,3.5),(7,'b',30,3.5),(8,'b',30,3.5)`)
@@ -13987,7 +14091,9 @@ test_host_collations :: proc(t: ^testing.T) {
 	// ORDER BY ranks the values under the host comparison, as SQLite orders
 	// them: by length, then by bytes; DESC reverses it.
 	ordered := run(t, store, "SELECT name FROM w ORDER BY name COLLATE by_length")
+	defer db.sql_result_destroy(&ordered)
 	descending := run(t, store, "SELECT name FROM w ORDER BY name COLLATE by_length DESC")
+	defer db.sql_result_destroy(&descending)
 	want := []string{"ab", "xy", "abc", "abcd"}
 	if testing.expect_value(t, len(ordered.rows), 4) && testing.expect_value(t, len(descending.rows), 4) {
 		for name, i in want {
@@ -13998,11 +14104,12 @@ test_host_collations :: proc(t: ^testing.T) {
 
 	// GROUP BY and DISTINCT group by the classes the comparison makes: 'ab'
 	// and 'xy' are not equal by length then bytes, so every name is its own.
-	testing.expect_value(t, len(run(t, store, "SELECT name FROM w GROUP BY name COLLATE by_length").rows), 4)
-	testing.expect_value(t, len(run(t, store, "SELECT DISTINCT name COLLATE by_length FROM w").rows), 4)
+	testing.expect_value(t, len(run_temp(t, store, "SELECT name FROM w GROUP BY name COLLATE by_length").rows), 4)
+	testing.expect_value(t, len(run_temp(t, store, "SELECT DISTINCT name COLLATE by_length FROM w").rows), 4)
 	// A window's ORDER BY ranks under it too: the running sum follows the
 	// comparison's order, 'ab' (2), 'xy' (2), 'abc' (3), 'abcd' (4).
 	running := run(t, store, "SELECT name, sum(length(name)) OVER (ORDER BY name COLLATE by_length) FROM w ORDER BY 2")
+	defer db.sql_result_destroy(&running)
 	if testing.expect_value(t, len(running.rows), 4) {
 		testing.expect_value(t, running.rows[0][1].i, i64(2))
 		testing.expect_value(t, running.rows[3][1].i, i64(11))

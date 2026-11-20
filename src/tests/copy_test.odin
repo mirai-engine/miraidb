@@ -120,13 +120,11 @@ test_copy_refuses_a_bad_row :: proc(t: ^testing.T) {
 	// A field that is not the column's type names the row and the column.
 	_ = os.write_entire_file("_test_copy_bad.txt", "1\tok\nnope\tx\n")
 	bad := run_error(t, store, "COPY t FROM '_test_copy_bad.txt'")
-	defer db.error_free(&bad)
 	testing.expect_value(t, bad.kind, db.Error_Kind.Invalid_Type)
 
 	// A duplicate key half way through writes none of the rows before it.
 	_ = os.write_entire_file("_test_copy_bad.txt", "1\tok\n1\tagain\n")
 	duplicate := run_error(t, store, "COPY t FROM '_test_copy_bad.txt'")
-	defer db.error_free(&duplicate)
 	testing.expect_value(t, duplicate.kind, db.Error_Kind.Duplicate_Primary_Key)
 	count := run(t, store, "SELECT count(*) FROM t")
 	defer db.sql_result_destroy(&count)
@@ -135,28 +133,23 @@ test_copy_refuses_a_bad_row :: proc(t: ^testing.T) {
 	// The wrong number of fields is refused before anything is written.
 	_ = os.write_entire_file("_test_copy_bad.txt", "1\n")
 	short := run_error(t, store, "COPY t FROM '_test_copy_bad.txt'")
-	defer db.error_free(&short)
 	testing.expect_value(t, short.kind, db.Error_Kind.Invalid_Argument)
 
 	// A NULL in a NOT NULL column is the insert's own error, under the row that
 	// caused it.
 	_ = os.write_entire_file("_test_copy_bad.txt", "2\t\\N\n")
 	null_row := run_error(t, store, "COPY t FROM '_test_copy_bad.txt'")
-	defer db.error_free(&null_row)
 	testing.expect_value(t, null_row.kind, db.Error_Kind.Not_Null_Violation)
 
 	// STDIN belongs to a client: the engine says so instead of reading a stream
 	// nobody is writing to.
 	stdin := run_error(t, store, "COPY t FROM STDIN")
-	defer db.error_free(&stdin)
 	testing.expect_value(t, stdin.kind, db.Error_Kind.Sql_Unsupported)
 
 	// A table that is not there, and a column that is not there.
 	missing_table := run_error(t, store, "COPY gone FROM '_test_copy_bad.txt'")
-	defer db.error_free(&missing_table)
 	testing.expect_value(t, missing_table.kind, db.Error_Kind.Table_Not_Found)
 	missing_column := run_error(t, store, "COPY t (nope) TO '_test_copy_bad.txt'")
-	defer db.error_free(&missing_column)
 	testing.expect_value(t, missing_column.kind, db.Error_Kind.Column_Not_Found)
 }
 
@@ -251,6 +244,5 @@ test_grouping_sets :: proc(t: ^testing.T) {
 
 	// GROUPING() outside a grouping clause says so instead of answering 0.
 	refused := run_error(t, store, "SELECT grouping(region) FROM sales")
-	defer db.error_free(&refused)
 	testing.expect_value(t, refused.kind, db.Error_Kind.Invalid_Argument)
 }
