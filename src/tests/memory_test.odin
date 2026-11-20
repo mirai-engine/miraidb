@@ -960,3 +960,37 @@ test_probes_for_a_table_leave_nothing :: proc(t: ^testing.T) {
 		"CREATE TABLE child (id INTEGER PRIMARY KEY, p INT REFERENCES nowhere (id))",
 	}, fails = true)
 }
+
+@(test)
+test_a_program_function_error_leaves_nothing :: proc(t: ^testing.T) {
+	// A program's function answers in the caller's allocator; the statement
+	// copied its error's message out and kept the program's copy.
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	{
+		context.allocator = mem.tracking_allocator(&track)
+		store, open_err := db.store_open("", {persistent = false})
+		if !testing.expect(t, db.error_ok(open_err)) do return
+		testing.expect(t, db.error_ok(db.store_register_function(store, "refuse", 1, refuse_function, nil)))
+		for _ in 0 ..< 3 {
+			result, err := db.sql_execute(store, "SELECT refuse(1)")
+			testing.expect_value(t, err.kind, db.Error_Kind.Invalid_Argument)
+			db.sql_result_destroy(&result)
+			db.error_free(&err)
+		}
+		db.store_close(store)
+		free_all(context.temp_allocator)
+	}
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "%d bytes left from %v", entry.size, entry.location)
+	}
+	for entry in track.bad_free_array {
+		testing.expectf(t, false, "bad free of %p at %v", entry.memory, entry.location)
+	}
+}
+
+@(private = "file")
+refuse_function :: proc(args: []db.Value, user: rawptr) -> (db.Value, db.Error) {
+	return {}, db.errf(.Invalid_Argument, "refuse() was called with %d", len(args))
+}

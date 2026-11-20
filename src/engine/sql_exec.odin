@@ -6638,6 +6638,32 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 	return value, err
 }
 
+// program_call runs a program's function with `outer`, the caller's allocator,
+// and moves the message of an error it answers into the statement's arena:
+// eval_call copies every message out of the arena, and a message the program
+// made in the heap was kept there.
+@(private)
+program_call :: proc(
+	ctx: ^Eval_Ctx,
+	fn: proc(args: []Value, user: rawptr) -> (Value, Error),
+	args: []Value,
+	user: rawptr,
+	outer: mem.Allocator,
+) -> (Value, Error) {
+	value: Value
+	err: Error
+	{
+		context.allocator = outer
+		value, err = fn(args, user)
+	}
+	if len(err.message) > 0 && ctx.tx != nil {
+		kept := strings.clone(err.message, ctx.tx.alloc)
+		delete(err.message, outer)
+		err.message = kept
+	}
+	return value, err
+}
+
 // eval_call_body answers a scalar function once its arguments are known. A
 // program's function runs with `outer`, the caller's allocator: it may do
 // anything (open a transaction, keep state), and what it makes is its own.
@@ -6648,15 +6674,14 @@ eval_call_body :: proc(ctx: ^Eval_Ctx, call: Call_Expr, args: []Value, outer: me
 	if ctx.tx != nil && ctx.tx.store != nil && len(ctx.tx.store.vtab_modules) > 0 && len(call.args) > 0 {
 		// Finding the overload may open the module's table: the store keeps it.
 		context.allocator = outer
-		if fn, user, overloaded := vtab_overload(ctx, call); overloaded do return fn(args[:], user)
+		if fn, user, overloaded := vtab_overload(ctx, call); overloaded do return program_call(ctx, fn, args[:], user, outer)
 		context.allocator = ctx.tx != nil ? ctx.tx.alloc : outer
 	}
 	// A host function registered to override a builtin answers before it, which
 	// is how SQLite treats an application-defined function with a builtin's name.
 	if ctx.tx != nil && ctx.tx.store != nil && len(ctx.tx.store.functions) > 0 {
 		if def, found, _ := store_function(ctx.tx.store, call.name, len(args)); found && def.overrides {
-			context.allocator = outer
-			return def.handler(args[:], def.user)
+			return program_call(ctx, def.handler, args[:], def.user, outer)
 		}
 	}
 
@@ -7297,10 +7322,7 @@ eval_call_body :: proc(ctx: ^Eval_Ctx, call: Call_Expr, args: []Value, outer: me
 	// the caller's mistake, in SQLite's words.
 	if ctx.tx != nil && ctx.tx.store != nil {
 		def, found, named := store_function(ctx.tx.store, call.name, len(args))
-		if found {
-			context.allocator = outer
-			return def.handler(args[:], def.user)
-		}
+		if found do return program_call(ctx, def.handler, args[:], def.user, outer)
 		if named do return {}, errf(.Invalid_Argument, "wrong number of arguments to function %s()", call.name)
 	}
 	return {}, errf(.Sql_Unsupported, "unknown function %s", call.name)
