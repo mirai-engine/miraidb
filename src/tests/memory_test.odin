@@ -593,3 +593,52 @@ test_subscriptions_leave_nothing :: proc(t: ^testing.T) {
 		testing.expectf(t, false, "bad free of %p at %v", entry.memory, entry.location)
 	}
 }
+
+@(test)
+test_the_wire_leaves_nothing :: proc(t: ^testing.T) {
+	// A subscription over the wire handed its snapshot to the encoder and kept
+	// it, and every error the wire answered kept its message.
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	{
+		context.allocator = mem.tracking_allocator(&track)
+		store, open_err := db.store_open("", {persistent = false})
+		if !testing.expect(t, db.error_ok(open_err)) do return
+		host := db.host_init(store)
+		for sql in ([]string{"CREATE TABLE t (id INTEGER PRIMARY KEY, v INT)", "INSERT INTO t VALUES (1, 5), (2, 6)"}) {
+			result, err := db.sql_execute(store, sql)
+			testing.expect(t, db.error_ok(err))
+			db.sql_result_destroy(&result)
+		}
+		exchange :: proc(host: ^db.Host, request: []u8) -> []u8 {
+			response := db.wire_request(host, request)
+			delete(request)
+			return response
+		}
+		failed := exchange(host, db.wire_encode_query("SELECT nope FROM t", nil))
+		testing.expect_value(t, wire_message_kind(failed), db.WIRE_ERROR)
+		delete(failed)
+		subscribed := exchange(host, db.wire_encode_subscribe([]string{"SELECT v FROM t"}))
+		testing.expect_value(t, wire_message_kind(subscribed), db.WIRE_SNAPSHOT)
+		id, _, _, decode_err := db.wire_decode_snapshot(subscribed, context.temp_allocator)
+		testing.expect(t, db.error_ok(decode_err))
+		delete(subscribed)
+		delete(exchange(host, db.wire_encode_unsubscribe(id)))
+		db.host_destroy(host)
+		db.store_close(store)
+		free_all(context.temp_allocator)
+	}
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "%d bytes left from %v", entry.size, entry.location)
+	}
+	for entry in track.bad_free_array {
+		testing.expectf(t, false, "bad free of %p at %v", entry.memory, entry.location)
+	}
+}
+
+@(private = "file")
+wire_message_kind :: proc(message: []u8) -> u32 {
+	if len(message) < 4 do return 0
+	return u32(message[0]) | u32(message[1]) << 8 | u32(message[2]) << 16 | u32(message[3]) << 24
+}

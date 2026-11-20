@@ -142,7 +142,11 @@ wire_encode_delta :: proc(update: ^Subscription_Update) -> []u8 {
 	return wire_finish(&w)
 }
 
+// wire_encode_error answers an error and frees it: every caller hands over
+// an error it is done with, and each message was left behind.
 wire_encode_error :: proc(err: Error) -> []u8 {
+	err := err
+	defer error_free(&err)
 	w: Byte_Writer
 	bw_init(&w)
 	bw_write_u32(&w, WIRE_ERROR)
@@ -179,7 +183,7 @@ wire_read_values :: proc(r: ^Byte_Reader, alloc: mem.Allocator) -> []Value {
 
 wire_read_rows :: proc(r: ^Byte_Reader, alloc: mem.Allocator) -> [][]Value {
 	count := int(br_read_u32(r))
-	rows := make([][]Value, count)
+	rows := make([][]Value, count, alloc)
 	for i in 0 ..< count do rows[i] = wire_read_values(r, alloc)
 	return rows
 }
@@ -219,7 +223,7 @@ wire_decode_snapshot :: proc(
 	id = br_read_u64(&r)
 	commit_seq = br_read_u64(&r)
 	count := int(br_read_u32(&r))
-	snapshot = make([][][]Value, count)
+	snapshot = make([][][]Value, count, alloc)
 	for i in 0 ..< count do snapshot[i] = wire_read_rows(&r, alloc)
 	if r.bad do return 0, 0, nil, errf(.Invalid_Argument, "truncated snapshot")
 	return id, commit_seq, snapshot, ERROR_NONE
@@ -297,6 +301,8 @@ wire_dispatch_owned :: proc(host: ^Host, data: []u8, owner: u64) -> []u8 {
 		for i in 0 ..< count do sqls[i] = br_read_string(&r, context.temp_allocator)
 		id, snapshot, sub_err := host_subscribe_many_owned(host, sqls, owner)
 		if sub_err.kind != .None do return wire_encode_error(sub_err)
+		// The snapshot is the caller's: once encoded it goes.
+		defer host_snapshot_destroy(snapshot)
 		return wire_encode_snapshot(id, host.store.commit_seq, snapshot)
 	case WIRE_CALL_PROCEDURE:
 		name := br_read_string(&r, context.temp_allocator)
