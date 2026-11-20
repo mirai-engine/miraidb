@@ -504,7 +504,10 @@ store_close :: proc(store: ^Store) {
 		table_release(table)
 	}
 	delete(store.tables)
-	for _, attached in store.attached do store_close(attached)
+	for name, attached in store.attached {
+		store_close(attached)
+		delete(name)
+	}
 	delete(store.attached)
 	mirror_destroy(store.mirror)
 	store_mirror_kept_destroy(store)

@@ -487,3 +487,27 @@ test_joins_leave_nothing :: proc(t: ^testing.T) {
 		"EXPLAIN SELECT * FROM a, b, c WHERE b.a_id = a.id AND c.b_id = b.id AND a.x = 1",
 	})
 }
+
+@(test)
+test_keys_and_attachments_leave_nothing :: proc(t: ^testing.T) {
+	// A file's table-level key split its column list and kept the pieces;
+	// PRAGMA index_xinfo read a table's text and dropped it; DETACH and a
+	// closing store kept the attached database's name; a write or a query on
+	// an attached table kept the names the resolver rewrote.
+	expect_nothing_left(t, .Sqlite_File, "_test_memory_keys.sqlite", {
+		"CREATE TABLE k (a TEXT, b INT, v, PRIMARY KEY (a, b))",
+		"INSERT INTO k VALUES ('x', 1, 2)",
+		"CREATE TABLE u (a INT, b TEXT, UNIQUE (a, b))",
+		"INSERT INTO u VALUES (1, 'y')",
+		"PRAGMA index_xinfo('sqlite_autoindex_k_1')",
+		"UPDATE k SET v = 3",
+	})
+	expect_nothing_left(t, .Memory, "_test_memory_attach", {
+		"ATTACH ':memory:' AS side",
+		"CREATE TABLE side.s (a INT)",
+		"INSERT INTO side.s VALUES (1)",
+		"SELECT a FROM side.s",
+		"DETACH side",
+		"ATTACH ':memory:' AS kept",
+	})
+}

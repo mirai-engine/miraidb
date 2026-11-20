@@ -743,7 +743,7 @@ sqlite_group_key :: proc(upper, item: string, columns: []Sqlite_Column, alloc: m
 		}
 	}
 	if close < 0 do return positions[:]
-	for part in strings.split(item[open + 1:close], ",") {
+	for part in strings.split(item[open + 1:close], ",", context.temp_allocator) {
 		name := sqlite_unquote_ident(strings.trim_space(part))
 		for column, i in columns {
 			if strings.equal_fold(column.name, name) {

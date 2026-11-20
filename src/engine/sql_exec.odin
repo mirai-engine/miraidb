@@ -609,8 +609,10 @@ sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sq
 	case Insert_Stmt, Update_Stmt, Delete_Stmt, Create_Table_Stmt, Create_View_Stmt, Create_Index_Stmt, Drop_Table_Stmt, Drop_View_Stmt, Drop_Index_Stmt, Create_Trigger_Stmt, Alter_Table_Stmt:
 		// A name that is not there (or is already there, for a CREATE) is
 		// refused before anything is written (D37).
+		// The names it rewrites live in the transaction's arena: the heap kept
+		// them for good.
 		statement := statement
-		if resolve_err := sql_resolve_names(tx, &statement); resolve_err.kind != .None do return {}, resolve_err
+		if resolve_err := sql_resolve_names(tx, &statement, tx.alloc); resolve_err.kind != .None do return {}, resolve_err
 	}
 	// A write with CTEs materializes them for its own life, then runs as a
 	// plain write that reads them by name.
@@ -1564,7 +1566,7 @@ free_partials :: proc(items: ^[dynamic][]Source) {
 sql_run_query :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sql_Result, Error) {
 	// A name that is not there is refused before a row is read (D37).
 	statement := statement
-	if resolve_err := sql_resolve_names(tx, &statement); resolve_err.kind != .None do return {}, resolve_err
+	if resolve_err := sql_resolve_names(tx, &statement, tx.alloc); resolve_err.kind != .None do return {}, resolve_err
 	if select_stmt, ok := statement.(Select_Stmt); ok {
 		return sql_exec_select(tx, select_stmt, params)
 	}

@@ -266,8 +266,10 @@ store_attach_remove :: proc(store: ^Store, name: string) -> Error {
 		sync.unlock(&store.mutex)
 		return errf(.Table_Not_Found, "database %s is not attached", name)
 	}
-	map_erase(&store.attached, name)
+	// The key is the copy ATTACH made of the name.
+	key, _ := delete_key(&store.attached, name)
 	sync.unlock(&store.mutex)
+	delete(key)
 	store_close(attached)
 	return ERROR_NONE
 }

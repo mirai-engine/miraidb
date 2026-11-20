@@ -500,7 +500,9 @@ Sqlite_Index_Entry :: struct {
 sqlite_index_list :: proc(tx: ^Tx, table: ^Table, alloc: mem.Allocator) -> []Sqlite_Index_Entry {
 	schema := &table.schema
 	texts := tx_sql_texts(tx, context.temp_allocator)
-	_, original, keep_text := sqlite_table_sql(tx.store, table, texts)
+	// Only the kept text's indexes are read here; the text itself is ours to free.
+	table_text, original, keep_text := sqlite_table_sql(tx.store, table, texts)
+	delete(table_text)
 	alias := sqlite_rowid_alias(table)
 	// The number SQLite gives the index a constraint made: its place among the
 	// constraints the declaration writes, or, without a declaration to read,
