@@ -830,3 +830,44 @@ test_pgwire_sessions_leave_nothing :: proc(t: ^testing.T) {
 		testing.expectf(t, false, "bad free of %p at %v", entry.memory, entry.location)
 	}
 }
+
+@(test)
+test_tokens_leave_nothing :: proc(t: ^testing.T) {
+	// Issuing a token kept its secret, its hex text, its digest and the
+	// insert's result; every check kept the digest it looked up; a JWT kept
+	// every piece it encoded or decoded.
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	{
+		context.allocator = mem.tracking_allocator(&track)
+		store, open_err := db.store_open("", {persistent = false})
+		if !testing.expect(t, db.error_ok(open_err)) do return
+		host := db.host_init(store)
+		who: db.Identity
+		who[0] = 7
+		token, issue_err := db.host_issue_token(host, who, 0)
+		testing.expect(t, db.error_ok(issue_err))
+		_, valid := db.host_authenticate(host, token)
+		testing.expect(t, valid)
+		_, forged := db.host_authenticate(host, "mt_00")
+		testing.expect(t, !forged)
+		testing.expect(t, db.host_revoke_token(host, token))
+		delete(token)
+		jwt := db.host_issue_jwt(host, who, 60_000_000)
+		_, signed := db.host_authenticate(host, jwt)
+		testing.expect(t, signed)
+		_, tampered := db.host_authenticate(host, "eyJ.e30.nope")
+		testing.expect(t, !tampered)
+		delete(jwt)
+		db.host_destroy(host)
+		db.store_close(store)
+		free_all(context.temp_allocator)
+	}
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "%d bytes left from %v", entry.size, entry.location)
+	}
+	for entry in track.bad_free_array {
+		testing.expectf(t, false, "bad free of %p at %v", entry.memory, entry.location)
+	}
+}

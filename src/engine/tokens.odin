@@ -29,9 +29,9 @@ tokens_ensure_table :: proc(host: ^Host) -> Error {
 }
 
 @(private)
-token_hex :: proc(bytes: []u8) -> string {
+token_hex :: proc(bytes: []u8, alloc := context.allocator) -> string {
 	digits := "0123456789abcdef"
-	out := make([]u8, len(bytes) * 2)
+	out := make([]u8, len(bytes) * 2, alloc)
 	for byte, i in bytes {
 		out[i * 2] = digits[byte >> 4]
 		out[i * 2 + 1] = digits[byte & 0x0f]
@@ -40,13 +40,16 @@ token_hex :: proc(bytes: []u8) -> string {
 }
 
 @(private)
-token_unhex :: proc(text: string) -> ([]u8, bool) {
+token_unhex :: proc(text: string, alloc := context.allocator) -> ([]u8, bool) {
 	if len(text) % 2 != 0 do return nil, false
-	out := make([]u8, len(text) / 2)
+	out := make([]u8, len(text) / 2, alloc)
 	for i in 0 ..< len(out) {
 		high, high_ok := hex_digit(text[i * 2])
 		low, low_ok := hex_digit(text[i * 2 + 1])
-		if !high_ok || !low_ok do return nil, false
+		if !high_ok || !low_ok {
+			delete(out, alloc)
+			return nil, false
+		}
 		out[i] = high << 4 | low
 	}
 	return out, true
@@ -80,30 +83,36 @@ store_token_key :: proc(store: ^Store) -> []u8 {
 		sql_result_destroy(&result)
 	}
 	if stored, found := store_meta(store, "token_key"); found {
-		if key, ok := token_unhex(stored); ok && len(key) == 32 {
-			store.token_key = key
-			return key
+		if key, ok := token_unhex(stored); ok {
+			if len(key) == 32 {
+				store.token_key = key
+				return key
+			}
+			delete(key)
 		}
 	}
 	key := make([]u8, 32)
 	crypto.rand_bytes(key)
-	encoded := token_hex(key)
-	_, _ = sql_execute_params(
+	encoded := token_hex(key, context.temp_allocator)
+	saved, save_err := sql_execute_params(
 		store,
 		"INSERT INTO _meta (key, value) VALUES ('token_key', ?)",
 		[]Value{value_string(encoded)},
 	)
+	sql_result_destroy(&saved)
+	error_free(&save_err)
 	store.token_key = key
 	return key
 }
 
 // store_token_digest is the stored form of a credential.
 @(private)
+// The digest is a query parameter: it lives in the temporary allocator.
 store_token_digest :: proc(store: ^Store, token: string) -> string {
 	dst := make([]u8, 32, context.temp_allocator)
 	message := transmute([]u8)token
 	hmac.sum(.SHA256, dst, message, store_token_key(store))
-	return token_hex(dst)
+	return token_hex(dst, context.temp_allocator)
 }
 
 @(private)
@@ -128,18 +137,22 @@ store_issue_token :: proc(store: ^Store, identity: Identity, ttl_us, now_us: i64
 	result, create_err := sql_execute(store, TOKEN_SCHEMA_SQL)
 	if create_err.kind != .None do return "", create_err
 	sql_result_destroy(&result)
-	secret := make([]u8, 32)
+	secret := make([]u8, 32, context.temp_allocator)
 	crypto.rand_bytes(secret)
-	token := strings.concatenate({"mt_", token_hex(secret)})
+	token := strings.concatenate({"mt_", token_hex(secret, context.temp_allocator)})
 	digest := store_token_digest(store, token)
 	expires := i64(0)
 	if ttl_us != 0 do expires = now_us + ttl_us
-	_, insert_err := sql_execute_params(
+	inserted, insert_err := sql_execute_params(
 		store,
 		"INSERT INTO _token (token, identity, expires_us) VALUES (?, ?, ?)",
 		[]Value{value_string(digest), value_identity(identity), value_int(expires)},
 	)
-	if insert_err.kind != .None do return "", insert_err
+	sql_result_destroy(&inserted)
+	if insert_err.kind != .None {
+		delete(token)
+		return "", insert_err
+	}
 	return token, ERROR_NONE
 }
 
@@ -168,7 +181,10 @@ store_authenticate :: proc(store: ^Store, token: string, now_us: i64) -> (Identi
 		"SELECT identity, expires_us FROM _token WHERE token = ?",
 		[]Value{value_string(digest)},
 	)
-	if query_err.kind != .None do return Identity{}, false
+	if query_err.kind != .None {
+		error_free(&query_err)
+		return Identity{}, false
+	}
 	defer sql_result_destroy(&result)
 	if len(result.rows) == 0 do return Identity{}, false
 	row := result.rows[0]
@@ -187,7 +203,10 @@ host_revoke_token :: proc(host: ^Host, token: string) -> bool {
 		"DELETE FROM _token WHERE token = ?",
 		[]Value{value_string(digest)},
 	)
-	if delete_err.kind != .None do return false
+	if delete_err.kind != .None {
+		error_free(&delete_err)
+		return false
+	}
 	removed := result.affected > 0
 	sql_result_destroy(&result)
 	return removed

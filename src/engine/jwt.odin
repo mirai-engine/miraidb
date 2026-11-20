@@ -131,6 +131,10 @@ jwt_identity :: proc(host: ^Host, token: string) -> (Identity, bool) {
 // jwt_identity_store verifies a signed token against a database, for a caller
 // that has no host to read the key or the clock from.
 jwt_identity_store :: proc(store: ^Store, token: string, now_us: i64) -> (Identity, bool) {
+	// The key first, in the store's own memory; everything the check decodes
+	// after it is temporary (each decoded part used to stay in the heap).
+	key := store_token_key(store)
+	context.allocator = context.temp_allocator
 	first := strings.index(token, ".")
 	if first < 0 do return Identity{}, false
 	after_first := token[first + 1:]
@@ -142,7 +146,7 @@ jwt_identity_store :: proc(store: ^Store, token: string, now_us: i64) -> (Identi
 
 	signing_input := token[:second]
 	expected := make([]u8, 32, context.temp_allocator)
-	hmac.sum(.SHA256, expected, transmute([]u8)signing_input, store_token_key(store))
+	hmac.sum(.SHA256, expected, transmute([]u8)signing_input, key)
 	expected_text := b64url_encode(expected)
 	if crypto.compare_constant_time(transmute([]u8)expected_text, transmute([]u8)signature) != 1 {
 		return Identity{}, false
@@ -161,6 +165,11 @@ jwt_identity_store :: proc(store: ^Store, token: string, now_us: i64) -> (Identi
 
 // host_issue_jwt signs a JWT for `identity`. `ttl_us` of zero means no `exp`.
 host_issue_jwt :: proc(host: ^Host, identity: Identity, ttl_us: i64) -> string {
+	// The key first, in the store's memory; the pieces of the token are
+	// temporary and only the token itself is the caller's.
+	key := host_token_key(host)
+	caller := context.allocator
+	context.allocator = context.temp_allocator
 	header := JWT_HEADER
 	header_text := b64url_encode(transmute([]u8)header)
 	expiry := ""
@@ -169,10 +178,9 @@ host_issue_jwt :: proc(host: ^Host, identity: Identity, ttl_us: i64) -> string {
 	}
 	subject := identity
 	payload := strings.concatenate({`{"sub":"`, token_hex(subject[:]), `"`, expiry, `}`})
-	defer delete(payload)
 	payload_text := b64url_encode(transmute([]u8)payload)
 	signing_input := strings.concatenate({header_text, ".", payload_text})
 	signature := make([]u8, 32, context.temp_allocator)
-	hmac.sum(.SHA256, signature, transmute([]u8)signing_input, host_token_key(host))
-	return strings.concatenate({signing_input, ".", b64url_encode(signature)})
+	hmac.sum(.SHA256, signature, transmute([]u8)signing_input, key)
+	return strings.concatenate({signing_input, ".", b64url_encode(signature)}, caller)
 }
