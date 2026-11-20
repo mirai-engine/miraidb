@@ -138,6 +138,9 @@ main :: proc() {
 		// A write keeps the row it wrote: its values, the array that holds its
 		// history, and a map node.
 		{"INSERT OR REPLACE INTO t (id, v) VALUES (3, 3)", 4},
+		// The same row from a query: the query's result, which the insert left
+		// behind whole before, is freed with the statement.
+		{"INSERT OR REPLACE INTO t (id, v) SELECT 3, v FROM t WHERE id = 1", 4},
 		{"UPDATE t SET v = v + 1 WHERE id = 1", 4},
 		{"DELETE FROM t WHERE id = 99", 4},
 	}

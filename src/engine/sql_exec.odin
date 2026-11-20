@@ -8179,10 +8179,16 @@ sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Res
 	if generated_err.kind != .None do return {}, generated_err
 	defer generated_plan_destroy(&generated)
 	insert_rows := stmt.rows
+	// The query's result holds the values its literals point at, so it lives
+	// until the statement ends; it was never freed, and every INSERT ... SELECT
+	// left the whole result behind.
+	query: Sql_Result
+	defer sql_result_destroy(&query)
 	if stmt.has_select {
 		// The VALUES path is reused: each row the query produces becomes a row
 		// of literals, so coercion, policies, UPSERT and RETURNING are shared.
-		query, query_err := sql_exec_select(tx, stmt.select_stmt, params)
+		query_err: Error
+		query, query_err = sql_exec_select(tx, stmt.select_stmt, params)
 		if query_err.kind != .None do return {}, query_err
 		rows := make([dynamic][]^Expr, 0, len(query.rows), tx.alloc)
 		for row in query.rows {

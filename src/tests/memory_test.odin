@@ -159,6 +159,18 @@ test_group_by_leaves_nothing :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_insert_select_leaves_nothing :: proc(t: ^testing.T) {
+	// INSERT ... SELECT turns the query's rows into literals; the query's
+	// result was never freed, so each one left every row it read behind.
+	expect_nothing_left(t, .Memory, "_test_memory_insert_select", {
+		"CREATE TABLE s (id INTEGER PRIMARY KEY, v TEXT)",
+		"INSERT INTO s VALUES (1, 'ab'), (2, 'cd')",
+		"INSERT INTO s SELECT id + 2, v || 'x' FROM s",
+		"INSERT INTO s SELECT id + 10, upper(v) FROM s WHERE id > 2 RETURNING id",
+	})
+}
+
+@(test)
 test_replay_leaves_nothing :: proc(t: ^testing.T) {
 	// Opening a directory replays its log: every operation is decoded, applied
 	// and dropped.
