@@ -1763,9 +1763,9 @@ tx_check_unique :: proc(
 				return unique_violation(table, i)
 			}
 		}
-		// A table this transaction dropped (and perhaps made again) has no
-		// committed rows left to collide with.
-		if committed, ok := tx.store.tables[name]; ok && !tx.state.dropped[name] {
+		// A table this transaction dropped (and perhaps made again) or emptied
+		// with TRUNCATE has no committed rows left to collide with.
+		if committed, ok := tx.store.tables[name]; ok && !tx.state.dropped[name] && (writes == nil || !writes.truncated) {
 			if tx_committed_key_taken(tx, committed, i, values, ignore, writes) {
 				return unique_violation(table, i)
 			}

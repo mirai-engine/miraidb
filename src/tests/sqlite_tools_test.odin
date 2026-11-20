@@ -374,3 +374,25 @@ test_a_step_that_met_busy_runs_again :: proc(t: ^testing.T) {
 	db.error_free(&again)
 	tools_expect(t, second, "SELECT n FROM c ORDER BY n", "1 2")
 }
+
+@(test)
+test_truncate_then_insert_the_same_key :: proc(t: ^testing.T) {
+	// TRUNCATE leaves no committed row to collide with: inserting a key the
+	// table held before, in the same transaction, failed as a duplicate, and
+	// the commit then kept the table empty.
+	store := fresh_db(t, "truncate_reinsert")
+	if store == nil do return
+	defer cleanup_db(store, "truncate_reinsert")
+	run_done(t, store, "CREATE TABLE t (a INT PRIMARY KEY, b TEXT)")
+	run_done(t, store, "INSERT INTO t VALUES (1, 'x'), (2, 'y')")
+	tx := db.tx_begin_write(store)
+	for sql in ([]string{"TRUNCATE t", "INSERT INTO t VALUES (1, 'z')"}) {
+		result, err := db.sql_execute_in_tx(tx, sql)
+		testing.expectf(t, db.error_ok(err), "%s: %s", sql, err.message)
+		db.error_free(&err)
+		db.sql_result_destroy(&result)
+	}
+	testing.expect(t, db.error_ok(db.tx_commit(tx)))
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t").i, 1)
+	testing.expect_value(t, scalar(t, store, "SELECT b FROM t WHERE a = 1").s, "z")
+}
