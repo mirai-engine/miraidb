@@ -1035,7 +1035,7 @@ mirror_sync_parent :: proc(m: ^Sqlite_Mirror, table: ^Mirror_Table, leaf_index: 
 		)
 		return false
 	}
-	defer delete(packed)
+	defer delete(packed, m.alloc)
 	return mirror_stage(m, parent_page, packed)
 }
 
@@ -1078,7 +1078,7 @@ mirror_apply_leaf :: proc(m: ^Sqlite_Mirror, table: ^Mirror_Table, leaf_index: i
 				m.fallback_reason = "pack empty"
 				return false
 			}
-			defer delete(packed)
+			defer delete(packed, m.alloc)
 			if !mirror_stage(m, leaf.page, packed) {
 				m.fallback_reason = "stage empty"
 				return false
@@ -1127,7 +1127,7 @@ mirror_apply_leaf :: proc(m: ^Sqlite_Mirror, table: ^Mirror_Table, leaf_index: i
 			return false
 		}
 		staged := mirror_stage(m, leaf.page, packed)
-		delete(packed)
+		delete(packed, m.alloc)
 		if !staged {
 			m.fallback_reason = "stage leaf"
 			return false
@@ -1154,8 +1154,11 @@ mirror_apply_leaf :: proc(m: ^Sqlite_Mirror, table: ^Mirror_Table, leaf_index: i
 	}
 	first := 0
 	new_leaves: int = 0
+	// `leaf` points into table.leaves, which the new leaves grow: past the first
+	// insert it may point at freed memory, so its page is read once, here.
+	leaf_page := leaf.page
 	for end, chunk in chunks {
-		page_no := leaf.page
+		page_no := leaf_page
 		if chunk > 0 {
 			page_no = mirror_alloc_page(m)
 			if page_no == 0 {
@@ -1169,7 +1172,7 @@ mirror_apply_leaf :: proc(m: ^Sqlite_Mirror, table: ^Mirror_Table, leaf_index: i
 			return false
 		}
 		staged := mirror_stage(m, page_no, packed)
-		delete(packed)
+		delete(packed, m.alloc)
 		if !staged {
 			m.fallback_reason = "stage chunk"
 			return false
@@ -1184,7 +1187,7 @@ mirror_apply_leaf :: proc(m: ^Sqlite_Mirror, table: ^Mirror_Table, leaf_index: i
 		}
 		first = end
 	}
-	if table.root == leaf.page {
+	if table.root == leaf_page {
 		// The tree was a single leaf; it needs a root above it now.
 		root_page := mirror_alloc_page(m)
 		if root_page == 0 {
@@ -1203,7 +1206,7 @@ mirror_apply_leaf :: proc(m: ^Sqlite_Mirror, table: ^Mirror_Table, leaf_index: i
 			m.fallback_reason = "pack root"
 			return false
 		}
-		defer delete(packed)
+		defer delete(packed, m.alloc)
 		if !mirror_stage(m, root_page, packed) {
 			m.fallback_reason = "stage root"
 			return false
@@ -1261,7 +1264,7 @@ mirror_write_master :: proc(m: ^Sqlite_Mirror) -> bool {
 	}
 	packed, ok := mirror_pack_leaf(m, cells[:], SQLITE_HEADER_MIN)
 	if !ok do return false
-	defer delete(packed)
+	defer delete(packed, m.alloc)
 	// Page 1 keeps the 100-byte file header, and its cell pointers are absolute.
 	// The packed page starts blank, so the header is the one there now: a new
 	// root used to leave the file without one.
@@ -1298,7 +1301,7 @@ mirror_page_checksum :: proc(bytes: []u8, nonce: u32) -> u32 {
 @(private)
 mirror_write_journal :: proc(m: ^Sqlite_Mirror, original_count: int) -> Error {
 	path := mirror_journal_path(m)
-	defer delete(path)
+	defer delete(path, m.alloc)
 	sector := 512
 	count := len(m.dirty_order)
 	per_record := 4 + m.page_size + 4
@@ -1361,7 +1364,7 @@ mirror_commit_pages :: proc(m: ^Sqlite_Mirror) -> Error {
 		return journal_err
 	}
 	path := mirror_journal_path(m)
-	defer delete(path)
+	defer delete(path, m.alloc)
 	file, open_err := os.open(m.path, {.Read, .Write})
 	if open_err != nil do return errf(.Io, "cannot open %s: %v", m.path, open_err)
 	defer os.close(file)

@@ -1,5 +1,7 @@
 package tests
 
+import "core:mem"
+import "core:mem/virtual"
 import "core:os"
 import "core:strings"
 import "core:testing"
@@ -218,6 +220,100 @@ test_the_mirror_keeps_its_header_when_a_root_splits :: proc(t: ^testing.T) {
 	if !testing.expectf(t, db.error_ok(again_err), "reopen: %s", again_err.message) do return
 	defer db.embed_close(again)
 	tools_expect(t, again, "SELECT a, length(b) FROM t1", "2|7000 3|9000 4|20000")
+}
+
+// Guard_Allocator gives every block pages of its own and hands them back to
+// the system when the block is freed or moved, so a pointer kept into a dynamic
+// array across an append faults at once instead of, now and then, when the heap
+// happened to return that memory.
+@(private = "file")
+Guard_Allocator :: struct {
+	sizes:   map[rawptr]int,
+	backing: mem.Allocator,
+}
+
+@(private = "file")
+guard_allocator_proc :: proc(
+	data: rawptr,
+	mode: mem.Allocator_Mode,
+	size, alignment: int,
+	old_memory: rawptr,
+	old_size: int,
+	loc := #caller_location,
+) -> ([]byte, mem.Allocator_Error) {
+	guard := (^Guard_Allocator)(data)
+	switch mode {
+	case .Alloc, .Alloc_Non_Zeroed:
+		block, err := virtual.reserve_and_commit(uint(max(size, 1)))
+		if err != nil do return nil, err
+		guard.sizes[raw_data(block)] = max(size, 1)
+		return block[:size], nil
+	case .Free:
+		if old_memory == nil do return nil, nil
+		held, ok := guard.sizes[old_memory]
+		// A block made before the guard was in place goes back where it came from.
+		if !ok do return guard.backing.procedure(guard.backing.data, mode, size, alignment, old_memory, old_size, loc)
+		delete_key(&guard.sizes, old_memory)
+		virtual.release(old_memory, uint(held))
+		return nil, nil
+	case .Resize, .Resize_Non_Zeroed:
+		fresh, err := guard_allocator_proc(data, .Alloc, size, alignment, nil, 0, loc)
+		if err != nil || old_memory == nil do return fresh, err
+		copy(fresh, ([^]byte)(old_memory)[:min(old_size, size)])
+		_, _ = guard_allocator_proc(data, .Free, 0, 0, old_memory, old_size, loc)
+		return fresh, nil
+	case .Free_All, .Query_Features, .Query_Info:
+		return nil, .Mode_Not_Implemented
+	}
+	return nil, .Mode_Not_Implemented
+}
+
+@(test)
+test_a_leaf_split_into_many_pages_keeps_its_page :: proc(t: ^testing.T) {
+	// mptest's multiwrite01: 32 rows of 1500 bytes added to a table in one
+	// commit split its last leaf into many pages. The split kept a pointer to
+	// the leaf in the list it was growing and read through it after the list
+	// moved: now and then that memory was gone, and the client died with an
+	// access violation while it held the file's EXCLUSIVE lock.
+	path := "_test_tools_split.sqlite"
+	os.remove(path)
+	defer os.remove(path)
+	_ = os.write_entire_file(path, []u8{})
+	guard := Guard_Allocator{sizes = make(map[rawptr]int), backing = context.allocator}
+	defer delete(guard.sizes)
+	conn, open_err := db.embed_open(path)
+	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
+	tools_ok(t, conn, "CREATE TABLE t1 (a INTEGER PRIMARY KEY, b)")
+	tools_ok(t, conn, "INSERT INTO t1 VALUES (1, zeroblob(2000))")
+	tools_ok(t, conn, "INSERT INTO t1 VALUES (2, zeroblob(1000))")
+	for step in ([]string{"2", "4", "8", "16", "32"}) {
+		// Read again before each, as another process's commit makes a client
+		// read the file again: the leaf list is then built to its size, so the
+		// split's inserts move it. The layout is read with the guard (an open
+		// reads it with the process's heap).
+		db.embed_close(conn)
+		conn, open_err = db.embed_open(path)
+		if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
+		{
+			context.allocator = mem.Allocator{procedure = guard_allocator_proc, data = &guard}
+			db.store_set_sqlite_mirror(conn.store, path)
+		}
+		// The path the store keeps is the heap's again; only the layout is the guard's.
+		kept := conn.store.sqlite_mirror
+		conn.store.sqlite_mirror = strings.clone(kept)
+		delete(kept, mem.Allocator{procedure = guard_allocator_proc, data = &guard})
+		tools_ok(t, conn, strings.concatenate({"INSERT INTO t1 SELECT a + ", step, ", zeroblob(1500) FROM t1"}, context.temp_allocator))
+		// The commit patched the file's pages: the split is the path under test.
+		testing.expectf(t, conn.store.mirror_full_writes == 0, "a + %s rewrote the file: %s", step, conn.store.mirror_reason)
+	}
+	tools_expect(t, conn, "SELECT count(*), sum(length(b)) FROM t1", "64|96000")
+	db.embed_close(conn)
+	ok, reason := db.sqlite_mirror_validate(path, context.temp_allocator)
+	testing.expectf(t, ok, "the file is malformed: %s", reason)
+	again, again_err := db.embed_open(path)
+	if !testing.expectf(t, db.error_ok(again_err), "reopen: %s", again_err.message) do return
+	defer db.embed_close(again)
+	tools_expect(t, again, "SELECT count(*), sum(length(b)) FROM t1", "64|96000")
 }
 
 @(private = "file")
