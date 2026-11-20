@@ -1644,8 +1644,15 @@ alter_row_values :: proc(
 		if old_index >= 0 && old_index < len(values) {
 			stored := values[old_index]
 			if stored.kind != .Null && !type_equal(old.columns[old_index].type, column.type) {
+				// What a conversion makes lives with the row, in `alloc`: in the heap
+				// it outlived the row, which a commit copies anyway.
+				caller := context.allocator
+				context.allocator = alloc
 				converted, cast_err := value_cast(stored, column.type)
 				if cast_err.kind != .None {
+					// The error is the caller's to free, in its allocator; the cast's
+					// own message stays in `alloc`.
+					context.allocator = caller
 					return nil, errf(
 						.Invalid_Type,
 						"column %s cannot become %s: %s",

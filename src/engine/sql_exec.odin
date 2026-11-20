@@ -3063,6 +3063,26 @@ select_drop_rows :: proc(
 	delete(group_keep^)
 }
 
+// select_drop_groups is select_drop_rows for a grouped SELECT that failed on
+// group `from`: that group and the ones after it were not handed on, and the
+// lists of groups go too. (The three error paths of the grouping loop freed
+// the rows but kept the output array, the window sources and every group.)
+@(private)
+select_drop_groups :: proc(
+	output: ^[dynamic]Output_Row,
+	window_cells: ^[dynamic][dynamic]Window_Cell,
+	window_sources: ^[dynamic][]Source,
+	group_keep: ^[dynamic][dynamic][]Source,
+	groups: ^[dynamic][dynamic][]Source,
+	group_set_of: ^[dynamic]int,
+	from: int,
+) {
+	select_drop_rows(output, window_cells, window_sources, group_keep)
+	for group in groups[from:] do delete(group)
+	delete(groups^)
+	delete(group_set_of^)
+}
+
 // window_cells_destroy frees one cell list: the keys it holds and the list itself.
 @(private)
 window_cells_destroy :: proc(cells: [dynamic]Window_Cell) {
@@ -4467,10 +4487,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			}
 			cells, cells_err := window_row_cells(&ctx, window_nodes[:], has_windows)
 			if cells_err.kind != .None {
-				free_values_over_rows(&output)
-				window_cell_rows_destroy(&window_cells)
-				for kept in group_keep do delete(kept)
-				delete(group_keep)
+				select_drop_groups(&output, &window_cells, &window_sources, &group_keep, &groups, &group_set_of, group_number)
 				free_partials(&filtered)
 				return {}, cells_err
 			}
@@ -4486,10 +4503,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 				if eval_err.kind != .None {
 					free_values(values)
 					window_cells_destroy(cells)
-					free_values_over_rows(&output)
-					window_cell_rows_destroy(&window_cells)
-					for kept in group_keep do delete(kept)
-					delete(group_keep)
+					select_drop_groups(&output, &window_cells, &window_sources, &group_keep, &groups, &group_set_of, group_number)
 					free_partials(&filtered)
 					return {}, eval_err
 				}
@@ -4502,10 +4516,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 				if having_err.kind != .None {
 					free_values(values)
 					window_cells_destroy(cells)
-					free_values_over_rows(&output)
-					window_cell_rows_destroy(&window_cells)
-					for kept in group_keep do delete(kept)
-					delete(group_keep)
+					select_drop_groups(&output, &window_cells, &window_sources, &group_keep, &groups, &group_set_of, group_number)
 					free_partials(&filtered)
 					return {}, having_err
 				}

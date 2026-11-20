@@ -1398,13 +1398,25 @@ store_apply :: proc(store: ^Store, op: Store_Op) -> Error {
 		schema := op.schema
 		replacement, table_err := table_create(&schema)
 		if table_err.kind != .None do return table_err
+		// Each row is converted into a scratch arena and copied in by the insert;
+		// converted texts in the heap were never freed.
+		scratch: virtual.Arena
+		if arena_err := virtual.arena_init_growing(&scratch); arena_err != .None {
+			table_destroy(replacement)
+			return errf(.Out_Of_Memory, "cannot convert the rows of %s", op.name)
+		}
+		defer virtual.arena_destroy(&scratch)
 		for id, row in existing.rows {
-			values, convert_err := alter_row_values(&existing.schema, op.schema, row.values, context.allocator)
-			defer delete(values)
-			if convert_err.kind != .None do return convert_err
+			values, convert_err := alter_row_values(&existing.schema, op.schema, row.values, virtual.arena_allocator(&scratch))
+			if convert_err.kind != .None {
+				table_destroy(replacement)
+				return convert_err
+			}
 			if insert_err := table_insert(replacement, id, values); insert_err.kind != .None {
+				table_destroy(replacement)
 				return insert_err
 			}
+			virtual.arena_free_all(&scratch)
 		}
 		replacement.next_row_id = existing.next_row_id
 		replacement.next_sequence = existing.next_sequence

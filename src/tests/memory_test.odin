@@ -511,3 +511,30 @@ test_keys_and_attachments_leave_nothing :: proc(t: ^testing.T) {
 		"ATTACH ':memory:' AS kept",
 	})
 }
+
+@(test)
+test_failed_and_converted_statements_leave_nothing :: proc(t: ^testing.T) {
+	// A grouped SELECT that fails (an aggregate that overflows, a HAVING or a
+	// projection that errs) kept its output array, its window sources and every
+	// group not yet reached.
+	expect_nothing_left(t, .Memory, "_test_memory_aggregate_error", {
+		"CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT, n INT)",
+		"INSERT INTO t VALUES (1, 'a', 9223372036854775807), (2, 'a', 1), (3, 'b', 5)",
+		"SELECT g, sum(n) FROM t GROUP BY g",
+	}, fails = true)
+	expect_nothing_left(t, .Memory, "_test_memory_having_error", {
+		"CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT, n INT)",
+		"INSERT INTO t VALUES (1, 'a', 0), (2, 'b', 1)",
+		"SELECT g FROM t GROUP BY g HAVING 10 / min(n) > 1",
+	}, fails = true)
+	// ALTER COLUMN TYPE converted each value in the heap, at the statement and
+	// again at the commit, and kept the converted texts; a WINDOW clause's
+	// pending names grew in the heap.
+	expect_nothing_left(t, .Memory, "_test_memory_alter_type", {
+		"CREATE TABLE t (id INTEGER PRIMARY KEY, v INT)",
+		"INSERT INTO t VALUES (1, 2), (2, 30)",
+		"ALTER TABLE t ALTER COLUMN v TYPE TEXT",
+		"SELECT v FROM t",
+		"SELECT sum(id) OVER w FROM t WINDOW w AS (ORDER BY id)",
+	})
+}

@@ -63,6 +63,9 @@ sql_parse :: proc(source: string) -> (Query, Error) {
 		alloc       = q.alloc,
 		query       = &q,
 		param_names = make([dynamic]string, q.alloc),
+		// In the query's arena like the rest: left empty, it grew in the heap
+		// and nothing freed it.
+		windows     = make([dynamic]Pending_Window, q.alloc),
 	}
 	p.current = lexer_next(&p.lexer)
 	statement := parse_statement(&p)
