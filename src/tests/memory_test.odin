@@ -538,3 +538,58 @@ test_failed_and_converted_statements_leave_nothing :: proc(t: ^testing.T) {
 		"SELECT sum(id) OVER w FROM t WINDOW w AS (ORDER BY id)",
 	})
 }
+
+@(test)
+test_subscriptions_leave_nothing :: proc(t: ^testing.T) {
+	// A subscription kept the array of every evaluation and the key of every
+	// row it cached; plain, joined and grouped ones, kept current through
+	// inserts, updates and deletes, then dropped.
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	{
+		context.allocator = mem.tracking_allocator(&track)
+		store, open_err := db.store_open("", {persistent = false})
+		if !testing.expect(t, db.error_ok(open_err)) do return
+		host := db.host_init(store)
+		run :: proc(t: ^testing.T, store: ^db.Store, sql: string) {
+			result, err := db.sql_execute(store, sql)
+			testing.expectf(t, db.error_ok(err), "%s: %s", sql, err.message)
+			db.error_free(&err)
+			db.sql_result_destroy(&result)
+		}
+		run(t, store, "CREATE TABLE author (id INTEGER PRIMARY KEY, name TEXT)")
+		run(t, store, "CREATE TABLE book (id INTEGER PRIMARY KEY, author_id INT, title TEXT)")
+		run(t, store, "INSERT INTO author VALUES (1, 'ana'), (2, 'luis')")
+		run(t, store, "INSERT INTO book VALUES (1, 1, 'a'), (2, 2, 'b')")
+		id, snapshots, err := db.host_subscribe_many(host, []string{
+			"SELECT id, name FROM author WHERE id > 0",
+			"SELECT author.name, book.title FROM author JOIN book ON author.id = book.author_id",
+			"SELECT author_id, count(*) FROM book GROUP BY author_id",
+		})
+		testing.expectf(t, db.error_ok(err), "subscribe: %s", err.message)
+		db.host_snapshot_destroy(snapshots)
+		run(t, store, "INSERT INTO book VALUES (3, 1, 'c')")
+		run(t, store, "UPDATE author SET name = 'ANA' WHERE id = 1")
+		run(t, store, "DELETE FROM book WHERE id = 2")
+		run(t, store, "INSERT INTO author VALUES (3, 'eva')")
+		db.host_unsubscribe(host, id)
+		// Two equal rows (no DISTINCT) are one entry of the cache.
+		run(t, store, "INSERT INTO book VALUES (5, 1, 'c')")
+		_, again, again_err := db.host_subscribe(host, "SELECT title FROM book")
+		testing.expect(t, db.error_ok(again_err))
+		db.host_rows_destroy(again)
+		run(t, store, "INSERT INTO book VALUES (4, 3, 'd')")
+		run(t, store, "CREATE INDEX bt ON book (title)")
+		run(t, store, "INSERT INTO book VALUES (6, 2, 'c')")
+		db.host_destroy(host)
+		db.store_close(store)
+		free_all(context.temp_allocator)
+	}
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "%d bytes left from %v", entry.size, entry.location)
+	}
+	for entry in track.bad_free_array {
+		testing.expectf(t, false, "bad free of %p at %v", entry.memory, entry.location)
+	}
+}

@@ -397,8 +397,25 @@ host_now :: proc(host: ^Host) -> i64 {
 
 // --- Subscriptions ---------------------------------------------------------
 
-// host_subscribe registers one SELECT and returns its first snapshot. The query
-// must read exactly one table (plus optional joins).
+// host_snapshot_destroy frees what host_subscribe_many hands back: each
+// query's rows, cloned for the caller, and the lists that hold them.
+host_snapshot_destroy :: proc(snapshot: [][][]Value) {
+	for rows in snapshot {
+		for row in rows do free_values(row)
+		delete(rows)
+	}
+	delete(snapshot)
+}
+
+// host_rows_destroy frees the snapshot host_subscribe hands back.
+host_rows_destroy :: proc(rows: [][]Value) {
+	for row in rows do free_values(row)
+	delete(rows)
+}
+
+// host_subscribe registers one SELECT and returns its first snapshot, which
+// the caller frees with host_rows_destroy. The query must read exactly one
+// table (plus optional joins).
 host_subscribe :: proc(host: ^Host, sql: string) -> (id: u64, snapshot: [][]Value, err: Error) {
 	snapshots: [][][]Value
 	id, snapshots, err = host_subscribe_many(host, []string{sql})
@@ -408,7 +425,8 @@ host_subscribe :: proc(host: ^Host, sql: string) -> (id: u64, snapshot: [][]Valu
 	return id, snapshot, ERROR_NONE
 }
 
-// host_subscribe_many registers several SELECTs under one id. Each query keeps
+// host_subscribe_many registers several SELECTs under one id (the caller frees
+// the snapshots with host_snapshot_destroy). Each query keeps
 // its own row set and publishes its own delta, tagged with its index.
 host_subscribe_many :: proc(
 	host: ^Host,
@@ -488,11 +506,21 @@ host_subscribe_many_owned :: proc(
 			rows_out[r] = value_row_clone(row)
 			entry := &subscription.queries[i]
 			key := encode_output_key_alloc(row, entry_key_alloc(entry))
-			entry.rows[key] = row
 			if r < len(ids) && ids[r] != NO_ROW_ID {
 				entry.row_keys[ids[r]] = strings.clone(key)
 			}
+			if cached, exists := entry.rows[key]; exists {
+				// Two equal rows are one entry: the second replaced the first,
+				// which was lost with its key.
+				free_values(cached)
+				entry.rows[key] = row
+				if !entry.join do delete(key)
+			} else {
+				entry.rows[key] = row
+			}
 		}
+		// The rows went to the entry; the array that held them is the query's.
+		delete(rows)
 		delete(ids)
 		snapshot[i] = rows_out
 		if subscription.queries[i].join {
@@ -542,7 +570,11 @@ host_unsubscribe :: proc(host: ^Host, id: u64) -> bool {
 @(private)
 free_subscription_queries :: proc(queries: []Subscription_Query) {
 	for &entry in queries {
-		for _, row in entry.rows do free_values(row)
+		for key, row in entry.rows {
+			free_values(row)
+			// A join keeps its row keys in its arena, destroyed below.
+			if !entry.join do delete(key)
+		}
 		delete(entry.rows)
 		if entry.join {
 			// The row keys and the tuple index are arena allocations: they go away
@@ -553,16 +585,9 @@ free_subscription_queries :: proc(queries: []Subscription_Query) {
 			delete(entry.join_tuples)
 			delete(entry.join_by_row)
 			delete(entry.join_counts)
+			delete(entry.join_keys)
 		}
-		if entry.agg {
-			for _, group in entry.agg_groups {
-				free_values(group.published)
-				delete(group.rows)
-			}
-			delete(entry.agg_groups)
-			for _, key in entry.agg_by_row do delete(key)
-			delete(entry.agg_by_row)
-		}
+		if entry.agg do host_agg_state_free(&entry)
 		for _, key in entry.row_keys do delete(key)
 		delete(entry.row_keys)
 		query_destroy(&entry.query)
@@ -570,6 +595,21 @@ free_subscription_queries :: proc(queries: []Subscription_Query) {
 		for name in entry.join_tables do delete(name)
 		delete(entry.join_tables)
 	}
+}
+
+// host_agg_state_free frees a grouped subscription's state: each group's key,
+// published row and row set, and the key each row was filed under. Resetting
+// it kept the keys and the row sets of every group.
+@(private)
+host_agg_state_free :: proc(entry: ^Subscription_Query) {
+	for key, group in entry.agg_groups {
+		free_values(group.published)
+		delete(group.rows)
+		delete(key)
+	}
+	delete(entry.agg_groups)
+	for _, key in entry.agg_by_row do delete(key)
+	delete(entry.agg_by_row)
 }
 
 // entry_key_alloc is the allocator that owns the keys of a query's row cache.
@@ -739,7 +779,8 @@ host_join_plan_probes :: proc(
 	}
 	for level in 0 ..< count {
 		if host_join_index_column(entry, level) < 0 do continue
-		entry.join_index[level] = make(map[string][dynamic]Row_Id)
+		// In the arena with its buckets: in the heap each rebuild lost the map.
+		entry.join_index[level] = make(map[string][dynamic]Row_Id, entry.join_allocator)
 	}
 }
 
@@ -1189,7 +1230,9 @@ host_agg_publish :: proc(
 		cached_key := encode_output_key(group.published)
 		if cached, exists := entry.rows[cached_key]; exists {
 			free_values(cached)
-			delete_key(&entry.rows, cached_key)
+			// The map holds its own copy of the key.
+			stored, _ := delete_key(&entry.rows, cached_key)
+			delete(stored)
 		}
 		delete(cached_key)
 		free_values(group.published)
@@ -1199,7 +1242,15 @@ host_agg_publish :: proc(
 	if present {
 		group.published = value_row_clone(values)
 		group.found = true
-		entry.rows[encode_output_key(values)] = value_row_clone(values)
+		key := encode_output_key(values)
+		if cached, exists := entry.rows[key]; exists {
+			// Another group published the same row: the map keeps its key.
+			free_values(cached)
+			entry.rows[key] = value_row_clone(values)
+			delete(key)
+		} else {
+			entry.rows[key] = value_row_clone(values)
+		}
 		if inserts != nil do append(inserts, value_row_clone(values))
 	}
 	if values != nil do free_values(values)
@@ -1236,10 +1287,8 @@ host_agg_recompute :: proc(
 host_agg_prepare :: proc(host: ^Host, entry: ^Subscription_Query) -> bool {
 	stmt, is_select := entry.query.statement.(Select_Stmt)
 	if !is_select do return false
-	for _, group in entry.agg_groups do free_values(group.published)
-	delete(entry.agg_groups)
+	host_agg_state_free(entry)
 	entry.agg_groups = make(map[string]Agg_Group)
-	delete(entry.agg_by_row)
 	entry.agg_by_row = make(map[Row_Id]string)
 
 	tx := tx_begin_read(host.store)
@@ -1252,7 +1301,7 @@ host_agg_prepare :: proc(host: ^Host, entry: ^Subscription_Query) -> bool {
 	columns := make([dynamic]string, 0, len(stmt.projections), tx.alloc)
 	expanded := expand_projections(star, stmt.joins, stmt.projections, &columns, tx.alloc)
 	defer {
-		for column in columns do delete(column, tx.alloc)
+		for column in columns do delete(column) // projection names are cloned in the heap
 		delete(columns)
 	}
 	live := make([dynamic]Row)
@@ -1295,8 +1344,15 @@ host_agg_drop_group :: proc(
 	if !exists do return
 	if group.found && deletes != nil do append(deletes, value_row_clone(group.published))
 	free_values(group.published)
-	delete_key(&entry.agg_groups, key)
-	for id, _ in group.rows do delete_key(&entry.agg_by_row, id)
+	// The map's key and each row's copy of it are the entry's to free.
+	stored, _ := delete_key(&entry.agg_groups, key)
+	delete(stored)
+	for id, _ in group.rows {
+		if row_key, filed := entry.agg_by_row[id]; filed {
+			delete_key(&entry.agg_by_row, id)
+			delete(row_key)
+		}
+	}
 	delete(group.rows)
 
 }
@@ -1363,7 +1419,7 @@ host_apply_incremental_aggregate :: proc(
 	columns := make([dynamic]string, 0, len(stmt.projections), tx.alloc)
 	expanded := expand_projections(star, stmt.joins, stmt.projections, &columns, tx.alloc)
 	defer {
-		for column in columns do delete(column, tx.alloc)
+		for column in columns do delete(column) // projection names are cloned in the heap
 		delete(columns)
 	}
 
@@ -1414,7 +1470,9 @@ host_apply_incremental_aggregate :: proc(
 					delete_key(&group.rows, op.row_id)
 					entry.agg_groups[old_key] = group
 				}
+				// The row's entry held its own copy of the key.
 				delete_key(&entry.agg_by_row, op.row_id)
+				delete(old_key)
 			}
 			if matched {
 				touch(&touched, new_key)
@@ -1487,7 +1545,7 @@ host_join_prepare :: proc(host: ^Host, entry: ^Subscription_Query) -> bool {
 	columns := make([dynamic]string, 0, len(stmt.projections), tx.alloc)
 	expanded := expand_projections(star[:], stmt.joins, stmt.projections, &columns, tx.alloc)
 	defer {
-		for column in columns do delete(column, tx.alloc)
+		for column in columns do delete(column) // projection names are cloned in the heap
 		delete(columns)
 	}
 	// `SELECT *` keeps the column order it was written in; the walk may visit the
@@ -1690,7 +1748,7 @@ host_apply_incremental_join :: proc(
 	columns := make([dynamic]string, 0, len(stmt.projections), tx.alloc)
 	expanded := expand_projections(star[:], stmt.joins, stmt.projections, &columns, tx.alloc)
 	defer {
-		for column in columns do delete(column, tx.alloc)
+		for column in columns do delete(column) // projection names are cloned in the heap
 		delete(columns)
 	}
 	if len(expanded) == 0 do return false
@@ -1838,7 +1896,7 @@ host_project_row :: proc(
 	}
 	columns := make([dynamic]string, 0, len(stmt.projections), tx.alloc)
 	expanded := expand_projections([]Source{source}, stmt.joins, stmt.projections, &columns, tx.alloc)
-	for column in columns do delete(column, tx.alloc)
+	for column in columns do delete(column) // projection names are cloned in the heap
 	delete(columns)
 	out := make([]Value, len(expanded))
 	for expr, i in expanded {
@@ -1902,16 +1960,24 @@ host_apply_incremental :: proc(
 				if cached, exists := entry.rows[old_key]; exists {
 					append(&deletes, value_row_clone(cached))
 					free_values(cached)
-					delete_key(&entry.rows, old_key)
+					// The cache holds its own copy of the key.
+					stored, _ := delete_key(&entry.rows, old_key)
+					delete(stored)
 				}
 				delete_key(&entry.row_keys, op.row_id)
 				delete(old_key)
 			}
 			if matched {
 				key := encode_output_key(projected)
-				if cached, exists := entry.rows[key]; exists do free_values(cached)
-				entry.rows[key] = projected
 				entry.row_keys[op.row_id] = strings.clone(key)
+				if cached, exists := entry.rows[key]; exists {
+					// The same row again: the cache keeps the key it has.
+					free_values(cached)
+					entry.rows[key] = projected
+					delete(key)
+				} else {
+					entry.rows[key] = projected
+				}
 				append(&inserts, value_row_clone(projected))
 			} else {
 				free_values(projected)
@@ -1921,7 +1987,9 @@ host_apply_incremental :: proc(
 				if cached, exists := entry.rows[old_key]; exists {
 					append(&deletes, value_row_clone(cached))
 					free_values(cached)
-					delete_key(&entry.rows, old_key)
+					// The cache holds its own copy of the key.
+					stored, _ := delete_key(&entry.rows, old_key)
+					delete(stored)
 				}
 				delete_key(&entry.row_keys, op.row_id)
 				delete(old_key)
@@ -2004,9 +2072,17 @@ host_on_commit :: proc(ctx: rawptr, store: ^Store, ops: []Store_Op) {
 			next_keys := make(map[Row_Id]string)
 			for row, r in rows {
 				key := encode_output_key_alloc(row, entry_key_alloc(&entry))
-				next[key] = row
 				if r < len(ids) && ids[r] != NO_ROW_ID do next_keys[ids[r]] = strings.clone(key)
+				if cached, exists := next[key]; exists {
+					// Two equal rows are one entry, as above.
+					free_values(cached)
+					next[key] = row
+					if !entry.join do delete(key)
+				} else {
+					next[key] = row
+				}
 			}
+			delete(rows)
 			delete(ids)
 			inserts := make([dynamic][]Value)
 			for key, row in next {

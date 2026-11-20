@@ -286,6 +286,7 @@ test_subscriptions :: proc(t: ^testing.T) {
 	run_done(t, store, "INSERT INTO items (name) VALUES ('one')")
 
 	id, snapshot, err := db.host_subscribe(host, "SELECT id, name FROM items")
+	defer db.host_rows_destroy(snapshot)
 	if !testing.expectf(t, db.error_ok(err), "subscribe failed: %s", err.message) {
 		return
 	}
@@ -738,6 +739,7 @@ test_join_subscription :: proc(t: ^testing.T) {
 	_, snapshot, sub_err := db.host_subscribe(host, `
 		SELECT author.name, book.title
 		FROM author JOIN book ON author.id = book.author_id`)
+	defer db.host_rows_destroy(snapshot)
 	if !testing.expectf(t, db.error_ok(sub_err), "subscribe: %s", sub_err.message) {
 		return
 	}
@@ -2623,6 +2625,7 @@ test_subscription_set :: proc(t: ^testing.T) {
 		host,
 		[]string{"SELECT v FROM alpha", "SELECT v FROM beta"},
 	)
+	defer db.host_snapshot_destroy(snapshots)
 	if !testing.expectf(t, db.error_ok(err), "subscribe failed: %s", err.message) do return
 	testing.expect_value(t, len(snapshots), 2)
 	testing.expect_value(t, len(snapshots[0]), 1)
@@ -3099,6 +3102,7 @@ test_subscription_owners :: proc(t: ^testing.T) {
 
 	owner := u64(77)
 	owned, snapshot, owned_err := db.host_subscribe_many_owned(host, []string{"SELECT v FROM t"}, owner)
+	defer db.host_snapshot_destroy(snapshot)
 	testing.expect(t, db.error_ok(owned_err))
 	testing.expect_value(t, len(snapshot[0]), 1)
 	testing.expect_value(t, db.host_drop_owned(host, owner), 1)
@@ -3106,14 +3110,17 @@ test_subscription_owners :: proc(t: ^testing.T) {
 	testing.expect_value(t, db.host_drop_owned(host, owner), 0)
 
 	// Owner 0 is unowned and survives a bulk drop; explicit unsubscribe works.
-	unowned, _, unowned_err := db.host_subscribe_many(host, []string{"SELECT v FROM t"})
+	unowned, dropped_snapshot_3109, unowned_err := db.host_subscribe_many(host, []string{"SELECT v FROM t"})
+	defer db.host_snapshot_destroy(dropped_snapshot_3109)
 	testing.expect(t, db.error_ok(unowned_err))
 	testing.expect_value(t, db.host_drop_owned(host, 0), 0)
 	testing.expect(t, db.host_unsubscribe(host, unowned))
 
 	// One owner can hold several sets, all dropped together.
-	first, _, _ := db.host_subscribe_many_owned(host, []string{"SELECT v FROM t"}, 1)
-	second, _, _ := db.host_subscribe_many_owned(host, []string{"SELECT v FROM t"}, 1)
+	first, dropped_snapshot_3115, _ := db.host_subscribe_many_owned(host, []string{"SELECT v FROM t"}, 1)
+	defer db.host_snapshot_destroy(dropped_snapshot_3115)
+	second, dropped_snapshot_3116, _ := db.host_subscribe_many_owned(host, []string{"SELECT v FROM t"}, 1)
+	defer db.host_snapshot_destroy(dropped_snapshot_3116)
 	testing.expect_value(t, db.host_drop_owned(host, 1), 2)
 	testing.expect(t, !db.host_unsubscribe(host, first))
 	testing.expect(t, !db.host_unsubscribe(host, second))
@@ -5754,6 +5761,7 @@ test_incremental_subscriptions :: proc(t: ^testing.T) {
 	run_done(t, store, "INSERT INTO inc (id, label) VALUES (2, 'two')")
 
 	id, snapshot, err := db.host_subscribe(host, "SELECT id, label FROM inc WHERE id > 1")
+	defer db.host_rows_destroy(snapshot)
 	if !testing.expectf(t, db.error_ok(err), "subscribe failed: %s", err.message) do return
 	testing.expect_value(t, len(snapshot), 1)
 	testing.expect_value(t, snapshot[0][1].s, "two")
