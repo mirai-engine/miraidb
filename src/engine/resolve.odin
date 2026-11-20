@@ -382,7 +382,10 @@ res_view_columns :: proc(walk: ^Res_Walk, sql: string) -> ([]string, bool) {
 	if walk.depth >= VIEW_MAX_DEPTH do return nil, false
 	query, parse_err := sql_parse(sql)
 	defer query_destroy(&query)
-	if parse_err.kind != .None do return nil, false
+	if parse_err.kind != .None {
+		error_free(&parse_err)
+		return nil, false
+	}
 	inner := Res_Walk{tx = walk.tx, depth = walk.depth + 1}
 	inner.scopes = make([dynamic]Res_Scope, 0, 4, context.temp_allocator)
 	inner.ctes = make([dynamic]Res_Cte, 0, 2, context.temp_allocator)

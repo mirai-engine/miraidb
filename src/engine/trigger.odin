@@ -87,6 +87,7 @@ trigger_create :: proc(tx: ^Tx, stmt: Create_Trigger_Stmt) -> Error {
 	}
 	if is_view {
 	} else if table, table_err := tx_table(tx, stmt.table); table_err.kind != .None {
+		error_free(&table_err)
 		return errf(.Table_Not_Found, "trigger table %s does not exist", stmt.table)
 	} else if table.schema.ephemeral {
 		return errf(.Sql_Unsupported, "triggers need a persistent table")

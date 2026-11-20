@@ -137,6 +137,8 @@ sqlite_view_sql :: proc(store: ^Store, name, body: string, texts: map[string]str
 			if stmt, ok := parsed.statement.(Create_View_Stmt); ok && stmt.sql == body {
 				return strings.clone(original.sql, alloc)
 			}
+		} else {
+			error_free(&parse_err)
 		}
 	}
 	builder := strings.builder_make(alloc)
@@ -171,6 +173,8 @@ sqlite_trigger_sql :: proc(store: ^Store, trigger: Sqlite_Trigger, texts: map[st
 			   stmt.event == trigger.event {
 				return strings.clone(original.sql, alloc)
 			}
+		} else {
+			error_free(&parse_err)
 		}
 	}
 	builder := strings.builder_make(alloc)

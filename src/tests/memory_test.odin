@@ -938,3 +938,25 @@ test_the_memory_vfs_leaves_nothing :: proc(t: ^testing.T) {
 		testing.expectf(t, false, "bad free of %p at %v", entry.memory, entry.location)
 	}
 }
+
+@(test)
+test_probes_for_a_table_leave_nothing :: proc(t: ^testing.T) {
+	// Asking whether a table is there (to price a view over a view, to order a
+	// join, to check a trigger's or a foreign key's table) kept the "not
+	// visible" error each time it was not.
+	expect_nothing_left(t, .Memory, "_test_memory_table_probes", {
+		"CREATE TABLE base (id INTEGER PRIMARY KEY, v INT)",
+		"CREATE TABLE other (id INTEGER PRIMARY KEY, base_id INT)",
+		"INSERT INTO base VALUES (1, 2)",
+		"CREATE VIEW inner_view AS SELECT id, v FROM base",
+		"CREATE VIEW outer_view AS SELECT id FROM inner_view",
+		"SELECT * FROM outer_view JOIN other ON other.base_id = outer_view.id",
+		"SELECT * FROM other JOIN inner_view ON inner_view.id = other.base_id",
+	})
+	expect_nothing_left(t, .Memory, "_test_memory_missing_targets", {
+		"CREATE TRIGGER g AFTER INSERT ON nowhere BEGIN SELECT 1; END",
+	}, fails = true)
+	expect_nothing_left(t, .Memory, "_test_memory_missing_parent", {
+		"CREATE TABLE child (id INTEGER PRIMARY KEY, p INT REFERENCES nowhere (id))",
+	}, fails = true)
+}

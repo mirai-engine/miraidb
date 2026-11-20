@@ -378,6 +378,7 @@ auth_triggers :: proc(walk: ^Auth_Walk, table_name: string, event: string) {
 		if len(row.values) > 5 && row.values[5].kind == .String && len(row.values[5].s) > 0 {
 			condition, condition_expr, condition_err := sql_parse_expression(row.values[5].s)
 			if condition_err.kind == .None do auth_expr(walk, &condition_expr)
+			error_free(&condition_err)
 			query_destroy(&condition)
 		}
 		for statement in trigger_split(body.s, context.temp_allocator) {
@@ -385,6 +386,7 @@ auth_triggers :: proc(walk: ^Auth_Walk, table_name: string, event: string) {
 			if len(text) == 0 do continue
 			query, parse_err := sql_parse(text)
 			if parse_err.kind == .None do auth_statement(walk, &query.statement)
+			error_free(&parse_err)
 			query_destroy(&query)
 		}
 		auth_pop(walk)

@@ -9292,6 +9292,7 @@ sql_exec_create_table :: proc(tx: ^Tx, stmt: Create_Table_Stmt, params: []Value)
 			} else {
 				parent, parent_err := tx_table(tx, constraint.ref_table)
 				if parent_err.kind != .None {
+					error_free(&parent_err)
 					return {}, errf(
 						.Table_Not_Found,
 						"foreign key %s references missing table %s",

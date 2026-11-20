@@ -1296,7 +1296,10 @@ host_agg_prepare :: proc(host: ^Host, entry: ^Subscription_Query) -> bool {
 	tx := tx_begin_read(host.store)
 	defer tx_end(tx)
 	base, table_err := tx_table(tx, stmt.from.name)
-	if table_err.kind != .None do return false
+	if table_err.kind != .None {
+		error_free(&table_err)
+		return false
+	}
 	star := make([]Source, 1, tx.alloc)
 	defer delete(star, tx.alloc)
 	star[0] = Source{table = base, alias = stmt.from.alias}
@@ -1409,7 +1412,10 @@ host_apply_incremental_aggregate :: proc(
 	tx := tx_begin_read(host.store)
 	defer tx_end(tx)
 	base, table_err := tx_table(tx, stmt.from.name)
-	if table_err.kind != .None do return false
+	if table_err.kind != .None {
+		error_free(&table_err)
+		return false
+	}
 	policies, policy_err := policy_load(tx, stmt.from.name)
 	if policy_err.kind != .None do return false
 	active := len(policies.using_exprs) > 0
@@ -1702,7 +1708,10 @@ host_join_tables :: proc(
 		name := index == 0 ? stmt.from.name : stmt.joins[index - 1].table.name
 		alias := index == 0 ? stmt.from.alias : stmt.joins[index - 1].table.alias
 		table, table_err := tx_table(tx, name)
-		if table_err.kind != .None do return false
+		if table_err.kind != .None {
+			error_free(&table_err)
+			return false
+		}
 		if table.paged != nil do return false
 		tables[index] = table
 		alias_text := alias
@@ -2189,6 +2198,8 @@ host_ensure_schedule :: proc(host: ^Host) -> Error {
 	if table, table_err := tx_table(tx, SCHEDULE_TABLE); table_err.kind == .None {
 		exists = true
 		_, has_interval = schema_column_index(&table.schema, "interval_us")
+	} else {
+		error_free(&table_err)
 	}
 	tx_end(tx)
 	if exists && !has_interval {

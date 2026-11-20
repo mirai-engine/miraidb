@@ -644,6 +644,8 @@ plan_candidate :: proc(
 	relation := relations[candidate]
 	kept = relation.scan_rows
 	table, table_err := tx_table(tx, relation.ref.name)
+	// Only whether the table is there matters: the message goes.
+	defer error_free(&table_err)
 	bound[candidate] = true
 	step_ons := make([dynamic]^Expr)
 	defer delete(step_ons)
@@ -845,12 +847,17 @@ plan_view_relation :: proc(
 	sql, found := view_sql(tx, ref.name)
 	if !found do return {}, false
 	query, parse_err := sql_parse(sql)
-	if parse_err.kind != .None do return {}, false
+	if parse_err.kind != .None {
+		error_free(&parse_err)
+		return {}, false
+	}
 	defer query_destroy(&query)
 	inner, is_select := query.statement.(Select_Stmt)
 	if !is_select do return {}, false
 	base, base_err := tx_table(tx, inner.from.name)
 	if base_err.kind != .None {
+		// A view over a view: the nested one is priced instead.
+		error_free(&base_err)
 		nested, nested_ok := plan_view_relation(store, tx, inner.from, nil, params, depth + 1)
 		if !nested_ok do return {}, false
 		nested.ref = ref

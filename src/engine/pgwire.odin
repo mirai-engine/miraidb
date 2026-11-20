@@ -822,7 +822,10 @@ pg_describe_select :: proc(host: ^Host, sql: string) -> []u8 {
 // referenced table is missing.
 pg_describe_plan :: proc(host: ^Host, sql: string) -> (columns: []string, ok: bool) {
 	query, parse_err := sql_parse(sql)
-	if parse_err.kind != .None do return nil, false
+	if parse_err.kind != .None {
+		error_free(&parse_err)
+		return nil, false
+	}
 	defer query_destroy(&query)
 	stmt, is_select := query.statement.(Select_Stmt)
 	if !is_select do return nil, false
@@ -1236,6 +1239,8 @@ pg_statement_param_types :: proc(statement: Pg_Statement) -> []u32 {
 	if query, parse_err := sql_parse(statement.sql); parse_err.kind == .None {
 		count = max(count, query.param_count)
 		query_destroy(&query)
+	} else {
+		error_free(&parse_err)
 	}
 	types := make([]u32, count, context.temp_allocator)
 	for i in 0 ..< count {

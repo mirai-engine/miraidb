@@ -45,6 +45,7 @@ store_integrity_check :: proc(store: ^Store, alloc: mem.Allocator, in_tx: ^Tx = 
 		table, table_err := tx_table(tx, name)
 		if table_err.kind != .None {
 			append(&problems, fmt.aprintf("table %s is unreadable: %s", name, table_err.message, allocator = alloc))
+			error_free(&table_err)
 			continue
 		}
 		live := make([dynamic]Row)
@@ -155,7 +156,10 @@ store_foreign_key_check :: proc(store: ^Store, alloc: mem.Allocator, in_tx: ^Tx 
 	slice.sort(names)
 	for name in names {
 		table, table_err := tx_table(tx, name)
-		if table_err.kind != .None do continue
+		if table_err.kind != .None {
+			error_free(&table_err)
+			continue
+		}
 		live := make([dynamic]Row)
 		if collect_err := tx_collect(tx, name, &live); collect_err.kind != .None {
 			delete(live)
