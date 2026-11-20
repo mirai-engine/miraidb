@@ -438,3 +438,35 @@ test_windows_with_an_order_leave_nothing :: proc(t: ^testing.T) {
 		"SELECT g, sum(n) OVER (PARTITION BY g ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY 2",
 	})
 }
+
+@(test)
+test_show_leaves_nothing :: proc(t: ^testing.T) {
+	// SHOW types, events and indexes answered with a column array that was a
+	// slice literal (on the stack of the proc that returned it) and string
+	// literals for names: destroying such a result was a bad free.
+	expect_nothing_left(t, .Memory, "_test_memory_show", {
+		"CREATE TYPE money AS DECIMAL",
+		"CREATE TABLE t (id INTEGER PRIMARY KEY, a INT, b INT)",
+		"CREATE INDEX i ON t (a, b)",
+		"CREATE EVENT TABLE e (n INT)",
+		"SHOW tables",
+		"SHOW types",
+		"SHOW events",
+		"SHOW indexes",
+	})
+}
+
+@(test)
+test_catalog_reads_leave_nothing :: proc(t: ^testing.T) {
+	// _indexes named an index's columns by concatenating them, keeping every
+	// partial string; PRAGMA stats formatted its bucket names and kept them.
+	expect_nothing_left(t, .Memory, "_test_memory_catalog", {
+		"CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, n INT)",
+		"CREATE INDEX i ON t (v, n)",
+		"CREATE INDEX e ON t (n + 1)",
+		"SELECT name, type FROM _columns WHERE table = 't' ORDER BY name",
+		"SELECT name, columns FROM _indexes WHERE table = 't' ORDER BY name",
+		"SHOW indexes",
+		"PRAGMA stats",
+	})
+}

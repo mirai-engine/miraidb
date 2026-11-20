@@ -987,6 +987,16 @@ sql_exec_set :: proc(store: ^Store, stmt: Set_Stmt, params: []Value, locked := f
 	return Sql_Result{kind = .Ack, commit_seq = store.commit_seq}, ERROR_NONE
 }
 
+// show_columns gives a result its column names, the array and each name its
+// own: a slice literal there lived on the stack of the proc that returned it,
+// and the result's destroy freed string literals.
+@(private)
+show_columns :: proc(names: ..string) -> []string {
+	out := make([]string, len(names))
+	for name, i in names do out[i] = result_own(name)
+	return out
+}
+
 sql_exec_show :: proc(store: ^Store, stmt: Show_Stmt, locked := false) -> (Sql_Result, Error) {
 	if !locked {
 		sync.shared_lock(&store.mutex)
@@ -1007,6 +1017,7 @@ sql_exec_show :: proc(store: ^Store, stmt: Show_Stmt, locked := false) -> (Sql_R
 			row[0] = value_string(strings.clone(name))
 			append(&rows_out, row)
 		}
+		delete(result.columns[0])
 		result.columns[0] = result_own("table")
 		delete(result.columns[1])
 		result.columns = result.columns[:1]
@@ -1017,11 +1028,10 @@ sql_exec_show :: proc(store: ^Store, stmt: Show_Stmt, locked := false) -> (Sql_R
 	}
 	if len(stmt.name) > 0 && strings.equal_fold(stmt.name, "types") {
 		sql_result_destroy(&result)
+		delete(rows)
 		out := Sql_Result{kind = .Rows, commit_seq = store.commit_seq}
-		if _, exists := store.tables[TYPE_TABLE]; !exists {
-			out.columns = []string{result_own("name"), result_own("base")}
-			return out, ERROR_NONE
-		}
+		out.columns = show_columns("name", "base")
+		if _, exists := store.tables[TYPE_TABLE]; !exists do return out, ERROR_NONE
 		catalog := store.tables[TYPE_TABLE]
 		entries := make([dynamic]Row)
 		defer delete(entries)
@@ -1029,7 +1039,6 @@ sql_exec_show :: proc(store: ^Store, stmt: Show_Stmt, locked := false) -> (Sql_R
 		slice.sort_by(entries[:], proc(a, b: Row) -> bool {
 			return strings.compare(a.values[0].s, b.values[0].s) < 0
 		})
-		out.columns = []string{result_own("name"), result_own("base")}
 		out.rows = make([][]Value, len(entries))
 		for entry, i in entries {
 			row := make([]Value, 2)
@@ -1041,9 +1050,11 @@ sql_exec_show :: proc(store: ^Store, stmt: Show_Stmt, locked := false) -> (Sql_R
 	}
 	if len(stmt.name) > 0 && strings.equal_fold(stmt.name, "events") {
 		sql_result_destroy(&result)
+		delete(rows)
 		out := Sql_Result{kind = .Rows, commit_seq = store.commit_seq}
-		out.columns = []string{result_own("table")}
+		out.columns = show_columns("table")
 		names := event_tables(store, context.allocator)
+		defer delete(names)
 		rows_out := make([][]Value, len(names))
 		for name, i in names {
 			row := make([]Value, 1)
@@ -1055,8 +1066,9 @@ sql_exec_show :: proc(store: ^Store, stmt: Show_Stmt, locked := false) -> (Sql_R
 	}
 	if len(stmt.name) > 0 && strings.equal_fold(stmt.name, "indexes") {
 		sql_result_destroy(&result)
+		delete(rows)
 		out := Sql_Result{kind = .Rows, commit_seq = store.commit_seq}
-		out.columns = []string{result_own("table"), result_own("index"), result_own("columns")}
+		out.columns = show_columns("table", "index", "columns")
 		rows_out := make([dynamic][]Value)
 		names := store_table_names(store, context.allocator)
 		defer delete(names)
@@ -1067,12 +1079,7 @@ sql_exec_show :: proc(store: ^Store, stmt: Show_Stmt, locked := false) -> (Sql_R
 				row := make([]Value, 3)
 				row[0] = value_string(strings.clone(table_name))
 				row[1] = value_string(strings.clone(idx.name))
-				column_list := ""
-				for col, i in idx.columns {
-					if i > 0 do column_list = strings.concatenate({column_list, ", "})
-					column_list = strings.concatenate({column_list, table.schema.columns[col].name})
-				}
-				row[2] = value_string(column_list)
+				row[2] = value_string(index_parts_text(table, idx, context.allocator))
 				append(&rows_out, row)
 			}
 		}

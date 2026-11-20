@@ -197,15 +197,10 @@ system_table_rows :: proc(tx: ^Tx, name: string, alloc: mem.Allocator) -> [dynam
 			}
 		case:
 			for index in table.schema.indexes {
-				column_list := ""
-				for position, i in index.columns {
-					if i > 0 do column_list = strings.concatenate({column_list, ", "})
-					column_list = strings.concatenate({column_list, table.schema.columns[position].name})
-				}
 				values := make([]Value, 4, alloc)
 				values[0] = value_string(strings.clone(table_name, alloc))
 				values[1] = value_string(strings.clone(index.name, alloc))
-				values[2] = value_string(column_list)
+				values[2] = value_string(index_parts_text(table, index, alloc))
 				values[3] = value_bool(index.unique)
 				append(&out, Row{id = Row_Id(next_id), values = values})
 				next_id += 1

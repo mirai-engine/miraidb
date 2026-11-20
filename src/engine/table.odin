@@ -192,6 +192,23 @@ index_part_values :: proc(t: ^Table, index: int, values: []Value, alloc: mem.All
 	return out
 }
 
+// index_parts_text names an index's key parts, comma separated, in `alloc`: a
+// column by its name and an expression part by its text. (Both readers of it
+// concatenated the names and lost every intermediate string, and indexed the
+// columns by an expression part's NO_COLUMN.)
+index_parts_text :: proc(t: ^Table, index: Index_Schema, alloc: mem.Allocator) -> string {
+	parts := make([]string, len(index.columns), context.temp_allocator)
+	for column, i in index.columns {
+		switch {
+		case column >= 0 && column < len(t.schema.columns):
+			parts[i] = t.schema.columns[column].name
+		case i < len(index.exprs):
+			parts[i] = index.exprs[i]
+		}
+	}
+	return strings.join(parts, ", ", alloc)
+}
+
 // table_index_position finds an index of the table by name.
 table_index_position :: proc(t: ^Table, name: string) -> (int, bool) {
 	for index, i in t.indexes do if index.schema.name == name do return i, true

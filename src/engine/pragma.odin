@@ -825,8 +825,8 @@ pragma_stats :: proc(store: ^Store) -> Sql_Result {
 	append_counts(&rows, "mirror_rewrites", u64(store.mirror_full_writes))
 	bound: u64 = 1
 	for bucket in 0 ..< LATENCY_BUCKETS {
-		append_counts(&rows, fmt.aprintf("commit_us_lt_%d", bound), stats.commit_bucket[bucket])
-		append_counts(&rows, fmt.aprintf("query_us_lt_%d", bound), stats.query_bucket[bucket])
+		append_counts(&rows, fmt.tprintf("commit_us_lt_%d", bound), stats.commit_bucket[bucket])
+		append_counts(&rows, fmt.tprintf("query_us_lt_%d", bound), stats.query_bucket[bucket])
 		bound *= 2
 	}
 	result.rows = rows[:]
