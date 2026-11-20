@@ -10032,20 +10032,20 @@ test_fault_injection :: proc(t: ^testing.T) {
 		db.vfs_fault_arm(fault, .Write, u64(n))
 		store, open_err := db.store_open(path, {persistent = true, create = true, durable = true, vfs = fault})
 		if !db.error_ok(open_err) {
+			db.error_free(&open_err)
 			// A fault during the initial header leaves no usable database; opening
 			// again must report the same thing instead of inventing state.
 			_, retry_err := db.store_open(path, {persistent = true, create = false, durable = false, vfs = memory})
 			testing.expectf(t, retry_err.kind != .None, "n=%d: a failed header opened clean", n)
+			db.error_free(&retry_err)
 			delete(path)
 			continue
 		}
 		created := db.error_ok(run_err(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"))
 		inserted := 0
 		for i in 0 ..< 6 {
-			statement := fmt.aprintf("INSERT INTO t (v) VALUES (%d)", i)
-			_, insert_err := db.sql_execute(store, statement)
-			delete(statement)
-			if db.error_ok(insert_err) do inserted += 1
+			statement := fmt.tprintf("INSERT INTO t (v) VALUES (%d)", i)
+			if db.error_ok(run_err(t, store, statement)) do inserted += 1
 		}
 		if db.vfs_fault_fired(fault) do fired += 1
 		db.store_close(store)
@@ -10060,7 +10060,9 @@ test_fault_injection :: proc(t: ^testing.T) {
 		if db.error_ok(count_err) {
 			count = result.rows[0][0].i
 		}
+		db.sql_result_destroy(&result)
 		testing.expectf(t, db.error_ok(count_err) == created, "n=%d: table exists=%v created=%v", n, db.error_ok(count_err), created)
+		db.error_free(&count_err)
 		testing.expectf(t, count == i64(inserted), "n=%d: %d rows landed, %d commits reported success", n, count, inserted)
 		db.store_close(clean)
 		delete(path)
@@ -10073,6 +10075,7 @@ test_fault_injection :: proc(t: ^testing.T) {
 		path := fmt.aprintf("_fault_short_%d", n)
 		store, open_err := db.store_open(path, {persistent = true, create = true, durable = true, vfs = fault})
 		if !db.error_ok(open_err) {
+			db.error_free(&open_err)
 			delete(path)
 			continue
 		}
@@ -10081,8 +10084,7 @@ test_fault_injection :: proc(t: ^testing.T) {
 		db.vfs_fault_short(fault, 3)
 		created := db.error_ok(run_err(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"))
 		inserted := 0
-		_, insert_err := db.sql_execute(store, "INSERT INTO t (v) VALUES (1)")
-		if db.error_ok(insert_err) do inserted += 1
+		if db.error_ok(run_err(t, store, "INSERT INTO t (v) VALUES (1)")) do inserted += 1
 		if db.vfs_fault_fired(fault) do short_fired += 1
 		db.store_close(store)
 		clean, clean_err := db.store_open(path, {persistent = true, create = false, durable = false, vfs = memory})
@@ -10091,7 +10093,9 @@ test_fault_injection :: proc(t: ^testing.T) {
 			result, count_err := db.sql_execute(clean, "SELECT count(*) FROM t")
 			count := i64(0)
 			if db.error_ok(count_err) do count = result.rows[0][0].i
+			db.sql_result_destroy(&result)
 			testing.expectf(t, db.error_ok(count_err) == created, "short n=%d: table exists=%v created=%v", n, db.error_ok(count_err), created)
+			db.error_free(&count_err)
 			testing.expectf(t, count == i64(inserted), "short n=%d: %d rows, %d reported", n, count, inserted)
 			db.store_close(clean)
 		}
@@ -10115,6 +10119,7 @@ test_fault_injection :: proc(t: ^testing.T) {
 		db.vfs_fault_arm(fault, .Read, 1)
 		_, replay_err := db.store_open(path, {persistent = true, create = false, durable = false, vfs = fault})
 		testing.expectf(t, replay_err.kind != .None, "a failing read during replay must be reported")
+		db.error_free(&replay_err)
 		db.vfs_fault_arm(fault, .Read, 0)
 		clean, clean_err := db.store_open(path, {persistent = true, create = false, durable = false, vfs = memory})
 		testing.expectf(t, db.error_ok(clean_err), "reopen after a read fault: %s", clean_err.message)
@@ -10126,9 +10131,14 @@ test_fault_injection :: proc(t: ^testing.T) {
 }
 
 @(private)
+// run_err runs a statement that may fail and answers its error, the message in
+// the test's temporary memory, the result freed.
 run_err :: proc(t: ^testing.T, store: ^db.Store, sql: string) -> db.Error {
-	_, err := db.sql_execute(store, sql)
-	return err
+	result, err := db.sql_execute(store, sql)
+	db.sql_result_destroy(&result)
+	out := db.Error{kind = err.kind, message = strings.clone(err.message, context.temp_allocator)}
+	db.error_free(&err)
+	return out
 }
 
 @(test)
@@ -11518,9 +11528,11 @@ test_paged_commit_survives_a_failed_write :: proc(t: ^testing.T) {
 			paged_tables = true,
 			page_frames = 2,
 		})
-		if !db.error_ok(open_err) do continue
-		_, create_err := db.sql_execute(store, "CREATE TABLE p (id INTEGER PRIMARY KEY, v TEXT)")
-		if !db.error_ok(create_err) {
+		if !db.error_ok(open_err) {
+			db.error_free(&open_err)
+			continue
+		}
+		if !db.error_ok(run_err(t, store, "CREATE TABLE p (id INTEGER PRIMARY KEY, v TEXT)")) {
 			db.store_close(store)
 			continue
 		}
@@ -11528,9 +11540,10 @@ test_paged_commit_survives_a_failed_write :: proc(t: ^testing.T) {
 		armed := true
 		tx := db.tx_begin_write(store)
 		for i in 0 ..< 50 {
-			statement := fmt.aprintf("INSERT INTO p (v) VALUES ('row-%d')", i)
-			defer delete(statement)
-			_, insert_err := db.sql_execute_in_tx(tx, statement)
+			statement := fmt.tprintf("INSERT INTO p (v) VALUES ('row-%d')", i)
+			inserted, insert_err := db.sql_execute_in_tx(tx, statement)
+			db.sql_result_destroy(&inserted)
+			defer db.error_free(&insert_err)
 			if !db.error_ok(insert_err) {
 				// The fault fired while staging: nothing to commit.
 				db.tx_rollback(tx)
@@ -11541,6 +11554,7 @@ test_paged_commit_survives_a_failed_write :: proc(t: ^testing.T) {
 		if armed {
 			commit_err := db.tx_commit(tx)
 			committed = db.error_ok(commit_err)
+			db.error_free(&commit_err)
 			if db.vfs_fault_fired(fault) do fired_cases += 1
 		}
 		db.vfs_fault_arm(fault, .Write, 0)
