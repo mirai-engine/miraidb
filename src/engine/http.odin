@@ -25,6 +25,14 @@ Http_Request :: struct {
 	zlib_body:     bool,
 }
 
+// http_request_destroy frees what a parsed request owns: its method and path
+// (the body points into the bytes that were parsed).
+http_request_destroy :: proc(request: ^Http_Request) {
+	delete(request.method)
+	delete(request.path)
+	request^ = {}
+}
+
 http_parse_request :: proc(data: []u8) -> (request: Http_Request, consumed: int, err: Error) {
 	return http_parse_request_within(data, HTTP_DEFAULT_MAX_HEADER, HTTP_DEFAULT_MAX_BODY)
 }
@@ -80,10 +88,12 @@ http_parse_request_within :: proc(
 		value := strings.trim_space(line[len("content-length:"):])
 		for c in value {
 			if c < '0' || c > '9' {
-				return request, 0, errf(.Invalid_Argument, "bad Content-Length")
+				http_request_destroy(&request)
+				return {}, 0, errf(.Invalid_Argument, "bad Content-Length")
 			}
 			content_length = content_length * 10 + int(c - '0')
 			if content_length < 0 || (max_body > 0 && content_length > max_body) {
+				http_request_destroy(&request)
 				return {}, 0, errf(
 					.Quota_Exceeded,
 					"HTTP body is more than the %d byte limit",
@@ -95,7 +105,9 @@ http_parse_request_within :: proc(
 	body_start := header_end + 4
 	consumed = body_start + content_length
 	if consumed > len(data) {
-		return request, 0, errf(.Incomplete, "incomplete HTTP body")
+		// The caller reads more and parses again: this parse's copies go.
+		http_request_destroy(&request)
+		return {}, 0, errf(.Incomplete, "incomplete HTTP body")
 	}
 	request.body = data[body_start:consumed]
 	return request, consumed, ERROR_NONE
@@ -171,7 +183,7 @@ client_drops :: proc(host: ^Host) -> u64 {
 // subscriptions.
 http_handle :: proc(host: ^Host, request: Http_Request) -> []u8 {
 	if host != nil && host.max_request_bytes > 0 && len(request.body) > host.max_request_bytes {
-		return http_response(413, "text/plain", http_bytes("request body too large"))
+		return http_response(413, "text/plain", transmute([]u8)string("request body too large"))
 	}
 	effective := request
 	if request.zlib_body && len(request.body) > 0 {
@@ -181,7 +193,10 @@ http_handle :: proc(host: ^Host, request: Http_Request) -> []u8 {
 	}
 	response := http_dispatch(host, effective)
 	if request.accepts_zlib && len(response) > 0 {
-		return http_compress_response(response)
+		// The compressed message is a new one; the plain one goes.
+		compressed := http_compress_response(response)
+		if raw_data(compressed) != raw_data(response) do delete(response)
+		return compressed
 	}
 	return response
 }
@@ -224,7 +239,7 @@ http_compress_response :: proc(raw: []u8) -> []u8 {
 @(private)
 http_dispatch :: proc(host: ^Host, request: Http_Request) -> []u8 {
 	if request.method == "GET" && request.path == "/health" {
-		return http_response(200, "text/plain", http_bytes("ok"))
+		return http_response(200, "text/plain", transmute([]u8)string("ok"))
 	}
 	if request.method == "GET" && request.path == "/metrics" {
 		body := fmt.aprintf(
@@ -242,14 +257,14 @@ http_dispatch :: proc(host: ^Host, request: Http_Request) -> []u8 {
 			client_drops(host),
 		)
 		defer delete(body)
-		return http_response(200, "text/plain; version=0.0.4", http_bytes(body))
+		return http_response(200, "text/plain; version=0.0.4", transmute([]u8)body)
 	}
 	if request.method == "GET" && request.path == "/schema" {
 		body := host_schema_text(host, context.temp_allocator)
-		return http_response(200, "text/plain", http_bytes(body))
+		return http_response(200, "text/plain", transmute([]u8)body)
 	}
 	if request.method != "POST" {
-		return http_response(405, "text/plain", http_bytes("method not allowed"))
+		return http_response(405, "text/plain", transmute([]u8)string("method not allowed"))
 	}
 	switch request.path {
 	case "/call", "/query", "/subscribe", "/unsubscribe", "/wire":
@@ -258,5 +273,5 @@ http_dispatch :: proc(host: ^Host, request: Http_Request) -> []u8 {
 		delete(body)
 		return response
 	}
-	return http_response(404, "text/plain", http_bytes("not found"))
+	return http_response(404, "text/plain", transmute([]u8)string("not found"))
 }

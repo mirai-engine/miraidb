@@ -735,3 +735,54 @@ test_failed_writes_leave_nothing :: proc(t: ^testing.T) {
 		testing.expectf(t, false, "bad free of %p at %v", entry.memory, entry.location)
 	}
 }
+
+@(test)
+test_http_requests_leave_nothing :: proc(t: ^testing.T) {
+	// Each request the server read kept its method and path, every partial
+	// read kept an "incomplete" error, a plain endpoint's body was allocated
+	// and dropped, and a compressed answer dropped the plain one.
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	{
+		context.allocator = mem.tracking_allocator(&track)
+		store, open_err := db.store_open("", {persistent = false})
+		if !testing.expect(t, db.error_ok(open_err)) do return
+		host := db.host_init(store)
+		created, create_err := db.sql_execute(store, "CREATE TABLE t (v INT)")
+		db.sql_result_destroy(&created)
+		db.error_free(&create_err)
+		query := db.wire_encode_query("SELECT v FROM t", nil)
+		post := fmt.tprintf("POST /query HTTP/1.1\r\nAccept-Encoding: zlib\r\nContent-Length: %d\r\n\r\n%s", len(query), string(query))
+		delete(query)
+		for text in ([]string{
+			"GET /health HTTP/1.1\r\n\r\n",
+			"GET /metrics HTTP/1.1\r\n\r\n",
+			"GET /schema HTTP/1.1\r\n\r\n",
+			"GET /nowhere HTTP/1.1\r\n\r\n",
+			"PUT /query HTTP/1.1\r\n\r\n",
+			post,
+			"POST /query HTTP/1.1\r\nContent-Length: 10\r\n\r\nabc",
+			"POST /query HTTP/1.1\r\nContent-Length: 1x\r\n\r\n",
+			"GET /health HTTP/1.1\r\n",
+		}) {
+			request, _, parse_err := db.http_parse_request(transmute([]u8)text)
+			if !db.error_ok(parse_err) {
+				db.error_free(&parse_err)
+				continue
+			}
+			response := db.http_handle(host, request)
+			db.http_request_destroy(&request)
+			delete(response)
+		}
+		db.host_destroy(host)
+		db.store_close(store)
+		free_all(context.temp_allocator)
+	}
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "%d bytes left from %v", entry.size, entry.location)
+	}
+	for entry in track.bad_free_array {
+		testing.expectf(t, false, "bad free of %p at %v", entry.memory, entry.location)
+	}
+}

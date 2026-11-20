@@ -367,9 +367,12 @@ serve :: proc(connection: ^Connection) {
 			host.max_request_bytes,
 		)
 		if db.error_ok(parse_err) do break
-		if parse_err.kind != .Incomplete {
+		// Only the kind is read: every message goes, incomplete or not.
+		kind := parse_err.kind
+		db.error_free(&parse_err)
+		if kind != .Incomplete {
 			status := 400
-			if parse_err.kind == .Quota_Exceeded do status = 413
+			if kind == .Quota_Exceeded do status = 413
 			body := text_bytes("bad request")
 			response := db.http_response(status, "text/plain", body)
 			delete(body)
@@ -385,6 +388,7 @@ serve :: proc(connection: ^Connection) {
 	_ = used
 	statement_begin(connection.port)
 	response := db.http_handle(host, request)
+	db.http_request_destroy(&request)
 	statement_end(connection.port)
 	_ = send(connection, response)
 	delete(response)
