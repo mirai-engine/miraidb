@@ -425,3 +425,16 @@ test_function_answers_leave_nothing :: proc(t: ^testing.T) {
 		"SELECT CAST(n AS TEXT), CAST(n AS REAL), -n, ~n, a || n, CASE WHEN n > 1 THEN upper(a) ELSE lower(a) END FROM t",
 	})
 }
+
+@(test)
+test_windows_with_an_order_leave_nothing :: proc(t: ^testing.T) {
+	// A query with a window builds its order keys once the window values
+	// exist; it also built one per row before, and dropped it.
+	expect_nothing_left(t, .Memory, "_test_memory_windows", {
+		"CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT, n INTEGER)",
+		"INSERT INTO t VALUES (1, 'a', 10), (2, 'a', 20), (3, 'a', 20), (4, 'b', 40)",
+		"SELECT sum(n) OVER (ORDER BY n RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t ORDER BY id",
+		"SELECT count(*) OVER (ORDER BY n GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t ORDER BY id DESC",
+		"SELECT g, sum(n) OVER (PARTITION BY g ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY 2",
+	})
+}

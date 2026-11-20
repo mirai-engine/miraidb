@@ -4569,14 +4569,15 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			// The row id comes from the sources, which the non-window branch
 			// frees below: read it first, never after the delete.
 			row_id := len(partial) == 1 ? partial[0].row.id : NO_ROW_ID
-			sort_key := build_order_key(&ctx, stmt.order_by, expanded, values, columns[:], row_id)
+			sort_key: []u8
 			if has_windows {
-				// The keys are rebuilt once the window values exist, so the
-				// sources have to outlive the loop.
-				sort_key = nil
+				// The keys are built once the window values exist, so the sources
+				// have to outlive the loop. A key built here as well was dropped
+				// without being freed, one per row.
 				append(&window_cells, cells)
 				append(&window_sources, partial)
 			} else {
+				sort_key = build_order_key(&ctx, stmt.order_by, expanded, values, columns[:], row_id)
 				delete(cells)
 				delete(partial)
 			}
