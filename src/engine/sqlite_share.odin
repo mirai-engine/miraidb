@@ -148,6 +148,9 @@ sqlite_share_leave :: proc(conn: ^Embed_Conn) {
 	share := conn.share
 	if share == nil do return
 	context.allocator = runtime.heap_allocator()
+	sqlite_share_hashes_clear(conn)
+	delete(conn.share_hashes)
+	conn.share_hashes = nil
 	sync.lock(&sqlite_shares_mutex)
 	defer sync.unlock(&sqlite_shares_mutex)
 	if share.writer == conn {
@@ -376,18 +379,242 @@ sqlite_share_refresh :: proc(conn: ^Embed_Conn) -> Error {
 	// What the connection set for itself stays; the content is the file's.
 	foreign_keys_off, sqlite_rules := store.foreign_keys_off, store.sqlite_rules
 	last_changes, total_changes, last_row_id := store.last_changes, store.total_changes, store.last_row_id
-	if replace_err := store_replace_content(store, image, true); replace_err.kind != .None {
-		// The store keeps what it had and stays the file's, so the next
-		// statement tries again; this one fails rather than read it.
+	// Most commits change a table or two: those are reloaded, and the store
+	// keeps the rest. Anything else (a schema change, a file this cannot hash)
+	// reads the whole file again, as before.
+	file, parse_err := sqlite_file_from_bytes(image)
+	parsed := parse_err.kind == .None
+	if !parsed do error_free(&parse_err)
+	defer if parsed do sqlite_file_destroy(&file)
+	hashes := make(map[string]u64, 16, context.temp_allocator)
+	if parsed do sqlite_share_hash_file(&file, &hashes)
+	caught_up := parsed && sqlite_share_catch_up(conn, &file, hashes, mirror)
+	if !caught_up {
+		if replace_err := store_replace_content(store, image, true); replace_err.kind != .None {
+			// The store keeps what it had and stays the file's, so the next
+			// statement tries again; this one fails rather than read it.
+			store_set_sqlite_mirror(store, mirror)
+			sqlite_share_hashes_clear(conn)
+			return replace_err
+		}
 		store_set_sqlite_mirror(store, mirror)
-		return replace_err
 	}
-	store_set_sqlite_mirror(store, mirror)
+	if parsed {
+		sqlite_share_hashes_keep(conn, hashes)
+	} else {
+		sqlite_share_hashes_clear(conn)
+	}
 	store.foreign_keys_off, store.sqlite_rules = foreign_keys_off, sqlite_rules
 	store.last_changes, store.total_changes, store.last_row_id = last_changes, total_changes, last_row_id
 	conn.share_generation = generation
 	if counted do conn.share_counter = counter
 	return ERROR_NONE
+}
+
+// SHARE_HASH_SCHEMA and SHARE_HASH_SEQUENCE key the hashes of sqlite_master
+// (with the header integers a program sets) and of sqlite_sequence; no table
+// name starts with a zero byte.
+@(private)
+SHARE_HASH_SCHEMA :: "\x00schema"
+@(private)
+SHARE_HASH_SEQUENCE :: "\x00sequence"
+
+// sqlite_share_hash_tree hashes a b-tree's rows, each its rowid and its whole
+// payload (overflow included), in key order: FNV-1a over the bytes.
+@(private)
+sqlite_share_hash_tree :: proc(file: ^Sqlite_File, root: u32, table: bool) -> (u64, bool) {
+	Ctx :: struct {
+		hash: u64,
+	}
+	ctx := Ctx{hash = 0xcbf29ce484222325}
+	mix :: proc(ctx: ^Ctx, bytes: []u8) {
+		for b in bytes {
+			ctx.hash ~= u64(b)
+			ctx.hash *= 0x100000001b3
+		}
+	}
+	visit := proc(user: rawptr, rowid: i64, payload: []u8) -> bool {
+		ctx := (^Ctx)(user)
+		id := rowid
+		mix(ctx, ([^]u8)(&id)[:size_of(i64)])
+		length := len(payload)
+		mix(ctx, ([^]u8)(&length)[:size_of(int)])
+		mix(ctx, payload)
+		return true
+	}
+	if !sqlite_walk(file, root, table, visit, &ctx, 0) do return 0, false
+	return ctx.hash, true
+}
+
+// sqlite_share_hash_file fills `out` with the hash of every table the file
+// declares, of its schema and of sqlite_sequence. A tree it cannot walk is left
+// out, and a table missing from the hashes is always reloaded.
+@(private)
+sqlite_share_hash_file :: proc(file: ^Sqlite_File, out: ^map[string]u64) {
+	if schema, ok := sqlite_share_hash_tree(file, 1, true); ok {
+		// The header's schema cookie, user_version, application_id and the
+		// rest of what a program sets (bytes 40 to 91): the change counter and
+		// the page count move with every commit and say nothing of content.
+		page_one := sqlite_page(file, 1)
+		if len(page_one) >= 92 {
+			for b in page_one[40:92] {
+				schema ~= u64(b)
+				schema *= 0x100000001b3
+			}
+			out[SHARE_HASH_SCHEMA] = schema
+		}
+	}
+	if file.sequence_root != 0 {
+		if sequence, ok := sqlite_share_hash_tree(file, file.sequence_root, true); ok do out[SHARE_HASH_SEQUENCE] = sequence
+	} else {
+		out[SHARE_HASH_SEQUENCE] = 0
+	}
+	for &table in file.tables {
+		if hash, ok := sqlite_share_hash_tree(file, table.root_page, !table.without_rowid); ok do out[table.name] = hash
+	}
+}
+
+// sqlite_share_catch_up brings the store up to the file by reloading only the
+// tables whose rows changed since the store last matched it. It answers false,
+// leaving the store as it was, whenever that is not enough: no hashes kept, a
+// schema or sqlite_sequence that moved, a table it does not reload row by row.
+@(private)
+sqlite_share_catch_up :: proc(conn: ^Embed_Conn, file: ^Sqlite_File, hashes: map[string]u64, mirror: string) -> bool {
+	kept := conn.share_hashes
+	if len(kept) == 0 do return false
+	for key in ([]string{SHARE_HASH_SCHEMA, SHARE_HASH_SEQUENCE}) {
+		now, has_now := hashes[key]
+		before, has_before := kept[key]
+		if !has_now || !has_before || now != before do return false
+	}
+	changed := make([dynamic]^Sqlite_Table, 0, 4, context.temp_allocator)
+	for &table in file.tables {
+		now, has_now := hashes[table.name]
+		before, has_before := kept[table.name]
+		if has_now && has_before && now == before do continue
+		if table.without_rowid || len(table.columns) == 0 do return false
+		append(&changed, &table)
+	}
+	if len(changed) == 0 do return true
+	store := conn.store
+	for table in changed {
+		if _, found := store.tables[table.name]; !found do return false
+	}
+	// The rows are the file's: no hook reports them, no trigger runs again, and
+	// the commit does not write them back.
+	saved_commit, saved_row := store.hooks.commit, store.hooks.row_change
+	store.hooks.commit, store.hooks.row_change = nil, nil
+	defer store.hooks.commit, store.hooks.row_change = saved_commit, saved_row
+	saved_keys := store.foreign_keys_off
+	store.foreign_keys_off = true
+	defer store.foreign_keys_off = saved_keys
+	delete(store.sqlite_mirror)
+	store.sqlite_mirror = ""
+	mirror_destroy(store.mirror)
+	store.mirror = nil
+	tx := tx_begin_write(store)
+	tx.no_triggers = true
+	ok := true
+	reload: for table in changed {
+		if truncate_err := tx_truncate(tx, table.name); truncate_err.kind != .None {
+			error_free(&truncate_err)
+			ok = false
+			break reload
+		}
+		rows, rows_err := sqlite_table_rows(file, table, context.allocator)
+		if rows_err.kind != .None {
+			error_free(&rows_err)
+			ok = false
+			break reload
+		}
+		defer {
+			for row in rows {
+				for value in row do value_deep_free(value, context.allocator)
+				delete(row)
+			}
+			delete(rows)
+		}
+		for row in rows {
+			if _, insert_err := tx_insert(tx, table.name, row); insert_err.kind != .None {
+				error_free(&insert_err)
+				ok = false
+				break reload
+			}
+		}
+	}
+	if ok {
+		if commit_err := tx_commit(tx); commit_err.kind != .None {
+			error_free(&commit_err)
+			ok = false
+		}
+	} else {
+		tx_rollback(tx)
+	}
+	store_set_sqlite_mirror(store, mirror)
+	return ok
+}
+
+// sqlite_share_hashes_keep makes `hashes` the ones the connection matches.
+@(private)
+sqlite_share_hashes_keep :: proc(conn: ^Embed_Conn, hashes: map[string]u64) {
+	sqlite_share_hashes_clear(conn)
+	context.allocator = runtime.heap_allocator()
+	if conn.share_hashes == nil do conn.share_hashes = make(map[string]u64, len(hashes))
+	for name, hash in hashes do conn.share_hashes[strings.clone(name)] = hash
+}
+
+// sqlite_share_hashes_clear forgets the hashes: the next catch-up reads the
+// whole file.
+@(private)
+sqlite_share_hashes_clear :: proc(conn: ^Embed_Conn) {
+	context.allocator = runtime.heap_allocator()
+	for name in conn.share_hashes do delete(name)
+	clear(&conn.share_hashes)
+}
+
+// store_mirror_note_touched records what a commit to a shared file changed:
+// the tables whose rows it wrote, sqlite_sequence for an AUTOINCREMENT table,
+// and the schema for anything else (DDL, a view, a trigger, a header integer,
+// a write the file did not take). The connection forgets those hashes after the
+// commit, so the next catch-up reloads them instead of trusting a hash of the
+// file from before this commit.
+@(private)
+store_mirror_note_touched :: proc(store: ^Store, ops: []Store_Op, mirror_failed: bool) {
+	context.allocator = store.alloc
+	note :: proc(store: ^Store, name: string) {
+		append(&store.mirror_touched, strings.clone(name))
+	}
+	if mirror_failed do note(store, SHARE_HASH_SCHEMA)
+	for op in ops {
+		#partial switch op.kind {
+		case .Insert, .Update, .Delete, .Truncate:
+			if strings.has_prefix(op.name, "_") {
+				note(store, SHARE_HASH_SCHEMA)
+				continue
+			}
+			note(store, op.name)
+			if table, found := store.tables[op.name]; found && table.schema.auto_increment_column >= 0 {
+				note(store, SHARE_HASH_SEQUENCE)
+			}
+		case:
+			note(store, SHARE_HASH_SCHEMA)
+		}
+	}
+}
+
+// sqlite_share_forget_touched drops the hashes of what the store's own commits
+// changed, and empties the list.
+@(private)
+sqlite_share_forget_touched :: proc(conn: ^Embed_Conn) {
+	store := conn.store
+	for name in store.mirror_touched {
+		if name in conn.share_hashes {
+			key, _ := delete_key(&conn.share_hashes, name)
+			delete(key, runtime.heap_allocator())
+		}
+		delete(name, store.alloc)
+	}
+	clear(&store.mirror_touched)
 }
 
 // embed_statement_writes reports a statement that needs the write lock: one
@@ -436,6 +663,7 @@ embed_run_shared :: proc(conn: ^Embed_Conn, prepared: ^Stmt_Prepared, params: []
 		// The file now carries this commit's counter: it is not news here.
 		if counter, ok := sqlite_share_counter(share); ok do conn.share_counter = counter
 	}
+	if len(conn.store.mirror_touched) > 0 do sqlite_share_forget_touched(conn)
 	if holds do sync.rw_mutex_unlock(&share.file)
 	if conn.tx == nil do sqlite_share_release(conn)
 	return result, err

@@ -94,6 +94,11 @@ Embed_Conn :: struct {
 	// shared file: one a function runs inside another (`eval()`) runs under
 	// the locks the outer one took.
 	share_depth:      int,
+	// share_hashes holds a hash of each table's rows as the file held them when
+	// the store last matched it (and of its schema, under SHARE_HASH_SCHEMA):
+	// catching up with another connection's commit reloads only the tables
+	// whose hash moved (sqlite_share.odin).
+	share_hashes:     map[string]u64,
 }
 
 // Busy_Handler answers whether to try again; `count` starts at 0.
@@ -163,6 +168,11 @@ embed_open_sqlite :: proc(conn: ^Embed_Conn, path: string) -> (^Embed_Conn, Erro
 	store_set_sqlite_mirror(opened, path)
 	conn.store = opened
 	conn.owns_store = true
+	// The tables as this read found them: the first catch-up after another
+	// connection's commit reloads only what that commit changed.
+	hashes := make(map[string]u64, 16, context.temp_allocator)
+	sqlite_share_hash_file(&file, &hashes)
+	sqlite_share_hashes_keep(conn, hashes)
 	return conn, ERROR_NONE
 }
 

@@ -396,3 +396,46 @@ test_truncate_then_insert_the_same_key :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t").i, 1)
 	testing.expect_value(t, scalar(t, store, "SELECT b FROM t WHERE a = 1").s, "z")
 }
+
+@(test)
+test_a_connection_catches_up_table_by_table :: proc(t: ^testing.T) {
+	// Another connection's commit used to make this one read the whole file
+	// and rebuild every table: 12 ms a statement on mptest's file, so five
+	// writers took four times SQLite's time. Only the tables whose rows moved
+	// are reloaded now; their triggers do not run again.
+	path := "_test_tools_catch_up.sqlite"
+	os.remove(path)
+	defer os.remove(path)
+	_ = os.write_entire_file(path, []u8{})
+	a, a_err := db.embed_open(path)
+	if !testing.expectf(t, db.error_ok(a_err), "open: %s", a_err.message) do return
+	defer db.embed_close(a)
+	tools_ok(t, a, "CREATE TABLE t1 (k INTEGER PRIMARY KEY, v)")
+	tools_ok(t, a, "CREATE TABLE t2 (k INTEGER PRIMARY KEY, v)")
+	tools_ok(t, a, "CREATE TABLE log (n)")
+	tools_ok(t, a, "CREATE TRIGGER t1_log AFTER INSERT ON t1 BEGIN INSERT INTO log VALUES (new.k); END")
+	tools_ok(t, a, "INSERT INTO t1 VALUES (1, 'a'), (2, 'b')")
+	tools_ok(t, a, "INSERT INTO t2 VALUES (1, 'x')")
+	b, b_err := db.embed_open(path)
+	if !testing.expectf(t, db.error_ok(b_err), "open: %s", b_err.message) do return
+	defer db.embed_close(b)
+	tools_expect(t, b, "SELECT count(*) FROM log", "2")
+	untouched := b.store.tables["t2"]
+	tools_ok(t, a, "INSERT INTO t1 VALUES (3, 'c')")
+	tools_ok(t, a, "UPDATE t1 SET v = 'B' WHERE k = 2")
+	tools_expect(t, b, "SELECT k, v FROM t1", "1|a 2|B 3|c")
+	// The trigger ran in a, once; b reloaded its rows without running it.
+	tools_expect(t, b, "SELECT n FROM log", "1 2 3")
+	tools_expect(t, b, "SELECT v FROM t2", "x")
+	testing.expect(t, b.store.tables["t2"] == untouched, "t2 did not change and was rebuilt")
+	// b's own write, then a's: b still sees its own row.
+	tools_ok(t, b, "UPDATE t2 SET v = 'y'")
+	tools_ok(t, a, "DELETE FROM t1 WHERE k = 1")
+	tools_expect(t, b, "SELECT v FROM t2", "y")
+	tools_expect(t, b, "SELECT k FROM t1", "2 3")
+	tools_expect(t, a, "SELECT v FROM t2", "y")
+	// A schema change reads the whole file.
+	tools_ok(t, a, "CREATE TABLE t3 (z)")
+	tools_ok(t, a, "INSERT INTO t3 VALUES (9)")
+	tools_expect(t, b, "SELECT z FROM t3", "9")
+}

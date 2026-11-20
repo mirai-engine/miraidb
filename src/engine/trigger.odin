@@ -210,6 +210,7 @@ trigger_fire :: proc(
 	// Internal tables have no triggers, and a transaction that never created one
 	// never pays for the catalog lookup.
 	if len(table_name) > 0 && table_name[0] == '_' do return ERROR_NONE
+	if tx.no_triggers do return ERROR_NONE
 	// Most databases have no triggers, and that is the answer to almost every call
 	// here: a probe asks it without an error message to throw away.
 	if !tx_system_table_exists(tx, TRIGGER_TABLE, &tx.trigger_probe) do return ERROR_NONE

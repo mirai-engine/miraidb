@@ -223,6 +223,9 @@ Store :: struct {
 	mirror_full_writes:   int,
 	// mirror_reason says why the last commit re-encoded the mirrored file.
 	mirror_reason:        string,
+	// mirror_touched names what this store's commits to a shared file changed
+	// since its connection last looked (store_mirror_note_touched).
+	mirror_touched:       [dynamic]string,
 	// mirror_kept holds the catalog text the imported file had (a table's
 	// CREATE statement, a view, a trigger), so a rewrite can re-emit an object it
 	// did not have to change instead of rebuilding it from a model that does not
@@ -510,6 +513,8 @@ store_close :: proc(store: ^Store) {
 	delete(store.mirror_losses)
 	clear(&store.mirror_losses)
 	delete(store.mirror_reason)
+	for name in store.mirror_touched do delete(name)
+	delete(store.mirror_touched)
 	delete(store.sqlite_mirror)
 	for name, value in store.variables {
 		delete(name)

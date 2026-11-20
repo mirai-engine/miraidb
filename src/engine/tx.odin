@@ -127,6 +127,9 @@ Tx :: struct {
 	trigger_new_present: bool,
 	trigger_old_present: bool,
 	trigger_depth:       int,
+	// no_triggers loads rows that another connection already wrote (catching up
+	// with a shared SQLite file): its triggers ran there, and must not run twice.
+	no_triggers:         bool,
 	// grant_probe and trigger_probe remember whether `_grant` and `_trigger`
 	// exist for this transaction. Every inserted row asked both (four times in
 	// all, each through half a dozen maps keyed by name) and the answer changes
@@ -2054,6 +2057,9 @@ tx_commit :: proc(tx: ^Tx) -> Error {
 	if guard != nil && len(store.sqlite_mirror) > 0 do guard(guard_ctx, true)
 	mirror_err := store_sqlite_mirror_flush(store, notify_ops)
 	if guard != nil && len(store.sqlite_mirror) > 0 do guard(guard_ctx, false)
+	// A file other connections share: what this commit changed is news to the
+	// hashes its connection keeps of the file (sqlite_share.odin).
+	if guard != nil && len(store.sqlite_mirror) > 0 do store_mirror_note_touched(store, notify_ops, mirror_err.kind != .None)
 	if mirror_err.kind != .None {
 		store_note_error(store, mirror_err)
 	}
