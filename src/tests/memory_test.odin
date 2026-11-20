@@ -677,3 +677,17 @@ test_a_streamed_aggregate_leaves_nothing :: proc(t: ^testing.T) {
 		testing.expectf(t, false, "bad free of %p at %v", entry.memory, entry.location)
 	}
 }
+
+@(test)
+test_grouped_windows_leave_nothing :: proc(t: ^testing.T) {
+	// A window over a grouped query keeps the rows its groups point at until
+	// the window is done; only the groups' lists were freed, and every row was
+	// lost. Under GROUPING SETS one row sits in several groups.
+	expect_nothing_left(t, .Memory, "_test_memory_grouped_windows", {
+		"CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT)",
+		"INSERT INTO t VALUES (1, 'a'), (2, 'a'), (3, 'b')",
+		"SELECT k, count(*) AS n, sum(count(*)) OVER () AS total FROM t GROUP BY k ORDER BY k",
+		"SELECT k, rank() OVER (ORDER BY count(*) DESC) AS r FROM t GROUP BY k ORDER BY k",
+		"SELECT k, count(*), sum(count(*)) OVER () FROM t GROUP BY GROUPING SETS ((k), ())",
+	})
+}

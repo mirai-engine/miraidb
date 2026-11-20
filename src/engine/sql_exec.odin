@@ -4406,6 +4406,15 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 	// has no source behind it, and rebuilding its ORDER BY key after the windows
 	// need the group the row came from.
 	group_keep := make([dynamic][dynamic][]Source, 0, len(filtered))
+	// kept_partials holds a grouped query's rows while its windows are pending:
+	// the groups point at them (one row may sit in several, under GROUPING
+	// SETS), so they are freed once, here, however the statement ends. Only the
+	// groups' lists were freed before, and every row was lost.
+	kept_partials: [dynamic][]Source
+	defer {
+		for partial in kept_partials do delete(partial)
+		delete(kept_partials)
+	}
 
 	output := make([dynamic]Output_Row, 0, len(filtered))
 	if aggregate {
@@ -4554,9 +4563,12 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		delete(groups)
 		delete(group_set_of)
 		ctx.group = nil
-		// A pending window owns its partials: they are freed with the group below.
+		// A pending window needs the rows its groups point at until it is done.
 		if !has_windows {
 			for partial in filtered do delete(partial)
+		} else {
+			kept_partials = filtered
+			filtered = nil
 		}
 	} else {
 		for partial, index in filtered {
