@@ -3,6 +3,7 @@ package tests
 import "core:fmt"
 import "core:mem"
 import "core:os"
+import "core:strings"
 import "core:testing"
 
 import db "../engine"
@@ -901,4 +902,39 @@ test_internal_statements_leave_nothing :: proc(t: ^testing.T) {
 		"CREATE VIEW v AS SELECT name FROM emp",
 		"SELECT * FROM v",
 	})
+}
+
+@(test)
+test_the_memory_vfs_leaves_nothing :: proc(t: ^testing.T) {
+	// Opening with Trunc dropped the old contents, a truncate that grew a file
+	// kept the old buffer, and the map named files with the caller's string
+	// (freed with it) and never freed a name.
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	{
+		context.allocator = mem.tracking_allocator(&track)
+		vfs := db.vfs_memory_new()
+		for name in ([]string{"a", "b"}) {
+			path := strings.clone(name)
+			file, open_err := vfs.ops.open(vfs, path, {.Read, .Write, .Create})
+			testing.expect(t, db.error_ok(open_err))
+			_, _ = vfs.ops.write(file, []u8{1, 2, 3})
+			testing.expect(t, db.error_ok(vfs.ops.truncate(file, 64)))
+			vfs.ops.close(file)
+			again, again_err := vfs.ops.open(vfs, path, {.Read, .Write, .Trunc})
+			testing.expect(t, db.error_ok(again_err))
+			_, _ = vfs.ops.write(again, []u8{4})
+			vfs.ops.close(again)
+			delete(path)
+		}
+		testing.expect(t, db.error_ok(vfs.ops.remove(vfs, "a")))
+		db.vfs_memory_destroy(vfs)
+	}
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "%d bytes left from %v", entry.size, entry.location)
+	}
+	for entry in track.bad_free_array {
+		testing.expectf(t, false, "bad free of %p at %v", entry.memory, entry.location)
+	}
 }

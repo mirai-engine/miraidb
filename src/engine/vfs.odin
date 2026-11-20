@@ -179,8 +179,14 @@ vfs_memory_open :: proc(vfs: ^Vfs, path: string, mode: Vfs_Mode) -> (^Vfs_File, 
 			return nil, errf(.Io, "no such file: %s", path)
 		}
 	}
-	if .Create in mode && !exists do inner.files[path] = make([]u8, 0)
-	if .Trunc in mode do inner.files[path] = make([]u8, 0)
+	// The map keeps its own copy of the name: the caller's may go away.
+	if .Create in mode && !exists do inner.files[strings.clone(path)] = make([]u8, 0)
+	if .Trunc in mode {
+		if old, had := inner.files[path]; had {
+			delete(old)
+			inner.files[path] = make([]u8, 0)
+		}
+	}
 	file := new(Vfs_File)
 	file.ops = vfs.ops
 	file.vfs = vfs
@@ -256,6 +262,7 @@ vfs_memory_truncate :: proc(file: ^Vfs_File, size: i64) -> Error {
 	} else {
 		grown := make([]u8, int(size))
 		copy(grown, current)
+		delete(current)
 		inner.files[entry.path] = grown
 	}
 	return ERROR_NONE
@@ -280,9 +287,10 @@ vfs_memory_remove :: proc(vfs: ^Vfs, path: string) -> Error {
 	inner := cast(^Memory_Vfs)vfs.data
 	sync.lock(&inner.mutex)
 	defer sync.unlock(&inner.mutex)
-	if data, exists := inner.files[path]; exists {
+	if path in inner.files {
+		key, data := delete_key(&inner.files, path)
 		delete(data)
-		delete_key(&inner.files, path)
+		delete(key)
 	}
 	return ERROR_NONE
 }
@@ -314,7 +322,10 @@ vfs_memory_new :: proc() -> ^Vfs {
 vfs_memory_destroy :: proc(vfs: ^Vfs) {
 	if vfs == nil || vfs.data == nil do return
 	inner := cast(^Memory_Vfs)vfs.data
-	for _, data in inner.files do delete(data)
+	for name, data in inner.files {
+		delete(data)
+		delete(name)
+	}
 	delete(inner.files)
 	free(inner)
 	free(vfs)
