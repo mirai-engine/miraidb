@@ -2659,6 +2659,14 @@ test_subscription_set :: proc(t: ^testing.T) {
 	testing.expect(t, !db.host_unsubscribe(host, id))
 }
 
+// wire_ask sends a request the test made for it and frees the request; the
+// response is the test's to free.
+@(private)
+wire_ask :: proc(host: ^db.Host, request: []u8) -> []u8 {
+	defer delete(request)
+	return db.wire_request(host, request)
+}
+
 @(private)
 wire_kind :: proc(data: []u8) -> u32 {
 	return u32(data[0]) | u32(data[1]) << 8 | u32(data[2]) << 16 | u32(data[3]) << 24
@@ -2676,7 +2684,8 @@ test_wire_messages :: proc(t: ^testing.T) {
 	run_done(t, store, "INSERT INTO t (v) VALUES (5)")
 
 	// One-off query over the wire.
-	response := db.wire_request(host, db.wire_encode_query("SELECT v FROM t", nil))
+	response := wire_ask(host, db.wire_encode_query("SELECT v FROM t", nil))
+	defer delete(response)
 	testing.expect_value(t, wire_kind(response), db.WIRE_RESULT)
 	result, decode_err := db.wire_decode_result(response, context.allocator)
 	testing.expect(t, db.error_ok(decode_err))
@@ -2693,7 +2702,9 @@ test_wire_messages :: proc(t: ^testing.T) {
 	}
 	testing.expect(t, db.error_ok(db.host_register(host, "bump", []db.Column_Type{db.type_int}, bump)))
 	call := db.wire_encode_call(42, "bump", []db.Value{db.value_int(3)})
+	defer delete(call)
 	call_response := db.wire_request(host, call)
+	defer delete(call_response)
 	testing.expect_value(t, wire_kind(call_response), db.WIRE_RESULT)
 	decoded, call_err := db.wire_decode_result(call_response, context.allocator)
 	testing.expect(t, db.error_ok(call_err))
@@ -2703,19 +2714,22 @@ test_wire_messages :: proc(t: ^testing.T) {
 
 	// The same id must not run the reducer twice.
 	retry := db.wire_request(host, call)
+	defer delete(retry)
 	retry_result, retry_err := db.wire_decode_result(retry, context.allocator)
 	testing.expect(t, db.error_ok(retry_err))
 	db.sql_result_destroy(&retry_result)
 	testing.expect_value(t, scalar(t, store, "SELECT v FROM t").i, i64(8))
 
 	// Subscribe, then unsubscribe.
-	sub := db.wire_request(host, db.wire_encode_subscribe([]string{"SELECT v FROM t"}))
+	sub := wire_ask(host, db.wire_encode_subscribe([]string{"SELECT v FROM t"}))
+	defer delete(sub)
 	testing.expect_value(t, wire_kind(sub), db.WIRE_SNAPSHOT)
 	sub_id, _, snapshot, sub_err := db.wire_decode_snapshot(sub, context.allocator)
 	testing.expect(t, db.error_ok(sub_err))
 	testing.expect_value(t, snapshot[0][0][0].i, i64(8))
 
-	unsub := db.wire_request(host, db.wire_encode_unsubscribe(sub_id))
+	unsub := wire_ask(host, db.wire_encode_unsubscribe(sub_id))
+	defer delete(unsub)
 	removed, unsub_err := db.wire_decode_result(unsub, context.allocator)
 	testing.expect(t, db.error_ok(unsub_err))
 	testing.expect_value(t, removed.affected, 1)
@@ -2883,6 +2897,7 @@ test_http_layer :: proc(t: ^testing.T) {
 	run_done(t, store, "INSERT INTO t (v) VALUES (7)")
 
 	wire := db.wire_encode_query("SELECT v FROM t", nil)
+	defer delete(wire)
 	head := fmt.aprintf("POST /query HTTP/1.1\r\nHost: localhost\r\nContent-Length: %d\r\n\r\n", len(wire))
 	request_bytes := make([]u8, len(head) + len(wire))
 	copy(request_bytes, head)
@@ -2996,7 +3011,8 @@ test_tokens :: proc(t: ^testing.T) {
 	testing.expect_value(t, resolved[31], u8(9))
 
 	// AUTH over the wire sets the identity policies see.
-	response := db.wire_request(host, db.wire_encode_auth(token))
+	response := wire_ask(host, db.wire_encode_auth(token))
+	defer delete(response)
 	testing.expect_value(t, wire_kind(response), db.WIRE_RESULT)
 	decoded, decode_err := db.wire_decode_result(response, context.allocator)
 	testing.expect(t, db.error_ok(decode_err))
@@ -3005,11 +3021,13 @@ test_tokens :: proc(t: ^testing.T) {
 	testing.expect_value(t, store.identity[0], u8(7))
 
 	// Unknown and expired tokens are rejected.
-	bad := db.wire_request(host, db.wire_encode_auth("nope"))
+	bad := wire_ask(host, db.wire_encode_auth("nope"))
+	defer delete(bad)
 	testing.expect_value(t, wire_kind(bad), db.WIRE_ERROR)
 	short, short_err := db.host_issue_token(host, identity, -1)
 	testing.expect(t, db.error_ok(short_err))
-	expired := db.wire_request(host, db.wire_encode_auth(short))
+	expired := wire_ask(host, db.wire_encode_auth(short))
+	defer delete(expired)
 	testing.expect_value(t, wire_kind(expired), db.WIRE_ERROR)
 
 	// Revocation.
@@ -3164,7 +3182,8 @@ test_procedures :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM log").i, i64(4))
 
 	// The same procedure runs over the wire (F6).
-	response := db.wire_request(host, db.wire_encode_call_procedure("step", nil))
+	response := wire_ask(host, db.wire_encode_call_procedure("step", nil))
+	defer delete(response)
 	testing.expect_value(t, wire_kind(response), db.WIRE_RESULT)
 	decoded, decode_err := db.wire_decode_result(response, context.allocator)
 	testing.expect(t, db.error_ok(decode_err))
@@ -3359,12 +3378,14 @@ test_meta_and_metrics :: proc(t: ^testing.T) {
 	testing.expect(t, found)
 	testing.expect_value(t, version, "1")
 
-	ok := db.wire_request(host, db.wire_encode_query("SELECT key FROM _meta", nil))
+	ok := wire_ask(host, db.wire_encode_query("SELECT key FROM _meta", nil))
+	defer delete(ok)
 	testing.expect(t, len(ok) > 0)
 	testing.expect_value(t, host.metric_requests, u64(1))
 	testing.expect_value(t, host.metric_errors, u64(0))
 
-	bad := db.wire_request(host, db.wire_encode_auth("nope"))
+	bad := wire_ask(host, db.wire_encode_auth("nope"))
+	defer delete(bad)
 	testing.expect_value(t, wire_kind(bad), db.WIRE_ERROR)
 	testing.expect_value(t, host.metric_requests, u64(2))
 	testing.expect_value(t, host.metric_errors, u64(1))
@@ -3535,6 +3556,7 @@ test_client_registry :: proc(t: ^testing.T) {
 	// Outbound accounting enables a backpressure policy in the transport.
 	testing.expect_value(t, db.host_client_bytes(host, 3), u64(0))
 	reply := db.wire_request_owned(host, db.wire_encode_query("SELECT 1", nil), 3)
+	defer delete(reply)
 	testing.expect(t, len(reply) > 0)
 	testing.expect(t, db.host_client_bytes(host, 3) > 0)
 	testing.expect(t, db.host_client_over_budget(host, 3, 0))
@@ -3572,7 +3594,8 @@ test_jwt_tokens :: proc(t: ^testing.T) {
 	testing.expect(t, !expired_ok)
 
 	host.now_us = i64(5_000_000)
-	response := db.wire_request(host, db.wire_encode_auth(token))
+	response := wire_ask(host, db.wire_encode_auth(token))
+	defer delete(response)
 	check, check_ok := db.host_authenticate(host, token)
 	testing.expectf(t, check_ok, "direct auth failed before wire (token len %d, now %d)", len(token), host.now_us)
 	testing.expect_value(t, check[0], u8(3))
@@ -3802,9 +3825,11 @@ test_wire_request_limit :: proc(t: ^testing.T) {
 	oversized := make([]u8, db.WIRE_MAX_REQUEST + 1)
 	defer delete(oversized)
 	response := db.wire_request(host, oversized)
+	defer delete(response)
 	testing.expect_value(t, wire_kind(response), db.WIRE_ERROR)
 
-	small := db.wire_request(host, db.wire_encode_query("SELECT 1", nil))
+	small := wire_ask(host, db.wire_encode_query("SELECT 1", nil))
+	defer delete(small)
 	testing.expect_value(t, wire_kind(small), db.WIRE_RESULT)
 }
 
@@ -4846,6 +4871,7 @@ test_postgres_wire :: proc(t: ^testing.T) {
 	query := pg_build_query("SELECT id, label FROM t")
 	defer delete(query)
 	response, close := db.pg_handle_message(host, query)
+	defer delete(response)
 	testing.expect(t, !close)
 	// RowDescription, one DataRow, CommandComplete, ReadyForQuery.
 	testing.expect_value(t, response[0], u8('T'))
@@ -4858,13 +4884,15 @@ test_postgres_wire :: proc(t: ^testing.T) {
 	bad := pg_build_query("SELECT * FROM ghost")
 	defer delete(bad)
 	bad_response, bad_close := db.pg_handle_message(host, bad)
+	defer delete(bad_response)
 	testing.expect(t, !bad_close)
 	testing.expect_value(t, bad_response[0], u8('E'))
 	testing.expect(t, strings_contains(string(bad_response), "ghost"))
 
 	// Terminate closes the connection.
 	terminate := []u8{'X', 0, 0, 0, 4}
-	_, terminate_close := db.pg_handle_message(host, terminate)
+	dropped_response_4875, terminate_close := db.pg_handle_message(host, terminate)
+	defer delete(dropped_response_4875)
 	testing.expect(t, terminate_close)
 }
 
@@ -5198,6 +5226,7 @@ test_postgres_extended_query :: proc(t: ^testing.T) {
 	delete(unknown_response)
 	// After an error the extended protocol discards everything until Sync.
 	skipped, _ := db.pg_handle_session_message(host, session, insert_execute)
+	defer delete(skipped)
 	testing.expect_value(t, len(skipped), 0)
 	after_sync, _ := db.pg_handle_session_message(host, session, []u8{'S', 0, 0, 0, 4})
 	testing.expect_value(t, after_sync[0], u8('Z'))
@@ -11212,6 +11241,7 @@ test_connection_identity :: proc(t: ^testing.T) {
 
 	count_for :: proc(t: ^testing.T, host: ^db.Host, owner: u64, sql: string) -> i64 {
 		response := db.wire_request_owned(host, db.wire_encode_query(sql, nil), owner)
+		defer delete(response)
 		result, err := db.wire_decode_result(response, context.allocator)
 		if !testing.expectf(t, db.error_ok(err), "owner %d: %s", owner, err.message) do return -1
 		defer db.sql_result_destroy(&result)
@@ -11227,6 +11257,7 @@ test_connection_identity :: proc(t: ^testing.T) {
 
 	// Client 1 authenticates as Ana.
 	auth := db.wire_encode_auth(ana_token)
+	defer delete(auth)
 	testing.expect_value(t, wire_kind(db.wire_request_owned(host, auth, 1)), db.WIRE_RESULT)
 	testing.expect_value(t, count_for(t, host, 1, "SELECT count(*) FROM note"), i64(2))
 
@@ -11253,6 +11284,7 @@ test_connection_identity :: proc(t: ^testing.T) {
 
 	// SET identity inside a request persists for that client only.
 	set := db.wire_encode_query(fmt.tprintf("SET identity = '%s'", ana), nil)
+	defer delete(set)
 	testing.expect_value(t, wire_kind(db.wire_request_owned(host, set, 3)), db.WIRE_RESULT)
 	testing.expect_value(t, count_for(t, host, 3, "SELECT count(*) FROM note"), i64(2))
 	testing.expect_value(t, count_for(t, host, 2, "SELECT count(*) FROM note"), i64(1))
@@ -14378,7 +14410,7 @@ test_procedure_over_the_wire :: proc(t: ^testing.T) {
 	}
 	testing.expect(t, db.error_ok(db.host_register_procedure(host, "step", nil, step)))
 
-	response := db.wire_request(host, db.wire_encode_call_procedure("step", nil))
+	response := wire_ask(host, db.wire_encode_call_procedure("step", nil))
 	defer delete(response)
 	testing.expect_value(t, wire_kind(response), db.WIRE_RESULT)
 	result, decode_err := db.wire_decode_result(response, context.allocator)
@@ -14386,7 +14418,7 @@ test_procedure_over_the_wire :: proc(t: ^testing.T) {
 	db.sql_result_destroy(&result)
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM log").i, i64(1))
 
-	unknown := db.wire_request(host, db.wire_encode_call_procedure("nope", nil))
+	unknown := wire_ask(host, db.wire_encode_call_procedure("nope", nil))
 	defer delete(unknown)
 	testing.expect_value(t, wire_kind(unknown), db.WIRE_ERROR)
 }
