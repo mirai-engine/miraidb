@@ -49,7 +49,7 @@ Rules for this file:
 | D24 | an index the engine cannot express is dropped on import | a counted skip, and a mirror fuzz pass | S |
 | D34 | the threaded suite is green on Linux and Windows; the sanitizer covers the Windows CLI, not the suite | run the suite sanitized on every platform, in CI | S |
 | D36 | a query never reads a partial or expression index | match a query's predicate to the index | M |
-| D35 | diagnostics: test-side leak lines; a file open per commit for the log index | quiet the lines if they hide a report; keep the index file open | S |
+| D35 | diagnostics: a file open per commit for the log index | keep the index file open | S |
 
 ---
 
@@ -332,9 +332,11 @@ a flat count for writes; `scripts/leaks.py` is a CI gate.
 
 **Left, in order.**
 
-1. The lines the suite still prints are test-side: a test that expects an error
-   drops it. Quieting them is worth doing only if the noise starts hiding a real
-   report.
+1. ~~The leak lines the suite printed.~~ Closed: the suite runs with no leak and
+   no bad free reported. Tracing each one to its allocation found engine leaks
+   on error and teardown paths, and four readers that answered text from a
+   result they had already freed (module variables, metadata, the token key,
+   client names); a test-side leak is now a regression like any other.
 2. ~~A map node freed through the wrong allocator.~~ Closed with D34's crash:
    it was the process-wide maps (the lock registry and the live-handle set)
    growing through whatever allocator their first caller had; they grow on the
