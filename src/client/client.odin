@@ -7,6 +7,7 @@ package client
 
 import "core:fmt"
 import "core:mem"
+import "core:slice"
 import "core:strings"
 
 import engine "../engine"
@@ -54,6 +55,10 @@ client_request :: proc(
 	defer delete(request)
 	raw, send_err := client.transport(client.ctx, transmute([]u8)request, alloc)
 	if send_err.kind != .None do return nil, send_err
+	// The body the caller gets is its own, in `alloc`; the raw response it is
+	// cut from goes away here. Before, the raw bytes and every inflated body
+	// stayed behind.
+	defer delete(raw, alloc)
 	response, parse_err := engine.http_parse_response(raw)
 	if parse_err.kind != .None do return nil, parse_err
 	if response.status != 200 {
@@ -64,7 +69,7 @@ client_request :: proc(
 		if !ok do return nil, engine.errf(.Invalid_Argument, "cannot inflate the response")
 		return body, engine.ERROR_NONE
 	}
-	return response.body, engine.ERROR_NONE
+	return slice.clone(response.body, alloc), engine.ERROR_NONE
 }
 
 @(private)
@@ -95,6 +100,8 @@ client_query :: proc(
 	defer delete(message)
 	body, request_err := client_request(client, message, alloc)
 	if request_err.kind != .None do return {}, request_err
+	// Decoding copies what it keeps into `alloc`.
+	defer delete(body, alloc)
 	return client_decode(body, alloc)
 }
 
@@ -109,6 +116,8 @@ client_call :: proc(
 	defer delete(message)
 	body, request_err := client_request(client, message, alloc)
 	if request_err.kind != .None do return {}, request_err
+	// Decoding copies what it keeps into `alloc`.
+	defer delete(body, alloc)
 	return client_decode(body, alloc)
 }
 
@@ -123,6 +132,8 @@ client_subscribe :: proc(
 	defer delete(message)
 	body, request_err := client_request(client, message, alloc)
 	if request_err.kind != .None do return 0, 0, nil, request_err
+	// Decoding copies what it keeps into `alloc`.
+	defer delete(body, alloc)
 	if engine.wire_message_kind(body) == engine.WIRE_ERROR {
 		if message_err, decoded := engine.wire_decode_error(body, alloc); decoded {
 			return 0, 0, nil, message_err
@@ -156,21 +167,30 @@ client_poll_diff :: proc(
 	next: [][]engine.Value,
 	alloc: mem.Allocator,
 ) -> Poll_Delta {
-	previous_keys := make(map[string]bool, len(previous))
-	defer delete(previous_keys)
-	for row in previous do previous_keys[engine.Output_Key(row)] = true
-	next_keys := make(map[string]bool, len(next))
-	defer delete(next_keys)
-	for row in next do next_keys[engine.Output_Key(row)] = true
+	// Every key is built in the temporary allocator: the maps only answer
+	// membership during this call, and each key used to stay behind.
+	previous_keys := make(map[string]bool, len(previous), context.temp_allocator)
+	next_keys := make(map[string]bool, len(next), context.temp_allocator)
+	{
+		context.allocator = context.temp_allocator
+		for row in previous do previous_keys[engine.Output_Key(row)] = true
+		for row in next do next_keys[engine.Output_Key(row)] = true
+	}
 
 	inserts := make([dynamic][]engine.Value, 0, len(next), alloc)
 	deletes := make([dynamic][]engine.Value, 0, len(previous), alloc)
 	for row in next {
-		if engine.Output_Key(row) in previous_keys do continue
+		key := engine.Output_Key(row)
+		seen := key in previous_keys
+		delete(key)
+		if seen do continue
 		append(&inserts, engine.Value_Row_Clone(row, alloc))
 	}
 	for row in previous {
-		if engine.Output_Key(row) in next_keys do continue
+		key := engine.Output_Key(row)
+		seen := key in next_keys
+		delete(key)
+		if seen do continue
 		append(&deletes, engine.Value_Row_Clone(row, alloc))
 	}
 	return Poll_Delta{inserts = inserts[:], deletes = deletes[:]}
