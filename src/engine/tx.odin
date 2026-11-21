@@ -17,6 +17,9 @@ Tx :: struct {
 	store:     ^Store,
 	active:    bool,
 	read_only: bool,
+	// temp_only is a write transaction on a read-only store: it writes TEMP tables
+	// and nothing else, as SQLite's temp database is writable when main is not.
+	temp_only: bool,
 	// wrote is set when a write statement ran in the transaction, whether or
 	// not it changed a row: the commit hook runs for it.
 	wrote:     bool,
@@ -502,12 +505,10 @@ tx_arena_give :: proc(store: ^Store, arena: ^virtual.Arena) {
 }
 
 tx_begin_write :: proc(store: ^Store) -> ^Tx {
-	if store.read_only {
-		// Every write path already checks tx.read_only, so a read-only store
-		// answers a write with the error a read transaction gives.
-		return tx_begin_read(store)
-	}
 	tx := new(Tx)
+	// A read-only store writes its TEMP tables: every write path asks
+	// tx_write_refused, which refuses any other table with the read error.
+	tx.temp_only = store.read_only
 	tx.store = store
 	tx.active = true
 	tx_arena_take(store, &tx.arena)
@@ -762,7 +763,7 @@ tx_paged_alter_guard :: proc(tx: ^Tx, name: string) -> Error {
 // schema and the store rebuilds the same way on replay.
 tx_alter_table :: proc(tx: ^Tx, name: string, next_schema: Table_Schema) -> Error {
 	tx_forget_catalog_cache(tx)
-	if tx.read_only do return errf(.Transaction_Read_Only, "cannot alter a table in a read transaction")
+	if tx_write_refused(tx, name) do return errf(.Transaction_Read_Only, "cannot alter a table in a read transaction")
 	if guard_err := tx_paged_alter_guard(tx, name); guard_err.kind != .None do return guard_err
 	if _, created := tx.state.created[name]; created {
 		return errf(.Sql_Unsupported, "alter a table outside the transaction that created it")
@@ -793,7 +794,7 @@ tx_alter_table :: proc(tx: ^Tx, name: string, next_schema: Table_Schema) -> Erro
 // uniqueness check of the rebuilt table.
 tx_alter_column_type :: proc(tx: ^Tx, name, column_name: string, next_type: Column_Type) -> Error {
 	tx_forget_catalog_cache(tx)
-	if tx.read_only do return errf(.Transaction_Read_Only, "cannot alter a table in a read transaction")
+	if tx_write_refused(tx, name) do return errf(.Transaction_Read_Only, "cannot alter a table in a read transaction")
 	if guard_err := tx_paged_alter_guard(tx, name); guard_err.kind != .None do return guard_err
 	if _, created := tx.state.created[name]; created {
 		return errf(.Sql_Unsupported, "alter a table outside the transaction that created it")
@@ -830,7 +831,7 @@ tx_alter_column_type :: proc(tx: ^Tx, name, column_name: string, next_type: Colu
 // their identity is part of how the table is written.
 tx_drop_column :: proc(tx: ^Tx, name, column_name: string) -> Error {
 	tx_forget_catalog_cache(tx)
-	if tx.read_only do return errf(.Transaction_Read_Only, "cannot alter a table in a read transaction")
+	if tx_write_refused(tx, name) do return errf(.Transaction_Read_Only, "cannot alter a table in a read transaction")
 	if guard_err := tx_paged_alter_guard(tx, name); guard_err.kind != .None do return guard_err
 	if _, created := tx.state.created[name]; created {
 		return errf(.Sql_Unsupported, "alter a table outside the transaction that created it")
@@ -966,7 +967,7 @@ tx_drop_column :: proc(tx: ^Tx, name, column_name: string) -> Error {
 // staged writes follow the table, so a commit applies the rename before them.
 tx_rename_table :: proc(tx: ^Tx, from, to: string) -> Error {
 	tx_forget_catalog_cache(tx)
-	if tx.read_only do return errf(.Transaction_Read_Only, "cannot alter a table in a read transaction")
+	if tx_write_refused(tx, from) do return errf(.Transaction_Read_Only, "cannot alter a table in a read transaction")
 	if guard_err := tx_paged_alter_guard(tx, from); guard_err.kind != .None do return guard_err
 	if _, created := tx.state.created[from]; created {
 		return errf(.Sql_Unsupported, "alter a table outside the transaction that created it")
@@ -1001,7 +1002,7 @@ tx_rename_table :: proc(tx: ^Tx, from, to: string) -> Error {
 // they keep working; text that names the column (a generated expression, a
 // trigger body, a policy) is not rewritten, which is noted in the docs.
 tx_rename_column :: proc(tx: ^Tx, table_name, from, to: string) -> Error {
-	if tx.read_only do return errf(.Transaction_Read_Only, "cannot alter a table in a read transaction")
+	if tx_write_refused(tx, table_name) do return errf(.Transaction_Read_Only, "cannot alter a table in a read transaction")
 	if guard_err := tx_paged_alter_guard(tx, table_name); guard_err.kind != .None do return guard_err
 	if _, created := tx.state.created[table_name]; created {
 		return errf(.Sql_Unsupported, "alter a table outside the transaction that created it")
@@ -1202,11 +1203,29 @@ tx_row_count :: proc(tx: ^Tx, name: string) -> (int, Error) {
 	return len(rows), ERROR_NONE
 }
 
+// tx_table_is_temp reports a TEMP table, made in this transaction or before.
+@(private)
+tx_table_is_temp :: proc(tx: ^Tx, name: string) -> bool {
+	if table, ok := tx.state.created[name]; ok do return table.schema.ephemeral
+	if table, ok := tx.store.tables[name]; ok do return table.schema.ephemeral
+	return false
+}
+
+// tx_write_refused is whether a write to `name` is refused here: always in a read
+// transaction, and on a read-only store unless the table is a TEMP one.
+@(private)
+tx_write_refused :: proc(tx: ^Tx, name: string) -> bool {
+	if tx.read_only do return true
+	return tx.temp_only && !tx_table_is_temp(tx, name)
+}
+
 // --- DDL -------------------------------------------------------------------
 
 tx_create_table :: proc(tx: ^Tx, schema: ^Table_Schema) -> Error {
 	tx_forget_catalog_cache(tx)
-	if tx.read_only do return errf(.Transaction_Read_Only, "cannot create a table in a read transaction")
+	if tx.read_only || (tx.temp_only && !schema.ephemeral) {
+		return errf(.Transaction_Read_Only, "cannot create a table in a read transaction")
+	}
 	if _, exists := tx.state.created[schema.name]; exists {
 		return errf(.Table_Exists, "table %s was already created in this transaction", schema.name)
 	}
@@ -1228,7 +1247,7 @@ tx_create_table :: proc(tx: ^Tx, schema: ^Table_Schema) -> Error {
 
 tx_drop_table :: proc(tx: ^Tx, name: string) -> Error {
 	tx_forget_catalog_cache(tx)
-	if tx.read_only do return errf(.Transaction_Read_Only, "cannot drop a table in a read transaction")
+	if tx_write_refused(tx, name) do return errf(.Transaction_Read_Only, "cannot drop a table in a read transaction")
 	if created, ok := tx.state.created[name]; ok {
 		// Erase before destroying: the map's key is the name in the table's own
 		// arena, so a destroy first leaves the map comparing against freed
@@ -1297,7 +1316,7 @@ tx_next_int_key :: proc(table: ^Table, writes: ^Table_Writes, position: int) -> 
 
 @(private)
 tx_insert_row :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error) {
-	if tx.read_only do return 0, errf(.Transaction_Read_Only, "cannot insert in a read transaction")
+	if tx_write_refused(tx, name) do return 0, errf(.Transaction_Read_Only, "cannot insert in a read transaction")
 	table: ^Table
 	cached := tx.insert_table != nil && len(tx.cte_tables) == 0 && tx.insert_name == name
 	if cached {
@@ -1453,7 +1472,7 @@ tx_update :: proc(tx: ^Tx, name: string, id: Row_Id, values: []Value) -> Error {
 
 @(private)
 tx_update_row :: proc(tx: ^Tx, name: string, id: Row_Id, values: []Value) -> Error {
-	if tx.read_only do return errf(.Transaction_Read_Only, "cannot update in a read transaction")
+	if tx_write_refused(tx, name) do return errf(.Transaction_Read_Only, "cannot update in a read transaction")
 	table, table_err := tx_table(tx, name)
 	if table_err.kind != .None do return table_err
 	if table.schema.event do return errf(.Sql_Unsupported, "event table %s is append-only", name)
@@ -1570,7 +1589,7 @@ tx_delete_without_triggers :: proc(tx: ^Tx, name: string, id: Row_Id) -> Error {
 
 @(private)
 tx_delete_impl :: proc(tx: ^Tx, name: string, id: Row_Id, fire_triggers: bool) -> Error {
-	if tx.read_only do return errf(.Transaction_Read_Only, "cannot delete in a read transaction")
+	if tx_write_refused(tx, name) do return errf(.Transaction_Read_Only, "cannot delete in a read transaction")
 	table, table_err := tx_table(tx, name)
 	if table_err.kind != .None do return table_err
 	if table.schema.event do return errf(.Sql_Unsupported, "event table %s is append-only", name)
@@ -1611,7 +1630,7 @@ tx_delete_impl :: proc(tx: ^Tx, name: string, id: Row_Id, fire_triggers: bool) -
 }
 
 tx_truncate :: proc(tx: ^Tx, name: string) -> Error {
-	if tx.read_only do return errf(.Transaction_Read_Only, "cannot truncate in a read transaction")
+	if tx_write_refused(tx, name) do return errf(.Transaction_Read_Only, "cannot truncate in a read transaction")
 	table, table_err := tx_table(tx, name)
 	if table_err.kind != .None do return table_err
 	if table.schema.event do return errf(.Sql_Unsupported, "event table %s is append-only", name)
@@ -1640,7 +1659,7 @@ tx_truncate :: proc(tx: ^Tx, name: string) -> Error {
 // a table created here, rows inserted here and an index on them still land in one
 // atomic commit.
 tx_create_index :: proc(tx: ^Tx, table_name: string, index: Index_Schema) -> Error {
-	if tx.read_only do return errf(.Transaction_Read_Only, "cannot create an index in a read transaction")
+	if tx_write_refused(tx, table_name) do return errf(.Transaction_Read_Only, "cannot create an index in a read transaction")
 	table, table_err := tx_table(tx, table_name)
 	if table_err.kind != .None do return table_err
 	// A full copy, so a partial index keeps its WHERE and an expression index
@@ -1673,7 +1692,7 @@ tx_create_index :: proc(tx: ^Tx, table_name: string, index: Index_Schema) -> Err
 }
 
 tx_drop_index :: proc(tx: ^Tx, table_name: string, name: string) -> Error {
-	if tx.read_only do return errf(.Transaction_Read_Only, "cannot drop an index in a read transaction")
+	if tx_write_refused(tx, table_name) do return errf(.Transaction_Read_Only, "cannot drop an index in a read transaction")
 	table, table_err := tx_table(tx, table_name)
 	if table_err.kind != .None do return table_err
 	// The index may already be gone because this transaction created it: the
@@ -1979,8 +1998,12 @@ tx_commit :: proc(tx: ^Tx) -> Error {
 	// Ephemeral operations are applied to the live store but never logged, so
 	// temporary tables and their rows vanish on reopen.
 	logged := make([dynamic]Store_Op, 0, len(ops))
-	for op in ops {
-		if tx_op_is_ephemeral(tx, op) do continue
+	// Which ops are TEMP is asked now, before the apply: a dropped TEMP table is
+	// gone afterwards, and its drop would look like a main table's.
+	ephemeral := make([]bool, len(ops), context.temp_allocator)
+	for op, i in ops {
+		ephemeral[i] = tx_op_is_ephemeral(tx, op)
+		if ephemeral[i] do continue
 		append(&logged, op)
 	}
 	logged_count := len(logged)
@@ -2044,6 +2067,17 @@ tx_commit :: proc(tx: ^Tx) -> Error {
 	notify_ops: []Store_Op
 	if notify != nil || len(store.sqlite_mirror) > 0 do notify_ops = tx_clone_ops(ops)
 	defer if notify_ops != nil do tx_free_ops(notify_ops)
+	// A TEMP table is not in the file: the mirror hears only the rest. A temp
+	// table's write used to reach it as an unknown table and rewrite the whole
+	// file at every commit.
+	mirror_ops := notify_ops
+	if len(store.sqlite_mirror) > 0 && notify_ops != nil {
+		kept := make([dynamic]Store_Op, 0, len(notify_ops), context.temp_allocator)
+		for op, i in notify_ops {
+			if !ephemeral[i] do append(&kept, op)
+		}
+		mirror_ops = kept[:]
+	}
 	// The engine's part is durable: the virtual tables commit theirs.
 	if len(tx.vtabs_written) > 0 {
 		tx.vtabs_done = true
@@ -2054,12 +2088,15 @@ tx_commit :: proc(tx: ^Tx) -> Error {
 	// reading it with any SQLite driver sees the commit. O(state) per commit, by
 	// design: the file is a materialized export, the log is the truth.
 	guard, guard_ctx := store.mirror_guard, store.mirror_guard_ctx
-	if guard != nil && len(store.sqlite_mirror) > 0 do guard(guard_ctx, true)
-	mirror_err := store_sqlite_mirror_flush(store, notify_ops)
-	if guard != nil && len(store.sqlite_mirror) > 0 do guard(guard_ctx, false)
+	// A commit that changed only TEMP tables leaves the file alone: no lock on
+	// it, no write.
+	writes_file := len(store.sqlite_mirror) > 0 && (notify_ops == nil || len(mirror_ops) > 0)
+	if guard != nil && writes_file do guard(guard_ctx, true)
+	mirror_err := writes_file ? store_sqlite_mirror_flush(store, mirror_ops) : ERROR_NONE
+	if guard != nil && writes_file do guard(guard_ctx, false)
 	// A file other connections share: what this commit changed is news to the
 	// hashes its connection keeps of the file (sqlite_share.odin).
-	if guard != nil && len(store.sqlite_mirror) > 0 do store_mirror_note_touched(store, notify_ops, mirror_err.kind != .None)
+	if guard != nil && writes_file do store_mirror_note_touched(store, mirror_ops, mirror_err.kind != .None)
 	if mirror_err.kind != .None {
 		store_note_error(store, mirror_err)
 	}

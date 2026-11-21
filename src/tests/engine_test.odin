@@ -15323,3 +15323,53 @@ test_sqlite_file_keeps_its_page_size :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, conn.store, "SELECT count(*) FROM t").i, i64(201))
 	testing.expect_value(t, scalar(t, conn.store, "SELECT body FROM t WHERE id = 201").s, "late")
 }
+
+@(test)
+test_temp_tables_leave_the_sqlite_file_alone :: proc(t: ^testing.T) {
+	// A TEMP table is not in the file. A write to one used to reach the mirror as
+	// an unknown table and rewrite the whole file at every commit; and a
+	// read-only connection refused to make one, where SQLite's temp database
+	// stays writable when main is not (sqldiff --vtab makes one).
+	path :: "_test_temp_mirror.db"
+	os.remove(path)
+	defer os.remove(path)
+	testing.expect(t, db.sqlite_create_empty_file(path))
+	conn, open_err := db.embed_open(path, {persistent = true, create = false, durable = false})
+	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")))
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "INSERT INTO t VALUES (1, 'a')")))
+	fulls := conn.store.mirror_full_writes
+	writes := conn.store.mirror_pages_written
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "CREATE TEMP TABLE scratch (x INTEGER)")))
+	for i in 1 ..= 5 {
+		testing.expect(t, db.error_drop(db.embed_exec(conn, fmt.tprintf("INSERT INTO scratch VALUES (%d)", i))))
+	}
+	testing.expect_value(t, conn.store.mirror_full_writes, fulls)
+	testing.expect_value(t, conn.store.mirror_pages_written, writes)
+	testing.expect_value(t, scalar(t, conn.store, "SELECT sum(x) FROM scratch").i, i64(15))
+	db.embed_close(conn)
+
+	// Read-only: TEMP tables are written, main is not, and the file is untouched.
+	reader, reader_err := db.embed_open(path, {persistent = true, create = false, durable = false})
+	if !testing.expectf(t, db.error_ok(reader_err), "read-only open: %s", reader_err.message) do return
+	defer db.embed_close(reader)
+	// What sqlite3_open_v2 does with SQLITE_OPEN_READONLY.
+	reader.store.read_only = true
+	before, before_err := os.read_entire_file(path, context.temp_allocator)
+	testing.expect(t, before_err == nil)
+	testing.expect(t, db.error_drop(db.embed_exec(reader, "CREATE TEMP TABLE pairs (k TEXT, n INTEGER)")))
+	testing.expect(t, db.error_drop(db.embed_exec(reader, "INSERT INTO pairs SELECT v, id FROM t")))
+	testing.expect(t, db.error_drop(db.embed_exec(reader, "UPDATE pairs SET n = n + 10")))
+	testing.expect_value(t, scalar(t, reader.store, "SELECT n FROM pairs WHERE k = 'a'").i, i64(11))
+	refused := db.embed_exec(reader, "INSERT INTO t VALUES (2, 'b')")
+	defer db.error_free(&refused)
+	testing.expect_value(t, refused.kind, db.Error_Kind.Transaction_Read_Only)
+	refused_table := db.embed_exec(reader, "CREATE TABLE more (x INTEGER)")
+	defer db.error_free(&refused_table)
+	testing.expect_value(t, refused_table.kind, db.Error_Kind.Transaction_Read_Only)
+	testing.expect(t, db.error_drop(db.embed_exec(reader, "DROP TABLE pairs")))
+	after, after_err := os.read_entire_file(path, context.temp_allocator)
+	testing.expect(t, after_err == nil)
+	testing.expect(t, string(after) == string(before), "a read-only connection wrote the file")
+	testing.expect_value(t, scalar(t, reader.store, "SELECT count(*) FROM t").i, i64(1))
+}

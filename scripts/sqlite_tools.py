@@ -42,10 +42,7 @@ ROOT = shell.ROOT
 EXE = ".exe" if os.name == "nt" else ""
 
 # A known difference: the tool and its options, with the reason.
-KNOWN: dict[tuple[str, str], str] = {
-    ("sqldiff", "--vtab"): "a TEMP table on a read-only connection: SQLite's temp "
-    "database is writable when main is not; the facade keeps temp tables in main",
-}
+KNOWN: dict[tuple[str, str], str] = {}
 
 # Pairs of databases for sqldiff and the single ones dbhash hashes. Every
 # statement is deterministic, so the content hash test can run them too.

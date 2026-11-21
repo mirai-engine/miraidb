@@ -55,11 +55,12 @@ one it does not; a time is read in whole milliseconds and never rounded into
 the next second; `printf()`/`format()` are SQLite's printf, the one
 `sqlite3_mprintf` answers with; `quote()` of a real is `%!0.17g`; a literal
 past a double's range is infinity; a REAL column keeps `-0.0` as `0.0`; a
-PRAGMA may follow a comment; `PRAGMA page_size = N` answers no row. Two
-differences are left, each a known one of the gate: a connection opened
-read-only cannot make a TEMP table (SQLite's temp database is writable when
-main is not; the facade keeps temp tables in main), and the file keeps
-4096-byte pages whatever `PRAGMA page_size` and `VACUUM` ask for.
+PRAGMA may follow a comment; `PRAGMA page_size = N` answers no row and takes
+effect at the next `VACUUM`, or at once on a file with no table, and a file
+keeps the page size it has (from 512 to 65536); a connection opened read-only
+writes its TEMP tables, as SQLite's temp database is writable when main is
+not, and a TEMP table's commit leaves the file alone. The gate has no known
+difference left.
 
 The switch is one flag on the store, `sqlite_rules`, set by `sqlite3_open` and
 by opening a SQLite file. Foreign keys follow the same split: off until
