@@ -31,7 +31,6 @@ that way.
 | 2 | **R2 — fixed-size index keys** | Index entries are encoded strings: an index filter is 3–4× the reference and the entry is the largest share of applying a row. Key integer columns by value. | M | — |
 | 3 | **R3 — prune what a commit touched** | Pruning walks every row of every table after each statement. | S | — |
 | 4 | **R4 — hand the staged row to the table** | About 4% of an insert is a copy from the arena to the table. | M | 1 |
-| 5 | **Parity gate** | `scripts/bench.py` gates the parity workloads, measured twice per run, so a regression against the reference fails CI. | S | — |
 | 6 | **D12 — module sandbox** | A module is a process with a work budget; the reference runs modules deterministically with enforced limits. | L | — |
 | 7 | **D16 — generated clients** | Deferred by months: generate the Python binding from the catalog, then a second language. Until then the C ABI, the `sqlite3_*` face and the Python wrapper stay gated, so a binding is a thin layer when it comes ([backlog](backlog.md#d16--clients-generated-from-the-catalog)). | M | — |
 
@@ -67,8 +66,9 @@ with peer-to-peer sync; its networked phases build on items 27 and 28.
 
 ## Suggested order
 
-1. **R1 and R2**: the two largest gaps against the reference, measured, with the
-   parity gate (item 5) landing alongside so the gain cannot slip back.
+1. **R1 and R2**: the two largest gaps against the reference, measured. The
+   parity gate (`scripts/parity.py`) is in CI: each one records its gain
+   with `--record` so it cannot slip back.
 2. **D36**: let the planner read partial and expression indexes, which are
    enforced today but never read.
 3. **D23**: the remaining way the process can die instead of answering; **D34**
@@ -104,4 +104,4 @@ the CI gate checks; they are not a comparison with the reference.
 Every row of this table is met today and gated by `scripts/bench.py`, the read
 and commit numbers by `bench-read`, and the subscription row by
 `test_join_subscription_probes_the_join_key`. The engineering gates are listed in
-`docs/status.md` and run by `scripts/ci.py` (37 gates).
+`docs/status.md` and run by `scripts/ci.py` (38 gates).

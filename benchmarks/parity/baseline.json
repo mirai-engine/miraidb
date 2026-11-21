@@ -1,0 +1,42 @@
+{
+  "note": "In memory, best median of three runs, nanoseconds. engine_ns is this machine's, written by `python3 scripts/parity.py --record`; reference_ns and sqlite_ns were measured on the same machine on 2026-11-19 (benchmarks/parity/RESULTS.md).",
+  "engine_ns": {
+    "miraidb/mem/empty": 500,
+    "miraidb/mem/filter/string/index/load=2048/count=256": 12700,
+    "miraidb/mem/filter/u64/index/load=2048/count=256": 12200,
+    "miraidb/mem/insert_bulk/u32_u64_str/btree_each_column/load=2048/count=256": 779700,
+    "miraidb/mem/insert_bulk/u32_u64_str/unique_0/load=2048/count=256": 668200,
+    "miraidb/mem/insert_bulk/u32_u64_u64/btree_each_column/load=2048/count=256": 615400,
+    "miraidb/mem/insert_bulk/u32_u64_u64/unique_0/load=2048/count=256": 517900,
+    "miraidb/mem/iterate/u32_u64_str/unique_0/count=256": 4500,
+    "miraidb/mem/iterate/u32_u64_u64/unique_0/count=256": 4600,
+    "miraidb/mem/update_bulk/u32_u64_str/unique_0/load=2048/count=256": 969000,
+    "miraidb/mem/update_bulk/u32_u64_u64/unique_0/load=2048/count=256": 823800
+  },
+  "reference_ns": {
+    "miraidb/mem/empty": 530,
+    "miraidb/mem/filter/string/index/load=2048/count=256": 3250,
+    "miraidb/mem/filter/u64/index/load=2048/count=256": 3280,
+    "miraidb/mem/insert_bulk/u32_u64_str/btree_each_column/load=2048/count=256": 534000,
+    "miraidb/mem/insert_bulk/u32_u64_str/unique_0/load=2048/count=256": 231000,
+    "miraidb/mem/insert_bulk/u32_u64_u64/btree_each_column/load=2048/count=256": 363000,
+    "miraidb/mem/insert_bulk/u32_u64_u64/unique_0/load=2048/count=256": 186000,
+    "miraidb/mem/iterate/u32_u64_str/unique_0/count=256": 1330,
+    "miraidb/mem/iterate/u32_u64_u64/unique_0/count=256": 1990,
+    "miraidb/mem/update_bulk/u32_u64_str/unique_0/load=2048/count=256": 349000,
+    "miraidb/mem/update_bulk/u32_u64_u64/unique_0/load=2048/count=256": 313000
+  },
+  "sqlite_ns": {
+    "miraidb/mem/empty": 550,
+    "miraidb/mem/filter/string/index/load=2048/count=256": 90500,
+    "miraidb/mem/filter/u64/index/load=2048/count=256": 72300,
+    "miraidb/mem/insert_bulk/u32_u64_str/btree_each_column/load=2048/count=256": 801000,
+    "miraidb/mem/insert_bulk/u32_u64_str/unique_0/load=2048/count=256": 127000,
+    "miraidb/mem/insert_bulk/u32_u64_u64/btree_each_column/load=2048/count=256": 482000,
+    "miraidb/mem/insert_bulk/u32_u64_u64/unique_0/load=2048/count=256": 121000,
+    "miraidb/mem/iterate/u32_u64_str/unique_0/count=256": 25000,
+    "miraidb/mem/iterate/u32_u64_u64/unique_0/count=256": 22600,
+    "miraidb/mem/update_bulk/u32_u64_str/unique_0/load=2048/count=256": 51200,
+    "miraidb/mem/update_bulk/u32_u64_u64/unique_0/load=2048/count=256": 42900
+  }
+}

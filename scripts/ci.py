@@ -224,6 +224,10 @@ def build_gates(args: argparse.Namespace) -> list[Gate]:
             [sys.executable, "scripts/leaks.py", "--odin", args.odin, "--repeat", "1000"],
         )
     )
+    # The parity workloads may not get slower than the baseline this machine
+    # recorded (benchmarks/parity/baseline.json): a gain R1-R4 makes is recorded
+    # and held.
+    gates.append(Gate("parity budget", [sys.executable, "scripts/parity.py", "--odin", args.odin]))
     # A library with symbols and no header is not an API: this compares each
     # header with what its package exports, and compiles both on their own.
     gates.append(Gate("ABI headers", [sys.executable, "scripts/abi_header.py"]))

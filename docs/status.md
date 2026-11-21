@@ -122,7 +122,7 @@ the gaps are named rather than left to be discovered.
 ### Tooling
 
 - `python3 scripts/ci.py` runs every gate in one command and reports each one;
-  it is what "green" means. 37 gates (`--list` prints them): the suite, the
+  it is what "green" means. 38 gates (`--list` prints them): the suite, the
   corpus, the smokes, CPython's own sqlite3 tests on the facade, the
   measurements, the SQLite surface count, the heap sanitizer and the
   document check.
