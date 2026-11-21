@@ -49,7 +49,7 @@ Rules for this file:
 | D24 | an index the engine cannot express is dropped on import | a counted skip, and a mirror fuzz pass | S |
 | D34 | the threaded suite is green on Linux and Windows; the sanitizer covers the Windows CLI, not the suite | run the suite sanitized on every platform, in CI | S |
 | D36 | a query never reads a partial or expression index | match a query's predicate to the index | M |
-| D35 | diagnostics: a file open per commit for the log index | keep the index file open | S |
+| D35 | diagnostics: closed | — | — |
 
 ---
 
@@ -349,5 +349,7 @@ a flat count for writes; `scripts/leaks.py` is a CI gate.
    (`error_drop` for a yes or no), a store that notes a failure frees the one it
    replaces and its last on close (`store_note_error`), and `tools/leakcheck`
    fails on a leak or a double free of the error path.
-4. `log_index_append` opens the index sidecar, seeks and writes 16 bytes on every
-   commit: the first place to look when commit latency matters.
+4. ~~The log index opened per commit.~~ Closed: the log keeps the sidecar open
+   from its first commit and closes it with the log, on rotation and before a
+   rewind cuts it (`test_log_index_kept_open_matches_the_log` fails if a rewind
+   leaves a hole of zeros).

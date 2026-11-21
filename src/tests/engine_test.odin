@@ -2565,6 +2565,55 @@ test_log_offset_index :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_log_index_kept_open_matches_the_log :: proc(t: ^testing.T) {
+	// The log keeps its sidecar open across commits (D35). After a rewind the
+	// sidecar is cut through another handle, so the kept one must not write past
+	// the cut: the file holds exactly one entry per record the log keeps, in
+	// order, with no hole of zeros.
+	path :: "_test_logindex_open"
+	os.remove_all(path)
+	defer os.remove_all(path)
+	testing.expect(t, os.make_directory(path) == nil)
+	log, open_err := db.log_open(path, true, .None, .CRC32C)
+	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
+	offsets: [dynamic]i64
+	defer delete(offsets)
+	payload := []u8{1, 2, 3, 4}
+	for seq in 1 ..= 3 {
+		append(&offsets, log.size)
+		testing.expect(t, db.error_drop(db.log_append(&log, u64(seq), payload)))
+	}
+	// The third record is taken back, as a commit that failed to apply is.
+	testing.expect(t, db.error_drop(db.log_rewind(&log, offsets[2])))
+	pop(&offsets)
+	for seq in 3 ..= 4 {
+		append(&offsets, log.size)
+		testing.expect(t, db.error_drop(db.log_append(&log, u64(seq), payload)))
+	}
+	db.log_close(&log)
+
+	data, read_err := os.read_entire_file(path + "/log.index", context.temp_allocator)
+	if !testing.expectf(t, read_err == nil, "sidecar: %v", read_err) do return
+	testing.expect_value(t, len(data), db.LOG_INDEX_HEADER_LEN + 4 * db.LOG_INDEX_ENTRY_LEN)
+	for i in 0 ..< min(4, (len(data) - db.LOG_INDEX_HEADER_LEN) / db.LOG_INDEX_ENTRY_LEN) {
+		at := db.LOG_INDEX_HEADER_LEN + i * db.LOG_INDEX_ENTRY_LEN
+		seq := u64(data[at]) | u64(data[at + 1]) << 8 | u64(data[at + 2]) << 16 | u64(data[at + 3]) << 24
+		offset := i64(data[at + 8]) | i64(data[at + 9]) << 8 | i64(data[at + 10]) << 16 | i64(data[at + 11]) << 24
+		testing.expect_value(t, seq, u64(i + 1))
+		testing.expect_value(t, offset, offsets[i])
+	}
+
+	// A reopened log appends after what is there, through a fresh handle.
+	log, open_err = db.log_open(path, false, .None, .CRC32C)
+	if !testing.expectf(t, db.error_ok(open_err), "reopen: %s", open_err.message) do return
+	testing.expect(t, db.error_drop(db.log_append(&log, 5, payload)))
+	db.log_close(&log)
+	again, again_err := os.read_entire_file(path + "/log.index", context.temp_allocator)
+	testing.expect(t, again_err == nil)
+	testing.expect_value(t, len(again), db.LOG_INDEX_HEADER_LEN + 5 * db.LOG_INDEX_ENTRY_LEN)
+}
+
+@(test)
 test_in_memory_log :: proc(t: ^testing.T) {
 	store, err := db.store_open("", {in_memory_log = true})
 	if !testing.expectf(t, db.error_ok(err), "open: %s", err.message) do return

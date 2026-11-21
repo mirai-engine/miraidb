@@ -188,6 +188,11 @@ Commit_Log :: struct {
 	// segment is the index of the live file and directory the database folder.
 	segment:   int,
 	directory: string,
+	// index_file is the live segment's offset sidecar, opened at the first commit
+	// and kept: opening, sizing and seeking it on every commit was a file open per
+	// commit (D35). It is closed with the log, on rotation and before a rewind
+	// cuts the sidecar through another handle.
+	index_file: ^os.File,
 }
 
 // log_segment_path names segment 0 `<db>/log` (so databases from before
@@ -319,6 +324,8 @@ log_open :: proc(
 // to append the record for `next_seq`, so the new header's base is one less.
 @(private)
 log_rotate :: proc(log: ^Commit_Log, next_seq: u64) -> Error {
+	// The sidecar belongs to the segment being closed.
+	log_index_close(log)
 	if log.file != nil {
 		if log.durability == .Full {
 			_ = log_file_sync(log.file)
@@ -374,6 +381,7 @@ log_open_memory :: proc() -> Commit_Log {
 }
 
 log_close :: proc(log: ^Commit_Log) {
+	log_index_close(log)
 	delete(log.path)
 	log.path = ""
 	if log.memory_mode {
@@ -422,7 +430,7 @@ log_append :: proc(log: ^Commit_Log, commit_seq: u64, payload: []u8) -> Error {
 	}
 	record_offset := log.size
 	log.size += i64(len(record))
-	if log.vfs == nil do log_index_append(log.path, commit_seq, record_offset)
+	if log.vfs == nil do log_index_write(log, commit_seq, record_offset)
 	#partial switch log.durability {
 	case .Full:
 		if sync_err := log_file_sync(log.file); sync_err.kind != .None do return sync_err
@@ -445,7 +453,12 @@ log_rewind :: proc(log: ^Commit_Log, size: i64) -> Error {
 	if truncate_err := log_file_truncate(log.file, size); truncate_err.kind != .None {
 		return error_wrap(truncate_err, .Io, "cannot rewind the commit log: %v", truncate_err.message)
 	}
-	if log.vfs == nil do log_index_truncate(log.path, size)
+	if log.vfs == nil {
+		// The kept handle would write past the cut and leave a hole of zeros: the
+		// next commit opens the sidecar again at its new end.
+		log_index_close(log)
+		log_index_truncate(log.path, size)
+	}
 	if _, seek_err := log_file_seek(log.file, size); seek_err.kind != .None {
 		return error_wrap(seek_err, .Io, "cannot seek after rewinding the log: %v", seek_err.message)
 	}
@@ -469,26 +482,62 @@ log_index_write_header :: proc(file: ^os.File) -> Error {
 	return ERROR_NONE
 }
 
+// log_index_open_end opens a sidecar for appending: created with its header when
+// it is new, positioned at its end. It answers nil when it cannot.
 @(private)
-log_index_append :: proc(log_path: string, seq: u64, offset: i64) {
+log_index_open_end :: proc(log_path: string) -> ^os.File {
 	index_path := log_index_path(log_path)
 	defer delete(index_path)
 	file, open_err := os.open(index_path, {.Read, .Write, .Create})
-	if open_err != nil do return
-	defer os.close(file)
+	if open_err != nil do return nil
 	size, size_err := os.file_size(file)
-	if size_err != nil do return
+	if size_err != nil {
+		os.close(file)
+		return nil
+	}
 	if size == 0 {
 		// A sidecar created here starts with its header. Without it every lookup
 		// rejects the file and the index is dead weight: a database created by
 		// this build used to have no usable index at all.
-		if header_err := log_index_write_header(file); header_err.kind != .None do return
+		if header_err := log_index_write_header(file); header_err.kind != .None {
+			error_free(&header_err)
+			os.close(file)
+			return nil
+		}
 	}
-	if _, seek_err := os.seek(file, 0, .End); seek_err != nil do return
+	if _, seek_err := os.seek(file, 0, .End); seek_err != nil {
+		os.close(file)
+		return nil
+	}
+	return file
+}
+
+@(private)
+log_index_put :: proc(file: ^os.File, seq: u64, offset: i64) -> bool {
 	entry: [LOG_INDEX_ENTRY_LEN]u8
 	put_u64_le(entry[0:8], seq)
 	put_u64_le(entry[8:16], u64(offset))
-	_, _ = os.write(file, entry[:])
+	written, write_err := os.write(file, entry[:])
+	return write_err == nil && written == LOG_INDEX_ENTRY_LEN
+}
+
+// log_index_write records one commit in the live segment's sidecar through the
+// handle the log keeps. The index is derived data: a failure drops the handle and
+// the next commit tries again; a lookup that finds the index short replays.
+@(private)
+log_index_write :: proc(log: ^Commit_Log, seq: u64, offset: i64) {
+	if log.index_file == nil {
+		log.index_file = log_index_open_end(log.path)
+		if log.index_file == nil do return
+	}
+	if !log_index_put(log.index_file, seq, offset) do log_index_close(log)
+}
+
+@(private)
+log_index_close :: proc(log: ^Commit_Log) {
+	if log.index_file == nil do return
+	os.close(log.index_file)
+	log.index_file = nil
 }
 
 // log_index_last returns the highest sequence the sidecar names, which is the
@@ -528,7 +577,8 @@ log_index_ensure :: proc(log_path: string) {
 	if os.exists(index_path) do return
 	file, open_err := os.open(index_path, {.Read, .Write, .Create, .Trunc})
 	if open_err != nil do return
-	if log_index_write_header(file).kind != .None {
+	if header_err := log_index_write_header(file); header_err.kind != .None {
+		error_free(&header_err)
 		os.close(file)
 		return
 	}
@@ -539,8 +589,11 @@ log_index_ensure :: proc(log_path: string) {
 		error_free(&read_err)
 		return
 	}
+	sidecar := log_index_open_end(log_path)
+	if sidecar == nil do return
+	defer os.close(sidecar)
 	for record in records {
-		log_index_append(log_path, record.seq, record.offset)
+		if !log_index_put(sidecar, record.seq, record.offset) do return
 	}
 }
 
