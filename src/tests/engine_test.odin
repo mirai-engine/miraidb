@@ -179,7 +179,9 @@ test_transactions :: proc(t: ^testing.T) {
 	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, value INTEGER NOT NULL)")
 
 	tx := db.tx_begin_write(store)
-	_, insert_err := db.sql_execute_in_tx(tx, "INSERT INTO t (value) VALUES (1)")
+	dropped_result_182, insert_err := db.sql_execute_in_tx(tx, "INSERT INTO t (value) VALUES (1)")
+	defer db.error_free(&insert_err)
+	defer db.sql_result_destroy(&dropped_result_182)
 	testing.expect(t, db.error_ok(insert_err))
 	// Inside the transaction the row is visible.
 	result, select_err := db.sql_execute_in_tx(tx, "SELECT count(*) FROM t")
@@ -192,7 +194,9 @@ test_transactions :: proc(t: ^testing.T) {
 	testing.expect_value(t, count.i, i64(0))
 
 	tx2 := db.tx_begin_write(store)
-	_, insert_err2 := db.sql_execute_in_tx(tx2, "INSERT INTO t (value) VALUES (2)")
+	dropped_result_195, insert_err2 := db.sql_execute_in_tx(tx2, "INSERT INTO t (value) VALUES (2)")
+	defer db.error_free(&insert_err2)
+	defer db.sql_result_destroy(&dropped_result_195)
 	testing.expect(t, db.error_ok(insert_err2))
 	commit_err := db.tx_commit(tx2)
 	testing.expect(t, db.error_ok(commit_err))
@@ -245,13 +249,17 @@ test_reducers :: proc(t: ^testing.T) {
 
 	add :: proc(ctx: ^db.Reducer_Ctx, args: []db.Value) -> db.Error {
 		amount, _ := db.value_to_i64(args[0])
-		_, err := db.sql_execute_in_tx(ctx.tx, "UPDATE counter SET value = value + 1 WHERE id = 0")
+		dropped_result_248, err := db.sql_execute_in_tx(ctx.tx, "UPDATE counter SET value = value + 1 WHERE id = 0")
+		defer db.error_free(&err)
+		defer db.sql_result_destroy(&dropped_result_248)
 		if !db.error_ok(err) do return err
 		_ = amount
 		return db.Error{kind = .None}
 	}
 	failing :: proc(ctx: ^db.Reducer_Ctx, args: []db.Value) -> db.Error {
-		_, err := db.sql_execute_in_tx(ctx.tx, "UPDATE counter SET value = value + 100 WHERE id = 0")
+		dropped_result_254, err := db.sql_execute_in_tx(ctx.tx, "UPDATE counter SET value = value + 100 WHERE id = 0")
+		defer db.error_free(&err)
+		defer db.sql_result_destroy(&dropped_result_254)
 		if !db.error_ok(err) do return err
 		return db.Error{kind = .Invalid_Argument, message = "deliberate failure"}
 	}
@@ -432,11 +440,13 @@ test_bind_parameters :: proc(t: ^testing.T) {
 	testing.expect_value(t, insert.affected, 1)
 	db.sql_result_destroy(&insert)
 
-	_, second_err := db.sql_execute_params(
+	dropped_result_435, second_err := db.sql_execute_params(
 		store,
 		"INSERT INTO t (name, score) VALUES (?, ?)",
 		[]db.Value{db.value_string("luis"), db.value_int(20)},
 	)
+	defer db.error_free(&second_err)
+	defer db.sql_result_destroy(&dropped_result_435)
 	testing.expect(t, db.error_ok(second_err))
 
 	select, select_err := db.sql_execute_params(
@@ -553,12 +563,12 @@ test_compaction :: proc(t: ^testing.T) {
 	sequence := store.commit_seq
 
 	path := "_test_compact/log"
-	size_before, _ := os.stat(path, context.allocator)
+	size_before, _ := os.stat(path, context.temp_allocator)
 	compact_err := db.store_compact(store)
 	if !testing.expectf(t, db.error_ok(compact_err), "compact: %s", compact_err.message) {
 		return
 	}
-	size_after, _ := os.stat(path, context.allocator)
+	size_after, _ := os.stat(path, context.temp_allocator)
 	testing.expectf(t, size_after.size < size_before.size, "compaction did not shrink the log")
 	// The rewritten log carries the snapshot payload, so the standalone copy is
 	// gone: a compacted database is one artifact, not two.
@@ -629,7 +639,9 @@ test_scheduler :: proc(t: ^testing.T) {
 	bump :: proc(ctx: ^db.Reducer_Ctx, args: []db.Value) -> db.Error {
 		amount, _ := db.value_to_i64(args[0])
 		statement := fmt.tprintf("UPDATE counter SET value = value + %d WHERE id = 0", amount)
-		_, err := db.sql_execute_in_tx(ctx.tx, statement)
+		dropped_result_632, err := db.sql_execute_in_tx(ctx.tx, statement)
+		defer db.error_free(&err)
+		defer db.sql_result_destroy(&dropped_result_632)
 		return err
 	}
 	testing.expect(t, db.error_ok(db.host_register(host, "bump", []db.Column_Type{db.type_int}, bump)))
@@ -796,6 +808,15 @@ join_delta_capture :: proc(ctx: rawptr, update: ^db.Subscription_Update) {
 	deltas.last_table = update.table
 	for row in update.inserts do append(&deltas.inserts, db.value_row_clone(row))
 	for row in update.deletes do append(&deltas.deletes, db.value_row_clone(row))
+}
+
+// join_deltas_destroy frees the rows still captured, both lists and the deltas.
+@(private)
+join_deltas_destroy :: proc(deltas: ^Join_Deltas) {
+	join_deltas_clear(deltas)
+	delete(deltas.inserts)
+	delete(deltas.deletes)
+	free(deltas)
 }
 
 @(private)
@@ -970,7 +991,7 @@ test_join_subscription_walks_the_planned_order :: proc(t: ^testing.T) {
 
 	// A commit still publishes the right delta through the reordered walk.
 	deltas := new(Join_Deltas)
-	defer free(deltas)
+	defer join_deltas_destroy(deltas)
 	host.on_update = join_delta_capture
 	host.on_update_ctx = deltas
 	run_done(t, store, "INSERT INTO book (author_id, title) VALUES (3, 'new')")
@@ -1094,7 +1115,7 @@ test_incremental_join_subscription :: proc(t: ^testing.T) {
 	delete(snapshot)
 
 	deltas := new(Join_Deltas)
-	defer free(deltas)
+	defer join_deltas_destroy(deltas)
 	host.on_update = join_delta_capture
 	host.on_update_ctx = deltas
 
@@ -1226,7 +1247,7 @@ test_join_subscription_probes_the_join_key :: proc(t: ^testing.T) {
 	delete(snapshot)
 
 	deltas := new(Join_Deltas)
-	defer free(deltas)
+	defer join_deltas_destroy(deltas)
 	host.on_update = join_delta_capture
 	host.on_update_ctx = deltas
 
@@ -1307,7 +1328,7 @@ test_incremental_aggregate_subscription :: proc(t: ^testing.T) {
 	delete(total_snapshot)
 
 	deltas := new(Join_Deltas)
-	defer free(deltas)
+	defer join_deltas_destroy(deltas)
 	host.on_update = join_delta_capture
 	host.on_update_ctx = deltas
 
@@ -1640,7 +1661,9 @@ test_work_budget :: proc(t: ^testing.T) {
 	run_done(t, store, strings.to_string(builder))
 
 	sweep :: proc(ctx: ^db.Reducer_Ctx, args: []db.Value) -> db.Error {
-		_, err := db.sql_execute_in_tx(ctx.tx, "UPDATE numbers SET value = value + 1")
+		dropped_result_1652, err := db.sql_execute_in_tx(ctx.tx, "UPDATE numbers SET value = value + 1")
+		defer db.error_free(&err)
+		defer db.sql_result_destroy(&dropped_result_1652)
 		return err
 	}
 	testing.expect(t, db.error_ok(db.host_register(host, "sweep", nil, sweep)))
@@ -1679,7 +1702,9 @@ test_durability_after_restart :: proc(t: ^testing.T) {
 	os.remove_all(path)
 
 	bump :: proc(ctx: ^db.Reducer_Ctx, args: []db.Value) -> db.Error {
-		_, err := db.sql_execute_in_tx(ctx.tx, "UPDATE counter SET value = value + 1 WHERE id = 0")
+		dropped_result_1691, err := db.sql_execute_in_tx(ctx.tx, "UPDATE counter SET value = value + 1 WHERE id = 0")
+		defer db.error_free(&err)
+		defer db.sql_result_destroy(&dropped_result_1691)
 		return err
 	}
 
@@ -1739,7 +1764,9 @@ test_idempotent_calls :: proc(t: ^testing.T) {
 	incr :: proc(ctx: ^db.Reducer_Ctx, args: []db.Value) -> db.Error {
 		amount, _ := db.value_to_i64(args[0])
 		statement := fmt.tprintf("UPDATE counter SET value = value + %d WHERE id = 0", amount)
-		_, err := db.sql_execute_in_tx(ctx.tx, statement)
+		dropped_result_1751, err := db.sql_execute_in_tx(ctx.tx, statement)
+		defer db.error_free(&err)
+		defer db.sql_result_destroy(&dropped_result_1751)
 		return err
 	}
 	testing.expect(t, db.error_ok(db.host_register(host, "incr", []db.Column_Type{db.type_int}, incr)))
@@ -2074,7 +2101,9 @@ test_indexed_dml_and_offsets :: proc(t: ^testing.T) {
 	// Inside a transaction with staged writes the index cannot see the new row,
 	// so the fallback scan must still find and update it.
 	tx := db.tx_begin_write(store)
-	_, insert_err := db.sql_execute_in_tx(tx, "INSERT INTO item (score, tag) VALUES (3, 'v')")
+	dropped_result_2086, insert_err := db.sql_execute_in_tx(tx, "INSERT INTO item (score, tag) VALUES (3, 'v')")
+	defer db.error_free(&insert_err)
+	defer db.sql_result_destroy(&dropped_result_2086)
 	testing.expect(t, db.error_ok(insert_err))
 	updated, update_err := db.sql_execute_in_tx(tx, "UPDATE item SET tag = 'new' WHERE score = 3")
 	testing.expect(t, db.error_ok(update_err))
@@ -2337,7 +2366,9 @@ test_schedule_interval :: proc(t: ^testing.T) {
 	bump :: proc(ctx: ^db.Reducer_Ctx, args: []db.Value) -> db.Error {
 		amount, _ := db.value_to_i64(args[0])
 		statement := fmt.tprintf("UPDATE counter SET value = value + %d WHERE id = 0", amount)
-		_, err := db.sql_execute_in_tx(ctx.tx, statement)
+		dropped_result_2349, err := db.sql_execute_in_tx(ctx.tx, statement)
+		defer db.error_free(&err)
+		defer db.sql_result_destroy(&dropped_result_2349)
 		return err
 	}
 	testing.expect(t, db.error_ok(db.host_register(host, "bump", []db.Column_Type{db.type_int}, bump)))
@@ -2674,6 +2705,16 @@ wire_ask :: proc(host: ^db.Host, request: []u8) -> []u8 {
 	return db.wire_request(host, request)
 }
 
+// wire_ask_owned sends a request as connection `owner` and answers the
+// response's kind, the response freed: for the tests that only check it. The
+// request stays the caller's.
+@(private)
+wire_ask_owned :: proc(host: ^db.Host, request: []u8, owner: u64) -> u32 {
+	response := db.wire_request_owned(host, request, owner)
+	defer delete(response)
+	return wire_kind(response)
+}
+
 @(private)
 wire_kind :: proc(data: []u8) -> u32 {
 	return u32(data[0]) | u32(data[1]) << 8 | u32(data[2]) << 16 | u32(data[3]) << 24
@@ -2704,7 +2745,9 @@ test_wire_messages :: proc(t: ^testing.T) {
 	// Reducer call with an idempotency id.
 	bump :: proc(ctx: ^db.Reducer_Ctx, args: []db.Value) -> db.Error {
 		amount, _ := db.value_to_i64(args[0])
-		_, err := db.sql_execute_in_tx(ctx.tx, fmt.tprintf("UPDATE t SET v = v + %d", amount))
+		dropped_result_2726, err := db.sql_execute_in_tx(ctx.tx, fmt.tprintf("UPDATE t SET v = v + %d", amount))
+		defer db.error_free(&err)
+		defer db.sql_result_destroy(&dropped_result_2726)
 		return err
 	}
 	testing.expect(t, db.error_ok(db.host_register(host, "bump", []db.Column_Type{db.type_int}, bump)))
@@ -2731,7 +2774,7 @@ test_wire_messages :: proc(t: ^testing.T) {
 	sub := wire_ask(host, db.wire_encode_subscribe([]string{"SELECT v FROM t"}))
 	defer delete(sub)
 	testing.expect_value(t, wire_kind(sub), db.WIRE_SNAPSHOT)
-	sub_id, _, snapshot, sub_err := db.wire_decode_snapshot(sub, context.allocator)
+	sub_id, _, snapshot, sub_err := db.wire_decode_snapshot(sub, context.temp_allocator)
 	testing.expect(t, db.error_ok(sub_err))
 	testing.expect_value(t, snapshot[0][0][0].i, i64(8))
 
@@ -2745,7 +2788,8 @@ test_wire_messages :: proc(t: ^testing.T) {
 
 @(private)
 http_bytes_of :: proc(text: string) -> []u8 {
-	out := make([]u8, len(text))
+	// In the test's temporary memory: no caller frees the bytes.
+	out := make([]u8, len(text), context.temp_allocator)
 	copy(out, text)
 	return out
 }
@@ -2827,7 +2871,7 @@ test_background_compaction :: proc(t: ^testing.T) {
 test_transport_caps :: proc(t: ^testing.T) {
 	// A connection can send anything; the transport must refuse what is too big
 	// with an error instead of allocating it or crashing.
-	long_header := fmt.aprintf("GET /health HTTP/1.1\r\nX: %s\r\n\r\n", strings.repeat("a", 200))
+	long_header := fmt.aprintf("GET /health HTTP/1.1\r\nX: %s\r\n\r\n", strings.repeat("a", 200, context.temp_allocator))
 	defer delete(long_header)
 	_, _, header_err := db.http_parse_request_within(transmute([]u8)long_header, 64, 1024)
 	defer db.error_free(&header_err)
@@ -2886,12 +2930,14 @@ test_transport_caps :: proc(t: ^testing.T) {
 	_, _, _, frame_err := db.ws_read_frame_within(frame, 128)
 	defer db.error_free(&frame_err)
 	testing.expect_value(t, frame_err.kind, db.Error_Kind.Quota_Exceeded)
-	_, _, _, ok_err := db.ws_read_frame_within(frame, 1024)
+	ok_payload, _, _, ok_err := db.ws_read_frame_within(frame, 1024)
+	defer delete(ok_payload)
 	defer db.error_free(&ok_err)
 	testing.expect(t, db.error_ok(ok_err))
 
 	// A 64-bit length with the top bit set must not wrap into a negative size.
 	forged := make([]u8, 14)
+	defer delete(forged)
 	forged[0] = 0x2
 	forged[1] = 127
 	forged[2] = 0xff
@@ -2960,9 +3006,11 @@ test_http_layer :: proc(t: ^testing.T) {
 	// A single reader is enough for the socket loop later: two requests back to
 	// back parse one after the other.
 	combined := make([]byte, len(request_bytes) + 3)
+	defer delete(combined)
 	copy(combined, request_bytes)
 	copy(combined[len(request_bytes):], "abc")
-	_, first, first_err := db.http_parse_request(combined)
+	combined_request, first, first_err := db.http_parse_request(combined)
+	defer db.http_request_destroy(&combined_request)
 	defer db.error_free(&first_err)
 	testing.expect(t, db.error_ok(first_err))
 	testing.expect_value(t, first, len(request_bytes))
@@ -2977,6 +3025,7 @@ strings_index_of :: proc(haystack, needle: string) -> int {
 test_websocket :: proc(t: ^testing.T) {
 	// RFC 6455 section 1.3 example.
 	accept := db.ws_accept_key("dGhlIHNhbXBsZSBub25jZQ==")
+	defer delete(accept)
 	testing.expect_value(t, accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
 
 	request := http_bytes_of(
@@ -2984,11 +3033,13 @@ test_websocket :: proc(t: ^testing.T) {
 	)
 	testing.expect(t, db.ws_is_upgrade(request))
 	response, ok := db.ws_handshake(request)
+	defer delete(response)
 	testing.expect(t, ok)
 	testing.expect(t, strings_contains(string(response), "101 Switching Protocols"))
 	testing.expect(t, strings_contains(string(response), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="))
 
 	framed := db.ws_frame(http_bytes_of("hi"))
+	defer delete(framed)
 	testing.expect_value(t, len(framed), 4)
 	testing.expect_value(t, framed[0], u8(0x82))
 	testing.expect_value(t, framed[1], u8(2))
@@ -3023,6 +3074,7 @@ test_tokens :: proc(t: ^testing.T) {
 	identity[31] = 9
 	host.now_us = i64(1_000_000)
 	token, issue_err := db.host_issue_token(host, identity, 0)
+	defer delete(token)
 	testing.expect(t, db.error_ok(issue_err))
 	testing.expect_value(t, len(token), 67)
 	testing.expect(t, strings_contains(token, "mt_"))
@@ -3052,6 +3104,7 @@ test_tokens :: proc(t: ^testing.T) {
 	defer delete(bad)
 	testing.expect_value(t, wire_kind(bad), db.WIRE_ERROR)
 	short, short_err := db.host_issue_token(host, identity, -1)
+	defer delete(short)
 	testing.expect(t, db.error_ok(short_err))
 	expired := wire_ask(host, db.wire_encode_auth(short))
 	defer delete(expired)
@@ -3182,7 +3235,9 @@ test_procedures :: proc(t: ^testing.T) {
 	run_done(t, store, "CREATE TABLE log (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER NOT NULL)")
 
 	step :: proc(ctx: ^db.Procedure_Ctx, args: []db.Value) -> db.Error {
-		_, err := db.sql_execute_in_tx(ctx.tx, "INSERT INTO log (v) VALUES (1)")
+		dropped_result_3213, err := db.sql_execute_in_tx(ctx.tx, "INSERT INTO log (v) VALUES (1)")
+		defer db.error_free(&err)
+		defer db.sql_result_destroy(&dropped_result_3213)
 		if !db.error_ok(err) do return err
 		if commit_err := db.procedure_commit(ctx); commit_err.kind != .None do return commit_err
 		_, err = db.sql_execute_in_tx(ctx.tx, "INSERT INTO log (v) VALUES (2)")
@@ -3198,7 +3253,9 @@ test_procedures :: proc(t: ^testing.T) {
 	// A failure after a commit keeps the committed phases and drops only the
 	// phase that failed.
 	fail_late :: proc(ctx: ^db.Procedure_Ctx, args: []db.Value) -> db.Error {
-		_, err := db.sql_execute_in_tx(ctx.tx, "INSERT INTO log (v) VALUES (4)")
+		dropped_result_3229, err := db.sql_execute_in_tx(ctx.tx, "INSERT INTO log (v) VALUES (4)")
+		defer db.error_free(&err)
+		defer db.sql_result_destroy(&dropped_result_3229)
 		if !db.error_ok(err) do return err
 		if commit_err := db.procedure_commit(ctx); commit_err.kind != .None do return commit_err
 		return db.Error{kind = .Invalid_Argument, message = "boom"}
@@ -3440,6 +3497,8 @@ test_module_variables :: proc(t: ^testing.T) {
 	testing.expect(t, db.error_ok(db.host_set_module_variable(host, "mode", "fast")))
 	value, found := db.host_get_module_variable(host, "mode", context.temp_allocator)
 	testing.expect(t, found)
+	// The value outlives the statements that run after it was read.
+	run_done(t, store, "SELECT key, value FROM _var")
 	testing.expect_value(t, value, "fast")
 
 	testing.expect(t, db.error_ok(db.host_set_module_variable(host, "mode", "slow")))
@@ -3469,6 +3528,7 @@ test_schema_reflection :: proc(t: ^testing.T) {
 	run_done(t, store, "CREATE TABLE thing (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
 	run_done(t, store, "CREATE INDEX thing_name ON thing (name)")
 	text := db.host_schema_text(host, context.allocator)
+	defer delete(text)
 	testing.expect(t, strings_contains(text, "table thing"))
 	testing.expect(t, strings_contains(text, "name TEXT"))
 	testing.expect(t, strings_contains(text, "thing_name"))
@@ -3487,9 +3547,13 @@ test_schema_validation :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "validate")
 
-	_, duplicated := db.sql_execute(store, "CREATE TABLE dup (a INTEGER, a TEXT)")
+	dropped_result_3489, duplicated := db.sql_execute(store, "CREATE TABLE dup (a INTEGER, a TEXT)")
+	defer db.error_free(&duplicated)
+	defer db.sql_result_destroy(&dropped_result_3489)
 	testing.expect(t, !db.error_ok(duplicated))
-	_, bad_default := db.sql_execute(store, "CREATE TABLE bad_default (a INTEGER NOT NULL DEFAULT NULL)")
+	dropped_result_3491, bad_default := db.sql_execute(store, "CREATE TABLE bad_default (a INTEGER NOT NULL DEFAULT NULL)")
+	defer db.error_free(&bad_default)
+	defer db.sql_result_destroy(&dropped_result_3491)
 	testing.expect(t, !db.error_ok(bad_default))
 	run_done(t, store, "CREATE TABLE good (a INTEGER, b TEXT)")
 	dropped_result_3483, repeated := db.sql_execute(store, "CREATE INDEX twice ON good (a, a)")
@@ -3523,6 +3587,7 @@ run_params :: proc(
 ) -> db.Sql_Result {
 	result, err := db.sql_execute_params(store, sql, params)
 	testing.expectf(t, db.error_ok(err), "%s failed: %s", sql, err.message)
+	db.error_free(&err)
 	return result
 }
 
@@ -3546,6 +3611,7 @@ test_codegen :: proc(t: ^testing.T) {
 
 	run_done(t, store, "CREATE TABLE person (id INTEGER PRIMARY KEY, name TEXT NOT NULL, score REAL)")
 	code := db.codegen_odin(host, context.allocator)
+	defer delete(code)
 	testing.expect(t, strings_contains(code, "package generated"))
 	testing.expect(t, strings_contains(code, "Row_person :: struct {"))
 	testing.expect(t, strings_contains(code, "id: i64"))
@@ -3564,6 +3630,7 @@ test_export_sql :: proc(t: ^testing.T) {
 	run_done(t, store, "INSERT INTO item (id, label, qty) VALUES (1, 'it''s ok', 3)")
 	run_done(t, store, "INSERT INTO item (id, label, qty) VALUES (2, 'plain', 0)")
 	text := db.export_sql(host, context.allocator)
+	defer delete(text)
 	testing.expect(t, strings_contains(text, "INSERT INTO item VALUES (1, 'it''s ok', 3);"))
 	testing.expect(t, strings_contains(text, "INSERT INTO item VALUES (2, 'plain', 0);"))
 	testing.expect(t, !strings_contains(text, "_meta"))
@@ -3592,7 +3659,9 @@ test_client_registry :: proc(t: ^testing.T) {
 
 	// Outbound accounting enables a backpressure policy in the transport.
 	testing.expect_value(t, db.host_client_bytes(host, 3), u64(0))
-	reply := db.wire_request_owned(host, db.wire_encode_query("SELECT 1", nil), 3)
+	query_one := db.wire_encode_query("SELECT 1", nil)
+	defer delete(query_one)
+	reply := db.wire_request_owned(host, query_one, 3)
 	defer delete(reply)
 	testing.expect(t, len(reply) > 0)
 	testing.expect(t, db.host_client_bytes(host, 3) > 0)
@@ -3619,6 +3688,7 @@ test_jwt_tokens :: proc(t: ^testing.T) {
 	host.now_us = i64(5_000_000)
 
 	token := db.host_issue_jwt(host, identity, 60_000_000)
+	defer delete(token)
 	resolved, valid := db.host_authenticate(host, token)
 	testing.expect(t, valid)
 	testing.expect_value(t, resolved[0], u8(3))
@@ -3792,7 +3862,9 @@ test_alter_table_add_column :: proc(t: ^testing.T) {
 	fresh := scalar(t, store, "SELECT qty FROM t WHERE id = 3")
 	testing.expect_value(t, fresh.i, i64(7))
 
-	_, duplicate := db.sql_execute(store, "ALTER TABLE t ADD COLUMN qty INTEGER")
+	dropped_result_3794, duplicate := db.sql_execute(store, "ALTER TABLE t ADD COLUMN qty INTEGER")
+	defer db.error_free(&duplicate)
+	defer db.sql_result_destroy(&dropped_result_3794)
 	testing.expect(t, !db.error_ok(duplicate))
 
 	// The change is part of the log: reopening replays it.
@@ -3820,7 +3892,9 @@ test_create_or_replace_view :: proc(t: ^testing.T) {
 	total := scalar(t, store, "SELECT count(*) FROM v")
 	testing.expect_value(t, total.i, i64(2))
 
-	_, duplicate := db.sql_execute(store, "CREATE VIEW v AS SELECT id FROM t WHERE id = 1")
+	dropped_result_3822, duplicate := db.sql_execute(store, "CREATE VIEW v AS SELECT id FROM t WHERE id = 1")
+	defer db.error_free(&duplicate)
+	defer db.sql_result_destroy(&dropped_result_3822)
 	testing.expect(t, !db.error_ok(duplicate))
 
 	run_done(t, store, "CREATE OR REPLACE VIEW v AS SELECT id FROM t WHERE id = 2")
@@ -3938,12 +4012,16 @@ test_procedure_logs_and_timers :: proc(t: ^testing.T) {
 	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
 	handler := proc(ctx: ^db.Procedure_Ctx, args: []db.Value) -> db.Error {
 		db.procedure_log(ctx, "phase one")
-		_, first := db.sql_execute_in_tx(ctx.tx, "INSERT INTO t (id) VALUES (1)")
+		dropped_result_3986, first := db.sql_execute_in_tx(ctx.tx, "INSERT INTO t (id) VALUES (1)")
+		defer db.error_free(&first)
+		defer db.sql_result_destroy(&dropped_result_3986)
 		if !db.error_ok(first) do return first
 		if commit_err := db.procedure_commit(ctx); !db.error_ok(commit_err) do return commit_err
 		db.procedure_log(ctx, "phase two")
 		if db.procedure_now_us(ctx) == 0 do return db.errf(.Invalid_Argument, "no timer")
-		_, second := db.sql_execute_in_tx(ctx.tx, "INSERT INTO t (id) VALUES (2)")
+		dropped_result_3991, second := db.sql_execute_in_tx(ctx.tx, "INSERT INTO t (id) VALUES (2)")
+		defer db.error_free(&second)
+		defer db.sql_result_destroy(&dropped_result_3991)
 		return second
 	}
 	host.now_us = i64(3_000_000)
@@ -3967,7 +4045,9 @@ test_module_abi :: proc(t: ^testing.T) {
 
 	counting := proc(h: ^db.Host, reducer: string, args: []db.Value) -> (db.Value, db.Error) {
 		if reducer != "deposit" do return {}, db.errf(.Invalid_Argument, "unknown reducer %s", reducer)
-		_, insert_err := db.sql_execute(h.store, "INSERT INTO ledger (id, amount) VALUES (1, 100)")
+		dropped_result_4015, insert_err := db.sql_execute(h.store, "INSERT INTO ledger (id, amount) VALUES (1, 100)")
+		defer db.error_free(&insert_err)
+		defer db.sql_result_destroy(&dropped_result_4015)
 		if !db.error_ok(insert_err) do return {}, insert_err
 		return db.value_string("deposited"), db.ERROR_NONE
 	}
@@ -3980,6 +4060,7 @@ test_module_abi :: proc(t: ^testing.T) {
 	testing.expect(t, db.error_ok(db.host_register_module(host, db.Module{abi_version = db.MODULE_ABI_VERSION, name = "audit"})))
 
 	names := db.host_module_names(host, context.allocator)
+	defer delete(names)
 	testing.expect_value(t, len(names), 2)
 	testing.expect_value(t, names[0], "audit")
 	testing.expect_value(t, names[1], "bank")
@@ -4003,6 +4084,7 @@ test_module_abi :: proc(t: ^testing.T) {
 	defer db.error_free(&unknown)
 	testing.expect(t, !db.error_ok(unknown))
 	_, bad_reducer := db.host_call_module(host, "bank", "withdraw", nil)
+	defer db.error_free(&bad_reducer)
 	testing.expect(t, !db.error_ok(bad_reducer))
 
 	db.host_shutdown_modules(host)
@@ -4065,6 +4147,7 @@ test_module_identity :: proc(t: ^testing.T) {
 
 	host.now_us = i64(1_000_000)
 	token := db.host_issue_jwt(host, identity, 60_000_000)
+	defer delete(token)
 	resolved, valid := db.module_authenticate(host, token)
 	testing.expect(t, valid)
 	testing.expect_value(t, resolved[0], u8(5))
@@ -4098,7 +4181,9 @@ test_ephemeral_tables :: proc(t: ^testing.T) {
 	testing.expect(t, db.error_ok(open_err))
 	defer db.store_close(reopened)
 
-	_, missing := db.sql_execute(reopened, "SELECT * FROM scratch")
+	dropped_result_4100, missing := db.sql_execute(reopened, "SELECT * FROM scratch")
+	defer db.error_free(&missing)
+	defer db.sql_result_destroy(&dropped_result_4100)
 	testing.expect(t, !db.error_ok(missing))
 	testing.expect_value(t, scalar(t, reopened, "SELECT count(*) FROM durable").i, i64(0))
 }
@@ -4116,11 +4201,15 @@ test_transaction_read_set :: proc(t: ^testing.T) {
 
 	tx := db.tx_begin_write(store)
 	testing.expect_value(t, db.tx_read_seq(tx), start_seq)
-	_, read_err := db.sql_execute_in_tx(tx, "SELECT id FROM a")
+	read_result, read_err := db.sql_execute_in_tx(tx, "SELECT id FROM a")
+	defer db.sql_result_destroy(&read_result)
 	testing.expect(t, db.error_ok(read_err))
-	_, write_err := db.sql_execute_in_tx(tx, "INSERT INTO b (id) VALUES (1)")
+	dropped_result_4171, write_err := db.sql_execute_in_tx(tx, "INSERT INTO b (id) VALUES (1)")
+	defer db.error_free(&write_err)
+	defer db.sql_result_destroy(&dropped_result_4171)
 	testing.expect(t, db.error_ok(write_err))
 	tables := db.tx_read_tables(tx, context.allocator)
+	defer delete(tables)
 	found_a, found_b := false, false
 	for name in tables {
 		if name == "a" do found_a = true
@@ -4174,9 +4263,13 @@ test_event_tables :: proc(t: ^testing.T) {
 	run_done(t, store, "INSERT INTO audit (message) VALUES ('one'), ('two')")
 
 	// Append-only: updates, deletes and truncates are rejected.
-	_, update_err := db.sql_execute(store, "UPDATE audit SET message = 'x'")
+	dropped_result_4176, update_err := db.sql_execute(store, "UPDATE audit SET message = 'x'")
+	defer db.error_free(&update_err)
+	defer db.sql_result_destroy(&dropped_result_4176)
 	testing.expect(t, !db.error_ok(update_err))
-	_, delete_err := db.sql_execute(store, "DELETE FROM audit")
+	dropped_result_4178, delete_err := db.sql_execute(store, "DELETE FROM audit")
+	defer db.error_free(&delete_err)
+	defer db.sql_result_destroy(&dropped_result_4178)
 	testing.expect(t, !db.error_ok(delete_err))
 	dropped_result_4164, truncate_err := db.sql_execute(store, "TRUNCATE TABLE audit")
 	defer db.error_free(&truncate_err)
@@ -4184,12 +4277,12 @@ test_event_tables :: proc(t: ^testing.T) {
 	testing.expect(t, !db.error_ok(truncate_err))
 
 	// The outbox cursor reads only newer rows.
-	rows, read_err := db.events_read(host, "audit", db.Row_Id(0), 0, context.allocator)
+	rows, read_err := db.events_read(host, "audit", db.Row_Id(0), 0, context.temp_allocator)
 	testing.expect(t, db.error_ok(read_err))
 	testing.expect_value(t, len(rows), 2)
 	testing.expect_value(t, rows[0].values[1].s, "one")
 
-	after, after_err := db.events_read(host, "audit", rows[0].id + 1, 1, context.allocator)
+	after, after_err := db.events_read(host, "audit", rows[0].id + 1, 1, context.temp_allocator)
 	testing.expect(t, db.error_ok(after_err))
 	testing.expect_value(t, len(after), 1)
 	testing.expect_value(t, after[0].values[1].s, "two")
@@ -4262,6 +4355,7 @@ test_view_parameters :: proc(t: ^testing.T) {
 
 	// Parameters bind through a parameterised statement as well.
 	bound := run_params(t, store, "SELECT count(*) FROM above(?)", []db.Value{db.value_int(0)})
+	defer db.sql_result_destroy(&bound)
 	testing.expect_value(t, bound.rows[0][0].i, i64(3))
 
 	// A normal table rejects parameters.
@@ -4338,7 +4432,7 @@ test_byte_cursors :: proc(t: ^testing.T) {
 	big, big_ok := db.bytes_source_read_u64(&source)
 	testing.expect(t, big_ok)
 	testing.expect_value(t, big, u64(1 << 40))
-	text, text_ok := db.bytes_source_read_string(&source, context.allocator)
+	text, text_ok := db.bytes_source_read_string(&source, context.temp_allocator)
 	testing.expect(t, text_ok)
 	testing.expect_value(t, text, "hello")
 	_, tail_ok := db.bytes_source_read_u32(&source)
@@ -4468,7 +4562,8 @@ sdk_route :: proc(ctx: rawptr, request: []u8, alloc: mem.Allocator) -> ([]u8, db
 	host := (^db.Host)(ctx)
 	parsed, _, parse_err := db.http_parse_request(request)
 	defer db.http_request_destroy(&parsed)
-	defer db.error_free(&parse_err)
+	// A parse error is handed to the caller, which frees it; freeing it here
+	// too returned an error whose message was already gone.
 	if !db.error_ok(parse_err) do return nil, parse_err
 	if token, has_token := db.http_bearer_token(request); has_token {
 		if identity, valid := db.host_authenticate(host, token); valid {
@@ -4493,12 +4588,14 @@ test_client_sdk :: proc(t: ^testing.T) {
 
 	session := sdk.client_init(sdk_route, host)
 	rows, query_err := sdk.client_query(&session, "SELECT id FROM t", context.allocator)
+	defer db.sql_result_destroy(&rows)
 	testing.expect(t, db.error_ok(query_err))
 	testing.expect_value(t, len(rows.rows), 1)
 	testing.expect_value(t, rows.rows[0][0].i, i64(1))
 
 	// Errors travel back as the engine's error kind.
 	_, missing := sdk.client_query(&session, "SELECT id FROM ghost", context.allocator)
+	defer db.error_free(&missing)
 	testing.expect(t, !db.error_ok(missing))
 	testing.expect_value(t, missing.kind, db.Error_Kind.Table_Not_Found)
 
@@ -4511,9 +4608,12 @@ test_client_sdk :: proc(t: ^testing.T) {
 	identity: db.Identity
 	identity[0] = 7
 	token, token_err := db.host_issue_token(host, identity, 0)
+	defer delete(token)
 	testing.expect(t, db.error_ok(token_err))
 	sdk.client_authenticate(&session, token)
 	who, who_err := sdk.client_query(&session, "SELECT current_identity() AS who", context.allocator)
+	defer db.sql_result_destroy(&who)
+	defer db.error_free(&who_err)
 	testing.expectf(t, db.error_ok(who_err), "identity query: %s: %s", db.error_kind_name(who_err.kind), who_err.message)
 	testing.expect_value(t, who.rows[0][0].kind, db.Value_Kind.Identity)
 	testing.expect_value(t, db.value_identity_of(who.rows[0][0])[0], u8(7))
@@ -4524,6 +4624,7 @@ test_client_sdk :: proc(t: ^testing.T) {
 		[]string{"SELECT id FROM t"},
 		context.allocator,
 	)
+	defer db.host_snapshot_destroy(snapshot)
 	testing.expect(t, db.error_ok(sub_err))
 	testing.expect(t, id > 0)
 	testing.expect_value(t, len(snapshot), 1)
@@ -4612,6 +4713,8 @@ test_deflate_roundtrip :: proc(t: ^testing.T) {
 		make_noise(1024),
 		make_binary_pattern(512),
 	}
+	// The first two are literals; the helpers' buffers are the test's.
+	defer for payload in payloads[2:] do delete(payload)
 	for index in 0 ..< len(payloads) {
 		payload := payloads[index]
 		compressed := db.zlib_compress(payload, context.allocator)
@@ -4699,6 +4802,7 @@ test_http_compression :: proc(t: ^testing.T) {
 	testing.expectf(t, inflated, "body len %d first %v head_end %d", len(parsed.body), parsed.body[:min(len(parsed.body), 8)], head_end)
 	defer delete(body)
 	decoded, decode_err := db.wire_decode_result(body, context.allocator)
+	defer db.sql_result_destroy(&decoded)
 	testing.expect(t, db.error_ok(decode_err))
 	testing.expect_value(t, len(decoded.rows), 1)
 	testing.expect_value(t, decoded.rows[0][0].i, i64(1))
@@ -4724,6 +4828,7 @@ test_http_compression :: proc(t: ^testing.T) {
 	testing.expect(t, db.error_ok(parse3_err))
 	testing.expect(t, !parsed2.zlib)
 	decoded2, decode2_err := db.wire_decode_result(parsed2.body, context.allocator)
+	defer db.sql_result_destroy(&decoded2)
 	testing.expect(t, db.error_ok(decode2_err))
 	testing.expect_value(t, len(decoded2.rows), 1)
 }
@@ -4739,7 +4844,9 @@ test_prepared_commit_group :: proc(t: ^testing.T) {
 	start_seq := store.commit_seq
 
 	first := db.tx_begin_write(store)
-	_, first_err := db.sql_execute_in_tx(first, "INSERT INTO a (id) VALUES (1)")
+	dropped_result_4808, first_err := db.sql_execute_in_tx(first, "INSERT INTO a (id) VALUES (1)")
+	defer db.error_free(&first_err)
+	defer db.sql_result_destroy(&dropped_result_4808)
 	testing.expect(t, db.error_ok(first_err))
 	prepared_one, prepare_one_err := db.tx_prepare(first)
 	testing.expect(t, db.error_ok(prepare_one_err))
@@ -4748,7 +4855,9 @@ test_prepared_commit_group :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM a").i, i64(0))
 
 	second := db.tx_begin_write(store)
-	_, second_err := db.sql_execute_in_tx(second, "INSERT INTO b (id) VALUES (1)")
+	dropped_result_4817, second_err := db.sql_execute_in_tx(second, "INSERT INTO b (id) VALUES (1)")
+	defer db.error_free(&second_err)
+	defer db.sql_result_destroy(&dropped_result_4817)
 	testing.expect(t, db.error_ok(second_err))
 	prepared_two, prepare_two_err := db.tx_prepare(second)
 	testing.expect(t, db.error_ok(prepare_two_err))
@@ -4865,9 +4974,13 @@ test_named_types :: proc(t: ^testing.T) {
 
 	// A name no CREATE TYPE defined is read by SQLite's affinity rules, as
 	// SQLite reads any type name: NOPE has NUMERIC affinity.
-	_, unknown := db.sql_execute(store, "CREATE TABLE loose (id nope)")
+	dropped_result_4934, unknown := db.sql_execute(store, "CREATE TABLE loose (id nope)")
+	defer db.error_free(&unknown)
+	defer db.sql_result_destroy(&dropped_result_4934)
 	testing.expect(t, db.error_ok(unknown))
-	_, bad_base := db.sql_execute(store, "CREATE TYPE weird AS nonsense")
+	dropped_result_4869, bad_base := db.sql_execute(store, "CREATE TYPE weird AS nonsense")
+	defer db.error_free(&bad_base)
+	defer db.sql_result_destroy(&dropped_result_4869)
 	testing.expect(t, !db.error_ok(bad_base))
 
 	// The catalog replays with the rest of the log.
@@ -4917,6 +5030,7 @@ test_postgres_wire :: proc(t: ^testing.T) {
 	startup := pg_build_startup("postgres")
 	defer delete(startup)
 	parsed, startup_ok := db.pg_parse_startup(startup)
+	defer delete(parsed.user)
 	testing.expect(t, startup_ok)
 	testing.expect_value(t, parsed.user, "postgres")
 
@@ -4982,9 +5096,11 @@ test_structural_types :: proc(t: ^testing.T) {
 	unit_err: db.Error
 	_, unit_err = db.sql_execute(store, "INSERT INTO t (id, u) VALUES (2, 1)")
 	testing.expect(t, !db.error_ok(unit_err))
+	db.error_free(&unit_err)
 	option_err: db.Error
 	_, option_err = db.sql_execute(store, "INSERT INTO t (id, o) VALUES (3, 'x')")
 	testing.expect(t, !db.error_ok(option_err))
+	db.error_free(&option_err)
 
 	described := run(t, store, "SELECT name, type FROM _columns WHERE table = 't'")
 	defer db.sql_result_destroy(&described)
@@ -5020,7 +5136,9 @@ test_structural_types :: proc(t: ^testing.T) {
 	run_done(t, store, "CREATE TABLE named (id INTEGER PRIMARY KEY, n maybe_count)")
 	run_done(t, store, "INSERT INTO named (id, n) VALUES (1, 3)")
 	testing.expect_value(t, scalar(t, store, "SELECT n FROM named").i, i64(3))
-	_, unit_not_null := db.sql_execute(store, "CREATE TABLE bad_unit (u UNIT NOT NULL)")
+	dropped_result_5022, unit_not_null := db.sql_execute(store, "CREATE TABLE bad_unit (u UNIT NOT NULL)")
+	defer db.error_free(&unit_not_null)
+	defer db.sql_result_destroy(&dropped_result_5022)
 	testing.expect(t, !db.error_ok(unit_not_null))
 
 	// Structural types survive a reopen through the schema codec.
@@ -5045,6 +5163,7 @@ test_statement_work_budget :: proc(t: ^testing.T) {
 		run_done(t, store, statement)
 	}
 	selected := run(t, store, "SELECT id, label FROM e")
+	defer db.sql_result_destroy(&selected)
 	testing.expect(t, selected.work >= 3)
 	first_used := db.store_work_used(store)
 	testing.expect(t, first_used >= selected.work)
@@ -5144,7 +5263,9 @@ test_hash_and_direct_indexes :: proc(t: ^testing.T) {
 	testing.expect_value(t, matched.rows[0][0].i, i64(1))
 
 	// The direct index is unique: a duplicate key is rejected.
-	_, duplicate := db.sql_execute(store, "INSERT INTO t (id, code, label) VALUES (4, 'c1', 'other')")
+	dropped_result_5146, duplicate := db.sql_execute(store, "INSERT INTO t (id, code, label) VALUES (4, 'c1', 'other')")
+	defer db.error_free(&duplicate)
+	defer db.sql_result_destroy(&dropped_result_5146)
 	testing.expect(t, !db.error_ok(duplicate))
 	dropped_result_5111, not_direct := db.sql_execute(store, "CREATE INDEX bad ON t USING DIRECT (label)")
 	defer db.error_free(&not_direct)
@@ -5697,9 +5818,13 @@ test_product_arity :: proc(t: ^testing.T) {
 	_, short_err := db.value_coerce(short, triple_type)
 	defer db.error_free(&short_err)
 	testing.expect(t, !db.error_ok(short_err))
-	_, one_component := db.sql_execute(store, "CREATE TABLE bad (x PRODUCT(INT))")
+	dropped_result_5699, one_component := db.sql_execute(store, "CREATE TABLE bad (x PRODUCT(INT))")
+	defer db.error_free(&one_component)
+	defer db.sql_result_destroy(&dropped_result_5699)
 	testing.expect(t, !db.error_ok(one_component))
-	_, nested := db.sql_execute(store, "CREATE TABLE bad2 (x PRODUCT(INT, ARRAY(TEXT)))")
+	dropped_result_5701, nested := db.sql_execute(store, "CREATE TABLE bad2 (x PRODUCT(INT, ARRAY(TEXT)))")
+	defer db.error_free(&nested)
+	defer db.sql_result_destroy(&dropped_result_5701)
 	testing.expect(t, !db.error_ok(nested))
 
 	// Reopen keeps both the arity and the components.
@@ -5954,10 +6079,12 @@ test_foreign_key_catalog :: proc(t: ^testing.T) {
 	testing.expect(t, !db.error_ok(missing))
 	// A key naming no unique key of its parent is declared, as SQLite declares
 	// it; enforcing it fails with "foreign key mismatch".
-	_, not_unique := db.sql_execute(
+	dropped_result_6037, not_unique := db.sql_execute(
 		store,
 		"CREATE TABLE bad2 (id INTEGER PRIMARY KEY, other INTEGER, FOREIGN KEY (other) REFERENCES authors (name))",
 	)
+	defer db.error_free(&not_unique)
+	defer db.sql_result_destroy(&dropped_result_6037)
 	testing.expect(t, db.error_ok(not_unique))
 	mismatch := run_error(t, store, "INSERT INTO bad2 VALUES (1, 1)")
 	testing.expect_value(t, mismatch.message, `foreign key mismatch - "bad2" referencing "authors"`)
@@ -5993,7 +6120,9 @@ test_foreign_key_enforcement :: proc(t: ^testing.T) {
 	run_done(t, store, "INSERT INTO authors (id, name) VALUES (1, 'a')")
 
 	// A child needs its parent.
-	_, missing := db.sql_execute(store, "INSERT INTO books (id, author, title) VALUES (1, 9, 'x')")
+	dropped_result_5995, missing := db.sql_execute(store, "INSERT INTO books (id, author, title) VALUES (1, 9, 'x')")
+	defer db.error_free(&missing)
+	defer db.sql_result_destroy(&dropped_result_5995)
 	testing.expect_value(t, missing.kind, db.Error_Kind.Foreign_Key_Violation)
 	testing.expect_value(t, missing.message, "FOREIGN KEY constraint failed")
 	run_done(t, store, "INSERT INTO books (id, author, title) VALUES (1, 1, 'x')")
@@ -6001,7 +6130,9 @@ test_foreign_key_enforcement :: proc(t: ^testing.T) {
 	run_done(t, store, "INSERT INTO books (id, author, title) VALUES (2, NULL, 'y')")
 
 	// RESTRICT (the default) refuses to delete a referenced parent.
-	_, restricted := db.sql_execute(store, "DELETE FROM authors WHERE id = 1")
+	dropped_result_6003, restricted := db.sql_execute(store, "DELETE FROM authors WHERE id = 1")
+	defer db.error_free(&restricted)
+	defer db.sql_result_destroy(&dropped_result_6003)
 	testing.expect_value(t, restricted.kind, db.Error_Kind.Foreign_Key_Violation)
 
 	// A cascade chains through grandchildren.
@@ -6019,15 +6150,21 @@ test_foreign_key_enforcement :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT profile FROM owners WHERE id = 1").i, i64(6))
 
 	// ON UPDATE RESTRICT reports the reference.
-	_, update_blocked := db.sql_execute(store, "UPDATE authors SET id = 2 WHERE id = 1")
+	dropped_result_6106, update_blocked := db.sql_execute(store, "UPDATE authors SET id = 2 WHERE id = 1")
+	defer db.error_free(&update_blocked)
+	defer db.sql_result_destroy(&dropped_result_6106)
 	testing.expect(t, db.error_ok(update_blocked))
 
 	// A child insert with a staged parent in the same transaction works.
 	tx := db.tx_begin_write(store)
 	run_tx := proc(t: ^testing.T, tx: ^db.Tx) {
-		_, err1 := db.sql_execute_in_tx(tx, "INSERT INTO authors (id, name) VALUES (7, 'seven')")
+		dropped_result_6112, err1 := db.sql_execute_in_tx(tx, "INSERT INTO authors (id, name) VALUES (7, 'seven')")
+		defer db.error_free(&err1)
+		defer db.sql_result_destroy(&dropped_result_6112)
 		testing.expect(t, db.error_ok(err1))
-		_, err2 := db.sql_execute_in_tx(tx, "INSERT INTO books (id, author, title) VALUES (7, 7, 'seven')")
+		dropped_result_6114, err2 := db.sql_execute_in_tx(tx, "INSERT INTO books (id, author, title) VALUES (7, 7, 'seven')")
+		defer db.error_free(&err2)
+		defer db.sql_result_destroy(&dropped_result_6114)
 		testing.expect(t, db.error_ok(err2))
 	}
 	run_tx(t, tx)
@@ -6127,7 +6264,9 @@ test_client_call_and_poll :: proc(t: ^testing.T) {
 	run_done(t, store, "INSERT INTO items (id, label) VALUES (1, 'one')")
 
 	insert_one :: proc(ctx: ^db.Reducer_Ctx, args: []db.Value) -> db.Error {
-		_, err := db.sql_execute_in_tx(ctx.tx, "INSERT INTO items (id, label) VALUES (2, 'two')")
+		dropped_result_6214, err := db.sql_execute_in_tx(ctx.tx, "INSERT INTO items (id, label) VALUES (2, 'two')")
+		defer db.error_free(&err)
+		defer db.sql_result_destroy(&dropped_result_6214)
 		return err
 	}
 	testing.expect(t, db.error_ok(db.host_register(host, "insert_one", nil, insert_one)))
@@ -6618,11 +6757,13 @@ test_sqlite_write_index_pages :: proc(t: ^testing.T) {
 	run_done(t, store, "CREATE INDEX tb ON t (b)")
 	tx := db.tx_begin_write(store)
 	for i in 1 ..= 3000 {
-		_, err := db.sql_execute_in_tx_params(
+		dropped_result_6705, err := db.sql_execute_in_tx_params(
 			tx,
 			"INSERT INTO t (a, b) VALUES (?, ?)",
 			[]db.Value{db.value_int(i64(i)), db.value_string(fmt.tprintf("value-%06d-padding-padding", i))},
 		)
+		defer db.error_free(&err)
+		defer db.sql_result_destroy(&dropped_result_6705)
 		testing.expect(t, db.error_ok(err))
 	}
 	testing.expect(t, db.error_ok(db.tx_commit(tx)))
@@ -6650,7 +6791,9 @@ test_sqlite_write_without_rowid :: proc(t: ^testing.T) {
 	run_done(t, store, "INSERT INTO w VALUES (1, 'x', 3), (2, 'a', 30), (NULL, 'm', -1)")
 	tx := db.tx_begin_write(store)
 	for i in 1 ..= 2000 {
-		_, err := db.sql_execute_in_tx_params(tx, "INSERT INTO n VALUES (?, ?)", []db.Value{db.value_int(i64(2001 - i)), db.value_string(fmt.tprintf("v%d", i))})
+		dropped_result_6737, err := db.sql_execute_in_tx_params(tx, "INSERT INTO n VALUES (?, ?)", []db.Value{db.value_int(i64(2001 - i)), db.value_string(fmt.tprintf("v%d", i))})
+		defer db.error_free(&err)
+		defer db.sql_result_destroy(&dropped_result_6737)
 		testing.expect(t, db.error_ok(err))
 	}
 	testing.expect(t, db.error_ok(db.tx_commit(tx)))
@@ -6764,11 +6907,13 @@ test_sqlite_write_many_rows :: proc(t: ^testing.T) {
 	run_done(t, store, "CREATE TABLE big (id INTEGER PRIMARY KEY, name TEXT, score FLOAT)")
 	tx := db.tx_begin_write(store)
 	for i in 1 ..= 300 {
-		_, insert_err := db.sql_execute_in_tx_params(
+		dropped_result_6851, insert_err := db.sql_execute_in_tx_params(
 			tx,
 			"INSERT INTO big (id, name, score) VALUES (?, ?, ?)",
 			[]db.Value{db.value_int(i64(i)), db.value_string(fmt.tprintf("row%d", i)), db.value_float(f64(i) / 2)},
 		)
+		defer db.error_free(&insert_err)
+		defer db.sql_result_destroy(&dropped_result_6851)
 		testing.expect(t, db.error_ok(insert_err))
 	}
 	testing.expect(t, db.error_ok(db.tx_commit(tx)))
@@ -6872,7 +7017,9 @@ test_not_null_survives_replay :: proc(t: ^testing.T) {
 	if store == nil do return
 	run_done(t, store, "CREATE TABLE strict (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
 	run_done(t, store, "INSERT INTO strict (id, name) VALUES (1, 'ok')")
-	_, insert_err := db.sql_execute(store, "INSERT INTO strict (id, name) VALUES (2, NULL)")
+	dropped_result_6874, insert_err := db.sql_execute(store, "INSERT INTO strict (id, name) VALUES (2, NULL)")
+	defer db.error_free(&insert_err)
+	defer db.sql_result_destroy(&dropped_result_6874)
 	testing.expect_value(t, insert_err.kind, db.Error_Kind.Not_Null_Violation)
 	db.host_destroy(host)
 	db.store_close(store)
@@ -6880,7 +7027,9 @@ test_not_null_survives_replay :: proc(t: ^testing.T) {
 	reopened, open_err := db.store_open(path, {persistent = true, create = true, durable = false})
 	testing.expect(t, db.error_ok(open_err))
 	defer db.store_close(reopened)
-	_, replay_err := db.sql_execute(reopened, "INSERT INTO strict (id, name) VALUES (3, NULL)")
+	dropped_result_6882, replay_err := db.sql_execute(reopened, "INSERT INTO strict (id, name) VALUES (3, NULL)")
+	defer db.error_free(&replay_err)
+	defer db.sql_result_destroy(&dropped_result_6882)
 	testing.expect_value(t, replay_err.kind, db.Error_Kind.Not_Null_Violation)
 	described := run(t, reopened, "DESCRIBE strict")
 	defer db.sql_result_destroy(&described)
@@ -6926,6 +7075,7 @@ test_pragma_and_sqlite_functions :: proc(t: ^testing.T) {
 		store,
 		"SELECT typeof(1), typeof(1.5), typeof('x'), typeof(NULL), quote('it''s'), hex('AB'), iif(0, 'a', 'b'), sqlite_version(), instr('hello', 'll'), format('%d/%s', 7, 'x'), char(65, 66)",
 	)
+	defer db.sql_result_destroy(&functions)
 	row := functions.rows[0]
 	testing.expect_value(t, row[0].s, "integer")
 	testing.expect_value(t, row[1].s, "real")
@@ -7097,6 +7247,7 @@ test_vfs_memory_and_quota :: proc(t: ^testing.T) {
 	_, seek_err := file.ops.seek(file, 0)
 	testing.expect(t, db.error_ok(seek_err))
 	read, read_err := db.vfs_read_all(file, 5)
+	defer delete(read)
 	testing.expect(t, db.error_ok(read_err))
 	testing.expect_value(t, string(read), "hello")
 	testing.expect(t, db.error_ok(file.ops.truncate(file, 2)))
@@ -7246,7 +7397,9 @@ test_remote_module :: proc(t: ^testing.T) {
 	note :: proc(ctx: ^db.Reducer_Ctx, args: []db.Value) -> db.Error {
 		// The clock is the caller's, which is what makes a call reproducible.
 		statement := fmt.tprintf("INSERT INTO hits (note, at) VALUES ('from the host', %d)", ctx.now_us)
-		_, err := db.sql_execute_in_tx(ctx.tx, statement)
+		dropped_result_7339, err := db.sql_execute_in_tx(ctx.tx, statement)
+		defer db.error_free(&err)
+		defer db.sql_result_destroy(&dropped_result_7339)
 		return err
 	}
 	testing.expect(t, db.error_ok(db.host_register(module_host, "note", nil, note)))
@@ -7278,6 +7431,7 @@ test_remote_module :: proc(t: ^testing.T) {
 	testing.expect_value(t, count.i, i64(1))
 	// A second call reuses the pooled socket instead of connecting again.
 	_, second := db.host_call_module(host, "notes", "note", nil)
+	defer db.error_free(&second)
 	testing.expectf(t, db.error_ok(second), "second call: %s", second.message)
 	testing.expect_value(t, state.connections, 1)
 	testing.expect_value(t, scalar(t, module_store, "SELECT count(*) FROM hits").i, i64(2))
@@ -7285,10 +7439,12 @@ test_remote_module :: proc(t: ^testing.T) {
 
 	// An unregistered reducer is refused before any socket work.
 	_, unknown := db.host_call_module(host, "notes", "nope", nil)
+	defer db.error_free(&unknown)
 	testing.expect_value(t, unknown.kind, db.Error_Kind.Sql_Unsupported)
 	// A module that is not listening is an error, not a crash.
 	db.host_register_remote_module(host, "dead", "127.0.0.1", 1, nil)
 	_, dead := db.host_call_module(host, "dead", "note", nil)
+	defer db.error_free(&dead)
 	testing.expect_value(t, dead.kind, db.Error_Kind.Io)
 
 	db.host_destroy(host)
@@ -7326,6 +7482,7 @@ test_spatial_rtree :: proc(t: ^testing.T) {
 	// Moving a box moves it out of the window.
 	run_done(t, store, "UPDATE places SET minx = 100, maxx = 110, miny = 100, maxy = 110 WHERE id = 3")
 	window_count := strings.concatenate({"SELECT count(*) FROM places WHERE minx <= 12 AND maxx >= 12 AND miny <= 12 AND maxy >= 12"})
+	defer delete(window_count)
 	testing.expect_value(t, scalar(t, store, window_count).i, i64(0))
 	// Deleting removes it from every query.
 	run_done(t, store, "DELETE FROM places WHERE id = 4")
@@ -7342,7 +7499,9 @@ test_spatial_rtree :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM grid WHERE maxx >= 1 AND minx <= 1").i, i64(1))
 	// MATCH is a full-text operator: asking an rtree for it fails instead of
 	// silently returning nothing.
-	_, no_match := db.sql_execute(store, "SELECT count(*) FROM places WHERE places MATCH 'x'")
+	dropped_result_7344, no_match := db.sql_execute(store, "SELECT count(*) FROM places WHERE places MATCH 'x'")
+	defer db.error_free(&no_match)
+	defer db.sql_result_destroy(&dropped_result_7344)
 	testing.expect(t, !db.error_ok(no_match))
 
 	// Both the boxes and the catalog survive a reopen.
@@ -7374,7 +7533,9 @@ test_extension_load :: proc(t: ^testing.T) {
 	defer destroy_host(module_store, module_host, "ext_module")
 	run_done(t, module_store, "CREATE TABLE hits (id INTEGER PRIMARY KEY AUTOINCREMENT, note TEXT NOT NULL)")
 	note :: proc(ctx: ^db.Reducer_Ctx, args: []db.Value) -> db.Error {
-		_, err := db.sql_execute_in_tx(ctx.tx, "INSERT INTO hits (note) VALUES ('from an extension')")
+		dropped_result_7470, err := db.sql_execute_in_tx(ctx.tx, "INSERT INTO hits (note) VALUES ('from an extension')")
+		defer db.error_free(&err)
+		defer db.sql_result_destroy(&dropped_result_7470)
 		return err
 	}
 	testing.expect(t, db.error_ok(db.host_register(module_host, "note", nil, note)))
@@ -7398,7 +7559,9 @@ test_extension_load :: proc(t: ^testing.T) {
 	run_done(t, store, "CREATE TABLE before_load (id INTEGER PRIMARY KEY)")
 
 	// The address is required and must carry a usable port.
-	_, no_port := db.sql_execute(store, "LOAD EXTENSION broken AT '127.0.0.1'")
+	dropped_result_7494, no_port := db.sql_execute(store, "LOAD EXTENSION broken AT '127.0.0.1'")
+	defer db.error_free(&no_port)
+	defer db.sql_result_destroy(&dropped_result_7494)
 	testing.expect_value(t, no_port.kind, db.Error_Kind.Invalid_Argument)
 
 	address := fmt.aprintf("127.0.0.1:%d", bound.port)
@@ -7415,14 +7578,18 @@ test_extension_load :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, module_store, "SELECT count(*) FROM hits").i, i64(1))
 	// The declared reducer list is enforced before a socket is opened.
 	_, unknown := db.host_call_module(host, "notes", "drop_everything", nil)
+	defer db.error_free(&unknown)
 	testing.expect_value(t, unknown.kind, db.Error_Kind.Sql_Unsupported)
 
 	// Unloading forgets both the module and the catalog row.
 	run_done(t, store, "UNLOAD EXTENSION notes")
 	testing.expect_value(t, len(db.host_remote_module_names(host, context.temp_allocator)), 0)
 	_, gone := db.host_call_module(host, "notes", "note", nil)
+	defer db.error_free(&gone)
 	testing.expect_value(t, gone.kind, db.Error_Kind.Invalid_Argument)
-	_, unload_again := db.sql_execute(store, "UNLOAD EXTENSION notes")
+	dropped_result_7518, unload_again := db.sql_execute(store, "UNLOAD EXTENSION notes")
+	defer db.error_free(&unload_again)
+	defer db.sql_result_destroy(&dropped_result_7518)
 	testing.expect_value(t, unload_again.kind, db.Error_Kind.Invalid_Argument)
 	run_done(t, store, "UNLOAD EXTENSION IF EXISTS notes")
 
@@ -7496,7 +7663,9 @@ test_full_text_search :: proc(t: ^testing.T) {
 
 	// Dropping the virtual table drops the shadow table with it.
 	run_done(t, store, "DROP TABLE docs")
-	_, gone := db.sql_execute(store, "SELECT count(*) FROM _fts_docs_terms")
+	dropped_result_7498, gone := db.sql_execute(store, "SELECT count(*) FROM _fts_docs_terms")
+	defer db.error_free(&gone)
+	defer db.sql_result_destroy(&dropped_result_7498)
 	testing.expect_value(t, gone.kind, db.Error_Kind.Table_Not_Found)
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM _virtual").i, i64(1))
 	db.store_close(store)
@@ -7699,7 +7868,9 @@ test_limit_stops_the_scan :: proc(t: ^testing.T) {
 			if i > 1 do strings.write_string(&builder, ", ")
 			fmt.sbprintf(&builder, "(%d, 'v%d')", i, i)
 		}
-		_, insert_err := db.sql_execute_in_tx(tx, strings.to_string(builder))
+		dropped_result_7797, insert_err := db.sql_execute_in_tx(tx, strings.to_string(builder))
+		defer db.error_free(&insert_err)
+		defer db.sql_result_destroy(&dropped_result_7797)
 		testing.expect(t, db.error_ok(insert_err))
 		testing.expect(t, db.error_ok(db.tx_commit(tx)))
 	}
@@ -7754,7 +7925,9 @@ test_limit_stops_the_scan :: proc(t: ^testing.T) {
 	{
 		tx := db.tx_begin_write(store)
 		for i in 1 ..= 200 {
-			_, insert_err := db.sql_execute_in_tx(tx, fmt.tprintf("INSERT INTO u (id) VALUES (%d)", i))
+			dropped_result_7852, insert_err := db.sql_execute_in_tx(tx, fmt.tprintf("INSERT INTO u (id) VALUES (%d)", i))
+			defer db.error_free(&insert_err)
+			defer db.sql_result_destroy(&dropped_result_7852)
 			testing.expect(t, db.error_ok(insert_err))
 		}
 		testing.expect(t, db.error_ok(db.tx_commit(tx)))
@@ -7783,9 +7956,13 @@ test_row_quota_stops_a_cross_join :: proc(t: ^testing.T) {
 	{
 		tx := db.tx_begin_write(store)
 		for i in 1 ..= 200 {
-			_, insert_a := db.sql_execute_in_tx(tx, fmt.tprintf("INSERT INTO a (id) VALUES (%d)", i))
+			dropped_result_7881, insert_a := db.sql_execute_in_tx(tx, fmt.tprintf("INSERT INTO a (id) VALUES (%d)", i))
+			defer db.error_free(&insert_a)
+			defer db.sql_result_destroy(&dropped_result_7881)
 			testing.expect(t, db.error_ok(insert_a))
-			_, insert_b := db.sql_execute_in_tx(tx, fmt.tprintf("INSERT INTO b (id) VALUES (%d)", i))
+			dropped_result_7883, insert_b := db.sql_execute_in_tx(tx, fmt.tprintf("INSERT INTO b (id) VALUES (%d)", i))
+			defer db.error_free(&insert_b)
+			defer db.sql_result_destroy(&dropped_result_7883)
 			testing.expect(t, db.error_ok(insert_b))
 		}
 		testing.expect(t, db.error_ok(db.tx_commit(tx)))
@@ -7835,12 +8012,16 @@ test_rewrite_keeps_a_keyed_table_as_it_was :: proc(t: ^testing.T) {
 	if !testing.expect(t, db.error_ok(before_err)) do return
 	originals := make(map[string]string)
 	defer {
-		for _, sql in originals do delete(sql)
+		for name, sql in originals {
+			delete(name)
+			delete(sql)
+		}
 		delete(originals)
 	}
-	for table in before.tables do originals[table.name] = strings.clone(table.sql)
-	group_counts := make(map[string]int)
-	for table in before.tables do group_counts[table.name] = len(table.key_order)
+	// The keys are copies: `before` is destroyed below, and its names with it.
+	for table in before.tables do originals[strings.clone(table.name)] = strings.clone(table.sql)
+	group_counts := make(map[string]int, context.temp_allocator)
+	for table in before.tables do group_counts[strings.clone(table.name, context.temp_allocator)] = len(table.key_order)
 	db.sqlite_file_destroy(&before)
 
 	conn, open_err := db.embed_open(path, {persistent = true, create = false, durable = false})
@@ -7883,11 +8064,13 @@ test_mirror_patches_only_the_pages_it_touched :: proc(t: ^testing.T) {
 	{
 		tx := db.tx_begin_write(source)
 		for i in 1 ..= 400 {
-			_, insert_err := db.sql_execute_in_tx_params(
+			dropped_result_7981, insert_err := db.sql_execute_in_tx_params(
 				tx,
 				"INSERT INTO items (id, name, score) VALUES (?, ?, ?)",
 				[]db.Value{db.value_int(i64(i)), db.value_string(fmt.tprintf("row%d", i)), db.value_int(i64(i % 10))},
 			)
+			defer db.error_free(&insert_err)
+			defer db.sql_result_destroy(&dropped_result_7981)
 			testing.expect(t, db.error_ok(insert_err))
 		}
 		testing.expect(t, db.error_ok(db.tx_commit(tx)))
@@ -7968,11 +8151,13 @@ test_mirror_survives_a_torn_commit :: proc(t: ^testing.T) {
 	{
 		tx := db.tx_begin_write(source)
 		for i in 1 ..= 200 {
-			_, err := db.sql_execute_in_tx_params(
+			dropped_result_8066, err := db.sql_execute_in_tx_params(
 				tx,
 				"INSERT INTO t (id, v) VALUES (?, ?)",
 				[]db.Value{db.value_int(i64(i)), db.value_string(fmt.tprintf("v%d", i))},
 			)
+			defer db.error_free(&err)
+			defer db.sql_result_destroy(&dropped_result_8066)
 			testing.expect(t, db.error_ok(err))
 		}
 		testing.expect(t, db.error_ok(db.tx_commit(tx)))
@@ -8058,19 +8243,23 @@ test_mirror_grows_and_reopens :: proc(t: ^testing.T) {
 	{
 		tx := db.tx_begin_write(source)
 		for i in 1 ..= 400 {
-			_, err := db.sql_execute_in_tx_params(
+			dropped_result_8156, err := db.sql_execute_in_tx_params(
 				tx,
 				"INSERT INTO items (id, name, score) VALUES (?, ?, ?)",
 				[]db.Value{db.value_int(i64(i)), db.value_string(fmt.tprintf("row%d", i)), db.value_int(i64(i % 10))},
 			)
+			defer db.error_free(&err)
+			defer db.sql_result_destroy(&dropped_result_8156)
 			testing.expect(t, db.error_ok(err))
 		}
 		for i in 1 ..= 50 {
-			_, err := db.sql_execute_in_tx_params(
+			dropped_result_8164, err := db.sql_execute_in_tx_params(
 				tx,
 				"INSERT INTO others (id, tag) VALUES (?, ?)",
 				[]db.Value{db.value_int(i64(i)), db.value_string(fmt.tprintf("tag%d", i))},
 			)
+			defer db.error_free(&err)
+			defer db.sql_result_destroy(&dropped_result_8164)
 			testing.expect(t, db.error_ok(err))
 		}
 		testing.expect(t, db.error_ok(db.tx_commit(tx)))
@@ -8099,11 +8288,13 @@ test_mirror_grows_and_reopens :: proc(t: ^testing.T) {
 	{
 		tx := db.tx_begin_write(conn.store)
 		for i in 1000 ..= 2500 {
-			_, err := db.sql_execute_in_tx_params(
+			dropped_result_8197, err := db.sql_execute_in_tx_params(
 				tx,
 				"INSERT INTO items (id, name, score) VALUES (?, ?, ?)",
 				[]db.Value{db.value_int(i64(i)), db.value_string(fmt.tprintf("bulk%d", i)), db.value_int(i64(i % 7))},
 			)
+			defer db.error_free(&err)
+			defer db.sql_result_destroy(&dropped_result_8197)
 			testing.expect(t, db.error_ok(err))
 		}
 		testing.expect(t, db.error_ok(db.tx_commit(tx)))
@@ -8198,7 +8389,9 @@ test_column_collation_and_generated :: proc(t: ^testing.T) {
 	testing.expect_value(t, ordered.rows[1][0].s, "bob")
 	db.sql_result_destroy(&ordered)
 	// The unique index is case-insensitive.
-	_, duplicate := db.sql_execute(store, "INSERT INTO users (id, name) VALUES (3, 'ALICE')")
+	dropped_result_8200, duplicate := db.sql_execute(store, "INSERT INTO users (id, name) VALUES (3, 'ALICE')")
+	defer db.error_free(&duplicate)
+	defer db.sql_result_destroy(&dropped_result_8200)
 	testing.expect_value(t, duplicate.kind, db.Error_Kind.Duplicate_Unique)
 	// A column without a collation keeps BINARY.
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM users WHERE tag = 'a'").i, i64(0))
@@ -8474,9 +8667,13 @@ test_attach_and_detach :: proc(t: ^testing.T) {
 	testing.expect_value(t, twice.kind, db.Error_Kind.Invalid_Argument)
 
 	// An unknown database and an unknown table are clean errors.
-	_, unknown_db := db.sql_execute(store, "SELECT * FROM nope.other_items")
+	dropped_result_8476, unknown_db := db.sql_execute(store, "SELECT * FROM nope.other_items")
+	defer db.error_free(&unknown_db)
+	defer db.sql_result_destroy(&dropped_result_8476)
 	testing.expect_value(t, unknown_db.kind, db.Error_Kind.Table_Not_Found)
-	_, unknown_table := db.sql_execute(store, "SELECT * FROM side.nope")
+	dropped_result_8478, unknown_table := db.sql_execute(store, "SELECT * FROM side.nope")
+	defer db.error_free(&unknown_table)
+	defer db.sql_result_destroy(&dropped_result_8478)
 	testing.expect_value(t, unknown_table.kind, db.Error_Kind.Table_Not_Found)
 
 	// A write to the attached database lands there, as in SQLite.
@@ -8502,6 +8699,7 @@ test_attach_and_detach :: proc(t: ^testing.T) {
 	run_done(t, store, "DELETE FROM mine WHERE id > 1000")
 
 	// The catalog survives a reopen of the principal.
+	db.host_destroy(host)
 	db.store_close(store)
 	reopened, reopen_err := db.store_open("_test_attach_principal", {persistent = true, create = false, durable = false})
 	if !testing.expectf(t, db.error_ok(reopen_err), "reopen: %s", reopen_err.message) do return
@@ -8513,13 +8711,17 @@ test_attach_and_detach :: proc(t: ^testing.T) {
 	detach_result := run(t, reopened, "DETACH side")
 	defer db.sql_result_destroy(&detach_result)
 	testing.expect_value(t, detach_result.kind, db.Sql_Result_Kind.Ack)
-	_, gone := db.sql_execute(reopened, "SELECT * FROM side.other_items")
+	dropped_result_8515, gone := db.sql_execute(reopened, "SELECT * FROM side.other_items")
+	defer db.error_free(&gone)
+	defer db.sql_result_destroy(&dropped_result_8515)
 	testing.expect_value(t, gone.kind, db.Error_Kind.Table_Not_Found)
 
 	db.store_close(reopened)
 	again, again_err := db.store_open("_test_attach_principal", {persistent = true, create = false, durable = false})
 	if !testing.expectf(t, db.error_ok(again_err), "reopen after detach: %s", again_err.message) do return
-	_, still_gone := db.sql_execute(again, "SELECT * FROM side.other_items")
+	dropped_result_8521, still_gone := db.sql_execute(again, "SELECT * FROM side.other_items")
+	defer db.error_free(&still_gone)
+	defer db.sql_result_destroy(&dropped_result_8521)
 	testing.expect_value(t, still_gone.kind, db.Error_Kind.Table_Not_Found)
 	db.store_close(again)
 	db.host_destroy(host)
@@ -8588,9 +8790,13 @@ test_json_table_functions :: proc(t: ^testing.T) {
 	db.sql_result_destroy(&joined)
 
 	// Bad input is a clean error, not a crash.
-	_, invalid := db.sql_execute(store, "SELECT * FROM json_each('not json')")
+	dropped_result_8590, invalid := db.sql_execute(store, "SELECT * FROM json_each('not json')")
+	defer db.error_free(&invalid)
+	defer db.sql_result_destroy(&dropped_result_8590)
 	testing.expect_value(t, invalid.kind, db.Error_Kind.Invalid_Argument)
-	_, missing := db.sql_execute(store, "SELECT * FROM json_each()")
+	dropped_result_8592, missing := db.sql_execute(store, "SELECT * FROM json_each()")
+	defer db.error_free(&missing)
+	defer db.sql_result_destroy(&dropped_result_8592)
 	testing.expect_value(t, missing.kind, db.Error_Kind.Invalid_Argument)
 }
 
@@ -8659,6 +8865,7 @@ test_like_glob_functions :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer destroy_host(store, host, "like_glob")
 	result := run(t, store, "SELECT glob('a*', 'abc'), glob('a*', 'xbc'), like('A%', 'abc'), like('a%', 'xbc'), glob('a*', NULL)")
+	defer db.sql_result_destroy(&result)
 	row := result.rows[0]
 	testing.expect(t, row[0].b)
 	testing.expect(t, !row[1].b)
@@ -9122,10 +9329,14 @@ test_savepoints :: proc(t: ^testing.T) {
 	}
 
 	tx := db.tx_begin_write(store)
-	_, insert_err := db.sql_execute_in_tx(tx, "INSERT INTO s (n) VALUES ('one')")
+	dropped_result_9236, insert_err := db.sql_execute_in_tx(tx, "INSERT INTO s (n) VALUES ('one')")
+	defer db.error_free(&insert_err)
+	defer db.sql_result_destroy(&dropped_result_9236)
 	testing.expect(t, db.error_ok(insert_err))
 	testing.expect(t, db.error_ok(db.tx_savepoint(tx, "a")))
-	_, second := db.sql_execute_in_tx(tx, "INSERT INTO s (n) VALUES ('two')")
+	dropped_result_9239, second := db.sql_execute_in_tx(tx, "INSERT INTO s (n) VALUES ('two')")
+	defer db.error_free(&second)
+	defer db.sql_result_destroy(&dropped_result_9239)
 	testing.expect(t, db.error_ok(second))
 	testing.expect_value(t, count_in(t, tx, "SELECT count(*) FROM s"), i64(2))
 
@@ -9134,17 +9345,25 @@ test_savepoints :: proc(t: ^testing.T) {
 	testing.expect_value(t, count_in(t, tx, "SELECT count(*) FROM s"), i64(1))
 
 	// A table created after the savepoint disappears with it.
-	_, created := db.sql_execute_in_tx(tx, "CREATE TABLE later (x INTEGER)")
+	dropped_result_9248, created := db.sql_execute_in_tx(tx, "CREATE TABLE later (x INTEGER)")
+	defer db.error_free(&created)
+	defer db.sql_result_destroy(&dropped_result_9248)
 	testing.expect(t, db.error_ok(created))
 	testing.expect(t, db.error_ok(db.tx_rollback_to_savepoint(tx, "a")))
-	_, missing := db.sql_execute_in_tx(tx, "SELECT count(*) FROM later")
+	dropped_result_9139, missing := db.sql_execute_in_tx(tx, "SELECT count(*) FROM later")
+	defer db.error_free(&missing)
+	defer db.sql_result_destroy(&dropped_result_9139)
 	testing.expect_value(t, missing.kind, db.Error_Kind.Table_Not_Found)
 
 	// Nested savepoints: releasing the outer one drops the inner one too.
-	_, third := db.sql_execute_in_tx(tx, "INSERT INTO s (n) VALUES ('three')")
+	dropped_result_9257, third := db.sql_execute_in_tx(tx, "INSERT INTO s (n) VALUES ('three')")
+	defer db.error_free(&third)
+	defer db.sql_result_destroy(&dropped_result_9257)
 	testing.expect(t, db.error_ok(third))
 	testing.expect(t, db.error_ok(db.tx_savepoint(tx, "b")))
-	_, fourth := db.sql_execute_in_tx(tx, "INSERT INTO s (n) VALUES ('four')")
+	dropped_result_9260, fourth := db.sql_execute_in_tx(tx, "INSERT INTO s (n) VALUES ('four')")
+	defer db.error_free(&fourth)
+	defer db.sql_result_destroy(&dropped_result_9260)
 	testing.expect(t, db.error_ok(fourth))
 	testing.expect(t, db.error_ok(db.tx_release_savepoint(tx, "a")))
 	released := db.tx_release_savepoint(tx, "b")
@@ -9178,7 +9397,9 @@ test_common_table_expressions :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "WITH big AS (SELECT * FROM t WHERE v > 1) SELECT count(*) FROM big a JOIN big b ON a.id = b.id").i, i64(2))
 
 	// The CTE is scoped to the statement.
-	_, missing := db.sql_execute(store, "SELECT * FROM big")
+	dropped_result_9180, missing := db.sql_execute(store, "SELECT * FROM big")
+	defer db.error_free(&missing)
+	defer db.sql_result_destroy(&dropped_result_9180)
 	testing.expect_value(t, missing.kind, db.Error_Kind.Table_Not_Found)
 	// The recursive keyword is accepted; a base term without a step yields one row.
 	testing.expect_value(t, scalar(t, store, "WITH RECURSIVE r(x) AS (SELECT 1) SELECT count(*) FROM r").i, i64(1))
@@ -9281,14 +9502,18 @@ test_alter_table_rename :: proc(t: ^testing.T) {
 	run_done(t, store, "ALTER TABLE old RENAME TO fresh")
 
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM fresh").i, i64(2))
-	_, missing := db.sql_execute(store, "SELECT * FROM old")
+	dropped_result_9283, missing := db.sql_execute(store, "SELECT * FROM old")
+	defer db.error_free(&missing)
+	defer db.sql_result_destroy(&dropped_result_9283)
 	testing.expect_value(t, missing.kind, db.Error_Kind.Table_Not_Found)
 	// A second rename continues from the new name.
 	run_done(t, store, "ALTER TABLE fresh RENAME TO again")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM again").i, i64(2))
 	// A name in use is rejected.
 	run_done(t, store, "CREATE TABLE other (x INTEGER)")
-	_, clash := db.sql_execute(store, "ALTER TABLE again RENAME TO other")
+	dropped_result_9290, clash := db.sql_execute(store, "ALTER TABLE again RENAME TO other")
+	defer db.error_free(&clash)
+	defer db.sql_result_destroy(&dropped_result_9290)
 	testing.expect_value(t, clash.kind, db.Error_Kind.Table_Exists)
 	// The renamed table keeps inserting and numbering rows.
 	run_done(t, store, "INSERT INTO again (n) VALUES ('c')")
@@ -9300,7 +9525,9 @@ test_alter_table_rename :: proc(t: ^testing.T) {
 	reopened, open_err := db.store_open("_test_rename_table", {persistent = true, create = false, durable = false})
 	if !testing.expectf(t, db.error_ok(open_err), "reopen failed: %s", open_err.message) do return
 	testing.expect_value(t, scalar(t, reopened, "SELECT count(*) FROM again").i, i64(3))
-	_, gone := db.sql_execute(reopened, "SELECT * FROM fresh")
+	dropped_result_9302, gone := db.sql_execute(reopened, "SELECT * FROM fresh")
+	defer db.error_free(&gone)
+	defer db.sql_result_destroy(&dropped_result_9302)
 	testing.expect_value(t, gone.kind, db.Error_Kind.Table_Not_Found)
 	cleanup_db(reopened, "rename_table")
 }
@@ -9436,7 +9663,9 @@ test_sqlite_import_wal_and_journal :: proc(t: ^testing.T) {
 	db.sqlite_file_destroy(&journal_file)
 	testing.expect(t, db.error_ok(journal_import_err))
 	testing.expect_value(t, scalar(t, journal_store, "SELECT x FROM old").i, i64(7))
-	_, missing := db.sql_execute(journal_store, "SELECT y FROM fresh")
+	dropped_result_9438, missing := db.sql_execute(journal_store, "SELECT y FROM fresh")
+	defer db.error_free(&missing)
+	defer db.sql_result_destroy(&dropped_result_9438)
 	testing.expect_value(t, missing.kind, db.Error_Kind.Table_Not_Found)
 	destroy_host(journal_store, journal_host, "journal_import")
 }
@@ -9471,7 +9700,9 @@ test_json_functions :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, `SELECT json_array_length('{"a":[1,2]}', '$.a')`).i, i64(2))
 	// json() minifies; malformed input is an error.
 	testing.expect_value(t, scalar(t, store, `SELECT json(' { "a" : [ 1 , 2 ] } ')`).s, `{"a":[1,2]}`)
-	_, malformed := db.sql_execute(store, `SELECT json('{bad')`)
+	dropped_result_9473, malformed := db.sql_execute(store, `SELECT json('{bad')`)
+	defer db.error_free(&malformed)
+	defer db.sql_result_destroy(&dropped_result_9473)
 	testing.expect_value(t, malformed.kind, db.Error_Kind.Invalid_Argument)
 	// The functions read columns.
 	run_done(t, store, "CREATE TABLE docs (body TEXT)")
@@ -9486,7 +9717,9 @@ test_json_functions :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, `SELECT json_remove('{"a":1,"b":2}', '$.a')`).s, `{"b":2}`)
 	testing.expect_value(t, scalar(t, store, `SELECT json_remove('[10,20,30]', '$[1]')`).s, "[10,30]")
 	testing.expect_value(t, scalar(t, store, `SELECT json_remove('{"a":[1,2],"b":3}', '$.a')`).s, `{"b":3}`)
-	_, bad_set := db.sql_execute(store, `SELECT json_set('{"a":1}', '$.a')`)
+	dropped_result_9488, bad_set := db.sql_execute(store, `SELECT json_set('{"a":1}', '$.a')`)
+	defer db.error_free(&bad_set)
+	defer db.sql_result_destroy(&dropped_result_9488)
 	testing.expect_value(t, bad_set.kind, db.Error_Kind.Invalid_Argument)
 }
 
@@ -9499,22 +9732,30 @@ test_strict_table_option :: proc(t: ^testing.T) {
 	run_done(t, store, "CREATE TABLE s (id INTEGER PRIMARY KEY, n TEXT NOT NULL) STRICT")
 	run_done(t, store, "INSERT INTO s (n) VALUES ('x')")
 	testing.expect_value(t, scalar(t, store, "SELECT n FROM s").s, "x")
-	_, not_null := db.sql_execute(store, "INSERT INTO s (n) VALUES (NULL)")
+	dropped_result_9501, not_null := db.sql_execute(store, "INSERT INTO s (n) VALUES (NULL)")
+	defer db.error_free(&not_null)
+	defer db.sql_result_destroy(&dropped_result_9501)
 	testing.expect_value(t, not_null.kind, db.Error_Kind.Not_Null_Violation)
 	// A STRICT table refuses a value its column cannot convert, in SQLite's words.
 	run_done(t, store, "CREATE TABLE si (i INTEGER) STRICT")
 	refused := run_error(t, store, "INSERT INTO si VALUES ('abc')")
 	testing.expect_value(t, refused.kind, db.Error_Kind.Check_Violation)
 	testing.expect(t, strings.contains(refused.message, "cannot store TEXT value in INTEGER column si.i"))
-	_, unknown := db.sql_execute(store, "CREATE TABLE sv (x VARCHAR) STRICT")
+	dropped_result_9508, unknown := db.sql_execute(store, "CREATE TABLE sv (x VARCHAR) STRICT")
+	defer db.error_free(&unknown)
+	defer db.sql_result_destroy(&dropped_result_9508)
 	testing.expect(t, !db.error_ok(unknown))
 	// WITHOUT ROWID: the primary key is the identity, and rowid names nothing.
 	run_done(t, store, "CREATE TABLE w (id INTEGER PRIMARY KEY, v TEXT) WITHOUT ROWID")
 	run_done(t, store, "INSERT INTO w VALUES (2, 'b'), (1, 'a')")
 	testing.expect_value(t, scalar(t, store, "SELECT v FROM w WHERE id = 1").s, "a")
-	_, rowid := db.sql_execute(store, "SELECT rowid FROM w")
+	dropped_result_9514, rowid := db.sql_execute(store, "SELECT rowid FROM w")
+	defer db.error_free(&rowid)
+	defer db.sql_result_destroy(&dropped_result_9514)
 	testing.expect_value(t, rowid.kind, db.Error_Kind.Column_Not_Found)
-	_, keyless := db.sql_execute(store, "CREATE TABLE nk (v TEXT) WITHOUT ROWID")
+	dropped_result_9516, keyless := db.sql_execute(store, "CREATE TABLE nk (v TEXT) WITHOUT ROWID")
+	defer db.error_free(&keyless)
+	defer db.sql_result_destroy(&dropped_result_9516)
 	testing.expect(t, !db.error_ok(keyless))
 	// SQLite walks a WITHOUT ROWID table in its key's order, so does a scan here.
 	run_done(t, store, "CREATE TABLE z (x, y, z, PRIMARY KEY (z, x)) WITHOUT ROWID")
@@ -9553,7 +9794,9 @@ test_create_table_as_select :: proc(t: ^testing.T) {
 	// IF NOT EXISTS leaves an existing table alone; without it, the name is taken.
 	run_done(t, store, "CREATE TABLE IF NOT EXISTS v AS SELECT 1")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM v").i, i64(2))
-	_, taken := db.sql_execute(store, "CREATE TABLE v AS SELECT 1")
+	dropped_result_9555, taken := db.sql_execute(store, "CREATE TABLE v AS SELECT 1")
+	defer db.error_free(&taken)
+	defer db.sql_result_destroy(&dropped_result_9555)
 	testing.expect_value(t, taken.kind, db.Error_Kind.Table_Exists)
 }
 
@@ -9609,7 +9852,9 @@ test_alter_table_drop_column :: proc(t: ^testing.T) {
 	run_done(t, store, "CREATE TABLE indexed (id INTEGER PRIMARY KEY, a TEXT, b TEXT)")
 	run_done(t, store, "CREATE UNIQUE INDEX indexed_a ON indexed (a)")
 	run_done(t, store, "INSERT INTO indexed (id, a, b) VALUES (1, 'x', 'y')")
-	_, indexed_err := db.sql_execute(store, "ALTER TABLE indexed DROP COLUMN b")
+	dropped_result_9749, indexed_err := db.sql_execute(store, "ALTER TABLE indexed DROP COLUMN b")
+	defer db.error_free(&indexed_err)
+	defer db.sql_result_destroy(&dropped_result_9749)
 	testing.expect_value(t, indexed_err.kind, db.Error_Kind.None)
 	testing.expect_value(t, run_error(t, store, "INSERT INTO indexed (id, a) VALUES (2, 'x')").kind, db.Error_Kind.Duplicate_Unique)
 	dropped_result_9535, on_index := db.sql_execute(store, "ALTER TABLE indexed DROP COLUMN a")
@@ -9896,7 +10141,9 @@ test_log_on_memory_vfs :: proc(t: ^testing.T) {
 	}
 	tiny, tiny_err := db.store_open("quota/db", tight)
 	if !testing.expectf(t, db.error_ok(tiny_err), "quota open failed: %s", tiny_err.message) do return
-	_, write_err := db.sql_execute(tiny, "CREATE TABLE big (a TEXT)")
+	dropped_result_9898, write_err := db.sql_execute(tiny, "CREATE TABLE big (a TEXT)")
+	defer db.error_free(&write_err)
+	defer db.sql_result_destroy(&dropped_result_9898)
 	testing.expect_value(t, write_err.kind, db.Error_Kind.Quota_Exceeded)
 	db.store_close(tiny)
 }
@@ -10097,13 +10344,17 @@ test_commit_queue :: proc(t: ^testing.T) {
 	start_seq := store.commit_seq
 
 	first_tx := db.tx_begin_write(store)
-	_, first_err := db.sql_execute_in_tx(first_tx, "INSERT INTO a (id) VALUES (1)")
+	dropped_result_10239, first_err := db.sql_execute_in_tx(first_tx, "INSERT INTO a (id) VALUES (1)")
+	defer db.error_free(&first_err)
+	defer db.sql_result_destroy(&dropped_result_10239)
 	testing.expect(t, db.error_ok(first_err))
 	prepared_a, prepare_a_err := db.tx_prepare(first_tx)
 	testing.expect(t, db.error_ok(prepare_a_err))
 
 	second_tx := db.tx_begin_write(store)
-	_, second_err := db.sql_execute_in_tx(second_tx, "INSERT INTO b (id) VALUES (1)")
+	dropped_result_10245, second_err := db.sql_execute_in_tx(second_tx, "INSERT INTO b (id) VALUES (1)")
+	defer db.error_free(&second_err)
+	defer db.sql_result_destroy(&dropped_result_10245)
 	testing.expect(t, db.error_ok(second_err))
 	prepared_b, prepare_b_err := db.tx_prepare(second_tx)
 	testing.expect(t, db.error_ok(prepare_b_err))
@@ -10307,11 +10558,17 @@ test_ddl_in_transaction :: proc(t: ^testing.T) {
 
 	// Rows changed and an index created in the same transaction.
 	tx := db.tx_begin_write(store)
-	_, insert_err := db.sql_execute_in_tx(tx, "INSERT INTO t (a, b) VALUES (3, 'z')")
+	dropped_result_10449, insert_err := db.sql_execute_in_tx(tx, "INSERT INTO t (a, b) VALUES (3, 'z')")
+	defer db.error_free(&insert_err)
+	defer db.sql_result_destroy(&dropped_result_10449)
 	testing.expect(t, db.error_ok(insert_err))
-	_, index_err := db.sql_execute_in_tx(tx, "CREATE INDEX t_a ON t (a)")
+	dropped_result_10451, index_err := db.sql_execute_in_tx(tx, "CREATE INDEX t_a ON t (a)")
+	defer db.error_free(&index_err)
+	defer db.sql_result_destroy(&dropped_result_10451)
 	testing.expectf(t, db.error_ok(index_err), "create index with rows: %s", index_err.message)
-	_, update_err := db.sql_execute_in_tx(tx, "UPDATE t SET b = 'q' WHERE a = 1")
+	dropped_result_10453, update_err := db.sql_execute_in_tx(tx, "UPDATE t SET b = 'q' WHERE a = 1")
+	defer db.error_free(&update_err)
+	defer db.sql_result_destroy(&dropped_result_10453)
 	testing.expect(t, db.error_ok(update_err))
 	testing.expect(t, db.error_ok(db.tx_commit(tx)))
 
@@ -10327,32 +10584,50 @@ test_ddl_in_transaction :: proc(t: ^testing.T) {
 
 	// Table, rows and a unique index created together.
 	tx = db.tx_begin_write(store)
-	_, create_err := db.sql_execute_in_tx(tx, "CREATE TABLE u (id INTEGER, label TEXT)")
+	dropped_result_10469, create_err := db.sql_execute_in_tx(tx, "CREATE TABLE u (id INTEGER, label TEXT)")
+	defer db.error_free(&create_err)
+	defer db.sql_result_destroy(&dropped_result_10469)
 	testing.expect(t, db.error_ok(create_err))
-	_, rows_err := db.sql_execute_in_tx(tx, "INSERT INTO u (id, label) VALUES (7, 'seven'), (8, 'eight')")
+	dropped_result_10471, rows_err := db.sql_execute_in_tx(tx, "INSERT INTO u (id, label) VALUES (7, 'seven'), (8, 'eight')")
+	defer db.error_free(&rows_err)
+	defer db.sql_result_destroy(&dropped_result_10471)
 	testing.expect(t, db.error_ok(rows_err))
-	_, unique_err := db.sql_execute_in_tx(tx, "CREATE UNIQUE INDEX u_id ON u (id)")
+	dropped_result_10473, unique_err := db.sql_execute_in_tx(tx, "CREATE UNIQUE INDEX u_id ON u (id)")
+	defer db.error_free(&unique_err)
+	defer db.sql_result_destroy(&dropped_result_10473)
 	testing.expectf(t, db.error_ok(unique_err), "unique index on a new table: %s", unique_err.message)
 	testing.expect(t, db.error_ok(db.tx_commit(tx)))
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM u WHERE id = 8").i, i64(1))
-	_, duplicate_err := db.sql_execute(store, "INSERT INTO u (id, label) VALUES (8, 'again')")
+	dropped_result_10337, duplicate_err := db.sql_execute(store, "INSERT INTO u (id, label) VALUES (8, 'again')")
+	defer db.error_free(&duplicate_err)
+	defer db.sql_result_destroy(&dropped_result_10337)
 	testing.expect_value(t, duplicate_err.kind, db.Error_Kind.Duplicate_Unique)
 
 	// A rollback takes the index with it and leaves nothing behind.
 	tx = db.tx_begin_write(store)
-	_, staged_err := db.sql_execute_in_tx(tx, "CREATE INDEX t_b ON t (b)")
+	dropped_result_10484, staged_err := db.sql_execute_in_tx(tx, "CREATE INDEX t_b ON t (b)")
+	defer db.error_free(&staged_err)
+	defer db.sql_result_destroy(&dropped_result_10484)
 	testing.expect(t, db.error_ok(staged_err))
 	db.tx_rollback(tx)
-	_, missing_err := db.sql_execute(store, "DROP INDEX t_b")
+	dropped_result_10345, missing_err := db.sql_execute(store, "DROP INDEX t_b")
+	defer db.error_free(&missing_err)
+	defer db.sql_result_destroy(&dropped_result_10345)
 	testing.expect_value(t, missing_err.kind, db.Error_Kind.Index_Not_Found)
 
 	// Two indexes in one transaction, one of them created and dropped again.
 	tx = db.tx_begin_write(store)
-	_, first_err := db.sql_execute_in_tx(tx, "CREATE INDEX t_b ON t (b)")
+	dropped_result_10494, first_err := db.sql_execute_in_tx(tx, "CREATE INDEX t_b ON t (b)")
+	defer db.error_free(&first_err)
+	defer db.sql_result_destroy(&dropped_result_10494)
 	testing.expect(t, db.error_ok(first_err))
-	_, second_err := db.sql_execute_in_tx(tx, "CREATE INDEX t_ab ON t (a, b)")
+	dropped_result_10496, second_err := db.sql_execute_in_tx(tx, "CREATE INDEX t_ab ON t (a, b)")
+	defer db.error_free(&second_err)
+	defer db.sql_result_destroy(&dropped_result_10496)
 	testing.expect(t, db.error_ok(second_err))
-	_, drop_err := db.sql_execute_in_tx(tx, "DROP INDEX t_ab")
+	dropped_result_10498, drop_err := db.sql_execute_in_tx(tx, "DROP INDEX t_ab")
+	defer db.error_free(&drop_err)
+	defer db.sql_result_destroy(&dropped_result_10498)
 	testing.expectf(t, db.error_ok(drop_err), "drop inside the creating transaction: %s", drop_err.message)
 	testing.expect(t, db.error_ok(db.tx_commit(tx)))
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t WHERE b = 'q'").i, i64(1))
@@ -10476,7 +10751,9 @@ test_full_text_phrase_prefix_and_column :: proc(t: ^testing.T) {
 	// AND is an operator that changes nothing, never a term to look for.
 	testing.expect_value(t, count(t, store, "fox AND quick"), i64(2))
 	// An unknown column is refused with its name.
-	_, bad := db.sql_execute(store, "SELECT count(*) FROM notes WHERE notes MATCH 'author:fox'")
+	dropped_result_10478, bad := db.sql_execute(store, "SELECT count(*) FROM notes WHERE notes MATCH 'author:fox'")
+	defer db.error_free(&bad)
+	defer db.sql_result_destroy(&dropped_result_10478)
 	testing.expect_value(t, bad.kind, db.Error_Kind.Column_Not_Found)
 
 	// Ranking reads the item's own count: the phrase-matching row ranks first.
@@ -10518,7 +10795,8 @@ test_insert_caches_follow_the_catalog :: proc(t: ^testing.T) {
 	if !step(t, tx, "INSERT INTO t (id, v) VALUES (2, 'b')") do return
 	// The keys registered without a trigger and with one both still guard
 	// uniqueness inside the transaction.
-	_, duplicate := db.sql_execute_in_tx(tx, "INSERT INTO t (id, v) VALUES (3, 'a')")
+	dropped_result_10666, duplicate := db.sql_execute_in_tx(tx, "INSERT INTO t (id, v) VALUES (3, 'a')")
+	defer db.sql_result_destroy(&dropped_result_10666)
 	testing.expect_value(t, duplicate.kind, db.Error_Kind.Duplicate_Unique)
 	db.error_free(&duplicate)
 	// Dropping a table resets the cache too: the next insert into another table
@@ -10774,7 +11052,8 @@ test_idempotent_result :: proc(t: ^testing.T) {
 		amount := args[0].i
 		statement := fmt.tprintf("UPDATE counter SET value = value + %d WHERE id = 0", amount)
 		if _, err := db.sql_execute_in_tx(ctx.tx, statement); !db.error_ok(err) do return err
-		_, read_err := db.sql_execute_in_tx(ctx.tx, "SELECT value FROM counter WHERE id = 0")
+		read_result, read_err := db.sql_execute_in_tx(ctx.tx, "SELECT value FROM counter WHERE id = 0")
+		db.sql_result_destroy(&read_result)
 		if !db.error_ok(read_err) do return read_err
 		// The reducer names its result; it is recorded with the request. The slice
 		// lives in the transaction: a literal would live in this frame, which is
@@ -11279,10 +11558,12 @@ test_trigger_when :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM audit WHERE note = 'never'").i, i64(0))
 
 	// A bad condition is refused at CREATE TRIGGER, not discovered later.
-	_, bad := db.sql_execute(
+	dropped_result_11281, bad := db.sql_execute(
 		store,
 		"CREATE TRIGGER broken AFTER INSERT ON t WHEN NEW.v > BEGIN INSERT INTO audit (note) VALUES ('x') END",
 	)
+	defer db.error_free(&bad)
+	defer db.sql_result_destroy(&dropped_result_11281)
 	testing.expect(t, !db.error_ok(bad))
 
 	// A catalog written before WHEN existed gets the column on first use.
@@ -11319,10 +11600,14 @@ test_alter_rename_column :: proc(t: ^testing.T) {
 	run_done(t, store, "ALTER TABLE t RENAME score TO points")
 	testing.expect_value(t, scalar(t, store, "SELECT sum(points) FROM t").i, i64(30))
 	// The unique index still rejects a duplicate through the new name.
-	_, duplicate := db.sql_execute(store, "INSERT INTO t (id, name, points) VALUES (3, 'a', 30)")
+	dropped_result_11321, duplicate := db.sql_execute(store, "INSERT INTO t (id, name, points) VALUES (3, 'a', 30)")
+	defer db.error_free(&duplicate)
+	defer db.sql_result_destroy(&dropped_result_11321)
 	testing.expect_value(t, duplicate.kind, db.Error_Kind.Duplicate_Unique)
 	// The old name is gone.
-	_, old_name := db.sql_execute(store, "SELECT label FROM t")
+	dropped_result_11324, old_name := db.sql_execute(store, "SELECT label FROM t")
+	defer db.error_free(&old_name)
+	defer db.sql_result_destroy(&dropped_result_11324)
 	testing.expect_value(t, old_name.kind, db.Error_Kind.Column_Not_Found)
 
 	// Renaming to an existing column, or renaming a missing one, is refused.
@@ -11371,11 +11656,15 @@ test_connection_identity :: proc(t: ^testing.T) {
 	luis_identity, _ := db.identity_parse(luis)
 	host.now_us = i64(1_000_000)
 	ana_token, ana_err := db.host_issue_token(host, ana_identity, 0)
+	defer delete(ana_token)
 	luis_token, luis_err := db.host_issue_token(host, luis_identity, 0)
+	defer delete(luis_token)
 	testing.expect(t, db.error_ok(ana_err) && db.error_ok(luis_err))
 
 	count_for :: proc(t: ^testing.T, host: ^db.Host, owner: u64, sql: string) -> i64 {
-		response := db.wire_request_owned(host, db.wire_encode_query(sql, nil), owner)
+		request := db.wire_encode_query(sql, nil)
+		defer delete(request)
+		response := db.wire_request_owned(host, request, owner)
 		defer delete(response)
 		result, err := db.wire_decode_result(response, context.allocator)
 		if !testing.expectf(t, db.error_ok(err), "owner %d: %s", owner, err.message) do return -1
@@ -11393,14 +11682,16 @@ test_connection_identity :: proc(t: ^testing.T) {
 	// Client 1 authenticates as Ana.
 	auth := db.wire_encode_auth(ana_token)
 	defer delete(auth)
-	testing.expect_value(t, wire_kind(db.wire_request_owned(host, auth, 1)), db.WIRE_RESULT)
+	testing.expect_value(t, wire_ask_owned(host, auth, 1), db.WIRE_RESULT)
 	testing.expect_value(t, count_for(t, host, 1, "SELECT count(*) FROM note"), i64(2))
 
 	// Client 2 is still unauthenticated: it must not inherit Ana.
 	testing.expect_value(t, count_for(t, host, 2, "SELECT count(*) FROM note"), i64(0))
 	// Authenticating client 2 as Luis gives it his two rows and leaves client 1
 	// with Ana's.
-	testing.expect_value(t, wire_kind(db.wire_request_owned(host, db.wire_encode_auth(luis_token), 2)), db.WIRE_RESULT)
+	luis_auth := db.wire_encode_auth(luis_token)
+	defer delete(luis_auth)
+	testing.expect_value(t, wire_ask_owned(host, luis_auth, 2), db.WIRE_RESULT)
 	testing.expect_value(t, count_for(t, host, 2, "SELECT count(*) FROM note"), i64(1))
 	testing.expect_value(t, count_for(t, host, 1, "SELECT count(*) FROM note"), i64(2))
 	testing.expect_value(
@@ -11410,7 +11701,9 @@ test_connection_identity :: proc(t: ^testing.T) {
 	)
 
 	// A bad token leaves the caller as it was.
-	testing.expect_value(t, wire_kind(db.wire_request_owned(host, db.wire_encode_auth("nope"), 2)), db.WIRE_ERROR)
+	nope_auth := db.wire_encode_auth("nope")
+	defer delete(nope_auth)
+	testing.expect_value(t, wire_ask_owned(host, nope_auth, 2), db.WIRE_ERROR)
 	testing.expect_value(t, count_for(t, host, 2, "SELECT count(*) FROM note"), i64(1))
 
 	// A new, unauthenticated connection starts from the default again.
@@ -11420,7 +11713,7 @@ test_connection_identity :: proc(t: ^testing.T) {
 	// SET identity inside a request persists for that client only.
 	set := db.wire_encode_query(fmt.tprintf("SET identity = '%s'", ana), nil)
 	defer delete(set)
-	testing.expect_value(t, wire_kind(db.wire_request_owned(host, set, 3)), db.WIRE_RESULT)
+	testing.expect_value(t, wire_ask_owned(host, set, 3), db.WIRE_RESULT)
 	testing.expect_value(t, count_for(t, host, 3, "SELECT count(*) FROM note"), i64(2))
 	testing.expect_value(t, count_for(t, host, 2, "SELECT count(*) FROM note"), i64(1))
 }
@@ -11488,7 +11781,9 @@ test_paged_table_roundtrip :: proc(t: ^testing.T) {
 
 	// A transaction that writes and rolls back leaves the pages untouched.
 	tx := db.tx_begin_write(store)
-	_, delete_err := db.sql_execute_in_tx(tx, "DELETE FROM item")
+	dropped_result_11651, delete_err := db.sql_execute_in_tx(tx, "DELETE FROM item")
+	defer db.error_free(&delete_err)
+	defer db.sql_result_destroy(&dropped_result_11651)
 	testing.expect(t, db.error_ok(delete_err))
 	inside, inside_err := db.sql_execute_in_tx(tx, "SELECT count(*) FROM item")
 	testing.expect(t, db.error_ok(inside_err))
@@ -11613,7 +11908,9 @@ test_paged_table_churn :: proc(t: ^testing.T) {
 				round * 1000 + id,
 				id,
 			)
-			_, update_err := db.sql_execute_in_tx(tx, statement)
+			dropped_result_11776, update_err := db.sql_execute_in_tx(tx, statement)
+			defer db.error_free(&update_err)
+			defer db.sql_result_destroy(&dropped_result_11776)
 			if !db.error_ok(update_err) {
 				db.tx_rollback(tx)
 				testing.expectf(t, db.error_ok(update_err), "update %d: %s", id, update_err.message)
@@ -11628,12 +11925,16 @@ test_paged_table_churn :: proc(t: ^testing.T) {
 	tx := db.tx_begin_write(store)
 	for id in 0 ..< 300 {
 		if id % 2 != 0 do continue
-		_, delete_err := db.sql_execute_in_tx(tx, fmt.tprintf("DELETE FROM c WHERE id = %d", id))
+		dropped_result_11791, delete_err := db.sql_execute_in_tx(tx, fmt.tprintf("DELETE FROM c WHERE id = %d", id))
+		defer db.error_free(&delete_err)
+		defer db.sql_result_destroy(&dropped_result_11791)
 		testing.expect(t, db.error_ok(delete_err))
 	}
 	for id in 1000 ..< 1150 {
 		statement := fmt.tprintf("INSERT INTO c (id, v, n) VALUES (%d, 'new-%d', %d)", id, id, id)
-		_, insert_err := db.sql_execute_in_tx(tx, statement)
+		dropped_result_11796, insert_err := db.sql_execute_in_tx(tx, statement)
+		defer db.error_free(&insert_err)
+		defer db.sql_result_destroy(&dropped_result_11796)
 		testing.expect(t, db.error_ok(insert_err))
 	}
 	testing.expect(t, db.error_ok(db.tx_commit(tx)))
@@ -12408,7 +12709,7 @@ plan_line_of :: proc(t: ^testing.T, store: ^db.Store, sql: string) -> string {
 	if !testing.expectf(t, db.error_ok(err), "%s: %s", sql, err.message) do return ""
 	defer db.sql_result_destroy(&result)
 	for row in result.rows {
-		if strings.has_prefix(row[0].s, "scan ") do return strings.clone(row[0].s)
+		if strings.has_prefix(row[0].s, "scan ") do return strings.clone(row[0].s, context.temp_allocator)
 	}
 	return ""
 }
@@ -12794,6 +13095,7 @@ test_window_range_and_groups_frames :: proc(t: ^testing.T) {
 	}
 	for sql in refused {
 		result, err := db.sql_execute(store, sql)
+		defer db.error_free(&err)
 		testing.expectf(t, !db.error_ok(err), "%s should be refused", sql)
 		db.sql_result_destroy(&result)
 	}
@@ -12900,6 +13202,7 @@ test_join_using :: proc(t: ^testing.T) {
 
 	// A column that is not in both relations is an error, not a silent cross join.
 	missing, missing_err := db.sql_execute(store, "SELECT * FROM emp JOIN dept USING (nope)")
+	defer db.error_free(&missing_err)
 	testing.expect(t, !db.error_ok(missing_err))
 	db.sql_result_destroy(&missing)
 }
@@ -13553,10 +13856,7 @@ test_subscription_knows_its_connection :: proc(t: ^testing.T) {
 
 	first, snapshot, err := db.host_subscribe_many_owned(host, []string{"SELECT id, name FROM items"}, 7)
 	testing.expectf(t, db.error_ok(err), "subscribe failed: %s", err.message)
-	defer {
-		for query_rows in snapshot do for row in query_rows do db.free_values(row)
-		delete(snapshot)
-	}
+	defer db.host_snapshot_destroy(snapshot)
 	testing.expect_value(t, db.host_subscription_owner(host, first), u64(7))
 
 	second, snapshot_two, second_err := db.host_subscribe_many_owned(
@@ -13565,10 +13865,7 @@ test_subscription_knows_its_connection :: proc(t: ^testing.T) {
 		9,
 	)
 	testing.expectf(t, db.error_ok(second_err), "second subscribe failed: %s", second_err.message)
-	defer {
-		for query_rows in snapshot_two do for row in query_rows do db.free_values(row)
-		delete(snapshot_two)
-	}
+	defer db.host_snapshot_destroy(snapshot_two)
 	testing.expect_value(t, db.host_subscription_owner(host, second), u64(9))
 
 	// An id nobody created belongs to no connection, so nothing is written.
@@ -13595,8 +13892,9 @@ test_host_statements_need_host_access :: proc(t: ^testing.T) {
 
 	allowed, allowed_err := db.sql_execute(
 		store,
-		strings.concatenate({"ATTACH '", path, "' AS attached"}),
+		strings.concatenate({"ATTACH '", path, "' AS attached"}, context.temp_allocator),
 	)
+	defer db.sql_result_destroy(&allowed)
 	defer db.error_free(&allowed_err)
 	testing.expectf(t, allowed_err.kind != .None || allowed.commit_seq > 0, "%v", allowed_err)
 
@@ -13606,7 +13904,7 @@ test_host_statements_need_host_access :: proc(t: ^testing.T) {
 	// A refused statement changes nothing and says why.
 	before := store.commit_seq
 	refusals := []string{
-		strings.concatenate({"ATTACH '", path, "' AS again"}),
+		strings.concatenate({"ATTACH '", path, "' AS again"}, context.temp_allocator),
 		"LOAD EXTENSION nowhere AT '127.0.0.1:1'",
 		"VACUUM INTO '_test_hostaccess_out.db'",
 	}
@@ -13651,8 +13949,9 @@ test_expression_depth_is_bounded :: proc(t: ^testing.T) {
 	if store == nil do return
 	defer cleanup_db(store, "depth")
 
+	// The statements are built in the test's temporary memory.
 	deep :: proc(count: int, open_char, close_char: string) -> string {
-		builder := strings.builder_make()
+		builder := strings.builder_make(context.temp_allocator)
 		for _ in 0 ..< count do strings.write_string(&builder, open_char)
 		strings.write_string(&builder, "1")
 		for _ in 0 ..< count do strings.write_string(&builder, close_char)
@@ -13662,7 +13961,7 @@ test_expression_depth_is_bounded :: proc(t: ^testing.T) {
 
 	// The outermost expression is level one, so the deepest that parses is the
 	// limit minus one level of parentheses.
-	at_limit, ok := db.sql_execute(store, strings.concatenate({"SELECT ", deep(db.MAX_EXPRESSION_DEPTH - 1, "(", ")")}))
+	at_limit, ok := db.sql_execute(store, strings.concatenate({"SELECT ", deep(db.MAX_EXPRESSION_DEPTH - 1, "(", ")")}, context.temp_allocator))
 	testing.expectf(t, db.error_ok(ok), "depth %d failed: %s", db.MAX_EXPRESSION_DEPTH - 1, ok.message)
 	if db.error_ok(ok) {
 		testing.expect_value(t, at_limit.rows[0][0].i, i64(1))
@@ -13670,7 +13969,7 @@ test_expression_depth_is_bounded :: proc(t: ^testing.T) {
 	}
 
 	// One more is refused, with a message, and the process is still here.
-	over := run_error(t, store, strings.concatenate({"SELECT ", deep(db.MAX_EXPRESSION_DEPTH, "(", ")")}))
+	over := run_error(t, store, strings.concatenate({"SELECT ", deep(db.MAX_EXPRESSION_DEPTH, "(", ")")}, context.temp_allocator))
 	testing.expect_value(t, over.kind, db.Error_Kind.Sql_Unsupported)
 	testing.expectf(t, strings.contains(over.message, "nests deeper than"), "%s", over.message)
 
@@ -13918,7 +14217,9 @@ test_alter_column_type :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, store, "SELECT typeof(v) FROM t WHERE id = 1").s, "text")
 	testing.expect_value(t, scalar(t, store, "SELECT v FROM t WHERE id = 2").s, "20")
 	run_done(t, store, "UPDATE t SET v = 'thirty' WHERE id = 3")
-	_, bad := db.sql_execute(store, "ALTER TABLE t ALTER COLUMN v TYPE INTEGER")
+	dropped_result_13920, bad := db.sql_execute(store, "ALTER TABLE t ALTER COLUMN v TYPE INTEGER")
+	defer db.error_free(&bad)
+	defer db.sql_result_destroy(&dropped_result_13920)
 	testing.expect(t, !db.error_ok(bad), "a text that is not a number cannot become an integer")
 	if !db.error_ok(bad) {
 		testing.expect_value(t, bad.kind, db.Error_Kind.Invalid_Type)
@@ -13929,7 +14230,9 @@ test_alter_column_type :: proc(t: ^testing.T) {
 	// Two values that collide under the new type are refused by the rebuilt table.
 	run_done(t, store, "CREATE TABLE u (id INTEGER PRIMARY KEY, k TEXT UNIQUE)")
 	run_done(t, store, "INSERT INTO u (id, k) VALUES (1, '1'), (2, '01')")
-	_, collide := db.sql_execute(store, "ALTER TABLE u ALTER COLUMN k TYPE INTEGER")
+	dropped_result_13931, collide := db.sql_execute(store, "ALTER TABLE u ALTER COLUMN k TYPE INTEGER")
+	defer db.error_free(&collide)
+	defer db.sql_result_destroy(&dropped_result_13931)
 	testing.expect(t, !db.error_ok(collide), "a type change cannot merge unique keys")
 	testing.expect_value(t, scalar(t, store, "SELECT typeof(k) FROM u WHERE id = 2").s, "text")
 
@@ -14217,7 +14520,8 @@ test_error_free_releases_the_message :: proc(t: ^testing.T) {
 	defer cleanup_db(store, "error_free")
 	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
 
-	_, missing := db.sql_execute(store, "SELECT * FROM nope")
+	dropped_result_14381, missing := db.sql_execute(store, "SELECT * FROM nope")
+	defer db.sql_result_destroy(&dropped_result_14381)
 	testing.expect(t, !db.error_ok(missing))
 	testing.expectf(t, len(missing.message) > 0, "a refusal carries a message")
 	db.error_free(&missing)
@@ -14265,7 +14569,9 @@ test_host_collations :: proc(t: ^testing.T) {
 
 	// A name nobody registered is refused, as SQLite refuses it: a comparison that
 	// falls back to BINARY answers a question nobody asked.
-	_, unknown := db.sql_execute(store, "SELECT 1 WHERE 'a' = 'a' COLLATE spanish")
+	dropped_result_14267, unknown := db.sql_execute(store, "SELECT 1 WHERE 'a' = 'a' COLLATE spanish")
+	defer db.error_free(&unknown)
+	defer db.sql_result_destroy(&dropped_result_14267)
 	testing.expect_value(t, unknown.kind, db.Error_Kind.Invalid_Argument)
 
 	testing.expect(t, db.error_ok(db.store_register_collation(store, "by_length", collation_by_length)))
@@ -14292,6 +14598,7 @@ test_host_collations :: proc(t: ^testing.T) {
 		store,
 		"SELECT length(name) AS n FROM w GROUP BY n HAVING count(*) = 1 AND min(name) < 'abcd' COLLATE by_length",
 	)
+	defer db.sql_result_destroy(&having)
 	testing.expect_value(t, len(having.rows), 1)
 	testing.expect_value(t, having.rows[0][0].i, i64(3))
 
@@ -14322,7 +14629,9 @@ test_host_collations :: proc(t: ^testing.T) {
 		testing.expect_value(t, running.rows[3][1].i, i64(11))
 	}
 	for statement in ([]string{}) {
-		_, refused := db.sql_execute(store, statement)
+		dropped_result_14489, refused := db.sql_execute(store, statement)
+		defer db.error_free(&refused)
+		defer db.sql_result_destroy(&dropped_result_14489)
 		testing.expectf(
 			t,
 			refused.kind == db.Error_Kind.Sql_Unsupported,
@@ -14338,11 +14647,15 @@ test_host_collations :: proc(t: ^testing.T) {
 	run_done(t, store, "INSERT INTO lc VALUES ('abc'), ('ab'), ('xy')")
 	testing.expect_value(t, scalar(t, store, "SELECT x FROM lc ORDER BY x LIMIT 1").s, "ab")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM lc WHERE x < 'aaa'").i, i64(2))
-	_, keyed := db.sql_execute(store, "CREATE TABLE keyed (x TEXT COLLATE by_length UNIQUE)")
+	dropped_result_14505, keyed := db.sql_execute(store, "CREATE TABLE keyed (x TEXT COLLATE by_length UNIQUE)")
+	defer db.error_free(&keyed)
+	defer db.sql_result_destroy(&dropped_result_14505)
 	testing.expect_value(t, keyed.kind, db.Error_Kind.None)
 	run_done(t, store, "INSERT INTO keyed VALUES ('ab')")
 	testing.expect_value(t, run_error(t, store, "INSERT INTO keyed VALUES ('ab')").kind, db.Error_Kind.Duplicate_Unique)
-	_, indexed := db.sql_execute(store, "CREATE INDEX lc_x ON lc (x)")
+	dropped_result_14509, indexed := db.sql_execute(store, "CREATE INDEX lc_x ON lc (x)")
+	defer db.error_free(&indexed)
+	defer db.sql_result_destroy(&dropped_result_14509)
 	testing.expect_value(t, indexed.kind, db.Error_Kind.None)
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM lc WHERE x < 'aaa'").i, i64(2))
 
@@ -14353,7 +14666,9 @@ test_host_collations :: proc(t: ^testing.T) {
 	// Dropping it unregisters it, and the name is unknown again.
 	testing.expect(t, db.store_unregister_collation(store, "By_Length"))
 	testing.expect_value(t, db.store_collation_count(store), 0)
-	_, gone := db.sql_execute(store, "SELECT 1 WHERE 'a' = 'a' COLLATE by_length")
+	dropped_result_14355, gone := db.sql_execute(store, "SELECT 1 WHERE 'a' = 'a' COLLATE by_length")
+	defer db.error_free(&gone)
+	defer db.sql_result_destroy(&dropped_result_14355)
 	testing.expect_value(t, gone.kind, db.Error_Kind.Invalid_Argument)
 }
 
@@ -14560,7 +14875,9 @@ test_procedure_over_the_wire :: proc(t: ^testing.T) {
 	run_done(t, store, "CREATE TABLE log (v INTEGER NOT NULL)")
 
 	step :: proc(ctx: ^db.Procedure_Ctx, args: []db.Value) -> db.Error {
-		_, err := db.sql_execute_in_tx(ctx.tx, "INSERT INTO log (v) VALUES (7)")
+		dropped_result_14729, err := db.sql_execute_in_tx(ctx.tx, "INSERT INTO log (v) VALUES (7)")
+		defer db.error_free(&err)
+		defer db.sql_result_destroy(&dropped_result_14729)
 		return err
 	}
 	testing.expect(t, db.error_ok(db.host_register_procedure(host, "step", nil, step)))
@@ -14594,7 +14911,9 @@ test_schedule_now :: proc(t: ^testing.T) {
 	bump :: proc(ctx: ^db.Reducer_Ctx, args: []db.Value) -> db.Error {
 		amount, _ := db.value_to_i64(args[0])
 		statement := fmt.tprintf("UPDATE counter SET value = value + %d WHERE id = 0", amount)
-		_, err := db.sql_execute_in_tx(ctx.tx, statement)
+		dropped_result_14763, err := db.sql_execute_in_tx(ctx.tx, statement)
+		defer db.error_free(&err)
+		defer db.sql_result_destroy(&dropped_result_14763)
 		return err
 	}
 	testing.expect(t, db.error_ok(db.host_register(host, "bump", []db.Column_Type{db.type_int}, bump)))
@@ -14825,7 +15144,9 @@ test_drop_and_create_in_one_transaction :: proc(t: ^testing.T) {
 		"CREATE TABLE t (a INTEGER, b TEXT)",
 		"INSERT INTO t VALUES (5, 'x')",
 	}) {
-		_, err := db.sql_execute_in_tx(tx, statement)
+		dropped_result_14994, err := db.sql_execute_in_tx(tx, statement)
+		defer db.error_free(&err)
+		defer db.sql_result_destroy(&dropped_result_14994)
 		testing.expectf(t, db.error_ok(err), "%s failed: %s", statement, err.message)
 	}
 	// Inside the transaction the new table is the visible one, and the row that
@@ -14854,7 +15175,9 @@ test_drop_and_create_in_one_transaction :: proc(t: ^testing.T) {
 	tx2 := db.tx_begin_write(reopened)
 	defer if tx2 != nil do db.tx_rollback(tx2)
 	for statement in ([]string {"CREATE TABLE gone (a INTEGER)", "DROP TABLE gone"}) {
-		_, err := db.sql_execute_in_tx(tx2, statement)
+		dropped_result_15023, err := db.sql_execute_in_tx(tx2, statement)
+		defer db.error_free(&err)
+		defer db.sql_result_destroy(&dropped_result_15023)
 		testing.expectf(t, db.error_ok(err), "%s failed: %s", statement, err.message)
 	}
 	testing.expect(t, db.error_ok(db.tx_commit(tx2)))
@@ -14871,7 +15194,9 @@ test_drop_and_create_in_one_transaction :: proc(t: ^testing.T) {
 		"CREATE TABLE again (b TEXT)",
 		"INSERT INTO again VALUES ('y')",
 	}) {
-		_, err := db.sql_execute_in_tx(tx3, statement)
+		dropped_result_15040, err := db.sql_execute_in_tx(tx3, statement)
+		defer db.error_free(&err)
+		defer db.sql_result_destroy(&dropped_result_15040)
 		testing.expectf(t, db.error_ok(err), "%s failed: %s", statement, err.message)
 	}
 	testing.expect(t, db.error_ok(db.tx_commit(tx3)))

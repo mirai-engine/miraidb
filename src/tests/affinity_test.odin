@@ -37,7 +37,9 @@ test_affinity_and_untyped_columns :: proc(t: ^testing.T) {
 	defer cleanup_db(reopened, "affinity")
 	refused := run_error(t, reopened, "INSERT INTO s VALUES ('abc', x'00')")
 	testing.expect_value(t, refused.kind, db.Error_Kind.Check_Violation)
-	_, rowid := db.sql_execute(reopened, "SELECT rowid FROM w")
+	dropped_result_40, rowid := db.sql_execute(reopened, "SELECT rowid FROM w")
+	defer db.error_free(&rowid)
+	defer db.sql_result_destroy(&dropped_result_40)
 	testing.expect_value(t, rowid.kind, db.Error_Kind.Column_Not_Found)
 	testing.expect_value(t, scalar(t, reopened, "SELECT group_concat(typeof(x), ',') FROM m").s, "integer,text,blob,null")
 
