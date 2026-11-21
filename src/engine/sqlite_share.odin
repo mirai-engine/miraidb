@@ -457,6 +457,12 @@ sqlite_share_hash_file :: proc(file: ^Sqlite_File, out: ^map[string]u64) {
 		// the page count move with every commit and say nothing of content.
 		page_one := sqlite_page(file, 1)
 		if len(page_one) >= 92 {
+			// The page size (bytes 16 and 17) too: a VACUUM to another size
+			// rewrites every page without changing a row.
+			for b in page_one[16:18] {
+				schema ~= u64(b)
+				schema *= 0x100000001b3
+			}
 			for b in page_one[40:92] {
 				schema ~= u64(b)
 				schema *= 0x100000001b3

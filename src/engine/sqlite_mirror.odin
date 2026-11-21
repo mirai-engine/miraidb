@@ -393,9 +393,9 @@ mirror_build :: proc(store: ^Store, path: string, recover := false, alloc := con
 	// them.
 	if file.wal_committed > 0 do return nil, errf(.Io, "%s has a write-ahead log", path)
 	if len(file.data) < int(file.page_size) do return nil, errf(.Io, "%s is not a database", path)
-	if int(file.page_size) != SQLITE_WRITE_PAGE_SIZE {
-		return nil, errf(.Io, "%s uses %d-byte pages", path, file.page_size)
-	}
+	// Every page operation reads m.page_size and m.usable: a file keeps the page
+	// size it has. A 1024-byte file used to be rewritten whole at 4096 on its
+	// first commit.
 
 	m := new(Sqlite_Mirror, alloc)
 	m.alloc = alloc

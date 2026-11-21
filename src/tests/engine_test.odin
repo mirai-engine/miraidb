@@ -15257,3 +15257,69 @@ test_drop_and_create_in_one_transaction :: proc(t: ^testing.T) {
 	tx3 = nil
 	testing.expect_value(t, scalar(t, reopened, "SELECT b FROM again").s, "y")
 }
+
+@(test)
+test_sqlite_file_keeps_its_page_size :: proc(t: ^testing.T) {
+	// A SQLite file keeps the page size it has: it used to be written whole at
+	// 4096 on its first commit. PRAGMA page_size takes effect at once on a file
+	// with no table and at the next VACUUM otherwise, as in SQLite.
+	path :: "_test_pagesize.db"
+	os.remove(path)
+	defer os.remove(path)
+	defer os.remove(path + "-journal")
+	testing.expect(t, db.sqlite_create_empty_file(path))
+	page_size_of :: proc(t: ^testing.T, path: string) -> u32 {
+		file, open_err := db.sqlite_file_open(path)
+		if !testing.expectf(t, db.error_ok(open_err), "read %s: %s", path, open_err.message) {
+			db.error_free(&open_err)
+			return 0
+		}
+		defer db.sqlite_file_destroy(&file)
+		return file.page_size
+	}
+	options := db.Store_Options{persistent = true, create = false, durable = false}
+
+	conn, open_err := db.embed_open(path, options)
+	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "PRAGMA page_size = 1024")))
+	testing.expect_value(t, scalar(t, conn.store, "PRAGMA page_size").i, i64(1024))
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT)")))
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "BEGIN")))
+	for i in 1 ..= 200 {
+		testing.expect(t, db.error_drop(db.embed_exec(conn, fmt.tprintf("INSERT INTO t VALUES (%d, '%s')", i, strings.repeat("x", 100, context.temp_allocator)))))
+	}
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "COMMIT")))
+	db.embed_close(conn)
+	testing.expect_value(t, page_size_of(t, path), u32(1024))
+
+	// Read back, the size is the file's, and a commit patches its pages rather
+	// than writing it again.
+	conn, open_err = db.embed_open(path, options)
+	if !testing.expectf(t, db.error_ok(open_err), "reopen: %s", open_err.message) do return
+	testing.expect_value(t, scalar(t, conn.store, "PRAGMA page_size").i, i64(1024))
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "INSERT INTO t VALUES (201, 'late')")))
+	testing.expect_value(t, conn.store.mirror_full_writes, 0)
+	testing.expect_value(t, page_size_of(t, path), u32(1024))
+
+	// On a file with tables a new size waits for VACUUM; a size SQLite would
+	// not take is ignored.
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "PRAGMA page_size = 1000")))
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "PRAGMA page_size = 4096")))
+	testing.expect_value(t, scalar(t, conn.store, "PRAGMA page_size").i, i64(1024))
+	testing.expect_value(t, page_size_of(t, path), u32(1024))
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "VACUUM")))
+	testing.expect_value(t, scalar(t, conn.store, "PRAGMA page_size").i, i64(4096))
+	testing.expect_value(t, page_size_of(t, path), u32(4096))
+	// 65536 is written as 1 in the header, and reads back as 65536.
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "PRAGMA page_size = 65536")))
+	testing.expect(t, db.error_drop(db.embed_exec(conn, "VACUUM")))
+	testing.expect_value(t, page_size_of(t, path), u32(65536))
+	db.embed_close(conn)
+
+	conn, open_err = db.embed_open(path, options)
+	if !testing.expectf(t, db.error_ok(open_err), "last open: %s", open_err.message) do return
+	defer db.embed_close(conn)
+	testing.expect_value(t, scalar(t, conn.store, "PRAGMA page_size").i, i64(65536))
+	testing.expect_value(t, scalar(t, conn.store, "SELECT count(*) FROM t").i, i64(201))
+	testing.expect_value(t, scalar(t, conn.store, "SELECT body FROM t WHERE id = 201").s, "late")
+}

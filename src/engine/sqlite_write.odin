@@ -19,6 +19,26 @@ import "core:strings"
 
 SQLITE_WRITE_PAGE_SIZE :: 4096
 
+// sqlite_image_page_count is the page count a database image's header records
+// (bytes 28 to 31), whatever its page size.
+sqlite_image_page_count :: proc(image: []u8) -> int {
+	if len(image) < 32 do return 0
+	return int(u32(image[28]) << 24 | u32(image[29]) << 16 | u32(image[30]) << 8 | u32(image[31]))
+}
+
+// sqlite_page_size_valid is SQLite's rule: a power of two from 512 to 65536.
+sqlite_page_size_valid :: proc(size: int) -> bool {
+	return size >= 512 && size <= 65536 && size & (size - 1) == 0
+}
+
+// store_sqlite_page_size is the page size the store's SQLite form uses: the one
+// the file it was read from had, or the one a VACUUM set (kept as a header
+// integer, so it is logged and travels with the transaction), else 4096.
+store_sqlite_page_size :: proc(store: ^Store) -> int {
+	size := int(store_header_value(store, "page_size"))
+	return sqlite_page_size_valid(size) ? size : SQLITE_WRITE_PAGE_SIZE
+}
+
 @(private)
 Sqlite_Writer :: struct {
 	pages:     [dynamic][]u8,
@@ -991,9 +1011,10 @@ sqlite_file_change_counter :: proc(path: string) -> (counter: u32, ok: bool) {
 // sqlite_file_image builds the SQLite database image of the store, the bytes
 // a file would hold. The caller owns them.
 sqlite_file_image :: proc(store: ^Store, alloc := context.allocator) -> (image: []u8, tables: int, rows: int, err: Error) {
+	page_size := store_sqlite_page_size(store)
 	w := Sqlite_Writer {
-		page_size = SQLITE_WRITE_PAGE_SIZE,
-		usable    = SQLITE_WRITE_PAGE_SIZE,
+		page_size = page_size,
+		usable    = page_size,
 	}
 	defer sqlite_writer_destroy(&w)
 	// Page 1 is reserved for sqlite_master even though its content is written last.
@@ -1247,8 +1268,10 @@ sqlite_file_image :: proc(store: ^Store, alloc := context.allocator) -> (image: 
 	page_count := len(w.pages)
 	header := sqlite_writer_page(&w, 1)
 	copy(header[:16], SQLITE_MAGIC)
-	header[16] = u8(w.page_size >> 8)
-	header[17] = u8(w.page_size)
+	// 65536 does not fit two bytes: SQLite writes it as 1.
+	stored_size := w.page_size == 65536 ? 1 : w.page_size
+	header[16] = u8(stored_size >> 8)
+	header[17] = u8(stored_size)
 	header[18] = 1 // write version: legacy
 	header[19] = 1 // read version: legacy
 	header[21] = 64

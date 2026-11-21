@@ -222,7 +222,7 @@ sqlite3_backup_step :: proc "c" (handle: rawptr, pages: c.int) -> c.int {
 			backup.code = SQLITE_ERROR
 			return backup.code
 		}
-		backup.pages = c.int(len(image) / engine.SQLITE_WRITE_PAGE_SIZE)
+		backup.pages = c.int(engine.sqlite_image_page_count(image))
 		delete(image)
 		backup.started = true
 		if backup.source_store != nil do backup.source_seq = backup.source_store.commit_seq
@@ -240,7 +240,7 @@ sqlite3_backup_step :: proc "c" (handle: rawptr, pages: c.int) -> c.int {
 		return backup.code
 	}
 	defer delete(image)
-	backup.pages = c.int(len(image) / engine.SQLITE_WRITE_PAGE_SIZE)
+	backup.pages = c.int(engine.sqlite_image_page_count(image))
 	backup.copied = backup.pages
 	if replace_err := engine.store_replace_content(backup.dest.conn.store, image, false); replace_err.kind != .None {
 		backup.code = sqlite_code(replace_err)

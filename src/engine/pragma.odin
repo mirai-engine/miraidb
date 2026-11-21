@@ -361,6 +361,9 @@ sql_exec_pragma :: proc(store: ^Store, body: string, locked: bool, tx: ^Tx = nil
 	if name == "user_version" || name == "application_id" {
 		return pragma_header_value(store, tx, name, argument, has_argument)
 	}
+	if name == "page_size" && has_argument {
+		return pragma_page_size_set(store, tx, argument)
+	}
 	if !locked {
 		sync.shared_lock(&store.mutex)
 		defer sync.shared_unlock(&store.mutex)
@@ -541,12 +544,9 @@ sql_exec_pragma :: proc(store: ^Store, body: string, locked: bool, tx: ^Tx = nil
 	case "schema_version":
 		return pragma_single("schema_version", value_int(i64(store.commit_seq)), store.commit_seq), ERROR_NONE
 	case "page_size":
-		// The engine is a log, not a page file; this is the page size an export
-		// uses, which is what a client reading it before a dump wants to know.
-		// Setting it answers no row, as in SQLite; the file keeps 4096-byte
-		// pages (docs/sqlite-semantics.md).
-		if has_argument do return pragma_result([]string{"page_size"}, nil, store.commit_seq), ERROR_NONE
-		return pragma_single("page_size", value_int(SQLITE_WRITE_PAGE_SIZE), store.commit_seq), ERROR_NONE
+		// The engine is a log, not a page file; this is the page size its SQLite
+		// form uses: the file's, or the one a VACUUM set (pragma_page_size_set).
+		return pragma_single("page_size", value_int(i64(store_sqlite_page_size(store))), store.commit_seq), ERROR_NONE
 	case "encoding":
 		return pragma_single("encoding", pragma_text("UTF-8"), store.commit_seq), ERROR_NONE
 	case "journal_mode":
@@ -587,7 +587,8 @@ sql_exec_pragma :: proc(store: ^Store, body: string, locked: bool, tx: ^Tx = nil
 		return pragma_single("mmap_size", value_int(0), store.commit_seq), ERROR_NONE
 	case "page_count":
 		bytes := store_log_bytes(store)
-		pages := (bytes + u64(SQLITE_WRITE_PAGE_SIZE) - 1) / u64(SQLITE_WRITE_PAGE_SIZE)
+		size := u64(store_sqlite_page_size(store))
+		pages := (bytes + size - 1) / size
 		return pragma_single("page_count", value_int(i64(pages)), store.commit_seq), ERROR_NONE
 	case "freelist_count":
 		return pragma_single("freelist_count", value_int(0), store.commit_seq), ERROR_NONE
@@ -903,6 +904,54 @@ pragma_header_value :: proc(store: ^Store, tx: ^Tx, name, argument: string, has_
 		if commit_err := tx_commit(writer); commit_err.kind != .None do return {}, commit_err
 	}
 	return Sql_Result{kind = .Ack, message = strings.clone("ok"), commit_seq = store.commit_seq}, ERROR_NONE
+}
+
+// pragma_page_size_set is SQLite's rule for a new page size: it is noted for the
+// connection and takes effect at the next VACUUM, or at once on a database that
+// holds no table yet. A size that is not a power of two from 512 to 65536 is
+// ignored, as SQLite ignores it; either way the set answers no row.
+@(private)
+pragma_page_size_set :: proc(store: ^Store, tx: ^Tx, argument: string) -> (Sql_Result, Error) {
+	answer := pragma_result([]string{"page_size"}, nil, store.commit_seq)
+	size, parsed := strconv.parse_int(argument)
+	if !parsed || !sqlite_page_size_valid(size) do return answer, ERROR_NONE
+	store.sqlite_page_size_pending = size
+	empty := true
+	{
+		sync.shared_lock(&store.mutex)
+		defer sync.shared_unlock(&store.mutex)
+		for name in store.tables {
+			if len(name) > 0 && name[0] != '_' {
+				empty = false
+				break
+			}
+		}
+	}
+	if empty {
+		if apply_err := store_apply_page_size(store, tx); apply_err.kind != .None {
+			sql_result_destroy(&answer)
+			return {}, apply_err
+		}
+	}
+	return answer, ERROR_NONE
+}
+
+// store_apply_page_size makes the noted page size the store's: a header
+// integer, so the commit rewrites a mirrored SQLite file at that size (a change
+// to the header table is one the page patcher leaves to a full write).
+store_apply_page_size :: proc(store: ^Store, tx: ^Tx) -> Error {
+	size := store.sqlite_page_size_pending
+	if size == 0 do return ERROR_NONE
+	store.sqlite_page_size_pending = 0
+	if size == store_sqlite_page_size(store) do return ERROR_NONE
+	writer := tx
+	if writer == nil do writer = tx_begin_write(store)
+	if set_err := header_set(writer, "page_size", i64(size)); set_err.kind != .None {
+		if tx == nil do tx_rollback(writer)
+		return set_err
+	}
+	if tx == nil do return tx_commit(writer)
+	return ERROR_NONE
 }
 
 // header_value is one header integer as the transaction sees it, 0 when unset.

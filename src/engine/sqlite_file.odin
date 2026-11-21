@@ -1326,6 +1326,12 @@ sqlite_import_tx :: proc(
 		}
 	}
 	if order_err := sqlite_import_text_order(file, tx); order_err.kind != .None do return tables, rows, order_err
+	// The page size the file was written with, so writing it back keeps it.
+	if int(file.page_size) != SQLITE_WRITE_PAGE_SIZE && sqlite_page_size_valid(int(file.page_size)) {
+		if size_err := header_set(tx, "page_size", i64(file.page_size)); size_err.kind != .None {
+			return tables, rows, size_err
+		}
+	}
 	// The integers SQLite keeps in the header for the program.
 	page_one := sqlite_page(file, 1)
 	if len(page_one) >= 72 {

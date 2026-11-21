@@ -214,6 +214,9 @@ Store :: struct {
 	// stays a SQLite database a client can open. The commit log is still the
 	// truth; the mirror is a cache of it in another format.
 	sqlite_mirror:       string,
+	// sqlite_page_size_pending is a PRAGMA page_size waiting for the next VACUUM.
+	// It is the connection's, as SQLite's is, and is not logged.
+	sqlite_page_size_pending: int,
 	// mirror is that file's layout, read once and then patched page by page.
 	mirror:              ^Sqlite_Mirror,
 	// The cost of the mirror, in pages: what a commit had to write, and how many

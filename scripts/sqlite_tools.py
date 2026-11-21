@@ -105,10 +105,7 @@ ALTER TABLE n ADD COLUMN s DEFAULT 7;
 
 # An mptest script with known differences: every check it fails has to be one
 # of these, and it has to fail at least one.
-KNOWN_MPTEST: dict[str, tuple[str, str]] = {
-    "config02.test": (r"Expected \[(512|1024|2048|8192|16384|32768|65536)( \1)*\]",
-                      "PRAGMA page_size then VACUUM: the facade writes 4096-byte pages"),
-}
+KNOWN_MPTEST: dict[str, tuple[str, str]] = {}
 
 SQLDIFF_OPTIONS = [[], ["--summary"], ["--primarykey"], ["--schema"], ["--table", "t"], ["--table", "w"],
                    ["--transaction"], ["--rbu"], ["--vtab"], ["--schema", "--summary"]]

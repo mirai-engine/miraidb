@@ -571,6 +571,9 @@ sql_exec_vacuum :: proc(store: ^Store, stmt: Vacuum_Stmt) -> (Sql_Result, Error)
 		return {}, host_access_refusal("VACUUM INTO")
 	}
 	if len(stmt.path) == 0 {
+		// A page size set since the last VACUUM takes effect now, as in SQLite:
+		// a mirrored SQLite file is written again at that size.
+		if size_err := store_apply_page_size(store, nil); size_err.kind != .None do return {}, size_err
 		// A database in memory has no file to compact: VACUUM does nothing, as
 		// in SQLite.
 		if !store.persistent || store.log.memory_mode {
