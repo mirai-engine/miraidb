@@ -7,6 +7,7 @@ import "core:crypto/hash"
 import "core:encoding/base64"
 import "core:fmt"
 import "core:mem"
+import "core:mem/virtual"
 import "core:strings"
 import "core:strconv"
 import "core:sync"
@@ -849,7 +850,15 @@ pg_describe_plan :: proc(host: ^Host, sql: string) -> (columns: []string, ok: bo
 		}
 	}
 	names := make([dynamic]string, 0, len(stmt.projections))
-	_ = expand_projections(sources[:], stmt.joins, stmt.projections, &names, context.allocator)
+	// The expanded expressions are only a by-product here: they go into a
+	// scratch arena, and the names (cloned into the heap) are what is kept.
+	scratch: virtual.Arena
+	if virtual.arena_init_growing(&scratch) != .None {
+		sync.shared_unlock(&host.store.mutex)
+		return nil, false
+	}
+	defer virtual.arena_destroy(&scratch)
+	_ = expand_projections(sources[:], stmt.joins, stmt.projections, &names, virtual.arena_allocator(&scratch))
 	sync.shared_unlock(&host.store.mutex)
 	return names[:], true
 }
@@ -1079,6 +1088,7 @@ pg_handle_session_message :: proc(
 		}
 		bound := make([]Value, len(params))
 		copy(bound, params[:])
+		delete(params)
 		session.portals[strings.clone(portal_name)] = Pg_Portal {
 			sql     = strings.clone(statement.sql),
 			params  = bound,
