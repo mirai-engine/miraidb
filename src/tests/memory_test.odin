@@ -1034,3 +1034,39 @@ test_rtree_drop_and_compaction_leave_nothing :: proc(t: ^testing.T) {
 		"INSERT INTO k VALUES (1, 'a')",
 	})
 }
+
+@(test)
+test_host_parts_leave_nothing :: proc(t: ^testing.T) {
+	// The module table, the connection registry, a scheduled call's argument
+	// list and a prepared statement's bound parameters.
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	{
+		context.allocator = mem.tracking_allocator(&track)
+		store, open_err := db.store_open("", {persistent = false})
+		if !testing.expect(t, db.error_ok(open_err)) do return
+		host := db.host_init(store)
+		testing.expect(t, db.error_ok(db.host_register_module(host, db.Module{abi_version = db.MODULE_ABI_VERSION, name = "m"})))
+		testing.expect(t, db.host_client_connect(host, 7))
+		_, schedule_err := db.host_schedule_in(host, "nobody", 1_000, nil)
+		db.error_free(&schedule_err)
+		db.host_destroy(host)
+		db.store_close(store)
+
+		conn, conn_err := db.embed_open("", {persistent = false})
+		if !testing.expect(t, db.error_ok(conn_err)) do return
+		stmt := db.embed_prepare(conn, "SELECT ? + ?")
+		testing.expect(t, db.error_drop(db.embed_bind_int(stmt, 0, 1)))
+		testing.expect(t, db.error_drop(db.embed_bind_int(stmt, 1, 2)))
+		db.embed_finalize(stmt)
+		db.embed_close(conn)
+		free_all(context.temp_allocator)
+	}
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "%d bytes left from %v", entry.size, entry.location)
+	}
+	for entry in track.bad_free_array {
+		testing.expectf(t, false, "bad free of %p at %v", entry.memory, entry.location)
+	}
+}

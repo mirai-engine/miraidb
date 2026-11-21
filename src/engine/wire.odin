@@ -281,7 +281,8 @@ wire_dispatch_owned :: proc(host: ^Host, data: []u8, owner: u64) -> []u8 {
 		caller_now := i64(br_read_u64(&r))
 		name := br_read_string(&r, context.temp_allocator)
 		args := wire_read_values(&r, context.temp_allocator)
-		request := make([]u8, 8)
+		// The host copies the id into its table; the buffer is only the key.
+		request := make([]u8, 8, context.temp_allocator)
 		put_u64_le(request, request_id)
 		call_err := host_call_once_at(host, request, name, args, caller_now)
 		if call_err.kind != .None do return wire_encode_error(call_err)

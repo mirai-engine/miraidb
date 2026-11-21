@@ -38,9 +38,12 @@ host_migrate :: proc(host: ^Host, migrations: []Migration) -> (applied: int, err
 		}
 		tx := tx_begin_write(host.store)
 		for statement in migration.sql {
-			if _, statement_err := sql_execute_in_tx(tx, statement); statement_err.kind != .None {
+			statement_result, statement_err := sql_execute_in_tx(tx, statement)
+			sql_result_destroy(&statement_result)
+			if statement_err.kind != .None {
 				tx_rollback(tx)
-				return applied, errf(
+				return applied, error_wrap(
+					statement_err,
 					statement_err.kind,
 					"migration %d failed: %s",
 					migration.version,
@@ -54,6 +57,7 @@ host_migrate :: proc(host: ^Host, migrations: []Migration) -> (applied: int, err
 			"UPDATE _meta SET value = ? WHERE key = 'schema_version'",
 			[]Value{value_string(version_text)},
 		)
+		delete(version_text)
 		sql_result_destroy(&discarded_17)
 		if update_err.kind != .None {
 			tx_rollback(tx)

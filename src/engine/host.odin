@@ -274,6 +274,12 @@ host_destroy :: proc(host: ^Host) {
 		free(subscription)
 	}
 	delete(host.subscriptions)
+	// The module table, the connection registry and the last procedure's
+	// messages are the host's too: a host that registered a module, took a
+	// client or ran a procedure left each one behind.
+	delete(host.modules)
+	delete(host.clients)
+	host_clear_procedure_logs(host)
 	host_remote_conns_close(host)
 	host_remote_modules_destroy(host)
 	free(host)
@@ -2276,6 +2282,7 @@ host_schedule_at :: proc(
 	defer delete(payload)
 
 	insert := make([]Value, 4)
+	defer delete(insert)
 	insert[0] = value_string(reducer)
 	insert[1] = value_int(at_us)
 	insert[2] = value_int(interval_us)

@@ -1734,9 +1734,13 @@ Notification_Deliver :: proc(ctx: rawptr, owner: u64, channel, payload: string)
 // statement, and the key outlives it.
 store_listen :: proc(store: ^Store, owner: u64, channel: string) {
 	if store.listeners == nil do store.listeners = make(map[Listener_Key]bool)
-	name, found := store_listener_channel(store, channel)
-	if !found do name = strings.clone(channel)
-	store.listeners[Listener_Key{channel = name, owner = owner}] = true
+	// The stored spelling is kept for every listener of a channel, but each key
+	// owns its own copy: shared, store_close freed one string once per owner
+	// and store_unlisten could free none.
+	spelling, _ := store_listener_channel(store, channel)
+	existing := Listener_Key{channel = spelling, owner = owner}
+	if existing in store.listeners do return
+	store.listeners[Listener_Key{channel = strings.clone(spelling), owner = owner}] = true
 }
 
 // store_listener_channel is the spelling a channel is stored under, and whether
@@ -1761,7 +1765,10 @@ store_unlisten :: proc(store: ^Store, owner: u64, channel: string, all: bool) ->
 			removed = true
 		}
 	}
-	for key in dropped do delete_key(&store.listeners, key)
+	for key in dropped {
+		stored, _ := delete_key(&store.listeners, key)
+		delete(stored.channel)
+	}
 	return removed
 }
 

@@ -548,7 +548,9 @@ embed_prepare :: proc(conn: ^Embed_Conn, sql: string) -> ^Embed_Statement {
 	// count known before the first bind, so index 99 can be refused (D29).
 	prepared, prepare_err := sql_prepare(conn.store, sql)
 	if prepare_err.kind != .None {
+		// The connection keeps its own copy for errmsg; this one is dropped.
 		embed_fail(conn, prepare_err)
+		error_free(&prepare_err)
 		return nil
 	}
 	if auth_err := embed_authorize(conn, prepared); auth_err.kind != .None {
@@ -572,6 +574,8 @@ embed_finalize :: proc(stmt: ^Embed_Statement) {
 	delete(stmt.sql)
 	stmt_prepared_destroy(stmt.prepared)
 	embed_clear_bindings(stmt)
+	// Clearing keeps the list's length; finalizing drops the list itself.
+	delete(stmt.params)
 	sql_result_destroy(&stmt.result)
 	error_free(&stmt.pending)
 	free(stmt)
@@ -694,16 +698,15 @@ embed_bind_bool :: proc(stmt: ^Embed_Statement, index: int, value: bool) -> Erro
 	return embed_bind(stmt, index, value_bool(value))
 }
 
-// embed_bind_text clones the text, so the caller keeps ownership of `value`.
+// embed_bind_text keeps a copy of the text (embed_bind clones what it binds), so
+// the caller keeps ownership of `value`. Cloning here too left one copy behind.
 embed_bind_text :: proc(stmt: ^Embed_Statement, index: int, value: string) -> Error {
-	return embed_bind(stmt, index, value_string(strings.clone(value)))
+	return embed_bind(stmt, index, value_string(value))
 }
 
-// embed_bind_blob clones the bytes, so the caller keeps ownership of `value`.
+// embed_bind_blob keeps a copy of the bytes, like embed_bind_text.
 embed_bind_blob :: proc(stmt: ^Embed_Statement, index: int, value: []u8) -> Error {
-	bytes := make([]u8, len(value))
-	copy(bytes, value)
-	return embed_bind(stmt, index, value_bytes(bytes))
+	return embed_bind(stmt, index, value_bytes(value))
 }
 
 // embed_reset discards the current result so the statement can run again. The
