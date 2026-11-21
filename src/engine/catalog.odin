@@ -158,13 +158,19 @@ catalog_write :: proc(store: ^Store, seq: u64) -> Error {
 catalog_read :: proc(store: ^Store) -> (seq: u64, entries: []Catalog_Entry, ok: bool) {
 	path := store_catalog_path(store)
 	defer delete(path)
+	// catalog_read answers only whether the catalog is usable: no error it meets
+	// is handed on, so each one is freed here.
 	file, open_err := log_file_open(store.vfs, path, {.Read})
-	if open_err.kind != .None do return 0, nil, false
+	if open_err.kind != .None {
+		error_free(&open_err)
+		return 0, nil, false
+	}
 	defer log_file_close(file)
 	size := log_file_size(file)
 	if size < CATALOG_HEADER_LEN do return 0, nil, false
 	header: [CATALOG_HEADER_LEN]u8
 	n, read_err := log_file_read(file, header[:])
+	defer error_free(&read_err)
 	if read_err.kind != .None || n != CATALOG_HEADER_LEN do return 0, nil, false
 	if string(header[:4]) != CATALOG_MAGIC do return 0, nil, false
 	if get_u32_le(header[4:8]) != CATALOG_VERSION do return 0, nil, false
@@ -174,6 +180,7 @@ catalog_read :: proc(store: ^Store) -> (seq: u64, entries: []Catalog_Entry, ok: 
 	body := make([]u8, length)
 	defer delete(body)
 	got, body_err := log_file_read(file, body)
+	defer error_free(&body_err)
 	if body_err.kind != .None || got != length do return 0, nil, false
 	if crc32c(body) != get_u32_le(header[24:28]) do return 0, nil, false
 	if get_u32_le(header[28:32]) & 1 == 0 do return 0, nil, false

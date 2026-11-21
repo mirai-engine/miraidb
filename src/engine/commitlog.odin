@@ -213,11 +213,17 @@ log_last_segment_index :: proc(db_path: string, vfs: ^Vfs = nil) -> int {
 @(private)
 log_segment_base :: proc(path: string, vfs: ^Vfs = nil) -> u64 {
 	file, open_err := log_file_open(vfs, path, {.Read})
-	if open_err.kind != .None do return 0
+	if open_err.kind != .None {
+		error_free(&open_err)
+		return 0
+	}
 	defer log_file_close(file)
 	header: [LOG_HEADER_LEN]u8
 	n, read_err := log_file_read(file, header[:])
-	if read_err.kind != .None || n != LOG_HEADER_LEN do return 0
+	if read_err.kind != .None || n != LOG_HEADER_LEN {
+		error_free(&read_err)
+		return 0
+	}
 	if string(header[:8]) != LOG_MAGIC do return 0
 	return get_u64_le(header[16:24])
 }
@@ -270,6 +276,8 @@ log_open :: proc(
 	header: [LOG_HEADER_LEN]u8
 	n, read_err := log_file_read(file, header[:])
 	if read_err.kind != .None || n != LOG_HEADER_LEN {
+		// A failed read says the same as a short one; its own words are dropped.
+		error_free(&read_err)
 		log_file_close(file)
 		return log, errf(.Corrupt_Log, "%s is shorter than a log header", path)
 	}
@@ -526,7 +534,11 @@ log_index_ensure :: proc(log_path: string) {
 	}
 	os.close(file)
 	records, _, _, read_err := log_read_at(log_path, LOG_HEADER_LEN)
-	if read_err.kind != .None do return
+	defer log_records_free(records)
+	if read_err.kind != .None {
+		error_free(&read_err)
+		return
+	}
 	for record in records {
 		log_index_append(log_path, record.seq, record.offset)
 	}
@@ -815,9 +827,17 @@ log_read_at :: proc(
 	ctx := Log_Read_Ctx{out = &out}
 	valid, base, read_err := log_stream_at(vfs, path, start, &ctx, log_read_visit)
 	if read_err.kind != .None {
+		log_records_free(out[:])
 		return nil, 0, 0, read_err
 	}
 	return out[:], valid, base, ERROR_NONE
+}
+
+// log_records_free releases what log_read and log_read_from answer: each
+// record's payload copy and the list.
+log_records_free :: proc(records: []Log_Record) {
+	for record in records do delete(record.payload)
+	delete(records)
 }
 // log_truncate cuts the file back to a known-good length.
 log_truncate :: proc(path: string, size: i64, vfs: ^Vfs = nil) -> Error {
@@ -923,6 +943,7 @@ log_reader_open :: proc(path: string, vfs: ^Vfs = nil) -> (^Log_Reader, Error) {
 	header: [LOG_HEADER_LEN]u8
 	n, read_err := log_file_read(file, header[:])
 	if read_err.kind != .None || n != LOG_HEADER_LEN {
+		error_free(&read_err)
 		log_file_close(file)
 		return nil, errf(.Corrupt_Log, "%s is shorter than a log header", path)
 	}
@@ -969,6 +990,8 @@ log_reader_next :: proc(reader: ^Log_Reader) -> (record: Log_Record, ok: bool, e
 	}
 	n, read_err := log_file_read(reader.file, header[:])
 	if read_err.kind != .None || n != LOG_RECORD_HEADER_LEN {
+		// A torn tail ends the stream; the read's own error is not the answer.
+		error_free(&read_err)
 		reader.finished = true
 		return {}, false, ERROR_NONE
 	}
@@ -983,6 +1006,7 @@ log_reader_next :: proc(reader: ^Log_Reader) -> (record: Log_Record, ok: bool, e
 	if length > 0 {
 		payload_n, payload_err := log_file_read(reader.file, reader.buffer[:])
 		if payload_err.kind != .None || payload_n != length {
+			error_free(&payload_err)
 			reader.finished = true
 			return {}, false, ERROR_NONE
 		}

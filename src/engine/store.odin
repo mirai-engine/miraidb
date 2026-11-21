@@ -1597,6 +1597,7 @@ store_compact :: proc(store: ^Store) -> Error {
 		return snapshot_err
 	}
 	log_path := store_log_path(store.path)
+	defer delete(log_path)
 	temp_path := strings.concatenate({store.path, "/log.tmp"})
 	defer delete(temp_path)
 	base := store.commit_seq == 0 ? u64(0) : store.commit_seq - 1

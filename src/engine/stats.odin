@@ -509,10 +509,10 @@ stats_remove :: proc(store: ^Store, name: string) {
 	old, exists := store.stats[name]
 	if !exists do return
 	delete(old.columns)
-	// The map owns the key string and `delete_key` only hands back the value, so
-	// the key is left to stats_destroy. One small string per dropped table is a
-	// cheaper answer than a second index of owned names.
-	delete_key(&store.stats, name)
+	// The map owns the key string; delete_key hands the stored one back, and it
+	// is freed here (it used to stay until nothing could free it).
+	stored, _ := delete_key(&store.stats, name)
+	delete(stored)
 }
 
 // stats_forget drops the statistics of one table, which is what a DROP TABLE
@@ -648,7 +648,14 @@ stats_load :: proc(store: ^Store) {
 			stats_destroy(store)
 			return
 		}
-		if old, exists := store.stats[name]; exists do delete(old.columns)
+		// A table already measured keeps its key: the map holds on to the first
+		// string, so the one just read is the duplicate to drop.
+		if old, exists := store.stats[name]; exists {
+			delete(old.columns)
+			store.stats[name] = Table_Stats{rows = rows, columns = measured}
+			delete(name)
+			continue
+		}
 		store.stats[name] = Table_Stats{rows = rows, columns = measured}
 	}
 	store.stats_seq = get_u64_le(header[8:16])

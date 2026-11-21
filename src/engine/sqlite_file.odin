@@ -691,7 +691,10 @@ sqlite_constraints_from_sql :: proc(sql: string, table: ^Sqlite_Table, alloc: me
 		primary := sqlite_has_word(upper, "PRIMARY")
 		if !primary && !sqlite_has_word(upper, "UNIQUE") do continue
 		positions := sqlite_group_key(upper, item, table.columns, alloc)
-		if len(positions) == 0 do continue
+		if len(positions) == 0 {
+			delete(positions, alloc)
+			continue
+		}
 		// An INTEGER PRIMARY KEY in a rowid table is the rowid, and SQLite makes
 		// no index for it, so it takes no automatic number.
 		rowid_alias := primary && len(positions) == 1 && !table.without_rowid &&
@@ -701,6 +704,8 @@ sqlite_constraints_from_sql :: proc(sql: string, table: ^Sqlite_Table, alloc: me
 			if len(positions) == 1 {
 				table.columns[positions[0]].primary_key = true
 				table.columns[positions[0]].not_null = true
+				// The rowid's key went into no list: nothing else frees it.
+				if rowid_alias do delete(positions, alloc)
 			} else {
 				table.primary_group = positions
 			}

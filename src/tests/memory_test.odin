@@ -1011,3 +1011,26 @@ test_literals_and_set_answers_leave_nothing :: proc(t: ^testing.T) {
 		"COPY t TO '_test_memory_copy.txt'",
 	})
 }
+
+@(test)
+test_rtree_drop_and_compaction_leave_nothing :: proc(t: ^testing.T) {
+	// Dropping an R-tree has no terms table to drop, whose refusal was kept;
+	// compacting a database on disk named its log; reopening reads the
+	// statistics ANALYZE saved; a rowid key read from a SQLite file went into
+	// no list.
+	expect_nothing_left(t, .Memory, "_test_memory_rtree", {
+		"CREATE VIRTUAL TABLE places USING rtree(id, minx, maxx, miny, maxy)",
+		"INSERT INTO places (id, minx, maxx, miny, maxy) VALUES (1, 0, 10, 0, 10)",
+		"DROP TABLE places",
+	})
+	expect_nothing_left(t, .Reopen, "_test_memory_compact", {
+		"CREATE TABLE t (a INT PRIMARY KEY, b TEXT)",
+		"INSERT INTO t VALUES (1, 'x'), (2, 'y')",
+		"ANALYZE",
+		"VACUUM",
+	})
+	expect_nothing_left(t, .Sqlite_File, "_test_memory_rowid_key.db", {
+		"CREATE TABLE k (id INTEGER PRIMARY KEY, v TEXT UNIQUE)",
+		"INSERT INTO k VALUES (1, 'a')",
+	})
+}
