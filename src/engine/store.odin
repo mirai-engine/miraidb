@@ -1965,7 +1965,8 @@ store_commit_prepared :: proc(store: ^Store, prepared: []^Prepared_Tx) -> (int, 
 		if len(group.payload) > 0 {
 			seq += 1
 			if log_err := log_append(&store.log, seq, group.payload); log_err.kind != .None {
-				_ = log_rewind(&store.log, log_before)
+				// The commit already failed; a rewind that fails too is not the error to report.
+				error_drop(log_rewind(&store.log, log_before))
 				store.log.durability = saved_durability
 				sync.unlock(&store.mutex)
 				return written, log_err
@@ -1975,7 +1976,8 @@ store_commit_prepared :: proc(store: ^Store, prepared: []^Prepared_Tx) -> (int, 
 		store.apply_seq = seq
 		for op in group.ops {
 			if apply_err := store_apply(store, op); apply_err.kind != .None {
-				_ = log_rewind(&store.log, log_before)
+				// The commit already failed; a rewind that fails too is not the error to report.
+				error_drop(log_rewind(&store.log, log_before))
 				store.log.durability = saved_durability
 				sync.unlock(&store.mutex)
 				return written, apply_err

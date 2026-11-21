@@ -124,15 +124,19 @@ host_replay_extensions :: proc(host: ^Host) -> Error {
 	for row in list.rows {
 		if len(row) < 4 || row[0].kind != .String || row[1].kind != .String do continue
 		module_host, port, parse_err := remote_parse_address(row[1].s)
-		if parse_err.kind != .None do continue
+		if parse_err.kind != .None {
+			error_free(&parse_err)
+			continue
+		}
 		reducers := make([dynamic]string, 0, 2, context.temp_allocator)
 		if row[3].kind == .String {
-			for piece in strings.split(row[3].s, ",") {
+			for piece in strings.split(row[3].s, ",", context.temp_allocator) {
 				trimmed := strings.trim_space(piece)
 				if len(trimmed) > 0 do append(&reducers, trimmed)
 			}
 		}
-		_ = host_load_extension(host, row[0].s, module_host, port, reducers[:])
+		// An extension that does not load leaves the others loading; its error is not kept.
+		error_drop(host_load_extension(host, row[0].s, module_host, port, reducers[:]))
 	}
 	return ERROR_NONE
 }

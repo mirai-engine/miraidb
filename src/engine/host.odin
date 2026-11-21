@@ -242,7 +242,7 @@ host_init :: proc(store: ^Store) -> ^Host {
 	}
 	// Extensions are processes: registering them opens nothing yet, so a database
 	// with an extension that is down still starts.
-	_ = host_replay_extensions(host)
+	error_drop(host_replay_extensions(host))
 	// Setup writes through the SQL path; those are not user changes, so the
 	// counters changes()/total_changes() report start clean.
 	store.last_changes = 0
