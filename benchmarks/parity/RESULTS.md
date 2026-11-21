@@ -230,10 +230,46 @@ What is left (2–7%) is within the spread of the runs and the WHERE a partial
 index has to be asked. `test_unique_null_check_allocates_nothing` fails if the
 check allocates again.
 
+## The parity gate (2026-11-21)
+
+`scripts/parity.py` is a gate of `scripts/ci.py`: it builds this suite with
+`-o:speed`, runs it in memory three times and fails when a workload's best median
+is more than 15% over `baseline.json` (with 0.2 µs of slack for the ones under a
+microsecond). The baseline is this machine's: `--record` writes the median of
+five rounds of best-of-three, a typical good run rather than the luckiest, which
+one round had made a workload sit 13–15% over its baseline on ordinary runs. A
+change that makes a workload faster records the new number, so the gain is held.
+The reference's and SQLite's numbers beside them are 2026-11-19's, on this
+machine. Disk is not gated: its medians move by half between runs.
+
+Recorded today, in µs (in memory):
+
+| Workload | Engine | Reference | SQLite | ÷ reference |
+|---|---:|---:|---:|---:|
+| empty transaction | 0.50 | 0.53 | 0.55 | 0.9× |
+| insert_bulk u32_u64_str unique_0 | 668 | 231 | 127 | 2.9× |
+| insert_bulk u32_u64_str btree_each_column | 780 | 534 | 801 | 1.5× |
+| insert_bulk u32_u64_u64 unique_0 | 518 | 186 | 121 | 2.8× |
+| insert_bulk u32_u64_u64 btree_each_column | 615 | 363 | 482 | 1.7× |
+| update_bulk u32_u64_str | 969 | 349 | 51.2 | 2.8× |
+| update_bulk u32_u64_u64 | 824 | 313 | 42.9 | 2.6× |
+| iterate 256 rows (u32_u64_str) | 4.50 | 1.33 | 25.0 | 3.4× |
+| iterate 256 rows (u32_u64_u64) | 4.60 | 1.99 | 22.6 | 2.3× |
+| filter, string index | 12.7 | 3.25 | 90.5 | 3.9× |
+| filter, u64 index | 12.2 | 3.28 | 72.3 | 3.7× |
+
+One workload is at the reference (the empty transaction); the others are
+1.5–3.9× it. The updates are 4–5% under 2026-11-19's numbers after the
+regression fix (1 009 → 969 µs and 864 → 824 µs), which is within what a day
+moves this machine and was not traced to a change. A run of the gate takes
+about 35 s.
+
 To reproduce:
 
 ```sh
 odin build benchmarks/parity -o:speed -out:bin/parity.exe
 bin/parity.exe mem
 bin/parity.exe disk
+python scripts/parity.py            # the gate
+python scripts/parity.py --record   # after a change that makes it faster
 ```
