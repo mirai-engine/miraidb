@@ -994,3 +994,20 @@ test_a_program_function_error_leaves_nothing :: proc(t: ^testing.T) {
 refuse_function :: proc(args: []db.Value, user: rawptr) -> (db.Value, db.Error) {
 	return {}, db.errf(.Invalid_Argument, "refuse() was called with %d", len(args))
 }
+
+@(test)
+test_literals_and_set_answers_leave_nothing :: proc(t: ^testing.T) {
+	// A blob literal's bytes, a scalar min/max's answer, DISTINCT's group keys,
+	// a missing table dropped IF EXISTS, an array written as text and the rows
+	// COPY TO formats.
+	defer os.remove("_test_memory_copy.txt")
+	expect_nothing_left(t, .Memory, "_test_memory_literals", {
+		"SELECT x'0102ff', length(x'00')",
+		"SELECT max('a', 'b'), min(3, 1, 2)",
+		"CREATE TABLE t (id INT, b TEXT, v ARRAY(INT))",
+		"INSERT INTO t VALUES (1, 'x', '{1,2}'), (2, 'x', '{3}'), (3, 'y', NULL)",
+		"SELECT DISTINCT b FROM t",
+		"DROP TABLE IF EXISTS nowhere",
+		"COPY t TO '_test_memory_copy.txt'",
+	})
+}

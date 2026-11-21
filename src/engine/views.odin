@@ -89,7 +89,10 @@ view_names :: proc(tx: ^Tx, alloc: mem.Allocator) -> ([]string, Error) {
 	rows := make([dynamic]Row)
 	defer delete(rows)
 	if collect_err := tx_collect(tx, VIEW_TABLE, &rows); collect_err.kind != .None {
-		if collect_err.kind == .Table_Not_Found do return nil, ERROR_NONE
+		if collect_err.kind == .Table_Not_Found {
+			error_free(&collect_err)
+			return nil, ERROR_NONE
+		}
 		return nil, collect_err
 	}
 	names := make([dynamic]string, 0, len(rows), alloc)

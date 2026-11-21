@@ -3269,7 +3269,8 @@ parse_primary :: proc(p: ^Parser) -> ^Expr {
 		return expr_literal(p, value_string(strings.clone(token.text, p.alloc)))
 	case .Blob:
 		p_advance(p)
-		bytes := make([]u8, len(token.text) / 2)
+		// In the query's arena, like a text literal: in the heap every x'..' stayed.
+		bytes := make([]u8, len(token.text) / 2, p.alloc)
 		for i in 0 ..< len(bytes) {
 			high, high_ok := hex_digit_value(rune(token.text[i * 2]))
 			low, low_ok := hex_digit_value(rune(token.text[i * 2 + 1]))

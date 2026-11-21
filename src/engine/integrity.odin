@@ -168,6 +168,8 @@ store_foreign_key_check :: proc(store: ^Store, alloc: mem.Allocator, in_tx: ^Tx 
 		for row in live {
 			for key, i in table.schema.foreign_keys {
 				if fk_err := fk_check_child_one(tx, key, row.values); fk_err.kind != .None {
+					// The problem is the answer: the error's words are not kept.
+					error_free(&fk_err)
 					append(&problems,
 						Foreign_Key_Problem {
 							table = strings.clone(name, alloc),

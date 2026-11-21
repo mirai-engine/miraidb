@@ -297,7 +297,11 @@ fts_drop :: proc(tx: ^Tx, name: string, if_exists: bool) -> Error {
 	if err := fts_run(tx, drop_row, []Value{value_string(strings.clone(name, tx.alloc))}); err.kind != .None {
 		return err
 	}
-	if err := tx_drop_table(tx, table.terms); err.kind != .None && err.kind != .Table_Not_Found do return err
+	// A missing terms table is not a failure here, but its error is still freed.
+	if err := tx_drop_table(tx, table.terms); err.kind != .None {
+		if err.kind != .Table_Not_Found do return err
+		error_free(&err)
+	}
 	for suffix in fts_shadow_suffixes(table.module) {
 		shadow := strings.concatenate({table.name, suffix}, tx.alloc)
 		if tx_table_probe(tx, shadow) == nil do continue

@@ -137,7 +137,10 @@ policy_load :: proc(tx: ^Tx, table: string) -> (Policy_Set, Error) {
 	rows := make([dynamic]Row)
 	defer delete(rows)
 	if collect_err := tx_collect(tx, POLICY_TABLE, &rows); collect_err.kind != .None {
-		if collect_err.kind == .Table_Not_Found do return set, ERROR_NONE
+		if collect_err.kind == .Table_Not_Found {
+			error_free(&collect_err)
+			return set, ERROR_NONE
+		}
 		return set, collect_err
 	}
 	for row in rows {

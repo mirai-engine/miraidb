@@ -442,7 +442,9 @@ copy_rows_to_text :: proc(tx: ^Tx, stmt: Copy_Stmt, alloc: mem.Allocator) -> (st
 	if collect_err := tx_collect(tx, stmt.table, &rows); collect_err.kind != .None {
 		return "", 0, collect_err
 	}
-	writer := copy_writer_make(stmt, names, alloc)
+	// The builder and each field's text live in the transaction's arena; only
+	// the finished text is cloned out. In `alloc` every field's text stayed.
+	writer := copy_writer_make(stmt, names, tx.alloc)
 	projected := make([]Value, len(positions), tx.alloc)
 	for row in rows {
 		for position, i in positions do projected[i] = row.values[position]
@@ -450,7 +452,6 @@ copy_rows_to_text :: proc(tx: ^Tx, stmt: Copy_Stmt, alloc: mem.Allocator) -> (st
 	}
 	text := strings.to_string(writer.builder)
 	text = strings.clone(text, alloc)
-	_ = writer
 	return text, len(rows), ERROR_NONE
 }
 

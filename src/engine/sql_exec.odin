@@ -978,7 +978,7 @@ sql_exec_set :: proc(store: ^Store, stmt: Set_Stmt, params: []Value, locked := f
 	if strings.equal_fold(stmt.name, "identity") {
 		coerced, coerce_err := value_coerce(value, Column_Type{kind = .Identity})
 		if coerce_err.kind != .None {
-			return {}, errf(.Invalid_Type, "SET identity needs a 32-byte hex string")
+			return {}, error_wrap(coerce_err, .Invalid_Type, "SET identity needs a 32-byte hex string")
 		}
 		store_set_identity(store, value_identity_of(coerced))
 		return Sql_Result{kind = .Ack, commit_seq = store.commit_seq}, ERROR_NONE
@@ -1174,7 +1174,12 @@ sql_exec_explain :: proc(tx: ^Tx, stmt: Explain_Stmt, params: []Value) -> (Sql_R
 				append(&lines, fmt.aprintf("join %s (nested loop, full scan, est. %d rows)", step.name, step.rows))
 				continue
 			}
-			if inner_table, inner_err := store_table(store, step.ref.name); inner_err.kind == .None {
+			// A view or CTE on the inner side is no stored table: that refusal only
+			// means no index can answer, and it is freed.
+			inner_table, inner_err := store_table(store, step.ref.name)
+			stored := inner_err.kind == .None
+			error_free(&inner_err)
+			if stored {
 				probe, probed := join_index_probe(inner_table, step.ref.alias, step.predicate)
 				if probed {
 					append(&lines, fmt.aprintf(
@@ -4772,7 +4777,11 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 
 	if stmt.is_distinct {
 		seen := make(map[string]bool)
-		defer delete(seen)
+		// The map owns the first row's key of each group.
+		defer {
+			for key in seen do delete(key)
+			delete(seen)
+		}
 		kept := make([dynamic]Output_Row, 0, len(output))
 		for row in output {
 			key := encode_output_key(distinct_key_values(&ctx, expanded, row.values))
@@ -5987,6 +5996,9 @@ value_cast :: proc(v: Value, target: Column_Type) -> (Value, Error) {
 	}
 	if coerced, coerce_err := value_coerce(v, target); coerce_err.kind == .None {
 		return coerced, ERROR_NONE
+	} else {
+		// The direct coercion failed; the fallbacks below answer instead.
+		error_free(&coerce_err)
 	}
 	if v.kind == .String {
 		if parsed, ok := value_parse_number(v.s); ok {
@@ -7471,7 +7483,8 @@ eval_scalar_minmax :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		}
 		if (want_min && order == .Less) || (!want_min && order == .Greater) do best = value
 	}
-	return value_clone(best, context.allocator), ERROR_NONE
+	// The answer lives in the statement's memory, like any call's (eval_call).
+	return value_clone(best, ctx.tx != nil ? ctx.tx.alloc : context.allocator), ERROR_NONE
 }
 
 eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
@@ -9449,6 +9462,7 @@ sql_exec_drop_table :: proc(tx: ^Tx, stmt: Drop_Table_Stmt) -> (Sql_Result, Erro
 	}
 	if drop_err := tx_drop_table(tx, stmt.name); drop_err.kind != .None {
 		if drop_err.kind == .Table_Not_Found && stmt.if_exists {
+			error_free(&drop_err)
 			return Sql_Result{kind = .Ack}, ERROR_NONE
 		}
 		return {}, drop_err

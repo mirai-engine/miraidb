@@ -798,7 +798,9 @@ array_parse_text :: proc(text: string, inner: Column_Type) -> (Value, Error) {
 		if coerce_err.kind != .None do return {}, coerce_err
 		append(&items, coerced)
 	}
-	list := make([]Value, len(items))
+	// The elements are already in temporary memory, like every coerced value a
+	// caller copies in; the list joins them there instead of staying in the heap.
+	list := make([]Value, len(items), context.temp_allocator)
 	copy(list, items[:])
 	return Value{kind = .Array, list = list}, ERROR_NONE
 }
