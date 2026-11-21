@@ -12,7 +12,8 @@ package generated
 
 // codegen_odin renders every user table as an Odin struct, in name order.
 codegen_odin :: proc(host: ^Host, alloc: mem.Allocator) -> string {
-	names := make([dynamic]string, 0, len(host.store.tables), alloc)
+	// Only the order is needed: the names stay the catalog's.
+	names := make([dynamic]string, 0, len(host.store.tables), context.temp_allocator)
 	for name in host.store.tables {
 		if len(name) > 0 && name[0] == '_' do continue
 		append(&names, name)

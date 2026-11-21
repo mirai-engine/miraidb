@@ -8,7 +8,8 @@ import "core:strings"
 // order and row order. Text is quoted and escaped; other kinds use the same
 // textual form the engine prints, which parses back as SQL.
 export_sql :: proc(host: ^Host, alloc: mem.Allocator) -> string {
-	names := make([dynamic]string, 0, len(host.store.tables), alloc)
+	// Only the order is needed: the names stay the catalog's.
+	names := make([dynamic]string, 0, len(host.store.tables), context.temp_allocator)
 	for name in host.store.tables {
 		if len(name) > 0 && name[0] == '_' do continue
 		append(&names, name)
@@ -37,8 +38,9 @@ value_sql_literal :: proc(v: Value) -> string {
 	case .Null, .Default:
 		return "NULL"
 	case .String:
-		escaped, _ := strings.replace_all(v.s, "'", "''")
-		return fmt.aprintf("'%s'", escaped)
+		// Written into the export at once: temporary, like the other kinds.
+		escaped, _ := strings.replace_all(v.s, "'", "''", context.temp_allocator)
+		return fmt.tprintf("'%s'", escaped)
 	case:
 		return value_format(v, context.temp_allocator)
 	}

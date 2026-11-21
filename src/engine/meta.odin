@@ -58,7 +58,8 @@ host_meta :: proc(host: ^Host, key: string) -> (string, bool) {
 // with its columns and indexes. It is the reflection source for clients and
 // for code generation.
 host_schema_text :: proc(host: ^Host, alloc: mem.Allocator) -> string {
-	names := make([dynamic]string, 0, len(host.store.tables), alloc)
+	// Only the order is needed: the names stay the catalog's.
+	names := make([dynamic]string, 0, len(host.store.tables), context.temp_allocator)
 	for name in host.store.tables {
 		if len(name) > 0 && name[0] == '_' do continue
 		append(&names, name)
