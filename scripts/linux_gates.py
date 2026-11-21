@@ -9,7 +9,7 @@ makes that slow; the copy is also a clean tree, nothing a Windows build left.
     python3 scripts/linux_gates.py tests --odin /opt/odin/odin
     python3 scripts/linux_gates.py processes --odin /opt/odin/odin
 
-`tests` fails on a failing test or on a bad free the runner reports; it prints
+`tests` fails on a failing test or on a bad free or leak the runner reports; it prints
 the runner's random seed with the failures, so a failure can be run again.
 `processes` builds libsqlite3_miraidb.so and runs scripts/sqlite_processes.py
 with this Python, whose sqlite3 module then loads the facade.
@@ -47,15 +47,17 @@ def run_tests(odin: str, work: str) -> int:
     lines = output.splitlines()
     summary = [line for line in lines if line.startswith("Finished") or line.startswith(" - ")]
     bad_frees = [line for line in lines if "+++ bad free" in line]
+    # A leak the runner reports is a regression too: the suite runs with none.
+    leaks = [line for line in lines if "+++ leak" in line]
     seed = [line for line in lines if "random seed" in line]
-    for line in summary + bad_frees[:10]:
+    for line in summary + bad_frees[:10] + leaks[:10]:
         print(line)
-    if done.returncode != 0 or bad_frees:
+    if done.returncode != 0 or bad_frees or leaks:
         for line in seed:
             print(line)
         if not summary:
             print("\n".join(lines[-20:]))
-        print(f"linux tests: failed ({len(bad_frees)} bad free(s))")
+        print(f"linux tests: failed ({len(bad_frees)} bad free(s), {len(leaks)} leak(s))")
         return 1
     print("linux tests: ok")
     return 0

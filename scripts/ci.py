@@ -47,14 +47,14 @@ class Gate:
         name: str,
         command: list[str],
         env: dict[str, str] | None = None,
-        refuse: str | None = None,
+        refuse: tuple[str, ...] = (),
         timeout: float = GATE_TIMEOUT_SECONDS,
     ):
         self.name = name
         self.command = command
         self.env = env or {}
-        # A line the output must not hold even when the command exits 0: the
-        # test runner reports a bad free and still passes the test.
+        # Lines the output must not hold even when the command exits 0: the
+        # test runner reports a bad free or a leak and still passes the test.
         self.refuse = refuse
         self.timeout = timeout
 
@@ -79,11 +79,10 @@ class Gate:
             return False, "\n".join(line for line in report if line), elapsed
         elapsed = time.time() - started
         output = (done.stdout + done.stderr).strip()
-        if self.refuse is not None:
-            refused = [line for line in output.splitlines() if self.refuse in line]
-            if refused:
-                report = [*refused[:10], f"{len(refused)} line(s) hold {self.refuse!r}"]
-                return False, "\n".join(report), elapsed
+        refused = [line for line in output.splitlines() if any(word in line for word in self.refuse)]
+        if refused:
+            report = [*refused[:10], f"{len(refused)} line(s) hold one of {self.refuse!r}"]
+            return False, "\n".join(report), elapsed
         return done.returncode == 0, output, elapsed
 
 
@@ -99,7 +98,7 @@ def build_gates(args: argparse.Namespace) -> list[Gate]:
     gates: list[Gate] = []
     if not args.skip_build:
         gates.append(Gate("build (binaries + suite)", [sys.executable, "scripts/build.py"], odin_env))
-    gates.append(Gate("unit tests", [args.odin, "test", "src/tests"], refuse="+++ bad free", timeout=900))
+    gates.append(Gate("unit tests", [args.odin, "test", "src/tests"], refuse=("+++ bad free", "+++ leak"), timeout=900))
     gates.append(
         Gate("conformance (20 cases)", [sys.executable, "scripts/conformance.py", "--bin", cli])
     )
