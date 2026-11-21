@@ -436,7 +436,10 @@ Ordered_Cursor :: struct {
 ip_cursor_step :: proc(cursor: ^Ordered_Cursor) -> bool {
 	for {
 		frame, load_err := page_load(cursor.op.file, cursor.page)
-		if load_err.kind != .None do return false
+		if load_err.kind != .None {
+			error_free(&load_err)
+			return false
+		}
 		next := page_header_decode(frame.data).next_free
 		page_release(cursor.op.file, frame, false)
 		if next == NO_PAGE_ID do return false
@@ -455,13 +458,19 @@ ip_cursor_step :: proc(cursor: ^Ordered_Cursor) -> bool {
 ordered_seek :: proc(op: ^Ordered_Pages, key: string) -> Ordered_Cursor {
 	cursor := Ordered_Cursor{op = op}
 	leaf, find_err := ip_find_leaf(op, key)
-	if find_err.kind != .None do return cursor
+	if find_err.kind != .None {
+		error_free(&find_err)
+		return cursor
+	}
 	scratch: [IP_SCRATCH]u8
 	cells: Ip_Cells
 	ip_cells_begin(&cells, scratch[:])
 	defer delete(cells.items)
 	frame, load_err := page_load(op.file, leaf)
-	if load_err.kind != .None do return cursor
+	if load_err.kind != .None {
+		error_free(&load_err)
+		return cursor
+	}
 	ip_cells_decode(&cells, frame.data)
 	position := ip_lower_bound(&cells, key)
 	page_release(op.file, frame, false)
@@ -488,7 +497,10 @@ ordered_next :: proc(cursor: ^Ordered_Cursor) -> bool {
 ordered_cursor_read :: proc(cursor: ^Ordered_Cursor, buf: []u8) -> (key: string, value: u64, ok: bool) {
 	if !cursor.valid do return "", 0, false
 	frame, load_err := page_load(cursor.op.file, cursor.page)
-	if load_err.kind != .None do return "", 0, false
+	if load_err.kind != .None {
+		error_free(&load_err)
+		return "", 0, false
+	}
 	defer page_release(cursor.op.file, frame, false)
 	if int(cursor.slot) >= int(page_header_decode(frame.data).slots) do return "", 0, false
 	off, length := page_slot_get(frame.data, cursor.slot)
@@ -805,9 +817,15 @@ ordered_put :: proc(op: ^Ordered_Pages, key: string, value: u64) -> Error {
 // that loses its last cell stays in the chain, and the cursor walks past it.
 ordered_remove :: proc(op: ^Ordered_Pages, key: string) -> bool {
 	leaf, find_err := ip_find_leaf(op, key)
-	if find_err.kind != .None do return false
+	if find_err.kind != .None {
+		error_free(&find_err)
+		return false
+	}
 	frame, load_err := page_load(op.file, leaf)
-	if load_err.kind != .None do return false
+	if load_err.kind != .None {
+		error_free(&load_err)
+		return false
+	}
 	scratch: [IP_SCRATCH]u8
 	cells: Ip_Cells
 	ip_cells_begin(&cells, scratch[:])

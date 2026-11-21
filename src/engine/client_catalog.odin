@@ -75,7 +75,10 @@ host_client_catalog :: proc(
 
 host_client_count_catalog :: proc(host: ^Host) -> int {
 	result, query_err := sql_execute(host.store, "SELECT count(*) FROM _client")
-	if query_err.kind != .None do return 0
+	if query_err.kind != .None {
+		error_free(&query_err)
+		return 0
+	}
 	defer sql_result_destroy(&result)
 	if len(result.rows) == 0 do return 0
 	return int(result.rows[0][0].i)

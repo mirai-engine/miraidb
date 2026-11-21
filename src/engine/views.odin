@@ -109,7 +109,10 @@ view_sql :: proc(tx: ^Tx, name: string) -> (string, bool) {
 	if tx_table_probe(tx, VIEW_TABLE) == nil do return "", false
 	rows := make([dynamic]Row)
 	defer delete(rows)
-	if collect_err := tx_collect(tx, VIEW_TABLE, &rows); collect_err.kind != .None do return "", false
+	if collect_err := tx_collect(tx, VIEW_TABLE, &rows); collect_err.kind != .None {
+		error_free(&collect_err)
+		return "", false
+	}
 	for row in rows {
 		if row.values[0].kind == .String && row.values[0].s == name {
 			if row.values[1].kind == .String do return row.values[1].s, true

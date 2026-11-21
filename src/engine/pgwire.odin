@@ -810,7 +810,10 @@ pg_describe_select :: proc(host: ^Host, sql: string) -> []u8 {
 	describe_sql := pg_neutralize_params(sql)
 	defer delete(describe_sql)
 	result, exec_err := sql_execute(host.store, describe_sql)
-	if exec_err.kind != .None do return pg_no_data()
+	if exec_err.kind != .None {
+		error_free(&exec_err)
+		return pg_no_data()
+	}
 	defer sql_result_destroy(&result)
 	if len(result.columns) == 0 do return pg_no_data()
 	oids := pg_column_oids(result.columns, result.rows)

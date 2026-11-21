@@ -9837,7 +9837,10 @@ range_key :: proc(
 	value, constant := eval_constant(value_expr, params)
 	if !constant do return {}, false
 	coerced, coerce_err := value_coerce(value, table.schema.columns[column_index].type)
-	if coerce_err.kind != .None do return {}, false
+	if coerce_err.kind != .None {
+		error_free(&coerce_err)
+		return {}, false
+	}
 	// An index cannot answer a collation the program replaced: it was folded
 	// by the built-in rule.
 	if column_host_collated(statement_store(), table.schema.columns[column_index]) do return {}, false
@@ -10043,9 +10046,15 @@ join_probe_rows :: proc(
 ) -> (rows: [dynamic]Row, ok: bool) {
 	ctx.sources = partial
 	value, eval_err := eval_expr(ctx, probe.value)
-	if eval_err.kind != .None do return nil, false
+	if eval_err.kind != .None {
+		error_free(&eval_err)
+		return nil, false
+	}
 	coerced, coerce_err := value_coerce(value, table.schema.columns[probe.column].type)
-	if coerce_err.kind != .None do return nil, false
+	if coerce_err.kind != .None {
+		error_free(&coerce_err)
+		return nil, false
+	}
 	if column_host_collated(tx.store, table.schema.columns[probe.column]) do return nil, false
 	if len(table.schema.columns[probe.column].collation) > 0 {
 		coerced = collate_ordered_value(coerced, table.schema.columns[probe.column].collation)
@@ -10096,7 +10105,10 @@ candidates_from_conjunct :: proc(
 		value, constant := eval_constant(value_expr, params)
 		if !constant do return nil, false
 		coerced, coerce_err := value_coerce(value, table.schema.columns[column_index].type)
-		if coerce_err.kind != .None do return nil, false
+		if coerce_err.kind != .None {
+			error_free(&coerce_err)
+			return nil, false
+		}
 		if column_host_collated(statement_store(), table.schema.columns[column_index]) do return nil, false
 		// The index folded the text, so the probe must fold it the same way.
 		if len(table.schema.columns[column_index].collation) > 0 {

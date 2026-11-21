@@ -67,7 +67,10 @@ host_get_module_variable :: proc(host: ^Host, key: string, alloc := context.allo
 
 host_module_variable_names :: proc(host: ^Host, alloc: mem.Allocator) -> []string {
 	result, query_err := sql_execute(host.store, "SELECT key FROM _var")
-	if query_err.kind != .None do return nil
+	if query_err.kind != .None {
+		error_free(&query_err)
+		return nil
+	}
 	defer sql_result_destroy(&result)
 	names := make([dynamic]string, 0, len(result.rows), alloc)
 	// Each name is copied into `alloc`: the result goes away on return.

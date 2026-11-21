@@ -1388,7 +1388,10 @@ table_snapshot :: proc(source: ^Table) -> ^Table {
 	if source.paged != nil {
 		schema := source.schema
 		clone, create_err := table_create(&schema)
-		if create_err.kind != .None do return nil
+		if create_err.kind != .None {
+			error_free(&create_err)
+			return nil
+		}
 		rows := make([dynamic]Row)
 		table_collect(source, &rows, max(u64))
 		defer table_collect_release(source, &rows)
@@ -1404,7 +1407,10 @@ table_snapshot :: proc(source: ^Table) -> ^Table {
 	}
 	schema := source.schema
 	clone, create_err := table_create(&schema)
-	if create_err.kind != .None do return nil
+	if create_err.kind != .None {
+		error_free(&create_err)
+		return nil
+	}
 	// table_create opened its own store; hand it to the source's instead.
 	row_store_release(clone.store)
 	clone.store = source.store

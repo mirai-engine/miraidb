@@ -885,7 +885,10 @@ page_rows_put :: proc(rows: ^Page_Rows, row_id: Row_Id, values: []Value) -> Erro
 @(private)
 page_rows_erase_slot :: proc(rows: ^Page_Rows, location: Row_Location) {
 	frame, load_err := page_load(rows.file, location.page)
-	if load_err.kind != .None do return
+	if load_err.kind != .None {
+		error_free(&load_err)
+		return
+	}
 	if page_delete_cell(frame.data, location.slot) {
 		if rows.rows > 0 do rows.rows -= 1
 	}
@@ -913,7 +916,10 @@ page_rows_get :: proc(rows: ^Page_Rows, row_id: Row_Id, alloc: mem.Allocator) ->
 	location, exists := page_rows_locate(rows, row_id)
 	if !exists do return {}, false
 	frame, load_err := page_load(rows.file, location.page)
-	if load_err.kind != .None do return {}, false
+	if load_err.kind != .None {
+		error_free(&load_err)
+		return {}, false
+	}
 	defer page_release(rows.file, frame, false)
 	offset, length := page_slot_get(frame.data, location.slot)
 	if length == 0 do return {}, false

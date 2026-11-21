@@ -1048,7 +1048,10 @@ host_join_walk_probe :: proc(walk: ^Join_Walk, level: int, probe: Join_Probe) ->
 	}
 	ctx.sources = walk.sources
 	value, eval_err := eval_expr(&ctx, probe.left)
-	if eval_err.kind != .None do return false
+	if eval_err.kind != .None {
+		error_free(&eval_err)
+		return false
+	}
 	// NULL never equals anything, so it matches no row.
 	if value.kind == .Null do return true
 	key := encode_output_key_alloc([]Value{value}, context.allocator)
@@ -1078,7 +1081,10 @@ host_join_emit :: proc(walk: ^Join_Walk) -> bool {
 	for join in walk.stmt.joins {
 		if join.on == nil do continue
 		value, eval_err := eval_expr(&ctx, join.on)
-		if eval_err.kind != .None do return false
+		if eval_err.kind != .None {
+			error_free(&eval_err)
+			return false
+		}
 		if !value_is_truthy(value) do return true
 	}
 	projected, matched, eval_err := host_project_sources(
@@ -1133,7 +1139,10 @@ host_agg_key :: proc(tx: ^Tx, stmt: Select_Stmt, source: Source) -> (key: string
 	defer bw_destroy(&w)
 	for expr in stmt.group_by {
 		value, eval_err := eval_expr(&ctx, expr)
-		if eval_err.kind != .None do return "", false
+		if eval_err.kind != .None {
+			error_free(&eval_err)
+			return "", false
+		}
 		value_encode_key(&w, value)
 	}
 	return strings.clone(string(bw_bytes(&w))), true
@@ -1149,7 +1158,10 @@ host_agg_matches :: proc(tx: ^Tx, stmt: Select_Stmt, source: Source) -> bool {
 	}
 	ctx.sources = []Source{source}
 	value, eval_err := eval_expr(&ctx, stmt.where_clause)
-	if eval_err.kind != .None do return false
+	if eval_err.kind != .None {
+		error_free(&eval_err)
+		return false
+	}
 	return value_is_truthy(value)
 }
 
@@ -1423,7 +1435,10 @@ host_apply_incremental_aggregate :: proc(
 		return false
 	}
 	policies, policy_err := policy_load(tx, stmt.from.name)
-	if policy_err.kind != .None do return false
+	if policy_err.kind != .None {
+		error_free(&policy_err)
+		return false
+	}
 	active := len(policies.using_exprs) > 0
 	policy_set_destroy(&policies)
 	if active do return false
@@ -1753,7 +1768,10 @@ host_apply_incremental_join :: proc(
 	for name_index in 0 ..< source_count {
 		name := name_index == 0 ? stmt.from.name : stmt.joins[name_index - 1].table.name
 		policies, policy_err := policy_load(tx, name)
-		if policy_err.kind != .None do return false
+		if policy_err.kind != .None {
+			error_free(&policy_err)
+			return false
+		}
 		active := len(policies.using_exprs) > 0
 		policy_set_destroy(&policies)
 		if active do return false
@@ -1943,7 +1961,10 @@ host_apply_incremental :: proc(
 	tx := tx_begin_read(host.store)
 	defer tx_end(tx)
 	policies, policy_err := policy_load(tx, entry.table)
-	if policy_err.kind != .None do return false
+	if policy_err.kind != .None {
+		error_free(&policy_err)
+		return false
+	}
 	defer policy_set_destroy(&policies)
 	if len(policies.using_exprs) > 0 do return false
 

@@ -79,7 +79,10 @@ store_token_key :: proc(store: ^Store) -> []u8 {
 	// check a token against.
 	if _, exists := store.tables[META_TABLE]; !exists {
 		result, create_err := sql_execute(store, META_SCHEMA_SQL)
-		if create_err.kind != .None do return nil
+		if create_err.kind != .None {
+			error_free(&create_err)
+			return nil
+		}
 		sql_result_destroy(&result)
 	}
 	if stored, found := store_meta(store, "token_key"); found {
