@@ -1070,3 +1070,67 @@ test_host_parts_leave_nothing :: proc(t: ^testing.T) {
 		testing.expectf(t, false, "bad free of %p at %v", entry.memory, entry.location)
 	}
 }
+
+@(test)
+test_casts_listeners_and_bindings_leave_nothing :: proc(t: ^testing.T) {
+	// A cast that falls back from the direct coercion dropped that refusal; two
+	// owners on one channel shared its name, and a channel left kept it; a
+	// bound text was copied twice; a failed migration kept its statement's
+	// error and each version's text; a module variable read pointed into a
+	// result already freed.
+	expect_nothing_left(t, .Memory, "_test_memory_casts", {
+		"SELECT CAST('7' AS INTEGER) + 1, CAST('2.5' AS REAL), CAST('t' AS BOOL)",
+	})
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	{
+		context.allocator = mem.tracking_allocator(&track)
+		store, open_err := db.store_open("", {persistent = false})
+		if !testing.expect(t, db.error_ok(open_err)) do return
+		db.store_listen(store, 1, "orders")
+		db.store_listen(store, 2, "ORDERS")
+		db.store_listen(store, 2, "orders")
+		testing.expect_value(t, len(store.listeners), 2)
+		testing.expect(t, db.store_unlisten(store, 1, "orders", false))
+
+		host := db.host_init(store)
+		testing.expect(t, db.error_ok(db.host_set_module_variable(host, "mode", "fast")))
+		value, found := db.host_get_module_variable(host, "mode", context.allocator)
+		testing.expect(t, found)
+		testing.expect(t, db.error_ok(db.host_set_module_variable(host, "other", "x")))
+		testing.expect_value(t, value, "fast")
+		delete(value)
+		names := db.host_module_variable_names(host, context.allocator)
+		testing.expect_value(t, len(names), 2)
+		for name in names do delete(name)
+		delete(names)
+
+		good := []db.Migration{{version = 2, sql = []string{"CREATE TABLE m1 (id INTEGER PRIMARY KEY)"}}}
+		applied, migrate_err := db.host_migrate(host, good)
+		testing.expect(t, db.error_ok(migrate_err))
+		testing.expect_value(t, applied, 1)
+		broken := []db.Migration{{version = 3, sql = []string{"CREATE TABLE m1 (id INTEGER PRIMARY KEY)"}}}
+		_, broken_err := db.host_migrate(host, broken)
+		testing.expect(t, !db.error_ok(broken_err))
+		db.error_free(&broken_err)
+		db.host_destroy(host)
+		db.store_close(store)
+
+		conn, conn_err := db.embed_open("", {persistent = false})
+		if !testing.expect(t, db.error_ok(conn_err)) do return
+		stmt := db.embed_prepare(conn, "SELECT ?, ?")
+		testing.expect(t, db.error_drop(db.embed_bind_text(stmt, 0, "Ada")))
+		testing.expect(t, db.error_drop(db.embed_bind_text(stmt, 0, "Grace")))
+		testing.expect(t, db.error_drop(db.embed_bind_blob(stmt, 1, []u8{1, 2, 3})))
+		db.embed_finalize(stmt)
+		db.embed_close(conn)
+		free_all(context.temp_allocator)
+	}
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "%d bytes left from %v", entry.size, entry.location)
+	}
+	for entry in track.bad_free_array {
+		testing.expectf(t, false, "bad free of %p at %v", entry.memory, entry.location)
+	}
+}

@@ -1,5 +1,7 @@
 package engine
 
+import "core:strings"
+
 // The client catalog is persisted data: one row per known client identity.
 // Credentials live in `_token`; this table records who a client is.
 CLIENT_TABLE :: "_client"
@@ -49,8 +51,17 @@ host_register_client :: proc(host: ^Host, identity: Identity, name: string) -> E
 	return insert_err
 }
 
-// host_client_catalog reads one client record.
-host_client_catalog :: proc(host: ^Host, identity: Identity) -> (name: string, created_us: i64, found: bool) {
+// host_client_catalog reads one client record. The name is copied into `alloc`:
+// the result it comes from is freed on return.
+host_client_catalog :: proc(
+	host: ^Host,
+	identity: Identity,
+	alloc := context.temp_allocator,
+) -> (
+	name: string,
+	created_us: i64,
+	found: bool,
+) {
 	result, query_err := sql_execute_params(
 		host.store,
 		"SELECT name, created_us FROM _client WHERE identity = ?",
@@ -59,7 +70,7 @@ host_client_catalog :: proc(host: ^Host, identity: Identity) -> (name: string, c
 	if query_err.kind != .None do return "", 0, false
 	defer sql_result_destroy(&result)
 	if len(result.rows) == 0 do return "", 0, false
-	return result.rows[0][0].s, result.rows[0][1].i, true
+	return strings.clone(result.rows[0][0].s, alloc), result.rows[0][1].i, true
 }
 
 host_client_count_catalog :: proc(host: ^Host) -> int {

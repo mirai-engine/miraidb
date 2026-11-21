@@ -1,6 +1,7 @@
 package engine
 
 import "core:mem"
+import "core:strings"
 
 // Module variables live in `_var` as key/value text. Unlike the process-local
 // `SET`/`SHOW` variables, they are committed data: a module can publish state
@@ -50,7 +51,9 @@ host_set_module_variable :: proc(host: ^Host, key, value: string) -> Error {
 	return insert_err
 }
 
-host_get_module_variable :: proc(host: ^Host, key: string) -> (string, bool) {
+// host_get_module_variable answers the value copied into `alloc`: the result it
+// is read from is freed before returning, and the text used to point into it.
+host_get_module_variable :: proc(host: ^Host, key: string, alloc := context.allocator) -> (string, bool) {
 	result, query_err := sql_execute_params(
 		host.store,
 		"SELECT value FROM _var WHERE key = ?",
@@ -59,7 +62,7 @@ host_get_module_variable :: proc(host: ^Host, key: string) -> (string, bool) {
 	if query_err.kind != .None do return "", false
 	defer sql_result_destroy(&result)
 	if len(result.rows) == 0 do return "", false
-	return result.rows[0][0].s, true
+	return strings.clone(result.rows[0][0].s, alloc), true
 }
 
 host_module_variable_names :: proc(host: ^Host, alloc: mem.Allocator) -> []string {
@@ -67,7 +70,8 @@ host_module_variable_names :: proc(host: ^Host, alloc: mem.Allocator) -> []strin
 	if query_err.kind != .None do return nil
 	defer sql_result_destroy(&result)
 	names := make([dynamic]string, 0, len(result.rows), alloc)
-	for row in result.rows do append(&names, row[0].s)
+	// Each name is copied into `alloc`: the result goes away on return.
+	for row in result.rows do append(&names, strings.clone(row[0].s, alloc))
 	slice_sort_strings(names[:])
 	return names[:]
 }

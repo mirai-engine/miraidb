@@ -3438,17 +3438,18 @@ test_module_variables :: proc(t: ^testing.T) {
 	defer cleanup_db(store, "modvars")
 
 	testing.expect(t, db.error_ok(db.host_set_module_variable(host, "mode", "fast")))
-	value, found := db.host_get_module_variable(host, "mode")
+	value, found := db.host_get_module_variable(host, "mode", context.temp_allocator)
 	testing.expect(t, found)
 	testing.expect_value(t, value, "fast")
 
 	testing.expect(t, db.error_ok(db.host_set_module_variable(host, "mode", "slow")))
-	value, found = db.host_get_module_variable(host, "mode")
+	value, found = db.host_get_module_variable(host, "mode", context.temp_allocator)
 	testing.expect(t, found)
 	testing.expect_value(t, value, "slow")
 
 	testing.expect(t, db.error_ok(db.host_set_module_variable(host, "region", "eu")))
-	names := db.host_module_variable_names(host, context.allocator)
+	names := db.host_module_variable_names(host, context.temp_allocator)
+	run_done(t, store, "SELECT key, value FROM _var")
 	testing.expect_value(t, len(names), 2)
 	testing.expect_value(t, names[0], "mode")
 	testing.expect_value(t, names[1], "region")

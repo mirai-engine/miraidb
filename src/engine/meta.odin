@@ -37,7 +37,9 @@ host_ensure_meta :: proc(host: ^Host) -> Error {
 }
 
 // store_meta reads one metadata value from a database, with or without a host.
-store_meta :: proc(store: ^Store, key: string) -> (string, bool) {
+// The value is copied into `alloc`: the result it comes from is freed on return,
+// and the text used to point into it.
+store_meta :: proc(store: ^Store, key: string, alloc := context.temp_allocator) -> (string, bool) {
 	result, query_err := sql_execute_params(
 		store,
 		"SELECT value FROM _meta WHERE key = ?",
@@ -46,12 +48,12 @@ store_meta :: proc(store: ^Store, key: string) -> (string, bool) {
 	if query_err.kind != .None do return "", false
 	defer sql_result_destroy(&result)
 	if len(result.rows) == 0 do return "", false
-	return result.rows[0][0].s, true
+	return strings.clone(result.rows[0][0].s, alloc), true
 }
 
 // host_meta reads one metadata value.
-host_meta :: proc(host: ^Host, key: string) -> (string, bool) {
-	return store_meta(host.store, key)
+host_meta :: proc(host: ^Host, key: string, alloc := context.temp_allocator) -> (string, bool) {
+	return store_meta(host.store, key, alloc)
 }
 
 // host_schema_text renders the user schema as plain text: one block per table
