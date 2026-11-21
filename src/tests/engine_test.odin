@@ -8873,6 +8873,11 @@ test_pragma_list_and_accepted_settings :: proc(t: ^testing.T) {
 	testing.expect_value(t, run_temp(t, store, "PRAGMA encoding").rows[0][0].s, "UTF-8")
 	testing.expect_value(t, run_temp(t, store, "PRAGMA foreign_keys").rows[0][0].i, i64(1))
 	testing.expect_value(t, run_temp(t, store, "PRAGMA journal_mode").rows[0][0].s, "delete")
+	// The locks are taken per transaction: SQLite's `normal`. Asking for
+	// `exclusive` answers the mode in effect instead of failing, as SQLite does
+	// when it cannot switch.
+	testing.expect_value(t, run_temp(t, store, "PRAGMA locking_mode").rows[0][0].s, "normal")
+	testing.expect_value(t, run_temp(t, store, "PRAGMA locking_mode = EXCLUSIVE").rows[0][0].s, "normal")
 	// fresh_db opens with durable = false, so the honest answer is OFF (0).
 	testing.expect_value(t, run_temp(t, store, "PRAGMA synchronous").rows[0][0].i, i64(0))
 	testing.expect_value(t, run_temp(t, store, "PRAGMA data_version").rows[0][0].i, i64(store.commit_seq))

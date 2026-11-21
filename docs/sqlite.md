@@ -132,12 +132,12 @@ SQLite build answers "no such function" for, as this engine does.
 
 The engine sorts the 63 names in the inventory into four classes:
 
-- **28 answer with data**: `application_id`, `cache_size`, `collation_list`,
+- **29 answer with data**: `application_id`, `cache_size`, `collation_list`,
   `compile_options`, `legacy_file_format`, `module_list`,
   `data_version`, `database_list`, `encoding`, `foreign_key_check`,
   `foreign_key_list`, `foreign_keys`, `freelist_count`, `function_list`,
   `index_info`, `index_list`, `integrity_check`, `journal_mode`,
-  `max_page_count`, `mmap_size`, `page_count`, `page_size`, `pragma_list`,
+  `locking_mode` (`normal`; a set answers the mode in effect), `max_page_count`, `mmap_size`, `page_count`, `page_size`, `pragma_list`,
   `quick_check`, `schema_version`, `sqlite_version`, `stats` (engine
   extension), `synchronous`, `table_info`, `table_list`, `table_xinfo`,
   `user_version`.
@@ -147,10 +147,10 @@ The engine sorts the 63 names in the inventory into four classes:
   `default_cache_size`, `fullfsync`, `full_column_names`, `hard_heap_limit`,
   `journal_size_limit`, `optimize`, `secure_delete`, `short_column_names`,
   `soft_heap_limit`, `threads`, `wal_autocheckpoint`, `wal_checkpoint`.
-- **11 are refused with a reason**, because accepting them would promise a
+- **10 are refused with a reason**, because accepting them would promise a
   guarantee the engine does not give: `case_sensitive_like`,
   `defer_foreign_keys`, `ignore_check_constraints`, `legacy_alter_table`,
-  `locking_mode`, `query_only`, `read_uncommitted`, `recursive_triggers`,
+  `query_only`, `read_uncommitted`, `recursive_triggers`,
   `reverse_unordered_selects`, `trusted_schema`, `writable_schema`.
 - **The rest are acknowledged** and answer the neutral value SQLite answers when
   there is nothing to give back: `incremental_vacuum`, `shrink_memory`,

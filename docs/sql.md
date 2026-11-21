@@ -830,11 +830,13 @@ Three of them do real work:
 Settings a client inspects answer what the engine actually does:
 `journal_mode` reports `delete` (there is no WAL; one commit is one durable
 record) or `memory` for an ephemeral log, `synchronous` reports — and changes —
-the log's durability, `cache_size` and `mmap_size` are `0`, `page_size` is the
-export's 4096, `page_count`/`freelist_count`/`data_version` are real numbers.
+the log's durability, `locking_mode` is `normal` (a set answers the mode in effect,
+as SQLite does when it cannot switch), `cache_size` and `mmap_size` are `0`, `page_size` is the
+page size of the SQLite form (the file's, 4096 by default; a set takes effect at
+`VACUUM` or on a database with no table), `page_count`/`freelist_count`/`data_version` are real numbers.
 Knobs that would change what a statement does (`query_only`,
 `read_uncommitted`, `recursive_triggers`, `defer_foreign_keys`,
-`ignore_check_constraints`, `legacy_alter_table`, `locking_mode`,
+`ignore_check_constraints`, `legacy_alter_table`,
 `case_sensitive_like`, `trusted_schema`, `reverse_unordered_selects`,
 `writable_schema`) answer on a read and are refused on a write. The remaining
 tuning-only names are accepted and answered neutrally, because the engine has no

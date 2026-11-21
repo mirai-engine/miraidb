@@ -220,7 +220,7 @@ PRAGMA_NAMES := []string{
 	"encoding",
 	"foreign_key_list", "foreign_keys", "function_list", "index_info", "index_list",
 	"incremental_vacuum", "legacy_file_format", "module_list",
-	"foreign_key_check", "integrity_check", "journal_mode", "mmap_size", "page_size",
+	"foreign_key_check", "integrity_check", "journal_mode", "locking_mode", "mmap_size", "page_size",
 	"freelist_count", "page_count", "pragma_list", "quick_check", "schema_version",
 	"shrink_memory", "soft_heap_limit64",
 	"sqlite_version", "stats",
@@ -251,7 +251,7 @@ PRAGMA_ACCEPTED := []string{
 // a read answers the truth and a write is an error.
 PRAGMA_REFUSED := []string{
 	"case_sensitive_like", "defer_foreign_keys", "ignore_check_constraints",
-	"legacy_alter_table", "locking_mode", "query_only", "read_uncommitted",
+	"legacy_alter_table", "query_only", "read_uncommitted",
 	"recursive_triggers", "reverse_unordered_selects", "trusted_schema",
 	"writable_schema",
 }
@@ -556,6 +556,12 @@ sql_exec_pragma :: proc(store: ^Store, body: string, locked: bool, tx: ^Tx = nil
 		// which is what SQLite does when it cannot switch.
 		mode := store.log.memory_mode || !store.persistent ? "memory" : "delete"
 		return pragma_single("journal_mode", pragma_text(mode), store.commit_seq), ERROR_NONE
+	case "locking_mode":
+		// A connection takes and drops the file's locks per transaction, which is
+		// SQLite's `normal`. Like journal_mode, a set answers the mode in effect
+		// rather than failing: SQLite itself answers that way when it cannot
+		// switch, and an application that asks for `exclusive` still runs.
+		return pragma_single("locking_mode", pragma_text("normal"), store.commit_seq), ERROR_NONE
 	case "synchronous":
 		if has_argument {
 			level, known := pragma_sync_level(argument)
