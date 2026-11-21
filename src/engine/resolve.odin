@@ -418,11 +418,14 @@ res_select :: proc(walk: ^Res_Walk, select: ^Select_Stmt, names: ^[dynamic]strin
 		}
 	}
 	if walk.err.kind != .None do return false
+	// The select list's aliases are names for what comes after it (WHERE,
+	// GROUP BY, HAVING, ORDER BY), not for the list itself: `SELECT a AS a FROM
+	// v, w` is as ambiguous as `SELECT a FROM v, w`, as SQLite reads it.
 	aliases := make([dynamic]string, 0, len(select.projections), context.temp_allocator)
 	for item in select.projections do if len(item.alias) > 0 do append(&aliases, item.alias)
-	scope.aliases = aliases[:]
 	append(&walk.scopes, scope)
 	defer pop(&walk.scopes)
+	res_star_ambiguous(walk, select, scope)
 
 	complete := true
 	for item in select.projections {
@@ -448,6 +451,7 @@ res_select :: proc(walk: ^Res_Walk, select: ^Select_Stmt, names: ^[dynamic]strin
 			if names != nil do for column in source.columns do append(names, column)
 		}
 	}
+	walk.scopes[len(walk.scopes) - 1].aliases = aliases[:]
 	for join in select.joins do res_expr(walk, join.on)
 	// A name in WHERE that no source has may be an alias of the select list:
 	// the reference becomes the projection's expression, as SQLite reads it.
@@ -480,6 +484,39 @@ res_item_name :: proc(item: Select_Item) -> string {
 @(private)
 res_source_named :: proc(source: Res_Source, name: string) -> bool {
 	return strings.equal_fold(name, source.name) || (len(source.alias) > 0 && strings.equal_fold(name, source.alias))
+}
+
+// res_star_ambiguous is SQLite's refusal of a bare `*` over one table named
+// twice with nothing to tell the two apart: its first column has two owners of
+// one name (`ambiguous column name: main.v.a`). Under the engine's names the
+// query reads both copies.
+@(private)
+res_star_ambiguous :: proc(walk: ^Res_Walk, select: ^Select_Stmt, scope: Res_Scope) {
+	if !walk.tx.store.sqlite_names || walk.err.kind != .None do return
+	bare_star := false
+	for item in select.projections {
+		if item.star {
+			bare_star = true
+			break
+		}
+		if item.expr != nil {
+			if star, ok := item.expr^.(Star_Expr); ok && len(star.table) == 0 {
+				bare_star = true
+				break
+			}
+		}
+	}
+	if !bare_star do return
+	for a, i in scope.sources {
+		if !a.known || !a.table || len(a.columns) == 0 do continue
+		for b in scope.sources[i + 1:] {
+			if !b.known || !b.table do continue
+			if !strings.equal_fold(a.name, b.name) do continue
+			if len(a.alias) > 0 || len(b.alias) > 0 do continue
+			walk.err = errf(.Column_Not_Found, "ambiguous column name: main.%s.%s", a.name, a.columns[0])
+			return
+		}
+	}
 }
 
 // res_column decides one column reference, innermost scope first.

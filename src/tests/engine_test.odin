@@ -8504,15 +8504,21 @@ test_ambiguous_column_at_prepare :: proc(t: ^testing.T) {
 	conn.store.sqlite_names = true
 	testing.expect(t, db.error_drop(db.embed_exec(conn, "CREATE TABLE v (a, b)")))
 	testing.expect(t, db.error_drop(db.embed_exec(conn, "CREATE TABLE w (a, c)")))
-	for sql in ([]string{"SELECT a FROM v, w", "SELECT a FROM v AS p, v AS q", "SELECT v.a FROM v, w WHERE a = 1", "SELECT rowid FROM v, w"}) {
+	// An alias equal to the ambiguous name hides nothing in its own select list,
+	// and one table named twice without an alias makes `*` ambiguous.
+	for sql in ([]string{"SELECT a FROM v, w", "SELECT a FROM v AS p, v AS q", "SELECT v.a FROM v, w WHERE a = 1", "SELECT rowid FROM v, w", "SELECT a AS a FROM v, w", "SELECT * FROM v, v"}) {
 		stmt := db.embed_prepare(conn, sql)
 		testing.expectf(t, stmt == nil, "%s was prepared", sql)
 		if stmt != nil do db.embed_finalize(stmt)
 		testing.expect(t, strings.has_prefix(db.embed_error(conn), "ambiguous column name: "))
 	}
+	// In SQLite's words, naming the table's first column.
+	star := db.embed_prepare(conn, "SELECT * FROM v, v")
+	testing.expect(t, star == nil)
+	testing.expect_value(t, db.embed_error(conn), "ambiguous column name: main.v.a")
 	testing.expect(t, db.error_drop(db.embed_exec(conn, "CREATE TABLE k (a PRIMARY KEY, n)")))
 	testing.expect(t, db.error_drop(db.embed_exec(conn, "CREATE TABLE o (oid, d)")))
-	for sql in ([]string{"SELECT a FROM v JOIN w USING (a)", "SELECT a FROM v NATURAL JOIN w", "SELECT b, c FROM v, w", "INSERT INTO k VALUES (1, 1) ON CONFLICT (a) DO UPDATE SET n = n + excluded.n", "SELECT oid FROM v, o"}) {
+	for sql in ([]string{"SELECT a FROM v JOIN w USING (a)", "SELECT a FROM v NATURAL JOIN w", "SELECT b, c FROM v, w", "INSERT INTO k VALUES (1, 1) ON CONFLICT (a) DO UPDATE SET n = n + excluded.n", "SELECT oid FROM v, o", "SELECT * FROM v AS p, v AS q", "SELECT b AS a FROM v ORDER BY a", "SELECT b AS x FROM v WHERE x = 1", "SELECT count(*) AS n FROM v HAVING n > 0"}) {
 		stmt := db.embed_prepare(conn, sql)
 		testing.expectf(t, stmt != nil, "%s: %s", sql, db.embed_error(conn))
 		if stmt != nil do db.embed_finalize(stmt)

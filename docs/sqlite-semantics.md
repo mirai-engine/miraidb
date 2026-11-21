@@ -39,11 +39,11 @@ function SQLite does not have (`no such function: f`) or a count of arguments
 its function does not take (`wrong number of arguments to function abs()`,
 read from SQLite 3.54.1's own functions by `scripts/function_table.py`), a
 second trigger of one name, and `RENAME TO` a name another table, view or index
-has. A bare column beside `min()` or `max()` reads the row they chose. Two
-cases are left: `SELECT *` over one table named twice without an alias, which
-SQLite refuses (`ambiguous column name: main.v.a`), and an alias equal to an
-ambiguous column (`SELECT a AS a FROM v, w`), which the engine refuses only
-when the row is read.
+has. A bare column beside `min()` or `max()` reads the row they chose. A `*`
+over one table named twice without an alias is refused as SQLite refuses it
+(`ambiguous column name: main.v.a`), and an alias of the select list names
+what comes after the list, not the list itself: `SELECT a AS a FROM v, w` is
+ambiguous, while `ORDER BY` and `WHERE` read the alias.
 
 SQLite's own tools found the rest of what this section lists as SQLite's
 (`scripts/sqlite_tools.py` runs sqldiff, dbhash and mptest on the facade):
