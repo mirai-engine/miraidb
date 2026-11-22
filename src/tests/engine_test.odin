@@ -15519,3 +15519,83 @@ test_an_index_keeps_the_rows_of_a_key_together :: proc(t: ^testing.T) {
 		}
 	}
 }
+
+@(test)
+test_a_rowid_equality_reads_the_row_directly :: proc(t: ^testing.T) {
+	// `rowid = k` reads the row by its id instead of evaluating the comparison on
+	// every row. It must answer exactly what the scan answered: each alias, a
+	// table whose INTEGER PRIMARY KEY is the rowid, a real column named rowid,
+	// rows the transaction staged, a value that is not an integer, a qualifier,
+	// and the rest of the WHERE.
+	store := fresh_db(t, "rowid_direct")
+	if store == nil do return
+	defer cleanup_db(store, "rowid_direct")
+	run_done(t, store, "CREATE TABLE p (v TEXT)")
+	run_done(t, store, "INSERT INTO p (v) VALUES ('one'), ('two'), ('three'), ('four')")
+	run_done(t, store, "CREATE TABLE k (id INTEGER PRIMARY KEY, v TEXT)")
+	run_done(t, store, "INSERT INTO k (id, v) VALUES (10, 'ten'), (20, 'twenty'), (30, 'thirty')")
+	run_done(t, store, "CREATE TABLE r (rowid INTEGER, v TEXT)")
+	run_done(t, store, "INSERT INTO r (rowid, v) VALUES (2, 'named two'), (1, 'named one')")
+	text_of :: proc(t: ^testing.T, store: ^db.Store, sql: string) -> string {
+		result := run_temp(t, store, sql)
+		builder := strings.builder_make(context.temp_allocator)
+		for row, i in result.rows {
+			if i > 0 do strings.write_byte(&builder, ',')
+			strings.write_string(&builder, row[0].s)
+		}
+		return strings.to_string(builder)
+	}
+	for alias in ([]string{"rowid", "_rowid_", "oid"}) {
+		testing.expect_value(t, text_of(t, store, fmt.tprintf("SELECT v FROM p WHERE %s = 2", alias)), "two")
+	}
+	testing.expect_value(t, text_of(t, store, "SELECT v FROM p WHERE rowid = 9"), "")
+	testing.expect_value(t, text_of(t, store, "SELECT v FROM p WHERE rowid = 0"), "")
+	testing.expect_value(t, text_of(t, store, "SELECT v FROM p WHERE rowid = -1"), "")
+	testing.expect_value(t, text_of(t, store, "SELECT v FROM p WHERE 3 = rowid"), "three")
+	testing.expect_value(t, text_of(t, store, "SELECT v FROM p AS x WHERE x.rowid = 1"), "one")
+	testing.expect_value(t, text_of(t, store, "SELECT v FROM p WHERE rowid = 2 AND v = 'two'"), "two")
+	testing.expect_value(t, text_of(t, store, "SELECT v FROM p WHERE rowid = 2 AND v = 'one'"), "")
+	testing.expect_value(t, text_of(t, store, "SELECT v FROM p WHERE rowid = 2.0"), "two")
+	testing.expect_value(t, text_of(t, store, "SELECT v FROM p WHERE rowid = 2.5"), "")
+	// A text is no rowid under the engine's rules: the shortcut leaves it to the
+	// scan, which answers as it always did.
+	testing.expect_value(t, text_of(t, store, "SELECT v FROM p WHERE rowid = '2'"), "")
+	params := run_params(t, store, "SELECT v FROM p WHERE rowid = ?", []db.Value{db.value_int(4)})
+	defer db.sql_result_destroy(&params)
+	testing.expect(t, len(params.rows) == 1 && params.rows[0][0].s == "four")
+	// The INTEGER PRIMARY KEY is the rowid: its value finds the row.
+	testing.expect_value(t, text_of(t, store, "SELECT v FROM k WHERE rowid = 20"), "twenty")
+	testing.expect_value(t, text_of(t, store, "SELECT v FROM k WHERE rowid = 2"), "")
+	// A real column named rowid is the column.
+	testing.expect_value(t, text_of(t, store, "SELECT v FROM r WHERE rowid = 2"), "named two")
+	// In a join a bare name may be another table's column: `oid` is o's column
+	// here, not p's rowid. A name qualified by the table is its rowid.
+	run_done(t, store, "CREATE TABLE o (oid INTEGER, c TEXT)")
+	run_done(t, store, "INSERT INTO o (oid, c) VALUES (7, 'x')")
+	testing.expect_value(t, text_of(t, store, "SELECT c FROM p, o WHERE p.v = 'two' AND oid = 7"), "x")
+	testing.expect_value(t, text_of(t, store, "SELECT c FROM p, o WHERE p.rowid = 3 AND oid = 7"), "x")
+	testing.expect_value(t, text_of(t, store, "SELECT c FROM p, o WHERE p.rowid = 9 AND oid = 7"), "")
+	// Rows the transaction staged are read as it sees them.
+	tx := db.tx_begin_write(store)
+	defer db.tx_rollback(tx)
+	staged := []string{"DELETE FROM p WHERE rowid = 1", "UPDATE p SET v = 'TWO' WHERE rowid = 2", "INSERT INTO p (v) VALUES ('five')", "INSERT INTO k (id, v) VALUES (40, 'forty')"}
+	for sql in staged {
+		result, err := db.sql_execute_in_tx(tx, sql)
+		testing.expectf(t, db.error_ok(err), "%s: %s", sql, err.message)
+		db.sql_result_destroy(&result)
+		db.error_free(&err)
+	}
+	in_tx :: proc(t: ^testing.T, tx: ^db.Tx, sql: string) -> string {
+		result, err := db.sql_execute_in_tx(tx, sql)
+		defer db.sql_result_destroy(&result)
+		defer db.error_free(&err)
+		testing.expectf(t, db.error_ok(err), "%s: %s", sql, err.message)
+		builder := strings.builder_make(context.temp_allocator)
+		for row in result.rows do strings.write_string(&builder, row[0].s)
+		return strings.to_string(builder)
+	}
+	testing.expect_value(t, in_tx(t, tx, "SELECT v FROM p WHERE rowid = 1"), "")
+	testing.expect_value(t, in_tx(t, tx, "SELECT v FROM p WHERE rowid = 2"), "TWO")
+	testing.expect_value(t, in_tx(t, tx, "SELECT v FROM p WHERE rowid = 5"), "five")
+	testing.expect_value(t, in_tx(t, tx, "SELECT v FROM k WHERE rowid = 40"), "forty")
+}

@@ -3961,6 +3961,17 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 				}
 			}
 			used_index = true
+		} else if rowid_ids, by_rowid := rowid_candidates(tx, base, exec.from.name, exec.from.alias, stmt.where_clause, params, len(stmt.joins) > 0); by_rowid {
+			defer delete(rowid_ids)
+			for id in rowid_ids {
+				tx.rows_scanned += 1
+				if row, exists := tx_get(tx, exec.from.name, id); exists {
+					one := make([]Source, 1, sources_alloc)
+					one[0] = Source{table = base, row = row, alias = exec.from.alias}
+					append(&partials, one)
+				}
+			}
+			used_index = true
 		} else if indexed_ids, indexed := index_candidates(tx, base, exec.from.name, exec.from.alias, stmt.where_clause, params); indexed {
 			defer delete(indexed_ids)
 			for id in indexed_ids {
@@ -9668,6 +9679,81 @@ sql_exec_drop_index :: proc(tx: ^Tx, stmt: Drop_Index_Stmt) -> (Sql_Result, Erro
 }
 
 // --- Index-assisted filtering ----------------------------------------------
+
+// rowid_candidates answers a WHERE that holds `rowid = k` (or `_rowid_`, `oid`)
+// among its conjuncts with the one row it names, read by its id: a scan used to
+// evaluate the comparison on every row, so a point read cost more than counting
+// the table. The WHERE is still evaluated on the row afterwards, as it is on any
+// candidate. A real column of that name is the column, not the rowid, as SQLite
+// reads it; a single-column INTEGER PRIMARY KEY is the rowid, and is looked up in
+// its index. A rowid that is not an integer, a table this transaction has written
+// (the key's index does not hold its staged rows) and a WITHOUT ROWID table are
+// left to the other paths. With a join, only a name qualified by this table is
+// its rowid: a bare `oid` may be a column of another table in the FROM.
+rowid_candidates :: proc(
+	tx: ^Tx,
+	table: ^Table,
+	table_name: string,
+	table_alias: string,
+	predicate: ^Expr,
+	params: []Value,
+	joined: bool,
+) -> (ids: [dynamic]Row_Id, used: bool) {
+	if predicate == nil || table == nil || table.schema.without_rowid do return nil, false
+	conjuncts := make([dynamic]^Expr, context.temp_allocator)
+	split_and(predicate, &conjuncts)
+	for expr in conjuncts {
+		binary, is_binary := expr^.(Binary_Expr)
+		if !is_binary || binary.op != .Eq do continue
+		qualifier, column_name, value_expr, _, ok := comparison_sides(binary)
+		if !ok || !rowid_alias_name(column_name) do continue
+		if joined && len(qualifier) == 0 do continue
+		if len(qualifier) > 0 && !strings.equal_fold(qualifier, table.schema.name) &&
+		   !(len(table_alias) > 0 && strings.equal_fold(qualifier, table_alias)) {
+			continue
+		}
+		if _, real := schema_column_index(&table.schema, column_name); real do continue
+		value, constant := eval_constant(value_expr, params)
+		if !constant do continue
+		key: i64
+		#partial switch value.kind {
+		case .Int:
+			key = value.i
+		case .Float:
+			if value.f != f64(i64(value.f)) do continue
+			key = i64(value.f)
+		case:
+			continue
+		}
+		ids = make([dynamic]Row_Id)
+		schema := &table.schema
+		if len(schema.primary_key) == 1 && schema.columns[schema.primary_key[0]].type.kind == .Int {
+			// The rowid is the key column: its index finds the row, unless this
+			// transaction staged rows the index does not hold yet.
+			if _, staged := tx.state.writes[table_name]; staged {
+				delete(ids)
+				return nil, false
+			}
+			if _, created := tx.state.created[table_name]; created {
+				delete(ids)
+				return nil, false
+			}
+			if id, found := table_find_int_key(table, key); found do append(&ids, id)
+			return ids, true
+		}
+		if key > 0 do append(&ids, Row_Id(key))
+		return ids, true
+	}
+	return nil, false
+}
+
+// table_find_int_key is the row whose single-column INTEGER PRIMARY KEY is `key`.
+@(private)
+table_find_int_key :: proc(table: ^Table, key: i64) -> (Row_Id, bool) {
+	values := make([]Value, len(table.schema.columns), context.temp_allocator)
+	values[table.schema.primary_key[0]] = value_int(key)
+	return table_find_primary_key(table, values)
+}
 
 // index_candidates tries to turn the WHERE clause into a small set of row ids
 // using a single-column index. The caller still re-checks the whole predicate,
