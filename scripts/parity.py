@@ -126,7 +126,9 @@ def main() -> int:
         if ref and value > ref:
             above_target.append(short)
 
-    print(f"parity: {len(now) - len(above_target)} of {len(now)} workloads at or under the reference; "
+    # The SQL workloads have no reference figure: they are held to the baseline only.
+    compared = [name for name in now if reference.get(name)]
+    print(f"parity: {len(compared) - len(above_target)} of {len(compared)} workloads at or under the reference; "
           f"{len(regressions)} slower than the baseline")
     if args.record:
         baseline["engine_ns"] = {name: round(value) for name, value in sorted(now.items())}

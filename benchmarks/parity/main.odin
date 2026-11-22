@@ -349,6 +349,40 @@ table_suite :: proc(store: ^db.Store, shape: Shape, prefix: string) {
 	}
 }
 
+// sql_suite measures what a statement costs through SQL, which the reference's
+// suite does not have: the parse, the plan and the executor around the same
+// table. There is no reference number for these; the parity gate holds them to
+// this engine's own baseline.
+sql_suite :: proc(store: ^db.Store, prefix: string) {
+	exec(store, "CREATE TABLE sql_t (id UINT4 NOT NULL, age UBIGINT NOT NULL, name TEXT NOT NULL)")
+	exec(store, "CREATE UNIQUE INDEX sql_t_id ON sql_t (id)")
+	for i in 0 ..< 256 do exec(store, fmt.tprintf("INSERT INTO sql_t VALUES (%d, %d, 'name%d')", i, i * 3, i))
+	b := Bench{store = store, name = "sql_t"}
+	measure(fmt.aprintf("%s/sql/select_1", prefix), 2000, &b, nil, proc(data: rawptr) {
+		sql_run((^Bench)(data).store, "SELECT 1")
+	})
+	measure(fmt.aprintf("%s/sql/point_rowid/count=256", prefix), 2000, &b, nil, proc(data: rawptr) {
+		sql_run((^Bench)(data).store, "SELECT * FROM sql_t WHERE rowid = 77")
+	})
+	measure(fmt.aprintf("%s/sql/point_index/count=256", prefix), 2000, &b, nil, proc(data: rawptr) {
+		sql_run((^Bench)(data).store, "SELECT * FROM sql_t WHERE id = 77")
+	})
+	measure(fmt.aprintf("%s/sql/count/count=256", prefix), 2000, &b, nil, proc(data: rawptr) {
+		sql_run((^Bench)(data).store, "SELECT count(*) FROM sql_t")
+	})
+}
+
+// sql_run runs one statement and drops its answer; a failure stops the suite.
+sql_run :: proc(store: ^db.Store, sql: string) {
+	result, err := db.sql_execute(store, sql)
+	defer db.sql_result_destroy(&result)
+	defer db.error_free(&err)
+	if !db.error_ok(err) {
+		fmt.eprintfln("parity: %s: %s", sql, err.message)
+		os.exit(1)
+	}
+}
+
 main :: proc() {
 	mode := "mem"
 	as_json := false
@@ -387,6 +421,7 @@ main :: proc() {
 	measure(fmt.aprintf("%s/empty", prefix), 5000, &b, nil, bench_empty)
 	table_suite(store, .U32_U64_Str, prefix)
 	table_suite(store, .U32_U64_U64, prefix)
+	sql_suite(store, prefix)
 
 	if as_json {
 		builder := strings.builder_make()

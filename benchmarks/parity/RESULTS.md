@@ -301,6 +301,43 @@ An insert's time is not where R1's item put it. 256 inserts into a map are
 commit of a table with an index per column 575 µs against 306 µs with one. Both
 are the index keys, R2's item. The baseline is recorded again with R1's numbers.
 
+## The SQL path (2026-11-22)
+
+The reference's suite reads and writes through its table API; a statement through
+`sql_execute` was not measured at all. This suite now adds four SQL workloads over
+a 256-row table with a unique index (`sql/select_1`, `sql/point_rowid`,
+`sql/point_index`, `sql/count`), held to the baseline like the rest, with no
+reference figure beside them. Three costs stood out:
+
+- **Every parse reserved and released a virtual arena**, two system calls, about
+  11 µs of a `SELECT 1`. The parser now takes its arena from a pool of sixteen
+  and gives it back emptied (`query_arena_take`, `query_arena_give`).
+- **`WHERE rowid = k` scanned the table**, evaluating the comparison on every
+  row. A conjunct that names the rowid (`rowid`, `_rowid_`, `oid`, or a
+  single-column INTEGER PRIMARY KEY) now reads the one row it names
+  (`rowid_candidates`); the WHERE is still evaluated on it.
+- **A scan allocated one small list of sources per row** on the heap and freed
+  each in one of some forty places, then sorted the rows by id although a scan
+  already yields them in that order. The lists now live in one pooled arena per
+  statement, and the sort runs only when the rows are out of order.
+
+Before and after, interleaved six times, best run, in µs (the tables are 256
+rows, `u` is 2 048):
+
+| Statement | Before | After | Change |
+|---|---:|---:|---:|
+| `SELECT 1` | 21.7 | 5.6 | −74% |
+| `SELECT * FROM t WHERE rowid = 7` | 137.6 | 11.7 | −92% |
+| `SELECT * FROM t WHERE id = 7` (unique index) | 31.4 | 12.6 | −60% |
+| `SELECT count(*) FROM t` | 84.1 | 36.2 | −57% |
+| `SELECT count(*) FROM u` | 564.5 | 275.9 | −51% |
+| `SELECT count(*) FROM u WHERE age > 10` | 876.5 | 672.5 | −23% |
+| `SELECT id FROM u WHERE age = 30` | 868.1 | 597.5 | −31% |
+
+What a filtered scan spends now is mostly the WHERE itself, about 0.2 µs a row
+for one comparison. The baseline is recorded again; the table workloads came out
+2–6% under their previous numbers, within what a day moves this machine.
+
 To reproduce:
 
 ```sh
