@@ -15599,3 +15599,73 @@ test_a_rowid_equality_reads_the_row_directly :: proc(t: ^testing.T) {
 	testing.expect_value(t, in_tx(t, tx, "SELECT v FROM p WHERE rowid = 5"), "five")
 	testing.expect_value(t, in_tx(t, tx, "SELECT v FROM k WHERE rowid = 40"), "forty")
 }
+
+@(test)
+test_a_prune_visits_only_the_rows_a_commit_touched :: proc(t: ^testing.T) {
+	// A prune walked every row of every table. It now visits the rows that hold a
+	// version or are a tombstone: a commit to one table never visits another, and
+	// what an older read still needs is kept until a later prune.
+	store := fresh_db(t, "prune_touched")
+	if store == nil do return
+	defer cleanup_db(store, "prune_touched")
+	run_done(t, store, "CREATE TABLE big (v INTEGER)")
+	run_done(t, store, "CREATE TABLE small (v INTEGER)")
+	builder := strings.builder_make(context.temp_allocator)
+	strings.write_string(&builder, "INSERT INTO big (v) VALUES ")
+	for i in 0 ..< 500 {
+		if i > 0 do strings.write_byte(&builder, ',')
+		fmt.sbprintf(&builder, "(%d)", i)
+	}
+	run_done(t, store, strings.to_string(builder))
+	run_done(t, store, "INSERT INTO small (v) VALUES (1), (2), (3)")
+	versions_of :: proc(table: ^db.Table) -> int {
+		total := 0
+		for row in table.rows do total += len(row.versions)
+		return total
+	}
+
+	// Inserts leave no history: the prune has nothing to visit.
+	db.store_prune_history(store)
+	testing.expect_value(t, store.tables["big"].prune_visited, 0)
+
+	run_done(t, store, "UPDATE big SET v = v + 1")
+	db.store_prune_history(store)
+	big := store.tables["big"]
+	testing.expect_value(t, big.prune_visited, 500)
+	testing.expect_value(t, len(big.history), 0)
+	testing.expect_value(t, versions_of(big), 0)
+
+	// A commit to one table does not visit the other.
+	run_done(t, store, "UPDATE small SET v = 9 WHERE v = 2")
+	db.store_prune_history(store)
+	testing.expect_value(t, store.tables["big"].prune_visited, 500)
+	testing.expect_value(t, store.tables["small"].prune_visited, 1)
+	testing.expect_value(t, versions_of(store.tables["small"]), 0)
+
+	// A deleted row leaves the slice; the rows after it keep their order.
+	run_done(t, store, "DELETE FROM small WHERE v = 1")
+	db.store_prune_history(store)
+	small := store.tables["small"]
+	testing.expect_value(t, len(small.rows), 2)
+	testing.expect_value(t, len(small.history), 0)
+	if len(small.rows) == 2 do testing.expect(t, small.rows[0].id < small.rows[1].id)
+	answer := run_temp(t, store, "SELECT v FROM small ORDER BY rowid")
+	testing.expect_value(t, len(answer.rows), 2)
+	if len(answer.rows) == 2 {
+		testing.expect_value(t, answer.rows[0][0].i, 9)
+		testing.expect_value(t, answer.rows[1][0].i, 3)
+	}
+
+	// History an older read can still ask for survives a prune before it, and
+	// goes with the next one.
+	before := store.commit_seq
+	run_done(t, store, "UPDATE small SET v = 10 WHERE v = 3")
+	db.store_prune_versions(store, before)
+	small = store.tables["small"]
+	testing.expect_value(t, len(small.history), 1)
+	testing.expect_value(t, versions_of(small), 1)
+	db.store_prune_history(store)
+	small = store.tables["small"]
+	testing.expect_value(t, len(small.history), 0)
+	testing.expect_value(t, versions_of(small), 0)
+}

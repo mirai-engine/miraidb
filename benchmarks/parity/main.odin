@@ -167,8 +167,8 @@ clear_table :: proc(store: ^db.Store, name: string) {
 	}
 	_ = db.tx_commit(tx)
 	// Row history is kept for `AS OF` until the embedder says it keeps none, as
-	// the CLI and the C ABI do after every statement. The reference keeps no
-	// history, so neither does this run.
+	// the CLI does after every statement. The reference keeps no history, so
+	// neither does this run.
 	db.store_prune_history(store)
 }
 

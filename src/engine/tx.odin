@@ -665,8 +665,8 @@ tx_discard :: proc(tx: ^Tx) {
 	pinned_seq := tx.pinned_seq
 	// Row history is kept by default: a caller may pin a read to an older sequence
 	// at any time, and a pin nobody announced yet would find the history gone. A
-	// caller that knows it keeps no history - the CLI, the ABI - calls
-	// store_prune_history itself.
+	// caller that knows it keeps no history - the CLI - calls store_prune_history
+	// itself; the C ABI does not yet (D3).
 	store := tx.store
 	if tx.locked {
 		if tx.read_only {

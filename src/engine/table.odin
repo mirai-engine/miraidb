@@ -427,6 +427,13 @@ Table :: struct {
 	// cost a hash and an 80-byte copy per row read, and a scan had to walk a
 	// separate list of ids beside it.
 	rows:            [dynamic]Row,
+	// history holds the id of every row that keeps a version or is a tombstone,
+	// once each: the only rows a prune has anything to drop from (R3). A prune
+	// walked every row of every table after each statement; it now visits these.
+	history:         [dynamic]Row_Id,
+	// prune_visited counts the rows prunes of this table looked at, so a test can
+	// tell a prune that visited only what changed from one that walked the table.
+	prune_visited:   u64,
 	// key_scratch is where index_entry_key encodes a key before copying it into
 	// the arena at its exact length. Every caller mutates the table, which only
 	// the writer (or the transaction that owns a private table) does, so one
@@ -549,6 +556,7 @@ table_destroy :: proc(t: ^Table) {
 		table_free_row(row)
 	}
 	delete(t.rows)
+	delete(t.history)
 	for i in 0 ..< len(t.indexes) {
 		index_tree_free(&t.indexes[i].tree)
 		table_index_map_free(t, i)
@@ -618,12 +626,18 @@ row_values_at :: proc(row: Row, seq: u64) -> ([]Value, bool) {
 }
 
 // table_prune_versions drops history that no reader at `before_seq` or later
-// can ask for, and removes tombstones older than that.
+// can ask for, and removes tombstones older than that. It visits the rows in
+// `history` only; the slice is compacted from the first tombstone that leaves,
+// so a commit that deleted nothing moves no row.
 table_prune_versions :: proc(t: ^Table, before_seq: u64) {
-	// One pass: each row drops the history no reader can ask for, and a tombstone
-	// older than `before_seq` leaves the slice, which keeps its order.
+	if len(t.history) == 0 do return
 	kept := 0
-	for &row in t.rows {
+	first_gone := len(t.rows)
+	for id in t.history {
+		at := table_row_index(t, id)
+		if at < 0 do continue
+		t.prune_visited += 1
+		row := &t.rows[at]
 		write := 0
 		for version in row.versions {
 			if version.deleted_seq != 0 && version.deleted_seq <= before_seq {
@@ -641,12 +655,29 @@ table_prune_versions :: proc(t: ^Table, before_seq: u64) {
 			// of the process (tools/leakcheck counted 48 bytes per statement).
 			free_values(row.values)
 			delete(row.versions)
+			row.values = nil
+			row.versions = nil
+			first_gone = min(first_gone, at)
 			continue
 		}
-		t.rows[kept] = row
-		kept += 1
+		if len(row.versions) > 0 || row.deleted_seq != 0 {
+			t.history[kept] = id
+			kept += 1
+		}
 	}
-	resize(&t.rows, kept)
+	resize(&t.history, kept)
+	if first_gone == len(t.rows) do return
+	// Every tombstone old enough was in the list and is freed: the slice keeps
+	// the rest, in order.
+	write := first_gone
+	for i in first_gone ..< len(t.rows) {
+		t.prune_visited += 1
+		row := t.rows[i]
+		if row.deleted_seq != 0 && row.deleted_seq <= before_seq do continue
+		t.rows[write] = row
+		write += 1
+	}
+	resize(&t.rows, write)
 }
 
 // schema_normalize adds the implicit unique indexes for the primary key and for
@@ -1399,6 +1430,7 @@ table_update :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
 	}
 	// The current values become a version, so a reader that started earlier
 	// keeps its view.
+	if len(row.versions) == 0 do append(&t.history, id)
 	append(&row.versions, Row_Version {
 		values = row.values,
 		created_seq = row.created_seq,
@@ -1444,6 +1476,7 @@ table_delete :: proc(t: ^Table, id: Row_Id) -> bool {
 	// Tombstone instead of erasing: the live values stay owned by the row and are
 	// visible to snapshots taken before this sequence, so no extra version is
 	// recorded (that would share the values and double free them).
+	if len(row.versions) == 0 && row.deleted_seq == 0 do append(&t.history, id)
 	row.deleted_seq = t.apply_seq
 	return true
 }
@@ -1475,6 +1508,7 @@ table_truncate :: proc(t: ^Table) {
 		table_free_row(row)
 	}
 	clear(&t.rows)
+	clear(&t.history)
 	for _, i in t.indexes {
 		index_tree_free(&t.indexes[i].tree)
 		rbtree.init_cmp(&t.indexes[i].tree, index_cmp)
@@ -1625,6 +1659,7 @@ table_cow_clone :: proc(source: ^Table) -> ^Table {
 	clone.borrowed = false
 	source.borrowed = true
 	if !owning do return clone
+	clear(&source.history)
 	for &row in source.rows {
 		for version in row.versions do free_values(version.values)
 		delete(row.versions)
