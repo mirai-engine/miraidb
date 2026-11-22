@@ -9,7 +9,11 @@ of three by less) and compares it with benchmarks/parity/baseline.json:
 
   * a workload more than 15% slower than its baseline fails the gate, with
     0.2 us of slack for the ones that take well under a microsecond, where the
-    timer's step is a tenth of one;
+    timer's step is a tenth of one. The machine has slow stretches that move
+    every run of a measurement at once (up to +19% for an unchanged build), so a
+    workload over its baseline is measured again and keeps its better number: a
+    regression of the code survives that, a slow stretch does not. The
+    regressions this gate is for were 24-41%;
   * the reference's and SQLite's numbers, measured on the same machine on
     2026-11-19, are printed beside each one with the ratio; how many workloads
     are still slower than the reference is reported (the target is 1x or
@@ -43,6 +47,11 @@ def build(odin: str, out: str) -> None:
                           cwd=ROOT, capture_output=True, text=True)
     if done.returncode != 0:
         raise SystemExit(f"parity: build failed\n{done.stdout}{done.stderr}")
+
+
+def over(value: float, base: float | None) -> bool:
+    """Whether `value` is slower than the baseline allows."""
+    return bool(base) and value > max(base * (1 + TOLERANCE), base + SLACK_NS)
 
 
 def measure(binary: str, runs: int) -> dict[str, float]:
@@ -85,6 +94,14 @@ def main() -> int:
 
     baseline = json.load(open(BASELINE, encoding="utf-8"))
     engine = baseline["engine_ns"]
+    if not args.record and any(over(now[name], engine.get(name)) for name in now):
+        # The machine has slow stretches (a background load) that move every run
+        # of one measurement together: best-of-five did not remove a +14% one.
+        # A regression of the code is still there when measured again; a slow
+        # stretch is not. Each workload keeps its better measurement.
+        print("parity: a workload is over its baseline; measuring again")
+        again = measure(binary, args.runs)
+        now = {name: min(value, again.get(name, value)) for name, value in now.items()}
     reference = baseline["reference_ns"]
     sqlite = baseline["sqlite_ns"]
     missing = sorted(set(engine) - set(now))
@@ -104,7 +121,7 @@ def main() -> int:
         ratio = f"{value / ref:5.1f}x" if ref else "     -"
         short = name.removeprefix("miraidb/mem/")
         print(f"{short:58} {value / 1000:9.2f} {base / 1000 if base else 0:9.2f} {change:>7} {ref / 1000 if ref else 0:8.2f} {ratio:>6}")
-        if base and value > max(base * (1 + TOLERANCE), base + SLACK_NS):
+        if over(value, base):
             regressions.append(f"{short}: {value / 1000:.2f} us against {base / 1000:.2f} us")
         if ref and value > ref:
             above_target.append(short)

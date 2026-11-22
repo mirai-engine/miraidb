@@ -235,7 +235,12 @@ check allocates again.
 `scripts/parity.py` is a gate of `scripts/ci.py`: it builds this suite with
 `-o:speed`, runs it in memory three times and fails when a workload's best median
 is more than 15% over `baseline.json` (with 0.2 µs of slack for the ones under a
-microsecond). The baseline is this machine's: `--record` writes the median of
+microsecond). A workload over its baseline is measured again first and keeps its
+better number: the machine has slow stretches that move every run of one
+measurement together (+19% once, for an unchanged build, which best-of-five did
+not remove), and a regression of the code is still there the second time. A
+CPU-only calibration loop beside the workloads did not move at all while they
+did, so the stretches are not the clock and cannot be divided out. The baseline is this machine's: `--record` writes the median of
 five rounds of best-of-three, a typical good run rather than the luckiest, which
 one round had made a workload sit 13–15% over its baseline on ordinary runs. A
 change that makes a workload faster records the new number, so the gain is held.
