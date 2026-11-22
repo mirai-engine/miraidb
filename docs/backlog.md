@@ -30,7 +30,7 @@ Rules for this file:
 | Item | Today | Gap | Effort |
 |---|---|---|---|
 | R1 | closed: rows live in one slice in id order, a scan walks it | — | — |
-| R2 | every index entry is an encoded string | fixed-size keys where the column allows | M |
+| R2 | a memory index files the rows of a key under one entry; keys are encoded strings | the write path's keys: one encoding per check, fixed-size keys where the column allows | M |
 | R3 | pruning walks every row of every table after each statement | prune what the commit touched | S |
 | R4 | a committed row is copied from the transaction arena to the table | hand the staged row over | M |
 | D2 | overlap on an `rtree` table is a scan | node pages and a descent | M |
@@ -89,9 +89,14 @@ index entries at commit, which is R2.
 
 ## R2 — Fixed-size index keys
 
-**Now.** Every index entry is a key encoded into a string (`index_entry_key`),
-compared byte by byte, and copied into the table arena on apply: the largest
-share of applying a row, and the cost of an index filter. Measured for 256 rows:
+**Now.** A memory index keeps one entry per distinct key, holding its rows in id
+order (`Index_Slot`): an equality lookup that meets 256 rows walks one node and
+copies its ids, where it walked 256 nodes of the tree. The filter workloads went
+from 8.3–8.8 to 2.7–2.8 µs (the reference: 3.25 and 3.28), and an insert into a
+table with an index per column 13–20% down, interleaved against the build
+before. A UNIQUE key without NULL belongs to one row, so it is still filed in one
+descent. Keys are still encoded strings, compared byte by byte and copied into
+the table arena once per distinct key. Measured for 256 rows, before that:
 staging with one UNIQUE index costs 377 µs against 154 µs with none (the key is
 encoded and probed for every row), and the commit of a table with one index per
 column 575 µs against 306 µs with one.
