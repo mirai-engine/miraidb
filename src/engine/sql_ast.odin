@@ -2,6 +2,7 @@ package engine
 
 import "core:mem"
 import "core:mem/virtual"
+import "core:sync"
 
 // --- Expressions -----------------------------------------------------------
 
@@ -905,8 +906,54 @@ Query :: struct {
 }
 
 query_destroy :: proc(q: ^Query) {
-	virtual.arena_destroy(&q.arena)
+	query_arena_give(&q.arena)
 	q^ = {}
+}
+
+// A parse used to reserve a fresh virtual arena from the OS and give it back when
+// the query was destroyed: two system calls in every statement, most of what
+// parsing `SELECT 1` cost. The arenas are kept in a small pool instead, as the
+// transactions' are. The pool is a fixed array behind a mutex: nothing in it grows
+// through the allocator of whoever parsed first.
+QUERY_ARENA_POOL :: 16
+
+@(private)
+query_arena_pool: [QUERY_ARENA_POOL]virtual.Arena
+@(private)
+query_arena_count: int
+@(private)
+query_arena_mutex: sync.Mutex
+
+// query_arena_take hands out an empty arena: a pooled one, or a new one.
+query_arena_take :: proc(arena: ^virtual.Arena) -> bool {
+	sync.mutex_lock(&query_arena_mutex)
+	if query_arena_count > 0 {
+		query_arena_count -= 1
+		arena^ = query_arena_pool[query_arena_count]
+		query_arena_pool[query_arena_count] = {}
+		sync.mutex_unlock(&query_arena_mutex)
+		return true
+	}
+	sync.mutex_unlock(&query_arena_mutex)
+	return virtual.arena_init_growing(arena) == .None
+}
+
+// query_arena_give empties an arena and keeps it for the next parse, or releases
+// it when the pool is full. Emptying frees every block but the first and zeroes
+// what the query used of it, so nothing of one statement is readable by the next.
+query_arena_give :: proc(arena: ^virtual.Arena) {
+	if arena.curr_block == nil do return
+	virtual.arena_free_all(arena)
+	sync.mutex_lock(&query_arena_mutex)
+	if query_arena_count < QUERY_ARENA_POOL {
+		query_arena_pool[query_arena_count] = arena^
+		query_arena_count += 1
+		sync.mutex_unlock(&query_arena_mutex)
+		arena^ = {}
+		return
+	}
+	sync.mutex_unlock(&query_arena_mutex)
+	virtual.arena_destroy(arena)
 }
 
 // statement_name is the leading keyword of a statement, used by the CLI and by

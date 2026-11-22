@@ -53,7 +53,7 @@ Pending_Window :: struct {
 // with every node; destroy it with query_destroy.
 sql_parse :: proc(source: string) -> (Query, Error) {
 	q: Query
-	if arena_err := virtual.arena_init_growing(&q.arena); arena_err != .None {
+	if !query_arena_take(&q.arena) {
 		return q, errf(.Out_Of_Memory, "cannot allocate the query arena")
 	}
 	q.alloc = virtual.arena_allocator(&q.arena)
@@ -74,7 +74,7 @@ sql_parse :: proc(source: string) -> (Query, Error) {
 		if len(p.windows) > 0 do p_fail(&p, .Sql_Syntax, "no such window: %s", p.windows[0].base)
 	}
 	if p.err.kind != .None {
-		virtual.arena_destroy(&q.arena)
+		query_arena_give(&q.arena)
 		return {}, p.err
 	}
 	sqlite_text_capture(&p, &statement)
@@ -83,7 +83,7 @@ sql_parse :: proc(source: string) -> (Query, Error) {
 			p.current = lexer_next(&p.lexer)
 		}
 		if p.current.kind != .EOF {
-			virtual.arena_destroy(&q.arena)
+			query_arena_give(&q.arena)
 			return {}, p_fail(&p, .Sql_Syntax, "unexpected token %q", p.current.text)
 		}
 	}
