@@ -3,6 +3,7 @@ package engine
 import "core:fmt"
 import "core:slice"
 import "core:mem"
+import "core:mem/virtual"
 import "core:math"
 import "core:strings"
 import "core:sync"
@@ -1565,11 +1566,6 @@ rowid_value :: proc(source: Source) -> (Value, bool) {
 	return value_int(i64(source.row.id)), true
 }
 
-@(private)
-free_partials :: proc(items: ^[dynamic][]Source) {
-	for item in items do delete(item)
-	delete(items^)
-}
 
 // sql_run_query executes a plain query or one prefixed with common table
 // expressions, which are materialized for the life of the statement.
@@ -3067,7 +3063,6 @@ select_drop_rows :: proc(
 	free_values_over_rows(output)
 	delete(output^)
 	window_cell_rows_destroy(window_cells)
-	for sources in window_sources do delete(sources)
 	delete(window_sources^)
 	for kept in group_keep do delete(kept)
 	delete(group_keep^)
@@ -3867,23 +3862,31 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 
 	// Base rows. A usable index narrows the scan; the WHERE clause is still
 	// re-checked below.
+	// The row sources of the statement, one list per combination of rows, live
+	// in one arena that goes back to the pool when the statement ends: a scan
+	// made and freed one small list per row, and the lists move between the
+	// filter, the groups and the windows, so freeing each in the right place was
+	// where the double frees and the leaks of this function came from.
+	sources_arena: virtual.Arena
+	if !query_arena_take(&sources_arena) do return {}, errf(.Out_Of_Memory, "cannot reserve the statement's row sources")
+	defer query_arena_give(&sources_arena)
+	sources_alloc := virtual.arena_allocator(&sources_arena)
+	join_scratch := make([dynamic]Source)
+	defer delete(join_scratch)
 	partials := make([dynamic][]Source)
 	used_index := false
 	if system_name {
 		synthetic.schema = system_table_schema(exec.from.name, tx.alloc)
 		catalog_rows := system_table_rows(tx, exec.from.name, tx.alloc)
 		for row in catalog_rows {
-			// The source slice is freed by the filter below, so it cannot come
-			// from the transaction arena (the row values inside still do: they
-			// are only read, never freed here).
-			one := make([]Source, 1)
+			one := make([]Source, 1, sources_alloc)
 			one[0] = Source{table = base, row = row, alias = exec.from.alias}
 			append(&partials, one)
 		}
 		used_index = true
 	}
 	if empty_row {
-		append(&partials, make([]Source, 0))
+		append(&partials, make([]Source, 0, sources_alloc))
 		used_index = true
 	}
 	// A historical read asks for the rows as they were at one commit. It cannot
@@ -3928,7 +3931,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		for id in ordered_ids {
 			tx.rows_scanned += 1
 			if row, exists := tx_get(tx, exec.from.name, id); exists {
-				one := make([]Source, 1)
+				one := make([]Source, 1, sources_alloc)
 				one[0] = Source{table = base, row = row, alias = exec.from.alias}
 				append(&partials, one)
 			}
@@ -3945,14 +3948,14 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			params,
 		); used {
 			if fts_err.kind != .None {
-				free_partials(&partials)
+				delete(partials)
 				return {}, fts_err
 			}
 			defer delete(candidate_ids)
 			for id in candidate_ids {
 				tx.rows_scanned += 1
 				if row, exists := tx_get(tx, exec.from.name, id); exists {
-					one := make([]Source, 1)
+					one := make([]Source, 1, sources_alloc)
 					one[0] = Source{table = base, row = row, alias = exec.from.alias}
 					append(&partials, one)
 				}
@@ -3963,7 +3966,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			for id in indexed_ids {
 				tx.rows_scanned += 1
 				if row, exists := tx_get(tx, exec.from.name, id); exists {
-					one := make([]Source, 1)
+					one := make([]Source, 1, sources_alloc)
 					one[0] = Source{table = base, row = row, alias = exec.from.alias}
 					append(&partials, one)
 				}
@@ -3990,7 +3993,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		}
 		for row in rows {
 			tx.rows_scanned += 1
-			one := make([]Source, 1)
+			one := make([]Source, 1, sources_alloc)
 			one[0] = Source{table = base, row = row, alias = exec.from.alias}
 			append(&partials, one)
 			if limit_rows > 0 && len(partials) >= limit_rows do break
@@ -3998,9 +4001,20 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		delete(rows)
 	}
 	if !empty_row && !ordered && !key_ordered {
-		slice.sort_by(partials[:], proc(a, b: []Source) -> bool {
-			return u64(a[0].row.id) < u64(b[0].row.id)
-		})
+		// A scan hands the rows over in id order already, and so does a single
+		// rowid or a unique key: checking is one pass, sorting is many.
+		sorted := true
+		for i in 1 ..< len(partials) {
+			if u64(partials[i - 1][0].row.id) > u64(partials[i][0].row.id) {
+				sorted = false
+				break
+			}
+		}
+		if !sorted {
+			slice.sort_by(partials[:], proc(a, b: []Source) -> bool {
+				return u64(a[0].row.id) < u64(b[0].row.id)
+			})
+		}
 	}
 
 	// Nested-loop joins. Each partial is one bound combination of rows, and each
@@ -4023,7 +4037,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		// steps would have joined.
 		stop_at_limit := limit_rows > 0 && step_index == len(order.steps) - 2
 		if step.ref.as_of != nil {
-			free_partials(&partials)
+			delete(partials)
 			return {}, errf(.Sql_Unsupported, "AS OF is only supported on the first table of a join")
 		}
 		// A JSON table function may take a column of the table before it, so it
@@ -4036,7 +4050,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			(step.ref.lateral && step.ref.subquery != nil) ||
 			(len(step.ref.schema) == 0 && tx_table_probe(tx, step.ref.name) == nil && vtab_is_named(tx, step.ref.name))
 		if lateral && (step.kind == .Right || step.kind == .Full) {
-			free_partials(&partials)
+			delete(partials)
 			return {}, errf(
 				.Sql_Unsupported,
 				"a RIGHT or FULL join cannot take a table function that depends on the row before it",
@@ -4048,7 +4062,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		if !lateral {
 			join_args, join_args_err := view_args(tx, step.ref, params)
 			if join_args_err.kind != .None {
-				free_partials(&partials)
+				delete(partials)
 				return {}, join_args_err
 			}
 			resolved, resolved_is_view, join_err := tx_source_table(
@@ -4058,7 +4072,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 				step.ref.schema,
 			)
 			if join_err.kind != .None {
-				free_partials(&partials)
+				delete(partials)
 				return {}, join_err
 			}
 			table = resolved
@@ -4066,7 +4080,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			if join_is_view {
 				table_collect(table, &rows, tx.read_seq)
 			} else if collect_err := tx_collect(tx, step.ref.name, &rows); collect_err.kind != .None {
-				free_partials(&partials)
+				delete(partials)
 				return {}, collect_err
 			}
 			if !join_is_view && table != nil && table.schema.without_rowid do rows_sort_by_key(rows[:], table.schema.primary_key[:])
@@ -4094,8 +4108,8 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		for partial in partials {
 			if store_cancelled(tx.store) {
 				delete(rows)
-				free_partials(&partials)
-				free_partials(&next)
+				delete(partials)
+				delete(next)
 				return {}, errf(.Cancelled, "query cancelled")
 			}
 			lateral_rows := rows
@@ -4118,8 +4132,8 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			if lateral && step.ref.subquery != nil {
 				lateral_table, lateral_err := tx_materialize_lateral(tx, step.ref, params, partial)
 				if lateral_err.kind != .None {
-					free_partials(&partials)
-					free_partials(&next)
+					delete(partials)
+					delete(next)
 					return {}, lateral_err
 				}
 				table = lateral_table
@@ -4128,8 +4142,8 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			} else if lateral {
 				lateral_args, lateral_args_err := view_args(tx, step.ref, params, partial)
 				if lateral_args_err.kind != .None {
-					free_partials(&partials)
-					free_partials(&next)
+					delete(partials)
+					delete(next)
 					return {}, lateral_args_err
 				}
 				saved_join, saved_sources, saved_alias := tx.vtab_join, tx.vtab_sources, tx.vtab_alias
@@ -4142,8 +4156,8 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 				)
 				tx.vtab_join, tx.vtab_sources, tx.vtab_alias = saved_join, saved_sources, saved_alias
 				if lateral_err.kind != .None {
-					free_partials(&partials)
-					free_partials(&next)
+					delete(partials)
+					delete(next)
 					return {}, lateral_err
 				}
 				table = lateral_table
@@ -4153,25 +4167,22 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			matched := false
 			for row, row_index in lateral_rows {
 				tx.rows_scanned += 1
-				candidate := make([]Source, len(partial) + 1)
+				resize(&join_scratch, len(partial) + 1)
+				candidate := join_scratch[:]
 				copy(candidate, partial)
 				candidate[len(partial)] = Source{table = table, row = row, alias = step.ref.alias}
 				if step.predicate != nil {
 					ctx.sources = candidate
 					value, eval_err := eval_expr(&ctx, step.predicate)
 					if eval_err.kind != .None {
-						delete(candidate)
 						delete(rows)
-						free_partials(&partials)
-						free_partials(&next)
+						delete(partials)
+						delete(next)
 						return {}, eval_err
 					}
-					if !value_is_truthy(value) {
-						delete(candidate)
-						continue
-					}
+					if !value_is_truthy(value) do continue
 				}
-				append(&next, candidate)
+				append(&next, slice.clone(candidate, sources_alloc))
 				matched = true
 				if kept_inner != nil do kept_inner[row_index] = true
 				if stop_at_limit && len(next) >= limit_rows do break
@@ -4183,8 +4194,8 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 					if lateral do delete(lateral_rows)
 					if using_probe do delete(probe_rows)
 					delete(rows)
-					free_partials(&partials)
-					free_partials(&next)
+					delete(partials)
+					delete(next)
 					return {}, errf(
 						.Quota_Exceeded,
 						"query builds more than %d rows",
@@ -4193,7 +4204,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 				}
 			}
 			if (step.kind == .Left || step.kind == .Full) && !matched {
-				candidate := make([]Source, len(partial) + 1)
+				candidate := make([]Source, len(partial) + 1, sources_alloc)
 				copy(candidate, partial)
 				candidate[len(partial)] = Source{table = table, row = Row{}, alias = step.ref.alias}
 				append(&next, candidate)
@@ -4207,7 +4218,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		if step.kind == .Right || step.kind == .Full {
 			for row, row_index in rows {
 				if kept_inner[row_index] do continue
-				candidate := make([]Source, len(bound_tables) + 1)
+				candidate := make([]Source, len(bound_tables) + 1, sources_alloc)
 				for bound, i in bound_tables {
 					candidate[i] = Source{table = bound, row = Row{}, alias = bound_aliases[i]}
 				}
@@ -4216,8 +4227,8 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 				if stop_at_limit && len(next) >= limit_rows do break
 				if join_counts_quota && quota_reached(tx, len(next)) {
 					delete(rows)
-					free_partials(&partials)
-					free_partials(&next)
+					delete(partials)
+					delete(next)
 					return {}, errf(
 						.Quota_Exceeded,
 						"query builds more than %d rows",
@@ -4229,18 +4240,14 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		append(&bound_tables, table)
 		append(&bound_aliases, step.ref.alias)
 		delete(rows)
-		free_partials(&partials)
+		delete(partials)
 		partials = next
 	}
 
 	// WHERE
 	filtered := make([dynamic][]Source)
-	for partial, index in partials {
+	for partial in partials {
 		if store_cancelled(tx.store) {
-			// The rows before this one were either kept (and freed through
-			// filtered) or freed in place, so only the pending ones are left.
-			for pending in partials[index:] do delete(pending)
-			for kept in filtered do delete(kept)
 			delete(partials)
 			delete(filtered)
 			return {}, errf(.Cancelled, "query cancelled")
@@ -4250,8 +4257,6 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		for &set in policies {
 			allowed, policy_err := policy_allows(&set, &ctx, false)
 			if policy_err.kind != .None {
-				for pending in partials[index:] do delete(pending)
-				for kept in filtered do delete(kept)
 				delete(partials)
 				delete(filtered)
 				return {}, policy_err
@@ -4264,21 +4269,13 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		if keep && stmt.where_clause != nil {
 			value, eval_err := eval_expr(&ctx, stmt.where_clause)
 			if eval_err.kind != .None {
-				// A rejected row frees its sources in place, so the pending
-				// ones and the kept ones are all that is left.
-				for pending in partials[index:] do delete(pending)
-				for kept in filtered do delete(kept)
 				delete(partials)
 				delete(filtered)
 				return {}, eval_err
 			}
 			keep = value_is_truthy(value)
 		}
-		if keep {
-			append(&filtered, partial)
-		} else {
-			delete(partial)
-		}
+		if keep do append(&filtered, partial)
 	}
 	delete(partials)
 
@@ -4324,7 +4321,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 	group_exprs := group_by_expressions(stmt, star_sources[:], tx.alloc)
 	delete(star_sources)
 	if len(expanded) == 0 {
-		free_partials(&filtered)
+		delete(filtered)
 		return {}, errf(.Invalid_Argument, "SELECT has no projection")
 	}
 
@@ -4338,7 +4335,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		}
 	}
 	if stmt.having != nil && !aggregate {
-		free_partials(&filtered)
+		delete(filtered)
 		return {}, errf(.Sql_Unsupported, "HAVING needs GROUP BY or an aggregate")
 	}
 	window_positions := window_positions_of(expanded)
@@ -4402,7 +4399,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		for node in window_nodes {
 			window := node^.(Window_Expr)
 			if window_frame_reads_values(window.frame) {
-				free_partials(&filtered)
+				delete(filtered)
 				return {}, errf(
 					.Sql_Unsupported,
 					"a RANGE frame with an offset beside GROUP BY is not supported",
@@ -4418,13 +4415,9 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 	group_keep := make([dynamic][dynamic][]Source, 0, len(filtered))
 	// kept_partials holds a grouped query's rows while its windows are pending:
 	// the groups point at them (one row may sit in several, under GROUPING
-	// SETS), so they are freed once, here, however the statement ends. Only the
-	// groups' lists were freed before, and every row was lost.
+	// SETS). The rows are the statement arena's; only the list is freed here.
 	kept_partials: [dynamic][]Source
-	defer {
-		for partial in kept_partials do delete(partial)
-		delete(kept_partials)
-	}
+	defer delete(kept_partials)
 
 	output := make([dynamic]Output_Row, 0, len(filtered))
 	if aggregate {
@@ -4463,7 +4456,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 						for key in keys do delete(key)
 						delete(keys)
 						delete(buckets)
-						free_partials(&filtered)
+						delete(filtered)
 						return {}, errf(.Invalid_Type, "GROUP BY expression failed")
 					}
 					// The key is cloned once, for a new group: the map keeps the first.
@@ -4511,7 +4504,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			cells, cells_err := window_row_cells(&ctx, window_nodes[:], has_windows)
 			if cells_err.kind != .None {
 				select_drop_groups(&output, &window_cells, &window_sources, &group_keep, &groups, &group_set_of, group_number)
-				free_partials(&filtered)
+				delete(filtered)
 				return {}, cells_err
 			}
 			values := make([]Value, len(expanded) + len(nested_windows))
@@ -4527,7 +4520,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 					free_values(values)
 					window_cells_destroy(cells)
 					select_drop_groups(&output, &window_cells, &window_sources, &group_keep, &groups, &group_set_of, group_number)
-					free_partials(&filtered)
+					delete(filtered)
 					return {}, eval_err
 				}
 				values[i] = value_clone(value, context.allocator)
@@ -4540,7 +4533,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 					free_values(values)
 					window_cells_destroy(cells)
 					select_drop_groups(&output, &window_cells, &window_sources, &group_keep, &groups, &group_set_of, group_number)
-					free_partials(&filtered)
+					delete(filtered)
 					return {}, having_err
 				}
 				if !value_is_truthy(having) {
@@ -4574,20 +4567,17 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		delete(group_set_of)
 		ctx.group = nil
 		// A pending window needs the rows its groups point at until it is done.
-		if !has_windows {
-			for partial in filtered do delete(partial)
-		} else {
+		if has_windows {
 			kept_partials = filtered
 			filtered = nil
 		}
 	} else {
-		for partial, index in filtered {
+		for partial in filtered {
 			ctx.sources = partial
 			values := make([]Value, len(expanded) + len(nested_windows))
 			cells, cells_err := window_row_cells(&ctx, window_nodes[:], has_windows)
 			if cells_err.kind != .None {
 				free_values(values)
-				for pending in filtered[index:] do delete(pending)
 				delete(filtered)
 				select_drop_rows(&output, &window_cells, &window_sources, &group_keep)
 				return {}, cells_err
@@ -4602,9 +4592,6 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 				value, eval_err := eval_expr(&ctx, expr)
 				if eval_err.kind != .None {
 					free_values(values)
-					// Earlier rows already released their sources, so only the
-					// pending ones are freed here, with the rows already made.
-					for pending in filtered[index:] do delete(pending)
 					delete(filtered)
 					delete(cells)
 					select_drop_rows(&output, &window_cells, &window_sources, &group_keep)
@@ -4612,8 +4599,6 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 				}
 				values[i] = value_clone(value, context.allocator)
 			}
-			// The row id comes from the sources, which the non-window branch
-			// frees below: read it first, never after the delete.
 			row_id := len(partial) == 1 ? partial[0].row.id : NO_ROW_ID
 			sort_key: []u8
 			if has_windows {
@@ -4625,7 +4610,6 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			} else {
 				sort_key = build_order_key(&ctx, stmt.order_by, expanded, values, columns[:], row_id)
 				delete(cells)
-				delete(partial)
 			}
 			append(&output, Output_Row{values = values, sort_key = sort_key, row_id = row_id})
 			// A statement with LIMIT or OFFSET bounds its own rows, and it asks
@@ -4634,21 +4618,17 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			// either, the rows being produced are the answer.
 			if stmt.limit == nil && stmt.offset == nil && quota_reached(tx, len(output)) {
 				// Stop where the rows appear: the rest of the scan is work the
-				// caller has already said it does not want. Neither `values` nor
-				// `partial` is freed here: the row was already appended to `output`
-				// and the loop below frees what output holds, and the sources went
-				// either to the row loop (freed) or to window_sources (freed below).
-				// Freeing either a second time corrupts the heap, which a release
-				// build reports as exit 116 with no message at all.
+				// caller has already said it does not want. `values` is not freed
+				// here: the row was already appended to `output`, and the call
+				// below frees what output holds. Freeing it a second time corrupts
+				// the heap, which a release build reports as exit 116 with no
+				// message at all.
 				free_values_over_rows(&output)
 				window_cell_rows_destroy(&window_cells)
-				for pending_sources in window_sources do delete(pending_sources)
 				delete(window_sources)
 				for kept in group_keep do delete(kept)
 				delete(group_keep)
 				delete(output)
-				// The rows the scan did not reach still hold their sources.
-				for pending in filtered[index + 1:] do delete(pending)
 				delete(filtered)
 				return {}, errf(
 					.Quota_Exceeded,
@@ -4670,7 +4650,6 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		if window_err := apply_windows(&ctx, window_nodes[:], window_slot_list[:], window_cells[:], output[:], window_sources[:]); window_err.kind != .None {
 			free_values_over_rows(&output)
 			window_cell_rows_destroy(&window_cells)
-			for sources in window_sources do delete(sources)
 			delete(window_sources)
 			for kept in group_keep do delete(kept)
 			delete(group_keep)
@@ -4703,7 +4682,6 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 						ctx.sources = nil
 						free_values_over_rows(&output)
 						window_cell_rows_destroy(&window_cells)
-						for sources in window_sources do delete(sources)
 						delete(window_sources)
 						for kept in group_keep do delete(kept)
 						delete(group_keep)
@@ -4751,7 +4729,6 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		ctx.grouped = false
 		ctx.sources = nil
 		window_cell_rows_destroy(&window_cells)
-		for sources in window_sources do delete(sources)
 		delete(window_sources)
 		for kept in group_keep do delete(kept)
 		delete(group_keep)
