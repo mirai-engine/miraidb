@@ -9965,19 +9965,23 @@ index_order_ids :: proc(
 	ids := make([dynamic]Row_Id)
 	node := table.indexes[index].tree._root
 	if node == nil do return ids
+	// A key's rows come out ascending by id, or descending for a descending walk,
+	// as they did when each row had its own entry.
 	if descending {
 		for node._right != nil do node = node._right
 		for node != nil && (max_rows <= 0 || len(ids) < max_rows) {
-			append(&ids, node.value)
+			#reverse for id in node.value.more do append(&ids, id)
+			append(&ids, node.value.first)
 			node = node_prev(node)
 		}
-		return ids
+	} else {
+		for node._left != nil do node = node._left
+		for node != nil && (max_rows <= 0 || len(ids) < max_rows) {
+			index_slot_append(&ids, node.value)
+			node = node_next(node)
+		}
 	}
-	for node._left != nil do node = node._left
-	for node != nil && (max_rows <= 0 || len(ids) < max_rows) {
-		append(&ids, node.value)
-		node = node_next(node)
-	}
+	if max_rows > 0 && len(ids) > max_rows do resize(&ids, max_rows)
 	return ids
 }
 

@@ -15430,3 +15430,92 @@ test_temp_tables_leave_the_sqlite_file_alone :: proc(t: ^testing.T) {
 	testing.expect(t, string(after) == string(before), "a read-only connection wrote the file")
 	testing.expect_value(t, scalar(t, reader.store, "SELECT count(*) FROM t").i, i64(1))
 }
+
+@(test)
+test_an_index_keeps_the_rows_of_a_key_together :: proc(t: ^testing.T) {
+	// A memory index files the rows that share a key under one entry (R2): the
+	// lowest row id inline, the others ascending. Every way of reading it must
+	// still answer each row once, in the order an entry per row gave: by row id,
+	// which here is the order the rows were inserted in.
+	store := fresh_db(t, "index_slots")
+	if store == nil do return
+	defer cleanup_db(store, "index_slots")
+	run_done(t, store, "CREATE TABLE t (n TEXT, k INTEGER, u INTEGER UNIQUE)")
+	run_done(t, store, "CREATE INDEX t_k ON t (k)")
+	run_done(t, store, "INSERT INTO t (n, k, u) VALUES ('a', 10, 1), ('b', 20, 2), ('c', 10, 3), ('d', 30, NULL), ('e', 10, NULL), ('f', 20, 4), ('g', 10, NULL)")
+	run_done(t, store, "INSERT INTO t (n, k, u) VALUES ('h', 10, 5), ('i', 10, 6)")
+	names_of :: proc(t: ^testing.T, store: ^db.Store, sql: string) -> string {
+		result := run_temp(t, store, sql)
+		builder := strings.builder_make(context.temp_allocator)
+		for row in result.rows do strings.write_string(&builder, row[0].s)
+		return strings.to_string(builder)
+	}
+	testing.expect_value(t, names_of(t, store, "SELECT n FROM t WHERE k = 10"), "aceghi")
+	testing.expect_value(t, names_of(t, store, "SELECT n FROM t WHERE k = 20"), "bf")
+	// The answers an index with one entry per row gave (measured on that build).
+	testing.expect_value(t, names_of(t, store, "SELECT n FROM t WHERE k >= 20 ORDER BY k"), "bfd")
+	testing.expect_value(t, names_of(t, store, "SELECT n FROM t ORDER BY k LIMIT 4"), "aceg")
+	testing.expect_value(t, names_of(t, store, "SELECT n FROM t ORDER BY k DESC LIMIT 4"), "dbfa")
+	testing.expect_value(t, names_of(t, store, "SELECT n FROM t ORDER BY k DESC"), "dbfaceghi")
+	// Three rows hold NULL in the UNIQUE column: they share its key.
+	testing.expect_value(t, names_of(t, store, "SELECT n FROM t WHERE u IS NULL"), "deg")
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM t").i, i64(9))
+
+	// The lowest row of a key leaves, then a middle one; an update moves a row to
+	// another key, and a unique value becomes NULL and joins the others.
+	run_done(t, store, "DELETE FROM t WHERE n = 'a'")
+	testing.expect_value(t, names_of(t, store, "SELECT n FROM t WHERE k = 10"), "ceghi")
+	run_done(t, store, "DELETE FROM t WHERE n = 'g'")
+	testing.expect_value(t, names_of(t, store, "SELECT n FROM t WHERE k = 10"), "cehi")
+	run_done(t, store, "UPDATE t SET k = 20 WHERE n = 'c'")
+	testing.expect_value(t, names_of(t, store, "SELECT n FROM t WHERE k = 10"), "ehi")
+	testing.expect_value(t, names_of(t, store, "SELECT n FROM t WHERE k = 20"), "bcf")
+	run_done(t, store, "UPDATE t SET u = NULL WHERE n = 'b'")
+	testing.expect_value(t, names_of(t, store, "SELECT n FROM t WHERE u IS NULL"), "bde")
+
+	// A reader keeps its copy of the index while a commit changes the store's.
+	reader := db.tx_begin_read(store)
+	run_done(t, store, "DELETE FROM t WHERE k = 10")
+	testing.expect_value(t, names_of(t, store, "SELECT n FROM t WHERE k = 10"), "")
+	{
+		table := db.tx_table_probe(reader, "t")
+		index := -1
+		for candidate, i in table.indexes do if candidate.schema.name == "t_k" do index = i
+		if testing.expect(t, index >= 0) {
+			ids := db.table_index_lookup(table, index, []db.Value{db.value_string("x"), db.value_int(10), db.value_null()})
+			defer delete(ids)
+			testing.expectf(t, len(ids) == 3, "the reader's key 10 holds %v", ids[:])
+		}
+	}
+	db.tx_end(reader)
+	testing.expect_value(t, names_of(t, store, "SELECT n FROM t ORDER BY k"), "bcfd")
+
+	// Ids that reach one key out of order (a replay, an explicit row id) are
+	// placed among its rows.
+	{
+		schema := db.Table_Schema{name = "loose"}
+		columns := []db.Column{{name = "k", type = db.Column_Type{kind = .Int, width = 8}}}
+		indexes := []db.Index_Schema{{name = "loose_k", columns = []int{0}}}
+		schema.columns = columns
+		schema.indexes = indexes
+		loose, create_err := db.table_create(&schema)
+		if testing.expect(t, db.error_ok(create_err)) {
+			defer db.table_destroy(loose)
+			for id in ([]u64{50, 10, 30, 20, 40}) {
+				insert_err := db.table_insert(loose, db.Row_Id(id), []db.Value{db.value_int(7)})
+				db.error_free(&insert_err)
+			}
+			index := -1
+			for candidate, i in loose.indexes do if candidate.schema.name == "loose_k" do index = i
+			if testing.expect(t, index >= 0) {
+				ids := db.table_index_lookup(loose, index, []db.Value{db.value_int(7)})
+				defer delete(ids)
+				testing.expectf(t, len(ids) == 5 && ids[0] == 10 && ids[1] == 20 && ids[4] == 50, "key 7 holds %v", ids[:])
+				testing.expect(t, db.table_delete(loose, 10))
+				again := db.table_index_lookup(loose, index, []db.Value{db.value_int(7)})
+				defer delete(again)
+				testing.expectf(t, len(again) == 4 && again[0] == 20, "after the first left, key 7 holds %v", again[:])
+			}
+		}
+	}
+}

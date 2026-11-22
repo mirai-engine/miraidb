@@ -36,7 +36,98 @@ Row :: struct {
 	versions:    [dynamic]Row_Version,
 }
 
-Index_Tree :: rbtree.Tree(string, Row_Id)
+// Index_Slot is what one key of a memory index holds: the rows under it, the
+// lowest id inline and the others ascending in `more`, which stays empty (and
+// allocates nothing) for a key one row has. A key held one node per row before
+// (the row id appended to it), so an equality lookup that met 256 rows walked
+// 256 nodes of the tree; it walks one now and copies its ids (R2).
+Index_Slot :: struct {
+	first: Row_Id,
+	more:  [dynamic]Row_Id,
+}
+
+Index_Tree :: rbtree.Tree(string, Index_Slot)
+Index_Node :: rbtree.Node(string, Index_Slot)
+
+// index_slot_append adds a slot's rows to `ids`, ascending.
+@(private)
+index_slot_append :: proc(ids: ^[dynamic]Row_Id, slot: Index_Slot) {
+	append(ids, slot.first)
+	if len(slot.more) > 0 do append(ids, ..slot.more[:])
+}
+
+// index_slot_add puts `id` among a slot's rows, keeping them ascending. A row
+// already there is left alone.
+@(private)
+index_slot_add :: proc(slot: ^Index_Slot, id: Row_Id) {
+	if id == slot.first do return
+	if id < slot.first {
+		inject_at(&slot.more, 0, slot.first)
+		slot.first = id
+		return
+	}
+	n := len(slot.more)
+	if n == 0 || slot.more[n - 1] < id {
+		append(&slot.more, id)
+		return
+	}
+	low, high := 0, n
+	for low < high {
+		middle := (low + high) / 2
+		if slot.more[middle] < id {
+			low = middle + 1
+		} else {
+			high = middle
+		}
+	}
+	if low < n && slot.more[low] == id do return
+	inject_at(&slot.more, low, id)
+}
+
+// index_slot_remove takes `id` out of a slot and answers whether the slot is now
+// empty.
+@(private)
+index_slot_remove :: proc(slot: ^Index_Slot, id: Row_Id) -> (empty: bool) {
+	if id == slot.first {
+		if len(slot.more) == 0 do return true
+		slot.first = slot.more[0]
+		index_ids_remove_at(&slot.more, 0)
+		return false
+	}
+	for other, i in slot.more {
+		if other == id {
+			index_ids_remove_at(&slot.more, i)
+			break
+		}
+	}
+	return false
+}
+
+// index_ids_remove_at removes one id keeping the order (the engine's own
+// ordered_remove, of the paged index, hides the builtin one here).
+@(private)
+index_ids_remove_at :: proc(ids: ^[dynamic]Row_Id, at: int) {
+	copy(ids[at:], ids[at + 1:])
+	resize(ids, len(ids) - 1)
+}
+
+// index_tree_free frees every slot's list and the tree's nodes.
+@(private)
+index_tree_free :: proc(tree: ^Index_Tree) {
+	for node := rbtree.first(tree); node != nil; node = node_next(node) do delete(node.value.more)
+	rbtree.destroy(tree, false)
+}
+
+// index_tree_key encodes the key a memory index files `values` under: the indexed
+// columns alone, into the table's scratch buffer (overwritten by the next key).
+@(private)
+index_tree_key :: proc(t: ^Table, index: int, values: []Value) -> (key: string, has_null: bool) {
+	w := Byte_Writer{data = t.key_scratch}
+	clear(&w.data)
+	has_null = index_encode_parts(&w, t, index, values)
+	t.key_scratch = w.data
+	return string(w.data[:]), has_null
+}
 
 // Index is one ordered index. The key is the order-preserving encoding of the
 // indexed columns. A unique index stores the key alone; a non-unique index
@@ -254,8 +345,30 @@ index_validate_row :: proc(tx: ^Tx, t: ^Table, values: []Value) -> Error {
 @(private)
 table_index_put_row :: proc(t: ^Table, index: int, values: []Value, id: Row_Id) -> Error {
 	if !index_row_included(t, index, values) do return ERROR_NONE
-	key := index_entry_key(t, index, values, id)
-	if put_err := table_index_put(t, index, key, id); put_err.kind != .None do return put_err
+	if t.indexes[index].pages != nil {
+		key := index_entry_key(t, index, values, id)
+		if put_err := table_index_put(t, index, key, id); put_err.kind != .None do return put_err
+	} else {
+		key, has_null := index_tree_key(t, index, values)
+		tree := &t.indexes[index].tree
+		// A UNIQUE key without NULL belongs to one row (the uniqueness check ran
+		// before), so it is filed in one descent, as before slots existed; a key
+		// others may share is looked up first and the row joins its slot.
+		shared := !t.indexes[index].unique || has_null
+		node: ^Index_Node
+		if shared do node = rbtree.find(tree^, key)
+		if node != nil {
+			index_slot_add(&node.value, id)
+		} else {
+			// A new key is copied into the arena at its exact length; a key
+			// already filed copies nothing.
+			stored := make([]u8, len(key), t.arena_allocator)
+			copy(stored, key)
+			if _, _, insert_err := rbtree.upsert(tree, string(stored), Index_Slot{first = id}); insert_err != nil {
+				return errf(.Out_Of_Memory, "cannot grow index %s", t.indexes[index].schema.name)
+			}
+		}
+	}
 	return table_index_map_add(t, index, values, id)
 }
 
@@ -263,8 +376,19 @@ table_index_put_row :: proc(t: ^Table, index: int, values: []Value, id: Row_Id) 
 @(private)
 table_index_remove_row :: proc(t: ^Table, index: int, values: []Value, id: Row_Id) {
 	if !index_row_included(t, index, values) do return
-	key := index_entry_key(t, index, values, id)
-	table_index_remove_key(t, index, key)
+	if t.indexes[index].pages != nil {
+		key := index_entry_key(t, index, values, id)
+		table_index_remove_key(t, index, key)
+	} else {
+		tree := &t.indexes[index].tree
+		key, _ := index_tree_key(t, index, values)
+		if node := rbtree.find(tree^, key); node != nil {
+			if index_slot_remove(&node.value, id) {
+				delete(node.value.more)
+				rbtree.remove_node(tree, node, false)
+			}
+		}
+	}
 	table_index_map_remove(t, index, values, id)
 }
 
@@ -426,7 +550,7 @@ table_destroy :: proc(t: ^Table) {
 	}
 	delete(t.rows)
 	for i in 0 ..< len(t.indexes) {
-		rbtree.destroy(&t.indexes[i].tree)
+		index_tree_free(&t.indexes[i].tree)
 		table_index_map_free(t, i)
 		ordered_close(t.indexes[i].pages)
 		index_exprs_destroy(t.indexes[i].exprs)
@@ -743,10 +867,6 @@ table_index_put :: proc(t: ^Table, index: int, key: string, id: Row_Id) -> Error
 		}
 		return ERROR_NONE
 	}
-	_, _, insert_err := rbtree.upsert(&t.indexes[index].tree, key, id)
-	if insert_err != nil {
-		return errf(.Out_Of_Memory, "cannot grow index %s", t.indexes[index].schema.name)
-	}
 	return ERROR_NONE
 }
 
@@ -754,9 +874,7 @@ table_index_put :: proc(t: ^Table, index: int, key: string, id: Row_Id) -> Error
 table_index_remove_key :: proc(t: ^Table, index: int, key: string) {
 	if t.indexes[index].pages != nil {
 		_ = ordered_remove(t.indexes[index].pages, key)
-		return
 	}
-	rbtree.remove_key(&t.indexes[index].tree, key)
 }
 
 // table_index_count is how many entries an index holds.
@@ -765,7 +883,7 @@ table_index_count :: proc(t: ^Table, index: int) -> u64 {
 	count: u64
 	node := rbtree.first(&t.indexes[index].tree)
 	for node != nil {
-		count += 1
+		count += 1 + u64(len(node.value.more))
 		node = node_next(node)
 	}
 	return count
@@ -909,7 +1027,7 @@ append_be_u64 :: proc(w: ^Byte_Writer, v: u64) {
 
 // node_next returns the in-order successor of a node.
 @(private)
-node_next :: proc(n: ^rbtree.Node(string, Row_Id)) -> ^rbtree.Node(string, Row_Id) {
+node_next :: proc(n: ^Index_Node) -> ^Index_Node {
 	if n._right != nil {
 		next := n._right
 		for next._left != nil do next = next._left
@@ -927,7 +1045,7 @@ node_next :: proc(n: ^rbtree.Node(string, Row_Id)) -> ^rbtree.Node(string, Row_I
 // node_prev returns the in-order predecessor of a node, so an index can be read
 // backwards without materializing it.
 @(private)
-node_prev :: proc(n: ^rbtree.Node(string, Row_Id)) -> ^rbtree.Node(string, Row_Id) {
+node_prev :: proc(n: ^Index_Node) -> ^Index_Node {
 	if n._left != nil {
 		prev := n._left
 		for prev._right != nil do prev = prev._right
@@ -944,9 +1062,9 @@ node_prev :: proc(n: ^rbtree.Node(string, Row_Id)) -> ^rbtree.Node(string, Row_I
 
 // lower_bound returns the first node whose key is >= `key`.
 @(private)
-lower_bound :: proc(tree: ^Index_Tree, key: string) -> ^rbtree.Node(string, Row_Id) {
+lower_bound :: proc(tree: ^Index_Tree, key: string) -> ^Index_Node {
 	n := tree._root
-	best: ^rbtree.Node(string, Row_Id) = nil
+	best: ^Index_Node = nil
 	for n != nil {
 		if tree._cmp_fn(key, n.key) != .Greater {
 			best = n
@@ -980,7 +1098,7 @@ table_index_lookup :: proc(t: ^Table, index: int, values: []Value) -> [dynamic]R
 	node := lower_bound(&t.indexes[index].tree, prefix)
 	for node != nil {
 		if !strings.has_prefix(node.key, prefix) do break
-		append(&ids, node.value)
+		index_slot_append(&ids, node.value)
 		node = node_next(node)
 	}
 	return ids
@@ -998,7 +1116,7 @@ table_index_scan_prefix :: proc(t: ^Table, index: int, prefix: string) -> [dynam
 	node := lower_bound(tree, prefix)
 	for node != nil {
 		if !strings.has_prefix(node.key, prefix) do break
-		append(&ids, node.value)
+		index_slot_append(&ids, node.value)
 		node = node_next(node)
 	}
 	return ids
@@ -1027,7 +1145,7 @@ table_index_scan :: proc(
 			if order == .Greater do break
 			if order == .Equal && !inclusive_end do break
 		}
-		append(&ids, node.value)
+		index_slot_append(&ids, node.value)
 		node = node_next(node)
 	}
 	return ids
@@ -1338,7 +1456,7 @@ table_truncate :: proc(t: ^Table) {
 			if t.indexes[i].pages != nil {
 				_ = ordered_clear(t.indexes[i].pages)
 			} else {
-				rbtree.destroy(&t.indexes[i].tree, false)
+				index_tree_free(&t.indexes[i].tree)
 				rbtree.init_cmp(&t.indexes[i].tree, index_cmp)
 			}
 			table_index_map_free(t, i)
@@ -1358,7 +1476,7 @@ table_truncate :: proc(t: ^Table) {
 	}
 	clear(&t.rows)
 	for _, i in t.indexes {
-		rbtree.destroy(&t.indexes[i].tree, false)
+		index_tree_free(&t.indexes[i].tree)
 		rbtree.init_cmp(&t.indexes[i].tree, index_cmp)
 		table_index_map_free(t, i)
 		t.indexes[i].lookup = make(map[string]^Index_Bucket)
@@ -1392,15 +1510,21 @@ index_tree_clone :: proc(source: ^Index_Tree, target: ^Index_Tree, keys: mem.All
 
 @(private)
 index_node_clone :: proc(
-	node: ^rbtree.Node(string, Row_Id),
-	parent: ^rbtree.Node(string, Row_Id),
+	node: ^Index_Node,
+	parent: ^Index_Node,
 	node_allocator: mem.Allocator,
 	key_allocator: mem.Allocator,
-) -> ^rbtree.Node(string, Row_Id) {
+) -> ^Index_Node {
 	if node == nil do return nil
-	copy := new_clone(rbtree.Node(string, Row_Id){
+	// The rows of a slot are the clone's own: the source frees its list.
+	more: [dynamic]Row_Id
+	if len(node.value.more) > 0 {
+		more = make([dynamic]Row_Id, len(node.value.more))
+		copy(more[:], node.value.more[:])
+	}
+	copy := new_clone(Index_Node{
 		key = strings.clone(node.key, key_allocator),
-		value = node.value,
+		value = Index_Slot{first = node.value.first, more = more},
 		_color = node._color,
 		_parent = parent,
 	}, node_allocator)
@@ -1793,7 +1917,7 @@ table_drop_index :: proc(t: ^Table, name: string) -> Error {
 		if index.schema.implicit {
 			return errf(.Invalid_Argument, "index %s comes from a constraint and cannot be dropped", name)
 		}
-		rbtree.destroy(&t.indexes[i].tree)
+		index_tree_free(&t.indexes[i].tree)
 		table_index_map_free(t, i)
 		table_index_detach_pages(t, i, true)
 		index_exprs_destroy(t.indexes[i].exprs)

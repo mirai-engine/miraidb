@@ -1899,7 +1899,8 @@ tx_committed_key_taken :: proc(
 		prefix := index_prefix_in(committed, index, values, tx.alloc)
 		for node := lower_bound(&committed.indexes[index].tree, prefix); node != nil; node = node_next(node) {
 			if !strings.has_prefix(node.key, prefix) do break
-			if holds(node.value, ignore, writes) do return true
+			if holds(node.value.first, ignore, writes) do return true
+			for id in node.value.more do if holds(id, ignore, writes) do return true
 		}
 		return false
 	}
