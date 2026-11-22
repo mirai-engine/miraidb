@@ -22,8 +22,10 @@ normative description of the invariants; the code follows it.
 
 A table is a `Table_Schema` plus:
 
-- `rows: map[Row_Id]Row`, where a `Row` is an ordered `[]Value` matching the
-  schema columns.
+- `rows: [dynamic]Row`, every row (tombstones included) in ascending id order,
+  where a `Row` is an ordered `[]Value` matching the schema columns. A lookup by
+  id tries the slot the id would have with no id missing, then a binary search;
+  a scan walks the slice in place (`table_scan`).
 - One `Index` per index in the schema, keyed by the order-preserving encoding. A
   unique index stores the key alone; a non-unique index appends the row id, so
   every entry is distinct and iteration is ordered. The keys live in a red-black

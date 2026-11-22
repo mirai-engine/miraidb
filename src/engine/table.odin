@@ -297,18 +297,17 @@ Row_Store :: struct {
 
 Table :: struct {
 	schema:          Table_Schema,
-	rows:            map[Row_Id]Row,
+	// rows holds every row of a memory table, tombstones included, in ascending id
+	// order (R1). A scan walks the slice; a lookup by id tries the slot the id
+	// would have if no id were missing, then searches (table_row_index). A map
+	// cost a hash and an 80-byte copy per row read, and a scan had to walk a
+	// separate list of ids beside it.
+	rows:            [dynamic]Row,
 	// key_scratch is where index_entry_key encodes a key before copying it into
 	// the arena at its exact length. Every caller mutates the table, which only
 	// the writer (or the transaction that owns a private table) does, so one
 	// buffer per table is never used twice at once.
 	key_scratch:     [dynamic]u8,
-	// order holds the id of every row in `rows`, ascending. A scan walks it
-	// instead of the map, so it neither visits the empty slots a map keeps after
-	// deletes (4 096 of them for 256 rows after a truncate) nor sorts what it
-	// collected. Only writers maintain it; a borrowed table may list ids its
-	// owner has since freed, and a scan skips an id the map does not hold.
-	order:           [dynamic]Row_Id,
 	next_row_id:     u64,
 	next_sequence:   i64,
 	// next_int_key is the highest value an INTEGER PRIMARY KEY has held in a
@@ -370,7 +369,7 @@ table_create :: proc(schema: ^Table_Schema) -> (^Table, Error) {
 	t.schema = schema_copy(&normalized, t.arena_allocator)
 	t.store = new(Row_Store)
 	t.store.refs = 1
-	t.rows = make(map[Row_Id]Row)
+	t.rows = make([dynamic]Row)
 	// Row ids start at one, as SQLite's rowid does: a program that names a row by
 	// its rowid -- sqlite3_blob_open's iRow, or ORDER BY rowid with a literal --
 	// then finds the same row here as it did there.
@@ -414,7 +413,7 @@ table_release :: proc(t: ^Table) {
 table_destroy :: proc(t: ^Table) {
 	if t == nil do return
 	shared := t.store != nil && row_store_shared(t.store)
-	for _, row in t.rows {
+	for row in t.rows {
 		if t.borrowed {
 			// The values belong to the store that this snapshot borrowed from.
 			continue
@@ -439,7 +438,6 @@ table_destroy :: proc(t: ^Table) {
 	page_rows_close(t.paged)
 	if len(t.index_dir) > 0 do delete(t.index_dir)
 	delete(t.key_scratch)
-	delete(t.order)
 	virtual.arena_destroy(&t.arena)
 	if t.store != nil do row_store_release(t.store)
 	free(t)
@@ -498,37 +496,33 @@ row_values_at :: proc(row: Row, seq: u64) -> ([]Value, bool) {
 // table_prune_versions drops history that no reader at `before_seq` or later
 // can ask for, and removes tombstones older than that.
 table_prune_versions :: proc(t: ^Table, before_seq: u64) {
-	dead := make([dynamic]Row_Id)
-	defer delete(dead)
-	for id, stored_row in t.rows {
-		row := stored_row
+	// One pass: each row drops the history no reader can ask for, and a tombstone
+	// older than `before_seq` leaves the slice, which keeps its order.
+	kept := 0
+	for &row in t.rows {
 		write := 0
-		versions := row.versions
 		for version in row.versions {
 			if version.deleted_seq != 0 && version.deleted_seq <= before_seq {
 				free_values(version.values)
 				continue
 			}
-			versions[write] = version
+			row.versions[write] = version
 			write += 1
 		}
-		resize(&versions, write)
-		row.versions = versions
-		t.rows[id] = row
-		if row.deleted_seq != 0 && row.deleted_seq <= before_seq do append(&dead, id)
-	}
-	for id in dead {
-		// A tombstone nobody can read any more owns nothing: its values and the array
-		// that held their history are freed with it. Forgetting them is what made
-		// INSERT OR REPLACE leave the replaced row behind for the life of the process
-		// (tools/leakcheck counted 48 bytes per statement).
-		if row, ok := t.rows[id]; ok {
+		resize(&row.versions, write)
+		if row.deleted_seq != 0 && row.deleted_seq <= before_seq {
+			// A tombstone nobody can read any more owns nothing: its values and the
+			// array that held their history are freed with it. Forgetting them is
+			// what made INSERT OR REPLACE leave the replaced row behind for the life
+			// of the process (tools/leakcheck counted 48 bytes per statement).
 			free_values(row.values)
 			delete(row.versions)
+			continue
 		}
-		map_erase(&t.rows, id)
+		t.rows[kept] = row
+		kept += 1
 	}
-	if len(dead) > 0 do table_order_compact(t)
+	resize(&t.rows, kept)
 }
 
 // schema_normalize adds the implicit unique indexes for the primary key and for
@@ -882,15 +876,15 @@ table_memory :: proc(t: ^Table) -> Table_Memory {
 		}
 		return memory
 	}
-	for _, row in t.rows {
+	for row in t.rows {
 		memory.rows += 1
-		memory.row_bytes += 48 // map entry, slice header and row header
+		memory.row_bytes += 48 // slot, slice header and row header
 		for value in row.values {
 			memory.row_bytes += value_storage_size(value)
 		}
 	}
 	for _, position in t.indexes {
-		for _, row in t.rows {
+		for row in t.rows {
 			memory.index_entries += 1
 			memory.index_bytes += 40 + index_key_len(t, position, row.values, row.id)
 		}
@@ -1107,15 +1101,74 @@ index_is_primary :: proc(t: ^Table, index: int) -> bool {
 // decodes them into `alloc`, and the caller owns them.
 table_get_row :: proc(t: ^Table, id: Row_Id, alloc: mem.Allocator) -> (Row, bool) {
 	if t.paged != nil do return page_rows_get(t.paged, id, alloc)
-	row, exists := t.rows[id]
-	return row, exists
+	at := table_row_index(t, id)
+	if at < 0 do return {}, false
+	return t.rows[at], true
 }
 
 // table_row_exists answers without decoding the values.
 table_row_exists :: proc(t: ^Table, id: Row_Id) -> bool {
 	if t.paged != nil do return page_rows_contains(t.paged, id)
-	_, exists := t.rows[id]
-	return exists
+	return table_row_index(t, id) >= 0
+}
+
+// table_row_index is where row `id` sits in t.rows, or -1. Ids are handed out in
+// increasing order, so with none missing the row is at `id - first`: that slot is
+// tried first, and a binary search answers when ids are missing.
+table_row_index :: proc(t: ^Table, id: Row_Id) -> int {
+	n := len(t.rows)
+	if n == 0 do return -1
+	first := t.rows[0].id
+	if id < first || id > t.rows[n - 1].id do return -1
+	guess := int(id - first)
+	if guess < n && t.rows[guess].id == id do return guess
+	low, high := 0, n
+	for low < high {
+		middle := (low + high) / 2
+		if t.rows[middle].id < id {
+			low = middle + 1
+		} else {
+			high = middle
+		}
+	}
+	if low < n && t.rows[low].id == id do return low
+	return -1
+}
+
+// table_memory_row is row `id` of a memory table, as the slice holds it (a paged
+// table holds none there and answers false), without decoding anything.
+table_memory_row :: proc(t: ^Table, id: Row_Id) -> (Row, bool) {
+	at := table_row_index(t, id)
+	if at < 0 do return {}, false
+	return t.rows[at], true
+}
+
+// table_row_find is row `id` in place, or nil. The pointer is good until the
+// slice next grows or shrinks (an insert, a prune, a truncate).
+table_row_find :: proc(t: ^Table, id: Row_Id) -> ^Row {
+	at := table_row_index(t, id)
+	return at < 0 ? nil : &t.rows[at]
+}
+
+// table_row_put adds a row that is not there, at its place: an append when the
+// id is the highest, which is every id the table hands out itself.
+@(private)
+table_row_put :: proc(t: ^Table, row: Row) {
+	n := len(t.rows)
+	if n == 0 || t.rows[n - 1].id < row.id {
+		append(&t.rows, row)
+		return
+	}
+	low, high := 0, n
+	for low < high {
+		middle := (low + high) / 2
+		if t.rows[middle].id < row.id {
+			low = middle + 1
+		} else {
+			high = middle
+		}
+	}
+	inject_at(&t.rows, low, row)
 }
 
 // table_touch_int_key remembers the largest integer primary key a paged table
@@ -1173,7 +1226,7 @@ table_insert :: proc(t: ^Table, id: Row_Id, values: []Value, validated := false)
 		table_touch_int_key(t, values)
 		return table_index_add_all(t, values, id)
 	}
-	if _, exists := t.rows[id]; exists {
+	if table_row_index(t, id) >= 0 {
 		return errf(.Internal, "row id %d already exists in table %s", u64(id), t.schema.name)
 	}
 	if !validated {
@@ -1190,8 +1243,7 @@ table_insert :: proc(t: ^Table, id: Row_Id, values: []Value, validated := false)
 			if next > t.next_sequence do t.next_sequence = next
 		}
 	}
-	t.rows[id] = Row{id = id, values = stored, created_seq = t.apply_seq}
-	table_order_add(t, id)
+	table_row_put(t, Row{id = id, values = stored, created_seq = t.apply_seq})
 	for _, i in t.indexes {
 		if put_err := table_index_put_row(t, i, stored, id); put_err.kind != .None do return put_err
 	}
@@ -1216,10 +1268,11 @@ table_update :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
 		table_touch_int_key(t, values)
 		return table_index_add_all(t, values, id)
 	}
-	row, exists := t.rows[id]
-	if !exists {
+	at := table_row_index(t, id)
+	if at < 0 {
 		return errf(.Internal, "row id %d is missing from table %s", u64(id), t.schema.name)
 	}
+	row := t.rows[at]
 	if err := table_check_unique(t, values, id); err.kind != .None {
 		return err
 	}
@@ -1244,7 +1297,7 @@ table_update :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
 			if next > t.next_sequence do t.next_sequence = next
 		}
 	}
-	t.rows[id] = Row{
+	t.rows[at] = Row{
 		id = id,
 		values = stored,
 		created_seq = t.apply_seq,
@@ -1265,8 +1318,8 @@ table_delete :: proc(t: ^Table, id: Row_Id) -> bool {
 		table_index_remove_all(t, old.values, id)
 		return page_rows_delete(t.paged, id)
 	}
-	row, exists := t.rows[id]
-	if !exists do return false
+	row := table_row_find(t, id)
+	if row == nil do return false
 	for _, i in t.indexes {
 		table_index_remove_row(t, i, row.values, id)
 	}
@@ -1274,7 +1327,6 @@ table_delete :: proc(t: ^Table, id: Row_Id) -> bool {
 	// visible to snapshots taken before this sequence, so no extra version is
 	// recorded (that would share the values and double free them).
 	row.deleted_seq = t.apply_seq
-	t.rows[id] = row
 	return true
 }
 
@@ -1294,7 +1346,7 @@ table_truncate :: proc(t: ^Table) {
 		}
 		return
 	}
-	for _, row in t.rows {
+	for row in t.rows {
 		// Truncating while a snapshot reads the same values cannot free them: they
 		// are handed to the shared store, which frees them when the last reader is
 		// gone.
@@ -1305,7 +1357,6 @@ table_truncate :: proc(t: ^Table) {
 		table_free_row(row)
 	}
 	clear(&t.rows)
-	clear(&t.order)
 	for _, i in t.indexes {
 		rbtree.destroy(&t.indexes[i].tree, false)
 		rbtree.init_cmp(&t.indexes[i].tree, index_cmp)
@@ -1317,9 +1368,8 @@ table_truncate :: proc(t: ^Table) {
 // table_insert_borrowed stores a row whose values belong to another table. The
 // indexes are built as usual; the values are not cloned.
 table_insert_borrowed :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
-	if _, exists := t.rows[id]; exists do return errf(.Internal, "row id %d already exists", u64(id))
-	t.rows[id] = Row{id = id, values = values, created_seq = t.apply_seq}
-	table_order_add(t, id)
+	if table_row_index(t, id) >= 0 do return errf(.Internal, "row id %d already exists", u64(id))
+	table_row_put(t, Row{id = id, values = values, created_seq = t.apply_seq})
 	for _, i in t.indexes {
 		if put_err := table_index_put_row(t, i, values, id); put_err.kind != .None do return put_err
 	}
@@ -1424,18 +1474,14 @@ table_snapshot :: proc(source: ^Table) -> ^Table {
 		index_tree_clone(&source.indexes[index].tree, &clone.indexes[index].tree, clone.arena_allocator)
 		index_lookup_clone(&source.indexes[index], &clone.indexes[index], context.allocator)
 	}
-	clone.rows = make(map[Row_Id]Row, len(source.rows))
-	for _, row in source.rows {
+	// The rows are already in order, so the clone is one pass with no hashing.
+	clone.rows = make([dynamic]Row, 0, len(source.rows))
+	for row in source.rows {
 		if row.deleted_seq != 0 do continue
 		// The snapshot keeps the values (borrowed) and the creation sequence; the
 		// version chain belongs to the source table and is not copied.
-		clone.rows[row.id] = Row{id = row.id, values = row.values, created_seq = row.created_seq}
+		append(&clone.rows, Row{id = row.id, values = row.values, created_seq = row.created_seq})
 	}
-	reserve(&clone.order, len(clone.rows))
-	for id in source.order {
-		if id in clone.rows do append(&clone.order, id)
-	}
-	if len(clone.order) != len(clone.rows) do table_order_rebuild(clone)
 	return clone
 }
 
@@ -1455,7 +1501,7 @@ table_cow_clone :: proc(source: ^Table) -> ^Table {
 	clone.borrowed = false
 	source.borrowed = true
 	if !owning do return clone
-	for _, &row in source.rows {
+	for &row in source.rows {
 		for version in row.versions do free_values(version.values)
 		delete(row.versions)
 		row.versions = nil
@@ -1470,7 +1516,7 @@ table_cow_clone :: proc(source: ^Table) -> ^Table {
 table_row_count :: proc(t: ^Table) -> int {
 	if t.paged != nil do return int(t.paged.rows)
 	live := 0
-	for _, row in t.rows {
+	for row in t.rows {
 		if row.deleted_seq == 0 do live += 1
 	}
 	return live
@@ -1506,74 +1552,12 @@ table_collect :: proc(
 		return
 	}
 	reserve(out, len(out) + len(t.rows))
-	// The order lists every row in id order, so the rows come out sorted. A table
-	// whose order does not cover its rows (none should exist) still answers, the
-	// slow way.
-	if len(t.order) >= len(t.rows) {
-		start := len(out)
-		present_count := 0
-		for id in t.order {
-			row, present := t.rows[id]
-			if !present do continue
-			present_count += 1
-			values, visible := row_values_at(row, seq)
-			if !visible do continue
-			append(out, Row{id = row.id, values = values})
-		}
-		// Every row of the map was met: the scan is complete. Otherwise a writer
-		// added a row without listing it, and the scan is redone from the map so
-		// that no row is ever missed.
-		if present_count == len(t.rows) do return
-		resize(out, start)
-	}
-	for _, row in t.rows {
+	// The slice is in id order, so the rows come out sorted.
+	for &row in t.rows {
 		values, visible := row_values_at(row, seq)
 		if !visible do continue
 		append(out, Row{id = row.id, values = values})
 	}
-	rows_sort_by_id(out[:])
-}
-
-// table_order_add records a new row id. Ids are handed out in increasing order,
-// so this is an append; an id that arrives out of order (a replay, an explicit
-// row id) is placed by binary search.
-table_order_add :: proc(t: ^Table, id: Row_Id) {
-	n := len(t.order)
-	if n == 0 || t.order[n - 1] < id {
-		append(&t.order, id)
-		return
-	}
-	low, high := 0, n
-	for low < high {
-		middle := (low + high) / 2
-		if t.order[middle] < id {
-			low = middle + 1
-		} else {
-			high = middle
-		}
-	}
-	if low < n && t.order[low] == id do return
-	inject_at(&t.order, low, id)
-}
-
-// table_order_compact drops the ids whose rows are gone, keeping the order.
-table_order_compact :: proc(t: ^Table) {
-	write := 0
-	for id in t.order {
-		if id not_in t.rows do continue
-		t.order[write] = id
-		write += 1
-	}
-	resize(&t.order, write)
-}
-
-// table_order_rebuild makes the order from the map, for a table whose order
-// could not be derived from another one.
-table_order_rebuild :: proc(t: ^Table) {
-	clear(&t.order)
-	reserve(&t.order, len(t.rows))
-	for id in t.rows do append(&t.order, id)
-	row_ids_sort(t.order[:])
 }
 
 // table_max_int returns the largest Int value in one column, or 0 when the
@@ -1587,7 +1571,7 @@ table_max_int :: proc(t: ^Table, column: int) -> i64 {
 		_ = page_rows_each(t.paged, &ctx, max_column_visit)
 		return ctx.best
 	}
-	for _, row in t.rows {
+	for row in t.rows {
 		if column >= len(row.values) do continue
 		if row.values[column].kind == .Int && row.values[column].i > best {
 			best = row.values[column].i
@@ -1732,7 +1716,7 @@ table_add_index :: proc(t: ^Table, index: Index_Schema) -> Error {
 		}
 		return ERROR_NONE
 	}
-	for _, row in t.rows {
+	for row in t.rows {
 		if row.deleted_seq != 0 do continue
 		if put_err := table_index_put_row(t, position, row.values, row.id); put_err.kind != .None {
 			return error_wrap(put_err, put_err.kind, "cannot grow index %s: %s", index.name, put_err.message)

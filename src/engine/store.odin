@@ -1411,7 +1411,8 @@ store_apply :: proc(store: ^Store, op: Store_Op) -> Error {
 			return errf(.Out_Of_Memory, "cannot convert the rows of %s", op.name)
 		}
 		defer virtual.arena_destroy(&scratch)
-		for id, row in existing.rows {
+		for row in existing.rows {
+			id := row.id
 			values, convert_err := alter_row_values(&existing.schema, op.schema, row.values, virtual.arena_allocator(&scratch))
 			if convert_err.kind != .None {
 				table_destroy(replacement)

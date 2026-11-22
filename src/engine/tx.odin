@@ -774,7 +774,8 @@ tx_alter_table :: proc(tx: ^Tx, name: string, next_schema: Table_Schema) -> Erro
 	replacement, create_err := table_create(&schema)
 	if create_err.kind != .None do return create_err
 	append(&tx.replaced, replacement)
-	for id, row in current.rows {
+	for row in current.rows {
+		id := row.id
 		values, convert_err := alter_row_values(&current.schema, next_schema, row.values, tx.alloc)
 		if convert_err.kind != .None do return convert_err
 		if insert_err := table_insert(replacement, id, values); insert_err.kind != .None {
@@ -926,7 +927,8 @@ tx_drop_column :: proc(tx: ^Tx, name, column_name: string) -> Error {
 	replacement, create_err := table_create(&schema)
 	if create_err.kind != .None do return create_err
 	append(&tx.replaced, replacement)
-	for id, row in current.rows {
+	for row in current.rows {
+		id := row.id
 		values := make([]Value, len(row.values) - 1, tx.alloc)
 		copy(values, row.values[:index])
 		copy(values[index:], row.values[index + 1:])
@@ -983,7 +985,8 @@ tx_rename_table :: proc(tx: ^Tx, from, to: string) -> Error {
 	replacement, create_err := table_create(&schema)
 	if create_err.kind != .None do return create_err
 	append(&tx.replaced, replacement)
-	for id, row in current.rows {
+	for row in current.rows {
+		id := row.id
 		if insert_err := table_insert(replacement, id, row.values); insert_err.kind != .None {
 			return insert_err
 		}

@@ -13759,7 +13759,7 @@ test_snapshot_indexes_are_its_own :: proc(t: ^testing.T) {
 	if len(old_ids) == 1 {
 		// The id the frozen index names is the row whose qty is 10 in the frozen
 		// table, whatever the row-id counter did.
-		row, exists := frozen.rows[old_ids[0]]
+		row, exists := db.table_memory_row(frozen, old_ids[0])
 		testing.expect(t, exists)
 		testing.expect_value(t, row.values[2].i, i64(10))
 	}
@@ -13853,7 +13853,7 @@ test_a_commit_copies_the_table_a_reader_holds :: proc(t: ^testing.T) {
 	frozen, frozen_err := db.tx_table(first, "c")
 	if testing.expect(t, db.error_ok(frozen_err)) {
 		seen := i64(0)
-		for _, row in frozen.rows do seen = row.values[1].i
+		for row in frozen.rows do seen = row.values[1].i
 		testing.expect_value(t, seen, i64(10))
 	}
 	// The table the commit did not write is not copied.
@@ -14565,7 +14565,7 @@ test_prune_history_respects_a_pin :: proc(t: ^testing.T) {
 	table, found := store.tables["t"]
 	testing.expect(t, found)
 	if found {
-		for _, row in table.rows do testing.expect_value(t, len(row.versions), 0)
+		for row in table.rows do testing.expect_value(t, len(row.versions), 0)
 	}
 }
 

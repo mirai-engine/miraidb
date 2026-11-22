@@ -10,7 +10,7 @@ the gaps are named rather than left to be discovered.
 
 ### Storage and recovery
 
-- Typed rows in `map[Row_Id]Row`, one table per relation.
+- Typed rows in one slice per table, in id order, one table per relation.
 - Ordered indexes (red-black trees) with equality, prefix and range scans.
 - Primary keys (single or composite), named multi-column `UNIQUE`, `NOT NULL`,
   `DEFAULT` and `AUTOINCREMENT` with start/increment/range, independent of the

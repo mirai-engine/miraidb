@@ -844,7 +844,7 @@ host_join_index_build :: proc(entry: ^Subscription_Query, tables: []^Table) {
 	for level in 0 ..< len(tables) {
 		// A source with no equality of its own keeps no index.
 		if host_join_index_column(entry, level) < 0 do continue
-		for _, row in tables[level].rows {
+		for row in tables[level].rows {
 			if row.deleted_seq != 0 do continue
 			host_join_index_add(entry, level, row.id, row.values)
 		}
@@ -994,7 +994,7 @@ host_join_walk :: proc(walk: ^Join_Walk, level: int) -> bool {
 	table := walk.tables[level]
 	alias := walk.aliases[level]
 	if level == walk.fixed {
-		row, exists := table.rows[walk.fixed_id]
+		row, exists := table_memory_row(table, walk.fixed_id)
 		if !exists || row.deleted_seq != 0 do return true
 		walk.sources[level] = Source{table = table, row = row, alias = alias}
 		return host_join_walk(walk, level + 1)
@@ -1005,7 +1005,7 @@ host_join_walk :: proc(walk: ^Join_Walk, level: int) -> bool {
 	// The table cannot move under this transaction: a commit that has to change
 	// a table a reader holds copies it first, so walking the live rows is stable
 	// and costs no copy of its own.
-	for _, row in table.rows {
+	for row in table.rows {
 		if row.deleted_seq != 0 do continue
 		if store_cancelled(walk.tx.store) do return false
 		walk.sources[level] = Source{table = table, row = row, alias = alias}
@@ -1059,7 +1059,7 @@ host_join_walk_probe :: proc(walk: ^Join_Walk, level: int, probe: Join_Probe) ->
 	bucket, found := walk.entry.join_index[level][key]
 	if !found do return true
 	for id in bucket {
-		row, exists := table.rows[id]
+		row, exists := table_memory_row(table, id)
 		if !exists || row.deleted_seq != 0 do continue
 		if store_cancelled(walk.tx.store) do return false
 		walk.sources[level] = Source{table = table, row = row, alias = walk.aliases[level]}
@@ -1206,7 +1206,7 @@ host_agg_group_sources :: proc(
 ) -> [][]Source {
 	group := make([dynamic][]Source, 0, len(ids))
 	for id in ids {
-		row, exists := base.rows[id]
+		row, exists := table_memory_row(base, id)
 		if !exists do continue
 		if _, visible := row_values_at(row, tx.read_seq); !visible do continue
 		one := make([]Source, 1)
@@ -1481,7 +1481,7 @@ host_apply_incremental_aggregate :: proc(
 			matched := false
 			new_key := ""
 			if op.kind != .Delete {
-				if row, exists := base.rows[op.row_id]; exists {
+				if row, exists := table_memory_row(base, op.row_id); exists {
 					source := Source{table = base, row = row, alias = stmt.from.alias}
 					if host_agg_matches(tx, stmt, source) {
 						if key, key_ok := host_agg_key(tx, stmt, source); key_ok {
@@ -1820,7 +1820,7 @@ host_apply_incremental_join :: proc(
 		}
 		// The changed row is bound before the enumeration starts: that is what
 		// lets a probe read its values from an earlier level.
-		if row, exists := tables[changed].rows[op.row_id]; exists && row.deleted_seq == 0 {
+		if row, exists := table_memory_row(tables[changed], op.row_id); exists && row.deleted_seq == 0 {
 			sources[changed] = Source{table = tables[changed], row = row, alias = aliases[changed]}
 		}
 		switch op.kind {
