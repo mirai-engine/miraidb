@@ -56,10 +56,13 @@ Rules for this file:
 ## R — the reference model
 
 The reference's own suite, ported as `benchmarks/parity` and run on the same
-machine, is the measure. In memory this engine is faster on an empty
-transaction (0.50 µs against 0.62) and slower on everything else: inserts
-1.6–2.9×, updates 2.3×, a 256-row scan about 3×, an index filter 3–4×. On disk
-(written, not synced, the reference's own contract) inserts are 3.0–4.8×.
+machine, is the measure. In memory, with the baseline of
+`benchmarks/parity/baseline.json`, this engine is at or under it on an empty
+transaction (0.50 µs against 0.53), the index filters (2.7 against 3.25) and a
+256-row scan of the u64 table (1.4 against 1.99), at it on the other scan (1.4
+against 1.33), and slower on the writes: inserts 1.3–2.9×, updates 2.6–3.0×. On
+disk (written, not synced, the reference's own contract) inserts were 3.0–4.8×
+when last measured, on 2026-11-19.
 SQLite, measured in the same run, also beats this engine on inserts and on
 updates by a wide margin, so the target is not only the reference. Where the
 time goes is measured in [RESULTS.md](../benchmarks/parity/RESULTS.md); the four
@@ -99,12 +102,28 @@ descent. Keys are still encoded strings, compared byte by byte and copied into
 the table arena once per distinct key. Measured for 256 rows, before that:
 staging with one UNIQUE index costs 377 µs against 154 µs with none (the key is
 encoded and probed for every row), and the commit of a table with one index per
-column 575 µs against 306 µs with one.
+column 575 µs against 306 µs with one. Two changes were measured and dropped,
+neither moving an insert or a filter past the machine's noise: a key of up to
+30 bytes kept inside its tree node (a descent reading one place per level, not
+the node and then the key), and encoding a row's key once for the unique check
+and the index entry.
 
 **Done when.** An index over integer columns keys its tree by the integer (or a
 fixed-width tuple) and an index over text keys by the text it already holds; the
 filter workloads reach 4.05 µs and an insert with `btree_each_column` its
 reference figure.
+
+## R6 — The cost of a statement
+
+**Closed.** A statement through `sql_execute` paid a fixed 11 µs for the arena
+its parse reserved and released (now pooled), a full scan for `WHERE rowid = k`
+(now a read of the row), and a heap list per scanned row plus a sort of rows
+already in order (now one pooled arena per statement, and a sort only when it is
+needed). `SELECT 1` went from 21.7 to 5.6 µs, a rowid read from 138 to 11.7, a
+`count(*)` of 2 048 rows from 565 to 276 ([RESULTS.md](../benchmarks/parity/RESULTS.md#the-sql-path-2026-11-22)).
+The parity gate holds four SQL workloads to their baseline, and
+`test_a_rowid_equality_reads_the_row_directly` covers the rowid path, staged
+writes included.
 
 ## R3 — Prune only what a commit touched
 

@@ -27,7 +27,7 @@ that way.
 
 | # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
-| 2 | **R2 — fixed-size index keys** | Index entries are encoded strings: an index filter is 3–4× the reference and the entry is the largest share of applying a row. Key integer columns by value. | M | — |
+| 2 | **R2 — fixed-size index keys** | The index filters are under the reference since a key files its rows under one entry; an insert is 1.3–1.4× it with an index per column and 2.7–2.9× with one unique index, where the encoded key and its probe while staging are most of the time. | M | — |
 | 3 | **R3 — prune what a commit touched** | Pruning walks every row of every table after each statement. | S | — |
 | 4 | **R4 — hand the staged row to the table** | About 4% of an insert is a copy from the arena to the table. | M | — |
 | 6 | **D12 — module sandbox** | A module is a process with a work budget; the reference runs modules deterministically with enforced limits. | L | — |
@@ -53,7 +53,6 @@ that way.
 | 23 | **D11 — triggers and policies in a transaction** | Order them against the rows of the same transaction. | S | — |
 | 24 | **D2 — spatial tree** | Node pages and a descent instead of a scan over box columns. | M | — |
 | 25 | **D10 — precision and time** | Decimal scale, `TIMESTAMPTZ`, streaming blobs. | M | — |
-| 26 | **D35 — diagnostics** | A file open per commit for the log index, and the test-side leak lines if they start hiding a report. | S | 19 |
 | 27 | **D15 — network hardening** | TLS, HTTP/2, backpressure, per-route timeouts, a load test. | M | — |
 | 28 | **D14 — replication** | `GET /log?since=<seq>` and a follower applying through replay. | XL | 27 |
 | 29 | **Auth review** | Rate limits, token lifetime, adversarial tests over subscriptions and budgets; tokens travel in clear until TLS; **grants are opt-in**, so a database with no grant rows accepts every statement from every client. | S | — |
@@ -65,8 +64,8 @@ with peer-to-peer sync; its networked phases build on items 27 and 28.
 
 ## Suggested order
 
-1. **R2**: the largest gap left against the reference (filters 2.7–2.9×, and
-   most of an insert), measured. The parity gate (`scripts/parity.py`) is in CI:
+1. **R2**: the largest gap left against the reference (most of an insert),
+   measured. The parity gate (`scripts/parity.py`) is in CI:
    it records its gain with `--record` so it cannot slip back, as R1's is.
 2. **D36**: let the planner read partial and expression indexes, which are
    enforced today but never read.
