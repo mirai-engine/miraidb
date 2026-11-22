@@ -10894,10 +10894,12 @@ test_insert_caches_follow_the_catalog :: proc(t: ^testing.T) {
 
 @(test)
 test_scans_come_out_in_row_id_order :: proc(t: ^testing.T) {
-	// A scan walks the table's ordered id list instead of its map. Every writer
-	// keeps that list right: inserts in several transactions, deletes with their
-	// history pruned, a truncate, a commit while a reader holds the table (which
-	// copies it), and ids that arrive out of order.
+	// The rows are kept in id order, and both ways of reading them -- collecting
+	// them (table_collect) and walking them in place (table_scan) -- answer the
+	// same rows in that order. Every writer keeps it right: inserts in several
+	// transactions, deletes with their history pruned, a truncate, a commit
+	// while a reader holds the table (which copies it), and ids that arrive out
+	// of order.
 	store := fresh_db(t, "row_order")
 	if store == nil do return
 	defer cleanup_db(store, "row_order")
@@ -10924,11 +10926,35 @@ test_scans_come_out_in_row_id_order :: proc(t: ^testing.T) {
 				return
 			}
 		}
+		scan := db.table_scan(table)
+		defer db.table_scan_end(&scan)
+		walked := 0
+		for id, values in db.table_scan_next(&scan) {
+			if walked >= len(rows) || rows[walked].id != id || raw_data(rows[walked].values) != raw_data(values) {
+				testing.expectf(t, false, "%s: the scan's row %d (id %d) is not the collect's", label, walked, id)
+				return
+			}
+			walked += 1
+		}
+		testing.expectf(t, walked == len(rows), "%s: the scan met %d rows, the collect %d", label, walked, len(rows))
 	}
 	ascending(t, store, 600, "after three batches")
 
+	before_deletes := store.commit_seq
 	run_done(t, store, "DELETE FROM t WHERE n % 3 = 0")
 	ascending(t, store, 400, "after deletes, history kept")
+	// With the history kept, a scan at the sequence before the deletes still
+	// meets the deleted rows, as a reader that began then does.
+	{
+		tx := db.tx_begin_read(store)
+		table := db.tx_table_probe(tx, "t")
+		scan := db.table_scan(table, before_deletes)
+		seen := 0
+		for _ in db.table_scan_next(&scan) do seen += 1
+		db.table_scan_end(&scan)
+		db.tx_end(tx)
+		testing.expect_value(t, seen, 600)
+	}
 	db.store_prune_history(store)
 	ascending(t, store, 400, "after the history is pruned")
 
@@ -10971,6 +10997,14 @@ test_scans_come_out_in_row_id_order :: proc(t: ^testing.T) {
 			got := make([dynamic]u64, 0, 5)
 			for row in rows do append(&got, u64(row.id))
 			testing.expectf(t, len(got) == 5 && got[0] == 10 && got[1] == 20 && got[4] == 50, "out-of-order ids came out %v", got[:])
+			scan := db.table_scan(loose)
+			at := 0
+			for id in db.table_scan_next(&scan) {
+				if at < len(got) do testing.expect_value(t, u64(id), got[at])
+				at += 1
+			}
+			db.table_scan_end(&scan)
+			testing.expect_value(t, at, 5)
 			delete(got)
 			db.table_collect_release(loose, &rows)
 			db.table_destroy(loose)
@@ -11827,6 +11861,23 @@ test_paged_table_roundtrip :: proc(t: ^testing.T) {
 
 	run_done(t, store, "DELETE FROM item WHERE id = 150")
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM item").i, i64(399))
+	// The in-place scan reads a paged table too: its rows are decoded into the
+	// scan, come out in id order and are freed with it.
+	{
+		paged_table, paged_err := db.store_table(store, "item")
+		testing.expect(t, db.error_ok(paged_err))
+		scan := db.table_scan(paged_table)
+		count, last, ordered := 0, db.Row_Id(0), true
+		for id, values in db.table_scan_next(&scan) {
+			if count > 0 && id <= last do ordered = false
+			if values[0].i == 151 do testing.expect_value(t, values[1].s, "name-151")
+			last = id
+			count += 1
+		}
+		db.table_scan_end(&scan)
+		testing.expect_value(t, count, 399)
+		testing.expect(t, ordered)
+	}
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM item WHERE id = 150").i, i64(0))
 
 	duplicate := run_error(t, store, "INSERT INTO item (id, name, qty) VALUES (200, 'dup', 1)")

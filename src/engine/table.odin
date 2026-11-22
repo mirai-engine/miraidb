@@ -1597,6 +1597,49 @@ max_column_visit :: proc(ctx: rawptr, row: Row) -> bool {
 
 // table_collect_release frees a collect from a paged table. A memory table's
 // values belong to the table, so only the list goes.
+// Table_Scan walks a table's visible rows in id order without collecting them:
+// a memory table's rows are read in place, which is what a scan of the
+// reference's tables does. A paged table has no rows in memory, so its rows are
+// decoded once into the scan and freed by table_scan_end.
+Table_Scan :: struct {
+	table:  ^Table,
+	seq:    u64,
+	at:     int,
+	paged:  [dynamic]Row,
+}
+
+// table_scan starts a scan of the rows visible at `seq`. The values it hands out
+// are the table's (a paged table's: the scan's) and stay good until
+// table_scan_end, or until the table is written.
+table_scan :: proc(t: ^Table, seq: u64 = max(u64)) -> Table_Scan {
+	scan := Table_Scan{table = t, seq = seq}
+	if t.paged != nil do table_collect(t, &scan.paged, seq)
+	return scan
+}
+
+// table_scan_next answers the next visible row, or false at the end.
+table_scan_next :: proc(scan: ^Table_Scan) -> (id: Row_Id, values: []Value, ok: bool) {
+	t := scan.table
+	if t.paged != nil {
+		if scan.at >= len(scan.paged) do return 0, nil, false
+		row := scan.paged[scan.at]
+		scan.at += 1
+		return row.id, row.values, true
+	}
+	for scan.at < len(t.rows) {
+		row := &t.rows[scan.at]
+		scan.at += 1
+		if visible, shown := row_values_at(row^, scan.seq); shown do return row.id, visible, true
+	}
+	return 0, nil, false
+}
+
+// table_scan_end frees what a scan of a paged table decoded.
+table_scan_end :: proc(scan: ^Table_Scan) {
+	if scan.table != nil && scan.table.paged != nil do table_collect_release(scan.table, &scan.paged)
+	scan^ = {}
+}
+
 table_collect_release :: proc(t: ^Table, rows: ^[dynamic]Row) {
 	if t.paged != nil {
 		for row in rows^ do free_values(row.values)

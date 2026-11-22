@@ -237,15 +237,17 @@ bench_insert :: proc(data: rawptr) {
 	insert_rows(b.store, b.name, b.shape, b.batch)
 }
 
+// bench_iterate walks every row in place, as the reference's iteration does:
+// table_scan reads the rows where the table keeps them (table_collect would
+// copy each one into a list first).
 bench_iterate :: proc(data: rawptr) {
 	b := (^Bench)(data)
 	tx := db.tx_begin_read(b.store)
 	table := db.tx_table_probe(tx, b.name)
-	rows := make([dynamic]db.Row, 0, 256)
-	db.table_collect(table, &rows)
+	scan := db.table_scan(table)
 	sum: u64
-	for row in rows do sum += u64(row.id)
-	db.table_collect_release(table, &rows)
+	for id in db.table_scan_next(&scan) do sum += u64(id)
+	db.table_scan_end(&scan)
 	db.tx_end(tx)
 	if sum == max(u64) do fmt.println(sum)
 }
