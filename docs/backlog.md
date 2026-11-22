@@ -31,8 +31,9 @@ Rules for this file:
 |---|---|---|---|
 | R1 | closed: rows live in one slice in id order, a scan walks it | — | — |
 | R2 | a memory index files the rows of a key under one entry; keys are encoded strings | the write path's keys: one encoding per check, fixed-size keys where the column allows | M |
-| R3 | pruning walks every row of every table after each statement | prune what the commit touched | S |
+| R3 | closed: a prune visits the rows that hold a version or are a tombstone | — | — |
 | R4 | a committed row is copied from the transaction arena to the table | hand the staged row over | M |
+| R6 | closed: a statement's fixed cost, a rowid read and a scan's per-row lists | — | — |
 | D2 | overlap on an `rtree` table is a scan | node pages and a descent | M |
 | D3 | versions stay until `store_prune_versions` is called | automatic retention, `AS OF` on a join | M |
 | D4 | a table with a secondary index re-encodes the `.sqlite` mirror | patch the index b-trees | L |
@@ -127,11 +128,14 @@ writes included.
 
 ## R3 — Prune only what a commit touched
 
-**Now.** Pruning row history walks every row of every table, and the CLI and the
-C ABI prune after each statement.
-
-**Done when.** A commit records the rows it versioned and the prune visits those
-only; a test proves a commit to one table never visits another.
+**Closed.** A table keeps the ids of its rows that hold a version or are a
+tombstone (`Table.history`), once each, and a prune visits those; the slice is
+compacted from the first tombstone that leaves, so a commit that deleted nothing
+moves no row. A prune after a one-row commit beside a 100 000-row table went from
+997 µs to 0.1, and the parity inserts and updates, which prune after each
+commit, 2–7% down. `test_a_prune_visits_only_the_rows_a_commit_touched` counts
+the rows each prune visits: a commit to one table visits none of another, and
+what an older read can still ask for stays until a later prune.
 
 ## R4 — Hand the staged row to the table
 
@@ -162,7 +166,11 @@ on 100k boxes.
 **Now.** `SELECT … FROM t AS OF <seq>` reads the versions a table keeps
 (`test_as_of`). Versions stay until `store_prune_versions(store, before_seq)` is
 called with the oldest sequence in use; there is no automatic policy, history is
-not counted against a memory budget, and `AS OF` on a join is refused.
+not counted against a memory budget, and `AS OF` on a join is refused. The CLI
+prunes after each statement; the C ABI and the `sqlite3_*` facade do not, so an
+embedded process that updates rows keeps every value it replaced. Since R3 a
+prune costs the rows that changed, so pruning after each commit while no read is
+pinned is cheap.
 
 **Done when.** Retention follows the oldest open reader automatically, a test
 proves a long-lived database with updates stays bounded, and `AS OF` works on a

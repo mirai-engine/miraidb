@@ -338,6 +338,27 @@ What a filtered scan spends now is mostly the WHERE itself, about 0.2 µs a row
 for one comparison. The baseline is recorded again; the table workloads came out
 2–6% under their previous numbers, within what a day moves this machine.
 
+## R3: a prune visits what changed (2026-11-22)
+
+Pruning row history walked every row of every table, and this suite prunes after
+each commit, as the CLI does. A table now keeps the ids of the rows that hold a
+version or are a tombstone, and a prune visits those. Measured alone, a prune
+after a one-row commit beside a 100 000-row table went from 997 µs to 0.1 µs.
+Before and after, interleaved four times each, best median, in µs:
+
+| Workload | Before | R3 | Change |
+|---|---:|---:|---:|
+| insert_bulk u32_u64_str unique_0 | 683 | 651 | −5% |
+| insert_bulk u32_u64_str btree_each_column | 675 | 658 | −3% |
+| insert_bulk u32_u64_u64 unique_0 | 501 | 466 | −7% |
+| insert_bulk u32_u64_u64 btree_each_column | 521 | 489 | −6% |
+| update_bulk u32_u64_str | 1 078 | 1 013 | −6% |
+| update_bulk u32_u64_u64 | 835 | 822 | −2% |
+
+The reads do not prune and did not move. The baseline stays R6's: recorded
+again, every workload came out 0–14% slower, the reads R3 does not touch among
+them, which is the machine and not the code; R6's numbers hold the gate tighter.
+
 To reproduce:
 
 ```sh
