@@ -2,16 +2,16 @@
   "note": "In memory, best median of three runs, nanoseconds. engine_ns is this machine's, written by `python3 scripts/parity.py --record`; reference_ns and sqlite_ns were measured on the same machine on 2026-11-19 (benchmarks/parity/RESULTS.md).",
   "engine_ns": {
     "miraidb/mem/empty": 500,
-    "miraidb/mem/filter/string/index/load=2048/count=256": 12700,
-    "miraidb/mem/filter/u64/index/load=2048/count=256": 12200,
-    "miraidb/mem/insert_bulk/u32_u64_str/btree_each_column/load=2048/count=256": 779700,
-    "miraidb/mem/insert_bulk/u32_u64_str/unique_0/load=2048/count=256": 668200,
-    "miraidb/mem/insert_bulk/u32_u64_u64/btree_each_column/load=2048/count=256": 615400,
-    "miraidb/mem/insert_bulk/u32_u64_u64/unique_0/load=2048/count=256": 517900,
-    "miraidb/mem/iterate/u32_u64_str/unique_0/count=256": 4500,
-    "miraidb/mem/iterate/u32_u64_u64/unique_0/count=256": 4600,
-    "miraidb/mem/update_bulk/u32_u64_str/unique_0/load=2048/count=256": 969000,
-    "miraidb/mem/update_bulk/u32_u64_u64/unique_0/load=2048/count=256": 823800
+    "miraidb/mem/filter/string/index/load=2048/count=256": 9500,
+    "miraidb/mem/filter/u64/index/load=2048/count=256": 8800,
+    "miraidb/mem/insert_bulk/u32_u64_str/btree_each_column/load=2048/count=256": 880400,
+    "miraidb/mem/insert_bulk/u32_u64_str/unique_0/load=2048/count=256": 701600,
+    "miraidb/mem/insert_bulk/u32_u64_u64/btree_each_column/load=2048/count=256": 645200,
+    "miraidb/mem/insert_bulk/u32_u64_u64/unique_0/load=2048/count=256": 510100,
+    "miraidb/mem/iterate/u32_u64_str/unique_0/count=256": 1400,
+    "miraidb/mem/iterate/u32_u64_u64/unique_0/count=256": 1500,
+    "miraidb/mem/update_bulk/u32_u64_str/unique_0/load=2048/count=256": 1070000,
+    "miraidb/mem/update_bulk/u32_u64_u64/unique_0/load=2048/count=256": 881800
   },
   "reference_ns": {
     "miraidb/mem/empty": 530,

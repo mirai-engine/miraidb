@@ -269,6 +269,38 @@ regression fix (1 009 → 969 µs and 864 → 824 µs), which is within what a d
 moves this machine and was not traced to a change. A run of the gate takes
 about 35 s.
 
+## R1: rows stored in id order (2026-11-22)
+
+A memory table keeps its rows in one slice in id order, where a map keyed by id
+held them before (with a sorted list of ids beside it for scans). A lookup tries
+the slot the id would have with no id missing, then a binary search; a scan walks
+the slice. Before and after, interleaved three times each, best median, in µs:
+
+| Workload | Before | R1 | Change |
+|---|---:|---:|---:|
+| insert_bulk u32_u64_str unique_0 | 729 | 686 | −6% |
+| insert_bulk u32_u64_str btree_each_column | 907 | 849 | −6% |
+| insert_bulk u32_u64_u64 unique_0 | 578 | 495 | −14% |
+| insert_bulk u32_u64_u64 btree_each_column | 728 | 608 | −17% |
+| update_bulk u32_u64_str | 1 116 | 1 045 | −6% |
+| update_bulk u32_u64_u64 | 935 | 877 | −6% |
+| iterate 256 rows (u32_u64_str) | 5.0 | 3.0 | −40% |
+| iterate 256 rows (u32_u64_u64) | 4.8 | 3.1 | −35% |
+| filter, string index | 13.8 | 9.3 | −33% |
+| filter, u64 index | 13.4 | 8.6 | −36% |
+
+Of iterate's 3.0 µs, 2.1 were `table_collect` copying 256 rows into a list. The
+reference iterates over its rows; `table_scan` does the same over the slice, and
+this suite's iterate now uses it: **1.4 µs** (u32_u64_str, the reference's 1.33)
+and **1.5 µs** (u32_u64_u64, the reference's 1.99). Taking a read transaction and
+the table is 0.9 of that.
+
+An insert's time is not where R1's item put it. 256 inserts into a map are
+8.8 µs of the ~700 a 256-row insert takes; staging with one UNIQUE index costs
+377 µs against 154 µs with none (the key is encoded and probed per row), and the
+commit of a table with an index per column 575 µs against 306 µs with one. Both
+are the index keys, R2's item. The baseline is recorded again with R1's numbers.
+
 To reproduce:
 
 ```sh

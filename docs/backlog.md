@@ -29,7 +29,7 @@ Rules for this file:
 
 | Item | Today | Gap | Effort |
 |---|---|---|---|
-| R1 | rows live in a map keyed by id; a scan looks every id up | rows stored in id order | L |
+| R1 | closed: rows live in one slice in id order, a scan walks it | — | — |
 | R2 | every index entry is an encoded string | fixed-size keys where the column allows | M |
 | R3 | pruning walks every row of every table after each statement | prune what the commit touched | S |
 | R4 | a committed row is copied from the transaction arena to the table | hand the staged row over | M |
@@ -72,21 +72,29 @@ numbers, measured twice per run like the existing time metrics.
 
 ## R1 — Rows stored in id order
 
-**Now.** A table keeps its rows in `map[Row_Id]Row` plus a sorted id list
-(`Table.order`), so a scan walks the list and looks each id up in the map, and
-staging a row pays a map insert, the largest single cost of an insert.
+**Closed.** A memory table keeps its rows, tombstones included, in one slice in
+id order (`Table.rows`). A lookup by id tries the slot the id would have with
+no id missing, then a binary search; a scan walks the slice in place
+(`table_scan`, or `table_collect` for a list); a prune compacts the slice in one
+pass; a reader's copy is one pass over it with no hashing. The map cost a hash
+and an 80-byte copy per row read. Measured against the build before, interleaved:
+iterate 4.8–5.0 → 1.4–1.5 µs (the reference: 1.33 and 1.99), filter −33–36%,
+inserts −6–16%, updates −6%. `test_scans_come_out_in_row_id_order` reads every
+writer's result both ways, at the current sequence and at an older one.
 
-**Done when.** Rows live contiguously in id order (an array of rows with a
-tombstone, or pages of rows), a scan is a walk over memory, the map insert is
-gone from staging, and `test_scans_come_out_in_row_id_order` plus the
-copy-on-write tests still pass. Measured: iterate within the reference's 1.65 µs,
-and the insert workloads move by the map's share.
+The map insert of staging, which this item named the largest single cost of an
+insert, is 8.8 µs of a 256-row insert's ~700 (1.3%): what an insert spends is the
+unique-key check while staging (~0.9 µs a row with one UNIQUE index) and the
+index entries at commit, which is R2.
 
 ## R2 — Fixed-size index keys
 
 **Now.** Every index entry is a key encoded into a string (`index_entry_key`),
 compared byte by byte, and copied into the table arena on apply: the largest
-share of applying a row, and the cost of an index filter.
+share of applying a row, and the cost of an index filter. Measured for 256 rows:
+staging with one UNIQUE index costs 377 µs against 154 µs with none (the key is
+encoded and probed for every row), and the commit of a table with one index per
+column 575 µs against 306 µs with one.
 
 **Done when.** An index over integer columns keys its tree by the integer (or a
 fixed-width tuple) and an index over text keys by the text it already holds; the

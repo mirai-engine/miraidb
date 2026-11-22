@@ -27,10 +27,9 @@ that way.
 
 | # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
-| 1 | **R1 — rows stored in id order** | Rows in a map keyed by id make a 256-row scan 2.8–3.1× the reference and put a map insert in every staged row. Store them contiguously in id order. | L | — |
 | 2 | **R2 — fixed-size index keys** | Index entries are encoded strings: an index filter is 3–4× the reference and the entry is the largest share of applying a row. Key integer columns by value. | M | — |
 | 3 | **R3 — prune what a commit touched** | Pruning walks every row of every table after each statement. | S | — |
-| 4 | **R4 — hand the staged row to the table** | About 4% of an insert is a copy from the arena to the table. | M | 1 |
+| 4 | **R4 — hand the staged row to the table** | About 4% of an insert is a copy from the arena to the table. | M | — |
 | 6 | **D12 — module sandbox** | A module is a process with a work budget; the reference runs modules deterministically with enforced limits. | L | — |
 | 7 | **D16 — generated clients** | Deferred by months: generate the Python binding from the catalog, then a second language. Until then the C ABI, the `sqlite3_*` face and the Python wrapper stay gated, so a binding is a thin layer when it comes ([backlog](backlog.md#d16--clients-generated-from-the-catalog)). | M | — |
 
@@ -66,9 +65,9 @@ with peer-to-peer sync; its networked phases build on items 27 and 28.
 
 ## Suggested order
 
-1. **R1 and R2**: the two largest gaps against the reference, measured. The
-   parity gate (`scripts/parity.py`) is in CI: each one records its gain
-   with `--record` so it cannot slip back.
+1. **R2**: the largest gap left against the reference (filters 2.7–2.9×, and
+   most of an insert), measured. The parity gate (`scripts/parity.py`) is in CI:
+   it records its gain with `--record` so it cannot slip back, as R1's is.
 2. **D36**: let the planner read partial and expression indexes, which are
    enforced today but never read.
 3. **D23**: the remaining way the process can die instead of answering; **D34**
