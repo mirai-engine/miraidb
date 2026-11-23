@@ -477,8 +477,8 @@ than 1000 bytes cannot be indexed and the insert says so.
   `WHERE` and as the argument of an aggregate. `miraidb_create_function` carries
   the same thing across the C boundary, with text copied in both directions
   (`test_host_functions`, `scripts/capi_smoke.py`).
-- **The C ABI reaches every lever the engine has.** 33 `miraidb_*` exports and 43
-  `sqlite3_*` exports: open with flags (read-only, in-memory, no-sync, paged),
+- **The C ABI reaches every lever the engine has.** 33 `miraidb_*` exports and
+  the `sqlite3_*` facade (233 of SQLite's functions, S8 in the backlog): open with flags (read-only, in-memory, no-sync, paged),
   interrupt, the row quota and work budget with `miraidb_work_used`, an identity
   and a token (`miraidb_set_identity`, `miraidb_identity`, `miraidb_issue_token`,
   `miraidb_authenticate`, which answers `MIRAIDB_DENIED` for an unknown or expired

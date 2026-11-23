@@ -52,6 +52,9 @@ Rules for this file:
 | D34 | the threaded suite is green on Linux and Windows; the sanitizer covers the Windows CLI, not the suite | run the suite sanitized on every platform, in CI | S |
 | D36 | a query never reads a partial or expression index | match a query's predicate to the index | M |
 | D37 | a connection catching up with another process's commit reads the whole file and its schema | reuse the parsed schema, explain the stalls, time `multiwrite01` in CI | S |
+| S8 | the `sqlite3_*` facade exports 233 of the 309 functions SQLite declares | the other 76: statements, URIs, pre-update hooks, memory, WAL and snapshots, mutexes | M |
+| D39 | PostgreSQL's surface is not measured in CI; its catalog is `pg_tables` only | a probe gate, the catalog drivers and ORMs read, PostgreSQL's `GRANT` and `CREATE POLICY` | L |
+| D40 | a transaction holds the store's write lock until it commits | two writers that stage at once and conflict only at commit | L |
 | D35 | diagnostics: closed | — | — |
 
 ---
@@ -63,7 +66,8 @@ machine, is the measure. In memory, with the baseline of
 `benchmarks/parity/baseline.json`, this engine is at or under it on an empty
 transaction (0.50 µs against 0.53), the index filters (2.7 against 3.25) and a
 256-row scan of the u64 table (1.4 against 1.99), at it on the other scan (1.4
-against 1.33), and slower on the writes: inserts 1.3–2.9×, updates 2.6–3.0×. On
+against 1.33), and slower on the writes: inserts 1.2–1.3× with an index per
+column and 2.6–2.7× with one unique index, updates 2.6–2.8×. On
 disk (written, not synced, the reference's own contract) inserts were 3.0–4.8×
 when last measured, on 2026-11-19.
 SQLite, measured in the same run, also beats this engine on inserts and on
@@ -461,6 +465,54 @@ counts one schema parse per schema change and none for a commit of rows; the
 stalls are explained by a trace of the lock each process waited on; and
 `scripts/sqlite_tools.py` times `multiwrite01` against SQLite over five
 interleaved runs and fails past 1.25× SQLite's median.
+
+## S8 — The rest of SQLite's C API
+
+**Now.** `include/sqlite3_miraidb.h` declares 233 functions, each answered as
+SQLite answers it (`scripts/sqlite_abi_reference.py`, zero differences).
+SQLite's `sqlite.h.in` names 315; six of those are placeholders of its
+documentation (`sqlite3_bind_`, `sqlite3_result_xxxxx`, …), so 76 are missing:
+`bind_blob64`, `next_stmt`, `normalized_sql`, `get_table`, the `uri_*` and
+`filename_*` family, the pre-update hook, `stmt_scanstatus`, the memory counters
+and heap limits, the WAL checkpoint calls and snapshots, the mutex calls, and
+the setup calls a default build of SQLite answers trivially.
+
+**Done when.** The facade exports every function of `sqlite.h.in` but the
+placeholders, the count is measured against that header instead of a written
+number, and `scripts/sqlite_abi_reference.py` covers each new group with zero
+differences; the WAL and snapshot calls answer as SQLite does on a database in
+rollback-journal mode, and the hard heap limit waits for D23.
+
+## D39 — PostgreSQL's surface
+
+**Now.** The PostgreSQL front runs the wire protocol, SCRAM, `COPY`, cursors,
+`LISTEN`/`NOTIFY`, arrays, `MERGE`, `LATERAL` and `GROUPING SETS`, each with its
+test, but nothing measures how much of PostgreSQL's dialect runs: the probes
+that did (87 statements, 35 running when last counted) live outside the
+repository. The catalog has `pg_tables` only, so a driver's or an ORM's
+reflection fails, and grants and policies have the engine's own spelling.
+
+**Done when.** `scripts/pg_gaps.py --check` runs the probes in CI against a
+counted figure written in the docs, as `scripts/sqlite_gaps.py` does; `pg_type`,
+`pg_class`, `pg_attribute`, `pg_namespace`, `pg_index` and the
+`information_schema` tables answer what psycopg and SQLAlchemy's reflection
+read, with a gate that reflects a schema through them; `GRANT`, `REVOKE` and
+`CREATE POLICY` parse as PostgreSQL writes them onto the grants and policies the
+engine has; a cancel request stops the running statement.
+
+## D40 — Two writers
+
+**Now.** A write transaction takes the store's write lock when it starts and
+holds it until it commits, so a second writer waits for the first even when the
+two touch different rows: over the PostgreSQL front a client that leaves a
+transaction open blocks every other writer.
+
+**Done when.** A transaction stages without the lock and validates what it read
+and wrote at commit: the first to commit wins and the other fails with
+`40001 serialization_failure` over the PostgreSQL front (and `SQLITE_BUSY` on the
+SQLite face, which keeps one writer); a test runs two connections that write
+different rows at once without waiting and one conflict that fails, and
+`scripts/soak.py` stays green.
 
 ## D35 — Diagnostics
 

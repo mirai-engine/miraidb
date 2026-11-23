@@ -27,7 +27,7 @@ that way.
 
 | # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
-| 2 | **R2 — fixed-size index keys** | The index filters are under the reference since a key files its rows under one entry; an insert is 1.3–1.4× it with an index per column and 2.7–2.9× with one unique index, where the encoded key and its probe while staging are most of the time. | M | — |
+| 2 | **R2 — fixed-size index keys** | The index filters are under the reference since a key files its rows under one entry; an insert is 1.2–1.3× it with an index per column and 2.6–2.7× with one unique index, and an update 2.6–2.8×. The cost is spread over staging, maps, key encoding, the tree, the copy and the commit; the next step is a sampling profile of the write path. | M | — |
 | 5 | **R7 — share a table with its readers** | A commit with a reader open copies the table it writes: 13–17 ms over 50 000 rows, mostly new memory being touched. | L | — |
 | 6 | **D12 — module sandbox** | A module is a process with a work budget; the reference runs modules deterministically with enforced limits. | L | — |
 | 7 | **D16 — generated clients** | Deferred by months: generate the Python binding from the catalog, then a second language. Until then the C ABI, the `sqlite3_*` face and the Python wrapper stay gated, so a binding is a thin layer when it comes ([backlog](backlog.md#d16--clients-generated-from-the-catalog)). | M | — |
@@ -39,6 +39,10 @@ that way.
 | 15 | **D4 — secondary indexes in the mirror** | A table with a secondary index re-encodes the `.sqlite` file per commit. | L | — |
 | 16 | **D36 — partial and expression indexes in plans** | The planner skips them; match a predicate to a partial index's WHERE and an expression to its index. | M | 8 |
 | 17 | **D24 — the mirror's last gaps** | A counted skip for an index the engine cannot express, and a mirror fuzz pass. | S | 8 |
+| 32 | **D37 — catching up with a shared file** | Five processes on one file run `multiwrite01` in a median 1.4× SQLite's time; reuse the parsed schema, explain the stalls, time it in CI. | S | — |
+| 33 | **S8 — the rest of the C API** | 233 of SQLite's 309 functions are exported; 76 are left. | M | — |
+| 34 | **D39 — PostgreSQL's surface** | A probe gate for the dialect, the catalog drivers and ORMs read, PostgreSQL's spelling of grants and policies. | L | — |
+| 35 | **D40 — two writers** | A transaction holds the write lock until it commits; stage without it and conflict at commit. | L | — |
 
 ## C. Hardening and release
 
@@ -63,15 +67,17 @@ with peer-to-peer sync; its networked phases build on items 27 and 28.
 
 ## Suggested order
 
-1. **R2**: the largest gap left against the reference (most of an insert),
-   measured. The parity gate (`scripts/parity.py`) is in CI:
-   it records its gain with `--record` so it cannot slip back, as R1's is.
-2. **D36**: let the planner read partial and expression indexes, which are
-   enforced today but never read.
-3. **D23**: the remaining way the process can die instead of answering; **D34**
-   still owes the sanitized suite in CI.
-4. **D4/D24** and the depth items of track C.
-5. **D15, D14** and the release gates, in that order.
+1. **D24, D11, D23, D8, D3** and the grants review: the ways the engine can
+   still lose an index silently, answer from the wrong rows, die instead of
+   answering, or keep every old value of an embedded database.
+2. **R2**: the largest gap left against the reference (inserts and updates),
+   starting from a profile of the write path. The parity gate
+   (`scripts/parity.py`) records its gain with `--record` so it cannot slip back.
+3. **S8**, then **D37**, **D4** and **D36**.
+4. **D39**, then **D40**.
+5. **R7**, the disk workloads and the depth items of track C.
+6. **D15, D14** and the release gates, in that order; **D34** when its image is
+   ready.
 
 ## Efficiency contract and current baseline
 
@@ -80,7 +86,7 @@ model in every measurable dimension. **It does not meet that today**: on the
 reference's own suite ([RESULTS.md](../benchmarks/parity/RESULTS.md)) this engine
 is at or under it on an empty transaction, the index filters and one of the two
 256-row scans, at it on the other scan, and behind on the writes: inserts
-1.2–2.7× in memory, updates 2.6–2.9×.
+1.2–2.7× in memory, updates 2.6–2.8×.
 Track A is the plan to close it.
 
 The rows below are this engine against its own recorded baseline, which is what
