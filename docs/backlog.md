@@ -51,6 +51,7 @@ Rules for this file:
 | D24 | an index the engine cannot express is dropped on import | a counted skip, and a mirror fuzz pass | S |
 | D34 | the threaded suite is green on Linux and Windows; the sanitizer covers the Windows CLI, not the suite | run the suite sanitized on every platform, in CI | S |
 | D36 | a query never reads a partial or expression index | match a query's predicate to the index | M |
+| D37 | a connection catching up with another process's commit reads the whole file and its schema | reuse the parsed schema, explain the stalls, time `multiwrite01` in CI | S |
 | D35 | diagnostics: closed | — | — |
 
 ---
@@ -435,6 +436,31 @@ read the index.
 or a stronger bound) may read it, and an expression a query compares is matched
 to an index over the same expression text; `scripts/plan_check.py` gains both
 plans and the differential corpus keeps passing with the indexes present.
+
+## D37 — Catching up with a shared file
+
+**Now.** A connection that shares a `.sqlite` file with another process reads
+the whole file again before its next statement whenever the change counter
+moved, parses its schema, and hashes again only the tables whose pages changed
+(each table it knows keeps its root, its pages and a sum of each page's bytes);
+it reloads only the tables whose rows changed, and the mirror keeps the place of
+every other table. After a one-row commit by another connection that costs
+1.4 ms, against 3.9 ms when every table was hashed and the mirror built again
+from the file (and 3.0 ms for SQLite's own commit on the same disk): 0.4 ms
+reading the file, 0.4 ms parsing its schema, 0.2 ms hashing, 0.3 ms reloading
+the row and following the mirror. `mptest`'s `multiwrite01` (five processes,
+one file) takes 2.8–4.1 s, median 3.6, against SQLite's 2.4–2.7; a writer holds
+RESERVED for its catch-up and its commit, and every other writer sleeps 10 ms
+in mptest's busy handler for each try that finds it held. Some runs of both
+the old and the new code take 1.5–3.5 s longer than the rest; the cause is not
+known.
+
+**Done when.** A catch-up whose schema hash did not move reuses the schema it
+parsed last, with the root pages read again from `sqlite_master`, and a test
+counts one schema parse per schema change and none for a commit of rows; the
+stalls are explained by a trace of the lock each process waited on; and
+`scripts/sqlite_tools.py` times `multiwrite01` against SQLite over five
+interleaved runs and fails past 1.25× SQLite's median.
 
 ## D35 — Diagnostics
 
