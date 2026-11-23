@@ -48,7 +48,7 @@ Rules for this file:
 | D16 | a hand-written Python binding | bindings generated from the catalog, more languages | M |
 | D18 | a read-only open replays | a reader that trusts the pages of a quiescent writer | M |
 | D23 | depth, row quota and budget are bounded | an allocation failure is a crash, not an error | M |
-| D24 | `scripts/mirror_fuzz.py` against SQLite: 16 of 20 seeds pass 400 statements | reduce and fix the other four, then make the fuzz a gate | M |
+| D24 | closed: `scripts/mirror_fuzz.py` passes 20 seeds of 400 statements against SQLite, a CI gate | — | — |
 | D34 | the threaded suite is green on Linux and Windows; the sanitizer covers the Windows CLI, not the suite | run the suite sanitized on every platform, in CI | S |
 | D36 | a query never reads a partial or expression index | match a query's predicate to the index | M |
 | D37 | a connection catching up with another process's commit reads the whole file and its schema | reuse the parsed schema, explain the stalls, time `multiwrite01` in CI | S |
@@ -439,15 +439,23 @@ index or an ALTER in its transaction failed the commit
 table does not have was accepted (`test_an_index_expression_needs_its_columns`);
 and a partial or expression index of a WITHOUT ROWID table repeated the key
 columns it holds in each entry, which SQLite found missing every row
-(`test_a_without_rowid_index_holds_each_key_column_once`).
+(`test_a_without_rowid_index_holds_each_key_column_once`). Last: a UNIQUE index
+dropped in a transaction still refused the rest of it
+(`test_a_dropped_unique_index_holds_nothing`); an error in a multi-row
+`INSERT OR IGNORE` or `OR REPLACE` took back the rows before it, where SQLite
+keeps them inside an explicit transaction when the statement has nothing that
+makes it open a statement journal (no function call, trigger or foreign key;
+`test_an_insert_without_a_statement_journal_keeps_its_rows`); and a
+`sqlite_master` past page 1 kept on every page of its tree the 100 bytes only
+the root needs, which integrity_check found in no cell and no freeblock
+(`test_a_schema_past_page_one_accounts_for_every_byte`;
+`sqlite_mirror_validate` now accounts for every byte of a page, as
+integrity_check does).
 
-**Left.** Sixteen of twenty seeds pass 400 statements; seeds 1, 9, 15 and 20
-still end with a table SQLite holds differently, not reduced yet. The fuzz
-becomes a CI gate once its seeds pass. Not followed on purpose, and kept out of
-the stream: SQLite's `UPDATE OR IGNORE` of a rowid to a real drops the row
-without an error; and under `INSERT OR IGNORE` SQLite keeps or takes back the
-rows before a datatype mismatch as its statement journal decides, where the
-engine always takes them back. Besides, a schema change re-encodes the whole file.
+**Closed.** Twenty seeds of 400 statements pass, and `scripts/ci.py` runs them
+as the `mirror fuzz` gate. Not followed on purpose, and kept out of the stream:
+SQLite's `UPDATE OR IGNORE` of a rowid to a real drops the row without an
+error. A schema change still re-encodes the whole file, which is D4.
 
 ## D34 — The Linux suite and the heap sanitizer
 

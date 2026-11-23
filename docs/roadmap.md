@@ -38,7 +38,6 @@ that way.
 |---|---|---|---|---|
 | 15 | **D4 — secondary indexes in the mirror** | A table with a secondary index re-encodes the `.sqlite` file per commit. | L | — |
 | 16 | **D36 — partial and expression indexes in plans** | The planner skips them; match a predicate to a partial index's WHERE and an expression to its index. | M | 8 |
-| 17 | **D24 — the mirror's last gaps** | The fuzz against SQLite (`scripts/mirror_fuzz.py`) passes 16 of 20 seeds; reduce and fix the other four, then make it a gate. | M | — |
 | 32 | **D37 — catching up with a shared file** | Five processes on one file run `multiwrite01` in a median 1.4× SQLite's time; reuse the parsed schema, explain the stalls, time it in CI. | S | — |
 | 33 | **S8 — the rest of the C API** | 233 of SQLite's 309 functions are exported; 76 are left. | M | — |
 | 34 | **D39 — PostgreSQL's surface** | A probe gate for the dialect, the catalog drivers and ORMs read, PostgreSQL's spelling of grants and policies. | L | — |
@@ -67,8 +66,8 @@ with peer-to-peer sync; its networked phases build on items 27 and 28.
 
 ## Suggested order
 
-1. **D24, D11, D23, D8, D3** and the grants review: the ways the engine can
-   still lose an index silently, answer from the wrong rows, die instead of
+1. **D11, D23, D8, D3** and the grants review: the ways the engine can
+   still answer from the wrong rows, die instead of
    answering, or keep every old value of an embedded database.
 2. **R2**: the largest gap left against the reference (inserts and updates),
    starting from a profile of the write path. The parity gate
@@ -107,4 +106,4 @@ the CI gate checks; they are not a comparison with the reference.
 Every row of this table is met today and gated by `scripts/bench.py`, the read
 and commit numbers by `bench-read`, and the subscription row by
 `test_join_subscription_probes_the_join_key`. The engineering gates are listed in
-`docs/status.md` and run by `scripts/ci.py` (38 gates).
+`docs/status.md` and run by `scripts/ci.py` (39 gates).
