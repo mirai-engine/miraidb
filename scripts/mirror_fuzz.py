@@ -14,7 +14,7 @@ both sides or fail on both. After each chunk:
   * every table holds the same rows on both files, and both catalogs name the
     same objects.
 
-    python scripts/mirror_fuzz.py [--seed N] [--statements N] [--chunk N] [facade]
+    python scripts/mirror_fuzz.py [--seed N] [--seeds N] [--statements N] [--chunk N] [facade]
 
 Exit code 0 means every chunk held. A failure prints the seed and the statement
 number, which replays it.
@@ -171,16 +171,8 @@ def integrity(path: str) -> list:
         return [row[0] for row in cx.execute("PRAGMA integrity_check").fetchall()]
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("facade", nargs="?", default=os.path.join("bin", "sqlite3_miraidb.dll" if os.name == "nt" else "sqlite3_miraidb.so"))
-    parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--statements", type=int, default=600)
-    parser.add_argument("--chunk", type=int, default=40)
-    args = parser.parse_args()
-    if not os.path.isfile(args.facade):
-        print(f"mirror fuzz: no facade at {args.facade}")
-        return 2
+def run_seed(args: argparse.Namespace, seed: int) -> list[str] | None:
+    """Runs one seed's stream; None when a side did not load what it should."""
     staged = tempfile.mkdtemp(prefix="mirror_fuzz_")
     reference_dir = tempfile.mkdtemp(prefix="mirror_fuzz_sqlite_")
     failures: list[str] = []
@@ -194,11 +186,11 @@ def main() -> int:
         sqlite = Side("sqlite", theirs, None)
         if facade.version != facade_libversion(args.facade):
             print(f"mirror fuzz: the facade side loaded SQLite {facade.version}, not the facade")
-            return 2
+            return None
         if sqlite.run("SELECT sqlite_source_id()") == facade.run("SELECT sqlite_source_id()"):
             print("mirror fuzz: the SQLite side loaded the facade")
-            return 2
-        model = Model(random.Random(args.seed))
+            return None
+        model = Model(random.Random(seed))
         for number in range(1, args.statements + 1):
             sql = model.statement()
             got = facade.run(sql)
@@ -233,10 +225,30 @@ def main() -> int:
     finally:
         shutil.rmtree(staged, ignore_errors=True)
         shutil.rmtree(reference_dir, ignore_errors=True)
-    for failure in failures:
-        print(f"FAIL (seed {args.seed}) {failure}")
-    print(f"mirror fuzz: seed {args.seed}, {args.statements} statements, {len(failures)} failure(s)")
-    return 1 if failures else 0
+    return failures
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("facade", nargs="?", default=os.path.join("bin", "sqlite3_miraidb.dll" if os.name == "nt" else "sqlite3_miraidb.so"))
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--seeds", type=int, default=1, help="run this many seeds from --seed on")
+    parser.add_argument("--statements", type=int, default=600)
+    parser.add_argument("--chunk", type=int, default=40)
+    args = parser.parse_args()
+    if not os.path.isfile(args.facade):
+        print(f"mirror fuzz: no facade at {args.facade}")
+        return 2
+    failed = 0
+    for seed in range(args.seed, args.seed + args.seeds):
+        failures = run_seed(args, seed)
+        if failures is None:
+            return 2
+        for failure in failures:
+            print(f"FAIL (seed {seed}) {failure}")
+        print(f"mirror fuzz: seed {seed}, {args.statements} statements, {len(failures)} failure(s)", flush=True)
+        failed += bool(failures)
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

@@ -174,6 +174,16 @@ def build_gates(args: argparse.Namespace) -> list[Gate]:
             gates.append(
                 Gate("SQLite's tools on the facade", [args.windows_python, "scripts/sqlite_tools.py"])
             )
+            # Random DDL and DML through the facade and through SQLite, with
+            # SQLite's integrity_check on the facade's file after each chunk
+            # and the same rows on both: twenty fixed seeds (D24).
+            gates.append(
+                Gate(
+                    "mirror fuzz",
+                    [args.windows_python, "scripts/mirror_fuzz.py", "--seeds", "20", "--statements", "400"],
+                    timeout=1800,
+                )
+            )
             gates.append(
                 Gate("Python SDK smoke", [args.windows_python, "scripts/sdk_smoke.py"])
             )
