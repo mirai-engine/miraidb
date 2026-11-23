@@ -172,6 +172,31 @@ embedded process that updates rows keeps every value it replaced. Since R3 a
 prune costs the rows that changed, so pruning after each commit while no read is
 pinned is cheap.
 
+**Why the C ABI does not prune after each commit yet.** History has three
+readers, and an automatic prune is only safe against two of them:
+
+- *A read transaction* (`tx_begin_read`) shares the tables it reads and scans
+  them without the store's lock. A prune skips a table anyone shares
+  (`store_prune_table`), so its rows never move under a scan; before that skip a
+  prune compacted a table a reader could be walking. Safe.
+- *A pinned read* (`tx_begin_read_at`) reads the live tables at an older
+  sequence. A prune does nothing while one is announced or reading: it reads the
+  pins under the lock and only tries that lock, which a live pin holds shared.
+  Before, it read the pins before taking the lock, so a pin announced in between
+  lost the history it pinned. Safe, for a pin announced before the prune.
+- *`AS OF <seq>`* reads the live tables at any sequence the statement names, and
+  nothing announces it beforehand. A prune after every commit leaves no history
+  for it to read, so `AS OF` would miss every row changed since the sequence
+  it names, through the C ABI and the `sqlite3_*` facade, where today it reads
+  every past commit
+  (as long as no reader forced a copy of the table, which drops its history).
+
+So an automatic prune cannot be made safe by itself: it needs a retention
+policy the embedder chooses — keep nothing (the CLI's choice today), keep the
+last N commits or T seconds, or keep everything (today's default for the ABI).
+That policy, with a test that a long-lived database with updates stays bounded
+under it and that `AS OF` inside the kept window still answers, is this item.
+
 **Done when.** Retention follows the oldest open reader automatically, a test
 proves a long-lived database with updates stays bounded, and `AS OF` works on a
 join.
