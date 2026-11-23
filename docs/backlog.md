@@ -48,7 +48,7 @@ Rules for this file:
 | D16 | a hand-written Python binding | bindings generated from the catalog, more languages | M |
 | D18 | a read-only open replays | a reader that trusts the pages of a quiescent writer | M |
 | D23 | depth, row quota and budget are bounded | an allocation failure is a crash, not an error | M |
-| D24 | `scripts/mirror_fuzz.py` against SQLite finds four more wrong files or answers (ALTER, a DESC index, a crash) | fix them and make the fuzz a gate | M |
+| D24 | `scripts/mirror_fuzz.py` against SQLite still finds four wrong answers (REPLACE before affinity, ALTER in the creating transaction, a UNIQUE expression index, integer against real past 2^53) | fix them and make the fuzz a gate | M |
 | D34 | the threaded suite is green on Linux and Windows; the sanitizer covers the Windows CLI, not the suite | run the suite sanitized on every platform, in CI | S |
 | D36 | a query never reads a partial or expression index | match a query's predicate to the index | M |
 | D37 | a connection catching up with another process's commit reads the whole file and its schema | reuse the parsed schema, explain the stalls, time `multiwrite01` in CI | S |
@@ -417,17 +417,24 @@ negative one was 1, not one past it (`test_an_omitted_key_follows_a_negative_one
 a PRIMARY KEY of a rowid table refused NULL, which SQLite stores
 (`test_a_primary_key_takes_null_as_sqlite_s_does`); and two empty texts compared
 unequal when one had a nil pointer, so an index put them out of rowid order
-(`test_two_empty_texts_are_equal`).
+(`test_two_empty_texts_are_equal`). The next seeds found: `ADD COLUMN` wrote the
+column after the table constraints, text SQLite cannot parse
+(`test_an_added_column_goes_before_the_table_constraints`); ALTER brought a
+deleted row back and left the rows its transaction had staged in the old shape,
+without the DEFAULT, where an UPDATE of one took the process down
+(`test_alter_keeps_deleted_rows_deleted_and_reshapes_staged_ones`); and an
+integer and a real had keys of their own kinds, so a range through an index
+lost rows and `c = 5.0` missed 5 (`test_numbers_share_one_key_space`; the index
+page format is now version 2).
 
-**Left.** What the fuzz still finds, each reduced to a few statements:
-`ALTER TABLE … ADD COLUMN` on a WITHOUT ROWID table writes a CREATE text SQLite
-cannot parse (seed 5); an `UPDATE … WHERE c < k` through a DESC index on `c`
-changes other rows than SQLite does (seed 3); after `ALTER TABLE … ADD COLUMN`
-some rows lack the column's DEFAULT, and a table whose INTEGER column holds
-text (as SQLite allows) is written so that the facade cannot open the file
-again ("cannot use a string value as BIGINT", seeds 1, 2, 4); a statement
-crashes the facade with an index out of range in `sql_exec.odin` (seed 6). The fuzz becomes a CI gate once
-its seeds pass. Besides, a schema change re-encodes the whole file.
+**Left.** What the fuzz still finds (seeds 1, 6 and 9 of ten pass 400
+statements), each reduced to a few statements: `INSERT OR REPLACE` looks for
+the row it replaces with the value before its column's affinity, so `22` into a
+TEXT key fails on the `'22'` it should replace; ALTER of a table created in the
+same transaction is refused, where SQLite runs it; a UNIQUE index over `b + 1`
+misses a duplicate SQLite reports; and the engine answers
+`9007199254740993 > 9007199254740992.0` false, where SQLite compares an integer
+and a real exactly. The fuzz becomes a CI gate once its seeds pass. Besides, a schema change re-encodes the whole file.
 
 ## D34 — The Linux suite and the heap sanitizer
 
