@@ -834,3 +834,15 @@ test_a_unique_index_holds_the_rest_of_its_transaction :: proc(t: ^testing.T) {
 	tools_ok(t, conn, "COMMIT")
 	tools_expect(t, conn, "SELECT b FROM t", "pp")
 }
+
+// An integer and a real are compared exactly, as SQLite compares them: as two
+// doubles 9007199254740993 equalled 9007199254740992.0, and an infinity
+// equalled every number.
+@(test)
+test_an_integer_and_a_real_compare_exactly :: proc(t: ^testing.T) {
+	store := tools_store(t)
+	defer db.store_close(store)
+	conn := db.embed_wrap(store)
+	defer db.embed_close(conn)
+	tools_expect(t, conn, "SELECT 9007199254740993 > 9007199254740992.0, 9007199254740993 = 9007199254740992.0, 1 < 9e999, -1 > -9e999, 9223372036854775807 = 9223372036854775807.0, 3 < 3.5, -3 > -3.5, 2 = 2.0", "1|0|1|1|0|1|1|1")
+}

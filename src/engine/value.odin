@@ -536,13 +536,41 @@ numeric_compare_exact :: proc(a, b: Value) -> slice.Ordering {
 		if ai > bi do return .Greater
 		return .Equal
 	}
-	af, _ := numeric_as_f64(a)
-	bf, _ := numeric_as_f64(b)
-	if !is_finite_f64(af) || !is_finite_f64(bf) {
+	if a.kind == .Float && b.kind == .Float {
+		// NaN is no number SQLite stores: it compares equal, as it did.
+		if a.f < b.f do return .Less
+		if a.f > b.f do return .Greater
 		return .Equal
 	}
-	if af < bf do return .Less
-	if af > bf do return .Greater
+	// An integer against a real is compared exactly, as SQLite compares them:
+	// both as doubles, 9007199254740993 equalled 9007199254740992.0, and an
+	// infinity equalled every number.
+	if a.kind == .Float {
+		switch integer_against_real(b, a.f) {
+		case .Less: return .Greater
+		case .Greater: return .Less
+		case .Equal: return .Equal
+		}
+	}
+	return integer_against_real(a, b.f)
+}
+
+// integer_against_real orders an integer value against a real exactly.
+@(private)
+integer_against_real :: proc(v: Value, f: f64) -> slice.Ordering {
+	if f != f do return .Equal
+	// 2^127: past it no integer kind reaches.
+	if f >= 1.7014118346046923e38 do return .Less
+	if f < -1.7014118346046923e38 do return .Greater
+	if is_unsigned_kind(v.kind) && value_as_u128(v) > u128(max(i128)) do return .Greater
+	i := value_as_i128(v)
+	whole := i128(f)
+	if i < whole do return .Less
+	if i > whole do return .Greater
+	// The whole part of a double is a double, so the fraction is exact.
+	fraction := f - f64(whole)
+	if fraction > 0 do return .Less
+	if fraction < 0 do return .Greater
 	return .Equal
 }
 
