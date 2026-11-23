@@ -813,3 +813,24 @@ test_alter_runs_in_the_transaction_that_created_the_table :: proc(t: ^testing.T)
 	tools_ok(t, conn, "ROLLBACK")
 	tools_expect(t, conn, "SELECT count(*) FROM sqlite_master WHERE name = 'u'", "0")
 }
+
+// A UNIQUE index created in a transaction held nothing to the rows written
+// after it in the same transaction: two equal keys committed, and SQLite
+// found the file's index not unique.
+@(test)
+test_a_unique_index_holds_the_rest_of_its_transaction :: proc(t: ^testing.T) {
+	store := tools_store(t)
+	defer db.store_close(store)
+	conn := db.embed_wrap(store)
+	defer db.embed_close(conn)
+	tools_ok(t, conn, "CREATE TABLE t (b TEXT)")
+	tools_ok(t, conn, "BEGIN")
+	tools_ok(t, conn, "CREATE UNIQUE INDEX i ON t (b)")
+	tools_ok(t, conn, "CREATE UNIQUE INDEX e ON t ((b + 1))")
+	tools_ok(t, conn, "CREATE UNIQUE INDEX p ON t (b) WHERE b > 'q'")
+	tools_ok(t, conn, "INSERT INTO t VALUES ('pp')")
+	tools_fails(t, conn, "INSERT INTO t VALUES ('pp')", "UNIQUE constraint failed: t.b")
+	tools_fails(t, conn, "INSERT INTO t VALUES ('Z')", "UNIQUE constraint failed: index 'e'")
+	tools_ok(t, conn, "COMMIT")
+	tools_expect(t, conn, "SELECT b FROM t", "pp")
+}

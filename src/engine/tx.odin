@@ -1944,7 +1944,82 @@ tx_check_unique :: proc(
 			}
 		}
 	}
+	if len(tx.state.index_ops) > 0 do return tx_staged_unique_check(tx, name, table, values, ignore)
 	return ERROR_NONE
+}
+
+// tx_staged_unique_check holds a row to the UNIQUE indexes this transaction
+// created on its table, which are not in the table until the commit: the rows
+// after `CREATE UNIQUE INDEX` in the same transaction were never checked, two
+// equal keys committed, and SQLite found the file's index not unique. It reads
+// every row the transaction sees, which only a transaction that changes a
+// table's indexes and then writes to it pays.
+@(private)
+tx_staged_unique_check :: proc(tx: ^Tx, name: string, table: ^Table, values: []Value, ignore: Row_Id) -> Error {
+	for op, k in tx.state.index_ops {
+		if op.drop || !op.index.unique || !strings.equal_fold(op.table, name) do continue
+		dropped := false
+		for later in tx.state.index_ops[k + 1:] {
+			dropped ||= later.drop && strings.equal_fold(later.table, name) && strings.equal_fold(later.index.name, op.index.name)
+		}
+		if dropped do continue
+		exprs, exprs_err := index_exprs_make(op.index)
+		if exprs_err.kind != .None {
+			error_free(&exprs_err)
+			continue
+		}
+		defer index_exprs_destroy(exprs)
+		mine, included, has_null := tx_staged_index_key(table, op.index, exprs, values)
+		if !included || has_null do continue
+		rows := make([dynamic]Row, context.temp_allocator)
+		if collect_err := tx_collect(tx, name, &rows); collect_err.kind != .None {
+			error_drop(collect_err)
+			continue
+		}
+		for row in rows {
+			if row.id == ignore do continue
+			theirs, row_included, row_null := tx_staged_index_key(table, op.index, exprs, row.values)
+			if !row_included || row_null || theirs != mine do continue
+			for expr in op.index.exprs {
+				if len(expr) > 0 do return errf(.Duplicate_Unique, "UNIQUE constraint failed: index '%s'", op.index.name)
+			}
+			columns := strings.builder_make(context.temp_allocator)
+			for position, part in op.index.columns {
+				if part > 0 do strings.write_string(&columns, ", ")
+				strings.write_string(&columns, table.schema.name)
+				strings.write_byte(&columns, '.')
+				if position >= 0 && position < len(table.schema.columns) do strings.write_string(&columns, table.schema.columns[position].name)
+			}
+			return errf(.Duplicate_Unique, "UNIQUE constraint failed: %s", strings.to_string(columns))
+		}
+	}
+	return ERROR_NONE
+}
+
+// tx_staged_index_key is a row's key under an index that is not in its table
+// yet, folded as the table would fold it: `included` is false for a row a
+// partial index leaves out, and `has_null` says a part is NULL.
+@(private)
+tx_staged_index_key :: proc(table: ^Table, index: Index_Schema, exprs: ^Index_Exprs, values: []Value) -> (key: string, included: bool, has_null: bool) {
+	defer if exprs != nil do virtual.arena_free_all(&exprs.scratch)
+	if exprs != nil && exprs.where_expr != nil {
+		held := index_eval(table, exprs, exprs.where_expr, values)
+		if held.kind == .Null || !value_is_truthy(held) do return "", false, false
+	}
+	w := Byte_Writer{data = make([dynamic]u8, 0, 32, context.temp_allocator)}
+	for column, part in index.columns {
+		value: Value
+		if exprs != nil && part < len(exprs.parts) && exprs.parts[part] != nil {
+			value = index_eval(table, exprs, exprs.parts[part], values)
+			if collation, has := collate_name(exprs.parts[part]); has && len(collation) > 0 do value = collate_ordered_value(value, collation)
+		} else if column >= 0 && column < len(values) {
+			value = values[column]
+			if len(table.schema.columns[column].collation) > 0 do value = collate_ordered_value(value, table.schema.columns[column].collation)
+		}
+		if value.kind == .Null do has_null = true
+		value_encode_key(&w, value)
+	}
+	return string(w.data[:]), true, has_null
 }
 
 // index_host_collated reports an index over a column whose collation is a
