@@ -1376,6 +1376,7 @@ tx_drop_table :: proc(tx: ^Tx, name: string) -> Error {
 		table_destroy(created)
 		// Rows staged for a table created in this transaction disappear with it.
 		tx_discard_writes(tx, name)
+		tx_discard_schema_changes(tx, name)
 		return ERROR_NONE
 	}
 	if _, exists := tx.store.tables[name]; !exists {
@@ -1385,8 +1386,22 @@ tx_drop_table :: proc(tx: ^Tx, name: string) -> Error {
 	// the drop first, and a staged row left behind made it fail ("table does
 	// not exist"), losing the whole transaction.
 	tx_discard_writes(tx, name)
+	tx_discard_schema_changes(tx, name)
 	tx.state.dropped[strings.clone(name, tx.alloc)] = true
 	return ERROR_NONE
+}
+
+// tx_discard_schema_changes forgets the indexes and the ALTER the transaction
+// staged for a table it drops: the commit applies the drop first, and an index
+// or an ALTER left for the dropped table failed the whole commit ("table does
+// not exist").
+@(private)
+tx_discard_schema_changes :: proc(tx: ^Tx, name: string) {
+	for i := len(tx.state.index_ops) - 1; i >= 0; i -= 1 {
+		if strings.equal_fold(tx.state.index_ops[i].table, name) do mirror_list_remove(&tx.state.index_ops, i)
+	}
+	// The altered table itself is in `replaced`, released with the transaction.
+	if _, altered := tx.state.altered[name]; altered do delete_key(&tx.state.altered, name)
 }
 
 // tx_discard_writes forgets the rows the transaction staged for one table.

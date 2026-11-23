@@ -846,3 +846,24 @@ test_an_integer_and_a_real_compare_exactly :: proc(t: ^testing.T) {
 	defer db.embed_close(conn)
 	tools_expect(t, conn, "SELECT 9007199254740993 > 9007199254740992.0, 9007199254740993 = 9007199254740992.0, 1 < 9e999, -1 > -9e999, 9223372036854775807 = 9223372036854775807.0, 3 < 3.5, -3 > -3.5, 2 = 2.0", "1|0|1|1|0|1|1|1")
 }
+
+// A table dropped in the transaction that made an index on it, or altered it,
+// left the index or the ALTER for the commit, which applies the drop first:
+// the commit failed ("table does not exist") and took the transaction with it.
+@(test)
+test_a_dropped_table_takes_its_staged_indexes :: proc(t: ^testing.T) {
+	store := tools_store(t)
+	defer db.store_close(store)
+	conn := db.embed_wrap(store)
+	defer db.embed_close(conn)
+	tools_ok(t, conn, "CREATE TABLE t (a, b)")
+	tools_ok(t, conn, "CREATE TABLE keep (a)")
+	tools_ok(t, conn, "BEGIN")
+	tools_ok(t, conn, "INSERT INTO keep VALUES (1)")
+	tools_ok(t, conn, "CREATE INDEX i ON t (b, a)")
+	tools_ok(t, conn, "ALTER TABLE t ADD COLUMN c DEFAULT 3")
+	tools_ok(t, conn, "DROP TABLE t")
+	tools_ok(t, conn, "COMMIT")
+	tools_expect(t, conn, "SELECT name FROM sqlite_master ORDER BY name", "keep")
+	tools_expect(t, conn, "SELECT a FROM keep", "1")
+}
