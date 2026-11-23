@@ -133,12 +133,7 @@ Sqlite_Mirror :: struct {
 @(private)
 mirror_destroy :: proc(m: ^Sqlite_Mirror) {
 	if m == nil do return
-	for _, table in m.tables {
-		for leaf in table.leaves do delete(leaf.rowids)
-		delete(table.leaves)
-		delete(table.rowid_of)
-		delete(table.name, m.alloc)
-	}
+	for _, table in m.tables do mirror_table_free(m, table)
 	delete(m.tables)
 	for name in m.sequence do delete(name, m.alloc)
 	delete(m.sequence)
@@ -405,21 +400,7 @@ mirror_build :: proc(store: ^Store, path: string, recover := false, alloc := con
 	m.tables = make(map[string]Mirror_Table, alloc)
 	m.dirty = make(map[int][]u8, alloc)
 	m.dirty_original = make(map[int][]u8, alloc)
-	m.image = make([]u8, len(file.data), alloc)
-	copy(m.image, file.data)
-	header := mirror_page(m, 1)
-	count := int(sqlite_be32(header, 16))
-	m.page_count = int(sqlite_be32(header, 28))
-	if m.page_count <= 0 do m.page_count = count
-	m.freelist = int(sqlite_be32(header, 32))
-	m.freelist_free = int(sqlite_be32(header, 36))
-	m.change = sqlite_be32(header, 24)
-	if m.page_count * m.page_size > len(m.image) {
-		grown := make([]u8, m.page_count * m.page_size, alloc)
-		copy(grown, m.image)
-		delete(m.image, alloc)
-		m.image = grown
-	}
+	mirror_take_image(m, file.data)
 
 	ctx := Mirror_Build_Ctx{m = m, ok = true}
 	if !sqlite_walk(&file, 1, true, mirror_master_visit, &ctx, 0) {
@@ -433,76 +414,11 @@ mirror_build :: proc(store: ^Store, path: string, recover := false, alloc := con
 	m.sequence = make(map[string]Mirror_Sequence, alloc)
 	for row in m.master {
 		if row.kind != "table" do continue
-		table, known := store.tables[row.name]
-		is_sequence := row.name == "sqlite_sequence"
-		if !known && !is_sequence do continue
-		entry := Mirror_Table {
-			name = strings.clone(row.name, alloc),
-			root = row.root,
-		}
-		entry.rowid_of = make(map[Row_Id]i64, alloc)
-		pages := make([dynamic]int, 0, 8, alloc)
-		walker_ok := mirror_collect_leaves(m, row.root, &pages, 0)
-		if walker_ok {
-			for page in pages {
-				rowids, ok := mirror_leaf_rowids(m, page)
-				if !ok {
-					delete(rowids)
-					walker_ok = false
-					break
-				}
-				append(&entry.leaves, Mirror_Leaf{page = page, rowids = rowids})
-			}
-		}
-		delete(pages)
-		if !walker_ok {
-			// The tree is taller than this writer patches; re-encode instead.
-			for leaf in entry.leaves do delete(leaf.rowids)
-			delete(entry.leaves)
-			delete(entry.rowid_of)
-			delete(entry.name, alloc)
+		if _, known := store.tables[row.name]; !known && row.name != "sqlite_sequence" do continue
+		entry, entry_ok := mirror_table_entry(m, store, &file, row)
+		if !entry_ok {
 			failed = true
 			continue
-		}
-		if is_sequence {
-			// Its rows are read once, to know where each counter lives.
-			Sequence_Ctx :: struct {
-				m:     ^Sqlite_Mirror,
-				alloc: mem.Allocator,
-			}
-			sequence_ctx := Sequence_Ctx{m = m, alloc = alloc}
-			visit := proc(user: rawptr, rowid: i64, payload: []u8) -> bool {
-				ctx := cast(^Sequence_Ctx)user
-				values, ok := sqlite_record(payload, context.temp_allocator)
-				if !ok || len(values) < 2 || values[0].kind != .String do return true
-				seq := values[1].kind == .Int ? values[1].i : 0
-				ctx.m.sequence[strings.clone(values[0].s, ctx.alloc)] = Mirror_Sequence{rowid = rowid, seq = seq}
-				return true
-			}
-			if !sqlite_walk(&file, u32(row.root), true, visit, &sequence_ctx, 0) {
-				failed = true
-			}
-			entry.supported = true
-			m.has_sequence = true
-			m.tables[entry.name] = entry
-			continue
-		}
-		entry.supported = mirror_rowid_column(table.schema) >= 0
-		if entry.supported {
-			for index in table.schema.indexes {
-				if !index.implicit do entry.supported = false
-			}
-		}
-		if entry.supported {
-			column := mirror_rowid_column(table.schema)
-			collected := make([dynamic]Row)
-			table_collect(table, &collected, max(u64))
-			for row2 in collected {
-				if column < len(row2.values) && row2.values[column].kind == .Int {
-					entry.rowid_of[row2.id] = row2.values[column].i
-				}
-			}
-			table_collect_release(table, &collected)
 		}
 		m.tables[entry.name] = entry
 	}
@@ -513,6 +429,174 @@ mirror_build :: proc(store: ^Store, path: string, recover := false, alloc := con
 		return nil, errf(.Io, "%s has a table this writer cannot patch", path)
 	}
 	return m, ERROR_NONE
+}
+
+// mirror_take_image makes `data` the image the mirror patches, and reads the
+// header fields a commit writes back.
+@(private)
+mirror_take_image :: proc(m: ^Sqlite_Mirror, data: []u8) {
+	if len(m.image) != len(data) {
+		delete(m.image, m.alloc)
+		m.image = make([]u8, len(data), m.alloc)
+	}
+	copy(m.image, data)
+	header := mirror_page(m, 1)
+	count := int(sqlite_be32(header, 16))
+	m.page_count = int(sqlite_be32(header, 28))
+	if m.page_count <= 0 do m.page_count = count
+	m.freelist = int(sqlite_be32(header, 32))
+	m.freelist_free = int(sqlite_be32(header, 36))
+	m.change = sqlite_be32(header, 24)
+	if m.page_count * m.page_size > len(m.image) {
+		grown := make([]u8, m.page_count * m.page_size, m.alloc)
+		copy(grown, m.image)
+		delete(m.image, m.alloc)
+		m.image = grown
+	}
+}
+
+// mirror_table_entry reads one table's place in the file: the leaves of its
+// tree and the rowids each holds, the rowid of each of its store rows, and for
+// sqlite_sequence where each counter lives. It answers false for a tree taller
+// than this writer patches.
+@(private)
+mirror_table_entry :: proc(m: ^Sqlite_Mirror, store: ^Store, file: ^Sqlite_File, row: Mirror_Master_Row) -> (Mirror_Table, bool) {
+	alloc := m.alloc
+	entry := Mirror_Table {
+		name = strings.clone(row.name, alloc),
+		root = row.root,
+	}
+	entry.rowid_of = make(map[Row_Id]i64, alloc)
+	pages := make([dynamic]int, 0, 8, alloc)
+	walker_ok := mirror_collect_leaves(m, row.root, &pages, 0)
+	if walker_ok {
+		for page in pages {
+			rowids, ok := mirror_leaf_rowids(m, page)
+			if !ok {
+				delete(rowids)
+				walker_ok = false
+				break
+			}
+			append(&entry.leaves, Mirror_Leaf{page = page, rowids = rowids})
+		}
+	}
+	delete(pages)
+	if row.name == "sqlite_sequence" && walker_ok {
+		// Its rows are read once, to know where each counter lives.
+		Sequence_Ctx :: struct {
+			m:     ^Sqlite_Mirror,
+			alloc: mem.Allocator,
+		}
+		sequence_ctx := Sequence_Ctx{m = m, alloc = alloc}
+		visit := proc(user: rawptr, rowid: i64, payload: []u8) -> bool {
+			ctx := cast(^Sequence_Ctx)user
+			values, ok := sqlite_record(payload, context.temp_allocator)
+			if !ok || len(values) < 2 || values[0].kind != .String do return true
+			seq := values[1].kind == .Int ? values[1].i : 0
+			ctx.m.sequence[strings.clone(values[0].s, ctx.alloc)] = Mirror_Sequence{rowid = rowid, seq = seq}
+			return true
+		}
+		walker_ok = sqlite_walk(file, u32(row.root), true, visit, &sequence_ctx, 0)
+		entry.supported = true
+		m.has_sequence = true
+	}
+	if !walker_ok {
+		// The tree is taller than this writer patches; re-encode instead.
+		for leaf in entry.leaves do delete(leaf.rowids)
+		delete(entry.leaves)
+		delete(entry.rowid_of)
+		delete(entry.name, alloc)
+		return {}, false
+	}
+	if row.name == "sqlite_sequence" do return entry, true
+	table := store.tables[row.name]
+	entry.supported = mirror_rowid_column(table.schema) >= 0
+	if entry.supported {
+		for index in table.schema.indexes {
+			if !index.implicit do entry.supported = false
+		}
+	}
+	if entry.supported {
+		column := mirror_rowid_column(table.schema)
+		collected := make([dynamic]Row)
+		table_collect(table, &collected, max(u64))
+		for row2 in collected {
+			if column < len(row2.values) && row2.values[column].kind == .Int {
+				entry.rowid_of[row2.id] = row2.values[column].i
+			}
+		}
+		table_collect_release(table, &collected)
+	}
+	return entry, true
+}
+
+// mirror_table_free lets one table's place go.
+@(private)
+mirror_table_free :: proc(m: ^Sqlite_Mirror, table: Mirror_Table) {
+	for leaf in table.leaves do delete(leaf.rowids)
+	delete(table.leaves)
+	delete(table.rowid_of)
+	delete(table.name, m.alloc)
+}
+
+// mirror_refresh brings the mirror up to `file`, which another connection
+// wrote and the store has caught up with: the image and its header,
+// sqlite_master, and the place of every table but the ones `same` names, whose
+// trees kept every page and whose store rows were not reloaded. It answers
+// false when the file is not one it can follow (the mirror then holds part of
+// it, and is to be destroyed).
+@(private)
+mirror_refresh :: proc(store: ^Store, m: ^Sqlite_Mirror, file: ^Sqlite_File, same: map[string]bool) -> bool {
+	if file.wal_committed > 0 || len(file.wal_pages) > 0 do return false
+	if int(file.page_size) != m.page_size || int(file.usable) != m.usable do return false
+	if len(m.dirty) > 0 || len(m.dirty_order) > 0 do return false
+	mirror_take_image(m, file.data)
+	ctx := Mirror_Build_Ctx{m = m, ok = true}
+	if !sqlite_walk(file, 1, true, mirror_master_visit, &ctx, 0) {
+		for row in ctx.rows {
+			delete(row.kind, m.alloc)
+			delete(row.name, m.alloc)
+			delete(row.table, m.alloc)
+			delete(row.sql, m.alloc)
+		}
+		delete(ctx.rows)
+		return false
+	}
+	for row in m.master {
+		delete(row.kind, m.alloc)
+		delete(row.name, m.alloc)
+		delete(row.table, m.alloc)
+		delete(row.sql, m.alloc)
+	}
+	delete(m.master)
+	m.master = ctx.rows
+	m.root = 1
+	m.master_dirty = false
+	for name in m.sequence do delete(name, m.alloc)
+	clear(&m.sequence)
+	m.has_sequence = false
+	tables := make(map[string]Mirror_Table, max(len(m.tables), 16), m.alloc)
+	ok := true
+	for row in m.master {
+		if row.kind != "table" do continue
+		if _, known := store.tables[row.name]; !known && row.name != "sqlite_sequence" do continue
+		if before, found := m.tables[row.name]; found && row.name != "sqlite_sequence" && same[row.name] && before.root == row.root {
+			delete_key(&m.tables, row.name)
+			tables[before.name] = before
+			continue
+		}
+		entry, entry_ok := mirror_table_entry(m, store, file, row)
+		if !entry_ok {
+			ok = false
+			break
+		}
+		tables[entry.name] = entry
+	}
+	// What is left of the old places is gone from the file, or was read again.
+	for _, table in m.tables do mirror_table_free(m, table)
+	delete(m.tables)
+	m.tables = tables
+	return ok
 }
 
 // --- Cells and pages -------------------------------------------------------

@@ -389,9 +389,12 @@ sqlite_share_refresh :: proc(conn: ^Embed_Conn) -> Error {
 	if !parsed do error_free(&parse_err)
 	defer if parsed do sqlite_file_destroy(&file)
 	hashes := make(map[string]Share_Tree, 16, context.temp_allocator)
-	if parsed do sqlite_share_hash_file(&file, &hashes, conn.share_hashes)
+	same := make(map[string]bool, 16, context.temp_allocator)
+	if parsed do sqlite_share_hash_file(&file, &hashes, conn.share_hashes, &same)
 	caught_up := parsed && sqlite_share_catch_up(conn, &file, hashes, mirror)
-	if !caught_up {
+	if caught_up {
+		sqlite_share_follow_mirror(store, mirror, &file, same)
+	} else {
 		if replace_err := store_replace_content(store, image, true); replace_err.kind != .None {
 			// The store keeps what it had and stays the file's, so the next
 			// statement tries again; this one fails rather than read it.
@@ -528,10 +531,15 @@ sqlite_share_hash_schema :: proc(file: ^Sqlite_File) -> (u64, bool) {
 // sqlite_share_hash_file fills `out` with the hash of every table the file
 // declares, of its schema and of sqlite_sequence. A table whose tree `known`
 // still matches keeps what is known of it (the entry shares its pages with
-// `known`); the rest are walked. A tree it cannot walk is left out, and a table
+// `known`) and goes into `same`; the rest are walked. A tree it cannot walk is left out, and a table
 // missing from the hashes is always reloaded.
 @(private)
-sqlite_share_hash_file :: proc(file: ^Sqlite_File, out: ^map[string]Share_Tree, known: map[string]Share_Tree = nil) {
+sqlite_share_hash_file :: proc(
+	file: ^Sqlite_File,
+	out: ^map[string]Share_Tree,
+	known: map[string]Share_Tree = nil,
+	same: ^map[string]bool = nil,
+) {
 	if schema, ok := sqlite_share_hash_schema(file); ok {
 		// The header's schema cookie, user_version, application_id and the
 		// rest of what a program sets (bytes 40 to 91): the change counter and
@@ -559,6 +567,7 @@ sqlite_share_hash_file :: proc(file: ^Sqlite_File, out: ^map[string]Share_Tree, 
 	for &table in file.tables {
 		if before, has_before := known[table.name]; has_before && sqlite_share_tree_same(file, before, table.root_page) {
 			out[table.name] = before
+			if same != nil do same[table.name] = true
 			continue
 		}
 		pages := make([dynamic]u32, 0, 16, context.temp_allocator)
@@ -604,10 +613,15 @@ sqlite_share_catch_up :: proc(conn: ^Embed_Conn, file: ^Sqlite_File, hashes: map
 	saved_keys := store.foreign_keys_off
 	store.foreign_keys_off = true
 	defer store.foreign_keys_off = saved_keys
+	// The mirror is set aside, not written, and follows the file afterwards.
+	saved_mirror := store.mirror
 	delete(store.sqlite_mirror)
 	store.sqlite_mirror = ""
-	mirror_destroy(store.mirror)
 	store.mirror = nil
+	defer {
+		store.sqlite_mirror = strings.clone(mirror)
+		store.mirror = saved_mirror
+	}
 	tx := tx_begin_write(store)
 	tx.no_triggers = true
 	ok := true
@@ -646,8 +660,21 @@ sqlite_share_catch_up :: proc(conn: ^Embed_Conn, file: ^Sqlite_File, hashes: map
 	} else {
 		tx_rollback(tx)
 	}
-	store_set_sqlite_mirror(store, mirror)
 	return ok
+}
+
+// sqlite_share_follow_mirror brings the store's mirror up to the file the store
+// just caught up with: the tables in `same` keep their place, and the rest are
+// read again. Without that the mirror patched the next commit onto the file as
+// it was before, change counter included, which could then match the counter
+// another process last read. A file with a hot journal beside it, or one the
+// mirror cannot follow, builds the mirror again from the file on disk.
+@(private)
+sqlite_share_follow_mirror :: proc(store: ^Store, mirror: string, file: ^Sqlite_File, same: map[string]bool) {
+	if store.mirror != nil && !os.is_file(strings.concatenate({mirror, "-journal"}, context.temp_allocator)) {
+		if mirror_refresh(store, store.mirror, file, same) do return
+	}
+	store_set_sqlite_mirror(store, mirror)
 }
 
 // sqlite_share_hashes_keep makes `hashes` the ones the connection matches. They

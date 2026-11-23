@@ -455,6 +455,16 @@ test_a_connection_catches_up_table_by_table :: proc(t: ^testing.T) {
 	tools_expect(t, b, "SELECT v FROM t2", "z")
 	tools_expect(t, b, "SELECT count(*) FROM t0", "8")
 	tools_expect(t, a, "SELECT count(*) FROM t0", "8")
+	// A commit that leaves every row as it was reloads nothing, and b's mirror
+	// still follows the file: it kept the change counter from before, so b's
+	// next commit wrote the counter a's had, which another process that last
+	// read a's would take for no change.
+	tools_ok(t, a, "UPDATE t2 SET v = v")
+	tools_expect(t, b, "SELECT v FROM t2", "z")
+	if image, read_err := os.read_entire_file(path, context.temp_allocator); read_err == nil && len(image) >= 28 {
+		counter := u32(image[24]) << 24 | u32(image[25]) << 16 | u32(image[26]) << 8 | u32(image[27])
+		testing.expect_value(t, b.store.mirror.change, counter)
+	}
 	// A schema change reads the whole file.
 	tools_ok(t, a, "CREATE TABLE t3 (z)")
 	tools_ok(t, a, "INSERT INTO t3 VALUES (9)")
