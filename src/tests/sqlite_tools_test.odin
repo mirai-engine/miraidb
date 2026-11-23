@@ -867,3 +867,17 @@ test_a_dropped_table_takes_its_staged_indexes :: proc(t: ^testing.T) {
 	tools_expect(t, conn, "SELECT name FROM sqlite_master ORDER BY name", "keep")
 	tools_expect(t, conn, "SELECT a FROM keep", "1")
 }
+
+// An index over an expression that names a column the table does not have
+// was accepted while the table was empty; SQLite refuses it.
+@(test)
+test_an_index_expression_needs_its_columns :: proc(t: ^testing.T) {
+	store := tools_store(t)
+	defer db.store_close(store)
+	conn := db.embed_wrap(store)
+	defer db.embed_close(conn)
+	tools_ok(t, conn, "CREATE TABLE t (k INTEGER PRIMARY KEY, a)")
+	tools_fails(t, conn, "CREATE INDEX i ON t (lower(x))", "no such column: x")
+	tools_fails(t, conn, "CREATE INDEX p ON t (a) WHERE y > 1", "no such column: y")
+	tools_ok(t, conn, "CREATE INDEX r ON t (a) WHERE rowid > 1")
+}

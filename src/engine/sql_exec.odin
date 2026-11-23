@@ -9535,7 +9535,9 @@ sql_exec_create_index :: proc(tx: ^Tx, stmt: Create_Index_Stmt) -> (Sql_Result, 
 		if parsed, parsed_expr, parse_err := sql_parse_expression(stmt.where_sql); parse_err.kind == .None {
 			_, nondeterministic := expr_nondeterministic(tx.store, parsed_expr)
 			problem, problem_kind := index_host_problem(tx.store, parsed_expr)
+			missing := index_unknown_column(table, parsed_expr)
 			query_destroy(&parsed)
+			if len(missing) > 0 do return {}, errf(.Column_Not_Found, "no such column: %s", missing)
 			if nondeterministic do return {}, errf(.Sql_Unsupported, "non-deterministic functions prohibited in partial index WHERE clauses")
 			if len(problem) > 0 do return {}, errf(problem_kind, "%s", problem)
 		} else {
@@ -9547,7 +9549,9 @@ sql_exec_create_index :: proc(tx: ^Tx, stmt: Create_Index_Stmt) -> (Sql_Result, 
 		if parsed, parsed_expr, parse_err := sql_parse_expression(text); parse_err.kind == .None {
 			_, nondeterministic := expr_nondeterministic(tx.store, parsed_expr)
 			problem, problem_kind := index_host_problem(tx.store, parsed_expr)
+			missing := index_unknown_column(table, parsed_expr)
 			query_destroy(&parsed)
+			if len(missing) > 0 do return {}, errf(.Column_Not_Found, "no such column: %s", missing)
 			if nondeterministic do return {}, errf(.Sql_Unsupported, "non-deterministic functions prohibited in index expressions")
 			if len(problem) > 0 do return {}, errf(problem_kind, "%s", problem)
 		} else {
@@ -9583,6 +9587,28 @@ sql_exec_create_index :: proc(tx: ^Tx, stmt: Create_Index_Stmt) -> (Sql_Result, 
 INDEX_FORBIDDEN_CALLS :: []string{
 	"random", "randomblob", "now", "uuid", "changes", "total_changes", "last_insert_rowid",
 	"current_identity", "has_role", "rank", "snippet", "highlight",
+}
+
+// index_unknown_column names a column an index expression reads that its table
+// does not have, or answers "": the expression was accepted, and only a row
+// made it fail. The name is the temp allocator's.
+@(private)
+index_unknown_column :: proc(table: ^Table, expr: ^Expr) -> string {
+	Probe :: struct {
+		table:   ^Table,
+		missing: string,
+	}
+	probe := Probe{table = table}
+	expr_walk(expr, proc(node: ^Expr, user: rawptr) -> bool {
+		probe := (^Probe)(user)
+		if column, ok := node^.(Column_Expr); ok && len(probe.missing) == 0 {
+			if _, found := schema_column_index(&probe.table.schema, column.name); !found && !rowid_alias_name(column.name) {
+				probe.missing = strings.clone(column.name, context.temp_allocator)
+			}
+		}
+		return true
+	}, &probe)
+	return probe.missing
 }
 
 // index_host_problem says why an index cannot hold an expression, or answers
