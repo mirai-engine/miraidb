@@ -1043,7 +1043,7 @@ sql_exec_show :: proc(store: ^Store, stmt: Show_Stmt, locked := false) -> (Sql_R
 		defer delete(entries)
 		table_collect(catalog, &entries, max(u64))
 		slice.sort_by(entries[:], proc(a, b: Row) -> bool {
-			return strings.compare(a.values[0].s, b.values[0].s) < 0
+			return text_compare(a.values[0].s, b.values[0].s) < 0
 		})
 		out.rows = make([][]Value, len(entries))
 		for entry, i in entries {
@@ -1835,9 +1835,9 @@ sqlite_compound_sort :: proc(store: ^Store, rows: [][]Value, stmt: Select_Stmt) 
 						continue
 					}
 				}
-				if order := strings.compare(left.s, right.s); order != 0 do return order
+				if order := text_compare(left.s, right.s); order != 0 do return order
 			case 3:
-				if order := strings.compare(string(left.bytes), string(right.bytes)); order != 0 do return order
+				if order := text_compare(string(left.bytes), string(right.bytes)); order != 0 do return order
 			}
 		}
 		return 0
@@ -4493,7 +4493,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 					bw_destroy(&w)
 				}
 				slice.sort_by(keys[:], proc(a, b: string) -> bool {
-					return strings.compare(a, b) < 0
+					return text_compare(a, b) < 0
 				})
 				for key in keys {
 					append(&groups, buckets[key])
@@ -11004,7 +11004,7 @@ eval_aggregate_chosen :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error)
 	if host_slots != nil do host_order_resolve(ctx.tx.store, host_slots^[:])
 	if len(call.order_by) > 0 {
 		slice.stable_sort_by(chosen[:], proc(a, b: Chosen_Row) -> bool {
-			return string(a.key) < string(b.key)
+			return text_compare(string(a.key), string(b.key)) < 0
 		})
 	}
 	group := make([][]Source, len(chosen))

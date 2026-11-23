@@ -1,5 +1,6 @@
 package tests
 
+import "base:runtime"
 import "core:mem"
 import "core:mem/virtual"
 import "core:os"
@@ -648,6 +649,36 @@ test_a_primary_key_takes_null_as_sqlite_s_does :: proc(t: ^testing.T) {
 	tools_expect(t, conn, "SELECT count(*), count(s) FROM t", "3|1")
 	tools_expect(t, conn, "SELECT count(*) FROM p", "2")
 	tools_expect(t, conn, "SELECT k FROM r", "1")
+}
+
+// Two empty texts are equal whatever their pointers. Odin's runtime compares
+// the data pointers before the length, so an empty text with a nil pointer
+// came out less than another: an index put two '' entries out of rowid order
+// (the row whose key was NULL made the nil one), and SQLite found the file's
+// index missing a row.
+@(test)
+test_two_empty_texts_are_equal :: proc(t: ^testing.T) {
+	nil_data := transmute(string)runtime.Raw_String{nil, 0}
+	not_nil := "x"[:0]
+	order, ok := db.value_compare(db.value_string(not_nil), db.value_string(nil_data))
+	testing.expectf(t, ok && order == .Equal, "'' against '': %v", order)
+	testing.expect_value(t, db.text_compare(not_nil, nil_data), 0)
+	testing.expect_value(t, db.text_compare(nil_data, "a"), -1)
+	path := "_test_tools_empty_text.sqlite"
+	os.remove(path)
+	defer os.remove(path)
+	_ = os.write_entire_file(path, []u8{})
+	{
+		conn, err := db.embed_open(path)
+		if !testing.expectf(t, db.error_ok(err), "open: %s", err.message) do return
+		defer db.embed_close(conn)
+		tools_ok(t, conn, "CREATE TABLE t (s TEXT PRIMARY KEY, c)")
+		tools_ok(t, conn, "INSERT INTO t VALUES ('b', '')")
+		tools_ok(t, conn, "CREATE INDEX i ON t (c)")
+		tools_ok(t, conn, "INSERT INTO t VALUES (NULL, '')")
+	}
+	valid, reason := db.sqlite_mirror_validate(path, context.temp_allocator)
+	testing.expectf(t, valid, "the file is malformed: %s", reason)
 }
 
 // An omitted INTEGER PRIMARY KEY is one past the largest key, as SQLite gives

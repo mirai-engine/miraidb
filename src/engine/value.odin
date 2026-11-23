@@ -440,6 +440,19 @@ numeric_as_f64 :: proc(v: Value) -> (f64, bool) {
 // value_compare orders values of the same kind, and numeric values across
 // kinds. Null sorts before everything. `ok` is false when the two values are
 // not comparable (for example a string and a timestamp).
+// text_compare orders two strings byte by byte, a prefix first, as
+// strings.compare does, except that two empty strings are equal. Odin's
+// runtime compares the data pointers before the length, so an empty string
+// whose pointer is nil came out less than one whose pointer is not: an index
+// on SQLite's file put two '' entries out of rowid order, which SQLite then
+// found missing (D24).
+text_compare :: proc "contextless" (a, b: string) -> int {
+	if len(a) == 0 || len(b) == 0 {
+		return len(a) == len(b) ? 0 : (len(a) == 0 ? -1 : 1)
+	}
+	return strings.compare(a, b)
+}
+
 value_compare :: proc(a, b: Value) -> (order: slice.Ordering, ok: bool) {
 	if a.kind == .Null || b.kind == .Null {
 		if a.kind == .Null && b.kind == .Null do return .Equal, true
@@ -471,7 +484,7 @@ value_compare :: proc(a, b: Value) -> (order: slice.Ordering, ok: bool) {
 		if a.b == b.b do return .Equal, true
 		return a.b ? .Greater : .Less, true
 	case .String:
-		return string_ordering(strings.compare(a.s, b.s)), true
+		return string_ordering(text_compare(a.s, b.s)), true
 	case .Bytes:
 		return slice_ordering(cmp_bytes(a.bytes, b.bytes)), true
 	case .Uuid:

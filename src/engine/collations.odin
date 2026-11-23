@@ -124,17 +124,17 @@ collation_compare :: proc(store: ^Store, name: string, a: string, b: string) -> 
 		}
 	}
 	if len(name) == 0 || strings.equal_fold(name, "binary") {
-		return strings.compare(a, b), true
+		return text_compare(a, b), true
 	}
 	if strings.equal_fold(name, "nocase") {
 		left := strings.to_lower(a, context.temp_allocator)
 		right := strings.to_lower(b, context.temp_allocator)
-		return strings.compare(left, right), true
+		return text_compare(left, right), true
 	}
 	if strings.equal_fold(name, "rtrim") {
 		left := strings.trim_right(a, " ")
 		right := strings.trim_right(b, " ")
-		return strings.compare(left, right), true
+		return text_compare(left, right), true
 	}
 	if def, found := store_collation(store, name); found {
 		return def.compare(a, b, def.user), true
@@ -319,7 +319,7 @@ host_value_compare :: proc(a, b: ^Host_Order_Slot) -> int {
 		order, _ := collation_compare(host_sort_store, a.collation, a.value.s, b.value.s)
 		return order
 	case 3:
-		return strings.compare(string(a.value.bytes), string(b.value.bytes))
+		return text_compare(string(a.value.bytes), string(b.value.bytes))
 	}
 	order, ok := value_compare(a.value, b.value)
 	if !ok do return 0

@@ -1467,7 +1467,7 @@ host_apply_incremental_aggregate :: proc(
 	}
 	touch :: proc(touched: ^[dynamic]string, key: string) {
 		for existing in touched^ {
-			if strings.compare(existing, key) == 0 do return
+			if text_compare(existing, key) == 0 do return
 		}
 		append(touched, strings.clone(key))
 	}

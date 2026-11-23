@@ -2254,7 +2254,7 @@ tx_build_ops :: proc(tx: ^Tx) -> []Store_Op {
 	for name in tx.state.writes do append(&names, name)
 	for name in tx.state.created do append(&names, name)
 	slice.sort_by(names[:], proc(a, b: string) -> bool {
-		return strings.compare(a, b) < 0
+		return text_compare(a, b) < 0
 	})
 	defer delete(names)
 	emitted := make(map[string]bool)

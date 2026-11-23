@@ -586,7 +586,7 @@ Table :: struct {
 
 @(private)
 index_cmp :: proc(a, b: string) -> slice.Ordering {
-	return slice.Ordering(strings.compare(a, b))
+	return slice.Ordering(text_compare(a, b))
 }
 
 table_create :: proc(schema: ^Table_Schema) -> (^Table, Error) {
@@ -1047,7 +1047,7 @@ table_index_map_remove :: proc(t: ^Table, index: int, values: []Value, id: Row_I
 	if !found_row do return
 	if len(bucket.ids) == 0 {
 		for key in t.indexes[index].lookup {
-			if strings.compare(key, probe) == 0 {
+			if text_compare(key, probe) == 0 {
 				delete_key(&t.indexes[index].lookup, key)
 				delete(key)
 				break

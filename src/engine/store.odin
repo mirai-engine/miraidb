@@ -1769,7 +1769,7 @@ slice_sort_strings :: proc(names: []string) {
 	// handful of tables a database has.
 	for i in 1 ..< len(names) {
 		j := i
-		for j > 0 && strings.compare(names[j - 1], names[j]) > 0 {
+		for j > 0 && text_compare(names[j - 1], names[j]) > 0 {
 			names[j - 1], names[j] = names[j], names[j - 1]
 			j -= 1
 		}

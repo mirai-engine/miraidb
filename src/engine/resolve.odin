@@ -727,7 +727,7 @@ sqlite_function_arity :: proc(name: string) -> (counts: u16, known: bool) {
 	low, high := 0, len(SQLITE_FUNCTION_ARITIES)
 	for low < high {
 		middle := (low + high) / 2
-		order := strings.compare(SQLITE_FUNCTION_ARITIES[middle].name, name)
+		order := text_compare(SQLITE_FUNCTION_ARITIES[middle].name, name)
 		if order == 0 do return SQLITE_FUNCTION_ARITIES[middle].counts, true
 		if order < 0 {
 			low = middle + 1

@@ -648,7 +648,7 @@ sql_exec_pragma :: proc(store: ^Store, body: string, locked: bool, tx: ^Tx = nil
 		host_names := make([dynamic]string, 0, len(store.collations))
 		for host_name in store.collations do append(&host_names, host_name)
 		slice.sort_by(host_names[:], proc(a, b: string) -> bool {
-			return strings.compare(a, b) < 0
+			return text_compare(a, b) < 0
 		})
 		defer delete(host_names)
 		result := Sql_Result{kind = .Rows, commit_seq = store.commit_seq}

@@ -173,7 +173,7 @@ ip_lower_bound :: proc(cells: ^Ip_Cells, key: string) -> int {
 	lo, hi := 0, len(cells.items)
 	for lo < hi {
 		mid := (lo + hi) / 2
-		if strings.compare(string(ip_key_of(ip_cell_bytes(cells, mid))), key) < 0 {
+		if text_compare(string(ip_key_of(ip_cell_bytes(cells, mid))), key) < 0 {
 			lo = mid + 1
 		} else {
 			hi = mid
@@ -189,7 +189,7 @@ ip_child_for :: proc(cells: ^Ip_Cells, key: string) -> int {
 	lo, hi := 0, len(cells.items)
 	for lo < hi {
 		mid := (lo + hi) / 2
-		if strings.compare(string(ip_key_of(ip_cell_bytes(cells, mid))), key) <= 0 {
+		if text_compare(string(ip_key_of(ip_cell_bytes(cells, mid))), key) <= 0 {
 			lo = mid + 1
 		} else {
 			hi = mid
@@ -544,7 +544,7 @@ ordered_scan :: proc(
 		key, value, ok := ordered_cursor_read(&cursor, buf[:])
 		if !ok do break
 		if end != "" {
-			order := strings.compare(key, end)
+			order := text_compare(key, end)
 			if strings.has_prefix(key, end) do order = 0
 			if order > 0 do break
 			if order == 0 && !inclusive_end do break
