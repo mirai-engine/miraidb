@@ -9501,8 +9501,10 @@ sql_exec_create_index :: proc(tx: ^Tx, stmt: Create_Index_Stmt) -> (Sql_Result, 
 	if len(stmt.where_sql) > 0 {
 		if parsed, parsed_expr, parse_err := sql_parse_expression(stmt.where_sql); parse_err.kind == .None {
 			_, nondeterministic := expr_nondeterministic(tx.store, parsed_expr)
+			problem, problem_kind := index_host_problem(tx.store, parsed_expr)
 			query_destroy(&parsed)
 			if nondeterministic do return {}, errf(.Sql_Unsupported, "non-deterministic functions prohibited in partial index WHERE clauses")
+			if len(problem) > 0 do return {}, errf(problem_kind, "%s", problem)
 		} else {
 			error_free(&parse_err)
 		}
@@ -9511,8 +9513,10 @@ sql_exec_create_index :: proc(tx: ^Tx, stmt: Create_Index_Stmt) -> (Sql_Result, 
 		if len(text) == 0 do continue
 		if parsed, parsed_expr, parse_err := sql_parse_expression(text); parse_err.kind == .None {
 			_, nondeterministic := expr_nondeterministic(tx.store, parsed_expr)
+			problem, problem_kind := index_host_problem(tx.store, parsed_expr)
 			query_destroy(&parsed)
 			if nondeterministic do return {}, errf(.Sql_Unsupported, "non-deterministic functions prohibited in index expressions")
+			if len(problem) > 0 do return {}, errf(problem_kind, "%s", problem)
 		} else {
 			error_free(&parse_err)
 		}
@@ -9546,6 +9550,35 @@ sql_exec_create_index :: proc(tx: ^Tx, stmt: Create_Index_Stmt) -> (Sql_Result, 
 INDEX_FORBIDDEN_CALLS :: []string{
 	"random", "randomblob", "now", "uuid", "changes", "total_changes", "last_insert_rowid",
 	"current_identity", "has_role", "rank", "snippet", "highlight",
+}
+
+// index_host_problem says why an index cannot hold an expression, or answers
+// "": a collation nobody registered is refused as SQLite refuses it, since an
+// index ordered by BINARY under another name is one SQLite finds out of order
+// (D24). The message is the temp allocator's, so it outlives the parsed
+// expression.
+@(private)
+index_host_problem :: proc(store: ^Store, expr: ^Expr) -> (string, Error_Kind) {
+	Probe :: struct {
+		store:   ^Store,
+		problem: string,
+		kind:    Error_Kind,
+	}
+	probe := Probe{store = store}
+	expr_walk(expr, proc(node: ^Expr, user: rawptr) -> bool {
+		probe := (^Probe)(user)
+		if len(probe.problem) > 0 do return false
+		#partial switch e in node^ {
+		case Collate_Expr:
+			if len(e.name) == 0 || collation_is_builtin(e.name) do break
+			if _, found := store_collation(probe.store, e.name); !found {
+				probe.problem = fmt.tprintf("no such collation sequence: %s", e.name)
+				probe.kind = .Invalid_Argument
+			}
+		}
+		return true
+	}, &probe)
+	return probe.problem, probe.kind
 }
 
 // index_expression_refusal names why an expression cannot be part of an index,

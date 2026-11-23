@@ -470,3 +470,26 @@ test_a_connection_catches_up_table_by_table :: proc(t: ^testing.T) {
 	tools_ok(t, a, "INSERT INTO t3 VALUES (9)")
 	tools_expect(t, b, "SELECT z FROM t3", "9")
 }
+
+// tools_fails runs a statement that must fail with `message`.
+@(private = "file")
+tools_fails :: proc(t: ^testing.T, conn: ^db.Embed_Conn, sql: string, message: string) {
+	err := db.embed_exec(conn, sql)
+	defer db.error_free(&err)
+	testing.expectf(t, err.message == message, "%s: got %q, want %q", sql, err.message, message)
+}
+
+// An index ordered by a collation nobody registered was accepted and written
+// in BINARY order, which SQLite then found missing every row. It is refused
+// now, as SQLite refuses it (D24).
+@(test)
+test_an_index_needs_what_it_can_evaluate :: proc(t: ^testing.T) {
+	store := tools_store(t)
+	defer db.store_close(store)
+	conn := db.embed_wrap(store)
+	defer db.embed_close(conn)
+	tools_ok(t, conn, "CREATE TABLE t (a INTEGER, b TEXT)")
+	tools_fails(t, conn, "CREATE INDEX c ON t (b COLLATE nobody)", "no such collation sequence: nobody")
+	tools_fails(t, conn, "CREATE INDEX p ON t (a) WHERE b COLLATE nobody = 'x'", "no such collation sequence: nobody")
+	tools_ok(t, conn, "CREATE INDEX e ON t (upper(b) COLLATE nocase)")
+}
