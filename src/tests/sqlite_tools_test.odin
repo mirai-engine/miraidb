@@ -443,6 +443,18 @@ test_a_connection_catches_up_table_by_table :: proc(t: ^testing.T) {
 	tools_expect(t, b, "SELECT count(*) FROM t1", "8")
 	tools_expect(t, b, "SELECT v FROM t2", "y")
 	testing.expect(t, b.store.tables["t2"] == untouched, "a new root page of t1 rebuilt t2")
+	// A table whose pages did not move is not read again, so what b knows of a
+	// tree must follow b's own commits: one to a table with an index re-encodes
+	// the file and moves every table's pages, t2's included. a's change to t2
+	// after that still reaches b.
+	tools_ok(t, a, "CREATE TABLE t0 (k INTEGER PRIMARY KEY, v)")
+	tools_ok(t, a, "CREATE INDEX t0v ON t0 (v)")
+	tools_expect(t, b, "SELECT count(*) FROM t0", "0")
+	tools_ok(t, b, "INSERT INTO t0 SELECT k, randomblob(3000) FROM t1")
+	tools_ok(t, a, "UPDATE t2 SET v = 'z'")
+	tools_expect(t, b, "SELECT v FROM t2", "z")
+	tools_expect(t, b, "SELECT count(*) FROM t0", "8")
+	tools_expect(t, a, "SELECT count(*) FROM t0", "8")
 	// A schema change reads the whole file.
 	tools_ok(t, a, "CREATE TABLE t3 (z)")
 	tools_ok(t, a, "INSERT INTO t3 VALUES (9)")

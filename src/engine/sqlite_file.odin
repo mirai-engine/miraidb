@@ -308,6 +308,7 @@ sqlite_payload :: proc(
 	payload_len: int,
 	table_leaf: bool,
 	alloc: mem.Allocator,
+	pages: ^[dynamic]u32 = nil,
 ) -> ([]u8, bool) {
 	local := sqlite_local_size(payload_len, int(file.usable), table_leaf)
 	if at + local > len(cell) do return nil, false
@@ -319,6 +320,7 @@ sqlite_payload :: proc(
 		next := sqlite_be32(cell, at + local)
 		written := local
 		for next != 0 && written < payload_len {
+			if pages != nil do append(pages, next)
 			page := sqlite_page(file, next)
 			if len(page) < 4 do return nil, false
 			next = sqlite_be32(page, 0)
@@ -403,7 +405,9 @@ sqlite_record :: proc(payload: []u8, alloc: mem.Allocator) -> ([]Value, bool) {
 	return values, true
 }
 
-// sqlite_walk visits every cell payload of a b-tree in key order.
+// sqlite_walk visits every cell payload of a b-tree in key order. `pages`,
+// when given, collects every page the tree is made of: its interior pages, its
+// leaves and their overflow chains.
 @(private)
 sqlite_walk :: proc(
 	file: ^Sqlite_File,
@@ -412,8 +416,10 @@ sqlite_walk :: proc(
 	visit: proc(user: rawptr, rowid: i64, payload: []u8) -> bool,
 	user: rawptr,
 	depth: int,
+	pages: ^[dynamic]u32 = nil,
 ) -> bool {
 	if depth > 64 do return false
+	if pages != nil do append(pages, page_no)
 	page := sqlite_page(file, page_no)
 	if len(page) < 8 do return false
 	// Page 1 starts with the 100-byte file header, so its b-tree page header is
@@ -434,12 +440,12 @@ sqlite_walk :: proc(
 			pointer := int(sqlite_be16(page, at))
 			if pointer + 4 > len(page) do return false
 			child := sqlite_be32(page, pointer)
-			if !sqlite_walk(file, child, table, visit, user, depth + 1) do return false
+			if !sqlite_walk(file, child, table, visit, user, depth + 1, pages) do return false
 			if page_type == 2 {
 				cell := page[pointer + 4:]
 				payload_len, size := sqlite_varint(cell, 0)
 				if size == 0 do return false
-				payload, ok := sqlite_payload(file, cell, size, int(payload_len), false, file.alloc)
+				payload, ok := sqlite_payload(file, cell, size, int(payload_len), false, file.alloc, pages)
 				if !ok do return false
 				keep_going := visit(user, 0, payload)
 				delete(payload, file.alloc)
@@ -448,7 +454,7 @@ sqlite_walk :: proc(
 		}
 		right := sqlite_be32(page, base + 8)
 		if right != 0 {
-			if !sqlite_walk(file, right, table, visit, user, depth + 1) do return false
+			if !sqlite_walk(file, right, table, visit, user, depth + 1, pages) do return false
 		}
 		return true
 	}
@@ -472,7 +478,7 @@ sqlite_walk :: proc(
 		}
 		// Index cells (WITHOUT ROWID tables) have no rowid: the key columns are
 		// the payload itself, so nothing else is skipped here.
-		payload, ok := sqlite_payload(file, cell, cursor, int(payload_len), leaf_table, file.alloc)
+		payload, ok := sqlite_payload(file, cell, cursor, int(payload_len), leaf_table, file.alloc, pages)
 		if !ok do return false
 		keep_going := visit(user, rowid, payload)
 		delete(payload, file.alloc)

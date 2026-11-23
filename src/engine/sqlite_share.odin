@@ -1,8 +1,10 @@
 package engine
 
+import "base:intrinsics"
 import "base:runtime"
 import "core:os"
 import "core:path/filepath"
+import "core:slice"
 import "core:strings"
 import "core:sync"
 import "core:time"
@@ -386,8 +388,8 @@ sqlite_share_refresh :: proc(conn: ^Embed_Conn) -> Error {
 	parsed := parse_err.kind == .None
 	if !parsed do error_free(&parse_err)
 	defer if parsed do sqlite_file_destroy(&file)
-	hashes := make(map[string]u64, 16, context.temp_allocator)
-	if parsed do sqlite_share_hash_file(&file, &hashes)
+	hashes := make(map[string]Share_Tree, 16, context.temp_allocator)
+	if parsed do sqlite_share_hash_file(&file, &hashes, conn.share_hashes)
 	caught_up := parsed && sqlite_share_catch_up(conn, &file, hashes, mirror)
 	if !caught_up {
 		if replace_err := store_replace_content(store, image, true); replace_err.kind != .None {
@@ -419,10 +421,51 @@ SHARE_HASH_SCHEMA :: "\x00schema"
 @(private)
 SHARE_HASH_SEQUENCE :: "\x00sequence"
 
-// sqlite_share_hash_tree hashes a b-tree's rows, each its rowid and its whole
-// payload (overflow included), in key order: FNV-1a over the bytes.
+// Share_Tree is what a connection knows of one b-tree of the file: a hash of
+// its rows, its root, and the pages it is made of with a sum of each page's
+// bytes. A tree whose root is the same and whose pages all hold the same bytes
+// is the same tree, so its rows are not read again. The schema and
+// sqlite_sequence keep the hash alone and are always hashed again.
+Share_Tree :: struct {
+	hash:  u64,
+	root:  u32,
+	pages: []u32,
+	sums:  []u64,
+}
+
+// sqlite_share_page_sum sums a page's bytes, eight at a time.
 @(private)
-sqlite_share_hash_tree :: proc(file: ^Sqlite_File, root: u32, table: bool) -> (u64, bool) {
+sqlite_share_page_sum :: proc(page: []u8) -> u64 {
+	hash := u64(0xcbf29ce484222325) ~ u64(len(page))
+	words := len(page) / 8
+	for i in 0 ..< words {
+		hash = (hash ~ intrinsics.unaligned_load((^u64)(&page[i * 8]))) * 0x9e3779b97f4a7c15
+		hash ~= hash >> 29
+	}
+	for b in page[words * 8:] {
+		hash = (hash ~ u64(b)) * 0x9e3779b97f4a7c15
+		hash ~= hash >> 29
+	}
+	return hash
+}
+
+// sqlite_share_tree_same says the tree the connection knows is still the
+// file's: the same root, and every page of it holding the same bytes.
+@(private)
+sqlite_share_tree_same :: proc(file: ^Sqlite_File, known: Share_Tree, root: u32) -> bool {
+	if known.root != root || len(known.pages) == 0 || len(known.pages) != len(known.sums) do return false
+	for page_no, i in known.pages {
+		page := sqlite_page(file, page_no)
+		if len(page) != int(file.page_size) || sqlite_share_page_sum(page) != known.sums[i] do return false
+	}
+	return true
+}
+
+// sqlite_share_hash_tree hashes a b-tree's rows, each its rowid and its whole
+// payload (overflow included), in key order: FNV-1a over the bytes. `pages`,
+// when given, collects the pages the tree is made of.
+@(private)
+sqlite_share_hash_tree :: proc(file: ^Sqlite_File, root: u32, table: bool, pages: ^[dynamic]u32 = nil) -> (u64, bool) {
 	Ctx :: struct {
 		hash: u64,
 	}
@@ -442,7 +485,7 @@ sqlite_share_hash_tree :: proc(file: ^Sqlite_File, root: u32, table: bool) -> (u
 		mix(ctx, payload)
 		return true
 	}
-	if !sqlite_walk(file, root, table, visit, &ctx, 0) do return 0, false
+	if !sqlite_walk(file, root, table, visit, &ctx, 0, pages) do return 0, false
 	return ctx.hash, true
 }
 
@@ -483,10 +526,12 @@ sqlite_share_hash_schema :: proc(file: ^Sqlite_File) -> (u64, bool) {
 }
 
 // sqlite_share_hash_file fills `out` with the hash of every table the file
-// declares, of its schema and of sqlite_sequence. A tree it cannot walk is left
-// out, and a table missing from the hashes is always reloaded.
+// declares, of its schema and of sqlite_sequence. A table whose tree `known`
+// still matches keeps what is known of it (the entry shares its pages with
+// `known`); the rest are walked. A tree it cannot walk is left out, and a table
+// missing from the hashes is always reloaded.
 @(private)
-sqlite_share_hash_file :: proc(file: ^Sqlite_File, out: ^map[string]u64) {
+sqlite_share_hash_file :: proc(file: ^Sqlite_File, out: ^map[string]Share_Tree, known: map[string]Share_Tree = nil) {
 	if schema, ok := sqlite_share_hash_schema(file); ok {
 		// The header's schema cookie, user_version, application_id and the
 		// rest of what a program sets (bytes 40 to 91): the change counter and
@@ -503,16 +548,25 @@ sqlite_share_hash_file :: proc(file: ^Sqlite_File, out: ^map[string]u64) {
 				schema ~= u64(b)
 				schema *= 0x100000001b3
 			}
-			out[SHARE_HASH_SCHEMA] = schema
+			out[SHARE_HASH_SCHEMA] = Share_Tree{hash = schema}
 		}
 	}
 	if file.sequence_root != 0 {
-		if sequence, ok := sqlite_share_hash_tree(file, file.sequence_root, true); ok do out[SHARE_HASH_SEQUENCE] = sequence
+		if sequence, ok := sqlite_share_hash_tree(file, file.sequence_root, true); ok do out[SHARE_HASH_SEQUENCE] = Share_Tree{hash = sequence}
 	} else {
-		out[SHARE_HASH_SEQUENCE] = 0
+		out[SHARE_HASH_SEQUENCE] = Share_Tree{}
 	}
 	for &table in file.tables {
-		if hash, ok := sqlite_share_hash_tree(file, table.root_page, !table.without_rowid); ok do out[table.name] = hash
+		if before, has_before := known[table.name]; has_before && sqlite_share_tree_same(file, before, table.root_page) {
+			out[table.name] = before
+			continue
+		}
+		pages := make([dynamic]u32, 0, 16, context.temp_allocator)
+		hash, ok := sqlite_share_hash_tree(file, table.root_page, !table.without_rowid, &pages)
+		if !ok do continue
+		sums := make([]u64, len(pages), context.temp_allocator)
+		for page_no, i in pages do sums[i] = sqlite_share_page_sum(sqlite_page(file, page_no))
+		out[table.name] = Share_Tree{hash = hash, root = table.root_page, pages = pages[:], sums = sums}
 	}
 }
 
@@ -521,19 +575,19 @@ sqlite_share_hash_file :: proc(file: ^Sqlite_File, out: ^map[string]u64) {
 // leaving the store as it was, whenever that is not enough: no hashes kept, a
 // schema or sqlite_sequence that moved, a table it does not reload row by row.
 @(private)
-sqlite_share_catch_up :: proc(conn: ^Embed_Conn, file: ^Sqlite_File, hashes: map[string]u64, mirror: string) -> bool {
+sqlite_share_catch_up :: proc(conn: ^Embed_Conn, file: ^Sqlite_File, hashes: map[string]Share_Tree, mirror: string) -> bool {
 	kept := conn.share_hashes
 	if len(kept) == 0 do return false
 	for key in ([]string{SHARE_HASH_SCHEMA, SHARE_HASH_SEQUENCE}) {
 		now, has_now := hashes[key]
 		before, has_before := kept[key]
-		if !has_now || !has_before || now != before do return false
+		if !has_now || !has_before || now.hash != before.hash do return false
 	}
 	changed := make([dynamic]^Sqlite_Table, 0, 4, context.temp_allocator)
 	for &table in file.tables {
 		now, has_now := hashes[table.name]
 		before, has_before := kept[table.name]
-		if has_now && has_before && now == before do continue
+		if has_now && has_before && now.hash == before.hash do continue
 		if table.without_rowid || len(table.columns) == 0 do return false
 		append(&changed, &table)
 	}
@@ -596,13 +650,21 @@ sqlite_share_catch_up :: proc(conn: ^Embed_Conn, file: ^Sqlite_File, hashes: map
 	return ok
 }
 
-// sqlite_share_hashes_keep makes `hashes` the ones the connection matches.
+// sqlite_share_hashes_keep makes `hashes` the ones the connection matches. They
+// may share pages with the ones it held, so they are copied before those go.
 @(private)
-sqlite_share_hashes_keep :: proc(conn: ^Embed_Conn, hashes: map[string]u64) {
-	sqlite_share_hashes_clear(conn)
+sqlite_share_hashes_keep :: proc(conn: ^Embed_Conn, hashes: map[string]Share_Tree) {
 	context.allocator = runtime.heap_allocator()
-	if conn.share_hashes == nil do conn.share_hashes = make(map[string]u64, len(hashes))
-	for name, hash in hashes do conn.share_hashes[strings.clone(name)] = hash
+	kept := make(map[string]Share_Tree, max(len(hashes), 16))
+	for name, tree in hashes {
+		copied := tree
+		copied.pages = slice.clone(tree.pages)
+		copied.sums = slice.clone(tree.sums)
+		kept[strings.clone(name)] = copied
+	}
+	sqlite_share_hashes_clear(conn)
+	delete(conn.share_hashes)
+	conn.share_hashes = kept
 }
 
 // sqlite_share_hashes_clear forgets the hashes: the next catch-up reads the
@@ -610,7 +672,11 @@ sqlite_share_hashes_keep :: proc(conn: ^Embed_Conn, hashes: map[string]u64) {
 @(private)
 sqlite_share_hashes_clear :: proc(conn: ^Embed_Conn) {
 	context.allocator = runtime.heap_allocator()
-	for name in conn.share_hashes do delete(name)
+	for name, tree in conn.share_hashes {
+		delete(name)
+		delete(tree.pages)
+		delete(tree.sums)
+	}
 	clear(&conn.share_hashes)
 }
 
@@ -651,8 +717,10 @@ sqlite_share_forget_touched :: proc(conn: ^Embed_Conn) {
 	store := conn.store
 	for name in store.mirror_touched {
 		if name in conn.share_hashes {
-			key, _ := delete_key(&conn.share_hashes, name)
+			key, tree := delete_key(&conn.share_hashes, name)
 			delete(key, runtime.heap_allocator())
+			delete(tree.pages, runtime.heap_allocator())
+			delete(tree.sums, runtime.heap_allocator())
 		}
 		delete(name, store.alloc)
 	}
