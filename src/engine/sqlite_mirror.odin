@@ -1720,6 +1720,10 @@ sqlite_mirror_validate :: proc(path: string, alloc := context.allocator) -> (ok:
 		return false, "cannot open"
 	}
 	defer sqlite_file_destroy(&file)
+	// sqlite_master is a table b-tree like the others, rooted at page 1.
+	master := Mirror_Check{file = &file, alloc = alloc, ok = true}
+	mirror_check_page(&master, 1, 0, false)
+	if !master.ok do return false, master.reason
 	rows := make(map[string]int, len(file.tables), context.temp_allocator)
 	for &table in file.tables {
 		if table.without_rowid {
@@ -1815,6 +1819,59 @@ Mirror_Check :: struct {
 	last:   i64,
 }
 
+// mirror_check_space accounts for every byte of a table b-tree page as SQLite's
+// integrity_check does: the header, the cell pointers, the gap before the
+// content, the cells, the freeblocks and the fragmented bytes the header counts
+// have to add up to the usable size. A page that left bytes in none of them
+// ("Fragmentation of 100 bytes reported as 0") used to pass here.
+@(private)
+mirror_check_space :: proc(check: ^Mirror_Check, block: []u8, base: int, page_no: u32) -> bool {
+	usable := int(check.file.usable)
+	leaf := block[base] == 13
+	header := leaf ? 8 : 12
+	count := int(sqlite_be16(block, base + 3))
+	content := int(sqlite_be16(block, base + 5))
+	if content == 0 do content = 65536
+	pointers := base + header + count * 2
+	fail := proc(check: ^Mirror_Check, page_no: u32, what: string) -> bool {
+		check.ok = false
+		check.reason = fmt.aprintf("page %d: %s", page_no, what, allocator = check.alloc)
+		return false
+	}
+	if pointers > content || content > usable do return fail(check, page_no, "content area out of bounds")
+	used := 0
+	for i in 0 ..< count {
+		at := int(sqlite_be16(block, base + header + i * 2))
+		if at < content || at >= usable do return fail(check, page_no, "cell outside the content area")
+		size := 0
+		if leaf {
+			length, a := sqlite_varint(block[at:], 0)
+			_, b := sqlite_varint(block[at:], a)
+			if a == 0 || b == 0 do return fail(check, page_no, "bad cell")
+			local := sqlite_local_size(int(length), usable, true)
+			size = a + b + local + (local < int(length) ? 4 : 0)
+		} else {
+			_, a := sqlite_varint(block[at + 4:], 0)
+			if a == 0 do return fail(check, page_no, "bad cell")
+			size = 4 + a
+		}
+		if at + size > usable do return fail(check, page_no, "cell past the usable area")
+		used += size
+	}
+	free := 0
+	next := int(sqlite_be16(block, base + 1))
+	for steps := 0; next != 0; steps += 1 {
+		if next < content || next + 4 > usable || steps > usable / 4 do return fail(check, page_no, "bad freeblock")
+		free += int(sqlite_be16(block, next + 2))
+		next = int(sqlite_be16(block, next))
+	}
+	fragmented := int(block[base + 7])
+	if pointers + (content - pointers) + used + free + fragmented != usable {
+		return fail(check, page_no, fmt.tprintf("%d bytes unaccounted, %d reported fragmented", usable - (content + used + free), fragmented))
+	}
+	return true
+}
+
 @(private)
 mirror_check_page :: proc(check: ^Mirror_Check, page_no: u32, ceiling: i64, has_ceiling: bool) {
 	if !check.ok do return
@@ -1832,6 +1889,7 @@ mirror_check_page :: proc(check: ^Mirror_Check, page_no: u32, ceiling: i64, has_
 	}
 	kind := block[base]
 	count := int(sqlite_be16(block, base + 3))
+	if (kind == 5 || kind == 13) && !mirror_check_space(check, block, base, page_no) do return
 	switch kind {
 	case 5:
 		header := base + 12

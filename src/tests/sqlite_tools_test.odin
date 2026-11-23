@@ -1,6 +1,7 @@
 package tests
 
 import "base:runtime"
+import "core:fmt"
 import "core:mem"
 import "core:mem/virtual"
 import "core:os"
@@ -956,4 +957,29 @@ test_an_insert_without_a_statement_journal_keeps_its_rows :: proc(t: ^testing.T)
 	tools_ok(t, conn, "COMMIT")
 	tools_fails(t, conn, "INSERT OR IGNORE INTO t VALUES (7, 'a'), ('x', 'b')", "datatype mismatch")
 	tools_expect(t, conn, "SELECT k FROM t ORDER BY k", "4 5")
+}
+
+// A sqlite_master that outgrows page 1 is rebuilt as a tree whose root moves to
+// page 1. Every page of that tree kept the 100 bytes only the root needs for
+// the file header, and SQLite's integrity_check found them in no cell, no
+// freeblock and no fragment count ("Fragmentation of 100 bytes reported as 0").
+@(test)
+test_a_schema_past_page_one_accounts_for_every_byte :: proc(t: ^testing.T) {
+	path := "_test_tools_master_tree.sqlite"
+	os.remove(path)
+	defer os.remove(path)
+	_ = os.write_entire_file(path, []u8{})
+	conn, open_err := db.embed_open(path)
+	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
+	for i in 0 ..< 60 {
+		tools_ok(t, conn, fmt.tprintf("CREATE TABLE table_with_a_long_name_%d (a INTEGER, b TEXT, c)", i))
+	}
+	tools_ok(t, conn, "INSERT INTO table_with_a_long_name_7 VALUES (1, 'x', 2)")
+	db.embed_close(conn)
+	ok, reason := db.sqlite_mirror_validate(path, context.temp_allocator)
+	testing.expectf(t, ok, "the file is malformed: %s", reason)
+	again, again_err := db.embed_open(path)
+	if !testing.expectf(t, db.error_ok(again_err), "reopen: %s", again_err.message) do return
+	defer db.embed_close(again)
+	tools_expect(t, again, "SELECT count(*) FROM sqlite_master", "60")
 }

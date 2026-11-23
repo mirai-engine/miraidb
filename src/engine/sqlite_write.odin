@@ -307,6 +307,7 @@ sqlite_build_tree :: proc(
 		page[0] = 13
 		page[5] = u8(content >> 8)
 		page[6] = u8(content)
+		sqlite_reserve_freeblock(w, page, reserve)
 		return page_no
 	}
 	leaves := make([dynamic]Sqlite_Leaf, 0, 8)
@@ -321,6 +322,7 @@ sqlite_build_tree :: proc(
 		if len(cell) > space && pointer_count > 0 {
 			// Close this leaf and start another.
 			sqlite_finish_leaf(w, current, pointer_count, content)
+			sqlite_reserve_freeblock(w, page, reserve)
 			append(&leaves, Sqlite_Leaf{page = current, max_key = keys[i - 1]})
 			current = sqlite_writer_new_page(w)
 			page = sqlite_writer_page(w, current)
@@ -337,6 +339,7 @@ sqlite_build_tree :: proc(
 		pointer_count += 1
 	}
 	sqlite_finish_leaf(w, current, pointer_count, content)
+	sqlite_reserve_freeblock(w, page, reserve)
 	append(&leaves, Sqlite_Leaf{page = current, max_key = keys[len(keys) - 1]})
 
 	if len(leaves) == 1 do return leaves[0].page
@@ -386,6 +389,7 @@ sqlite_build_tree :: proc(
 			interior[4] = u8(count)
 			interior[5] = u8(content >> 8)
 			interior[6] = u8(content)
+			sqlite_reserve_freeblock(w, interior, reserve)
 			append(&next, Sqlite_Leaf{page = page_no, max_key = level[i - 1].max_key})
 			_ = start
 		}
@@ -395,6 +399,22 @@ sqlite_build_tree :: proc(
 		level = next
 	}
 	return level[0].page
+}
+
+// sqlite_reserve_freeblock records the bytes a page keeps free at its end as a
+// freeblock. Only the root of the sqlite_master tree moves to page 1 and uses
+// them; on every other page of that tree they were in no cell, no freeblock and
+// no fragment count, and SQLite's integrity_check reported "Fragmentation of
+// 100 bytes reported as 0".
+@(private)
+sqlite_reserve_freeblock :: proc(w: ^Sqlite_Writer, page: []u8, reserve: int) {
+	if reserve < 4 do return
+	at := w.usable - reserve
+	page[1] = u8(at >> 8)
+	page[2] = u8(at)
+	page[at], page[at + 1] = 0, 0
+	page[at + 2] = u8(reserve >> 8)
+	page[at + 3] = u8(reserve)
 }
 
 @(private)
@@ -1404,8 +1424,10 @@ sqlite_move_to_page_one :: proc(w: ^Sqlite_Writer, root: int) {
 	if page_type == 5 || page_type == 2 do header = 12
 	shift := SQLITE_HEADER_MIN
 	if content + shift > w.usable do return
-	copy(dst[content + shift:w.usable], src[content:w.usable])
+	copy(dst[content + shift:w.usable], src[content:w.usable - shift])
 	dst[shift] = page_type
+	// The freeblock the reserve made is the space the shift takes up.
+	dst[shift + 1], dst[shift + 2], dst[shift + 7] = 0, 0, 0
 	dst[shift + 3] = u8(count >> 8)
 	dst[shift + 4] = u8(count)
 	dst[shift + 5] = u8((content + shift) >> 8)
