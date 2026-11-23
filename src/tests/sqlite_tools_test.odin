@@ -579,3 +579,20 @@ test_an_index_calls_a_program_s_function :: proc(t: ^testing.T) {
 	ok, reason := db.sqlite_mirror_validate(path, context.temp_allocator)
 	testing.expectf(t, ok, "the file is malformed: %s", reason)
 }
+
+// An omitted INTEGER PRIMARY KEY is one past the largest key, as SQLite gives
+// it: after -5 comes -4, and 1 only in a table without one. The engine started
+// at 1 whatever the table held.
+@(test)
+test_an_omitted_key_follows_a_negative_one :: proc(t: ^testing.T) {
+	store := tools_store(t)
+	defer db.store_close(store)
+	conn := db.embed_wrap(store)
+	defer db.embed_close(conn)
+	tools_ok(t, conn, "CREATE TABLE t (k INTEGER PRIMARY KEY, v)")
+	tools_ok(t, conn, "INSERT INTO t (v) VALUES ('a')")
+	tools_ok(t, conn, "DELETE FROM t")
+	tools_ok(t, conn, "INSERT INTO t VALUES (-5, 'b')")
+	tools_ok(t, conn, "INSERT INTO t (v) VALUES ('c'), ('d')")
+	tools_expect(t, conn, "SELECT k, v FROM t ORDER BY k", "-5|b -4|c -3|d")
+}

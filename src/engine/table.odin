@@ -1942,6 +1942,20 @@ table_max_int :: proc(t: ^Table, column: int) -> i64 {
 	return best
 }
 
+// table_largest_int is the largest integer a memory table's live rows hold in
+// a column, negative ones included, and whether any row holds one. `skip` is
+// called with each row's id first: a transaction leaves out the rows it
+// deleted or changed, and weighs its own versions itself.
+table_largest_int :: proc(t: ^Table, column: int, skip: proc(id: Row_Id, user: rawptr) -> bool = nil, user: rawptr = nil) -> (largest: i64, found: bool) {
+	for row in t.rows {
+		if row.deleted_seq != 0 || column >= len(row.values) || row.values[column].kind != .Int do continue
+		if skip != nil && skip(row.id, user) do continue
+		if !found || row.values[column].i > largest do largest = row.values[column].i
+		found = true
+	}
+	return
+}
+
 @(private)
 Max_Column_Ctx :: struct {
 	column: int,

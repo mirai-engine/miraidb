@@ -1354,20 +1354,32 @@ tx_insert :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error) {
 }
 
 // tx_next_int_key is the INTEGER PRIMARY KEY an omitted value gets: one past
-// the largest over the stored rows and the staged ones.
+// the largest over the stored rows and the staged ones, as SQLite gives it,
+// negative too (after -5 comes -4), and 1 in a table with none.
 tx_next_int_key :: proc(table: ^Table, writes: ^Table_Writes, position: int) -> i64 {
-	next: i64
+	largest: i64
+	found: bool
 	if table.paged != nil {
-		next = table.next_int_key + 1
+		largest, found = table.next_int_key, table.next_int_key >= 1
 	} else {
-		next = table_max_int(table, position) + 1
+		staged := proc(id: Row_Id, user: rawptr) -> bool {
+			writes := (^Table_Writes)(user)
+			_, deleted := writes.deletes[id]
+			_, updated := writes.updates[id]
+			return deleted || updated
+		}
+		largest, found = table_largest_int(table, position, writes != nil ? staged : nil, writes)
 	}
 	if writes != nil {
-		for _, row in writes.inserts {
-			if row.values[position].kind == .Int && row.values[position].i >= next do next = row.values[position].i + 1
+		weigh := proc(values: []Value, position: int, largest: ^i64, found: ^bool) {
+			if position >= len(values) || values[position].kind != .Int do return
+			if !found^ || values[position].i > largest^ do largest^ = values[position].i
+			found^ = true
 		}
+		for _, row in writes.inserts do weigh(row.values, position, &largest, &found)
+		for _, values in writes.updates do weigh(values, position, &largest, &found)
 	}
-	return next
+	return found ? largest + 1 : 1
 }
 
 @(private)
