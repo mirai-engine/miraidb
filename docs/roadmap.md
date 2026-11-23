@@ -28,7 +28,6 @@ that way.
 | # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
 | 2 | **R2 — fixed-size index keys** | The index filters are under the reference since a key files its rows under one entry; an insert is 1.3–1.4× it with an index per column and 2.7–2.9× with one unique index, where the encoded key and its probe while staging are most of the time. | M | — |
-| 4 | **R4 — hand the staged row to the table** | About 4% of an insert is a copy from the arena to the table. | M | — |
 | 6 | **D12 — module sandbox** | A module is a process with a work budget; the reference runs modules deterministically with enforced limits. | L | — |
 | 7 | **D16 — generated clients** | Deferred by months: generate the Python binding from the catalog, then a second language. Until then the C ABI, the `sqlite3_*` face and the Python wrapper stay gated, so a binding is a thin layer when it comes ([backlog](backlog.md#d16--clients-generated-from-the-catalog)). | M | — |
 
@@ -70,9 +69,8 @@ with peer-to-peer sync; its networked phases build on items 27 and 28.
    enforced today but never read.
 3. **D23**: the remaining way the process can die instead of answering; **D34**
    still owes the sanitized suite in CI.
-4. **R4**: the smaller speed item left.
-5. **D4/D24** and the depth items of track C.
-6. **D15, D14** and the release gates, in that order.
+4. **D4/D24** and the depth items of track C.
+5. **D15, D14** and the release gates, in that order.
 
 ## Efficiency contract and current baseline
 

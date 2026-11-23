@@ -32,7 +32,7 @@ Rules for this file:
 | R1 | closed: rows live in one slice in id order, a scan walks it | — | — |
 | R2 | a memory index files the rows of a key under one entry; keys are encoded strings | the write path's keys: one encoding per check, fixed-size keys where the column allows | M |
 | R3 | closed: a prune visits the rows that hold a version or are a tombstone | — | — |
-| R4 | a committed row is copied from the transaction arena to the table | hand the staged row over | M |
+| R4 | closed: a stored row is one allocation; a full hand-over measured and not worth it | — | — |
 | R6 | closed: a statement's fixed cost, a rowid read and a scan's per-row lists | — | — |
 | D2 | overlap on an `rtree` table is a scan | node pages and a descent | M |
 | D3 | versions stay until `store_prune_versions` is called | automatic retention, `AS OF` on a join | M |
@@ -139,11 +139,34 @@ what an older read can still ask for stays until a later prune.
 
 ## R4 — Hand the staged row to the table
 
-**Now.** A committed row is copied from the transaction arena to the table's heap
-(about 4% of an insert, measured).
+**Closed, by a smaller change.** The copy a commit makes of each staged row was
+measured at a tenth of a 256-row insert (54–58 µs of ~555), not the 4% this item
+said: one allocation for the value array and one more per text, blob or list. A
+stored row is now one allocation, the array followed by those bytes and items
+(`row_values_pack`, freed whole by `row_values_free`), and only the table makes
+and frees one. The copy went from 57 to 42 µs for the text rows and stayed at
+~40 for the integer ones, which had one allocation already; the parity inserts
+and updates of the text tables 4–7% down, interleaved, the integer ones within
+the machine's noise. `test_a_stored_row_keeps_every_kind_of_value` writes every
+kind (texts, an empty one, blobs, arrays, products, an empty array) and reads it
+back through an update, an older pinned read, a delete and a prune.
 
-**Done when.** The table takes ownership of the staged values. The ownership has
-to survive savepoints, `ALTER` and rollback, which is why this is last.
+Handing the staged row over was not done: the transaction arena is freed with
+the transaction, so a row handed over would have to be allocated on the heap
+while staging, which is the one allocation this copy now costs, and the
+ownership would have to survive savepoints, `ALTER`, a staged row updated again
+and rollback. What is left is that one allocation per row, ~150 ns here; a
+table that allocated its rows in blocks would need a per-row free inside a
+block (an update frees one row's old version), so it waits for a reason beyond
+this suite.
+
+Working through the delete path found a regression from R6: `tx_get` returned
+a table's row as stored, tombstone or not, so a deleted row answered
+`WHERE rowid = k` until the next prune (which the C ABI never runs), a read
+pinned to an older sequence saw the current values, and a deleted row's id
+could not be used again (SQLite allows it). It now answers the row the
+transaction's sequence sees, and an insert that names a deleted row's id makes
+the tombstone a version of the new row.
 
 ---
 

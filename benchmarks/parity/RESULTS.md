@@ -359,6 +359,27 @@ The reads do not prune and did not move. The baseline stays R6's: recorded
 again, every workload came out 0–14% slower, the reads R3 does not touch among
 them, which is the machine and not the code; R6's numbers hold the gate tighter.
 
+## R4: a stored row is one allocation (2026-11-22)
+
+A commit copies each staged row from the transaction arena into the table. The
+copy was one allocation for the value array and one per text, blob or list; it is
+now one for the whole row. Measured inside the commit of 256 inserts over 2 048
+rows: 57 → 42 µs for the text rows, ~40 µs either way for the integer rows (one
+allocation already). The parity workloads, interleaved five times, best median:
+
+| Workload | Before | R4 | Change |
+|---|---:|---:|---:|
+| insert_bulk u32_u64_str unique_0 | 668 | 643 | −4% |
+| insert_bulk u32_u64_str btree_each_column | 705 | 659 | −6% |
+| update_bulk u32_u64_str | 1 102 | 1 025 | −7% |
+| insert_bulk u32_u64_u64 unique_0 | 486 | 489 | +1% |
+| insert_bulk u32_u64_u64 btree_each_column | 508 | 525 | +3% |
+| update_bulk u32_u64_u64 | 862 | 865 | 0% |
+
+The integer rows allocate as before (a row with nothing after its array is the
+array, as it was); their ±3% is what the same build moves between runs here (the
+text update read −7% in one round and +2% in the next). The baseline is kept.
+
 To reproduce:
 
 ```sh
