@@ -8194,6 +8194,17 @@ returning_prepare :: proc(result: ^Sql_Result, returning: ^Returning, table: ^Ta
 }
 
 
+// sqlite_key_takes_null says whether a PRIMARY KEY column may hold NULL: under
+// SQLite's rules it may in a rowid table, unless it is the INTEGER PRIMARY KEY
+// that is the rowid, since SQLite kept the bug that allowed it (each NULL a
+// distinct key). A WITHOUT ROWID table's key, and the engine's own, refuse it.
+@(private)
+sqlite_key_takes_null :: proc(store: ^Store, without_rowid: bool, declared: string, compound := false) -> bool {
+	if store == nil || !store.sqlite_rules || without_rowid do return false
+	if !compound && strings.equal_fold(strings.trim_space(declared), "integer") do return false
+	return true
+}
+
 // ROWID_POSITION marks the INSERT column that names the rowid of a table with
 // no INTEGER PRIMARY KEY.
 @(private)
@@ -9243,7 +9254,7 @@ sql_exec_create_table :: proc(tx: ^Tx, stmt: Create_Table_Stmt, params: []Value)
 			type           = column_type,
 			named_type     = named_type,
 			unique         = definition.unique,
-			not_null       = definition.not_null || definition.primary,
+			not_null       = definition.not_null || (definition.primary && !sqlite_key_takes_null(tx.store, stmt.without_rowid, definition.declared)),
 			not_null_conflict = definition.not_null_conflict,
 			unique_conflict   = definition.unique_conflict,
 			auto_increment = definition.autoinc,
@@ -9400,6 +9411,7 @@ sql_exec_create_table :: proc(tx: ^Tx, stmt: Create_Table_Stmt, params: []Value)
 			schema.primary_key = positions
 			schema.pk_conflict = constraint.conflict
 			for position in positions {
+				if sqlite_key_takes_null(tx.store, stmt.without_rowid, "", len(positions) > 1) do continue
 				schema.columns[position].not_null = true
 			}
 			continue

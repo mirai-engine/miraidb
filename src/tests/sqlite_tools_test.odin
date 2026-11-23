@@ -627,6 +627,29 @@ test_an_integer_primary_key_takes_only_integers :: proc(t: ^testing.T) {
 	tools_expect(t, conn, "SELECT k, typeof(a) FROM t ORDER BY k", "1|real 2|integer 3|text 7|integer 8|integer 9|integer")
 }
 
+// SQLite lets a PRIMARY KEY other than the INTEGER one that is the rowid hold
+// NULL, each NULL a key of its own: it kept the bug for the files that rely on
+// it. A WITHOUT ROWID table's key refuses NULL, as SQLite's does.
+@(test)
+test_a_primary_key_takes_null_as_sqlite_s_does :: proc(t: ^testing.T) {
+	store := tools_store(t)
+	defer db.store_close(store)
+	conn := db.embed_wrap(store)
+	defer db.embed_close(conn)
+	tools_ok(t, conn, "CREATE TABLE t (s TEXT PRIMARY KEY, a)")
+	tools_ok(t, conn, "INSERT INTO t VALUES (NULL, 1), (NULL, 2), ('x', 3)")
+	tools_fails(t, conn, "INSERT INTO t VALUES ('x', 4)", "UNIQUE constraint failed: t.s")
+	tools_ok(t, conn, "CREATE TABLE p (a, b, PRIMARY KEY (a, b))")
+	tools_ok(t, conn, "INSERT INTO p VALUES (1, NULL), (1, NULL)")
+	tools_ok(t, conn, "CREATE TABLE w (s TEXT PRIMARY KEY, a) WITHOUT ROWID")
+	tools_fails(t, conn, "INSERT INTO w VALUES (NULL, 1)", "NOT NULL constraint failed: w.s")
+	tools_ok(t, conn, "CREATE TABLE r (k INTEGER PRIMARY KEY, a)")
+	tools_ok(t, conn, "INSERT INTO r VALUES (NULL, 1)")
+	tools_expect(t, conn, "SELECT count(*), count(s) FROM t", "3|1")
+	tools_expect(t, conn, "SELECT count(*) FROM p", "2")
+	tools_expect(t, conn, "SELECT k FROM r", "1")
+}
+
 // An omitted INTEGER PRIMARY KEY is one past the largest key, as SQLite gives
 // it: after -5 comes -4, and 1 only in a table without one. The engine started
 // at 1 whatever the table held.
