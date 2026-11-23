@@ -697,3 +697,27 @@ test_an_omitted_key_follows_a_negative_one :: proc(t: ^testing.T) {
 	tools_ok(t, conn, "INSERT INTO t (v) VALUES ('c'), ('d')")
 	tools_expect(t, conn, "SELECT k, v FROM t ORDER BY k", "-5|b -4|c -3|d")
 }
+
+// ADD COLUMN puts the column after the last one, before the table
+// constraints, as SQLite does: after `PRIMARY KEY (a, b)` it was text SQLite
+// cannot parse, and the file could not be opened again.
+@(test)
+test_an_added_column_goes_before_the_table_constraints :: proc(t: ^testing.T) {
+	path := "_test_tools_add_column.sqlite"
+	os.remove(path)
+	defer os.remove(path)
+	_ = os.write_entire_file(path, []u8{})
+	{
+		conn, err := db.embed_open(path)
+		if !testing.expectf(t, db.error_ok(err), "open: %s", err.message) do return
+		defer db.embed_close(conn)
+		tools_ok(t, conn, "CREATE TABLE w (a INTEGER NOT NULL, b TEXT NOT NULL, c, PRIMARY KEY (a, b)) WITHOUT ROWID")
+		tools_ok(t, conn, "ALTER TABLE w ADD COLUMN x INTEGER DEFAULT 1")
+		tools_ok(t, conn, "INSERT INTO w (a, b) VALUES (1, 'k')")
+		tools_expect(t, conn, "SELECT sql FROM sqlite_master WHERE name = 'w'", "CREATE TABLE w (a INTEGER NOT NULL, b TEXT NOT NULL, c, x INTEGER DEFAULT 1, PRIMARY KEY (a, b)) WITHOUT ROWID")
+	}
+	again, err := db.embed_open(path)
+	if !testing.expectf(t, db.error_ok(err), "reopen: %s", err.message) do return
+	defer db.embed_close(again)
+	tools_expect(t, again, "SELECT a, b, c, x FROM w", "1|k||1")
+}

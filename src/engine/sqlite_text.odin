@@ -187,14 +187,51 @@ sql_text_column_list :: proc(tokens: []Sql_Token) -> (open, close: int, ok: bool
 	return -1, -1, false
 }
 
-// sql_text_add_column appends a column definition to a CREATE TABLE text,
-// before the parenthesis that closes the list, as SQLite does.
+// sql_text_add_column puts a column definition into a CREATE TABLE text after
+// the last column's, as SQLite does: before the table constraints, or the
+// parenthesis that closes the list. After a table constraint it is text SQLite
+// cannot parse (`PRIMARY KEY (a, b), x INTEGER`), and the file was unreadable.
 sql_text_add_column :: proc(text, definition: string, alloc: mem.Allocator) -> (string, bool) {
 	tokens := sql_text_tokens(text)
-	_, close, ok := sql_text_column_list(tokens[:])
+	open, close, ok := sql_text_column_list(tokens[:])
 	if !ok do return "", false
 	at := tokens[close].start
+	depth := 0
+	item_start := true
+	for i in open + 1 ..< close {
+		token := tokens[i]
+		if token.kind == .Punct && token.text == "(" do depth += 1
+		if token.kind == .Punct && token.text == ")" do depth -= 1
+		if depth == 0 && token.kind == .Punct && token.text == "," {
+			item_start = true
+			continue
+		}
+		if item_start && depth == 0 {
+			item_start = false
+			if sql_text_is_table_constraint(token.text) {
+				// Back over the comma before this item: the definition goes there.
+				at = tokens[i].start
+				for j := i - 1; j > open; j -= 1 {
+					if tokens[j].kind == .Punct && tokens[j].text == "," {
+						at = tokens[j].start
+						break
+					}
+				}
+				break
+			}
+		}
+	}
 	return strings.concatenate({strings.trim_right_space(text[:at]), ", ", definition, text[at:]}, alloc), true
+}
+
+// sql_text_is_table_constraint is whether an item of a CREATE TABLE list that
+// starts with `word` is a table constraint rather than a column.
+@(private)
+sql_text_is_table_constraint :: proc(word: string) -> bool {
+	for keyword in ([]string{"constraint", "primary", "unique", "check", "foreign"}) {
+		if strings.equal_fold(word, keyword) do return true
+	}
+	return false
 }
 
 // sql_text_drop_column removes a column's definition from a CREATE TABLE text.
