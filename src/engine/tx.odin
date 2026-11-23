@@ -778,11 +778,29 @@ tx_alter_table :: proc(tx: ^Tx, name: string, next_schema: Table_Schema) -> Erro
 	if create_err.kind != .None do return create_err
 	append(&tx.replaced, replacement)
 	for row in current.rows {
+		// A deleted row stays as a tombstone for older readers: copied, it came
+		// back to life in the altered table.
+		if row.deleted_seq != 0 do continue
 		id := row.id
 		values, convert_err := alter_row_values(&current.schema, next_schema, row.values, tx.alloc)
 		if convert_err.kind != .None do return convert_err
 		if insert_err := table_insert(replacement, id, values); insert_err.kind != .None {
 			return insert_err
+		}
+	}
+	// The rows this transaction staged take the new shape too: they kept the old
+	// one, read NULL for an added column instead of its DEFAULT, and an UPDATE of
+	// one indexed past its values.
+	if writes, has_writes := tx.state.writes[name]; has_writes {
+		for _, &row in writes.inserts {
+			values, convert_err := alter_row_values(&current.schema, next_schema, row.values, tx.alloc)
+			if convert_err.kind != .None do return convert_err
+			row.values = values
+		}
+		for _, &values in writes.updates {
+			converted, convert_err := alter_row_values(&current.schema, next_schema, values, tx.alloc)
+			if convert_err.kind != .None do return convert_err
+			values = converted
 		}
 	}
 	replacement.next_row_id = current.next_row_id

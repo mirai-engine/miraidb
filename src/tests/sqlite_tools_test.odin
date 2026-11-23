@@ -721,3 +721,27 @@ test_an_added_column_goes_before_the_table_constraints :: proc(t: ^testing.T) {
 	defer db.embed_close(again)
 	tools_expect(t, again, "SELECT a, b, c, x FROM w", "1|k||1")
 }
+
+// ALTER rebuilt the table from every row it held, tombstones included, so a
+// deleted row came back; and the rows the transaction had staged kept the old
+// shape: they read NULL for the added column instead of its DEFAULT, and an
+// UPDATE of one indexed past its values and took the process down.
+@(test)
+test_alter_keeps_deleted_rows_deleted_and_reshapes_staged_ones :: proc(t: ^testing.T) {
+	store := tools_store(t)
+	defer db.store_close(store)
+	conn := db.embed_wrap(store)
+	defer db.embed_close(conn)
+	tools_ok(t, conn, "CREATE TABLE t (a, b)")
+	tools_ok(t, conn, "INSERT INTO t VALUES (1, 'x'), (6, 'gone')")
+	tools_ok(t, conn, "DELETE FROM t WHERE a = 6")
+	tools_ok(t, conn, "BEGIN")
+	tools_ok(t, conn, "INSERT INTO t VALUES (2, 'y')")
+	tools_ok(t, conn, "UPDATE t SET b = 'z' WHERE a = 1")
+	tools_ok(t, conn, "ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 3")
+	tools_ok(t, conn, "INSERT INTO t (a, b) VALUES (3, 'w')")
+	tools_expect(t, conn, "SELECT a, b, c FROM t ORDER BY a", "1|z|3 2|y|3 3|w|3")
+	tools_ok(t, conn, "UPDATE t SET b = 'q' WHERE a = 2")
+	tools_ok(t, conn, "COMMIT")
+	tools_expect(t, conn, "SELECT a, b, c FROM t ORDER BY a", "1|z|3 2|q|3 3|w|3")
+}

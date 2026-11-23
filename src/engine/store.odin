@@ -1489,6 +1489,8 @@ store_apply :: proc(store: ^Store, op: Store_Op) -> Error {
 		}
 		defer virtual.arena_destroy(&scratch)
 		for row in existing.rows {
+			// A tombstone is for the readers of the table being replaced.
+			if row.deleted_seq != 0 do continue
 			id := row.id
 			values, convert_err := alter_row_values(&existing.schema, op.schema, row.values, virtual.arena_allocator(&scratch))
 			if convert_err.kind != .None {
