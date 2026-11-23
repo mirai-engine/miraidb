@@ -34,6 +34,7 @@ Rules for this file:
 | R3 | closed: a prune visits the rows that hold a version or are a tombstone | — | — |
 | R4 | closed: a stored row is one allocation; a full hand-over measured and not worth it | — | — |
 | R6 | closed: a statement's fixed cost, a rowid read and a scan's per-row lists | — | — |
+| R7 | a commit with a reader open copies the table it writes, in one pass, its index nodes from a pool | share the structure instead of copying it | L |
 | D2 | overlap on an `rtree` table is a scan | node pages and a descent | M |
 | D3 | versions stay until `store_prune_versions` is called | automatic retention, `AS OF` on a join | M |
 | D4 | a table with a secondary index re-encodes the `.sqlite` mirror | patch the index b-trees | L |
@@ -125,6 +126,28 @@ needed). `SELECT 1` went from 21.7 to 5.6 µs, a rowid read from 138 to 11.7, a
 The parity gate holds four SQL workloads to their baseline, and
 `test_a_rowid_equality_reads_the_row_directly` covers the rowid path, staged
 writes included.
+
+## R7 — The copy a commit makes for a reader
+
+**Now.** A commit that changes a table a reader holds copies it
+(`table_cow_clone`), so the reader keeps a table nobody writes. Measured after
+R1: 4.4–4.7 ms over 20 000 rows and 13–17 ms over 50 000 on this machine, which
+ran 5.7–17 and 15–78 before this item. Of the 50 000-row copy, the index tree
+was 10–16 ms and is 7.5 now: its nodes came from the heap one at a time and come
+from a pool per index (`Node_Pool`: chunks of fixed-size slots and a free list,
+released with the index), which also took 4–15% off the parity inserts and
+updates that create index keys. Freeing the source's empty history lists cost
+3.5 ms of it and costs 0.25. `test_an_index_takes_its_nodes_from_a_pool_of_its_own`
+covers the reuse of freed nodes, a copy with a pool of its own, and an emptied
+and dropped index.
+
+What is left is the copy itself: 4 MB of rows and 5.6 MB of nodes at 50 000
+rows, most of it first-touch page faults of new memory, and the walk.
+
+**Done when.** A reader and the writer share what the commit did not change
+(persistent index nodes and a row slice copied by chunk, or versions read in
+place under a reader count), so a commit costs the rows it writes whatever the
+table's size.
 
 ## R3 — Prune only what a commit touched
 

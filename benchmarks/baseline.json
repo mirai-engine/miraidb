@@ -10,9 +10,9 @@
     "iterations": 2000,
     "insert_per_s": 55713.0,
     "insert_seconds": 0.483,
-    "read_us_per_tx": 10.7,
-    "first_read_us": 38.3,
-    "commit_with_reader_us": 16882.0,
+    "read_us_per_tx": 1.5,
+    "first_read_us": 6.2,
+    "commit_with_reader_us": 7200.0,
     "compact_seconds": 0.361,
     "database_bytes": 1600375,
     "bytes_per_row": 80.019

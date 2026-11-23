@@ -380,6 +380,35 @@ The integer rows allocate as before (a row with nothing after its array is the
 array, as it was); their ±3% is what the same build moves between runs here (the
 text update read −7% in one round and +2% in the next). The baseline is kept.
 
+## R7: index nodes from a pool (2026-11-22)
+
+A memory index allocated each tree node from the heap. A commit with a reader
+open copies the whole table, so it allocated a node per key: 10–16 ms of the
+copy of a 50 000-row table. Each index now takes its nodes from a pool of its own
+(chunks of slots and a free list, freed with the index). The commit with a
+reader open (`miraidb bench-read`, interleaved five times): 20 000 rows 5.7–17 →
+4.4–4.7 ms, 50 000 rows 15–78 → 13–17 ms. Every insert that files a new key
+allocated a node too, so the writes moved, interleaved five times, best median:
+
+| Workload | Before | R7 | Change |
+|---|---:|---:|---:|
+| insert_bulk u32_u64_str unique_0 | 648 | 658 | +2% |
+| insert_bulk u32_u64_str btree_each_column | 704 | 674 | −4% |
+| update_bulk u32_u64_str | 1 138 | 1 054 | −7% |
+| insert_bulk u32_u64_u64 unique_0 | 506 | 474 | −6% |
+| insert_bulk u32_u64_u64 btree_each_column | 565 | 483 | −15% |
+| update_bulk u32_u64_u64 | 919 | 855 | −7% |
+
+The reads did not move. The baseline is kept.
+
+On the performance gate (`scripts/bench.py`, Linux, 20 000 rows) the commit with
+a reader open is 6.8–9.6 ms against 16.9 recorded before R1, a read transaction
+1.3–1.9 µs against 10.7, and the first read after a commit 5.8–6.9 µs against 38.
+Those three are written into `benchmarks/baseline.json` by hand (1.5, 6.2, 7 200):
+a full `--record` also rewrote the insert rate and the compaction time, which
+moved 46 000–106 000 rows/s and 0.34–1.39 s between three runs of the same build,
+so a recorded number there was a draw, not a baseline.
+
 To reproduce:
 
 ```sh
