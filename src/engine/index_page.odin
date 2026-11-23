@@ -24,7 +24,8 @@ import "core:strings"
 // is rebuilt.
 
 INDEX_PAGE_MAGIC :: u32(0x4D52_5049) // "MRPI"
-INDEX_PAGE_VERSION :: u32(1)
+// 2: an integer and a real share one key space (write_key_number).
+INDEX_PAGE_VERSION :: u32(2)
 
 // INDEX_PAGE_MAX_KEY bounds one key so a cell always fits a page. A row whose
 // index key is longer is refused by the insert, with a message that names the

@@ -745,3 +745,27 @@ test_alter_keeps_deleted_rows_deleted_and_reshapes_staged_ones :: proc(t: ^testi
 	tools_ok(t, conn, "COMMIT")
 	tools_expect(t, conn, "SELECT a, b, c FROM t ORDER BY a", "1|z|3 2|q|3 3|w|3")
 }
+
+// An integer and a real are one key space, ordered by value as SQLite
+// compares them. Every integer sorted before every real: through an index
+// `c < -3` skipped -3.5, a range lost the integers inside it, `c = 5.0` missed
+// the 5, and a UNIQUE column took 5.0 beside 5.
+@(test)
+test_numbers_share_one_key_space :: proc(t: ^testing.T) {
+	store := tools_store(t)
+	defer db.store_close(store)
+	conn := db.embed_wrap(store)
+	defer db.embed_close(conn)
+	tools_ok(t, conn, "CREATE TABLE t (a, c)")
+	tools_ok(t, conn, "INSERT INTO t VALUES (1, 5), (2, -10), (3, -2), (4, 'x'), (5, NULL), (6, -3.5), (7, 100), (8, 9007199254740993), (9, 9007199254740992.0)")
+	tools_ok(t, conn, "CREATE INDEX i ON t (c)")
+	tools_expect(t, conn, "SELECT a FROM t WHERE c < -3 ORDER BY a", "2 6")
+	tools_expect(t, conn, "SELECT a FROM t WHERE c >= -3.5 AND c < 6 ORDER BY a", "1 3 6")
+	tools_expect(t, conn, "SELECT a FROM t WHERE c = 5.0", "1")
+	tools_expect(t, conn, "SELECT a FROM t WHERE c = 9007199254740993", "8")
+	tools_expect(t, conn, "SELECT a FROM t WHERE c >= 9007199254740993", "4 8")
+	tools_expect(t, conn, "SELECT a FROM t ORDER BY c, a", "5 2 6 3 1 7 9 8 4")
+	tools_ok(t, conn, "CREATE TABLE u (k UNIQUE)")
+	tools_ok(t, conn, "INSERT INTO u VALUES (5)")
+	tools_fails(t, conn, "INSERT INTO u VALUES (5.0)", "UNIQUE constraint failed: u.k")
+}

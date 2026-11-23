@@ -277,8 +277,7 @@ value_encode_key :: proc(w: ^Byte_Writer, v: Value) {
 		bw_write_u8(w, 0x01)
 		bw_write_u8(w, v.b ? 1 : 0)
 	case .Int:
-		bw_write_u8(w, 0x02)
-		write_be_u64(w, u64(v.i) ~ (u64(1) << 63))
+		write_key_number(w, f64(v.i), i16(i128(v.i) - i128(f64(v.i))))
 	case .Uint:
 		bw_write_u8(w, 0x03)
 		write_be_u64(w, v.u)
@@ -299,14 +298,7 @@ value_encode_key :: proc(w: ^Byte_Writer, v: Value) {
 		bw_write_u8(w, 0x0f)
 		write_be_u64(w, v.u)
 	case .Float:
-		bw_write_u8(w, 0x04)
-		bits := u64(transmute(u64)v.f)
-		if bits & (u64(1) << 63) != 0 {
-			bits = ~bits
-		} else {
-			bits |= (u64(1) << 63)
-		}
-		write_be_u64(w, bits)
+		write_key_number(w, v.f, 0)
 	case .Timestamp:
 		bw_write_u8(w, 0x05)
 		write_be_u64(w, u64(v.i) ~ (u64(1) << 63))
@@ -327,6 +319,27 @@ value_encode_key :: proc(w: ^Byte_Writer, v: Value) {
 			value_encode_key(w, item)
 		}
 	}
+}
+
+// write_key_number writes an integer or a real in one key space, ordered by
+// value, as SQLite compares them: the nearest real, then what an integer is
+// past it (nonzero only past 2^53, where a real cannot hold every integer). An
+// integer and a real had keys of their own kinds, so every integer sorted
+// before every real: a range through an index skipped -3.5 under `c < -3`, and
+// `c = 5.0` missed the row holding 5 (D24). -0.0 is 0.
+@(private)
+write_key_number :: proc(w: ^Byte_Writer, approx: f64, past: i16) {
+	bw_write_u8(w, 0x02)
+	bits := transmute(u64)(approx == 0 ? 0.0 : approx)
+	if bits & (u64(1) << 63) != 0 {
+		bits = ~bits
+	} else {
+		bits |= (u64(1) << 63)
+	}
+	write_be_u64(w, bits)
+	ordered := u16(past) ~ (u16(1) << 15)
+	bw_write_u8(w, u8(ordered >> 8))
+	bw_write_u8(w, u8(ordered))
 }
 
 // write_key_blob escapes NUL bytes and terminates with 0x00 0x00, so a
