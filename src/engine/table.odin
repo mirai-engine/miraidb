@@ -113,9 +113,112 @@ index_ids_remove_at :: proc(ids: ^[dynamic]Row_Id, at: int) {
 
 // index_tree_free frees every slot's list and the tree's nodes.
 @(private)
-index_tree_free :: proc(tree: ^Index_Tree) {
+index_tree_free :: proc(index: ^Index) {
+	tree := &index.tree
 	for node := rbtree.first(tree); node != nil; node = node_next(node) do delete(node.value.more)
-	rbtree.destroy(tree, false)
+	if index.nodes == nil {
+		rbtree.destroy(tree, false)
+		return
+	}
+	// The nodes are the pool's: releasing its chunks frees every one at once.
+	node_pool_destroy(index.nodes)
+	index.nodes = nil
+	tree^ = {}
+}
+
+// index_tree_init gives a memory index an empty tree whose nodes come from a
+// pool of its own.
+@(private)
+index_tree_init :: proc(index: ^Index) {
+	if index.nodes == nil do index.nodes = node_pool_make(size_of(Index_Node))
+	rbtree.init_cmp(&index.tree, index_cmp, node_pool_allocator(index.nodes))
+}
+
+// Node_Pool hands out the nodes of one index tree: slots of one size, carved
+// from chunks that grow from NODE_POOL_FIRST to NODE_POOL_LAST slots, with the
+// freed ones kept on a list for the next node. A node came from the heap, one
+// allocation each, and a commit with a reader open clones the whole tree, so a
+// 50 000-row table spent 10-16 ms of that commit allocating nodes (M4). The
+// chunks go back to the heap when the index does; until then a tree keeps the
+// slots of its largest size, which the inserts after a delete reuse.
+Node_Pool :: struct {
+	backing:   mem.Allocator,
+	slot:      int,
+	free_list: rawptr,
+	chunks:    [dynamic]rawptr,
+	chunk:     [^]u8,
+	used:      int,
+	capacity:  int,
+}
+
+NODE_POOL_FIRST :: 16
+NODE_POOL_LAST :: 1024
+NODE_POOL_ALIGN :: 16
+
+@(private)
+node_pool_make :: proc(slot: int) -> ^Node_Pool {
+	pool := new(Node_Pool)
+	pool.backing = context.allocator
+	pool.slot = mem.align_forward_int(max(slot, size_of(rawptr)), NODE_POOL_ALIGN)
+	pool.chunks = make([dynamic]rawptr, pool.backing)
+	return pool
+}
+
+@(private)
+node_pool_destroy :: proc(pool: ^Node_Pool) {
+	for chunk in pool.chunks do mem.free(chunk, pool.backing)
+	delete(pool.chunks)
+	backing := pool.backing
+	free(pool, backing)
+}
+
+@(private)
+node_pool_allocator :: proc(pool: ^Node_Pool) -> mem.Allocator {
+	return mem.Allocator{procedure = node_pool_proc, data = pool}
+}
+
+@(private)
+node_pool_proc :: proc(
+	data: rawptr,
+	mode: mem.Allocator_Mode,
+	size, alignment: int,
+	old_memory: rawptr,
+	old_size: int,
+	location := #caller_location,
+) -> (
+	[]byte,
+	mem.Allocator_Error,
+) {
+	pool := (^Node_Pool)(data)
+	#partial switch mode {
+	case .Alloc, .Alloc_Non_Zeroed:
+		if size > pool.slot || alignment > NODE_POOL_ALIGN do return nil, .Mode_Not_Implemented
+		slot: rawptr
+		if pool.free_list != nil {
+			slot = pool.free_list
+			pool.free_list = (^rawptr)(slot)^
+		} else {
+			if pool.used == pool.capacity {
+				next := pool.capacity == 0 ? NODE_POOL_FIRST : min(pool.capacity * 2, NODE_POOL_LAST)
+				chunk, chunk_err := mem.alloc(next * pool.slot, NODE_POOL_ALIGN, pool.backing)
+				if chunk_err != nil do return nil, chunk_err
+				append(&pool.chunks, chunk)
+				pool.chunk = ([^]u8)(chunk)
+				pool.used = 0
+				pool.capacity = next
+			}
+			slot = &pool.chunk[pool.used * pool.slot]
+			pool.used += 1
+		}
+		if mode == .Alloc do mem.zero(slot, size)
+		return ([^]u8)(slot)[:size], nil
+	case .Free:
+		if old_memory == nil do return nil, nil
+		(^rawptr)(old_memory)^ = pool.free_list
+		pool.free_list = old_memory
+		return nil, nil
+	}
+	return nil, .Mode_Not_Implemented
 }
 
 // index_tree_key encodes the key a memory index files `values` under: the indexed
@@ -136,6 +239,8 @@ Index :: struct {
 	schema: Index_Schema,
 	unique: bool,
 	tree:   Index_Tree,
+	// nodes is the pool the tree's nodes come from (Node_Pool).
+	nodes:  ^Node_Pool,
 	// lookup is the equality map for HASH and DIRECT indexes. The tree is still
 	// maintained so ordering, range scans and the primary-key path keep working.
 	lookup: map[string]^Index_Bucket,
@@ -515,7 +620,7 @@ table_create :: proc(schema: ^Table_Schema) -> (^Table, Error) {
 			unique = t.schema.indexes[i].unique,
 			lookup = make(map[string]^Index_Bucket),
 		}
-		rbtree.init_cmp(&t.indexes[i].tree, index_cmp)
+		index_tree_init(&t.indexes[i])
 		exprs, exprs_err := index_exprs_make(t.schema.indexes[i])
 		if exprs_err.kind != .None {
 			table_destroy(t)
@@ -558,7 +663,7 @@ table_destroy :: proc(t: ^Table) {
 	delete(t.rows)
 	delete(t.history)
 	for i in 0 ..< len(t.indexes) {
-		index_tree_free(&t.indexes[i].tree)
+		index_tree_free(&t.indexes[i])
 		table_index_map_free(t, i)
 		ordered_close(t.indexes[i].pages)
 		index_exprs_destroy(t.indexes[i].exprs)
@@ -1579,8 +1684,8 @@ table_truncate :: proc(t: ^Table) {
 			if t.indexes[i].pages != nil {
 				_ = ordered_clear(t.indexes[i].pages)
 			} else {
-				index_tree_free(&t.indexes[i].tree)
-				rbtree.init_cmp(&t.indexes[i].tree, index_cmp)
+				index_tree_free(&t.indexes[i])
+				index_tree_init(&t.indexes[i])
 			}
 			table_index_map_free(t, i)
 			t.indexes[i].lookup = make(map[string]^Index_Bucket)
@@ -1600,8 +1705,8 @@ table_truncate :: proc(t: ^Table) {
 	clear(&t.rows)
 	clear(&t.history)
 	for _, i in t.indexes {
-		index_tree_free(&t.indexes[i].tree)
-		rbtree.init_cmp(&t.indexes[i].tree, index_cmp)
+		index_tree_free(&t.indexes[i])
+		index_tree_init(&t.indexes[i])
 		table_index_map_free(t, i)
 		t.indexes[i].lookup = make(map[string]^Index_Bucket)
 	}
@@ -1627,7 +1732,7 @@ index_tree_clone :: proc(source: ^Index_Tree, target: ^Index_Tree, keys: mem.All
 	target.user_data = source.user_data
 	target.on_remove = source.on_remove
 	target._cmp_fn = source._cmp_fn
-	target._node_allocator = source._node_allocator
+	// The target keeps its own node allocator: its nodes are its pool's.
 	target._size = source._size
 	target._root = index_node_clone(source._root, nil, target._node_allocator, keys)
 }
@@ -1751,9 +1856,13 @@ table_cow_clone :: proc(source: ^Table) -> ^Table {
 	if !owning do return clone
 	clear(&source.history)
 	for &row in source.rows {
-		for version in row.versions do row_values_free(version.values)
-		delete(row.versions)
-		row.versions = nil
+		// Most rows have no history: freeing an empty list still called the
+		// allocator, 3.5 ms of a commit over 50 000 rows.
+		if row.versions != nil {
+			for version in row.versions do row_values_free(version.values)
+			delete(row.versions)
+			row.versions = nil
+		}
 		if row.deleted_seq != 0 {
 			row_values_free(row.values)
 			row.values = nil
@@ -1991,7 +2100,7 @@ table_add_index :: proc(t: ^Table, index: Index_Schema) -> Error {
 		unique = stored.unique,
 		lookup = make(map[string]^Index_Bucket),
 	}
-	rbtree.init_cmp(&t.indexes[position].tree, index_cmp)
+	index_tree_init(&t.indexes[position])
 	exprs, exprs_err := index_exprs_make(stored)
 	if exprs_err.kind != .None do return exprs_err
 	t.indexes[position].exprs = exprs
@@ -2042,7 +2151,7 @@ table_drop_index :: proc(t: ^Table, name: string) -> Error {
 		if index.schema.implicit {
 			return errf(.Invalid_Argument, "index %s comes from a constraint and cannot be dropped", name)
 		}
-		index_tree_free(&t.indexes[i].tree)
+		index_tree_free(&t.indexes[i])
 		table_index_map_free(t, i)
 		table_index_detach_pages(t, i, true)
 		index_exprs_destroy(t.indexes[i].exprs)

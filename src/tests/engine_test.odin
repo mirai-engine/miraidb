@@ -15800,3 +15800,69 @@ test_a_stored_row_keeps_every_kind_of_value :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(store.tables["c"].rows), 1)
 	expect_row(t, store, first_id, changed)
 }
+
+@(test)
+test_an_index_takes_its_nodes_from_a_pool_of_its_own :: proc(t: ^testing.T) {
+	// A memory index's tree takes its nodes from a pool: a freed node is reused by
+	// the next key, a copy for a reader gets a pool of its own (two trees never
+	// share one), and truncate and drop free the pool with the tree.
+	store := fresh_db(t, "node_pool")
+	if store == nil do return
+	defer cleanup_db(store, "node_pool")
+	run_done(t, store, "CREATE TABLE n (k INTEGER, v TEXT)")
+	run_done(t, store, "CREATE INDEX n_k ON n (k)")
+	fill :: proc(t: ^testing.T, store: ^db.Store, from: int) {
+		builder := strings.builder_make(context.temp_allocator)
+		strings.write_string(&builder, "INSERT INTO n (k, v) VALUES ")
+		for i in 0 ..< 300 {
+			if i > 0 do strings.write_byte(&builder, ',')
+			fmt.sbprintf(&builder, "(%d, 'v%d')", from + i, from + i)
+		}
+		run_done(t, store, strings.to_string(builder))
+	}
+	pool_of :: proc(store: ^db.Store) -> ^db.Node_Pool {
+		table := store.tables["n"]
+		for index in table.indexes do if index.schema.name == "n_k" do return index.nodes
+		return nil
+	}
+	count_of :: proc(t: ^testing.T, store: ^db.Store, sql: string) -> i64 {
+		result := run_temp(t, store, sql)
+		return result.rows[0][0].i
+	}
+	fill(t, store, 0)
+	pool := pool_of(store)
+	if !testing.expect(t, pool != nil) do return
+	chunks := len(pool.chunks)
+
+	// The deleted keys' nodes go back to the pool and the next keys reuse them.
+	run_done(t, store, "DELETE FROM n")
+	db.store_prune_history(store)
+	fill(t, store, 1000)
+	testing.expect(t, pool_of(store) == pool)
+	testing.expect_value(t, len(pool.chunks), chunks)
+	testing.expect_value(t, count_of(t, store, "SELECT count(*) FROM n WHERE k = 1150"), 1)
+	testing.expect_value(t, count_of(t, store, "SELECT count(*) FROM n WHERE k = 150"), 0)
+
+	// A commit with a reader open copies the table; the copy has its own pool, and
+	// the reader's tree still answers from the old one.
+	reader := db.tx_begin_read(store)
+	run_done(t, store, "INSERT INTO n (k, v) VALUES (5000, 'new')")
+	copied := pool_of(store)
+	testing.expect(t, copied != nil && copied != pool)
+	seen, seen_err := db.sql_execute_in_tx(reader, "SELECT count(*) FROM n WHERE k = 5000")
+	if testing.expect(t, db.error_ok(seen_err)) do testing.expect_value(t, seen.rows[0][0].i, 0)
+	db.sql_result_destroy(&seen)
+	db.error_free(&seen_err)
+	db.tx_end(reader)
+	testing.expect_value(t, count_of(t, store, "SELECT count(*) FROM n WHERE k = 5000"), 1)
+	testing.expect_value(t, count_of(t, store, "SELECT count(*) FROM n WHERE k >= 1000 AND k < 1300"), 300)
+
+	// Emptied and filled again, the index still answers, and dropping it frees its
+	// pool: the suite's leak check fails this test if a chunk is left behind.
+	run_done(t, store, "DELETE FROM n")
+	testing.expect_value(t, count_of(t, store, "SELECT count(*) FROM n WHERE k = 1150"), 0)
+	fill(t, store, 2000)
+	testing.expect_value(t, count_of(t, store, "SELECT count(*) FROM n WHERE k = 2299"), 1)
+	run_done(t, store, "DROP INDEX n_k")
+	testing.expect_value(t, count_of(t, store, "SELECT count(*) FROM n WHERE k = 2299"), 1)
+}
