@@ -1375,7 +1375,8 @@ table_insert :: proc(t: ^Table, id: Row_Id, values: []Value, validated := false)
 		table_touch_int_key(t, values)
 		return table_index_add_all(t, values, id)
 	}
-	if table_row_index(t, id) >= 0 {
+	at := table_row_index(t, id)
+	if at >= 0 && t.rows[at].deleted_seq == 0 {
 		return errf(.Internal, "row id %d already exists in table %s", u64(id), t.schema.name)
 	}
 	if !validated {
@@ -1392,7 +1393,17 @@ table_insert :: proc(t: ^Table, id: Row_Id, values: []Value, validated := false)
 			if next > t.next_sequence do t.next_sequence = next
 		}
 	}
-	table_row_put(t, Row{id = id, values = stored, created_seq = t.apply_seq})
+	if at >= 0 {
+		// The id names a row deleted before a prune came: the tombstone becomes a
+		// version of the new row, so a read older than the delete still finds it.
+		// It is in `history` already, as every tombstone is.
+		old := t.rows[at]
+		versions := old.versions
+		append(&versions, Row_Version{values = old.values, created_seq = old.created_seq, deleted_seq = old.deleted_seq})
+		t.rows[at] = Row{id = id, values = stored, created_seq = t.apply_seq, versions = versions}
+	} else {
+		table_row_put(t, Row{id = id, values = stored, created_seq = t.apply_seq})
+	}
 	for _, i in t.indexes {
 		if put_err := table_index_put_row(t, i, stored, id); put_err.kind != .None do return put_err
 	}

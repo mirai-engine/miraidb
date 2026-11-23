@@ -15575,6 +15575,32 @@ test_a_rowid_equality_reads_the_row_directly :: proc(t: ^testing.T) {
 	testing.expect_value(t, text_of(t, store, "SELECT c FROM p, o WHERE p.v = 'two' AND oid = 7"), "x")
 	testing.expect_value(t, text_of(t, store, "SELECT c FROM p, o WHERE p.rowid = 3 AND oid = 7"), "x")
 	testing.expect_value(t, text_of(t, store, "SELECT c FROM p, o WHERE p.rowid = 9 AND oid = 7"), "")
+	// A committed delete leaves a tombstone until a prune, which the C ABI never
+	// runs: the row is gone for every read after it, and its id is free again, as
+	// in SQLite. A read pinned before the delete still sees the row, and one
+	// pinned before an update sees the old value.
+	run_done(t, store, "CREATE TABLE d (v TEXT)")
+	run_done(t, store, "INSERT INTO d (v) VALUES ('first'), ('second')")
+	before_change := store.commit_seq
+	run_done(t, store, "DELETE FROM d WHERE v = 'first'")
+	run_done(t, store, "UPDATE d SET v = 'SECOND' WHERE rowid = 2")
+	testing.expect_value(t, text_of(t, store, "SELECT v FROM d WHERE rowid = 1"), "")
+	testing.expect_value(t, text_of(t, store, "SELECT v FROM d WHERE rowid = 2"), "SECOND")
+	pinned := db.tx_begin_read_at(store, before_change)
+	for check in ([][2]string{{"SELECT v FROM d WHERE rowid = 1", "first"}, {"SELECT v FROM d WHERE rowid = 2", "second"}}) {
+		old, old_err := db.sql_execute_in_tx(pinned, check[0])
+		if testing.expectf(t, db.error_ok(old_err), "%s: %s", check[0], old_err.message) {
+			testing.expectf(t, len(old.rows) == 1 && old.rows[0][0].s == check[1], "%s at the older sequence", check[0])
+		}
+		db.sql_result_destroy(&old)
+		db.error_free(&old_err)
+	}
+	db.tx_end(pinned)
+	run_done(t, store, "INSERT INTO d (rowid, v) VALUES (1, 'again')")
+	testing.expect_value(t, text_of(t, store, "SELECT v FROM d WHERE rowid = 1"), "again")
+	testing.expect_value(t, text_of(t, store, "SELECT v FROM d ORDER BY rowid"), "again,SECOND")
+	db.store_prune_history(store)
+	testing.expect_value(t, text_of(t, store, "SELECT v FROM d ORDER BY rowid"), "again,SECOND")
 	// Rows the transaction staged are read as it sees them.
 	tx := db.tx_begin_write(store)
 	defer db.tx_rollback(tx)

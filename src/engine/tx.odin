@@ -1085,7 +1085,15 @@ tx_get :: proc(tx: ^Tx, name: string, id: Row_Id) -> (Row, bool) {
 	}
 	table := tx_table_probe(tx, name)
 	if table == nil do return {}, false
-	return table_get_row(table, id, tx.alloc)
+	row, found := table_get_row(table, id, tx.alloc)
+	if !found || table.paged != nil do return row, found
+	// A memory table keeps tombstones and older versions until a prune: the row
+	// is the one this transaction's sequence sees. Returned as stored, a deleted
+	// row answered `WHERE rowid = k` until the next prune (which the C ABI never
+	// runs), and a pinned read saw the current values instead of its own.
+	values, visible := row_values_at(row, tx.read_seq)
+	if !visible do return {}, false
+	return Row{id = row.id, values = values, created_seq = row.created_seq}, true
 }
 
 // tx_collect fills `out` with the visible rows of one table, ordered by row id.
