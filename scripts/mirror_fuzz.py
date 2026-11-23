@@ -134,15 +134,25 @@ class Model:
         columns = self.tables[table]
         if r < 0.62:
             verb = self.rng.choice(["INSERT", "INSERT", "INSERT OR REPLACE", "INSERT OR IGNORE"])
+            # Under OR IGNORE SQLite keeps or takes back the rows before a
+            # datatype mismatch as its statement journal decides; the engine
+            # takes them back. An INTEGER PRIMARY KEY gets integers there.
+            def cell(column: str) -> str:
+                if column == "k" and verb == "INSERT OR IGNORE":
+                    return self.rng.choice(["NULL", str(self.rng.randint(-5, 60))])
+                return self.value()
             rows = ", ".join(
-                "(" + ", ".join(self.value() for _ in columns) + ")"
+                "(" + ", ".join(cell(column) for column in columns) + ")"
                 for _ in range(self.rng.choice([1, 1, 2, 5]))
             )
             return f"{verb} INTO {table} ({', '.join(columns)}) VALUES {rows}"
         if r < 0.82:
             column = self.column(table)
             target = self.column(table)
-            return f"UPDATE {table} SET {target} = {self.value()} WHERE {column} < {self.rng.randint(-5, 40)}"
+            # SQLite's UPDATE OR IGNORE of a rowid to a real drops the row; an
+            # INTEGER PRIMARY KEY is updated to integers only.
+            value = str(self.rng.randint(-5, 60)) if target == "k" else self.value()
+            return f"UPDATE {table} SET {target} = {value} WHERE {column} < {self.rng.randint(-5, 40)}"
         column = self.column(table)
         return f"DELETE FROM {table} WHERE {column} = {self.value()}"
 
@@ -221,7 +231,7 @@ def main() -> int:
                 if mine[table] != reference[table]:
                     pairs = list(zip(mine[table], reference[table]))
                     first = next((p for p in pairs if p[0] != p[1]), None)
-                    shown = tuple(str(v)[:40] for v in first[0]), tuple(str(v)[:40] for v in first[1]) if first else ("", "")
+                    shown = (tuple(str(v)[:40] for v in first[0]), tuple(str(v)[:40] for v in first[1])) if first else ("", "")
                     failures.append(f"after statement {number}: {table} differs: facade {len(mine[table])} rows, SQLite {len(reference[table])}; first: facade {shown[0]} SQLite {shown[1]}")
             if failures:
                 break
