@@ -15717,3 +15717,86 @@ test_a_prune_visits_only_the_rows_a_commit_touched :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(small.history), 0)
 	testing.expect_value(t, versions_of(small), 0)
 }
+
+@(test)
+test_a_stored_row_keeps_every_kind_of_value :: proc(t: ^testing.T) {
+	// A row a table keeps is one allocation: its values, then the bytes of its
+	// texts and blobs and the items of its lists. Every kind must come back as
+	// it went in, through an update (the old row becomes a version), an older
+	// read of that version, a delete and a prune.
+	store := fresh_db(t, "packed_rows")
+	if store == nil do return
+	defer cleanup_db(store, "packed_rows")
+	run_done(t, store, "CREATE TABLE c (id INTEGER PRIMARY KEY, tags ARRAY(TEXT), pair PRODUCT(INT, TEXT), b BLOB, s TEXT)")
+	first := []db.Value{
+		db.value_int(1),
+		db.value_array([]db.Value{db.value_string(""), db.value_string("beta")}),
+		db.value_product([]db.Value{db.value_int(7), db.value_string("x")}),
+		db.value_bytes([]u8{1, 2, 3}),
+		db.value_string(""),
+	}
+	second := []db.Value{
+		db.value_int(2),
+		db.value_array(nil),
+		db.value_product([]db.Value{db.value_int(8), db.value_string("a longer text than the others")}),
+		db.value_bytes(nil),
+		db.value_null(),
+	}
+	tx := db.tx_begin_write(store)
+	first_id, first_err := db.tx_insert(tx, "c", first)
+	testing.expectf(t, db.error_ok(first_err), "insert: %s", first_err.message)
+	db.error_free(&first_err)
+	second_id, second_err := db.tx_insert(tx, "c", second)
+	testing.expectf(t, db.error_ok(second_err), "insert: %s", second_err.message)
+	db.error_free(&second_err)
+	commit_err := db.tx_commit(tx)
+	testing.expect(t, db.error_ok(commit_err))
+	db.error_free(&commit_err)
+	inserted := store.commit_seq
+
+	expect_row :: proc(t: ^testing.T, store: ^db.Store, id: db.Row_Id, want: []db.Value, loc := #caller_location) {
+		reader := db.tx_begin_read(store)
+		defer db.tx_end(reader)
+		row, found := db.tx_get(reader, "c", id)
+		if !testing.expect(t, found, loc = loc) do return
+		if !testing.expect_value(t, len(row.values), len(want), loc = loc) do return
+		for value, i in want {
+			testing.expectf(t, db.value_equal(row.values[i], value), "column %d: %v against %v", i, row.values[i], value, loc = loc)
+		}
+	}
+	expect_row(t, store, first_id, first)
+	expect_row(t, store, second_id, second)
+
+	// The update keeps the old row as a version, read at the older sequence.
+	changed := []db.Value{
+		db.value_int(1),
+		db.value_array([]db.Value{db.value_string("gamma")}),
+		db.value_product([]db.Value{db.value_int(9), db.value_string("")}),
+		db.value_bytes([]u8{9}),
+		db.value_string("now set"),
+	}
+	tx = db.tx_begin_write(store)
+	update_err := db.tx_update(tx, "c", first_id, changed)
+	testing.expectf(t, db.error_ok(update_err), "update: %s", update_err.message)
+	db.error_free(&update_err)
+	commit_err = db.tx_commit(tx)
+	db.error_free(&commit_err)
+	expect_row(t, store, first_id, changed)
+	old := db.tx_begin_read_at(store, inserted)
+	old_row, old_found := db.tx_get(old, "c", first_id)
+	if testing.expect(t, old_found) {
+		for value, i in first do testing.expectf(t, db.value_equal(old_row.values[i], value), "old column %d", i)
+	}
+	db.tx_end(old)
+
+	// A delete and a prune free the version and the tombstone; what is left reads
+	// as before.
+	tx = db.tx_begin_write(store)
+	delete_err := db.tx_delete(tx, "c", second_id)
+	db.error_free(&delete_err)
+	commit_err = db.tx_commit(tx)
+	db.error_free(&commit_err)
+	db.store_prune_history(store)
+	testing.expect_value(t, len(store.tables["c"].rows), 1)
+	expect_row(t, store, first_id, changed)
+}

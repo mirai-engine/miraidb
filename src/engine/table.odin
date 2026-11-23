@@ -605,9 +605,88 @@ row_store_release :: proc(store: ^Row_Store) {
 
 @(private)
 table_free_row :: proc(row: Row) {
-	free_values(row.values)
-	for version in row.versions do free_values(version.values)
+	row_values_free(row.values)
+	for version in row.versions do row_values_free(version.values)
 	delete(row.versions)
+}
+
+// A row a memory table keeps lives in one allocation: its value array, then
+// the bytes of its texts and blobs and the items of its lists (R4). A commit
+// copied each row out of the transaction arena with one allocation for the
+// array and one more per text, blob or list, and freed them one by one; that
+// copy was a tenth of a 256-row insert. Only the table makes and frees these
+// rows (table_insert, table_update, and the frees in this file), so nothing
+// frees one value of a stored row on its own.
+@(private)
+row_values_pack :: proc(values: []Value) -> []Value {
+	if len(values) == 0 do return nil
+	extra := 0
+	for value in values do extra += value_packed_size(value)
+	if extra == 0 {
+		// Nothing to place after the array: the array is the row.
+		out := make([]Value, len(values))
+		copy(out, values)
+		return out
+	}
+	size := len(values) * size_of(Value) + extra
+	block, alloc_err := mem.alloc_bytes_non_zeroed(size, align_of(Value))
+	if alloc_err != nil do return nil
+	out := ([^]Value)(raw_data(block))[:len(values)]
+	at := len(values) * size_of(Value)
+	for value, i in values do out[i] = value_pack(value, block, &at)
+	return out
+}
+
+// row_values_free releases a row row_values_pack made: the one allocation.
+@(private)
+row_values_free :: proc(values: []Value) {
+	if values == nil do return
+	mem.free(raw_data(values))
+}
+
+// value_packed_size is what a value needs after the row's value array: its
+// bytes, or its list's items (aligned) and what they need in turn.
+@(private)
+value_packed_size :: proc(value: Value) -> int {
+	#partial switch value.kind {
+	case .String:
+		return len(value.s)
+	case .Bytes:
+		return len(value.bytes)
+	case .Array, .Product:
+		size := align_of(Value) - 1 + len(value.list) * size_of(Value)
+		for item in value.list do size += value_packed_size(item)
+		return size
+	}
+	return 0
+}
+
+@(private)
+value_pack :: proc(value: Value, block: []u8, at: ^int) -> Value {
+	out := value
+	#partial switch value.kind {
+	case .String:
+		n := len(value.s)
+		copy(block[at^:at^ + n], value.s)
+		out.s = string(block[at^:at^ + n])
+		at^ += n
+	case .Bytes:
+		n := len(value.bytes)
+		copy(block[at^:at^ + n], value.bytes)
+		out.bytes = block[at^:at^ + n]
+		at^ += n
+	case .Array, .Product:
+		if len(value.list) == 0 {
+			out.list = nil
+			return out
+		}
+		at^ = mem.align_forward_int(at^, align_of(Value))
+		list := ([^]Value)(&block[at^])[:len(value.list)]
+		at^ += len(value.list) * size_of(Value)
+		for item, i in value.list do list[i] = value_pack(item, block, at)
+		out.list = list
+	}
+	return out
 }
 
 // row_values_at returns the values a row showed at `seq`. The second result is
@@ -641,7 +720,7 @@ table_prune_versions :: proc(t: ^Table, before_seq: u64) {
 		write := 0
 		for version in row.versions {
 			if version.deleted_seq != 0 && version.deleted_seq <= before_seq {
-				free_values(version.values)
+				row_values_free(version.values)
 				continue
 			}
 			row.versions[write] = version
@@ -653,7 +732,7 @@ table_prune_versions :: proc(t: ^Table, before_seq: u64) {
 			// array that held their history are freed with it. Forgetting them is
 			// what made INSERT OR REPLACE leave the replaced row behind for the life
 			// of the process (tools/leakcheck counted 48 bytes per statement).
-			free_values(row.values)
+			row_values_free(row.values)
 			delete(row.versions)
 			row.values = nil
 			row.versions = nil
@@ -1382,7 +1461,7 @@ table_insert :: proc(t: ^Table, id: Row_Id, values: []Value, validated := false)
 	if !validated {
 		if err := table_check_unique(t, values); err.kind != .None do return err
 	}
-	stored := clone_values(values)
+	stored := row_values_pack(values)
 	// A value kept in a table has no subtype, as in SQLite: a JSON text read
 	// back from a table, or from a subquery in FROM, is text.
 	for &value in stored do value.subtype = 0
@@ -1447,7 +1526,7 @@ table_update :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
 		created_seq = row.created_seq,
 		deleted_seq = t.apply_seq,
 	})
-	stored := clone_values(values)
+	stored := row_values_pack(values)
 	// A value kept in a table has no subtype, as in SQLite: a JSON text read
 	// back from a table, or from a subquery in FROM, is text.
 	for &value in stored do value.subtype = 0
@@ -1672,11 +1751,11 @@ table_cow_clone :: proc(source: ^Table) -> ^Table {
 	if !owning do return clone
 	clear(&source.history)
 	for &row in source.rows {
-		for version in row.versions do free_values(version.values)
+		for version in row.versions do row_values_free(version.values)
 		delete(row.versions)
 		row.versions = nil
 		if row.deleted_seq != 0 {
-			free_values(row.values)
+			row_values_free(row.values)
 			row.values = nil
 		}
 	}
