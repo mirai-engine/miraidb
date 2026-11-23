@@ -81,8 +81,6 @@ sqlite_put_varint :: proc(buffer: ^[dynamic]u8, value: u64) {
 			bytes[i] = u8(v & 0xff)
 			v >>= 8
 		}
-		// Mark all but the last byte's high bit.
-		for i in 0 ..< 8 do bytes[i] |= 0x80
 		for b in bytes do append(buffer, b)
 		return
 	}
@@ -1179,6 +1177,22 @@ sqlite_file_image :: proc(store: ^Store, alloc := context.allocator) -> (image: 
 				append(&owned, index_row[4].s)
 			}
 			append(&master_rows, Sqlite_Export_Row{rowid = i64(len(master_rows) + 1), values = index_row})
+		}
+		// An index the engine could not build goes back as the file had it: its
+		// table refuses writes while it is kept, so its entries are still the
+		// ones the rows imply (D24).
+		for kept in store.mirror_kept {
+			if kept.kind != "index" || !strings.equal_fold(kept.table, table.schema.name) do continue
+			built := false
+			for index in table.schema.indexes do built ||= strings.equal_fold(index.name, kept.name)
+			if built do continue
+			kept_row := make([]Value, 5, alloc)
+			kept_row[0] = value_string("index")
+			kept_row[1] = value_string(kept.name)
+			kept_row[2] = value_string(table.schema.name)
+			kept_row[3] = value_int(i64(sqlite_index_btree(&w, kept.payloads, alloc)))
+			kept_row[4] = value_string(kept.sql)
+			append(&master_rows, Sqlite_Export_Row{rowid = i64(len(master_rows) + 1), values = kept_row})
 		}
 	}
 

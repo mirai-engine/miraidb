@@ -1741,8 +1741,17 @@ sqlite_mirror_validate :: proc(path: string, alloc := context.allocator) -> (ok:
 		rows[table.name] = count
 	}
 	for tree in file.index_trees {
-		count, sorted := mirror_index_entries(&file, tree.root)
-		if !sorted do return false, fmt.aprintf("index %s is not in key order", tree.name, allocator = alloc)
+		// The order is the index's own: a DESC part backwards and a text by its
+		// COLLATE. One ordered by a collation only a program has is counted but
+		// not ordered here, since nothing here can compare it (D24).
+		sql := ""
+		for index in file.indexes do if index.name == tree.name do sql = index.sql
+		order := Sqlite_Index_Order{}
+		order.desc, order.collations = sqlite_index_part_order(sql, 64, context.temp_allocator)
+		order_known := true
+		for collation in order.collations do if len(collation) > 0 && !collation_is_builtin(collation) do order_known = false
+		count, sorted := mirror_index_entries(&file, tree.root, &order)
+		if !sorted && order_known do return false, fmt.aprintf("index %s is not in key order", tree.name, allocator = alloc)
 		if !tree.partial && count != rows[tree.table] {
 			return false, fmt.aprintf("wrong # of entries in index %s", tree.name, allocator = alloc)
 		}
@@ -1753,13 +1762,14 @@ sqlite_mirror_validate :: proc(path: string, alloc := context.allocator) -> (ok:
 // mirror_index_entries counts an index b-tree's entries, interior cells
 // included, and answers whether each is greater than the one before.
 @(private)
-mirror_index_entries :: proc(file: ^Sqlite_File, root: u32) -> (count: int, sorted: bool) {
+mirror_index_entries :: proc(file: ^Sqlite_File, root: u32, order: ^Sqlite_Index_Order = nil) -> (count: int, sorted: bool) {
 	Ctx :: struct {
 		count:    int,
 		sorted:   bool,
 		previous: []Value,
+		order:    ^Sqlite_Index_Order,
 	}
-	ctx := Ctx{sorted = true}
+	ctx := Ctx{sorted = true, order = order}
 	defer if ctx.previous != nil {
 		for value in ctx.previous do value_deep_free(value, context.temp_allocator)
 		delete(ctx.previous, context.temp_allocator)
@@ -1771,7 +1781,11 @@ mirror_index_entries :: proc(file: ^Sqlite_File, root: u32) -> (count: int, sort
 			ctx.sorted = false
 			return false
 		}
-		if ctx.previous != nil {
+		if ctx.previous != nil && ctx.order != nil {
+			if sqlite_entry_compare(ctx.previous, values, ctx.order) >= 0 do ctx.sorted = false
+			for value in ctx.previous do value_deep_free(value, context.temp_allocator)
+			delete(ctx.previous, context.temp_allocator)
+		} else if ctx.previous != nil {
 			order := slice.Ordering.Equal
 			for i in 0 ..< min(len(values), len(ctx.previous)) {
 				compared, comparable := value_compare(ctx.previous[i], values[i])

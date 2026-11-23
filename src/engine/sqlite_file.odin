@@ -1303,19 +1303,20 @@ sqlite_import_tx :: proc(
 		}
 	}
 	// Secondary indexes, in the order the file lists them. SQLite's own CREATE
-	// INDEX statement is run as it stands, so a unique or multi-column index keeps
-	// its shape. An index this engine cannot express (a partial index, an
-	// expression index) is retried without the WHERE clause, and if that also
-	// fails it is left out rather than failing the import: the data is the point,
-	// the access path is an optimisation.
+	// INDEX statement is run as it stands, so a unique, partial, multi-column or
+	// expression index keeps its shape. One the engine cannot build (it calls a
+	// function or names a collation only the program that wrote the file had)
+	// is never built differently: a partial UNIQUE index made whole would refuse
+	// rows SQLite accepts. Its reason is noted, and store_mirror_keep keeps it as
+	// the file has it (D24).
+	store_mirror_skip_reasons_clear(tx.store)
 	for index in file.indexes {
 		if len(index.sql) == 0 do continue
-		if _, create_err := sql_execute_in_tx(tx, index.sql); create_err.kind == .None do continue
-		if plain, ok := sqlite_index_without_where(index.sql, context.temp_allocator); ok {
-			discarded_21, discarded_21_err := sql_execute_in_tx(tx, plain)
-			sql_result_destroy(&discarded_21)
-			error_free(&discarded_21_err)
-		}
+		created, create_err := sql_execute_in_tx(tx, index.sql)
+		sql_result_destroy(&created)
+		if create_err.kind == .None do continue
+		tx.store.mirror_skip_reasons[strings.clone(index.name)] = strings.clone(create_err.message)
+		error_free(&create_err)
 	}
 	// The views, then the triggers (an INSTEAD OF trigger needs its view), as
 	// the file wrote them. One this engine cannot read stays text the file
@@ -1455,15 +1456,20 @@ sqlite_write_group :: proc(builder: ^strings.Builder, table: ^Sqlite_Table, grou
 	strings.write_byte(builder, ')')
 }
 
-// sqlite_index_without_where drops a trailing WHERE clause, which is what makes
-// a partial index partial. Everything up to it is a CREATE INDEX this engine
-// understands.
-@(private)
-sqlite_index_without_where :: proc(sql: string, alloc: mem.Allocator) -> (string, bool) {
-	upper := strings.to_upper(sql, context.temp_allocator)
-	at := strings.index(upper, " WHERE ")
-	if at < 0 do return "", false
-	return strings.trim_space(sql[:at]), true
+// sqlite_index_payloads copies the records of an index b-tree in key order,
+// interior cells included, as sqlite_index_btree writes them back.
+sqlite_index_payloads :: proc(file: ^Sqlite_File, root: u32) -> (payloads: [][]u8, ok: bool) {
+	collected := make([dynamic][]u8)
+	visit := proc(user: rawptr, rowid: i64, payload: []u8) -> bool {
+		append((^[dynamic][]u8)(user), slice.clone(payload))
+		return true
+	}
+	if !sqlite_walk(file, root, false, visit, &collected, 0) {
+		for payload in collected do delete(payload)
+		delete(collected)
+		return nil, false
+	}
+	return collected[:], true
 }
 
 @(private)

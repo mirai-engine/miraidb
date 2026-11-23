@@ -386,6 +386,16 @@ sqlite_schema_rows :: proc(tx: ^Tx, temp: bool, alloc: mem.Allocator) -> [dynami
 			append(&out, Sqlite_Schema_Row{type = "index", name = index.name, tbl_name = table.schema.name, sql = strings.clone(index_sql, alloc)})
 			delete(index_sql)
 		}
+		// An index the engine could not build is still the file's, and the
+		// catalog lists it as SQLite does (D24).
+		if !temp && tx.store.mirror_kept_indexes > 0 {
+			for kept in tx.store.mirror_kept {
+				if kept.kind != "index" || !strings.equal_fold(kept.table, table.schema.name) do continue
+				built := false
+				for index in table.schema.indexes do built ||= strings.equal_fold(index.name, kept.name)
+				if !built do append(&out, Sqlite_Schema_Row{type = "index", name = kept.name, tbl_name = table.schema.name, sql = strings.clone(kept.sql, alloc)})
+			}
+		}
 	}
 	if temp do return out
 	if sequence {

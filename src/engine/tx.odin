@@ -764,6 +764,9 @@ tx_paged_alter_guard :: proc(tx: ^Tx, name: string) -> Error {
 tx_alter_table :: proc(tx: ^Tx, name: string, next_schema: Table_Schema) -> Error {
 	tx_forget_catalog_cache(tx)
 	if tx_write_refused(tx, name) do return errf(.Transaction_Read_Only, "cannot alter a table in a read transaction")
+	if tx.store.mirror_kept_indexes > 0 {
+		if kept_err := tx_kept_index_refusal(tx, name); kept_err.kind != .None do return kept_err
+	}
 	if guard_err := tx_paged_alter_guard(tx, name); guard_err.kind != .None do return guard_err
 	if _, created := tx.state.created[name]; created {
 		return errf(.Sql_Unsupported, "alter a table outside the transaction that created it")
@@ -796,6 +799,9 @@ tx_alter_table :: proc(tx: ^Tx, name: string, next_schema: Table_Schema) -> Erro
 tx_alter_column_type :: proc(tx: ^Tx, name, column_name: string, next_type: Column_Type) -> Error {
 	tx_forget_catalog_cache(tx)
 	if tx_write_refused(tx, name) do return errf(.Transaction_Read_Only, "cannot alter a table in a read transaction")
+	if tx.store.mirror_kept_indexes > 0 {
+		if kept_err := tx_kept_index_refusal(tx, name); kept_err.kind != .None do return kept_err
+	}
 	if guard_err := tx_paged_alter_guard(tx, name); guard_err.kind != .None do return guard_err
 	if _, created := tx.state.created[name]; created {
 		return errf(.Sql_Unsupported, "alter a table outside the transaction that created it")
@@ -833,6 +839,9 @@ tx_alter_column_type :: proc(tx: ^Tx, name, column_name: string, next_type: Colu
 tx_drop_column :: proc(tx: ^Tx, name, column_name: string) -> Error {
 	tx_forget_catalog_cache(tx)
 	if tx_write_refused(tx, name) do return errf(.Transaction_Read_Only, "cannot alter a table in a read transaction")
+	if tx.store.mirror_kept_indexes > 0 {
+		if kept_err := tx_kept_index_refusal(tx, name); kept_err.kind != .None do return kept_err
+	}
 	if guard_err := tx_paged_alter_guard(tx, name); guard_err.kind != .None do return guard_err
 	if _, created := tx.state.created[name]; created {
 		return errf(.Sql_Unsupported, "alter a table outside the transaction that created it")
@@ -970,6 +979,9 @@ tx_drop_column :: proc(tx: ^Tx, name, column_name: string) -> Error {
 tx_rename_table :: proc(tx: ^Tx, from, to: string) -> Error {
 	tx_forget_catalog_cache(tx)
 	if tx_write_refused(tx, from) do return errf(.Transaction_Read_Only, "cannot alter a table in a read transaction")
+	if tx.store.mirror_kept_indexes > 0 {
+		if kept_err := tx_kept_index_refusal(tx, from); kept_err.kind != .None do return kept_err
+	}
 	if guard_err := tx_paged_alter_guard(tx, from); guard_err.kind != .None do return guard_err
 	if _, created := tx.state.created[from]; created {
 		return errf(.Sql_Unsupported, "alter a table outside the transaction that created it")
@@ -1006,6 +1018,9 @@ tx_rename_table :: proc(tx: ^Tx, from, to: string) -> Error {
 // trigger body, a policy) is not rewritten, which is noted in the docs.
 tx_rename_column :: proc(tx: ^Tx, table_name, from, to: string) -> Error {
 	if tx_write_refused(tx, table_name) do return errf(.Transaction_Read_Only, "cannot alter a table in a read transaction")
+	if tx.store.mirror_kept_indexes > 0 {
+		if kept_err := tx_kept_index_refusal(tx, table_name); kept_err.kind != .None do return kept_err
+	}
 	if guard_err := tx_paged_alter_guard(tx, table_name); guard_err.kind != .None do return guard_err
 	if _, created := tx.state.created[table_name]; created {
 		return errf(.Sql_Unsupported, "alter a table outside the transaction that created it")
@@ -1230,6 +1245,34 @@ tx_write_refused :: proc(tx: ^Tx, name: string) -> bool {
 	return tx.temp_only && !tx_table_is_temp(tx, name)
 }
 
+// tx_kept_index_refusal answers why a write to `name` cannot run while the
+// table has an index the engine could not build from the file it imported
+// (store_mirror_keep): its entries would stop matching the rows, and SQLite
+// refuses the same write for want of the function or collation the index
+// needs. The index is tried again first, in this transaction: a program that
+// registered what it needs since the open gets it built, and the write runs.
+@(private)
+tx_kept_index_refusal :: proc(tx: ^Tx, name: string) -> Error {
+	for kept in tx.store.mirror_kept {
+		if kept.kind != "index" || !strings.equal_fold(kept.table, name) do continue
+		// Built in this transaction, or by an earlier one on a store whose
+		// catalog no rewrite has read again since.
+		built := false
+		for op in tx.state.index_ops {
+			if !op.drop && strings.equal_fold(op.table, name) && strings.equal_fold(op.index.name, kept.name) do built = true
+		}
+		if table := tx_table_probe(tx, name); table != nil {
+			for index in table.schema.indexes do built ||= strings.equal_fold(index.name, kept.name)
+		}
+		if built do continue
+		created, create_err := sql_execute_in_tx(tx, kept.sql)
+		sql_result_destroy(&created)
+		if create_err.kind == .None do continue
+		return create_err
+	}
+	return ERROR_NONE
+}
+
 // --- DDL -------------------------------------------------------------------
 
 tx_create_table :: proc(tx: ^Tx, schema: ^Table_Schema) -> Error {
@@ -1259,6 +1302,9 @@ tx_create_table :: proc(tx: ^Tx, schema: ^Table_Schema) -> Error {
 tx_drop_table :: proc(tx: ^Tx, name: string) -> Error {
 	tx_forget_catalog_cache(tx)
 	if tx_write_refused(tx, name) do return errf(.Transaction_Read_Only, "cannot drop a table in a read transaction")
+	if tx.store.mirror_kept_indexes > 0 {
+		if kept_err := tx_kept_index_refusal(tx, name); kept_err.kind != .None do return kept_err
+	}
 	if created, ok := tx.state.created[name]; ok {
 		// Erase before destroying: the map's key is the name in the table's own
 		// arena, so a destroy first leaves the map comparing against freed
@@ -1316,7 +1362,6 @@ tx_next_int_key :: proc(table: ^Table, writes: ^Table_Writes, position: int) -> 
 	} else {
 		next = table_max_int(table, position) + 1
 	}
-	if next < 1 do next = 1
 	if writes != nil {
 		for _, row in writes.inserts {
 			if row.values[position].kind == .Int && row.values[position].i >= next do next = row.values[position].i + 1
@@ -1328,6 +1373,9 @@ tx_next_int_key :: proc(table: ^Table, writes: ^Table_Writes, position: int) -> 
 @(private)
 tx_insert_row :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error) {
 	if tx_write_refused(tx, name) do return 0, errf(.Transaction_Read_Only, "cannot insert in a read transaction")
+	if tx.store.mirror_kept_indexes > 0 {
+		if kept_err := tx_kept_index_refusal(tx, name); kept_err.kind != .None do return 0, kept_err
+	}
 	table: ^Table
 	cached := tx.insert_table != nil && len(tx.cte_tables) == 0 && tx.insert_name == name
 	if cached {
@@ -1484,6 +1532,9 @@ tx_update :: proc(tx: ^Tx, name: string, id: Row_Id, values: []Value) -> Error {
 @(private)
 tx_update_row :: proc(tx: ^Tx, name: string, id: Row_Id, values: []Value) -> Error {
 	if tx_write_refused(tx, name) do return errf(.Transaction_Read_Only, "cannot update in a read transaction")
+	if tx.store.mirror_kept_indexes > 0 {
+		if kept_err := tx_kept_index_refusal(tx, name); kept_err.kind != .None do return kept_err
+	}
 	table, table_err := tx_table(tx, name)
 	if table_err.kind != .None do return table_err
 	if table.schema.event do return errf(.Sql_Unsupported, "event table %s is append-only", name)
@@ -1601,6 +1652,9 @@ tx_delete_without_triggers :: proc(tx: ^Tx, name: string, id: Row_Id) -> Error {
 @(private)
 tx_delete_impl :: proc(tx: ^Tx, name: string, id: Row_Id, fire_triggers: bool) -> Error {
 	if tx_write_refused(tx, name) do return errf(.Transaction_Read_Only, "cannot delete in a read transaction")
+	if tx.store.mirror_kept_indexes > 0 {
+		if kept_err := tx_kept_index_refusal(tx, name); kept_err.kind != .None do return kept_err
+	}
 	table, table_err := tx_table(tx, name)
 	if table_err.kind != .None do return table_err
 	if table.schema.event do return errf(.Sql_Unsupported, "event table %s is append-only", name)
@@ -1642,6 +1696,9 @@ tx_delete_impl :: proc(tx: ^Tx, name: string, id: Row_Id, fire_triggers: bool) -
 
 tx_truncate :: proc(tx: ^Tx, name: string) -> Error {
 	if tx_write_refused(tx, name) do return errf(.Transaction_Read_Only, "cannot truncate in a read transaction")
+	if tx.store.mirror_kept_indexes > 0 {
+		if kept_err := tx_kept_index_refusal(tx, name); kept_err.kind != .None do return kept_err
+	}
 	table, table_err := tx_table(tx, name)
 	if table_err.kind != .None do return table_err
 	if table.schema.event do return errf(.Sql_Unsupported, "event table %s is append-only", name)

@@ -234,6 +234,13 @@ Store :: struct {
 	// did not have to change instead of rebuilding it from a model that does not
 	// hold its rules (D27).
 	mirror_kept:          [dynamic]Mirror_Kept,
+	// mirror_kept_indexes counts the entries of mirror_kept that are an index
+	// the engine could not build, so a write to a table without one pays a
+	// comparison and not a walk (tx_kept_index_refusal).
+	mirror_kept_indexes:  int,
+	// mirror_skip_reasons says, by index name, why the last import could not
+	// build an index; store_mirror_keep moves each reason to its kept entry.
+	mirror_skip_reasons:  map[string]string,
 	// mirror_losses names the objects the last rewrite had to rebuild from the
 	// engine's model, which drops whatever that model cannot express.
 	mirror_losses:        [dynamic]string,
@@ -516,6 +523,8 @@ store_close :: proc(store: ^Store) {
 	delete(store.attached)
 	mirror_destroy(store.mirror)
 	store_mirror_kept_destroy(store)
+	store_mirror_skip_reasons_clear(store)
+	delete(store.mirror_skip_reasons)
 	delete(store.token_key)
 	for loss in store.mirror_losses do delete(loss)
 	delete(store.mirror_losses)
@@ -590,11 +599,29 @@ Mirror_Kept :: struct {
 	// DROP removes it from the file too. One the engine could not read stays
 	// text the file keeps.
 	modelled:  bool,
+	// An index the engine could not build (an expression over a function or a
+	// collation only the program that wrote the file had) is kept as the file
+	// had it: `payloads` are its entries' records in key order, which a rewrite
+	// writes back unchanged, and `reason` is the error building it gave. Its
+	// table refuses writes until the index can be built (D24), so the entries
+	// stay the ones its rows imply.
+	payloads:  [][]u8,
+	reason:    string,
 }
 
 // store_mirror_keep records the file's catalog, so a later rewrite can put back
 // what the engine does not model.
 store_mirror_keep :: proc(store: ^Store, file: ^Sqlite_File) {
+	// Why a kept index could not be built outlives the list it is in: a rewrite
+	// keeps the catalog again from the file it wrote, which no import read.
+	reasons := make(map[string]string, 4, context.temp_allocator)
+	for kept in store.mirror_kept {
+		if kept.kind == "index" do reasons[strings.clone(kept.name, context.temp_allocator)] = strings.clone(kept.reason, context.temp_allocator)
+	}
+	for name, reason in store.mirror_skip_reasons {
+		reasons[strings.clone(name, context.temp_allocator)] = strings.clone(reason, context.temp_allocator)
+	}
+	store_mirror_skip_reasons_clear(store)
 	store_mirror_kept_destroy(store)
 	for &table in file.tables {
 		schema, found := store.tables[table.name]
@@ -637,6 +664,52 @@ store_mirror_keep :: proc(store: ^Store, file: ^Sqlite_File) {
 			},
 		)
 	}
+	for tree in file.index_trees {
+		if strings.has_prefix(tree.name, "sqlite_autoindex_") do continue
+		sql := ""
+		for index in file.indexes do if index.name == tree.name do sql = index.sql
+		if len(sql) == 0 do continue
+		table, found := store.tables[tree.table]
+		if !found do continue
+		built := false
+		for index in table.schema.indexes do built ||= strings.equal_fold(index.name, tree.name)
+		if built do continue
+		payloads, read := sqlite_index_payloads(file, tree.root)
+		if !read do continue
+		reason := reasons[tree.name] or_else ""
+		append(
+			&store.mirror_kept,
+			Mirror_Kept {
+				kind = strings.clone("index"),
+				name = strings.clone(tree.name),
+				table = strings.clone(table.schema.name),
+				sql = strings.clone(sql),
+				payloads = payloads,
+				reason = len(reason) > 0 ? strings.clone(reason) : fmt.aprintf("index %s cannot be built", tree.name),
+			},
+		)
+		store.mirror_kept_indexes += 1
+	}
+}
+
+// store_mirror_skip_reasons_clear forgets why the last import skipped its
+// indexes.
+store_mirror_skip_reasons_clear :: proc(store: ^Store) {
+	for name, reason in store.mirror_skip_reasons {
+		delete(name)
+		delete(reason)
+	}
+	clear(&store.mirror_skip_reasons)
+}
+
+// store_mirror_kept_index is the kept index named `name`, one the engine could
+// not build.
+store_mirror_kept_index :: proc(store: ^Store, name: string) -> (Mirror_Kept, bool) {
+	if store == nil || store.mirror_kept_indexes == 0 do return {}, false
+	for kept in store.mirror_kept {
+		if kept.kind == "index" && strings.equal_fold(kept.name, name) do return kept, true
+	}
+	return {}, false
 }
 
 store_mirror_kept_lookup :: proc(store: ^Store, name: string) -> (Mirror_Kept, bool) {
@@ -657,8 +730,12 @@ store_mirror_kept_destroy :: proc(store: ^Store) {
 		if len(kept.signature) > 0 do delete(kept.signature)
 		for name in kept.key_indexes do delete(name)
 		delete(kept.key_indexes)
+		for payload in kept.payloads do delete(payload)
+		delete(kept.payloads)
+		if len(kept.reason) > 0 do delete(kept.reason)
 	}
 	delete(store.mirror_kept)
+	store.mirror_kept_indexes = 0
 	// The array is gone: leaving its length behind would let the next append write
 	// into freed memory.
 	store.mirror_kept = nil

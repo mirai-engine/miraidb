@@ -394,6 +394,10 @@ sqlite_share_refresh :: proc(conn: ^Embed_Conn) -> Error {
 	caught_up := parsed && sqlite_share_catch_up(conn, &file, hashes, mirror)
 	if caught_up {
 		sqlite_share_follow_mirror(store, mirror, &file, same)
+		// Another process (one with the function a kept index needs) may have
+		// written its table: the kept entries are read again from the file, or
+		// a rewrite here would put back the ones it replaced (D24).
+		if store.mirror_kept_indexes > 0 do store_mirror_keep(store, &file)
 	} else {
 		if replace_err := store_replace_content(store, image, true); replace_err.kind != .None {
 			// The store keeps what it had and stays the file's, so the next

@@ -241,6 +241,10 @@ main :: proc() {
 		table_count, row_count, import_err := db.sqlite_import(&file, store)
 		if !db.error_ok(import_err) do fail(import_err)
 		fmt.printfln("imported %d table%s and %d row%s", table_count, table_count == 1 ? "" : "s", row_count, row_count == 1 ? "" : "s")
+		// An index the engine could not build is said, never dropped silently.
+		for kept in store.mirror_kept {
+			if kept.kind == "index" do fmt.printfln("skipped index %s on %s: %s", kept.name, kept.table, kept.reason)
+		}
 	case "export-sqlite":
 		if len(arguments) < 2 do usage_error("export-sqlite needs a database path and a file")
 		store, err := open_database(arguments[0], persistent, durable, durability)

@@ -471,12 +471,69 @@ test_a_connection_catches_up_table_by_table :: proc(t: ^testing.T) {
 	tools_expect(t, b, "SELECT z FROM t3", "9")
 }
 
+@(private = "file")
+tools_reverse :: proc(a, b: string, user: rawptr) -> int {
+	return a < b ? 1 : a > b ? -1 : 0
+}
+
 // tools_fails runs a statement that must fail with `message`.
 @(private = "file")
 tools_fails :: proc(t: ^testing.T, conn: ^db.Embed_Conn, sql: string, message: string) {
 	err := db.embed_exec(conn, sql)
 	defer db.error_free(&err)
 	testing.expectf(t, err.message == message, "%s: got %q, want %q", sql, err.message, message)
+}
+
+// An index the engine cannot build from a file (its collation, or its
+// function, is the program's that wrote the file) used to be built without
+// its WHERE, or left out: a partial UNIQUE index made whole refused rows
+// SQLite accepts, and the next rewrite dropped the other from the user's file.
+// It is kept as the file has it now, and its table refuses writes, as SQLite
+// does without the collation, until the program registers it (D24).
+@(test)
+test_an_index_the_engine_cannot_build_is_kept :: proc(t: ^testing.T) {
+	path := "_test_tools_kept_index.sqlite"
+	os.remove(path)
+	defer os.remove(path)
+	_ = os.write_entire_file(path, []u8{})
+	{
+		a, a_err := db.embed_open(path)
+		if !testing.expectf(t, db.error_ok(a_err), "open: %s", a_err.message) do return
+		testing.expect(t, db.error_ok(db.store_register_collation(a.store, "rev", tools_reverse)))
+		tools_ok(t, a, "CREATE TABLE t (a INTEGER, b TEXT)")
+		tools_ok(t, a, "INSERT INTO t VALUES (1, 'x'), (1, 'y'), (2, 'z')")
+		tools_ok(t, a, "CREATE INDEX i ON t (b COLLATE rev)")
+		tools_ok(t, a, "CREATE UNIQUE INDEX pu ON t (a) WHERE b COLLATE rev = 'x'")
+		tools_ok(t, a, "CREATE TABLE u (x)")
+		db.embed_close(a)
+	}
+	b, b_err := db.embed_open(path)
+	if !testing.expectf(t, db.error_ok(b_err), "open: %s", b_err.message) do return
+	defer db.embed_close(b)
+	testing.expect_value(t, b.store.mirror_kept_indexes, 2)
+	kept, found := db.store_mirror_kept_index(b.store, "pu")
+	testing.expect(t, found && kept.reason == "no such collation sequence: rev", "pu is kept with its reason")
+	// Reads answer from the rows; writes to t wait for the collation.
+	tools_expect(t, b, "SELECT a, b FROM t ORDER BY rowid", "1|x 1|y 2|z")
+	tools_fails(t, b, "INSERT INTO t VALUES (3, 'w')", "no such collation sequence: rev")
+	tools_fails(t, b, "DELETE FROM t", "no such collation sequence: rev")
+	// Another table is written, and a rewrite of the whole file (DDL) keeps
+	// both indexes, with the entries their rows imply.
+	tools_ok(t, b, "INSERT INTO u VALUES (1)")
+	tools_ok(t, b, "CREATE INDEX ux ON u (x)")
+	ok, reason := db.sqlite_mirror_validate(path, context.temp_allocator)
+	testing.expectf(t, ok, "the file is malformed: %s", reason)
+	tools_expect(t, b, "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 't' ORDER BY name", "i pu")
+	tools_expect(t, b, "SELECT sql FROM sqlite_master WHERE name = 'pu'", "CREATE UNIQUE INDEX pu ON t (a) WHERE b COLLATE rev = 'x'")
+	// With the collation registered the indexes are built and t is written as
+	// SQLite writes it: the partial index takes the second a = 1 that is not 'x',
+	// and refuses one that is.
+	testing.expect(t, db.error_ok(db.store_register_collation(b.store, "rev", tools_reverse)))
+	tools_ok(t, b, "INSERT INTO t VALUES (1, 'q')")
+	tools_fails(t, b, "INSERT INTO t VALUES (1, 'x')", "UNIQUE constraint failed: t.a")
+	testing.expect_value(t, b.store.mirror_kept_indexes, 0)
+	ok, reason = db.sqlite_mirror_validate(path, context.temp_allocator)
+	testing.expectf(t, ok, "the file is malformed: %s", reason)
 }
 
 // An index ordered by a collation nobody registered was accepted and written
