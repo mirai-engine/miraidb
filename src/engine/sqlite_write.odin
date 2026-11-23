@@ -476,8 +476,12 @@ sqlite_write_index_tree :: proc(
 	suffix := make([dynamic]int, 0, 4, alloc)
 	defer delete(suffix)
 	if table.schema.without_rowid {
+		// A key column the index already holds as a column is not repeated, in
+		// a partial or expression index too: SQLite writes (a, b) where the
+		// entry was (a, a, b), and found the row missing from the index. One an
+		// expression reads is still appended (its part is NO_COLUMN).
 		for column in table.schema.primary_key {
-			if !plain || !slice.contains(index.columns[:], column) do append(&suffix, column)
+			if !slice.contains(index.columns[:], column) do append(&suffix, column)
 		}
 	}
 	width := len(index.columns) + (table.schema.without_rowid ? len(suffix) : 1)

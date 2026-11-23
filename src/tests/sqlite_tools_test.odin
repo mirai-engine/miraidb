@@ -881,3 +881,40 @@ test_an_index_expression_needs_its_columns :: proc(t: ^testing.T) {
 	tools_fails(t, conn, "CREATE INDEX p ON t (a) WHERE y > 1", "no such column: y")
 	tools_ok(t, conn, "CREATE INDEX r ON t (a) WHERE rowid > 1")
 }
+
+// A partial or expression index of a WITHOUT ROWID table repeated in each
+// entry the key columns it already holds, (a, a, b) where SQLite writes (a, b),
+// and SQLite found every row missing from it.
+@(test)
+test_a_without_rowid_index_holds_each_key_column_once :: proc(t: ^testing.T) {
+	path := "_test_tools_without_rowid_index.sqlite"
+	os.remove(path)
+	defer os.remove(path)
+	_ = os.write_entire_file(path, []u8{})
+	{
+		conn, err := db.embed_open(path)
+		if !testing.expectf(t, db.error_ok(err), "open: %s", err.message) do return
+		defer db.embed_close(conn)
+		tools_ok(t, conn, "CREATE TABLE w (a INTEGER NOT NULL, b TEXT NOT NULL, c, PRIMARY KEY (a, b)) WITHOUT ROWID")
+		tools_ok(t, conn, "CREATE INDEX partial ON w (a) WHERE a > 13")
+		tools_ok(t, conn, "CREATE INDEX expression ON w (a, lower(b))")
+		tools_ok(t, conn, "INSERT INTO w VALUES (20, 'X', 1)")
+	}
+	file, err := db.sqlite_file_open(path)
+	if !testing.expectf(t, db.error_ok(err), "read: %s", err.message) do return
+	defer db.sqlite_file_destroy(&file)
+	for tree in file.index_trees {
+		// The partial index holds a, then b; the expression index a and
+		// lower(b), then b, which only its expression reads.
+		want := tree.name == "partial" ? 2 : tree.name == "expression" ? 3 : 0
+		if want == 0 do continue
+		payloads, read := db.sqlite_index_payloads(&file, tree.root)
+		testing.expect(t, read && len(payloads) == 1, "one entry")
+		for payload in payloads {
+			values, ok := db.sqlite_record(payload, context.temp_allocator)
+			testing.expectf(t, ok && len(values) == want, "%s: %d values, want %d", tree.name, len(values), want)
+			delete(payload)
+		}
+		delete(payloads)
+	}
+}
