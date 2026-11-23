@@ -134,15 +134,8 @@ class Model:
         columns = self.tables[table]
         if r < 0.62:
             verb = self.rng.choice(["INSERT", "INSERT", "INSERT OR REPLACE", "INSERT OR IGNORE"])
-            # Under OR IGNORE SQLite keeps or takes back the rows before a
-            # datatype mismatch as its statement journal decides; the engine
-            # takes them back. An INTEGER PRIMARY KEY gets integers there.
-            def cell(column: str) -> str:
-                if column == "k" and verb == "INSERT OR IGNORE":
-                    return self.rng.choice(["NULL", str(self.rng.randint(-5, 60))])
-                return self.value()
             rows = ", ".join(
-                "(" + ", ".join(cell(column) for column in columns) + ")"
+                "(" + ", ".join(self.value() for _ in columns) + ")"
                 for _ in range(self.rng.choice([1, 1, 2, 5]))
             )
             return f"{verb} INTO {table} ({', '.join(columns)}) VALUES {rows}"

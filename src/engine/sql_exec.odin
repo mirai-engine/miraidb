@@ -282,6 +282,43 @@ statement_fails_partially :: proc(statement: Statement) -> bool {
 	return false
 }
 
+// insert_without_statement_journal reports an INSERT SQLite runs without a
+// journal of its own, which an error inside a transaction the program opened
+// does not take back: the rows before the failing one stay, as under OR FAIL.
+// SQLite journals a statement that writes more than one row only when
+// something in it may abort (vdbeaux.c, usesStmtJournal): a constraint whose
+// resolution is ABORT, a function call, a trigger, a foreign key. OR IGNORE and
+// OR REPLACE over a VALUES list of plain values have none, so a datatype
+// mismatch in their third row keeps the first two. They were taken back.
+@(private)
+insert_without_statement_journal :: proc(tx: ^Tx, statement: Statement) -> bool {
+	insert, is_insert := statement.(Insert_Stmt)
+	if !is_insert || !insert.conflict_explicit || !(insert.conflict_ignore || insert.conflict_replace) do return false
+	if insert.has_select || len(insert.rows) < 2 do return false
+	table := tx_table_probe(tx, insert.table)
+	if table == nil do return false
+	if !tx.store.foreign_keys_off && len(table.schema.foreign_keys) > 0 do return false
+	if insert.conflict_replace {
+		// REPLACE on a NOT NULL column with no default aborts; NULL for the
+		// INTEGER PRIMARY KEY is a new rowid instead.
+		alias, _ := rowid_alias_column(&table.schema)
+		for column, i in table.schema.columns do if i != alias && column.not_null && !column.has_default do return false
+	}
+	for trigger in tx_triggers(tx, context.temp_allocator) {
+		if strings.equal_fold(trigger.table, insert.table) do return false
+	}
+	calls := false
+	for row in insert.rows {
+		for expr in row {
+			expr_walk(expr, proc(node: ^Expr, user: rawptr) -> bool {
+				if _, is_call := node^.(Call_Expr); is_call do (^bool)(user)^ = true
+				return true
+			}, &calls)
+		}
+	}
+	return !calls
+}
+
 // conflict_skippable reports the failures INSERT OR IGNORE and OR FAIL act on:
 // the constraints a row breaks by itself, checked before anything is staged.
 @(private)
@@ -309,7 +346,8 @@ sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value) 
 		mark := tx_statement_begin(tx)
 		tx.keep_partial = false
 		result, err := sql_exec_mutation(tx, stmt, params)
-		tx_statement_end(tx, mark, err.kind != .None && !statement_fails_partially(stmt) && !tx.keep_partial)
+		keeps := err.kind != .None && insert_without_statement_journal(tx, stmt)
+		tx_statement_end(tx, mark, err.kind != .None && !statement_fails_partially(stmt) && !tx.keep_partial && !keeps)
 		tx.keep_partial = false
 		// OR ROLLBACK: a broken constraint ends the whole transaction, which the
 		// connection that holds it rolls back (embed_run).

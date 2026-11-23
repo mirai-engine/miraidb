@@ -936,3 +936,24 @@ test_a_dropped_unique_index_holds_nothing :: proc(t: ^testing.T) {
 	tools_ok(t, conn, "COMMIT")
 	tools_expect(t, conn, "SELECT count(*) FROM t WHERE a = 1", "2")
 }
+
+// SQLite journals a statement that writes several rows only when something in
+// it may abort it: an INSERT OR IGNORE or OR REPLACE over plain values has
+// none, so inside a transaction an error (a datatype mismatch) leaves the rows
+// before it. With a function call, or on its own, the statement is taken back.
+@(test)
+test_an_insert_without_a_statement_journal_keeps_its_rows :: proc(t: ^testing.T) {
+	store := tools_store(t)
+	defer db.store_close(store)
+	conn := db.embed_wrap(store)
+	defer db.embed_close(conn)
+	tools_ok(t, conn, "CREATE TABLE t (k INTEGER PRIMARY KEY, a)")
+	tools_ok(t, conn, "BEGIN")
+	tools_fails(t, conn, "INSERT OR IGNORE INTO t VALUES (4, 'a'), ('x', 'b')", "datatype mismatch")
+	tools_fails(t, conn, "INSERT OR REPLACE INTO t VALUES (5, 'a'), ('x', 'b')", "datatype mismatch")
+	tools_fails(t, conn, "INSERT OR IGNORE INTO t VALUES (6, zeroblob(2)), ('x', 'b')", "datatype mismatch")
+	tools_fails(t, conn, "INSERT INTO t VALUES (9, 'a'), ('x', 'b')", "datatype mismatch")
+	tools_ok(t, conn, "COMMIT")
+	tools_fails(t, conn, "INSERT OR IGNORE INTO t VALUES (7, 'a'), ('x', 'b')", "datatype mismatch")
+	tools_expect(t, conn, "SELECT k FROM t ORDER BY k", "4 5")
+}
