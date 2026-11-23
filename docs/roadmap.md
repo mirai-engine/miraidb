@@ -38,7 +38,7 @@ that way.
 |---|---|---|---|---|
 | 15 | **D4 — secondary indexes in the mirror** | A table with a secondary index re-encodes the `.sqlite` file per commit. | L | — |
 | 16 | **D36 — partial and expression indexes in plans** | The planner skips them; match a predicate to a partial index's WHERE and an expression to its index. | M | 8 |
-| 17 | **D24 — the mirror's last gaps** | The fuzz against SQLite (`scripts/mirror_fuzz.py`) still finds four wrong answers: `INSERT OR REPLACE` before affinity, ALTER in the creating transaction, a UNIQUE expression index, integer against real past 2^53; then it becomes a gate. | M | — |
+| 17 | **D24 — the mirror's last gaps** | The fuzz against SQLite (`scripts/mirror_fuzz.py`) passes 16 of 20 seeds; reduce and fix the other four, then make it a gate. | M | — |
 | 32 | **D37 — catching up with a shared file** | Five processes on one file run `multiwrite01` in a median 1.4× SQLite's time; reuse the parsed schema, explain the stalls, time it in CI. | S | — |
 | 33 | **S8 — the rest of the C API** | 233 of SQLite's 309 functions are exported; 76 are left. | M | — |
 | 34 | **D39 — PostgreSQL's surface** | A probe gate for the dialect, the catalog drivers and ORMs read, PostgreSQL's spelling of grants and policies. | L | — |
