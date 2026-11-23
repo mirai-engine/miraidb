@@ -481,6 +481,9 @@ def at_15_digits(value: object) -> object:
 
 if __name__ == "__main__":
     path = sys.argv[1] if len(sys.argv) > 1 else os.path.join("bin", "sqlite3_miraidb.dll")
+    if not os.path.isfile(path):
+        print(f"no facade library at {path}: build it with `python scripts/build.py`, or pass its path")
+        raise SystemExit(2)
     differences = compare(path)
     for line in differences:
         print(line)
