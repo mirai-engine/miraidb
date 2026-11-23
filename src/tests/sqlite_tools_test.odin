@@ -580,6 +580,25 @@ test_an_index_calls_a_program_s_function :: proc(t: ^testing.T) {
 	testing.expectf(t, ok, "the file is malformed: %s", reason)
 }
 
+// SQLite's INTEGER PRIMARY KEY is the rowid: a value its affinity cannot make
+// an integer is "datatype mismatch", where another INTEGER column keeps it. A
+// real key was kept and reached the file as a rowid nobody wrote.
+@(test)
+test_an_integer_primary_key_takes_only_integers :: proc(t: ^testing.T) {
+	store := tools_store(t)
+	defer db.store_close(store)
+	conn := db.embed_wrap(store)
+	defer db.embed_close(conn)
+	tools_ok(t, conn, "CREATE TABLE t (k INTEGER PRIMARY KEY, a INTEGER)")
+	tools_ok(t, conn, "INSERT INTO t VALUES (2.0, 1), ('7', 1), (' 8 ', 1), (NULL, 1)")
+	tools_ok(t, conn, "INSERT INTO t VALUES (1, -1.838), (3, 'x')")
+	for value in ([]string{"-1.838", "'x'", "x'01'", "9.3e18"}) {
+		tools_fails(t, conn, strings.concatenate({"INSERT INTO t VALUES (", value, ", 1)"}, context.temp_allocator), "datatype mismatch")
+	}
+	tools_fails(t, conn, "UPDATE t SET k = 3.5 WHERE k = 2", "datatype mismatch")
+	tools_expect(t, conn, "SELECT k, typeof(a) FROM t ORDER BY k", "1|real 2|integer 3|text 7|integer 8|integer 9|integer")
+}
+
 // An omitted INTEGER PRIMARY KEY is one past the largest key, as SQLite gives
 // it: after -5 comes -4, and 1 only in a table without one. The engine started
 // at 1 whatever the table held.

@@ -1453,6 +1453,12 @@ tx_insert_row :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error)
 		}
 		coerced, coerce_err := value_coerce_into(v, &table.schema, i)
 		if coerce_err.kind != .None do return 0, coerce_err
+		// SQLite's INTEGER PRIMARY KEY is the rowid: what its affinity cannot
+		// make an integer is refused, where another INTEGER column keeps it (a
+		// real key used to reach the file as a rowid nobody wrote).
+		if i == pk_position && coerced.kind != .Int && coerced.kind != .Uint && coerced.kind != .Null {
+			return 0, errf(.Invalid_Type, "datatype mismatch")
+		}
 		if coerced.kind == .Null && column.not_null {
 			return 0, errf(.Not_Null_Violation, "NOT NULL constraint failed: %s.%s", name, column.name)
 		}
@@ -1589,6 +1595,9 @@ tx_update_row :: proc(tx: ^Tx, name: string, id: Row_Id, values: []Value) -> Err
 		}
 		coerced, coerce_err := value_coerce_into(v, &table.schema, i)
 		if coerce_err.kind != .None do return coerce_err
+		if i == pk_position && coerced.kind != .Int && coerced.kind != .Uint && coerced.kind != .Null {
+			return errf(.Invalid_Type, "datatype mismatch")
+		}
 		if coerced.kind == .Null && column.not_null {
 			return errf(.Not_Null_Violation, "NOT NULL constraint failed: %s.%s", name, column.name)
 		}
