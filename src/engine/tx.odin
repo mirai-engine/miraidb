@@ -758,6 +758,56 @@ tx_paged_alter_guard :: proc(tx: ^Tx, name: string) -> Error {
 	return ERROR_NONE
 }
 
+// tx_reshape_staged gives the rows a transaction staged for `name` the shape
+// of `next_schema`.
+@(private)
+tx_reshape_staged :: proc(tx: ^Tx, name: string, current: ^Table_Schema, next_schema: Table_Schema) -> Error {
+	writes, has_writes := tx.state.writes[name]
+	if !has_writes do return ERROR_NONE
+	for _, &row in writes.inserts {
+		values, convert_err := alter_row_values(current, next_schema, row.values, tx.alloc)
+		if convert_err.kind != .None do return convert_err
+		row.values = values
+	}
+	for _, &values in writes.updates {
+		converted, convert_err := alter_row_values(current, next_schema, values, tx.alloc)
+		if convert_err.kind != .None do return convert_err
+		values = converted
+	}
+	return ERROR_NONE
+}
+
+// tx_alter_created alters a table this transaction created: the created table
+// is replaced by one of the new shape, which the commit creates as it is. It
+// was refused, where SQLite runs it.
+@(private)
+tx_alter_created :: proc(tx: ^Tx, name: string, created: ^Table, next_schema: Table_Schema) -> Error {
+	schema := next_schema
+	replacement, create_err := table_create(&schema)
+	if create_err.kind != .None do return create_err
+	for row in created.rows {
+		if row.deleted_seq != 0 do continue
+		values, convert_err := alter_row_values(&created.schema, next_schema, row.values, tx.alloc)
+		if convert_err.kind == .None do convert_err = table_insert(replacement, row.id, values)
+		if convert_err.kind != .None {
+			table_destroy(replacement)
+			return convert_err
+		}
+	}
+	replacement.next_row_id = created.next_row_id
+	replacement.next_sequence = created.next_sequence
+	if reshape_err := tx_reshape_staged(tx, name, &created.schema, next_schema); reshape_err.kind != .None {
+		table_destroy(replacement)
+		return reshape_err
+	}
+	// The map's key is the created table's own name: erase before re-keying, and
+	// free the old table with the transaction (its writes may name it).
+	map_erase(&tx.state.created, name)
+	tx.state.created[replacement.schema.name] = replacement
+	append(&tx.replaced, created)
+	return ERROR_NONE
+}
+
 // tx_alter_table stages a schema change. The replacement table already carries
 // the extra columns for every existing row, so the commit only records the
 // schema and the store rebuilds the same way on replay.
@@ -768,8 +818,13 @@ tx_alter_table :: proc(tx: ^Tx, name: string, next_schema: Table_Schema) -> Erro
 		if kept_err := tx_kept_index_refusal(tx, name); kept_err.kind != .None do return kept_err
 	}
 	if guard_err := tx_paged_alter_guard(tx, name); guard_err.kind != .None do return guard_err
-	if _, created := tx.state.created[name]; created {
-		return errf(.Sql_Unsupported, "alter a table outside the transaction that created it")
+	if created, is_created := tx.state.created[name]; is_created {
+		// A savepoint keeps the created table it saw: replacing it under one
+		// would leave the savepoint naming a table this one frees.
+		if len(tx.savepoints) > 0 {
+			return errf(.Sql_Unsupported, "alter a table created in this transaction under a savepoint")
+		}
+		return tx_alter_created(tx, name, created, next_schema)
 	}
 	current, current_err := tx_table(tx, name)
 	if current_err.kind != .None do return current_err
@@ -791,18 +846,7 @@ tx_alter_table :: proc(tx: ^Tx, name: string, next_schema: Table_Schema) -> Erro
 	// The rows this transaction staged take the new shape too: they kept the old
 	// one, read NULL for an added column instead of its DEFAULT, and an UPDATE of
 	// one indexed past its values.
-	if writes, has_writes := tx.state.writes[name]; has_writes {
-		for _, &row in writes.inserts {
-			values, convert_err := alter_row_values(&current.schema, next_schema, row.values, tx.alloc)
-			if convert_err.kind != .None do return convert_err
-			row.values = values
-		}
-		for _, &values in writes.updates {
-			converted, convert_err := alter_row_values(&current.schema, next_schema, values, tx.alloc)
-			if convert_err.kind != .None do return convert_err
-			values = converted
-		}
-	}
+	if reshape_err := tx_reshape_staged(tx, name, &current.schema, next_schema); reshape_err.kind != .None do return reshape_err
 	replacement.next_row_id = current.next_row_id
 	replacement.next_sequence = current.next_sequence
 	tx.state.altered[strings.clone(name, tx.alloc)] = replacement

@@ -790,3 +790,26 @@ test_a_replace_looks_up_the_value_as_stored :: proc(t: ^testing.T) {
 	tools_ok(t, conn, "INSERT OR REPLACE INTO n VALUES (5.0, 2)")
 	tools_expect(t, conn, "SELECT k, typeof(k), v FROM n", "5|integer|2")
 }
+
+// ALTER of a table created in the same transaction was refused; SQLite runs
+// it, and the commit creates the table in its new shape.
+@(test)
+test_alter_runs_in_the_transaction_that_created_the_table :: proc(t: ^testing.T) {
+	store := tools_store(t)
+	defer db.store_close(store)
+	conn := db.embed_wrap(store)
+	defer db.embed_close(conn)
+	tools_ok(t, conn, "BEGIN")
+	tools_ok(t, conn, "CREATE TABLE t (k INTEGER PRIMARY KEY, a)")
+	tools_ok(t, conn, "INSERT INTO t VALUES (1, 'x')")
+	tools_ok(t, conn, "ALTER TABLE t ADD COLUMN b INTEGER DEFAULT 4")
+	tools_ok(t, conn, "INSERT INTO t (a) VALUES ('y')")
+	tools_ok(t, conn, "UPDATE t SET b = 5 WHERE k = 1")
+	tools_ok(t, conn, "COMMIT")
+	tools_expect(t, conn, "SELECT k, a, b FROM t ORDER BY k", "1|x|5 2|y|4")
+	tools_ok(t, conn, "BEGIN")
+	tools_ok(t, conn, "CREATE TABLE u (a)")
+	tools_ok(t, conn, "ALTER TABLE u ADD COLUMN b DEFAULT 2")
+	tools_ok(t, conn, "ROLLBACK")
+	tools_expect(t, conn, "SELECT count(*) FROM sqlite_master WHERE name = 'u'", "0")
+}
