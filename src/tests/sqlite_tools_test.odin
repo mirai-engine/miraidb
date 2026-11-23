@@ -769,3 +769,24 @@ test_numbers_share_one_key_space :: proc(t: ^testing.T) {
 	tools_ok(t, conn, "INSERT INTO u VALUES (5)")
 	tools_fails(t, conn, "INSERT INTO u VALUES (5.0)", "UNIQUE constraint failed: u.k")
 }
+
+// INSERT OR REPLACE and UPSERT looked for the row they collide with by the
+// value as written, before the column's affinity: `22` into a TEXT key missed
+// the `'22'` it should replace, and the insert failed on it.
+@(test)
+test_a_replace_looks_up_the_value_as_stored :: proc(t: ^testing.T) {
+	store := tools_store(t)
+	defer db.store_close(store)
+	conn := db.embed_wrap(store)
+	defer db.embed_close(conn)
+	tools_ok(t, conn, "CREATE TABLE t (s TEXT PRIMARY KEY, a)")
+	tools_ok(t, conn, "INSERT INTO t VALUES (22, 1), ('x', 2)")
+	tools_ok(t, conn, "INSERT OR REPLACE INTO t VALUES (22, 9)")
+	tools_expect(t, conn, "SELECT s, typeof(s), a FROM t ORDER BY s", "22|text|9 x|text|2")
+	tools_ok(t, conn, "INSERT INTO t VALUES (22, 5) ON CONFLICT (s) DO UPDATE SET a = 7")
+	tools_expect(t, conn, "SELECT a FROM t WHERE s = '22'", "7")
+	tools_ok(t, conn, "CREATE TABLE n (k INTEGER UNIQUE, v)")
+	tools_ok(t, conn, "INSERT INTO n VALUES ('5', 1)")
+	tools_ok(t, conn, "INSERT OR REPLACE INTO n VALUES (5.0, 2)")
+	tools_expect(t, conn, "SELECT k, typeof(k), v FROM n", "5|integer|2")
+}

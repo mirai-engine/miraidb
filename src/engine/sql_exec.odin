@@ -8103,7 +8103,18 @@ row_with_defaults :: proc(tx: ^Tx, table: ^Table, values: []Value) -> []Value {
 	out := make([]Value, len(values), tx.alloc)
 	for value, i in values {
 		out[i] = value
-		if value.kind != .Default || i >= len(table.schema.columns) do continue
+		if i >= len(table.schema.columns) do continue
+		if value.kind != .Default {
+			// A supplied value is looked up as the column stores it, after its
+			// affinity: `22` into a TEXT key is the `'22'` a REPLACE replaces.
+			if value.kind == .Null do continue
+			if coerced, coerce_err := value_coerce_into(value, &table.schema, i); coerce_err.kind == .None {
+				out[i] = coerced
+			} else {
+				error_free(&coerce_err)
+			}
+			continue
+		}
 		column := table.schema.columns[i]
 		filled, fill_err := column_default_for_row(tx, column)
 		if fill_err.kind != .None {
@@ -8437,7 +8448,7 @@ sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Res
 		}
 		if insert_err.kind != .None {
 			// UPSERT: a collision on the target columns is not an error.
-			conflict, found := find_conflict_row(tx, stmt.table, table, values)
+			conflict, found := find_conflict_row(tx, stmt.table, table, row_with_defaults(tx, table, values))
 			if !found do return {}, insert_err
 			if stmt.conflict_do_nothing {
 				error_free(&insert_err)
