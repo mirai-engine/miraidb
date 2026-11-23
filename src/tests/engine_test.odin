@@ -15668,4 +15668,26 @@ test_a_prune_visits_only_the_rows_a_commit_touched :: proc(t: ^testing.T) {
 	small = store.tables["small"]
 	testing.expect_value(t, len(small.history), 0)
 	testing.expect_value(t, versions_of(small), 0)
+
+	// A read transaction shares the tables it reads and scans them without the
+	// store's lock: a prune leaves a shared table alone, so its rows never move
+	// under the reader, and the next prune after the reader is done drops it.
+	run_done(t, store, "UPDATE small SET v = 11 WHERE v = 10")
+	reader := db.tx_begin_read(store)
+	db.store_prune_history(store)
+	small = store.tables["small"]
+	testing.expect_value(t, len(small.history), 1)
+	testing.expect_value(t, versions_of(small), 1)
+	seen, seen_err := db.sql_execute_in_tx(reader, "SELECT v FROM small ORDER BY rowid")
+	if testing.expectf(t, db.error_ok(seen_err), "read failed: %s", seen_err.message) {
+		testing.expect_value(t, len(seen.rows), 2)
+		if len(seen.rows) == 2 do testing.expect_value(t, seen.rows[1][0].i, 11)
+		db.sql_result_destroy(&seen)
+	}
+	db.error_free(&seen_err)
+	db.tx_end(reader)
+	db.store_prune_history(store)
+	small = store.tables["small"]
+	testing.expect_value(t, len(small.history), 0)
+	testing.expect_value(t, versions_of(small), 0)
 }

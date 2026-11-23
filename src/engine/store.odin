@@ -1825,9 +1825,18 @@ store_work_used :: proc(store: ^Store) -> u64 {
 store_prune_versions :: proc(store: ^Store, before_seq: u64) {
 	sync.lock(&store.mutex)
 	defer sync.unlock(&store.mutex)
-	for _, table in store.tables {
-		table_prune_versions(table, before_seq)
-	}
+	for _, table in store.tables do store_prune_table(table, before_seq)
+}
+
+// store_prune_table prunes a table only the store holds. A read transaction
+// shares the tables it reads and scans them without the store's lock, so a
+// prune that compacted one of those under it would move rows mid-scan; the
+// history it keeps goes with the next prune after the reader is done, or with
+// the copy a commit to that table makes (table_cow_clone).
+@(private)
+store_prune_table :: proc(table: ^Table, before_seq: u64) {
+	if sync.atomic_load(&table.refs) > 1 do return
+	table_prune_versions(table, before_seq)
 }
 
 // store_pin_read records a read pinned to `seq`; store_unpin_read drops it. The
@@ -1853,15 +1862,23 @@ store_unpin_read :: proc(store: ^Store, seq: u64) {
 
 // store_prune_history drops the row versions and tombstones nothing can ask for any
 // more. A pinned read holds the store's shared lock for its whole life and may need
-// any version it can still see, so a prune while one is alive does nothing: taking
-// the exclusive lock here would wait for the pin to end, and the caller asked to
-// keep that read's history, not to wait for it.
+// any version it can still see, so a prune while one is alive does nothing: it only
+// tries the exclusive lock, which a live pin holds shared, and waiting for it would
+// wait for the pin to end, where the caller asked to keep that read's history. A
+// prune that finds the lock taken by anyone else does nothing either; the next one
+// drops what this one left.
+//
+// The pins are read under the lock: a pin is announced under it, before its read
+// takes the shared lock, so a pin announced but not yet reading is seen here. Read
+// before the lock, a pin could land between the check and the prune and lose the
+// history it pinned. A pin to a sequence older than the last prune finds that
+// history gone whatever the order; that is the contract of a caller that prunes.
 store_prune_history :: proc(store: ^Store) {
 	if store == nil do return
+	if !sync.rw_mutex_try_lock(&store.mutex) do return
+	defer sync.unlock(&store.mutex)
 	if len(store.pinned_reads) > 0 do return
-	sync.lock(&store.mutex)
-	for _, table in store.tables do table_prune_versions(table, store.commit_seq)
-	sync.unlock(&store.mutex)
+	for _, table in store.tables do store_prune_table(table, store.commit_seq)
 }
 
 // store_rows_scanned is how many rows scans visited since the last reset.
