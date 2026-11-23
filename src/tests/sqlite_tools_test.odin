@@ -918,3 +918,21 @@ test_a_without_rowid_index_holds_each_key_column_once :: proc(t: ^testing.T) {
 		delete(payloads)
 	}
 }
+
+// A UNIQUE index dropped in a transaction still refused the rows written after
+// the DROP in the same transaction.
+@(test)
+test_a_dropped_unique_index_holds_nothing :: proc(t: ^testing.T) {
+	store := tools_store(t)
+	defer db.store_close(store)
+	conn := db.embed_wrap(store)
+	defer db.embed_close(conn)
+	tools_ok(t, conn, "CREATE TABLE t (a, b)")
+	tools_ok(t, conn, "CREATE UNIQUE INDEX i ON t (a)")
+	tools_ok(t, conn, "INSERT INTO t VALUES (1, 'x')")
+	tools_ok(t, conn, "BEGIN")
+	tools_ok(t, conn, "DROP INDEX i")
+	tools_ok(t, conn, "INSERT INTO t VALUES (1, 'y')")
+	tools_ok(t, conn, "COMMIT")
+	tools_expect(t, conn, "SELECT count(*) FROM t WHERE a = 1", "2")
+}

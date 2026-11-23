@@ -1933,6 +1933,9 @@ tx_check_unique :: proc(
 	writes := tx.state.writes[name]
 	for idx, i in table.indexes {
 		if !idx.unique do continue
+		// An index this transaction dropped holds nothing to its rows: the rows
+		// after `DROP INDEX` were refused by the index they had just dropped.
+		if len(tx.state.index_ops) > 0 && tx_index_dropped(tx, name, idx.schema.name) do continue
 		// A row outside a partial index is not constrained by it, and a key with a
 		// NULL constrains nothing.
 		if !index_row_included(table, i, values) do continue
@@ -1961,6 +1964,17 @@ tx_check_unique :: proc(
 	}
 	if len(tx.state.index_ops) > 0 do return tx_staged_unique_check(tx, name, table, values, ignore)
 	return ERROR_NONE
+}
+
+// tx_index_dropped reports whether the transaction's last word on an index of
+// `table` is a DROP.
+@(private)
+tx_index_dropped :: proc(tx: ^Tx, table: string, index: string) -> bool {
+	dropped := false
+	for op in tx.state.index_ops {
+		if strings.equal_fold(op.table, table) && strings.equal_fold(op.index.name, index) do dropped = op.drop
+	}
+	return dropped
 }
 
 // tx_staged_unique_check holds a row to the UNIQUE indexes this transaction
