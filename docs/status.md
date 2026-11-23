@@ -146,7 +146,7 @@ the gaps are named rather than left to be discovered.
   returns a real where SQLite returns an integer is a difference (the second
   audit pass measured both defects, `AUDIT-10` P-B4/P-B5). `--json` keeps the
   `.0` on a real, so the type survives even before the comparison sees it.
-- `scripts/build.py` builds both binaries and runs the suite.
+- `scripts/build.py` builds both binaries and the shared libraries with `-o:speed` (what CI times and `scripts/package.py` ships) and runs the suite.
 - Every package passes `odin check` for `windows_amd64`, `linux_amd64`,
   `linux_arm64` and `darwin_arm64`. The POSIX lock is the reason it is checked:
   it carried a missing `core:sys/posix` import and two wrong integer types until

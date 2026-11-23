@@ -30,14 +30,20 @@ def main() -> int:
     # which also matters when Odin runs through WSL interop.
     suffix = ".exe" if os.name == "nt" or odin.lower().endswith(".exe") else ""
     os.makedirs(os.path.join(ROOT, BIN), exist_ok=True)
-    run(odin, "build", "src/cli", f"-out:bin/miraidb{suffix}")
-    run(odin, "build", "examples/todo", f"-out:bin/todo{suffix}")
-    run(odin, "build", "src/server", f"-out:bin/miraidb-server{suffix}")
+    # What this builds is what CI measures and scripts/package.py ships, so it is
+    # built optimized. Without -o:speed SQLite's multi-process mptest took 8.1-8.6 s
+    # on the facade against 3.7-4.1 s with it (SQLite: 2.3-2.5 s); every gate that
+    # times a binary measured the unoptimized one. The suite keeps the default
+    # build: it is where the bounds checks and the tracking allocator matter.
+    speed = "-o:speed"
+    run(odin, "build", "src/cli", speed, f"-out:bin/miraidb{suffix}")
+    run(odin, "build", "examples/todo", speed, f"-out:bin/todo{suffix}")
+    run(odin, "build", "src/server", speed, f"-out:bin/miraidb-server{suffix}")
     # Shared libraries carry a fixed extension on every platform the consumers
     # expect, so a Windows build always produces .dll.
     library = ".dll" if odin.lower().endswith(".exe") or os.name == "nt" else ".so"
-    run(odin, "build", "src/capi", "-build-mode:dll", f"-out:bin/miraidb{library}")
-    run(odin, "build", "src/sqlite_compat", "-build-mode:dll", f"-out:bin/sqlite3_miraidb{library}")
+    run(odin, "build", "src/capi", "-build-mode:dll", speed, f"-out:bin/miraidb{library}")
+    run(odin, "build", "src/sqlite_compat", "-build-mode:dll", speed, f"-out:bin/sqlite3_miraidb{library}")
     run(odin, "test", "src/tests")
     return 0
 
