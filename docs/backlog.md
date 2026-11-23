@@ -48,7 +48,7 @@ Rules for this file:
 | D16 | a hand-written Python binding | bindings generated from the catalog, more languages | M |
 | D18 | a read-only open replays | a reader that trusts the pages of a quiescent writer | M |
 | D23 | depth, row quota and budget are bounded | an allocation failure is a crash, not an error | M |
-| D24 | an index the engine cannot express is dropped on import | a counted skip, and a mirror fuzz pass | S |
+| D24 | `scripts/mirror_fuzz.py` against SQLite finds four more wrong files or answers (ALTER, a DESC index, a crash) | fix them and make the fuzz a gate | M |
 | D34 | the threaded suite is green on Linux and Windows; the sanitizer covers the Windows CLI, not the suite | run the suite sanitized on every platform, in CI | S |
 | D36 | a query never reads a partial or expression index | match a query's predicate to the index | M |
 | D37 | a connection catching up with another process's commit reads the whole file and its schema | reuse the parsed schema, explain the stalls, time `multiwrite01` in CI | S |
@@ -392,12 +392,42 @@ that fails the nth allocation, the way `Fault_Vfs` fails the nth write.
 
 **Now.** DDL keeps the file valid, an imported file's indexes are recreated, and
 `scripts/sqlite_abi_smoke.py` checks integrity after `DROP`, `ALTER` and index
-DDL.
+DDL. An index the engine cannot build from the file (a collation or a function
+only the program that wrote it had) is kept as the file has it: a rewrite writes
+its entries back unchanged, `sqlite_master` lists it, `import-sqlite` reports
+it, and its table refuses writes with the reason until the program registers
+what it needs, when the index is built in the writing transaction
+(`test_an_index_the_engine_cannot_build_is_kept`). It used to be built without
+its WHERE (a partial UNIQUE index made whole refused rows SQLite accepts) or
+left out, and the next rewrite dropped it from the user's file. `CREATE INDEX`
+refuses a collation nobody registered, which it used to write in BINARY order
+(`test_an_index_needs_what_it_can_evaluate`), and an index over a program's
+function calls it, in the statement and in the commit: it answered NULL for
+every row, so a partial UNIQUE index enforced nothing
+(`test_an_index_calls_a_program_s_function`).
 
-**Left.** A schema change re-encodes the whole file; an index the engine cannot
-express (partial or over an expression, until S1) is left out of an import
-silently, which should be a counted and reported skip; and the mirror has no fuzz
-pass of its own (random DDL and DML, integrity after each chunk).
+`scripts/mirror_fuzz.py` runs a seeded stream of DDL and DML through the facade
+and through SQLite and, after each chunk, checks the facade's file with SQLite's
+`integrity_check` and compares every table and the catalog. Its first seeds
+found, each fixed with a test: a negative rowid written in nine bytes lost its
+top seven bits (`test_a_negative_rowid_reaches_the_file`); an INTEGER PRIMARY
+KEY kept a real or a text instead of failing with "datatype mismatch"
+(`test_an_integer_primary_key_takes_only_integers`); an omitted key after a
+negative one was 1, not one past it (`test_an_omitted_key_follows_a_negative_one`);
+a PRIMARY KEY of a rowid table refused NULL, which SQLite stores
+(`test_a_primary_key_takes_null_as_sqlite_s_does`); and two empty texts compared
+unequal when one had a nil pointer, so an index put them out of rowid order
+(`test_two_empty_texts_are_equal`).
+
+**Left.** What the fuzz still finds, each reduced to a few statements:
+`ALTER TABLE … ADD COLUMN` on a WITHOUT ROWID table writes a CREATE text SQLite
+cannot parse (seed 5); an `UPDATE … WHERE c < k` through a DESC index on `c`
+changes other rows than SQLite does (seed 3); after `ALTER TABLE … ADD COLUMN`
+some rows lack the column's DEFAULT, and a table whose INTEGER column holds
+text (as SQLite allows) is written so that the facade cannot open the file
+again ("cannot use a string value as BIGINT", seeds 1, 2, 4); a statement
+crashes the facade with an index out of range in `sql_exec.odin` (seed 6). The fuzz becomes a CI gate once
+its seeds pass. Besides, a schema change re-encodes the whole file.
 
 ## D34 — The Linux suite and the heap sanitizer
 
