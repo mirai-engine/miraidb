@@ -446,12 +446,48 @@ sqlite_share_hash_tree :: proc(file: ^Sqlite_File, root: u32, table: bool) -> (u
 	return ctx.hash, true
 }
 
+// sqlite_share_hash_schema hashes sqlite_master's rows without their rootpage:
+// the mirror gives a table that outgrows its page a new root, which says
+// nothing of the schema, and the mirror is built again from the file anyway.
+@(private)
+sqlite_share_hash_schema :: proc(file: ^Sqlite_File) -> (u64, bool) {
+	Ctx :: struct {
+		hash: u64,
+	}
+	ctx := Ctx{hash = 0xcbf29ce484222325}
+	mix :: proc(ctx: ^Ctx, bytes: []u8) {
+		for b in bytes {
+			ctx.hash ~= u64(b)
+			ctx.hash *= 0x100000001b3
+		}
+	}
+	visit := proc(user: rawptr, rowid: i64, payload: []u8) -> bool {
+		ctx := (^Ctx)(user)
+		values, decoded := sqlite_record(payload, context.temp_allocator)
+		if !decoded do return false
+		id := rowid
+		mix(ctx, ([^]u8)(&id)[:size_of(i64)])
+		for value, column in values {
+			if column == 3 do continue
+			kind := u8(value.kind)
+			mix(ctx, ([^]u8)(&kind)[:1])
+			text := value.kind == .String ? value.s : ""
+			length := len(text)
+			mix(ctx, ([^]u8)(&length)[:size_of(int)])
+			mix(ctx, transmute([]u8)text)
+		}
+		return true
+	}
+	if !sqlite_walk(file, 1, true, visit, &ctx, 0) do return 0, false
+	return ctx.hash, true
+}
+
 // sqlite_share_hash_file fills `out` with the hash of every table the file
 // declares, of its schema and of sqlite_sequence. A tree it cannot walk is left
 // out, and a table missing from the hashes is always reloaded.
 @(private)
 sqlite_share_hash_file :: proc(file: ^Sqlite_File, out: ^map[string]u64) {
-	if schema, ok := sqlite_share_hash_tree(file, 1, true); ok {
+	if schema, ok := sqlite_share_hash_schema(file); ok {
 		// The header's schema cookie, user_version, application_id and the
 		// rest of what a program sets (bytes 40 to 91): the change counter and
 		// the page count move with every commit and say nothing of content.

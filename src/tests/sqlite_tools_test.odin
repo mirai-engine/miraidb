@@ -434,6 +434,15 @@ test_a_connection_catches_up_table_by_table :: proc(t: ^testing.T) {
 	tools_expect(t, b, "SELECT v FROM t2", "y")
 	tools_expect(t, b, "SELECT k FROM t1", "2 3")
 	tools_expect(t, a, "SELECT v FROM t2", "y")
+	// A table that outgrows its page gets a new root page, which rewrites its
+	// row of sqlite_master: that is no schema change, and the other tables
+	// stay. Half of mptest's catch-ups read the whole file for it.
+	untouched = b.store.tables["t2"]
+	tools_ok(t, a, "INSERT INTO t1 SELECT k + 10, randomblob(1500) FROM t1")
+	tools_ok(t, a, "INSERT INTO t1 SELECT k + 20, randomblob(1500) FROM t1")
+	tools_expect(t, b, "SELECT count(*) FROM t1", "8")
+	tools_expect(t, b, "SELECT v FROM t2", "y")
+	testing.expect(t, b.store.tables["t2"] == untouched, "a new root page of t1 rebuilt t2")
 	// A schema change reads the whole file.
 	tools_ok(t, a, "CREATE TABLE t3 (z)")
 	tools_ok(t, a, "INSERT INTO t3 VALUES (9)")
