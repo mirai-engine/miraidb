@@ -313,7 +313,11 @@ index_exprs_destroy :: proc(exprs: ^Index_Exprs) {
 index_eval :: proc(t: ^Table, exprs: ^Index_Exprs, expr: ^Expr, values: []Value) -> Value {
 	sources: [1]Source
 	sources[0] = Source{table = t, row = Row{values = values}}
-	ctx := Eval_Ctx{sources = sources[:]}
+	// The program's functions are the running statement's store's (a commit
+	// keeps that scope, tx_commit): without them a call to one answered NULL
+	// for every row, its index held NULL keys, a UNIQUE one enforced nothing,
+	// and SQLite found the file's index missing every row (D24).
+	ctx := Eval_Ctx{sources = sources[:], index_store = statement_store()}
 	context.allocator = virtual.arena_allocator(&exprs.scratch)
 	value, err := eval_expr(&ctx, expr)
 	if err.kind != .None {

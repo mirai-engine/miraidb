@@ -1529,6 +1529,16 @@ Eval_Ctx :: struct {
 	// host_slots are the order key slots a host collation leaves to fill once
 	// every row is known (collations.odin).
 	host_slots: ^[dynamic]Host_Order_Slot,
+	// index_store is the store an index expression evaluated outside a
+	// transaction (index_eval) takes the program's functions from.
+	index_store: ^Store,
+}
+
+// eval_function_store is the store whose program functions a call may reach.
+@(private)
+eval_function_store :: proc(ctx: ^Eval_Ctx) -> ^Store {
+	if ctx.tx != nil do return ctx.tx.store
+	return ctx.index_store
 }
 
 // rowid_alias_name reports SQLite's three spellings of a rowid, none of which is
@@ -6682,8 +6692,8 @@ eval_call_body :: proc(ctx: ^Eval_Ctx, call: Call_Expr, args: []Value, outer: me
 	}
 	// A host function registered to override a builtin answers before it, which
 	// is how SQLite treats an application-defined function with a builtin's name.
-	if ctx.tx != nil && ctx.tx.store != nil && len(ctx.tx.store.functions) > 0 {
-		if def, found, _ := store_function(ctx.tx.store, call.name, len(args)); found && def.overrides {
+	if store := eval_function_store(ctx); store != nil && len(store.functions) > 0 {
+		if def, found, _ := store_function(store, call.name, len(args)); found && def.overrides {
 			return program_call(ctx, def.handler, args[:], def.user, outer)
 		}
 	}
@@ -7323,8 +7333,8 @@ eval_call_body :: proc(ctx: ^Eval_Ctx, call: Call_Expr, args: []Value, outer: me
 	// A host function answers last, so the builtins keep their names. The count
 	// picks the function, as in SQLite: a name registered with other counts is
 	// the caller's mistake, in SQLite's words.
-	if ctx.tx != nil && ctx.tx.store != nil {
-		def, found, named := store_function(ctx.tx.store, call.name, len(args))
+	if store := eval_function_store(ctx); store != nil {
+		def, found, named := store_function(store, call.name, len(args))
 		if found do return program_call(ctx, def.handler, args[:], def.user, outer)
 		if named do return {}, errf(.Invalid_Argument, "wrong number of arguments to function %s()", call.name)
 	}

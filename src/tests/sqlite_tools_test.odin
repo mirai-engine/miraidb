@@ -493,3 +493,32 @@ test_an_index_needs_what_it_can_evaluate :: proc(t: ^testing.T) {
 	tools_fails(t, conn, "CREATE INDEX p ON t (a) WHERE b COLLATE nobody = 'x'", "no such collation sequence: nobody")
 	tools_ok(t, conn, "CREATE INDEX e ON t (upper(b) COLLATE nocase)")
 }
+
+// An index over a program's function evaluated it without the program's
+// functions: every row's key was NULL, so a partial UNIQUE index enforced
+// nothing and SQLite found the file's index missing every row. It calls the
+// program's function now, in the statement and in the commit (D24).
+@(test)
+test_an_index_calls_a_program_s_function :: proc(t: ^testing.T) {
+	path := "_test_tools_function_index.sqlite"
+	os.remove(path)
+	defer os.remove(path)
+	_ = os.write_entire_file(path, []u8{})
+	same :: proc(args: []db.Value, user: rawptr) -> (db.Value, db.Error) {
+		return args[0], db.ERROR_NONE
+	}
+	{
+		conn, err := db.embed_open(path)
+		if !testing.expectf(t, db.error_ok(err), "open: %s", err.message) do return
+		defer db.embed_close(conn)
+		testing.expect(t, db.error_ok(db.store_register_function(conn.store, "same", 1, same)))
+		tools_ok(t, conn, "CREATE TABLE t (a INTEGER, b TEXT)")
+		tools_ok(t, conn, "INSERT INTO t VALUES (1, 'x'), (2, 'y')")
+		tools_ok(t, conn, "CREATE INDEX f ON t (same(b))")
+		tools_ok(t, conn, "CREATE UNIQUE INDEX w ON t (a) WHERE same(b) = 'x'")
+		tools_ok(t, conn, "INSERT INTO t VALUES (1, 'z')")
+		tools_fails(t, conn, "INSERT INTO t VALUES (1, 'x')", "UNIQUE constraint failed: t.a")
+	}
+	ok, reason := db.sqlite_mirror_validate(path, context.temp_allocator)
+	testing.expectf(t, ok, "the file is malformed: %s", reason)
+}

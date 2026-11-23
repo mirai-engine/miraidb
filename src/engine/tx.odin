@@ -1969,6 +1969,10 @@ tx_unregister_unique :: proc(tx: ^Tx, name: string, table: ^Table, values: []Val
 // applied and the transaction is rolled back.
 tx_commit :: proc(tx: ^Tx) -> Error {
 	if tx == nil || !tx.active do return errf(.Transaction_Closed, "transaction is already closed")
+	// An index the commit builds or fills evaluates its expressions with the
+	// program's functions of this store (index_eval).
+	previous_scope := aggregate_scope_enter(tx.store)
+	defer aggregate_scope_leave(previous_scope)
 	if tx.read_only {
 		tx_discard(tx)
 		return ERROR_NONE
