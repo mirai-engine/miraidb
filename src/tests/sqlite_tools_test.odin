@@ -580,6 +580,34 @@ test_an_index_calls_a_program_s_function :: proc(t: ^testing.T) {
 	testing.expectf(t, ok, "the file is malformed: %s", reason)
 }
 
+// A rowid SQLite writes in nine bytes (a negative one, or one past 2^56) lost
+// its top seven bits on the way to the file: -5 came back as
+// 144115188075855867 and SQLite found the table out of order. An omitted
+// INTEGER PRIMARY KEY after -5 is -4, as SQLite gives it, not 1.
+@(test)
+test_a_negative_rowid_reaches_the_file :: proc(t: ^testing.T) {
+	path := "_test_tools_negative_rowid.sqlite"
+	os.remove(path)
+	defer os.remove(path)
+	_ = os.write_entire_file(path, []u8{})
+	{
+		conn, err := db.embed_open(path)
+		if !testing.expectf(t, db.error_ok(err), "open: %s", err.message) do return
+		tools_ok(t, conn, "CREATE TABLE t (k INTEGER PRIMARY KEY, v)")
+		tools_ok(t, conn, "INSERT INTO t VALUES (-5, 'a')")
+		tools_ok(t, conn, "INSERT INTO t (v) VALUES ('b')")
+		tools_ok(t, conn, "INSERT INTO t VALUES (1152921504606846976, 'c'), (-9223372036854775808, 'd')")
+		tools_expect(t, conn, "SELECT k, v FROM t WHERE v = 'b'", "-4|b")
+		db.embed_close(conn)
+	}
+	ok, reason := db.sqlite_mirror_validate(path, context.temp_allocator)
+	testing.expectf(t, ok, "the file is malformed: %s", reason)
+	again, err := db.embed_open(path)
+	if !testing.expectf(t, db.error_ok(err), "reopen: %s", err.message) do return
+	defer db.embed_close(again)
+	tools_expect(t, again, "SELECT k, v FROM t ORDER BY k", "-9223372036854775808|d -5|a -4|b 1152921504606846976|c")
+}
+
 // SQLite's INTEGER PRIMARY KEY is the rowid: a value its affinity cannot make
 // an integer is "datatype mismatch", where another INTEGER column keeps it. A
 // real key was kept and reached the file as a rowid nobody wrote.

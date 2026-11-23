@@ -75,11 +75,17 @@ sqlite_put_varint :: proc(buffer: ^[dynamic]u8, value: u64) {
 		return
 	}
 	if value > (u64(1) << 56) - 1 {
+		// The ninth byte holds the low eight bits and the first eight hold seven
+		// each, high bit set. Eight bits in every byte lost the top seven bits of
+		// the value: every negative rowid came back as a large positive one, and
+		// SQLite found the table out of order.
 		bytes: [9]u8
 		v := value
-		for i := 8; i >= 0; i -= 1 {
-			bytes[i] = u8(v & 0xff)
-			v >>= 8
+		bytes[8] = u8(v & 0xff)
+		v >>= 8
+		for i := 7; i >= 0; i -= 1 {
+			bytes[i] = u8(v & 0x7f) | 0x80
+			v >>= 7
 		}
 		for b in bytes do append(buffer, b)
 		return
