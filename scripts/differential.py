@@ -76,6 +76,15 @@ SETUP = [
     "CREATE TRIGGER vtv_ins INSTEAD OF INSERT ON vtv BEGIN INSERT INTO vt VALUES (NEW.a, upper(NEW.b)); END",
     "CREATE TRIGGER vtv_upd INSTEAD OF UPDATE ON vtv BEGIN UPDATE vt SET b = NEW.b WHERE a = OLD.a; END",
     "CREATE TRIGGER vtv_del INSTEAD OF DELETE ON vtv WHEN OLD.a > 1 BEGIN DELETE FROM vt WHERE a = OLD.a; END",
+    # A trigger's RAISE (D11): IGNORE skips the row, ABORT refuses it.
+    "CREATE TABLE rz (a INTEGER)",
+    "CREATE TRIGGER rz_even BEFORE INSERT ON rz WHEN NEW.a % 2 = 0 BEGIN SELECT RAISE(IGNORE); END",
+    "CREATE TRIGGER rz_big BEFORE INSERT ON rz WHEN NEW.a > 100 BEGIN SELECT RAISE(ABORT, 'too big'); END",
+    # A dropped table takes its triggers: the next table of its name has none.
+    "CREATE TABLE gone (a INTEGER)",
+    "CREATE TRIGGER gone_log AFTER INSERT ON gone BEGIN INSERT INTO audit (k) VALUES ('gone'); END",
+    "DROP TABLE gone",
+    "CREATE TABLE gone (a INTEGER)",
 ]
 
 QUERIES = [
@@ -270,6 +279,11 @@ QUERIES = [
     "UPDATE vtv SET b = 'w' WHERE c >= 20 RETURNING a, b",
     "DELETE FROM vtv WHERE a <= 2 RETURNING a",
     "SELECT a, b, c FROM vtv ORDER BY a",
+    # RAISE(IGNORE) skips the even rows; the dropped table's trigger is gone.
+    "INSERT INTO rz (a) VALUES (1), (2), (3), (4) RETURNING a",
+    "SELECT a FROM rz ORDER BY a",
+    "INSERT INTO gone (a) VALUES (1) RETURNING a",
+    "SELECT count(*) FROM audit WHERE k = 'gone'",
     # A constraint's ON CONFLICT (S1) decides when the statement names none.
     "INSERT INTO oc (id, u, n, f) VALUES (1, 10, 10, 10) RETURNING id, u",
     "INSERT INTO oc (id, u, n, f) VALUES (3, 2, 3, 3) RETURNING id",
@@ -375,6 +389,8 @@ REJECTED = {
     "SELECT a FROM empty_t ORDER BY nope": "a misspelled column in ORDER BY",
     "SELECT a FROM empty_t GROUP BY nope": "a misspelled column in GROUP BY",
     "SELECT * FROM missing_t": "a table that does not exist",
+    "INSERT INTO rz (a) VALUES (101)": "a trigger's RAISE(ABORT)",
+    "SELECT RAISE(ABORT, 'x')": "RAISE outside a trigger",
     "SELECT e.nope FROM empty_t AS e": "a qualified column that does not exist",
     "SELECT a FROM empty_t WHERE a IN (SELECT nope FROM empty_t)": "a misspelled column in a subquery",
     "UPDATE empty_t SET nope = 1": "an assigned column that does not exist",
