@@ -59,9 +59,10 @@ connection only; two clients never see each other's.
   slow query delays the others. Neither flag is on by default, and the row quota
   (`max_rows_per_query`, `--row-quota` on the CLI) has no server flag yet.
 - **Memory.** Expression depth is bounded (100 levels, refused by the parser and
-  the evaluator), but an allocation that fails still ends the process instead of
-  failing the statement (backlog D23). Treat the server as one out-of-memory away
-  from a restart.
+  the evaluator), and an allocation the system refuses fails its statement with
+  `out of memory` instead of ending the process (backlog D23): a 4 MiB ballast
+  carries the statement to its next checkpoint. The temporary allocator and a
+  few registries are outside that guard.
 - **One writer.** The server holds the directory lock; a second server on the
   same directory is refused with the owner's pid. Readers may open beside it with
   `--read-only`.

@@ -47,7 +47,6 @@ that way.
 
 | # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
-| 18 | **D23 — allocation failure** | A failed allocation is a crash, not `.Out_Of_Memory`; start with an allocator that fails the nth call. | M | — |
 | 19 | **D34 — Linux suite and heap sanitizer** | The threaded suite is green on Linux and every script finds its binary; left is CI on Linux and macOS with `-sanitize:address` and the suite sanitized as a gate (the CLI already is, on Windows). | S | — |
 | 20 | **D8 — fault injection beyond the log** | Snapshot, rotation, the mirror, a kill during a page flush. | S | — |
 | 21 | **D3 — version retention** | Automatic retention tied to the oldest reader; `AS OF` on a join. | M | — |
@@ -65,9 +64,9 @@ with peer-to-peer sync; its networked phases build on items 27 and 28.
 
 ## Suggested order
 
-1. **D23, D8, D3** and the grants review: the ways the engine can still
-   die instead of answering, lose a write to a crash outside the log, keep
-   every old value of an embedded database, or let any client do anything.
+1. **D8, D3** and the grants review: the ways the engine can still lose a
+   write to a crash outside the log, keep every old value of an embedded
+   database, or let any client do anything.
 2. **R2**: the largest gap left against the reference (inserts and updates),
    starting from a profile of the write path. The parity gate
    (`scripts/parity.py`) records its gain with `--record` so it cannot slip back.

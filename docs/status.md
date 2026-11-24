@@ -151,7 +151,7 @@ the gaps are named rather than left to be discovered.
   `linux_arm64` and `darwin_arm64`. The POSIX lock is the reason it is checked:
   it carried a missing `core:sys/posix` import and two wrong integer types until
   this round, so the code that a Linux build would run had never been compiled.
-- 465 integration tests covering CRUD, recovery, constraints, transactions,
+- 467 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
@@ -362,8 +362,9 @@ than 1000 bytes cannot be indexed and the insert says so.
   statement without `LIMIT`/`OFFSET` stops producing rows as soon as it passes
   `max_rows_per_query` instead of refusing after the result exists. What is left:
   a join still builds its intermediate before the projection sees it, `LIMIT` is
-  not pushed into the scan, and an allocation that fails is still a crash rather
-  than an error (`AUDIT-9` A5, backlog D23).
+  not pushed into the scan. An allocation the system refuses fails its statement
+  with `.Out_Of_Memory` instead of ending the process (`AUDIT-9` A5, backlog D23,
+  `test_allocation_failure_walk`).
 - **The server serves many clients, one statement at a time.** Each accepted
   socket gets its own thread, so a subscriber no longer blocks anyone: a
   subscription stays open while another client writes and the write's delta is
@@ -382,8 +383,7 @@ than 1000 bytes cannot be indexed and the insert says so.
   watchdog sets the store's atomic cancel flag, the executor answers `cancelled`,
   and the next statement runs — while `--budget` refuses a statement that
   overspends (after the work, not during). **What is still open:** the transport
-  is plain TCP (D15), the row quota is unreachable from the server, and an
-  expression nested deeply enough still overflows the stack (D23).
+  is plain TCP (D15) and the row quota is unreachable from the server.
 - **A mirrored `.sqlite` file stays readable through DDL, and loses what the
   engine does not model.** `DROP TABLE`, `ALTER TABLE`, `DROP INDEX` and `CREATE
   INDEX` all leave a file `sqlite3` opens: the rewrite used to leave a file whose

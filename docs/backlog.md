@@ -47,7 +47,7 @@ Rules for this file:
 | D15 | HTTP/1.1 and WebSocket with caps | TLS, HTTP/2, backpressure, timeouts, a load test | M |
 | D16 | a hand-written Python binding | bindings generated from the catalog, more languages | M |
 | D18 | a read-only open replays | a reader that trusts the pages of a quiescent writer | M |
-| D23 | depth, row quota and budget are bounded | an allocation failure is a crash, not an error | M |
+| D23 | closed: a refused allocation fails its statement with `.Out_Of_Memory` (`SQLITE_NOMEM`); `test_allocation_failure_walk` | — | — |
 | D24 | closed: `scripts/mirror_fuzz.py` passes 20 seeds of 400 statements against SQLite, a CI gate | — | — |
 | D34 | the threaded suite is green on Linux and Windows; the sanitizer covers the Windows CLI, not the suite | run the suite sanitized on every platform, in CI | S |
 | D36 | a query never reads a partial or expression index | match a query's predicate to the index | M |
@@ -395,9 +395,26 @@ than by concurrency.
 while a projection or a join produces rows, the work budget, `LIMIT` pushed into
 the scan, and both caps reachable from the CLI (`--row-quota=N`, `--budget=N`).
 
-**Left.** An allocation that fails is still a crash rather than
-`.Out_Of_Memory`. There is no reproduction yet; the first step is an allocator
-that fails the nth allocation, the way `Fault_Vfs` fails the nth write.
+**Closed.** Every arena the engine allocates from is guarded
+(`arena_allocator_guarded`, `src/engine/oom.odin`), and so is the heap the C
+entry points, the CLI and the server run under (`oom_context`,
+`oom_heap_allocator`). An allocation the system refuses releases a 4 MiB
+ballast held for it and is tried again, so the step in flight finishes instead
+of reading a nil. The statement then stops at its next checkpoint (each row of
+an insert, update or delete, and the end of every statement, before its
+commit) with `.Out_Of_Memory`, which the facade answers as `SQLITE_NOMEM`, and
+is taken back; the next statement runs only once the ballast is held again, and
+a rollback runs regardless. `oom_inject` fails a thread's nth guarded
+allocation and every later one: `test_allocation_failure_walk` runs a script of
+DDL, a trigger, a transaction, writes and a join once per allocation it makes,
+and each run answers or fails cleanly, leaks nothing, and leaves the rows of
+the statements that worked; `test_a_refused_allocation_is_sqlite_nomem` does the
+same through `sqlite3_exec`.
+
+**Outside it.** The temporary allocator, and the few registries that take the
+heap directly (`runtime.heap_allocator()`: locks, handles, virtual-table
+modules), are not guarded; a refusal there, or one larger than the ballast after
+it is spent, is still the caller's nil.
 
 ## D24 — The mirror's last gaps
 
