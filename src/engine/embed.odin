@@ -27,7 +27,6 @@ package engine
 // connection keeps its own copy for embed_error, so a caller that frees the
 // returned error can still ask the connection what went wrong.
 
-import "core:mem/virtual"
 import "core:os"
 import "core:strings"
 import "core:sync"
@@ -352,7 +351,7 @@ embed_authorize :: proc(conn: ^Embed_Conn, prepared: ^Stmt_Prepared) -> Error {
 	own := tx == nil
 	if own do tx = tx_begin_read(conn.store)
 	defer if own do tx_end(tx)
-	if resolve_err := sql_resolve_names(tx, &prepared.query.statement, virtual.arena_allocator(&prepared.query.arena)); resolve_err.kind != .None do return resolve_err
+	if resolve_err := sql_resolve_names(tx, &prepared.query.statement, arena_allocator_guarded(&prepared.query.arena)); resolve_err.kind != .None do return resolve_err
 	if conn.store.hooks.authorizer == nil do return ERROR_NONE
 	ignored, err := sql_authorize(conn.store, tx, prepared)
 	prepared.ignored = ignored
@@ -388,6 +387,9 @@ embed_run_statement :: proc(conn: ^Embed_Conn, prepared: ^Stmt_Prepared, params:
 	}
 	// A statement the authorizer told to ignore prepares and does nothing.
 	if prepared.ignored do return ack(conn)
+	// A statement runs once the ballast is held again (D23); a rollback runs
+	// without it, as it gives memory back.
+	if !oom_settle() && !statement_gives_back(prepared) do return {}, oom_error()
 	if !prepared.is_pragma {
 		#partial switch stmt in prepared.query.statement {
 		case Begin_Stmt:
@@ -449,6 +451,34 @@ embed_run_statement :: proc(conn: ^Embed_Conn, prepared: ^Stmt_Prepared, params:
 		return result, err
 	}
 	return prepared_execute(conn.store, prepared, params)
+}
+
+// oom_refuse is what a prepare answers when the ballast could not be held: the
+// statement it prepared only when that is a rollback, out of memory otherwise.
+@(private = "file")
+oom_refuse :: proc(prepared: ^^Stmt_Prepared, prepare_err: Error) -> Error {
+	if prepare_err.kind != .None {
+		err := prepare_err
+		error_free(&err)
+		return oom_error()
+	}
+	if statement_gives_back(prepared^) do return ERROR_NONE
+	stmt_prepared_destroy(prepared^)
+	prepared^ = nil
+	return oom_error()
+}
+
+// statement_gives_back is a rollback, which runs even out of memory.
+@(private = "file")
+statement_gives_back :: proc(prepared: ^Stmt_Prepared) -> bool {
+	if prepared.is_pragma do return false
+	#partial switch stmt in prepared.query.statement {
+	case Rollback_Stmt:
+		return true
+	case Savepoint_Stmt:
+		return stmt.kind == .Rollback_To
+	}
+	return false
 }
 
 // embed_backup writes a compacted copy of the database at path. The copy is a
@@ -520,7 +550,9 @@ embed_exec_params :: proc(conn: ^Embed_Conn, sql: string, params: []Value) -> Er
 	if conn.share != nil && conn.tx == nil {
 		if refresh_err := sqlite_share_refresh(conn); refresh_err.kind != .None do return embed_fail(conn, refresh_err)
 	}
+	settled := oom_settle()
 	prepared, prepare_err := sql_prepare(conn.store, sql)
+	if !settled do prepare_err = oom_refuse(&prepared, prepare_err)
 	if prepare_err.kind != .None do return embed_fail(conn, prepare_err)
 	defer stmt_prepared_destroy(prepared)
 	if auth_err := embed_authorize(conn, prepared); auth_err.kind != .None do return embed_fail(conn, auth_err)
@@ -548,7 +580,9 @@ embed_prepare :: proc(conn: ^Embed_Conn, sql: string) -> ^Embed_Statement {
 	// Parse now rather than at the first step: it is the same work, it reports a
 	// syntax error where a caller expects one, and it is what makes the parameter
 	// count known before the first bind, so index 99 can be refused (D29).
+	settled := oom_settle()
 	prepared, prepare_err := sql_prepare(conn.store, sql)
+	if !settled do prepare_err = oom_refuse(&prepared, prepare_err)
 	if prepare_err.kind != .None {
 		// The connection keeps its own copy for errmsg; this one is dropped.
 		embed_fail(conn, prepare_err)

@@ -1,7 +1,6 @@
 package engine
 
 import "core:mem"
-import "core:mem/virtual"
 import "core:strings"
 
 // --- The authorizer ---------------------------------------------------------
@@ -142,7 +141,7 @@ sql_authorize :: proc(store: ^Store, tx: ^Tx, prepared: ^Stmt_Prepared) -> (igno
 	// The query was copied into the prepared statement, so its own `alloc` still
 	// points at the arena where the parser left it: the allocator is made again
 	// from the arena where it lives now.
-	walk := Auth_Walk{store = store, tx = tx, prepared = prepared, alloc = virtual.arena_allocator(&prepared.query.arena)}
+	walk := Auth_Walk{store = store, tx = tx, prepared = prepared, alloc = arena_allocator_guarded(&prepared.query.arena)}
 	walk.scopes = make([dynamic]Auth_Scope, 0, 4, context.temp_allocator)
 	walk.ctes = make([dynamic]Auth_Cte, 0, 2, context.temp_allocator)
 	if prepared.is_pragma {
@@ -859,7 +858,7 @@ auth_replay_statement :: proc(tx: ^Tx, name: string, text: string) -> Error {
 auth_replay_condition :: proc(tx: ^Tx, name: string, condition: ^Query, expr: ^^Expr) {
 	// A view the condition reads is not rewritten: nothing would keep its query.
 	walk := auth_replay_walk(tx, nil, name)
-	walk.alloc = virtual.arena_allocator(&condition.arena)
+	walk.alloc = arena_allocator_guarded(&condition.arena)
 	auth_expr(&walk, expr)
 }
 
@@ -878,7 +877,7 @@ auth_replay_walk :: proc(tx: ^Tx, prepared: ^Stmt_Prepared, name: string) -> Aut
 		replaying = true,
 		depth     = 1,
 	}
-	if prepared != nil do walk.alloc = virtual.arena_allocator(&prepared.query.arena)
+	if prepared != nil do walk.alloc = arena_allocator_guarded(&prepared.query.arena)
 	walk.scopes = make([dynamic]Auth_Scope, 0, 4, context.temp_allocator)
 	walk.ctes = make([dynamic]Auth_Cte, 0, 2, context.temp_allocator)
 	scope := Auth_Scope{sources = make([dynamic]Auth_Source, 0, 2, context.temp_allocator)}

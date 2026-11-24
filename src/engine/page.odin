@@ -938,7 +938,7 @@ page_rows_each :: proc(rows: ^Page_Rows, ctx: rawptr, visit: Page_Row_Visitor) -
 		return errf(.Out_Of_Memory, "cannot create the row arena")
 	}
 	defer virtual.arena_destroy(&arena)
-	alloc := virtual.arena_allocator(&arena)
+	alloc := arena_allocator_guarded(&arena)
 	for id in 1 ..< rows.file.page_count {
 		frame, load_err := page_load(rows.file, id)
 		if load_err.kind != .None do return load_err

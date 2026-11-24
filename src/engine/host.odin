@@ -493,7 +493,7 @@ host_subscribe_many_owned :: proc(
 				free(subscription)
 				return 0, nil, errf(.Out_Of_Memory, "cannot set up a join subscription")
 			}
-			entry.join_allocator = virtual.arena_allocator(&entry.join_arena)
+			entry.join_allocator = arena_allocator_guarded(&entry.join_arena)
 			entry.join_tuples = make(map[string]Join_Tuple)
 			entry.join_by_row = make(map[Source_Row][dynamic]string)
 			entry.join_counts = make(map[string]int)

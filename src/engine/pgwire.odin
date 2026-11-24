@@ -863,7 +863,7 @@ pg_describe_plan :: proc(host: ^Host, sql: string) -> (columns: []string, ok: bo
 		return nil, false
 	}
 	defer virtual.arena_destroy(&scratch)
-	_ = expand_projections(sources[:], stmt.joins, stmt.projections, &names, virtual.arena_allocator(&scratch))
+	_ = expand_projections(sources[:], stmt.joins, stmt.projections, &names, arena_allocator_guarded(&scratch))
 	sync.shared_unlock(&host.store.mutex)
 	return names[:], true
 }

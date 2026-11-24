@@ -146,7 +146,7 @@ host_module_context :: proc(host: ^Host, buffer: []u8) -> (Module_Context, Error
 	arena := new(virtual.Arena)
 	if arena_err := virtual.arena_init_buffer(arena, memory); arena_err == .None {
 		ctx.arena = arena
-		ctx.alloc = virtual.arena_allocator(arena)
+		ctx.alloc = arena_allocator_guarded(arena)
 	} else {
 		free(arena)
 	}

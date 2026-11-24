@@ -512,7 +512,7 @@ tx_begin_write :: proc(store: ^Store) -> ^Tx {
 	tx.store = store
 	tx.active = true
 	tx_arena_take(store, &tx.arena)
-	tx.alloc = virtual.arena_allocator(&tx.arena)
+	tx.alloc = arena_allocator_guarded(&tx.arena)
 	tx.read_seq = store.commit_seq
 	tx.read_tables = make(map[string]bool)
 	tx.cte_tables = make(map[string]^Table)
@@ -533,7 +533,7 @@ tx_begin_read :: proc(store: ^Store) -> ^Tx {
 	tx.active = true
 	tx.read_only = true
 	tx_arena_take(store, &tx.arena)
-	tx.alloc = virtual.arena_allocator(&tx.arena)
+	tx.alloc = arena_allocator_guarded(&tx.arena)
 	tx.read_tables = make(map[string]bool)
 	tx.cte_tables = make(map[string]^Table)
 	tx.cursors = make(map[string]^Cursor)

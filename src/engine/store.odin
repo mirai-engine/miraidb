@@ -356,6 +356,8 @@ log_segment_path_temp :: proc(path: string) -> string {
 }
 
 store_open :: proc(path: string, options: Store_Options) -> (^Store, Error) {
+	// The ballast an allocation the system refuses is answered from (D23).
+	oom_hold()
 	settings := options
 	open_path := path
 	// An in-memory spelling is not a directory to create. In memory there is no
@@ -1426,7 +1428,7 @@ store_apply_payload :: proc(store: ^Store, payload: []u8, seq: u64) -> Error {
 	}
 	defer virtual.arena_destroy(&scratch)
 	for _ in 0 ..< count {
-		op, op_err := store_op_decode(&r, virtual.arena_allocator(&scratch))
+		op, op_err := store_op_decode(&r, arena_allocator_guarded(&scratch))
 		if op_err.kind != .None do return op_err
 		apply_err := store_apply(store, op)
 		virtual.arena_free_all(&scratch)
@@ -1492,7 +1494,7 @@ store_apply :: proc(store: ^Store, op: Store_Op) -> Error {
 			// A tombstone is for the readers of the table being replaced.
 			if row.deleted_seq != 0 do continue
 			id := row.id
-			values, convert_err := alter_row_values(&existing.schema, op.schema, row.values, virtual.arena_allocator(&scratch))
+			values, convert_err := alter_row_values(&existing.schema, op.schema, row.values, arena_allocator_guarded(&scratch))
 			if convert_err.kind != .None {
 				table_destroy(replacement)
 				return convert_err

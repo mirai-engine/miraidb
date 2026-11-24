@@ -546,7 +546,7 @@ copy_insert :: proc(tx: ^Tx, stmt: Copy_Stmt, text: string) -> (int, Error) {
 		tx   = tx,
 		stmt = stmt,
 	}
-	_, scan_err := copy_scan_all(stmt, text, copy_insert_sink, &state, virtual.arena_allocator(&temp))
+	_, scan_err := copy_scan_all(stmt, text, copy_insert_sink, &state, arena_allocator_guarded(&temp))
 	if scan_err.kind != .None do return state.row, scan_err
 	return state.row, ERROR_NONE
 }

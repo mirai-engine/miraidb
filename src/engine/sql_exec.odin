@@ -99,12 +99,18 @@ sql_execute_priced :: proc(store: ^Store, sql: string, params: []Value) -> (Sql_
 // reuse it to avoid parsing on every execution.
 @(private)
 sql_run_statement :: proc(store: ^Store, statement: Statement, params: []Value) -> (Sql_Result, Error) {
+	// A statement runs once the ballast is held again (D23).
+	if !oom_settle() do return {}, oom_error()
 	previous := aggregate_scope_enter(store)
 	defer aggregate_scope_leave(previous)
 	switch stmt in statement {
 	case Select_Stmt, With_Stmt:
 		tx := tx_begin_read(store)
 		result, exec_err := sql_run_query(tx, stmt, params)
+		if exec_err.kind == .None && oom_short() {
+			sql_result_destroy(&result)
+			exec_err = oom_error()
+		}
 		tx_end(tx)
 		result.commit_seq = store.commit_seq
 		return result, exec_err
@@ -121,11 +127,16 @@ sql_run_statement :: proc(store: ^Store, statement: Statement, params: []Value) 
 		store.statement_tx, store.statement_thread = tx, sync.current_thread_id()
 		result, exec_err := sql_exec_mutation(tx, stmt, params)
 		store.statement_tx, store.statement_thread = outer_tx, outer_thread
+		// A statement that needed the ballast is taken back whole (D23).
+		if exec_err.kind == .None && oom_short() {
+			sql_result_destroy(&result)
+			exec_err = oom_error()
+		}
 		if fail_mode do tx_statement_end(tx, mark, false)
 		if exec_err.kind != .None {
 			// A constraint's ON CONFLICT FAIL keeps the rows before the failing
 			// one, as an OR FAIL does.
-			if fail_mode || tx.keep_partial {
+			if (fail_mode || tx.keep_partial) && exec_err.kind != .Out_Of_Memory {
 				// The rows before the failing one stay, as SQLite keeps them.
 				if commit_err := tx_commit(tx); commit_err.kind != .None {
 					error_free(&exec_err)
@@ -334,11 +345,17 @@ conflict_skippable :: proc(kind: Error_Kind) -> bool {
 // transaction.
 @(private)
 sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sql_Result, Error) {
+	if !oom_settle() do return {}, oom_error()
 	previous := aggregate_scope_enter(tx.store)
 	defer aggregate_scope_leave(previous)
 	switch stmt in statement {
 	case Select_Stmt, With_Stmt:
-		return sql_run_query(tx, stmt, params)
+		result, err := sql_run_query(tx, stmt, params)
+		if err.kind == .None && oom_short() {
+			sql_result_destroy(&result)
+			err = oom_error()
+		}
+		return result, err
 	case Insert_Stmt, Update_Stmt, Delete_Stmt, Merge_Stmt, Copy_Stmt:
 		// A data statement that fails is taken back as a unit (SQLite's ABORT): the
 		// transaction keeps the work of the statements before it and none of this
@@ -349,8 +366,13 @@ sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value) 
 		outer := tx.trigger_depth == 0
 		if outer do tx.keep_partial = false
 		result, err := sql_exec_mutation(tx, stmt, params)
+		if err.kind == .None && oom_short() {
+			sql_result_destroy(&result)
+			err = oom_error()
+		}
 		keeps := err.kind != .None && insert_without_statement_journal(tx, stmt)
-		tx_statement_end(tx, mark, err.kind != .None && !statement_fails_partially(stmt) && !tx.keep_partial && !keeps)
+		out_of_memory := err.kind == .Out_Of_Memory
+		tx_statement_end(tx, mark, out_of_memory || (err.kind != .None && !statement_fails_partially(stmt) && !tx.keep_partial && !keeps))
 		if outer do tx.keep_partial = false
 		// OR ROLLBACK: a broken constraint ends the whole transaction, which the
 		// connection that holds it rolls back (embed_run).
@@ -3921,7 +3943,7 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 	sources_arena: virtual.Arena
 	if !query_arena_take(&sources_arena) do return {}, errf(.Out_Of_Memory, "cannot reserve the statement's row sources")
 	defer query_arena_give(&sources_arena)
-	sources_alloc := virtual.arena_allocator(&sources_arena)
+	sources_alloc := arena_allocator_guarded(&sources_arena)
 	join_scratch := make([dynamic]Source)
 	defer delete(join_scratch)
 	partials := make([dynamic][]Source)
@@ -8467,6 +8489,8 @@ sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Res
 			if fts_err := fts_index_if_virtual(tx, stmt.table, row_id, values, true); fts_err.kind != .None {
 				return {}, fts_err
 			}
+			// A row that needed the ballast is the statement's last (D23).
+			if oom_short() do return {}, oom_error()
 		}
 		if insert_err.kind != .None && row_replace {
 			// INSERT OR REPLACE: delete what the new row collides with, on any
@@ -9006,6 +9030,7 @@ sql_exec_update :: proc(tx: ^Tx, stmt: Update_Stmt, params: []Value) -> (Sql_Res
 		if update_err.kind != .None {
 			return {}, update_err
 		}
+		if oom_short() do return {}, oom_error()
 		if fts_err := fts_index_if_virtual(tx, stmt.table, row.id, new_values, false); fts_err.kind != .None {
 			return {}, fts_err
 		}
@@ -9102,6 +9127,7 @@ sql_exec_delete :: proc(tx: ^Tx, stmt: Delete_Stmt, params: []Value) -> (Sql_Res
 			if delete_err.kind == .Trigger_Ignore do continue
 			return {}, delete_err
 		}
+		if oom_short() do return {}, oom_error()
 		affected += 1
 	}
 	result.affected = affected

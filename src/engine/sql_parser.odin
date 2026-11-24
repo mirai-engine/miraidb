@@ -1,7 +1,6 @@
 package engine
 
 import "core:mem"
-import "core:mem/virtual"
 import "core:fmt"
 import "core:strconv"
 import "core:strings"
@@ -56,7 +55,7 @@ sql_parse :: proc(source: string) -> (Query, Error) {
 	if !query_arena_take(&q.arena) {
 		return q, errf(.Out_Of_Memory, "cannot allocate the query arena")
 	}
-	q.alloc = virtual.arena_allocator(&q.arena)
+	q.alloc = arena_allocator_guarded(&q.arena)
 	q.source = strings.clone(source, q.alloc)
 	p := Parser {
 		lexer       = lexer_init(source, q.alloc),

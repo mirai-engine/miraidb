@@ -318,7 +318,7 @@ index_eval :: proc(t: ^Table, exprs: ^Index_Exprs, expr: ^Expr, values: []Value)
 	// for every row, its index held NULL keys, a UNIQUE one enforced nothing,
 	// and SQLite found the file's index missing every row (D24).
 	ctx := Eval_Ctx{sources = sources[:], index_store = statement_store()}
-	context.allocator = virtual.arena_allocator(&exprs.scratch)
+	context.allocator = arena_allocator_guarded(&exprs.scratch)
 	value, err := eval_expr(&ctx, expr)
 	if err.kind != .None {
 		error_free(&err)
@@ -605,7 +605,7 @@ table_create :: proc(schema: ^Table_Schema) -> (^Table, Error) {
 		free(t)
 		return nil, errf(.Out_Of_Memory, "cannot create the table arena: %v", arena_err)
 	}
-	t.arena_allocator = virtual.arena_allocator(&t.arena)
+	t.arena_allocator = arena_allocator_guarded(&t.arena)
 	t.schema = schema_copy(&normalized, t.arena_allocator)
 	t.store = new(Row_Store)
 	t.store.refs = 1
