@@ -10,7 +10,6 @@ package sqlite_compat
 // SQLite's arguments. xBegin/xSync/xCommit/xRollback, savepoints, xRename and
 // xFindFunction are not called.
 
-import "base:runtime"
 import "core:c"
 import "core:strings"
 
@@ -413,13 +412,13 @@ create_module :: proc(handle: rawptr, name: cstring, module: ^Sqlite3_Module, au
 
 @(export)
 sqlite3_create_module :: proc "c" (handle: rawptr, name: cstring, module: ^Sqlite3_Module, aux: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return create_module(handle, name, module, aux, nil)
 }
 
 @(export)
 sqlite3_create_module_v2 :: proc "c" (handle: rawptr, name: cstring, module: ^Sqlite3_Module, aux: rawptr, destroy: Destroy_Callback) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return create_module(handle, name, module, aux, destroy)
 }
 
@@ -427,7 +426,7 @@ sqlite3_create_module_v2 :: proc "c" (handle: rawptr, name: cstring, module: ^Sq
 // NULL-terminated list `keep` (all of them when it is NULL).
 @(export)
 sqlite3_drop_modules :: proc "c" (handle: rawptr, keep: [^]cstring) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil do return SQLITE_MISUSE
 	names := engine.store_vtab_names(db.conn.store, context.temp_allocator)
@@ -446,7 +445,7 @@ sqlite3_drop_modules :: proc "c" (handle: rawptr, keep: [^]cstring) -> c.int {
 // columns, as a CREATE TABLE statement.
 @(export)
 sqlite3_declare_vtab :: proc "c" (handle: rawptr, sql: cstring) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil || sql == nil do return SQLITE_MISUSE
 	text := strings.trim_space(string(sql))
@@ -467,7 +466,7 @@ sqlite3_declare_vtab :: proc "c" (handle: rawptr, sql: cstring) -> c.int {
 // xConnect, as SQLite does; none changes how a table is read here.
 @(export)
 sqlite3_vtab_config :: proc "c" (handle: rawptr, op: c.int) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil || !db.in_vtab_constructor do return SQLITE_MISUSE
 	if op < 1 || op > 4 do return SQLITE_MISUSE
@@ -490,7 +489,7 @@ sqlite3_vtab_nochange :: proc "c" (ctx: rawptr) -> c.int {
 // xBestIndex runs: the term's COLLATE, else the column's, else BINARY.
 @(export)
 sqlite3_vtab_collation :: proc "c" (info: ^Sqlite3_Index_Info, constraint: c.int) -> cstring {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if constraint < 0 || int(constraint) >= len(index_collations) do return "BINARY"
 	name := index_collations[constraint].collation
 	if len(name) == 0 do return "BINARY"
@@ -523,7 +522,7 @@ sqlite3_vtab_in_next :: proc "c" (value: rawptr, out: ^rawptr) -> c.int {
 // xBestIndex runs; the box lives until the scan ends.
 @(export)
 sqlite3_vtab_rhs_value :: proc "c" (info: ^Sqlite3_Index_Info, constraint: c.int, out: ^rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if out != nil do out^ = nil
 	if info == nil || out == nil || constraint < 0 || constraint >= info.nConstraint do return SQLITE_MISUSE
 	if int(constraint) >= len(index_values) do return SQLITE_NOTFOUND

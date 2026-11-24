@@ -512,7 +512,7 @@ open_failed :: proc(ppDb: ^rawptr, code: c.int, message: string) -> c.int {
 
 @(export)
 sqlite3_open :: proc "c" (filename: cstring, ppDb: ^rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return open_database(filename, ppDb, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)
 }
 
@@ -580,15 +580,15 @@ open_database :: proc(filename: cstring, ppDb: ^rawptr, open_flags: c.int) -> c.
 
 @(export)
 sqlite3_open_v2 :: proc "c" (filename: cstring, ppDb: ^rawptr, flags: c.int, vfs: cstring) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	_ = vfs
 	return open_database(filename, ppDb, flags)
 }
 
 @(export)
 sqlite3_close :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
-	context = runtime.default_context()
+	context = engine.oom_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil do return SQLITE_OK
 	// A handle from a failed open holds only its error.
@@ -642,7 +642,7 @@ sqlite3_close :: proc "c" (handle: rawptr) -> c.int {
 // SQLite does: the call answers OK either way.
 @(export)
 sqlite3_close_v2 :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil do return SQLITE_OK
 	if len(db.statements) > 0 {
@@ -654,8 +654,8 @@ sqlite3_close_v2 :: proc "c" (handle: rawptr) -> c.int {
 
 @(export)
 sqlite3_errmsg :: proc "c" (handle: rawptr) -> cstring {
-	context = runtime.default_context()
-	context = runtime.default_context()
+	context = engine.oom_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil do return "out of memory"
 	if db.conn == nil do return cstring(raw_data(db.last_error))
@@ -677,7 +677,7 @@ sqlite3_errmsg :: proc "c" (handle: rawptr) -> cstring {
 
 @(export)
 sqlite3_errcode :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil do return SQLITE_ERROR
 	// The code the last exec or step answered, so a caller can tell a duplicate
@@ -692,7 +692,7 @@ sqlite3_errcode :: proc "c" (handle: rawptr) -> c.int {
 // every other call returns.
 @(export)
 sqlite3_extended_errcode :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil do return SQLITE_ERROR
 	return db.last_extended
@@ -703,7 +703,7 @@ sqlite3_extended_errcode :: proc "c" (handle: rawptr) -> c.int {
 // not poison it, which is what SQLite documents (D25).
 @(export)
 sqlite3_interrupt :: proc "c" (handle: rawptr) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil do return
 	engine.store_cancel(db.conn.store)
@@ -711,7 +711,7 @@ sqlite3_interrupt :: proc "c" (handle: rawptr) {
 
 @(export)
 sqlite3_changes :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil do return 0
 	// The counter belongs to the connection and is set by whichever statement ran
@@ -721,7 +721,7 @@ sqlite3_changes :: proc "c" (handle: rawptr) -> c.int {
 
 @(export)
 sqlite3_total_changes :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return c.int(sqlite3_total_changes64(handle))
 }
 
@@ -743,7 +743,7 @@ Exec_Callback :: #type proc "c" (
 // sqlite3_free.
 @(export)
 sqlite3_exec :: proc "c" (handle: rawptr, sql: cstring, callback: rawptr, arg: rawptr, errmsg: ^cstring) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if errmsg != nil do errmsg^ = nil
 	db := db_of(handle)
 	if db == nil || sql == nil do return SQLITE_MISUSE
@@ -798,7 +798,7 @@ exec_failed :: proc(db: ^Database, code: c.int, errmsg: ^cstring) -> c.int {
 
 @(export)
 sqlite3_prepare_v2 :: proc "c" (handle: rawptr, sql: cstring, nByte: c.int, ppStmt: ^rawptr, pzTail: ^cstring) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return prepare(handle, sql, nByte, ppStmt, pzTail)
 }
 
@@ -807,7 +807,7 @@ sqlite3_prepare_v2 :: proc "c" (handle: rawptr, sql: cstring, nByte: c.int, ppSt
 // whichever is set.
 @(export)
 sqlite3_prepare_v3 :: proc "c" (handle: rawptr, sql: cstring, nByte: c.int, flags: c.uint, ppStmt: ^rawptr, pzTail: ^cstring) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	_ = flags
 	return prepare(handle, sql, nByte, ppStmt, pzTail)
 }
@@ -816,7 +816,7 @@ sqlite3_prepare_v3 :: proc "c" (handle: rawptr, sql: cstring, nByte: c.int, flag
 // eagerly after a schema change; this engine never needs to.
 @(export)
 sqlite3_prepare :: proc "c" (handle: rawptr, sql: cstring, nByte: c.int, ppStmt: ^rawptr, pzTail: ^cstring) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return prepare(handle, sql, nByte, ppStmt, pzTail)
 }
 
@@ -1066,7 +1066,7 @@ prepare :: proc(handle: rawptr, sql: cstring, nByte: c.int, ppStmt: ^rawptr, pzT
 
 @(export)
 sqlite3_finalize :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	// Finalizing NULL is a harmless no-op in SQLite: a script loop finalizes
 	// the NULL statement its last, empty, prepare gave.
 	if handle == nil do return SQLITE_OK
@@ -1112,7 +1112,7 @@ sqlite3_finalize :: proc "c" (handle: rawptr) -> c.int {
 
 @(export)
 sqlite3_reset :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return SQLITE_MISUSE
 	stmt_clear_text_cache(stmt)
@@ -1138,7 +1138,7 @@ sqlite3_reset :: proc "c" (handle: rawptr) -> c.int {
 
 @(export)
 sqlite3_clear_bindings :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return SQLITE_MISUSE
 	engine.embed_clear_bindings(stmt.stmt)
@@ -1148,7 +1148,7 @@ sqlite3_clear_bindings :: proc "c" (handle: rawptr) -> c.int {
 
 @(export)
 sqlite3_bind_null :: proc "c" (handle: rawptr, index: c.int) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return SQLITE_MISUSE
 	if int(index) < 1 || int(index) > engine.Embed_Parameter_Count(stmt.stmt) do return SQLITE_RANGE
@@ -1159,13 +1159,13 @@ sqlite3_bind_null :: proc "c" (handle: rawptr, index: c.int) -> c.int {
 
 @(export)
 sqlite3_bind_int :: proc "c" (handle: rawptr, index: c.int, value: c.int) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return sqlite3_bind_int64(handle, index, c.longlong(value))
 }
 
 @(export)
 sqlite3_bind_int64 :: proc "c" (handle: rawptr, index: c.int, value: c.longlong) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return SQLITE_MISUSE
 	if int(index) < 1 || int(index) > engine.Embed_Parameter_Count(stmt.stmt) do return SQLITE_RANGE
@@ -1176,7 +1176,7 @@ sqlite3_bind_int64 :: proc "c" (handle: rawptr, index: c.int, value: c.longlong)
 
 @(export)
 sqlite3_bind_double :: proc "c" (handle: rawptr, index: c.int, value: c.double) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return SQLITE_MISUSE
 	if int(index) < 1 || int(index) > engine.Embed_Parameter_Count(stmt.stmt) do return SQLITE_RANGE
@@ -1192,7 +1192,7 @@ sqlite3_bind_double :: proc "c" (handle: rawptr, index: c.int, value: c.double) 
 
 @(export)
 sqlite3_bind_text :: proc "c" (handle: rawptr, index: c.int, value: cstring, length: c.int, destructor: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	// SQLite runs the destructor once it no longer needs the text: the text is
 	// copied, so that is when this returns, whatever the answer.
 	defer release_with(rawptr(value), destructor)
@@ -1221,7 +1221,7 @@ sqlite3_bind_text :: proc "c" (handle: rawptr, index: c.int, value: cstring, len
 
 @(export)
 sqlite3_bind_blob :: proc "c" (handle: rawptr, index: c.int, data: rawptr, length: c.int, destructor: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	defer release_with(data, destructor)
 	stmt := stmt_of(handle)
 	if stmt == nil do return SQLITE_MISUSE
@@ -1240,7 +1240,7 @@ sqlite3_bind_blob :: proc "c" (handle: rawptr, index: c.int, data: rawptr, lengt
 
 @(export)
 sqlite3_step :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return SQLITE_MISUSE
 	if stmt.finished {
@@ -1274,7 +1274,7 @@ sqlite3_step :: proc "c" (handle: rawptr) -> c.int {
 
 @(export)
 sqlite3_column_count :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return 0
 	return c.int(engine.embed_column_count(stmt.stmt))
@@ -1282,7 +1282,7 @@ sqlite3_column_count :: proc "c" (handle: rawptr) -> c.int {
 
 @(export)
 sqlite3_column_name :: proc "c" (handle: rawptr, index: c.int) -> cstring {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return nil
 	name := engine.embed_column_name(stmt.stmt, int(index))
@@ -1293,7 +1293,7 @@ sqlite3_column_name :: proc "c" (handle: rawptr, index: c.int) -> cstring {
 
 @(export)
 sqlite3_column_type :: proc "c" (handle: rawptr, index: c.int) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return SQLITE_NULL
 	#partial switch engine.embed_column_type(stmt.stmt, int(index)) {
@@ -1311,13 +1311,13 @@ sqlite3_column_type :: proc "c" (handle: rawptr, index: c.int) -> c.int {
 
 @(export)
 sqlite3_column_int :: proc "c" (handle: rawptr, index: c.int) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return c.int(sqlite3_column_int64(handle, index))
 }
 
 @(export)
 sqlite3_column_int64 :: proc "c" (handle: rawptr, index: c.int) -> c.longlong {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return 0
 	// SQLite's conversion: text is read for its numeric prefix ('42' is 42).
@@ -1328,7 +1328,7 @@ sqlite3_column_int64 :: proc "c" (handle: rawptr, index: c.int) -> c.longlong {
 
 @(export)
 sqlite3_column_double :: proc "c" (handle: rawptr, index: c.int) -> c.double {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return 0
 	value, ok := engine.embed_column_value(stmt.stmt, int(index))
@@ -1338,7 +1338,7 @@ sqlite3_column_double :: proc "c" (handle: rawptr, index: c.int) -> c.double {
 
 @(export)
 sqlite3_column_text :: proc "c" (handle: rawptr, index: c.int) -> cstring {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return nil
 	text, is_null := column_text(stmt, int(index))
@@ -1348,7 +1348,7 @@ sqlite3_column_text :: proc "c" (handle: rawptr, index: c.int) -> cstring {
 
 @(export)
 sqlite3_column_blob :: proc "c" (handle: rawptr, index: c.int) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return nil
 	// Any value has a blob form, as in SQLite: a text's bytes, a number's
@@ -1370,7 +1370,7 @@ sqlite3_column_blob :: proc "c" (handle: rawptr, index: c.int) -> rawptr {
 
 @(export)
 sqlite3_column_bytes :: proc "c" (handle: rawptr, index: c.int) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return 0
 	// SQLite answers the size of the text or blob form of the value, which for a
@@ -1426,20 +1426,20 @@ sqlite_strdup :: proc(text: string) -> cstring {
 
 @(export)
 sqlite3_malloc :: proc "c" (size: c.int) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return sqlite_alloc(int(size))
 }
 
 @(export)
 sqlite3_malloc64 :: proc "c" (size: u64) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if size > u64(max(int) - SQLITE_ALLOC_HEADER) do return nil
 	return sqlite_alloc(int(size))
 }
 
 @(export)
 sqlite3_realloc :: proc "c" (pointer: rawptr, size: c.int) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return sqlite3_realloc64(pointer, u64(max(size, 0)))
 }
 
@@ -1447,7 +1447,7 @@ sqlite3_realloc :: proc "c" (pointer: rawptr, size: c.int) -> rawptr {
 // and answers NULL, and anything else keeps the bytes that fit.
 @(export)
 sqlite3_realloc64 :: proc "c" (pointer: rawptr, size: u64) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if pointer == nil do return sqlite3_malloc64(size)
 	if size == 0 {
 		sqlite3_free(pointer)
@@ -1463,13 +1463,13 @@ sqlite3_realloc64 :: proc "c" (pointer: rawptr, size: u64) -> rawptr {
 
 @(export)
 sqlite3_msize :: proc "c" (pointer: rawptr) -> u64 {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return u64(sqlite_alloc_size(pointer))
 }
 
 @(export)
 sqlite3_free :: proc "c" (pointer: rawptr) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if pointer == nil do return
 	block := rawptr(uintptr(pointer) - SQLITE_ALLOC_HEADER)
 	runtime.mem_free(block, runtime.heap_allocator())
@@ -1481,19 +1481,19 @@ sqlite3_free :: proc "c" (pointer: rawptr) {
 // facade's own name follows SQLite's source id in sqlite3_sourceid.
 @(export)
 sqlite3_libversion :: proc "c" () -> cstring {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return "3.54.1"
 }
 
 @(export)
 sqlite3_initialize :: proc "c" () -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return SQLITE_OK
 }
 
 @(export)
 sqlite3_shutdown :: proc "c" () -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return SQLITE_OK
 }
 
@@ -1504,7 +1504,7 @@ Busy_Callback :: #type proc "c" (arg: rawptr, count: c.int) -> c.int
 // callback fails at once.
 @(export)
 sqlite3_busy_handler :: proc "c" (handle: rawptr, callback: Busy_Callback, arg: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil || db.conn == nil do return SQLITE_MISUSE
 	db.busy_hook, db.busy_arg = callback, arg
@@ -1525,7 +1525,7 @@ busy_bridge :: proc(user: rawptr, count: int) -> bool {
 
 @(export)
 sqlite3_busy_timeout :: proc "c" (handle: rawptr, milliseconds: c.int) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil || db.conn == nil do return SQLITE_MISUSE
 	// A write waits this long for another connection on the same file; the
@@ -1537,7 +1537,7 @@ sqlite3_busy_timeout :: proc "c" (handle: rawptr, milliseconds: c.int) -> c.int 
 
 @(export)
 sqlite3_extended_result_codes :: proc "c" (handle: rawptr, onoff: c.int) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil do return SQLITE_MISUSE
 	db.extended = onoff != 0
@@ -1552,7 +1552,7 @@ sqlite3_extended_result_codes :: proc "c" (handle: rawptr, onoff: c.int) -> c.in
 
 @(export)
 sqlite3_last_insert_rowid :: proc "c" (handle: rawptr) -> c.longlong {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil do return 0
 	return c.longlong(db.conn.store.last_row_id)
@@ -1560,7 +1560,7 @@ sqlite3_last_insert_rowid :: proc "c" (handle: rawptr) -> c.longlong {
 
 @(export)
 sqlite3_set_last_insert_rowid :: proc "c" (handle: rawptr, rowid: c.longlong) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil do return
 	db.conn.store.last_row_id = i64(rowid)
@@ -1568,7 +1568,7 @@ sqlite3_set_last_insert_rowid :: proc "c" (handle: rawptr, rowid: c.longlong) {
 
 @(export)
 sqlite3_changes64 :: proc "c" (handle: rawptr) -> c.longlong {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil do return 0
 	return c.longlong(engine.embed_last_changes(db.conn))
@@ -1578,7 +1578,7 @@ sqlite3_changes64 :: proc "c" (handle: rawptr) -> c.longlong {
 // since the connection opened; it used to answer the last statement's count.
 @(export)
 sqlite3_total_changes64 :: proc "c" (handle: rawptr) -> c.longlong {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil do return 0
 	return c.longlong(db.conn.store.total_changes)
@@ -1588,7 +1588,7 @@ sqlite3_total_changes64 :: proc "c" (handle: rawptr) -> c.longlong {
 // open on the connection, and 1 otherwise.
 @(export)
 sqlite3_get_autocommit :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil do return 1
 	return engine.embed_in_transaction(db.conn) ? 0 : 1
@@ -1596,7 +1596,7 @@ sqlite3_get_autocommit :: proc "c" (handle: rawptr) -> c.int {
 
 @(export)
 sqlite3_db_handle :: proc "c" (handle: rawptr) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return nil
 	return rawptr(stmt.db)
@@ -1607,7 +1607,7 @@ sqlite3_db_handle :: proc "c" (handle: rawptr) -> rawptr {
 // reads the same words.
 @(export)
 sqlite3_errstr :: proc "c" (code: c.int) -> cstring {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	switch code {
 	case 516:
 		return "abort due to ROLLBACK"
@@ -1675,7 +1675,7 @@ sqlite3_errstr :: proc "c" (code: c.int) -> cstring {
 // prepare stopped, or -1 when the last error carries no position.
 @(export)
 sqlite3_error_offset :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil do return -1
 	return db.error_offset
@@ -1685,7 +1685,7 @@ sqlite3_error_offset :: proc "c" (handle: rawptr) -> c.int {
 // it, up to the end of the statement.
 @(export)
 sqlite3_sql :: proc "c" (handle: rawptr) -> cstring {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return nil
 	return stmt.sql_text
@@ -1693,7 +1693,7 @@ sqlite3_sql :: proc "c" (handle: rawptr) -> cstring {
 
 @(export)
 sqlite3_stmt_readonly :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return 0
 	return engine.embed_read_only(stmt.stmt) ? 1 : 0
@@ -1703,7 +1703,7 @@ sqlite3_stmt_readonly :: proc "c" (handle: rawptr) -> c.int {
 // (or a reset).
 @(export)
 sqlite3_stmt_busy :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return 0
 	return engine.embed_busy(stmt.stmt) && !stmt.finished ? 1 : 0
@@ -1711,7 +1711,7 @@ sqlite3_stmt_busy :: proc "c" (handle: rawptr) -> c.int {
 
 @(export)
 sqlite3_stmt_isexplain :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return 0
 	return c.int(engine.embed_explain_mode(stmt.stmt))
@@ -1722,7 +1722,7 @@ sqlite3_stmt_isexplain :: proc "c" (handle: rawptr) -> c.int {
 // returns no rows.
 @(export)
 sqlite3_data_count :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil || !engine.embed_has_row(stmt.stmt) do return 0
 	return c.int(engine.embed_column_count(stmt.stmt))
@@ -1737,7 +1737,7 @@ SQLITE_STMTSTATUS_RUN :: c.int(6)
 // re-prepares) have no meaning in this engine and answer 0.
 @(export)
 sqlite3_stmt_status :: proc "c" (handle: rawptr, op: c.int, reset: c.int) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return 0
 	value := 0
@@ -1756,13 +1756,13 @@ sqlite3_stmt_status :: proc "c" (handle: rawptr, op: c.int, reset: c.int) -> c.i
 // fills afterwards with incremental blob I/O.
 @(export)
 sqlite3_bind_zeroblob :: proc "c" (handle: rawptr, index: c.int, n: c.int) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return sqlite3_bind_zeroblob64(handle, index, u64(max(n, 0)))
 }
 
 @(export)
 sqlite3_bind_zeroblob64 :: proc "c" (handle: rawptr, index: c.int, n: u64) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return SQLITE_MISUSE
 	if int(index) < 1 || int(index) > engine.Embed_Parameter_Count(stmt.stmt) do return SQLITE_RANGE
@@ -1779,7 +1779,7 @@ sqlite3_bind_zeroblob64 :: proc "c" (handle: rawptr, index: c.int, n: u64) -> c.
 // release.
 @(export)
 sqlite3_libversion_number :: proc "c" () -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return 3054001
 }
 
@@ -1825,7 +1825,7 @@ column_origin :: proc(stmt: ^Statement, index: c.int) -> ^Column_Origin_C {
 
 @(export)
 sqlite3_column_decltype :: proc "c" (handle: rawptr, index: c.int) -> cstring {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return nil
 	origin := column_origin(stmt, index)
@@ -1834,7 +1834,7 @@ sqlite3_column_decltype :: proc "c" (handle: rawptr, index: c.int) -> cstring {
 
 @(export)
 sqlite3_column_table_name :: proc "c" (handle: rawptr, index: c.int) -> cstring {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return nil
 	origin := column_origin(stmt, index)
@@ -1843,7 +1843,7 @@ sqlite3_column_table_name :: proc "c" (handle: rawptr, index: c.int) -> cstring 
 
 @(export)
 sqlite3_column_origin_name :: proc "c" (handle: rawptr, index: c.int) -> cstring {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return nil
 	origin := column_origin(stmt, index)
@@ -1852,7 +1852,7 @@ sqlite3_column_origin_name :: proc "c" (handle: rawptr, index: c.int) -> cstring
 
 @(export)
 sqlite3_column_database_name :: proc "c" (handle: rawptr, index: c.int) -> cstring {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return nil
 	origin := column_origin(stmt, index)
@@ -1863,7 +1863,7 @@ sqlite3_column_database_name :: proc "c" (handle: rawptr, index: c.int) -> cstri
 
 @(export)
 sqlite3_bind_parameter_count :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return 0
 	return c.int(engine.Embed_Parameter_Count(stmt.stmt))
@@ -1874,7 +1874,7 @@ sqlite3_bind_parameter_count :: proc "c" (handle: rawptr) -> c.int {
 // of range. The string lives until the statement is finalized.
 @(export)
 sqlite3_bind_parameter_name :: proc "c" (handle: rawptr, index: c.int) -> cstring {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return nil
 	count := engine.Embed_Parameter_Count(stmt.stmt)
@@ -1893,7 +1893,7 @@ sqlite3_bind_parameter_name :: proc "c" (handle: rawptr, index: c.int) -> cstrin
 // and answers its 1-based index, or 0.
 @(export)
 sqlite3_bind_parameter_index :: proc "c" (handle: rawptr, name: cstring) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil || name == nil do return 0
 	return c.int(engine.embed_parameter_index(stmt.stmt, string(name)) + 1)
@@ -2013,7 +2013,7 @@ expand_sql :: proc(stmt: ^Statement) -> string {
 // of its parameters, allocated with sqlite3_malloc for the caller to free.
 @(export)
 sqlite3_expanded_sql :: proc "c" (handle: rawptr) -> cstring {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return nil
 	expanded := expand_sql(stmt)
@@ -2114,7 +2114,7 @@ sqlite3_blob_open :: proc "c" (
 	flags: c.int,
 	ppBlob: ^rawptr,
 ) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil || ppBlob == nil || zTable == nil || zColumn == nil do return SQLITE_MISUSE
 	ppBlob^ = nil
@@ -2155,7 +2155,7 @@ blob_current :: proc(blob: ^Blob) -> c.int {
 
 @(export)
 sqlite3_blob_bytes :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	blob := blob_of(handle)
 	if blob == nil || blob.expired do return 0
 	return c.int(len(blob.data))
@@ -2163,7 +2163,7 @@ sqlite3_blob_bytes :: proc "c" (handle: rawptr) -> c.int {
 
 @(export)
 sqlite3_blob_read :: proc "c" (handle: rawptr, buffer: rawptr, count: c.int, offset: c.int) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	blob := blob_of(handle)
 	if blob == nil || buffer == nil do return SQLITE_MISUSE
 	if count < 0 || offset < 0 || int(offset) + int(count) > len(blob.data) {
@@ -2177,7 +2177,7 @@ sqlite3_blob_read :: proc "c" (handle: rawptr, buffer: rawptr, count: c.int, off
 
 @(export)
 sqlite3_blob_write :: proc "c" (handle: rawptr, buffer: rawptr, count: c.int, offset: c.int) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	blob := blob_of(handle)
 	if blob == nil || buffer == nil do return SQLITE_MISUSE
 	if !blob.writable do return set_error_code(blob.db, SQLITE_READONLY, "attempt to write a readonly database")
@@ -2213,7 +2213,7 @@ sqlite3_blob_write :: proc "c" (handle: rawptr, buffer: rawptr, count: c.int, of
 
 @(export)
 sqlite3_blob_close :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	blob := blob_of(handle)
 	if blob == nil do return SQLITE_OK
 	delete(blob.data)
@@ -2226,7 +2226,7 @@ sqlite3_blob_close :: proc "c" (handle: rawptr) -> c.int {
 
 @(export)
 sqlite3_blob_reopen :: proc "c" (handle: rawptr, iRow: c.longlong) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	blob := blob_of(handle)
 	if blob == nil do return SQLITE_MISUSE
 	data, is_text, has_row, code := blob_fetch(blob.db, blob.table, blob.column, blob.key, i64(iRow))

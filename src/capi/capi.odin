@@ -11,7 +11,6 @@ package capi
 // blobs are length-delimited. Handles are opaque pointers, like the classic
 // embedded database API.
 
-import "base:runtime"
 import "core:c"
 import "core:strings"
 import "core:sync"
@@ -134,7 +133,7 @@ set_misuse :: proc(message: string) {
 
 @(export)
 miraidb_open :: proc "c" (path: cstring) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return miraidb_open_ex(path, 0)
 }
 
@@ -145,7 +144,7 @@ miraidb_open :: proc "c" (path: cstring) -> rawptr {
 // include/miraidb.h because it is the one surprising part of opening.
 @(export)
 miraidb_open_ex :: proc "c" (path: cstring, flags: c.int) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if path == nil do return nil
 	options := engine.Store_Options {
 		persistent = flags & MIRAIDB_OPEN_IN_MEMORY == 0,
@@ -182,7 +181,7 @@ capi_conn :: proc(handle: rawptr) -> ^Capi_Connection {
 
 @(export)
 miraidb_close :: proc "c" (handle: rawptr) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	conn := capi_conn(handle)
 	if conn == nil {
 		set_misuse("connection handle is closed")
@@ -219,7 +218,7 @@ miraidb_close :: proc "c" (handle: rawptr) {
 
 @(export)
 miraidb_errmsg :: proc "c" (handle: rawptr) -> cstring {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	conn := capi_conn(handle)
 	if conn == nil {
 		sync.lock(&misuse_mutex)
@@ -243,7 +242,7 @@ miraidb_errmsg :: proc "c" (handle: rawptr) -> cstring {
 
 @(export)
 miraidb_exec :: proc "c" (handle: rawptr, sql: cstring) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	conn := capi_conn(handle)
 	if conn == nil do return MIRAIDB_MISUSE
 	if sql == nil do return MIRAIDB_ERROR
@@ -255,7 +254,7 @@ miraidb_exec :: proc "c" (handle: rawptr, sql: cstring) -> c.int {
 
 @(export)
 miraidb_backup :: proc "c" (handle: rawptr, path: cstring) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	conn := capi_conn(handle)
 	if conn == nil do return MIRAIDB_MISUSE
 	if path == nil do return MIRAIDB_ERROR
@@ -267,7 +266,7 @@ miraidb_backup :: proc "c" (handle: rawptr, path: cstring) -> c.int {
 
 @(export)
 miraidb_prepare :: proc "c" (handle: rawptr, sql: cstring) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	conn := capi_conn(handle)
 	if conn == nil || sql == nil do return nil
 	statement := engine.embed_prepare(conn.embed, string(sql))
@@ -288,7 +287,7 @@ capi_stmt :: proc(handle: rawptr) -> ^Capi_Statement {
 
 @(export)
 miraidb_finalize :: proc "c" (handle: rawptr) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := capi_stmt(handle)
 	if stmt == nil {
 		set_misuse("statement handle is closed")
@@ -302,7 +301,7 @@ miraidb_finalize :: proc "c" (handle: rawptr) {
 
 @(export)
 miraidb_reset :: proc "c" (handle: rawptr) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := capi_stmt(handle)
 	if stmt == nil {
 		set_misuse("statement handle is closed")
@@ -313,7 +312,7 @@ miraidb_reset :: proc "c" (handle: rawptr) {
 
 @(export)
 miraidb_bind_null :: proc "c" (handle: rawptr, index: c.int) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := capi_stmt(handle)
 	if stmt == nil do return MIRAIDB_MISUSE
 	if !engine.error_drop(engine.embed_bind_null(stmt.embed, int(index))) do return MIRAIDB_ERROR
@@ -322,7 +321,7 @@ miraidb_bind_null :: proc "c" (handle: rawptr, index: c.int) -> c.int {
 
 @(export)
 miraidb_bind_int :: proc "c" (handle: rawptr, index: c.int, value: c.longlong) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := capi_stmt(handle)
 	if stmt == nil do return MIRAIDB_MISUSE
 	if !engine.error_drop(engine.embed_bind_int(stmt.embed, int(index), i64(value))) do return MIRAIDB_ERROR
@@ -331,7 +330,7 @@ miraidb_bind_int :: proc "c" (handle: rawptr, index: c.int, value: c.longlong) -
 
 @(export)
 miraidb_bind_double :: proc "c" (handle: rawptr, index: c.int, value: c.double) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := capi_stmt(handle)
 	if stmt == nil do return MIRAIDB_MISUSE
 	if !engine.error_drop(engine.embed_bind_float(stmt.embed, int(index), f64(value))) do return MIRAIDB_ERROR
@@ -340,7 +339,7 @@ miraidb_bind_double :: proc "c" (handle: rawptr, index: c.int, value: c.double) 
 
 @(export)
 miraidb_bind_text :: proc "c" (handle: rawptr, index: c.int, value: cstring) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := capi_stmt(handle)
 	if stmt == nil do return MIRAIDB_MISUSE
 	if value == nil do return MIRAIDB_ERROR
@@ -350,7 +349,7 @@ miraidb_bind_text :: proc "c" (handle: rawptr, index: c.int, value: cstring) -> 
 
 @(export)
 miraidb_bind_blob :: proc "c" (handle: rawptr, index: c.int, data: rawptr, length: c.int) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := capi_stmt(handle)
 	if stmt == nil do return MIRAIDB_MISUSE
 	if data == nil && length > 0 do return MIRAIDB_ERROR
@@ -366,7 +365,7 @@ miraidb_bind_blob :: proc "c" (handle: rawptr, index: c.int, data: rawptr, lengt
 
 @(export)
 miraidb_step :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := capi_stmt(handle)
 	if stmt == nil do return MIRAIDB_MISUSE
 	has_row, err := engine.embed_step(stmt.embed)
@@ -377,7 +376,7 @@ miraidb_step :: proc "c" (handle: rawptr) -> c.int {
 
 @(export)
 miraidb_changes :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := capi_stmt(handle)
 	if stmt == nil do return 0
 	return c.int(engine.embed_changes(stmt.embed))
@@ -385,7 +384,7 @@ miraidb_changes :: proc "c" (handle: rawptr) -> c.int {
 
 @(export)
 miraidb_column_count :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := capi_stmt(handle)
 	if stmt == nil do return 0
 	return c.int(engine.embed_column_count(stmt.embed))
@@ -393,7 +392,7 @@ miraidb_column_count :: proc "c" (handle: rawptr) -> c.int {
 
 @(export)
 miraidb_column_name :: proc "c" (handle: rawptr, index: c.int) -> cstring {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := capi_stmt(handle)
 	if stmt == nil do return ""
 	name := engine.embed_column_name(stmt.embed, int(index))
@@ -403,7 +402,7 @@ miraidb_column_name :: proc "c" (handle: rawptr, index: c.int) -> cstring {
 
 @(export)
 miraidb_column_type :: proc "c" (handle: rawptr, index: c.int) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := capi_stmt(handle)
 	if stmt == nil do return CAPI_NULL
 	#partial switch engine.embed_column_type(stmt.embed, int(index)) {
@@ -425,7 +424,7 @@ miraidb_column_type :: proc "c" (handle: rawptr, index: c.int) -> c.int {
 
 @(export)
 miraidb_column_int :: proc "c" (handle: rawptr, index: c.int) -> c.longlong {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := capi_stmt(handle)
 	if stmt == nil do return 0
 	return c.longlong(engine.embed_column_int(stmt.embed, int(index)))
@@ -433,7 +432,7 @@ miraidb_column_int :: proc "c" (handle: rawptr, index: c.int) -> c.longlong {
 
 @(export)
 miraidb_column_double :: proc "c" (handle: rawptr, index: c.int) -> c.double {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := capi_stmt(handle)
 	if stmt == nil do return 0
 	return c.double(engine.embed_column_float(stmt.embed, int(index)))
@@ -441,7 +440,7 @@ miraidb_column_double :: proc "c" (handle: rawptr, index: c.int) -> c.double {
 
 @(export)
 miraidb_column_text :: proc "c" (handle: rawptr, index: c.int) -> cstring {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := capi_stmt(handle)
 	if stmt == nil do return ""
 	text := engine.embed_column_text(stmt.embed, int(index))
@@ -451,7 +450,7 @@ miraidb_column_text :: proc "c" (handle: rawptr, index: c.int) -> cstring {
 
 @(export)
 miraidb_column_bytes :: proc "c" (handle: rawptr, index: c.int, length: ^c.int) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := capi_stmt(handle)
 	if stmt == nil {
 		if length != nil do length^ = 0
@@ -465,7 +464,7 @@ miraidb_column_bytes :: proc "c" (handle: rawptr, index: c.int, length: ^c.int) 
 
 @(export)
 miraidb_column_is_null :: proc "c" (handle: rawptr, index: c.int) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := capi_stmt(handle)
 	if stmt == nil do return 1
 	return engine.embed_column_is_null(stmt.embed, int(index)) ? 1 : 0
@@ -476,7 +475,7 @@ miraidb_column_is_null :: proc "c" (handle: rawptr, index: c.int) -> c.int {
 // limit API, and nothing about it reaches the log (D23).
 @(export)
 miraidb_set_row_quota :: proc "c" (handle: rawptr, rows: c.ulonglong) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	conn := capi_conn(handle)
 	if conn == nil do return MIRAIDB_MISUSE
 	engine.store_set_row_quota(conn.embed.store, u64(rows))
@@ -487,7 +486,7 @@ miraidb_set_row_quota :: proc "c" (handle: rawptr, rows: c.ulonglong) -> c.int {
 // units miraidb_work_used reports (zero removes the cap).
 @(export)
 miraidb_set_work_budget :: proc "c" (handle: rawptr, units: c.ulonglong) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	conn := capi_conn(handle)
 	if conn == nil do return MIRAIDB_MISUSE
 	engine.store_set_work_budget(conn.embed.store, u64(units))
@@ -497,7 +496,7 @@ miraidb_set_work_budget :: proc "c" (handle: rawptr, units: c.ulonglong) -> c.in
 // miraidb_work_used is what the statements on this connection have spent so far.
 @(export)
 miraidb_work_used :: proc "c" (handle: rawptr) -> c.ulonglong {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	conn := capi_conn(handle)
 	if conn == nil do return 0
 	return c.ulonglong(engine.store_work_used(conn.embed.store))
@@ -509,7 +508,7 @@ miraidb_work_used :: proc "c" (handle: rawptr) -> c.ulonglong {
 // the sqlite3 face). A call with a dead handle is misuse and does nothing.
 @(export)
 miraidb_interrupt :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	conn := capi_conn(handle)
 	if conn == nil do return MIRAIDB_MISUSE
 	engine.store_cancel(conn.embed.store)
@@ -603,7 +602,7 @@ miraidb_create_function :: proc "c" (
 	callback: Capi_Function_Callback,
 	user: rawptr,
 ) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	conn := capi_conn(handle)
 	if conn == nil do return MIRAIDB_MISUSE
 	if name == nil || callback == nil do return MIRAIDB_ERROR
@@ -664,7 +663,7 @@ miraidb_create_collation :: proc "c" (
 	callback: Capi_Collation_Callback,
 	user: rawptr,
 ) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	conn := capi_conn(handle)
 	if conn == nil do return MIRAIDB_MISUSE
 	if name == nil || callback == nil do return MIRAIDB_ERROR
@@ -686,7 +685,7 @@ miraidb_create_collation :: proc "c" (
 // there and MIRAIDB_ERROR when the name was not registered.
 @(export)
 miraidb_unregister_collation :: proc "c" (handle: rawptr, name: cstring) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	conn := capi_conn(handle)
 	if conn == nil do return MIRAIDB_MISUSE
 	if name == nil do return MIRAIDB_ERROR
@@ -712,7 +711,7 @@ miraidb_unregister_collation :: proc "c" (handle: rawptr, name: cstring) -> c.in
 // path, not a privileged one.
 @(export)
 miraidb_set_identity :: proc "c" (handle: rawptr, identity: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	conn := capi_conn(handle)
 	if conn == nil do return MIRAIDB_MISUSE
 	if identity == nil do return MIRAIDB_ERROR
@@ -725,7 +724,7 @@ miraidb_set_identity :: proc "c" (handle: rawptr, identity: rawptr) -> c.int {
 // returns the number of bytes written, or MIRAIDB_MISUSE for a dead handle.
 @(export)
 miraidb_identity :: proc "c" (handle: rawptr, out: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	conn := capi_conn(handle)
 	if conn == nil do return MIRAIDB_MISUSE
 	if out == nil do return MIRAIDB_ERROR
@@ -740,7 +739,7 @@ miraidb_identity :: proc "c" (handle: rawptr, out: rawptr) -> c.int {
 // token (miraidb_errmsg says which), or MIRAIDB_MISUSE for a dead handle.
 @(export)
 miraidb_authenticate :: proc "c" (handle: rawptr, token: cstring) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	conn := capi_conn(handle)
 	if conn == nil do return MIRAIDB_MISUSE
 	if token == nil do return MIRAIDB_ERROR
@@ -757,7 +756,7 @@ miraidb_authenticate :: proc "c" (handle: rawptr, token: cstring) -> c.int {
 // more always succeeds. TTL is in microseconds and zero means it never expires.
 @(export)
 miraidb_issue_token :: proc "c" (handle: rawptr, identity: rawptr, ttl_us: c.longlong, out: cstring, out_len: c.ulonglong) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	conn := capi_conn(handle)
 	if conn == nil do return MIRAIDB_MISUSE
 	if identity == nil || out == nil do return MIRAIDB_ERROR
@@ -776,6 +775,6 @@ miraidb_issue_token :: proc "c" (handle: rawptr, identity: rawptr, ttl_us: c.lon
 
 @(export)
 miraidb_version :: proc "c" () -> cstring {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return engine.ENGINE_VERSION_TEXT
 }

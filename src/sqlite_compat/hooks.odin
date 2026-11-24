@@ -7,7 +7,6 @@ package sqlite_compat
 // NULL callback removes it. The engine calls them through the store's hooks
 // (src/engine/hooks.odin).
 
-import "base:runtime"
 import "core:c"
 import "core:strings"
 import "core:time"
@@ -57,7 +56,7 @@ hook_row :: proc(ctx: rawptr, change: engine.Row_Change, table: string, rowid: i
 
 @(export)
 sqlite3_commit_hook :: proc "c" (handle: rawptr, callback: Commit_Callback, arg: rawptr) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil do return nil
 	previous := db.commit_arg
@@ -71,7 +70,7 @@ sqlite3_commit_hook :: proc "c" (handle: rawptr, callback: Commit_Callback, arg:
 
 @(export)
 sqlite3_rollback_hook :: proc "c" (handle: rawptr, callback: Destroy_Callback, arg: rawptr) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil do return nil
 	previous := db.rollback_arg
@@ -85,7 +84,7 @@ sqlite3_rollback_hook :: proc "c" (handle: rawptr, callback: Destroy_Callback, a
 
 @(export)
 sqlite3_update_hook :: proc "c" (handle: rawptr, callback: Update_Callback, arg: rawptr) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil do return nil
 	previous := db.update_arg
@@ -112,7 +111,7 @@ hook_progress :: proc(ctx: rawptr) -> bool {
 // callback or a count under 1 removes it.
 @(export)
 sqlite3_progress_handler :: proc "c" (handle: rawptr, every: c.int, callback: Progress_Callback, arg: rawptr) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil do return
 	db.progress_hook = callback
@@ -144,7 +143,7 @@ SQLITE_TRACE_LEGACY :: c.uint(0x40)
 // answers the argument the previous one had.
 @(export)
 sqlite3_trace :: proc "c" (handle: rawptr, callback: Legacy_Trace_Callback, ctx: rawptr) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil do return nil
 	previous := db.trace_arg
@@ -161,7 +160,7 @@ sqlite3_trace :: proc "c" (handle: rawptr, callback: Legacy_Trace_Callback, ctx:
 // a NULL callback turns it off.
 @(export)
 sqlite3_trace_v2 :: proc "c" (handle: rawptr, mask: c.uint, callback: Trace_Callback, ctx: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil do return SQLITE_MISUSE
 	if callback == nil do db.trace_mask = 0
@@ -249,7 +248,7 @@ hook_authorize :: proc(ctx: rawptr, request: engine.Auth_Request) -> engine.Auth
 // nothing. A NULL callback removes it.
 @(export)
 sqlite3_set_authorizer :: proc "c" (handle: rawptr, callback: Authorizer_Callback, arg: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil do return SQLITE_MISUSE
 	db.authorizer = callback

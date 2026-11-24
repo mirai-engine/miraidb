@@ -7,7 +7,6 @@ package sqlite_compat
 // representation is handed UTF-16 bytes, as in SQLite. sqlite3_collation_needed
 // lets a program register one the first time a statement names it.
 
-import "base:runtime"
 import "core:c"
 import "core:strings"
 
@@ -124,7 +123,7 @@ set_error_code :: proc(db: ^Database, code: c.int, message: string) -> c.int {
 
 @(export)
 sqlite3_create_collation :: proc "c" (handle: rawptr, name: cstring, text_rep: c.int, arg: rawptr, compare: Collation_Callback) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if name == nil do return SQLITE_MISUSE
 	return create_collation(handle, string(name), text_rep, arg, compare, nil)
 }
@@ -138,14 +137,14 @@ sqlite3_create_collation_v2 :: proc "c" (
 	compare: Collation_Callback,
 	destroy: Destroy_Callback,
 ) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if name == nil do return SQLITE_MISUSE
 	return create_collation(handle, string(name), text_rep, arg, compare, destroy)
 }
 
 @(export)
 sqlite3_create_collation16 :: proc "c" (handle: rawptr, name: rawptr, text_rep: c.int, arg: rawptr, compare: Collation_Callback) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if name == nil do return SQLITE_MISUSE
 	decoded := utf16_decode(name, -1, NATIVE_BIG_ENDIAN)
 	defer delete(decoded)
@@ -174,7 +173,7 @@ collation_needed_install :: proc(db: ^Database) {
 
 @(export)
 sqlite3_collation_needed :: proc "c" (handle: rawptr, arg: rawptr, callback: Collation_Needed_Callback) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil do return SQLITE_MISUSE
 	db.collation_needed = callback
@@ -186,7 +185,7 @@ sqlite3_collation_needed :: proc "c" (handle: rawptr, arg: rawptr, callback: Col
 
 @(export)
 sqlite3_collation_needed16 :: proc "c" (handle: rawptr, arg: rawptr, callback: Collation_Needed16_Callback) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil do return SQLITE_MISUSE
 	db.collation_needed16 = callback

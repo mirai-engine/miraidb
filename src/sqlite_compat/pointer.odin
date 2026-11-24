@@ -133,7 +133,7 @@ step_pointers_end :: proc(mark: int) {
 
 @(export)
 sqlite3_bind_pointer :: proc "c" (handle: rawptr, index: c.int, data: rawptr, type: cstring, destroy: Destroy_Callback) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil {
 		if destroy != nil do destroy(data)
@@ -155,7 +155,7 @@ sqlite3_bind_pointer :: proc "c" (handle: rawptr, index: c.int, data: rawptr, ty
 
 @(export)
 sqlite3_result_pointer :: proc "c" (handle: rawptr, data: rawptr, type: cstring, destroy: Destroy_Callback) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	ctx := context_of(handle)
 	if ctx == nil {
 		if destroy != nil do destroy(data)
@@ -168,7 +168,7 @@ sqlite3_result_pointer :: proc "c" (handle: rawptr, data: rawptr, type: cstring,
 
 @(export)
 sqlite3_value_pointer :: proc "c" (handle: rawptr, type: cstring) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	box := box_of(handle)
 	if box == nil do return nil
 	return pointer_of(box.value, type)

@@ -87,6 +87,8 @@ apply_limits :: proc(store: ^db.Store) -> ^db.Store {
 }
 
 main :: proc() {
+	// A refused allocation fails its statement, not the process (D23).
+	context.allocator = db.oom_heap_allocator()
 	args := cli_args(context.temp_allocator)
 	if len(args) < 2 {
 		fmt.println(USAGE)

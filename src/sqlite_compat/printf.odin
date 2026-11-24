@@ -158,7 +158,7 @@ when ODIN_OS == .Windows {
 
 @(export)
 sqlite3_mprintf :: proc "c" (format: cstring, #c_vararg args: ..any) -> cstring {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	list: intrinsics.c_va_list
 	intrinsics.c_va_start(&list, args)
 	defer intrinsics.c_va_end(&list)
@@ -170,7 +170,7 @@ sqlite3_mprintf :: proc "c" (format: cstring, #c_vararg args: ..any) -> cstring 
 
 @(export)
 sqlite3_vmprintf :: proc "c" (format: cstring, list: C_Va_List) -> cstring {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	list := list
 	s: Sqlite_Str
 	defer delete(s.text)
@@ -189,7 +189,7 @@ snprintf_into :: proc(n: c.int, buffer: [^]u8, s: ^Sqlite_Str) {
 
 @(export)
 sqlite3_snprintf :: proc "c" (n: c.int, buffer: [^]u8, format: cstring, #c_vararg args: ..any) -> cstring {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if n <= 0 do return cstring(buffer)
 	list: intrinsics.c_va_list
 	intrinsics.c_va_start(&list, args)
@@ -203,7 +203,7 @@ sqlite3_snprintf :: proc "c" (n: c.int, buffer: [^]u8, format: cstring, #c_varar
 
 @(export)
 sqlite3_vsnprintf :: proc "c" (n: c.int, buffer: [^]u8, format: cstring, list: C_Va_List) -> cstring {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if n <= 0 do return cstring(buffer)
 	list := list
 	s: Sqlite_Str
@@ -215,7 +215,7 @@ sqlite3_vsnprintf :: proc "c" (n: c.int, buffer: [^]u8, format: cstring, list: C
 
 @(export)
 sqlite3_str_new :: proc "c" (db: rawptr) -> ^Sqlite_Str {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	s := new(Sqlite_Str, runtime.heap_allocator())
 	s.text = make([dynamic]u8, runtime.heap_allocator())
 	return s
@@ -223,7 +223,7 @@ sqlite3_str_new :: proc "c" (db: rawptr) -> ^Sqlite_Str {
 
 @(export)
 sqlite3_str_finish :: proc "c" (s: ^Sqlite_Str) -> cstring {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if s == nil do return nil
 	text := str_finish_text(s, true)
 	delete(s.text)
@@ -233,7 +233,7 @@ sqlite3_str_finish :: proc "c" (s: ^Sqlite_Str) -> cstring {
 
 @(export)
 sqlite3_str_free :: proc "c" (s: ^Sqlite_Str) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if s == nil do return
 	delete(s.text)
 	free(s, runtime.heap_allocator())
@@ -241,7 +241,7 @@ sqlite3_str_free :: proc "c" (s: ^Sqlite_Str) {
 
 @(export)
 sqlite3_str_appendf :: proc "c" (s: ^Sqlite_Str, format: cstring, #c_vararg args: ..any) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if s == nil do return
 	list: intrinsics.c_va_list
 	intrinsics.c_va_start(&list, args)
@@ -251,7 +251,7 @@ sqlite3_str_appendf :: proc "c" (s: ^Sqlite_Str, format: cstring, #c_vararg args
 
 @(export)
 sqlite3_str_vappendf :: proc "c" (s: ^Sqlite_Str, format: cstring, list: C_Va_List) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if s == nil do return
 	list := list
 	str_vappendf(s, format, va_source(&list))
@@ -259,35 +259,35 @@ sqlite3_str_vappendf :: proc "c" (s: ^Sqlite_Str, format: cstring, list: C_Va_Li
 
 @(export)
 sqlite3_str_append :: proc "c" (s: ^Sqlite_Str, z: [^]u8, n: c.int) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if s == nil || z == nil || n <= 0 do return
 	str_put(s, z[:n])
 }
 
 @(export)
 sqlite3_str_appendall :: proc "c" (s: ^Sqlite_Str, z: cstring) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if s == nil do return
 	str_put(s, cstring_bytes(z))
 }
 
 @(export)
 sqlite3_str_appendchar :: proc "c" (s: ^Sqlite_Str, n: c.int, ch: c.char) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if s == nil do return
 	str_put_char(s, int(n), u8(ch))
 }
 
 @(export)
 sqlite3_str_reset :: proc "c" (s: ^Sqlite_Str) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if s == nil do return
 	clear(&s.text)
 }
 
 @(export)
 sqlite3_str_truncate :: proc "c" (s: ^Sqlite_Str, n: c.int) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if s == nil || s.error != 0 || n < 0 || int(n) >= len(s.text) do return
 	resize(&s.text, int(n))
 }
@@ -307,7 +307,7 @@ sqlite3_str_length :: proc "c" (s: ^Sqlite_Str) -> c.int {
 // sqlite3_str_value is the text so far, terminated, or NULL when there is none.
 @(export)
 sqlite3_str_value :: proc "c" (s: ^Sqlite_Str) -> cstring {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if s == nil || len(s.text) == 0 do return nil
 	append(&s.text, 0)
 	pop(&s.text)

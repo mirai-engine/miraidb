@@ -5,7 +5,6 @@ package sqlite_compat
 // configuration, extension loading, and the small string helpers. Python's own
 // sqlite3 module links every one of them (scripts/python_sqlite3.py).
 
-import "base:runtime"
 import "core:c"
 import "core:strings"
 import "core:time"
@@ -29,7 +28,7 @@ sqlite3_create_window_function :: proc "c" (
 	inverse: Function_Callback,
 	destroy: Destroy_Callback,
 ) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	// All four or none, as SQLite asks.
 	given := int(step != nil) + int(final != nil) + int(value != nil) + int(inverse != nil)
 	if given != 0 && given != 4 {
@@ -54,14 +53,14 @@ sqlite3_create_window_function :: proc "c" (
 // only spaces or comments follow.
 @(export)
 sqlite3_complete :: proc "c" (sql: cstring) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if sql == nil do return 0
 	return sql_complete(string(sql)) ? 1 : 0
 }
 
 @(export)
 sqlite3_complete16 :: proc "c" (sql: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if sql == nil do return 0
 	units := ([^]u16)(sql)
 	n := 0
@@ -183,7 +182,7 @@ sql_complete :: proc(text: string) -> bool {
 // sqlite3_incomplete is sql_incomplete for a C string; NULL is SQLITE_MISUSE.
 @(export)
 sqlite3_incomplete :: proc "c" (sql: cstring) -> i64 {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if sql == nil do return i64(SQLITE_MISUSE)
 	return sql_incomplete(string(sql))
 }
@@ -222,7 +221,7 @@ connection_limit :: proc(db: ^Database, id: int) -> c.int {
 
 @(export)
 sqlite3_limit :: proc "c" (handle: rawptr, id: c.int, value: c.int) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil || id < 0 || id >= SQLITE_LIMIT_COUNT do return -1
 	if !db.limits_set {
@@ -260,7 +259,7 @@ dbconfig_default :: proc(op: int) -> c.int {
 // arguments arrive where fixed ones would on the platforms this builds for.
 @(export)
 sqlite3_db_config :: proc "c" (handle: rawptr, op: c.int, first: uintptr, second: uintptr, third: uintptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil do return SQLITE_MISUSE
 	switch {
@@ -293,7 +292,7 @@ sqlite3_db_config :: proc "c" (handle: rawptr, op: c.int, first: uintptr, second
 // a reason. Enabling the call is accepted.
 @(export)
 sqlite3_enable_load_extension :: proc "c" (handle: rawptr, onoff: c.int) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil do return SQLITE_MISUSE
 	db.extensions_enabled = onoff != 0
@@ -302,7 +301,7 @@ sqlite3_enable_load_extension :: proc "c" (handle: rawptr, onoff: c.int) -> c.in
 
 @(export)
 sqlite3_load_extension :: proc "c" (handle: rawptr, file: cstring, entry: cstring, errmsg: ^cstring) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if errmsg != nil do errmsg^ = nil
 	db := db_of(handle)
 	if db == nil do return SQLITE_MISUSE
@@ -335,7 +334,7 @@ sqlite3_threadsafe :: proc "c" () -> c.int {
 
 @(export)
 sqlite3_sleep :: proc "c" (milliseconds: c.int) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if milliseconds > 0 do time.sleep(time.Duration(milliseconds) * time.Millisecond)
 	return max(milliseconds, 0)
 }
@@ -369,14 +368,14 @@ sqlite3_strnicmp :: proc "c" (a: cstring, b: cstring, n: c.int) -> c.int {
 // sqlite3_strglob and sqlite3_strlike answer 0 for a match, as SQLite does.
 @(export)
 sqlite3_strglob :: proc "c" (pattern: cstring, text: cstring) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if pattern == nil || text == nil do return 1
 	return engine.glob_match(string(text), string(pattern)) ? 0 : 1
 }
 
 @(export)
 sqlite3_strlike :: proc "c" (pattern: cstring, text: cstring, escape: c.uint) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if pattern == nil || text == nil do return 1
 	return engine.like_match(string(text), string(pattern), true, u8(escape)) ? 0 : 1
 }

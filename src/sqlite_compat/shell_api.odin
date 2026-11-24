@@ -10,7 +10,6 @@ package sqlite_compat
 // them: zero counters, SQLITE_NOTFOUND for a file control it does not know.
 
 import "base:intrinsics"
-import "base:runtime"
 import "core:c"
 import "core:crypto"
 import "core:os"
@@ -26,7 +25,7 @@ import engine "../engine"
 // sqlite3_bind_value binds a copy of a value, by its type, as SQLite does.
 @(export)
 sqlite3_bind_value :: proc "c" (handle: rawptr, index: c.int, value: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	switch sqlite3_value_type(value) {
 	case SQLITE_INTEGER:
 		return sqlite3_bind_int64(handle, index, sqlite3_value_int64(value))
@@ -48,7 +47,7 @@ SQLITE_TRANSIENT_POINTER :: rawptr(~uintptr(0))
 // statement steps, resets or is finalized (an unprotected value).
 @(export)
 sqlite3_column_value :: proc "c" (handle: rawptr, index: c.int) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return nil
 	value, ok := engine.embed_column_value(stmt.stmt, int(index))
@@ -79,7 +78,7 @@ SQLITE_FINISH :: c.int(2)
 // the builder freed (SQLITE_FINISH). A builder in error passes its error on.
 @(export)
 sqlite3_result_str :: proc "c" (handle: rawptr, s: ^Sqlite_Str, own: c.int) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if handle == nil || s == nil do return
 	switch s.error {
 	case SQLITE_NOMEM:
@@ -132,7 +131,7 @@ sqlite3_status :: proc "c" (op: c.int, current: ^c.int, highwater: ^c.int, reset
 // counters, which SQLite keeps and the engine does not: zero, SQLITE_OK.
 @(export)
 sqlite3_db_status64 :: proc "c" (handle: rawptr, op: c.int, current: ^i64, highwater: ^i64, reset: c.int) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if db_of(handle) == nil do return SQLITE_MISUSE
 	if op < 0 || op > 13 do return SQLITE_ERROR
 	if current != nil do current^ = 0
@@ -142,7 +141,7 @@ sqlite3_db_status64 :: proc "c" (handle: rawptr, op: c.int, current: ^i64, highw
 
 @(export)
 sqlite3_db_status :: proc "c" (handle: rawptr, op: c.int, current: ^c.int, highwater: ^c.int, reset: c.int) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if db_of(handle) == nil do return SQLITE_MISUSE
 	if op < 0 || op > 13 do return SQLITE_ERROR
 	if current != nil do current^ = 0
@@ -158,7 +157,7 @@ SQLITE_FCNTL_DATA_VERSION :: c.int(35)
 // answers for an operation the file does not understand.
 @(export)
 sqlite3_file_control :: proc "c" (handle: rawptr, schema: cstring, op: c.int, argument: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil do return SQLITE_MISUSE
 	if op == SQLITE_FCNTL_DATA_VERSION && argument != nil {
@@ -225,7 +224,7 @@ sqlite3_keyword_check :: proc "c" (text: [^]u8, n: c.int) -> c.int {
 // source; a count of zero or less does nothing.
 @(export)
 sqlite3_randomness :: proc "c" (n: c.int, buffer: rawptr) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if n <= 0 || buffer == nil do return
 	crypto.rand_bytes(([^]u8)(buffer)[:n])
 }
@@ -290,7 +289,7 @@ vfs_open :: proc "c" (vfs: ^Sqlite_Vfs, name: cstring, file: rawptr, flags: c.in
 
 @(private)
 vfs_delete :: proc "c" (vfs: ^Sqlite_Vfs, name: cstring, sync_dir: c.int) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if name == nil do return SQLITE_OK
 	if os.exists(string(name)) && os.remove(string(name)) != nil do return SQLITE_IOERR
 	return SQLITE_OK
@@ -298,14 +297,14 @@ vfs_delete :: proc "c" (vfs: ^Sqlite_Vfs, name: cstring, sync_dir: c.int) -> c.i
 
 @(private)
 vfs_access :: proc "c" (vfs: ^Sqlite_Vfs, name: cstring, flags: c.int, result: ^c.int) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if result != nil do result^ = name != nil && os.exists(string(name)) ? 1 : 0
 	return SQLITE_OK
 }
 
 @(private)
 vfs_full_pathname :: proc "c" (vfs: ^Sqlite_Vfs, name: cstring, n: c.int, out: [^]u8) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if name == nil || out == nil || n <= 0 do return SQLITE_ERROR
 	absolute, abs_err := filepath.abs(string(name), context.temp_allocator)
 	if abs_err != nil do absolute = string(name)
@@ -341,7 +340,7 @@ vfs_randomness :: proc "c" (vfs: ^Sqlite_Vfs, n: c.int, out: [^]u8) -> c.int {
 
 @(private)
 vfs_sleep :: proc "c" (vfs: ^Sqlite_Vfs, microseconds: c.int) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	time.sleep(time.Duration(max(microseconds, 0)) * time.Microsecond)
 	return microseconds
 }
@@ -349,7 +348,7 @@ vfs_sleep :: proc "c" (vfs: ^Sqlite_Vfs, microseconds: c.int) -> c.int {
 // Julian day numbers, as SQLite's VFS reports the time.
 @(private)
 vfs_current_time_i64 :: proc "c" (vfs: ^Sqlite_Vfs, out: ^i64) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	unix_ms := time.time_to_unix_nano(time.now()) / 1_000_000
 	if out != nil do out^ = unix_ms + 210866760000000
 	return SQLITE_OK
@@ -372,7 +371,7 @@ vfs_get_last_error :: proc "c" (vfs: ^Sqlite_Vfs, n: c.int, out: [^]u8) -> c.int
 // sqlite3_vfs_find names a registered VFS; NULL asks for the default.
 @(export)
 sqlite3_vfs_find :: proc "c" (name: cstring) -> ^Sqlite_Vfs {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if name == nil do return vfs_list
 	for vfs := vfs_list; vfs != nil; vfs = vfs.next {
 		if vfs.name != nil && string(vfs.name) == string(name) do return vfs
@@ -429,7 +428,7 @@ Client_Data :: struct {
 // destructors run when the connection closes.
 @(export)
 sqlite3_set_clientdata :: proc "c" (handle: rawptr, name: cstring, data: rawptr, destroy: proc "c" (data: rawptr)) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil || name == nil do return SQLITE_MISUSE
 	key := string(name)
@@ -452,7 +451,7 @@ sqlite3_set_clientdata :: proc "c" (handle: rawptr, name: cstring, data: rawptr,
 
 @(export)
 sqlite3_get_clientdata :: proc "c" (handle: rawptr, name: cstring) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil || name == nil do return nil
 	if entry, found := db.clientdata[string(name)]; found do return entry.data
@@ -476,7 +475,7 @@ clientdata_close :: proc(db: ^Database) {
 // prefix it asks for; one that has started is SQLITE_BUSY, as in SQLite.
 @(export)
 sqlite3_stmt_explain :: proc "c" (handle: rawptr, mode: c.int) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return SQLITE_MISUSE
 	if mode < 0 || mode > 2 do return SQLITE_ERROR
@@ -528,7 +527,7 @@ sqlite3_compileoption_get :: proc "c" (n: c.int) -> cstring {
 // without SQLITE_, matched without regard to case up to an `=`.
 @(export)
 sqlite3_compileoption_used :: proc "c" (name: cstring) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if name == nil do return 0
 	wanted := string(name)
 	if len(wanted) >= 7 && strings.equal_fold(wanted[:7], "SQLITE_") do wanted = wanted[7:]
@@ -555,7 +554,7 @@ sqlite3_table_column_metadata :: proc "c" (
 	primary_key: ^c.int,
 	auto_increment: ^c.int,
 ) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil || table == nil do return SQLITE_MISUSE
 	column_name := column == nil ? "" : string(column)
@@ -593,7 +592,7 @@ sqlite3_filename_database :: proc "c" (filename: cstring) -> cstring {
 // sqlite3_malloc, which the caller frees with sqlite3_free.
 @(export)
 sqlite3_win32_utf8_to_unicode :: proc "c" (text: cstring) -> [^]u16 {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if text == nil do return nil
 	bytes := cstring_bytes(text)
 	units := make([dynamic]u16, 0, len(bytes) + 1, context.temp_allocator)

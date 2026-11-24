@@ -10,7 +10,6 @@ package sqlite_compat
 //
 // "16" alone is the machine's byte order; LE and BE name one.
 
-import "base:runtime"
 import "core:c"
 import "core:strings"
 
@@ -106,7 +105,7 @@ text_encoding_order :: proc(encoding: c.int) -> (utf16: bool, big_endian: bool) 
 
 @(export)
 sqlite3_open16 :: proc "c" (filename: rawptr, ppDb: ^rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if filename == nil {
 		if ppDb != nil do ppDb^ = nil
 		return SQLITE_MISUSE
@@ -120,7 +119,7 @@ sqlite3_open16 :: proc "c" (filename: rawptr, ppDb: ^rawptr) -> c.int {
 
 @(export)
 sqlite3_errmsg16 :: proc "c" (handle: rawptr) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	message := sqlite3_errmsg(handle)
 	db := db_of(handle)
 	if db == nil {
@@ -158,19 +157,19 @@ prepare16 :: proc(handle: rawptr, sql: rawptr, nByte: c.int, ppStmt: ^rawptr, pz
 
 @(export)
 sqlite3_prepare16 :: proc "c" (handle: rawptr, sql: rawptr, nByte: c.int, ppStmt: ^rawptr, pzTail: ^rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return prepare16(handle, sql, nByte, ppStmt, pzTail)
 }
 
 @(export)
 sqlite3_prepare16_v2 :: proc "c" (handle: rawptr, sql: rawptr, nByte: c.int, ppStmt: ^rawptr, pzTail: ^rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return prepare16(handle, sql, nByte, ppStmt, pzTail)
 }
 
 @(export)
 sqlite3_prepare16_v3 :: proc "c" (handle: rawptr, sql: rawptr, nByte: c.int, flags: c.uint, ppStmt: ^rawptr, pzTail: ^rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	_ = flags
 	return prepare16(handle, sql, nByte, ppStmt, pzTail)
 }
@@ -186,7 +185,7 @@ sqlite3_create_function16 :: proc "c" (
 	step: Function_Callback,
 	final: Final_Callback,
 ) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if name == nil do return create_function(handle, nil, arity, user, func, step, final, nil, text_rep)
 	decoded := utf16_decode(name, -1, NATIVE_BIG_ENDIAN)
 	defer delete(decoded)
@@ -217,14 +216,14 @@ bind_text_utf16 :: proc(handle: rawptr, index: c.int, data: rawptr, n: i64, dest
 
 @(export)
 sqlite3_bind_text16 :: proc "c" (handle: rawptr, index: c.int, data: rawptr, n: c.int, destructor: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return bind_text_utf16(handle, index, data, i64(n), destructor, NATIVE_BIG_ENDIAN)
 }
 
 // sqlite3_bind_text64 binds text in any of SQLite's encodings.
 @(export)
 sqlite3_bind_text64 :: proc "c" (handle: rawptr, index: c.int, data: cstring, n: u64, destructor: rawptr, encoding: u8) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	length := n > u64(max(i64)) ? -1 : i64(n)
 	if is_utf16, big_endian := text_encoding_order(c.int(encoding)); is_utf16 {
 		return bind_text_utf16(handle, index, rawptr(data), length, destructor, big_endian)
@@ -251,7 +250,7 @@ column_text16 :: proc(stmt: ^Statement, index: int) -> []u16 {
 
 @(export)
 sqlite3_column_text16 :: proc "c" (handle: rawptr, index: c.int) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return nil
 	units := column_text16(stmt, int(index))
@@ -263,7 +262,7 @@ sqlite3_column_text16 :: proc "c" (handle: rawptr, index: c.int) -> rawptr {
 // without the terminator.
 @(export)
 sqlite3_column_bytes16 :: proc "c" (handle: rawptr, index: c.int) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	stmt := stmt_of(handle)
 	if stmt == nil do return 0
 	return utf16_bytes(column_text16(stmt, int(index)))
@@ -280,31 +279,31 @@ name16 :: proc(stmt: ^Statement, name: cstring) -> rawptr {
 
 @(export)
 sqlite3_column_name16 :: proc "c" (handle: rawptr, index: c.int) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return name16(stmt_of(handle), sqlite3_column_name(handle, index))
 }
 
 @(export)
 sqlite3_column_decltype16 :: proc "c" (handle: rawptr, index: c.int) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return name16(stmt_of(handle), sqlite3_column_decltype(handle, index))
 }
 
 @(export)
 sqlite3_column_database_name16 :: proc "c" (handle: rawptr, index: c.int) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return name16(stmt_of(handle), sqlite3_column_database_name(handle, index))
 }
 
 @(export)
 sqlite3_column_table_name16 :: proc "c" (handle: rawptr, index: c.int) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return name16(stmt_of(handle), sqlite3_column_table_name(handle, index))
 }
 
 @(export)
 sqlite3_column_origin_name16 :: proc "c" (handle: rawptr, index: c.int) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return name16(stmt_of(handle), sqlite3_column_origin_name(handle, index))
 }
 
@@ -328,25 +327,25 @@ value_text16 :: proc(handle: rawptr, big_endian: bool) -> rawptr {
 
 @(export)
 sqlite3_value_text16 :: proc "c" (handle: rawptr) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return value_text16(handle, NATIVE_BIG_ENDIAN)
 }
 
 @(export)
 sqlite3_value_text16le :: proc "c" (handle: rawptr) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return value_text16(handle, false)
 }
 
 @(export)
 sqlite3_value_text16be :: proc "c" (handle: rawptr) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return value_text16(handle, true)
 }
 
 @(export)
 sqlite3_value_bytes16 :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	box := box_of(handle)
 	if box == nil || value_text16(handle, box.text16_big if box.text16 != nil else NATIVE_BIG_ENDIAN) == nil do return 0
 	return utf16_bytes(box.text16)
@@ -366,25 +365,25 @@ result_text16 :: proc(handle: rawptr, data: rawptr, n: i64, destructor: rawptr, 
 
 @(export)
 sqlite3_result_text16 :: proc "c" (handle: rawptr, data: rawptr, n: c.int, destructor: rawptr) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	result_text16(handle, data, i64(n), destructor, NATIVE_BIG_ENDIAN)
 }
 
 @(export)
 sqlite3_result_text16le :: proc "c" (handle: rawptr, data: rawptr, n: c.int, destructor: rawptr) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	result_text16(handle, data, i64(n), destructor, false)
 }
 
 @(export)
 sqlite3_result_text16be :: proc "c" (handle: rawptr, data: rawptr, n: c.int, destructor: rawptr) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	result_text16(handle, data, i64(n), destructor, true)
 }
 
 @(export)
 sqlite3_result_error16 :: proc "c" (handle: rawptr, message: rawptr, n: c.int) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	ctx := context_of(handle)
 	if ctx == nil do return
 	text := utf16_decode(message, i64(n), NATIVE_BIG_ENDIAN)

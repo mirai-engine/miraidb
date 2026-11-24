@@ -282,7 +282,7 @@ sqlite3_create_function :: proc "c" (
 	step: Function_Callback,
 	final: Final_Callback,
 ) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return create_function(handle, name, arity, user, func, step, final, nil, text_rep)
 }
 
@@ -301,7 +301,7 @@ sqlite3_create_function_v2 :: proc "c" (
 	final: Final_Callback,
 	destroy: Destroy_Callback,
 ) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return create_function(handle, name, arity, user, func, step, final, destroy, text_rep)
 }
 
@@ -517,7 +517,7 @@ facade_final :: proc(group: ^engine.Aggregate_Group) -> (engine.Value, engine.Er
 
 @(export)
 sqlite3_user_data :: proc "c" (handle: rawptr) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	ctx := context_of(handle)
 	if ctx == nil do return nil
 	return ctx.function.user
@@ -525,7 +525,7 @@ sqlite3_user_data :: proc "c" (handle: rawptr) -> rawptr {
 
 @(export)
 sqlite3_context_db_handle :: proc "c" (handle: rawptr) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	ctx := context_of(handle)
 	if ctx == nil do return nil
 	return rawptr(ctx.function.db)
@@ -536,7 +536,7 @@ sqlite3_context_db_handle :: proc "c" (handle: rawptr) -> rawptr {
 // step allocated it, it answers NULL, which is how a final tells an empty group.
 @(export)
 sqlite3_aggregate_context :: proc "c" (handle: rawptr, size: c.int) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	ctx := context_of(handle)
 	if ctx == nil || ctx.group == nil do return nil
 	if ctx.group.state != nil do return (^Aggregate_Memory)(ctx.group.state).block
@@ -554,7 +554,7 @@ sqlite3_aggregate_context :: proc "c" (handle: rawptr, size: c.int) -> rawptr {
 // contract with the shortest lifetime it allows.
 @(export)
 sqlite3_get_auxdata :: proc "c" (handle: rawptr, index: c.int) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	ctx := context_of(handle)
 	if ctx == nil do return nil
 	for aux in ctx.auxdata do if aux.index == index do return aux.data
@@ -563,7 +563,7 @@ sqlite3_get_auxdata :: proc "c" (handle: rawptr, index: c.int) -> rawptr {
 
 @(export)
 sqlite3_set_auxdata :: proc "c" (handle: rawptr, index: c.int, data: rawptr, destroy: Destroy_Callback) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	ctx := context_of(handle)
 	if ctx == nil {
 		if destroy != nil do destroy(data)
@@ -580,7 +580,7 @@ sqlite3_set_auxdata :: proc "c" (handle: rawptr, index: c.int, data: rawptr, des
 
 @(export)
 sqlite3_value_type :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	box := box_of(handle)
 	if box == nil do return SQLITE_NULL
 	return sqlite_type_of(box.value)
@@ -588,13 +588,13 @@ sqlite3_value_type :: proc "c" (handle: rawptr) -> c.int {
 
 @(export)
 sqlite3_value_int :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return c.int(sqlite3_value_int64(handle))
 }
 
 @(export)
 sqlite3_value_int64 :: proc "c" (handle: rawptr) -> c.longlong {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	box := box_of(handle)
 	if box == nil do return 0
 	return c.longlong(sqlite_to_i64(box.value))
@@ -602,7 +602,7 @@ sqlite3_value_int64 :: proc "c" (handle: rawptr) -> c.longlong {
 
 @(export)
 sqlite3_value_double :: proc "c" (handle: rawptr) -> c.double {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	box := box_of(handle)
 	if box == nil do return 0
 	return c.double(sqlite_to_f64(box.value))
@@ -612,7 +612,7 @@ sqlite3_value_double :: proc "c" (handle: rawptr) -> c.double {
 // as long as the value; NULL for SQL NULL.
 @(export)
 sqlite3_value_text :: proc "c" (handle: rawptr) -> cstring {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	box := box_of(handle)
 	if box == nil || sqlite_type_of(box.value) == SQLITE_NULL do return nil
 	if box.text == nil {
@@ -625,7 +625,7 @@ sqlite3_value_text :: proc "c" (handle: rawptr) -> cstring {
 
 @(export)
 sqlite3_value_blob :: proc "c" (handle: rawptr) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	box := box_of(handle)
 	if box == nil do return nil
 	if box.value.kind == .Bytes {
@@ -637,7 +637,7 @@ sqlite3_value_blob :: proc "c" (handle: rawptr) -> rawptr {
 
 @(export)
 sqlite3_value_bytes :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	box := box_of(handle)
 	if box == nil do return 0
 	#partial switch box.value.kind {
@@ -655,7 +655,7 @@ sqlite3_value_bytes :: proc "c" (handle: rawptr) -> c.int {
 // number becomes one, and the answer is the storage class after that.
 @(export)
 sqlite3_value_numeric_type :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	box := box_of(handle)
 	if box == nil do return SQLITE_NULL
 	if box.value.kind == .String {
@@ -680,7 +680,7 @@ sqlite3_value_numeric_type :: proc "c" (handle: rawptr) -> c.int {
 // releases it.
 @(export)
 sqlite3_value_dup :: proc "c" (handle: rawptr) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	box := box_of(handle)
 	if box == nil do return nil
 	copy := new(Value_Box)
@@ -692,7 +692,7 @@ sqlite3_value_dup :: proc "c" (handle: rawptr) -> rawptr {
 
 @(export)
 sqlite3_value_free :: proc "c" (handle: rawptr) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	box := box_of(handle)
 	if box == nil || !box.owned do return
 	engine.value_deep_free(box.value, context.allocator)
@@ -706,7 +706,7 @@ sqlite3_value_free :: proc "c" (handle: rawptr) {
 // column alone, and is not traced back to a bind.
 @(export)
 sqlite3_value_subtype :: proc "c" (handle: rawptr) -> c.uint {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	box := box_of(handle)
 	if box == nil do return 0
 	return c.uint(box.value.subtype)
@@ -714,13 +714,13 @@ sqlite3_value_subtype :: proc "c" (handle: rawptr) -> c.uint {
 
 @(export)
 sqlite3_value_nochange :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return 0
 }
 
 @(export)
 sqlite3_value_frombind :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	return 0
 }
 
@@ -749,25 +749,25 @@ c_bytes :: proc(data: rawptr, n: int) -> []u8 {
 
 @(export)
 sqlite3_result_null :: proc "c" (handle: rawptr) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if ctx := context_of(handle); ctx != nil do context_set(ctx, engine.value_null())
 }
 
 @(export)
 sqlite3_result_int :: proc "c" (handle: rawptr, value: c.int) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if ctx := context_of(handle); ctx != nil do context_set(ctx, engine.value_int(i64(value)))
 }
 
 @(export)
 sqlite3_result_int64 :: proc "c" (handle: rawptr, value: c.longlong) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if ctx := context_of(handle); ctx != nil do context_set(ctx, engine.value_int(i64(value)))
 }
 
 @(export)
 sqlite3_result_double :: proc "c" (handle: rawptr, value: c.double) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	// SQLite has no NaN: the result is NULL.
 	if ctx := context_of(handle); ctx != nil do context_set(ctx, value != value ? engine.value_null() : engine.value_float(f64(value)))
 }
@@ -775,13 +775,13 @@ sqlite3_result_double :: proc "c" (handle: rawptr, value: c.double) {
 // sqlite3_result_text copies `n` bytes, or up to the NUL when `n` is negative.
 @(export)
 sqlite3_result_text :: proc "c" (handle: rawptr, text: cstring, n: c.int, destructor: rawptr) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	result_text(handle, text, i64(n), destructor)
 }
 
 @(export)
 sqlite3_result_text64 :: proc "c" (handle: rawptr, text: cstring, n: u64, destructor: rawptr, encoding: u8) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	length := n > u64(max(i64)) ? -1 : i64(n)
 	if is_utf16, big_endian := text_encoding_order(c.int(encoding)); is_utf16 {
 		result_text16(handle, rawptr(text), length, destructor, big_endian)
@@ -805,13 +805,13 @@ result_text :: proc(handle: rawptr, text: cstring, n: i64, destructor: rawptr) {
 
 @(export)
 sqlite3_result_blob :: proc "c" (handle: rawptr, data: rawptr, n: c.int, destructor: rawptr) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	result_blob(handle, data, int(max(n, 0)), destructor)
 }
 
 @(export)
 sqlite3_result_blob64 :: proc "c" (handle: rawptr, data: rawptr, n: u64, destructor: rawptr) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if n > 1 << 30 {
 		release_with(data, destructor)
 		sqlite3_result_error_toobig(handle)
@@ -832,13 +832,13 @@ result_blob :: proc(handle: rawptr, data: rawptr, n: int, destructor: rawptr) {
 
 @(export)
 sqlite3_result_zeroblob :: proc "c" (handle: rawptr, n: c.int) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	_ = sqlite3_result_zeroblob64(handle, u64(max(n, 0)))
 }
 
 @(export)
 sqlite3_result_zeroblob64 :: proc "c" (handle: rawptr, n: u64) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	ctx := context_of(handle)
 	if ctx == nil do return SQLITE_MISUSE
 	if n > 1 << 30 {
@@ -851,7 +851,7 @@ sqlite3_result_zeroblob64 :: proc "c" (handle: rawptr, n: u64) -> c.int {
 
 @(export)
 sqlite3_result_value :: proc "c" (handle: rawptr, value: rawptr) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	ctx := context_of(handle)
 	box := box_of(value)
 	if ctx == nil do return
@@ -867,7 +867,7 @@ sqlite3_result_value :: proc "c" (handle: rawptr, value: rawptr) {
 // sqlite3_result_error_code says otherwise.
 @(export)
 sqlite3_result_error :: proc "c" (handle: rawptr, message: cstring, n: c.int) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	ctx := context_of(handle)
 	if ctx == nil do return
 	text := ""
@@ -880,7 +880,7 @@ sqlite3_result_error :: proc "c" (handle: rawptr, message: cstring, n: c.int) {
 
 @(export)
 sqlite3_result_error_code :: proc "c" (handle: rawptr, code: c.int) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	ctx := context_of(handle)
 	if ctx == nil do return
 	ctx.error_code = code == SQLITE_OK ? SQLITE_ERROR : code
@@ -893,7 +893,7 @@ sqlite3_result_error_code :: proc "c" (handle: rawptr, code: c.int) {
 
 @(export)
 sqlite3_result_error_nomem :: proc "c" (handle: rawptr) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	ctx := context_of(handle)
 	if ctx == nil do return
 	sqlite3_result_error(handle, "out of memory", -1)
@@ -902,7 +902,7 @@ sqlite3_result_error_nomem :: proc "c" (handle: rawptr) {
 
 @(export)
 sqlite3_result_error_toobig :: proc "c" (handle: rawptr) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	ctx := context_of(handle)
 	if ctx == nil do return
 	sqlite3_result_error(handle, SQLITE_TOOBIG_TEXT, -1)
@@ -911,7 +911,7 @@ sqlite3_result_error_toobig :: proc "c" (handle: rawptr) {
 
 @(export)
 sqlite3_result_subtype :: proc "c" (handle: rawptr, subtype: c.uint) {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	ctx := context_of(handle)
 	if ctx == nil do return
 	// SQLite keeps the low byte; a later sqlite3_result_* call resets it.
@@ -925,7 +925,7 @@ sqlite3_result_subtype :: proc "c" (handle: rawptr, subtype: c.uint) {
 // SQLite's, the placeholder hides a builtin of the same name.
 @(export)
 sqlite3_overload_function :: proc "c" (handle: rawptr, name: cstring, arity: c.int) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil || name == nil || arity < -1 do return SQLITE_MISUSE
 	for fn in db.functions {

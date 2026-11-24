@@ -6,7 +6,6 @@ package sqlite_compat
 // _db_readonly, _txn_state). The image is SQLite's file format, written and
 // read by the engine's own writer and importer (src/engine/sqlite_image.odin).
 
-import "base:runtime"
 import "core:c"
 import "core:slice"
 import "core:strings"
@@ -35,7 +34,7 @@ schema_is_main :: proc(schema: cstring) -> bool {
 // database that has none either.
 @(export)
 sqlite3_serialize :: proc "c" (handle: rawptr, schema: cstring, size: ^i64, flags: c.uint) -> [^]u8 {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	if size != nil do size^ = -1
 	db := db_of(handle)
 	if db == nil || !schema_is_main(schema) do return nil
@@ -71,7 +70,7 @@ db_image :: proc(db: ^Database) -> ([]u8, engine.Error) {
 // SQLITE_READONLY.
 @(export)
 sqlite3_deserialize :: proc "c" (handle: rawptr, schema: cstring, data: [^]u8, db_size: i64, buffer_size: i64, flags: c.uint) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil do return SQLITE_MISUSE
 	defer if flags & SQLITE_DESERIALIZE_FREEONCLOSE != 0 && data != nil do sqlite3_free(data)
@@ -141,7 +140,7 @@ backup_fail :: proc(db: ^Database, code: c.int, message: string) {
 // main database of either side can be named here.
 @(export)
 sqlite3_backup_init :: proc "c" (dest_handle: rawptr, dest_name: cstring, source_handle: rawptr, source_name: cstring) -> rawptr {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	dest := db_of(dest_handle)
 	source := db_of(source_handle)
 	if dest == nil || source == nil do return nil
@@ -201,7 +200,7 @@ backup_of :: proc(handle: rawptr) -> ^Backup {
 // negative, and answers SQLITE_DONE once the last one is copied.
 @(export)
 sqlite3_backup_step :: proc "c" (handle: rawptr, pages: c.int) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	backup := backup_of(handle)
 	if backup == nil do return SQLITE_MISUSE
 	if backup.done do return SQLITE_DONE
@@ -254,7 +253,7 @@ sqlite3_backup_step :: proc "c" (handle: rawptr, pages: c.int) -> c.int {
 
 @(export)
 sqlite3_backup_remaining :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	backup := backup_of(handle)
 	if backup == nil do return 0
 	return backup.pages - backup.copied
@@ -262,7 +261,7 @@ sqlite3_backup_remaining :: proc "c" (handle: rawptr) -> c.int {
 
 @(export)
 sqlite3_backup_pagecount :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	backup := backup_of(handle)
 	if backup == nil do return 0
 	return backup.pages
@@ -272,7 +271,7 @@ sqlite3_backup_pagecount :: proc "c" (handle: rawptr) -> c.int {
 // step changed nothing; the answer is the error a step met, if any.
 @(export)
 sqlite3_backup_finish :: proc "c" (handle: rawptr) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	backup := backup_of(handle)
 	if backup == nil do return SQLITE_OK
 	code := backup.code
@@ -289,7 +288,7 @@ sqlite3_backup_finish :: proc "c" (handle: rawptr) -> c.int {
 // "" for one in memory, and NULL for a name the connection does not hold.
 @(export)
 sqlite3_db_filename :: proc "c" (handle: rawptr, schema: cstring) -> cstring {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil do return nil
 	if schema_is_main(schema) do return db.filename
@@ -305,7 +304,7 @@ sqlite3_db_filename :: proc "c" (handle: rawptr, schema: cstring) -> cstring {
 // temp, and the attached ones follow in name order.
 @(export)
 sqlite3_db_name :: proc "c" (handle: rawptr, index: c.int) -> cstring {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil || index < 0 do return nil
 	switch index {
@@ -329,7 +328,7 @@ sqlite3_db_name :: proc "c" (handle: rawptr, index: c.int) -> cstring {
 // for its own store, as SQLite's does.
 @(export)
 sqlite3_db_readonly :: proc "c" (handle: rawptr, schema: cstring) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil do return -1
 	if schema_is_main(schema) do return db.conn.store.read_only ? 1 : 0
@@ -344,7 +343,7 @@ sqlite3_db_readonly :: proc "c" (handle: rawptr, schema: cstring) -> c.int {
 // connection does not hold is -1.
 @(export)
 sqlite3_txn_state :: proc "c" (handle: rawptr, schema: cstring) -> c.int {
-	context = runtime.default_context()
+	context = engine.oom_context()
 	db := db_of(handle)
 	if db == nil do return -1
 	if schema != nil && !schema_is_main(schema) {

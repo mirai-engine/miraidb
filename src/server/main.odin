@@ -53,6 +53,8 @@ Bodies are the binary messages described in src/engine/wire.odin.
 `
 
 main :: proc() {
+	// A refused allocation fails its statement, not the process (D23).
+	context.allocator = db.oom_heap_allocator()
 	path := ""
 	port := 8080
 	any_interface := false

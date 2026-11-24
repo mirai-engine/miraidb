@@ -5,6 +5,7 @@ import "core:strings"
 import "core:testing"
 
 import db "../engine"
+import face "../sqlite_compat"
 
 // Allocation failure (D23): an allocation the system refuses fails the statement
 // with Out_Of_Memory and leaves the database as the statements before it left
@@ -118,3 +119,28 @@ test_allocation_failure_walk :: proc(t: ^testing.T) {
 	testing.expectf(t, walked > 100 && failures > 0, "the script made %d allocations, %d refused", walked, failures)
 }
 
+// Through the sqlite3_* facade a refused allocation is SQLITE_NOMEM, from
+// sqlite3_exec and from sqlite3_errcode, and the handle works once memory is back.
+@(test)
+test_a_refused_allocation_is_sqlite_nomem :: proc(t: ^testing.T) {
+	handle: rawptr
+	if !testing.expect_value(t, face.sqlite3_open(":memory:", &handle), face.SQLITE_OK) do return
+	defer face.sqlite3_close(handle)
+	setup: cstring = "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT); INSERT INTO t VALUES (1, 'x'), (2, 'y')"
+	if !testing.expect_value(t, face.sqlite3_exec(handle, setup, nil, nil, nil), face.SQLITE_OK) do return
+	refused := 0
+	for nth := 1; nth < 10_000; nth += 1 {
+		db.oom_inject(nth)
+		rc := face.sqlite3_exec(handle, "UPDATE t SET b = b || 'z' WHERE a > 0", nil, nil, nil)
+		code := face.sqlite3_errcode(handle)
+		reached := db.oom_injected_calls() >= nth
+		db.oom_inject(0)
+		if rc != face.SQLITE_OK {
+			testing.expectf(t, rc == face.SQLITE_NOMEM && code == face.SQLITE_NOMEM, "nth %d: rc %d, errcode %d", nth, rc, code)
+			refused += 1
+		}
+		testing.expect_value(t, face.sqlite3_exec(handle, "SELECT count(*) FROM t", nil, nil, nil), face.SQLITE_OK)
+		if !reached || testing.failed(t) do break
+	}
+	testing.expectf(t, refused > 0, "no allocation was refused")
+}
