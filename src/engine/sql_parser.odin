@@ -703,6 +703,18 @@ parse_close_cursor :: proc(p: ^Parser) -> Statement {
 // p_next_is reports whether the token after the current one is `keyword`. The
 // parser keeps one token, and the lexer is a value, so two tokens of lookahead
 // cost nothing: `GROUPING` may start `GROUPING SETS` or a function call.
+// p_next_punct reports whether the token after the current one is `text`.
+@(private)
+p_next_punct :: proc(p: ^Parser, text: string) -> bool {
+	saved_lexer := p.lexer
+	saved := p.current
+	p_advance(p)
+	matched := p_is_punct(p, text)
+	p.lexer = saved_lexer
+	p.current = saved
+	return matched
+}
+
 @(private)
 p_next_is :: proc(p: ^Parser, keyword: string) -> bool {
 	saved_lexer := p.lexer
@@ -3306,6 +3318,38 @@ parse_primary :: proc(p: ^Parser) -> ^Expr {
 				return e
 			}
 		}
+		// A trigger's RAISE(IGNORE) or RAISE(ABORT | FAIL | ROLLBACK, message). The
+		// action is a keyword, not a column, so it is kept as text.
+		if p_is_keyword(p, "raise") && p_next_punct(p, "(") {
+			p_advance(p)
+			p_expect_punct(p, "(")
+			action := strings.to_lower(p.current.text, p.alloc)
+			if action != "ignore" && action != "rollback" && action != "abort" && action != "fail" {
+				p_fail(p, .Sql_Syntax, "near %q: syntax error", p.current.text)
+				return nil
+			}
+			p_advance(p)
+			args := make([]^Expr, action == "ignore" ? 1 : 2, p.alloc)
+			args[0] = expr_literal(p, value_string(action))
+			if action != "ignore" {
+				p_expect_punct(p, ",")
+				// The message is a string literal, as SQLite's grammar has it.
+				if p.current.kind != .String {
+					p_fail(p, .Sql_Syntax, "near %q: syntax error", p.current.text)
+					return nil
+				}
+				args[1] = expr_literal(p, value_string(strings.clone(p.current.text, p.alloc)))
+				p_advance(p)
+				if !p_is_punct(p, ")") {
+					p_fail(p, .Sql_Syntax, "near %q: syntax error", p.current.text)
+					return nil
+				}
+			}
+			p_expect_punct(p, ")")
+			e := new(Expr, p.alloc)
+			e^ = Call_Expr{name = RAISE_CALL, args = args}
+			return e
+		}
 		// SQLite's time keywords: the current UTC moment as text, as datetime(),
 		// date() and time() of 'now' give it.
 		if p_is_keyword(p, "current_timestamp") || p_is_keyword(p, "current_date") || p_is_keyword(p, "current_time") {
@@ -3504,6 +3548,10 @@ parse_primary :: proc(p: ^Parser) -> ^Expr {
 // ROW_VALUE_CALL names the node a row value `(a, b)` parses to. It has a space,
 // so no function a statement can call has this name.
 ROW_VALUE_CALL :: "row value"
+
+// RAISE_CALL names the node a trigger's RAISE(...) parses to; like
+// ROW_VALUE_CALL it has a space, so no function a program registers is it.
+RAISE_CALL :: "raise action"
 
 row_value_items :: proc(e: ^Expr) -> ([]^Expr, bool) {
 	if e == nil do return nil, false

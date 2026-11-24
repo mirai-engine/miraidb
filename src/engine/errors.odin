@@ -42,6 +42,11 @@ Error_Kind :: enum u8 {
 	// whose children still need it. It is last so the kinds before it keep
 	// the numbers the wire protocols carry.
 	Foreign_Key_Violation,
+	// Trigger_Raise is a trigger's RAISE(ABORT | FAIL | ROLLBACK, message).
+	Trigger_Raise,
+	// Trigger_Ignore is a trigger's RAISE(IGNORE): the row that fired it is
+	// skipped, and the statement goes on. It never reaches a caller.
+	Trigger_Ignore,
 }
 
 Error :: struct {
@@ -162,6 +167,10 @@ error_kind_name :: proc(kind: Error_Kind) -> string {
 		return "internal"
 	case .Foreign_Key_Violation:
 		return "foreign_key_violation"
+	case .Trigger_Raise:
+		return "trigger_raise"
+	case .Trigger_Ignore:
+		return "trigger_ignore"
 	}
 	return "unknown"
 }

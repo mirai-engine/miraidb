@@ -204,6 +204,8 @@ pg_sqlstate :: proc(kind: Error_Kind) -> string {
 	#partial switch kind {
 	case .Foreign_Key_Violation:
 		return "23503" // foreign_key_violation
+	case .Trigger_Raise:
+		return "P0001" // raise_exception
 	case .Table_Not_Found:
 		return "42P01" // undefined_table
 	case .Column_Not_Found:

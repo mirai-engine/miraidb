@@ -344,11 +344,14 @@ sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value) 
 		// transaction keeps the work of the statements before it and none of this
 		// one's. OR FAIL keeps the rows before the failing one instead.
 		mark := tx_statement_begin(tx)
-		tx.keep_partial = false
+		// A statement a trigger runs leaves the flag to the one that fired it: a
+		// RAISE(FAIL) under it keeps the rows of that outer statement.
+		outer := tx.trigger_depth == 0
+		if outer do tx.keep_partial = false
 		result, err := sql_exec_mutation(tx, stmt, params)
 		keeps := err.kind != .None && insert_without_statement_journal(tx, stmt)
 		tx_statement_end(tx, mark, err.kind != .None && !statement_fails_partially(stmt) && !tx.keep_partial && !keeps)
-		tx.keep_partial = false
+		if outer do tx.keep_partial = false
 		// OR ROLLBACK: a broken constraint ends the whole transaction, which the
 		// connection that holds it rolls back (embed_run).
 		if err.kind != .None && conflict_skippable(err.kind) {
@@ -6633,10 +6636,29 @@ grouping_missing_for :: proc(set: []int, count: int, alloc: mem.Allocator) -> []
 	return missing
 }
 
+// eval_raise answers a trigger's RAISE. IGNORE skips the row that fired the
+// trigger; ABORT takes the statement back, FAIL keeps its rows before this one
+// and ROLLBACK ends the transaction, each failing with the message.
+@(private)
+eval_raise :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
+	tx := ctx.tx
+	if tx == nil || !tx.trigger_active do return {}, errf(.Sql_Syntax, "RAISE() may only be used within a trigger-program")
+	action := call.args[0].(Literal_Expr).value.s
+	if action == "ignore" do return {}, Error{kind = .Trigger_Ignore}
+	message, message_err := eval_expr(ctx, call.args[1])
+	if message_err.kind != .None do return {}, message_err
+	// Not a switch: scripts/function_table.py reads a switch's labels as the
+	// names of functions.
+	if action == "fail" do tx.keep_partial = true
+	if action == "rollback" do tx.rollback_requested = true
+	return {}, errf(.Trigger_Raise, "%s", value_to_text(message))
+}
+
 eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 	// A row value is taken apart by the comparison that holds it; reaching it
 	// here means it stands alone, which SQLite refuses with the same words.
 	if call.name == ROW_VALUE_CALL do return {}, errf(.Sql_Syntax, "row value misused")
+	if call.name == RAISE_CALL do return eval_raise(ctx, call)
 	if (call.filter != nil || len(call.order_by) > 0) && (scalar_minmax(call) || !is_aggregate_name(call.name)) {
 		return {}, errf(.Sql_Syntax, "%s may not be used with non-aggregate %s()", call.filter != nil ? "FILTER" : "ORDER BY", call.name)
 	}
@@ -8433,6 +8455,8 @@ sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Res
 			}
 		}
 		if row_fail || declares do tx_statement_end(tx, row_mark, insert_err.kind != .None)
+		// A BEFORE trigger's RAISE(IGNORE): the row is skipped, the rest go on.
+		if insert_err.kind == .Trigger_Ignore do continue
 		if insert_err.kind != .None && row_ignore && conflict_skippable(insert_err.kind) {
 			// INSERT OR IGNORE: the row breaks a constraint by itself and is skipped;
 			// nothing of it was staged.
@@ -8972,6 +8996,8 @@ sql_exec_update :: proc(tx: ^Tx, stmt: Update_Stmt, params: []Value) -> (Sql_Res
 			}
 		}
 		if per_row do tx_statement_end(tx, row_mark, update_err.kind != .None)
+		// A BEFORE trigger's RAISE(IGNORE): the row keeps its values.
+		if update_err.kind == .Trigger_Ignore do continue
 		if update_err.kind != .None && resolution == .Ignore && conflict_skippable(update_err.kind) {
 			// UPDATE OR IGNORE: the row keeps its values and the statement goes on.
 			error_free(&update_err)
@@ -9072,6 +9098,8 @@ sql_exec_delete :: proc(tx: ^Tx, stmt: Delete_Stmt, params: []Value) -> (Sql_Res
 			return {}, fts_err
 		}
 		if delete_err := tx_delete(tx, stmt.table, row.id); delete_err.kind != .None {
+			// A BEFORE trigger's RAISE(IGNORE): the row stays.
+			if delete_err.kind == .Trigger_Ignore do continue
 			return {}, delete_err
 		}
 		affected += 1

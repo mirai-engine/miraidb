@@ -745,6 +745,10 @@ sqlite_function_arity :: proc(name: string) -> (counts: u16, known: bool) {
 // whatever its own check allows when it runs.
 @(private)
 res_function :: proc(walk: ^Res_Walk, e: Call_Expr) {
+	if e.name == RAISE_CALL {
+		if !walk.tx.trigger_active do walk.err = errf(.Sql_Syntax, "RAISE() may only be used within a trigger-program")
+		return
+	}
 	store := walk.tx.store
 	count := e.star ? 0 : len(e.args)
 	if _, found, _ := store_function(store, e.name, count); found do return

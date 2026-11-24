@@ -41,6 +41,7 @@ SQLITE_CONSTRAINT :: c.int(19)
 SQLITE_CONSTRAINT_CHECK :: c.int(19 | 1 << 8)
 SQLITE_CONSTRAINT_FOREIGNKEY :: c.int(19 | 3 << 8)
 SQLITE_CONSTRAINT_NOTNULL :: c.int(19 | 5 << 8)
+SQLITE_CONSTRAINT_TRIGGER :: c.int(19 | 7 << 8)
 SQLITE_CONSTRAINT_PRIMARYKEY :: c.int(19 | 6 << 8)
 SQLITE_CONSTRAINT_UNIQUE :: c.int(19 | 8 << 8)
 SQLITE_MISMATCH :: c.int(20)
@@ -339,7 +340,7 @@ sqlite_code :: proc(err: engine.Error) -> c.int {
 	switch err.kind {
 	case .None:
 		return SQLITE_OK
-	case .Duplicate_Primary_Key, .Duplicate_Unique, .Not_Null_Violation, .Check_Violation, .Foreign_Key_Violation:
+	case .Duplicate_Primary_Key, .Duplicate_Unique, .Not_Null_Violation, .Check_Violation, .Foreign_Key_Violation, .Trigger_Raise:
 		return SQLITE_CONSTRAINT
 	case .Invalid_Type:
 		return SQLITE_MISMATCH
@@ -364,7 +365,7 @@ sqlite_code :: proc(err: engine.Error) -> c.int {
 	case .Invalid_Argument, .Table_Not_Found, .Table_Exists, .Column_Not_Found,
 	     .Index_Exists, .Index_Not_Found, .No_Primary_Key, .Auto_Increment_Requires_Integer,
 	     .Sql_Syntax, .Sql_Unsupported, .Sql_Not_A_Query, .Transaction_Closed,
-	     .Internal, .Incomplete:
+	     .Internal, .Incomplete, .Trigger_Ignore:
 		// SQLite reports these as a plain error with the message saying which, and
 		// so do we: inventing a code would be a difference nobody asked for.
 		return SQLITE_ERROR
@@ -389,6 +390,8 @@ sqlite_extended_code :: proc(err: engine.Error) -> c.int {
 		return SQLITE_CONSTRAINT_CHECK
 	case .Foreign_Key_Violation:
 		return SQLITE_CONSTRAINT_FOREIGNKEY
+	case .Trigger_Raise:
+		return SQLITE_CONSTRAINT_TRIGGER
 	}
 	return sqlite_code(err)
 }

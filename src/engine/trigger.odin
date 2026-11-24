@@ -76,6 +76,14 @@ trigger_create :: proc(tx: ^Tx, stmt: Create_Trigger_Stmt) -> Error {
 	if len(stmt.body) == 0 {
 		return errf(.Sql_Syntax, "a trigger needs at least one statement")
 	}
+	// The body is parsed now, as SQLite parses it: a statement it cannot read
+	// used to be stored, and failed only when the trigger fired.
+	for statement in trigger_split(stmt.body, context.temp_allocator) {
+		if len(strings.trim_space(statement)) == 0 do continue
+		parsed, parse_err := sql_parse(statement)
+		query_destroy(&parsed)
+		if parse_err.kind != .None do return parse_err
+	}
 	if ensure_err := trigger_ensure(tx); ensure_err.kind != .None do return ensure_err
 	// A view takes only INSTEAD OF triggers, and a table never does.
 	_, is_view := view_sql(tx, stmt.table)
@@ -291,7 +299,7 @@ trigger_fire :: proc(
 			query_destroy(&condition)
 			if value_err.kind != .None {
 				trigger_restore(tx, saved_active, saved_schema, saved_new, saved_old, saved_new_present, saved_old_present, saved_depth)
-				return value_err
+				return trigger_ignored(value_err, timing)
 			}
 			if !value_is_truthy(value) {
 				trigger_restore(tx, saved_active, saved_schema, saved_new, saved_old, saved_new_present, saved_old_present, saved_depth)
@@ -307,7 +315,11 @@ trigger_fire :: proc(
 			if replayed {
 				exec_err = auth_replay_statement(tx, name, text)
 			} else {
-				_, exec_err = sql_execute_in_tx(tx, text)
+				// A SELECT in the body (a RAISE's, often) answers rows nobody reads,
+				// which are freed here: they leaked.
+				answered: Sql_Result
+				answered, exec_err = sql_execute_in_tx(tx, text)
+				sql_result_destroy(&answered)
 			}
 			if exec_err.kind != .None {
 				body_err = exec_err
@@ -321,7 +333,17 @@ trigger_fire :: proc(
 		tx.trigger_new_present = saved_new_present
 		tx.trigger_old_present = saved_old_present
 		tx.trigger_depth = saved_depth
-		if body_err.kind != .None do return body_err
+		if body_err.kind != .None do return trigger_ignored(body_err, timing)
 	}
 	return ERROR_NONE
+}
+
+// trigger_ignored is what a trigger's error means to the write that fired it.
+// RAISE(IGNORE) abandons this trigger and the ones after it; a BEFORE
+// trigger's also skips the row, which the statement does on hearing it, while
+// after an AFTER or INSTEAD OF trigger the row's write stands.
+@(private)
+trigger_ignored :: proc(err: Error, timing: Trigger_Timing) -> Error {
+	if err.kind == .Trigger_Ignore && timing != .Before do return ERROR_NONE
+	return err
 }
