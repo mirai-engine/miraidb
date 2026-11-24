@@ -41,7 +41,7 @@ Rules for this file:
 | D5 | paged tables: no leaf merge, one version per row | the rest of the page store (with D17) | L |
 | D8 | the fault walk covers the log | snapshot, rotation and mirror | S |
 | D10 | decimals are floats, timestamps have no zone | decimal scale, `TIMESTAMPTZ`, streaming blobs | M |
-| D11 | index DDL is atomic | triggers and policies ordered against the rows of their transaction | S |
+| D11 | closed: triggers and policies follow their transaction; RAISE; a dropped table takes its triggers and policies | — | — |
 | D12 | a module is a process with a work budget | a deterministic sandbox | L |
 | D14 | one process owns one log | log shipping to followers | XL |
 | D15 | HTTP/1.1 and WebSocket with caps | TLS, HTTP/2, backpressure, timeouts, a load test | M |
@@ -295,8 +295,19 @@ normalising to UTC, streaming blob reads, and conformance cases for rounding.
 **Now.** Index DDL is staged, applied after the rows and rolled back with them
 (`test_ddl_in_transaction`).
 
-**Left.** A trigger or policy created in the same transaction as the rows it
-affects is not ordered against those rows.
+Triggers and policies are rows of internal tables read through the
+transaction, so one created, dropped or rolled back in a transaction acts on
+that transaction's rows as SQLite's does (`test_triggers_follow_their_transaction`,
+`test_policies_follow_their_transaction`). Checking that against SQLite found:
+`RAISE` was parsed as a call to a function nobody has, so no trigger could
+refuse or skip a row (`test_a_trigger_raises_as_sqlite`,
+`test_a_raised_rollback_ends_the_transaction`); a trigger body was parsed only
+when it fired; and `DROP TABLE` left the table's triggers and policies, which
+held the next table of that name (`test_a_dropped_table_takes_its_triggers`).
+`scripts/differential.py` runs RAISE and the dropped table's trigger against
+SQLite.
+
+**Closed.**
 
 ## D12 — The module sandbox
 

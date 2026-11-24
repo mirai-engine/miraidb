@@ -968,9 +968,17 @@ DROP TRIGGER audit_insert;
   and `OLD` in scope: a false or NULL condition skips it without failing the
   write. The condition is checked when `CREATE TRIGGER` parses it, so a typo is
   reported there rather than on the first write.
-- Column-specific (`OF`) triggers are refused with `sql_unsupported` instead of
-  being approximated. A trigger that fires itself stops at a depth of 8 and fails
-  the statement.
+- `UPDATE OF <columns>` fires only for an UPDATE whose SET names one of them. A
+  trigger that fires itself stops at a depth of 8 and fails the statement.
+- `RAISE(IGNORE)` skips the row that fired the trigger and the statement goes
+  on; `RAISE(ABORT, 'message')` takes the statement back, `RAISE(FAIL, …)` keeps
+  the rows it wrote before this one, and `RAISE(ROLLBACK, …)` ends the
+  transaction, each failing with the message (`SQLITE_CONSTRAINT_TRIGGER`, or
+  `P0001` over the wire). The message is a string literal, and RAISE outside a
+  trigger is refused, as in SQLite.
+- The body is parsed when `CREATE TRIGGER` runs, and a trigger made, dropped or
+  rolled back in a transaction acts on that transaction's rows. `DROP TABLE`
+  drops the table's triggers and its policies.
 
 ## Roles and permissions
 
