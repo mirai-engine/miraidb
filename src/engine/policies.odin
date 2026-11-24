@@ -88,6 +88,17 @@ sql_exec_drop_policy :: proc(tx: ^Tx, stmt: Drop_Policy_Stmt) -> (Sql_Result, Er
 	return Sql_Result{kind = .Ack, affected = affected, commit_seq = tx.store.commit_seq}, ERROR_NONE
 }
 
+// policies_drop_on removes the policies of a table that is dropped: they
+// stayed, and held the next table of that name.
+@(private)
+policies_drop_on :: proc(tx: ^Tx, table_name: string) -> Error {
+	if tx_table_probe(tx, POLICY_TABLE) == nil do return ERROR_NONE
+	result, err := sql_execute_in_tx_params(tx, "DELETE FROM _policy WHERE lower(table_name) = lower(?)", []Value{value_string(table_name)})
+	if err.kind != .None do return err
+	sql_result_destroy(&result)
+	return ERROR_NONE
+}
+
 @(private)
 policies_ensure_table :: proc(tx: ^Tx) -> Error {
 	if _, err := tx_table(tx, POLICY_TABLE); err.kind == .None {

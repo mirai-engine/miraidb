@@ -106,3 +106,83 @@ test_a_raised_rollback_ends_the_transaction :: proc(t: ^testing.T) {
 	trig_ok(t, conn, "INSERT INTO t VALUES (4)")
 	trig_rows(t, conn, "SELECT group_concat(a) FROM t", "4")
 }
+
+// DROP TABLE left the table's triggers behind, and they fired on the next table
+// of that name.
+@(test)
+test_a_dropped_table_takes_its_triggers :: proc(t: ^testing.T) {
+	conn := trig_open(t)
+	if conn == nil do return
+	defer db.embed_close(conn)
+	trig_ok(t, conn, "CREATE TABLE t (a)")
+	trig_ok(t, conn, "CREATE TABLE log (x)")
+	trig_ok(t, conn, "CREATE TRIGGER copied AFTER INSERT ON T BEGIN INSERT INTO log VALUES (new.a); END")
+	trig_ok(t, conn, "BEGIN")
+	trig_ok(t, conn, "DROP TABLE t")
+	trig_rows(t, conn, "SELECT count(*) FROM sqlite_master WHERE type = 'trigger'", "0")
+	trig_ok(t, conn, "ROLLBACK")
+	trig_rows(t, conn, "SELECT name FROM sqlite_master WHERE type = 'trigger'", "copied")
+	trig_ok(t, conn, "DROP TABLE t")
+	trig_ok(t, conn, "CREATE TABLE t (a)")
+	trig_ok(t, conn, "INSERT INTO t VALUES (1)")
+	trig_rows(t, conn, "SELECT count(*) FROM log", "0")
+}
+
+// A trigger created, dropped or rolled back in a transaction acts on the rows
+// of that transaction as SQLite's does.
+@(test)
+test_triggers_follow_their_transaction :: proc(t: ^testing.T) {
+	conn := trig_open(t)
+	if conn == nil do return
+	defer db.embed_close(conn)
+	trig_ok(t, conn, "CREATE TABLE t (a)")
+	trig_ok(t, conn, "CREATE TABLE log (x)")
+	trig_ok(t, conn, "BEGIN")
+	trig_ok(t, conn, "INSERT INTO t VALUES (1)")
+	trig_ok(t, conn, "CREATE TRIGGER counted AFTER INSERT ON t BEGIN INSERT INTO log SELECT count(*) FROM t; END")
+	trig_ok(t, conn, "INSERT INTO t VALUES (2)")
+	trig_ok(t, conn, "SAVEPOINT s")
+	trig_ok(t, conn, "DROP TRIGGER counted")
+	trig_ok(t, conn, "INSERT INTO t VALUES (3)")
+	trig_ok(t, conn, "ROLLBACK TO s")
+	trig_ok(t, conn, "INSERT INTO t VALUES (4)")
+	trig_ok(t, conn, "COMMIT")
+	trig_rows(t, conn, "SELECT group_concat(x) FROM log", "2,3")
+	trig_ok(t, conn, "BEGIN")
+	trig_ok(t, conn, "DROP TRIGGER counted")
+	trig_ok(t, conn, "ROLLBACK")
+	trig_ok(t, conn, "INSERT INTO t VALUES (5)")
+	trig_rows(t, conn, "SELECT group_concat(x) FROM log", "2,3,4")
+}
+
+// A policy created, dropped or rolled back in a transaction holds the rest of
+// that transaction, and goes with it.
+@(test)
+test_policies_follow_their_transaction :: proc(t: ^testing.T) {
+	conn := trig_open(t)
+	if conn == nil do return
+	defer db.embed_close(conn)
+	trig_ok(t, conn, "CREATE TABLE t (a)")
+	trig_ok(t, conn, "INSERT INTO t VALUES (1), (2), (3)")
+	trig_ok(t, conn, "BEGIN")
+	trig_ok(t, conn, "CREATE POLICY big ON t USING (a > 1)")
+	trig_rows(t, conn, "SELECT count(*) FROM t", "2")
+	trig_ok(t, conn, "ROLLBACK")
+	trig_rows(t, conn, "SELECT count(*) FROM t", "3")
+	trig_ok(t, conn, "BEGIN")
+	trig_ok(t, conn, "INSERT INTO t VALUES (0)")
+	trig_ok(t, conn, "CREATE POLICY positive ON t CHECK (a > 0)")
+	trig_fails(t, conn, "INSERT INTO t VALUES (-1)", .Permission_Denied, "insert into t violates a policy")
+	trig_ok(t, conn, "COMMIT")
+	trig_rows(t, conn, "SELECT count(*) FROM t", "4")
+	trig_ok(t, conn, "BEGIN")
+	trig_ok(t, conn, "DROP POLICY positive")
+	trig_ok(t, conn, "INSERT INTO t VALUES (-2)")
+	trig_ok(t, conn, "ROLLBACK")
+	trig_fails(t, conn, "INSERT INTO t VALUES (-3)", .Permission_Denied, "insert into t violates a policy")
+	// A dropped table takes its policies, as it takes its triggers.
+	trig_ok(t, conn, "DROP TABLE t")
+	trig_ok(t, conn, "CREATE TABLE t (a)")
+	trig_ok(t, conn, "INSERT INTO t VALUES (-4)")
+	trig_rows(t, conn, "SELECT count(*) FROM t", "1")
+}

@@ -28,7 +28,8 @@ trigger_exists :: proc(tx: ^Tx, table_name: string, event: string, timing: strin
 @(private)
 triggers_drop_on :: proc(tx: ^Tx, table_name: string) -> Error {
 	if !tx_system_table_exists(tx, TRIGGER_TABLE, &tx.trigger_probe) do return ERROR_NONE
-	result, err := sql_execute_in_tx_params(tx, "DELETE FROM _triggers WHERE table_name = ?", []Value{value_string(table_name)})
+	// A name is matched as SQLite matches it, without regard to case.
+	result, err := sql_execute_in_tx_params(tx, "DELETE FROM _triggers WHERE lower(table_name) = lower(?)", []Value{value_string(table_name)})
 	if err.kind != .None do return err
 	sql_result_destroy(&result)
 	return ERROR_NONE

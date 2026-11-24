@@ -9557,6 +9557,10 @@ sql_exec_drop_table :: proc(tx: ^Tx, stmt: Drop_Table_Stmt) -> (Sql_Result, Erro
 		}
 		return {}, drop_err
 	}
+	// The table's triggers go with it, as in SQLite: they stayed, and fired on
+	// the next table of that name.
+	if trigger_err := triggers_drop_on(tx, stmt.name); trigger_err.kind != .None do return {}, trigger_err
+	if policy_err := policies_drop_on(tx, stmt.name); policy_err.kind != .None do return {}, policy_err
 	return Sql_Result{kind = .Ack}, ERROR_NONE
 }
 
