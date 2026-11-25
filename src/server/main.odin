@@ -385,13 +385,21 @@ serve :: proc(connection: ^Connection) {
 	// client asked to be someone and is not.
 	identity: db.Identity
 	proved := false
+	// An HTTP request with a wrong token is refused once it has been read
+	// whole: a socket closed with its body still unread is reset, and the
+	// client then read the reset instead of the 401 (the body comes after the
+	// headers, often in a segment of its own).
+	token_refused := false
 	if token, has_token := db.http_bearer_token(buffer[:n]); has_token {
 		statement_begin(connection.port)
 		identity, proved = db.host_authenticate(host, token)
 		statement_end(connection.port)
 		if !proved {
-			refuse_unauthorized(connection, "invalid or expired token")
-			return
+			if db.ws_is_upgrade(buffer[:n]) {
+				refuse_unauthorized(connection, "invalid or expired token")
+				return
+			}
+			token_refused = true
 		}
 	}
 	if db.ws_is_upgrade(buffer[:n]) {
@@ -435,6 +443,11 @@ serve :: proc(connection: ^Connection) {
 		n += read
 	}
 	_ = used
+	if token_refused {
+		db.http_request_destroy(&request)
+		refuse_unauthorized(connection, "invalid or expired token")
+		return
+	}
 	if connection.port.closed && !proved && !(request.method == "GET" && request.path == "/health") {
 		db.http_request_destroy(&request)
 		refuse_unauthorized(connection, "this server needs a bearer token")
