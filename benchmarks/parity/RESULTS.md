@@ -409,6 +409,101 @@ a full `--record` also rewrote the insert rate and the compaction time, which
 moved 46 000–106 000 rows/s and 0.34–1.39 s between three runs of the same build,
 so a recorded number there was a draw, not a baseline.
 
+## R2: the write path by stage (2026-11-25)
+
+Before changing the write path again, where its time goes. Three runs of
+`bin/parity.exe mem` on the same idle machine (best median, µs; the reference's
+numbers from 2026-11-19):
+
+| Workload | This engine | Reference | Ratio |
+|---|---:|---:|---:|
+| insert_bulk u32_u64_str unique_0 | 647 | 231 | 2.8× |
+| insert_bulk u32_u64_str btree_each_column | 634 | 534 | 1.2× |
+| update_bulk u32_u64_str | 1 036 | 349 | 3.0× |
+| insert_bulk u32_u64_u64 unique_0 | 464 | 186 | 2.5× |
+| insert_bulk u32_u64_u64 btree_each_column | 477 | 363 | 1.3× |
+| update_bulk u32_u64_u64 | 816 | 313 | 2.6× |
+
+An insert into a table with an index on every column (three indexes) costs what
+one into a table with a single unique index costs: maintaining an index is not
+what is slow, the unique check is.
+
+**How it was measured.** A harness outside the repository runs one workload
+2 000 times through the same calls as the parity suite (`tx_insert` and
+`tx_commit`; for the update, the index lookup and `tx_update`), against a copy of
+`src/engine` with a tick counter around each stage of `tx_insert_row`,
+`tx_update_row`, `tx_commit`, `table_insert` and `table_update`. Each probe costs
+a few tens of nanoseconds, so the probed totals are 10–40% above the parity
+numbers; the shares are what to read. The first 400 runs of each workload are
+slower than the rest (the arenas and the index pools growing); the numbers below
+include them. `perf` on a Linux build was tried first: the same workload is two to
+three times slower there, a third of it in `mmap`, `munmap` and page faults from
+musl's allocator, so its profile describes Linux's allocator more than this
+engine, and the gate machine is Windows.
+
+Insert, 256 rows into 2 048, one transaction (µs per transaction):
+
+| Stage | u64 | str | Share (u64) |
+|---|---:|---:|---:|
+| unique check: encode the key, probe the staged keys, descend the committed tree | 201 | 203 | 30% |
+| apply: put the row in each index | 105 | 100 | 15% |
+| stage: undo note, the staged row map, register the key | 98 | 99 | 14% |
+| table lookup, permission, coerce and clone the values | 83 | 125 | 12% |
+| commit: build the ops (sorted staged ids) | 52 | 52 | 8% |
+| apply: pack the values, put the row | 39 | 54 | 6% |
+| CHECK, index validation, foreign keys | 20 | 18 | 3% |
+| commit: ephemeral flags, log record | 17 | 19 | 2% |
+
+Update, 256 rows found by id and rewritten (column 1, which no index covers):
+
+| Stage | u64 | str | Share (u64) |
+|---|---:|---:|---:|
+| stage: unregister, check and register the unique key | 360 | 443 | 28% |
+| apply: remove from every index, keep the version, pack, put back in every index | 245 | 358 | 19% |
+| apply: the unique check again | 171 | 246 | 13% |
+| table lookup, `tx_get`, coerce and clone the values | 132 | 208 | 10% |
+| commit: build the ops | 62 | 61 | 5% |
+
+About 775 of the update's ~1 300 probed microseconds are spent on a key that did
+not change: encoded three times while staging, checked again at the apply, and
+taken out of its index and put back.
+
+**What the reference does per row** (read from its source, `crates/table`,
+`crates/datastore`). It does not do fewer steps: an insert writes the row into the
+transaction's pages, seeks the same unique index three times (the transaction's,
+then the committed one twice: set semantics and the constraint), and at commit
+builds a value per row and writes it again into the committed pages with a second
+index insertion. An update is a delete and an insert, and the commit removes the
+old row from every index too. What it does not pay is the cost of each step:
+
+- the index on a `u32` column is a `BTreeMap<u32, RowPointer>` keyed by the
+  integer read from the row: no encoded key, no allocation, no string compare;
+- tables are found by an integer id, not by hashing their name;
+- a delete in a transaction is a bit in a per-page bitset;
+- a row of fixed-size columns is copied into page memory with no heap allocation.
+
+**Candidates, by weight** (each to be measured interleaved against the build
+before it and dropped if it does not gain, as R2b was):
+
+1. An update that changes no column of an index skips the unique work while
+   staging and, at the apply, the second check and the index remove and put:
+   about 55–60% of `update_bulk`.
+2. A unique index over one integer column keyed by the integer itself (fixed size,
+   compared as a number): the unique check, the index put and the key
+   registration, together about 55% of `insert_bulk unique_0`.
+3. One key encoding per row: the key the unique check computes is the one the
+   apply files, instead of being encoded again for the tree (part of 1 and 2 where
+   a key is not an integer).
+4. The table looked up once per transaction, not by name per row: the update
+   path has no cached table at all, and `tx.state.writes[name]` and
+   `store.tables[name]` hash the name for every row (part of the 10–12% lookup
+   stage).
+5. The staged rows of a table whose ids only grow kept in a slice rather than a
+   map, which also makes building the ops a walk instead of a sort (the 8%
+   build stage and part of the 14% staging stage).
+
+The baseline is not changed: nothing here makes the engine faster yet.
+
 To reproduce:
 
 ```sh
