@@ -489,12 +489,10 @@ pg_authenticate :: proc(
 @(private)
 server_deliver_notification :: proc(ctx: rawptr, owner: u64, channel, payload: string) {
 	server := (^Server)(ctx)
-	fmt.eprintfln("DBG deliver to owner=%d", owner)
 	sync.mutex_lock(&server.registry)
 	connection, found := server.connections[owner]
 	sync.mutex_unlock(&server.registry)
 	if !found do return
-	fmt.eprintfln("DBG deliver found=%v", found)
 	message := db.pg_notification_response(channel, payload)
 	defer delete(message)
 	// A notification is not the answer to a message; it goes out on its own, under
