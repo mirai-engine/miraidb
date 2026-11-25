@@ -41,6 +41,9 @@ Vfs_Ops :: struct {
 	sync:     proc(file: ^Vfs_File) -> Error,
 	size:     proc(file: ^Vfs_File) -> i64,
 	remove:   proc(vfs: ^Vfs, path: string) -> Error,
+	// rename moves a file over another, replacing it: what publishes a file
+	// written beside its final name.
+	rename:   proc(vfs: ^Vfs, from, to: string) -> Error,
 }
 
 // --- OS backend ------------------------------------------------------------
@@ -130,6 +133,16 @@ vfs_os_remove :: proc(vfs: ^Vfs, path: string) -> Error {
 }
 
 @(private)
+vfs_os_rename :: proc(vfs: ^Vfs, from, to: string) -> Error {
+	// Windows cannot rename over an existing file.
+	if os.exists(to) {
+		if err := os.remove(to); err != nil do return errf(.Io, "cannot replace %s: %v", to, err)
+	}
+	if err := os.rename(from, to); err != nil do return errf(.Io, "cannot rename %s to %s: %v", from, to, err)
+	return ERROR_NONE
+}
+
+@(private)
 vfs_os_ops := Vfs_Ops {
 	open     = vfs_os_open,
 	close    = vfs_os_close,
@@ -140,6 +153,7 @@ vfs_os_ops := Vfs_Ops {
 	sync     = vfs_os_sync,
 	size     = vfs_os_size,
 	remove   = vfs_os_remove,
+	rename   = vfs_os_rename,
 }
 
 @(private)
@@ -296,6 +310,23 @@ vfs_memory_remove :: proc(vfs: ^Vfs, path: string) -> Error {
 }
 
 @(private)
+vfs_memory_rename :: proc(vfs: ^Vfs, from, to: string) -> Error {
+	inner := cast(^Memory_Vfs)vfs.data
+	sync.lock(&inner.mutex)
+	defer sync.unlock(&inner.mutex)
+	if from not_in inner.files do return errf(.Io, "no such file: %s", from)
+	from_key, data := delete_key(&inner.files, from)
+	delete(from_key)
+	if to in inner.files {
+		to_key, old := delete_key(&inner.files, to)
+		delete(old)
+		delete(to_key)
+	}
+	inner.files[strings.clone(to)] = data
+	return ERROR_NONE
+}
+
+@(private)
 vfs_memory_ops := Vfs_Ops {
 	open     = vfs_memory_open,
 	close    = vfs_memory_close,
@@ -306,6 +337,7 @@ vfs_memory_ops := Vfs_Ops {
 	sync     = vfs_memory_sync,
 	size     = vfs_memory_size,
 	remove   = vfs_memory_remove,
+	rename   = vfs_memory_rename,
 }
 
 // vfs_memory_new builds an in-memory file system, useful for tests and
@@ -419,6 +451,12 @@ vfs_quota_remove :: proc(vfs: ^Vfs, path: string) -> Error {
 }
 
 @(private)
+vfs_quota_rename :: proc(vfs: ^Vfs, from, to: string) -> Error {
+	inner := cast(^Quota_Vfs)vfs.data
+	return inner.inner.ops.rename(inner.inner, from, to)
+}
+
+@(private)
 vfs_quota_ops := Vfs_Ops {
 	open     = vfs_quota_open,
 	close    = vfs_quota_close,
@@ -429,6 +467,7 @@ vfs_quota_ops := Vfs_Ops {
 	sync     = vfs_quota_sync,
 	size     = vfs_quota_size,
 	remove   = vfs_quota_remove,
+	rename   = vfs_quota_rename,
 }
 
 // vfs_quota_new wraps another file system with a byte budget.
@@ -492,6 +531,7 @@ Fault_Kind :: enum u8 {
 	Truncate,
 	Sync,
 	Remove,
+	Rename,
 }
 
 // Fault_Vfs wraps another file system and fails the nth call of one operation.
@@ -541,6 +581,8 @@ vfs_fault_maybe_fail :: proc(vfs: ^Fault_Vfs, kind: Fault_Kind) -> (bool, Error)
 		name = "sync"
 	case .Remove:
 		name = "remove"
+	case .Rename:
+		name = "rename"
 	case .None:
 	}
 	if kind == .Write && vfs.short > 0 {
@@ -644,6 +686,15 @@ vfs_fault_remove :: proc(vfs: ^Vfs, path: string) -> Error {
 }
 
 @(private)
+vfs_fault_rename :: proc(vfs: ^Vfs, from, to: string) -> Error {
+	wrapper := cast(^Fault_Vfs)vfs.data
+	if fired, fault := vfs_fault_maybe_fail(wrapper, .Rename); fired {
+		if fault.kind != .None do return fault
+	}
+	return wrapper.inner.ops.rename(wrapper.inner, from, to)
+}
+
+@(private)
 vfs_fault_ops := Vfs_Ops {
 	open     = vfs_fault_open,
 	close    = vfs_fault_close,
@@ -654,6 +705,7 @@ vfs_fault_ops := Vfs_Ops {
 	sync     = vfs_fault_sync,
 	size     = vfs_fault_size,
 	remove   = vfs_fault_remove,
+	rename   = vfs_fault_rename,
 }
 
 // vfs_fault_new wraps another file system. No fault is armed until

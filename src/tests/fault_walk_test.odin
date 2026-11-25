@@ -11,6 +11,9 @@ import db "../engine"
 // success.
 
 @(private = "file")
+FAULT_KINDS := [?]db.Fault_Kind{.Open, .Write, .Sync, .Truncate, .Remove, .Rename}
+
+@(private = "file")
 fault_exec :: proc(store: ^db.Store, sql: string) -> bool {
 	result, err := db.sql_execute(store, sql)
 	defer db.error_free(&err)
@@ -33,6 +36,49 @@ fault_count :: proc(memory: ^db.Vfs, path: string) -> i64 {
 	defer db.sql_result_destroy(&result)
 	if !db.error_ok(err) do return -1
 	return result.rows[0][0].i
+}
+
+// A snapshot or a compaction broken at any operation leaves every commit before
+// it, and the commits after it land or fail as they report.
+@(test)
+test_snapshot_and_compaction_faults :: proc(t: ^testing.T) {
+	memory := db.vfs_memory_new()
+	defer db.vfs_memory_destroy(memory)
+	fault := db.vfs_fault_new(memory)
+	defer db.vfs_fault_destroy(fault)
+	fired := 0
+	for compact in ([?]bool{false, true}) {
+		for kind in FAULT_KINDS {
+			for nth in u64(1) ..< 200 {
+				path := fmt.tprintf("_snapshot_fault_%v_%v_%d", compact, kind, nth)
+				store, open_err := db.store_open(path, {persistent = true, create = true, durable = true, vfs = fault})
+				if !testing.expectf(t, db.error_ok(open_err), "%s: open: %s", path, open_err.message) {
+					db.error_free(&open_err)
+					return
+				}
+				landed: i64 = 0
+				testing.expect(t, fault_exec(store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"))
+				for i in 0 ..< 5 {
+					if fault_exec(store, fmt.tprintf("INSERT INTO t (v) VALUES ('before %d')", i)) do landed += 1
+				}
+				db.vfs_fault_arm(fault, kind, nth)
+				step_err := compact ? db.store_compact(store) : db.store_snapshot(store)
+				db.error_free(&step_err)
+				for i in 0 ..< 3 {
+					if fault_exec(store, fmt.tprintf("INSERT INTO t (v) VALUES ('after %d')", i)) do landed += 1
+				}
+				reached := db.vfs_fault_calls(fault) >= nth
+				if db.vfs_fault_fired(fault) do fired += 1
+				db.vfs_fault_arm(fault, .None, 0)
+				db.store_close(store)
+				got := fault_count(memory, path)
+				testing.expectf(t, got == landed, "%s: %d rows after reopening, %d commits reported success", path, got, landed)
+				if !reached || testing.failed(t) do break
+			}
+			if testing.failed(t) do return
+		}
+	}
+	testing.expectf(t, fired > 0, "no fault was reached")
 }
 
 // A log that passes its segment size opens the next segment; breaking any

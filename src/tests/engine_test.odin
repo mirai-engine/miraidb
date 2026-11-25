@@ -10178,14 +10178,19 @@ test_log_on_memory_vfs :: proc(t: ^testing.T) {
 	testing.expect_value(t, scalar(t, reopened, "SELECT a FROM t WHERE id = 2").s, "y")
 	db.store_close(reopened)
 
-	// Compaction needs real files, and says so.
+	// Compaction runs on the virtual file system too (D8), and keeps the rows.
 	compact_store, compact_err := db.store_open("virtual/memdb", options)
 	if testing.expectf(t, db.error_ok(compact_err), "reopen failed: %s", compact_err.message) {
 		dropped_result_9793, vacuum_err := db.sql_execute(compact_store, "VACUUM")
 		defer db.error_free(&vacuum_err)
 		defer db.sql_result_destroy(&dropped_result_9793)
-		testing.expect_value(t, vacuum_err.kind, db.Error_Kind.Sql_Unsupported)
+		testing.expectf(t, db.error_ok(vacuum_err), "VACUUM: %s", vacuum_err.message)
 		db.store_close(compact_store)
+		compacted, compacted_err := db.store_open("virtual/memdb", options)
+		if testing.expectf(t, db.error_ok(compacted_err), "open after VACUUM: %s", compacted_err.message) {
+			testing.expect_value(t, scalar(t, compacted, "SELECT count(*) FROM t").i, i64(2))
+			db.store_close(compacted)
+		}
 	}
 
 	// The quota wrapper turns an oversized write into a clean error.

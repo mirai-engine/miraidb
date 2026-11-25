@@ -1,6 +1,5 @@
 package engine
 
-import "core:os"
 import "core:strings"
 import "core:sync"
 
@@ -67,9 +66,6 @@ store_state_payload :: proc(store: ^Store) -> []u8 {
 
 @(private)
 store_write_snapshot_locked :: proc(store: ^Store) -> Error {
-	if store.vfs != nil {
-		return errf(.Sql_Unsupported, "snapshots need the OS file system")
-	}
 	payload := store_state_payload(store)
 	defer delete(payload)
 	return store_write_snapshot_payload(store, payload)
@@ -81,9 +77,10 @@ store_write_snapshot_payload :: proc(store: ^Store, payload: []u8) -> Error {
 	defer delete(path)
 	temp_path := strings.concatenate({store.path, "/snapshot.tmp"})
 	defer delete(temp_path)
-	file, open_err := os.open(temp_path, {.Read, .Write, .Create, .Trunc})
-	if open_err != nil {
-		return errf(.Io, "cannot create %s: %v", temp_path, open_err)
+	fs := log_vfs_or_os(store.vfs)
+	file, open_err := fs.ops.open(fs, temp_path, {.Read, .Write, .Create, .Trunc})
+	if open_err.kind != .None {
+		return error_wrap(open_err, .Io, "cannot create %s: %s", temp_path, open_err.message)
 	}
 	data := make([]u8, SNAPSHOT_HEADER_LEN + len(payload))
 	defer delete(data)
@@ -95,23 +92,17 @@ store_write_snapshot_payload :: proc(store: ^Store, payload: []u8) -> Error {
 	put_u32_le(data[32:36], crc32c(payload))
 	put_u32_le(data[36:40], 0)
 	copy(data[SNAPSHOT_HEADER_LEN:], payload)
-	if _, write_err := os.write(file, data); write_err != nil {
-		os.close(file)
-		return errf(.Io, "cannot write the snapshot: %v", write_err)
+	if write_err := vfs_write_all(file, data); write_err.kind != .None {
+		fs.ops.close(file)
+		return error_wrap(write_err, .Io, "cannot write the snapshot: %s", write_err.message)
 	}
-	if sync_err := os.sync(file); sync_err != nil {
-		os.close(file)
-		return errf(.Io, "cannot sync the snapshot: %v", sync_err)
+	if sync_err := fs.ops.sync(file); sync_err.kind != .None {
+		fs.ops.close(file)
+		return error_wrap(sync_err, .Io, "cannot sync the snapshot: %s", sync_err.message)
 	}
-	os.close(file)
-	// Windows cannot rename over an existing file.
-	if os.exists(path) {
-		if remove_err := os.remove(path); remove_err != nil {
-			return errf(.Io, "cannot replace the old snapshot: %v", remove_err)
-		}
-	}
-	if rename_err := os.rename(temp_path, path); rename_err != nil {
-		return errf(.Io, "cannot publish the snapshot: %v", rename_err)
+	fs.ops.close(file)
+	if rename_err := fs.ops.rename(fs, temp_path, path); rename_err.kind != .None {
+		return error_wrap(rename_err, .Io, "cannot publish the snapshot: %s", rename_err.message)
 	}
 	return ERROR_NONE
 }
@@ -122,10 +113,16 @@ store_write_snapshot_payload :: proc(store: ^Store, payload: []u8) -> Error {
 store_load_snapshot :: proc(store: ^Store) -> Error {
 	path := store_snapshot_path(store.path)
 	defer delete(path)
-	if !os.exists(path) do return ERROR_NONE
-	data, read_err := os.read_entire_file(path, context.allocator)
-	if read_err != nil {
-		return errf(.Io, "cannot read the snapshot %s: %v", path, read_err)
+	if !log_file_exists(store.vfs, path) do return ERROR_NONE
+	fs := log_vfs_or_os(store.vfs)
+	file, open_err := fs.ops.open(fs, path, {.Read})
+	if open_err.kind != .None {
+		return error_wrap(open_err, .Io, "cannot read the snapshot %s: %s", path, open_err.message)
+	}
+	data, read_err := vfs_read_all(file, int(fs.ops.size(file)))
+	fs.ops.close(file)
+	if read_err.kind != .None {
+		return error_wrap(read_err, .Io, "cannot read the snapshot %s: %s", path, read_err.message)
 	}
 	defer delete(data)
 	if len(data) < SNAPSHOT_HEADER_LEN {

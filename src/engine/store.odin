@@ -1660,9 +1660,6 @@ store_compact :: proc(store: ^Store) -> Error {
 	if store.log.memory_mode {
 		return errf(.Invalid_Argument, "an in-memory log has nothing to compact")
 	}
-	if store.vfs != nil {
-		return errf(.Sql_Unsupported, "a virtual file system has nothing to compact")
-	}
 	if !store.persistent {
 		return errf(.Invalid_Argument, "an in-memory database has nothing to compact")
 	}
@@ -1672,10 +1669,12 @@ store_compact :: proc(store: ^Store) -> Error {
 	defer delete(payload)
 	// Compaction replaces the log file, so it needs the reader byte exclusively:
 	// a reader replaying that file must not have it open while it is rewritten.
-	if !db_lock_rewriting(&store.lock, true) {
+	// A virtual file system has no directory lock and no other process reading.
+	locks := store.vfs == nil
+	if locks && !db_lock_rewriting(&store.lock, true) {
 		return errf(.Locked, "database %s has a reader open; compacting waits", store.path)
 	}
-	defer db_lock_rewriting(&store.lock, false)
+	defer if locks do db_lock_rewriting(&store.lock, false)
 	// Publish the snapshot before touching the log: if the log swap fails, the
 	// old log still holds every record and replay ignores the extra snapshot.
 	if snapshot_err := store_write_snapshot_payload(store, payload); snapshot_err.kind != .None {
@@ -1687,37 +1686,44 @@ store_compact :: proc(store: ^Store) -> Error {
 	defer delete(temp_path)
 	base := store.commit_seq == 0 ? u64(0) : store.commit_seq - 1
 	durability := store.log.durability
+	fs := log_vfs_or_os(store.vfs)
+	// The new log is whole and durable before any old segment goes: a failure
+	// up to here leaves the live log as it was (D8).
+	if write_err := log_write_snapshot(temp_path, base, store.commit_seq, payload, store.vfs); write_err.kind != .None {
+		error_drop(fs.ops.remove(fs, temp_path))
+		return write_err
+	}
 	// The live handle must be closed before replacing the file: Windows cannot
 	// rename over an open file.
 	log_close(&store.log)
-	// Every old segment and sidecar goes away: segment 0 is rewritten below.
-	for index := 0; ; index += 1 {
+	// The later segments and every sidecar go; segment 0 is replaced below. A
+	// segment left behind holds records the snapshot already has, which replay
+	// skips.
+	for index := 1; ; index += 1 {
 		segment := log_segment_path(store.path, index)
-		if !os.exists(segment) {
+		if !log_file_exists(store.vfs, segment) {
 			delete(segment)
 			break
 		}
-		os.remove(segment)
+		error_drop(fs.ops.remove(fs, segment))
 		index_path := log_index_path(segment)
-		if os.exists(index_path) do os.remove(index_path)
+		if log_file_exists(store.vfs, index_path) do error_drop(fs.ops.remove(fs, index_path))
 		delete(segment)
 		delete(index_path)
 	}
-	if write_err := log_write_snapshot(temp_path, base, store.commit_seq, payload); write_err.kind != .None {
+	if rename_err := fs.ops.rename(fs, temp_path, log_path); rename_err.kind != .None {
 		reopen_after_failure(store, durability)
-		return write_err
-	}
-	if rename_err := os.rename(temp_path, log_path); rename_err != nil {
-		reopen_after_failure(store, durability)
-		return errf(.Io, "cannot replace the log with the snapshot: %v", rename_err)
+		return error_wrap(rename_err, .Io, "cannot replace the log with the snapshot: %s", rename_err.message)
 	}
 	// The rewrite invalidated every offset in the sidecar; log_open rebuilds it.
 	index_path := strings.concatenate({log_path, ".index"})
-	if os.exists(index_path) do os.remove(index_path)
+	if log_file_exists(store.vfs, index_path) do error_drop(fs.ops.remove(fs, index_path))
 	delete(index_path)
-	reopened, open_err := log_open(store.path, false, durability, store.log.checksum)
+	reopened, open_err := log_open(store.path, false, durability, store.log.checksum, store.vfs)
 	if open_err.kind != .None {
 		log_close(&reopened)
+		// The log stays closed, and its commits are refused until it reopens.
+		store.log.directory = store.path
 		return open_err
 	}
 	store.log = reopened
@@ -1727,7 +1733,7 @@ store_compact :: proc(store: ^Store) -> Error {
 	// startup still uses it.
 	snapshot_path := store_snapshot_path(store.path)
 	defer delete(snapshot_path)
-	if os.exists(snapshot_path) do os.remove(snapshot_path)
+	if log_file_exists(store.vfs, snapshot_path) do error_drop(fs.ops.remove(fs, snapshot_path))
 	return ERROR_NONE
 }
 
@@ -1758,12 +1764,14 @@ store_table_memory :: proc(store: ^Store, name: string) -> (Table_Memory, Error)
 
 @(private)
 reopen_after_failure :: proc(store: ^Store, durability: Durability) {
-	reopened, open_err := log_open(store.path, false, durability, store.log.checksum)
+	reopened, open_err := log_open(store.path, false, durability, store.log.checksum, store.vfs)
 	if open_err.kind == .None {
 		store.log = reopened
 	} else {
 		log_close(&reopened)
 		error_free(&open_err)
+		// The log stays closed, and its commits are refused until it reopens.
+		store.log.directory = store.path
 	}
 }
 
