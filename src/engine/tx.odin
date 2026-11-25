@@ -1694,10 +1694,16 @@ tx_update_row :: proc(tx: ^Tx, name: string, id: Row_Id, values: []Value) -> Err
 	if fk_err := fk_check_child(tx, table, row_values); fk_err.kind != .None {
 		return fk_err
 	}
-	tx_unregister_unique(tx, name, table, previous.values, id)
-	if err := tx_check_unique(tx, name, table, row_values, id); err.kind != .None {
-		tx_register_unique(tx, name, table, previous.values, id)
-		return err
+	// An update that keeps every unique key of the row checks none and moves
+	// none: the keys are still the row's own, a committed one in the committed
+	// index (tx_rewrite_keeps_key) and a staged one in `unique_keys`.
+	keys_kept := tx_unique_keys_kept(tx, table, previous.values, row_values)
+	if !keys_kept {
+		tx_unregister_unique(tx, name, table, previous.values, id)
+		if err := tx_check_unique(tx, name, table, row_values, id); err.kind != .None {
+			tx_register_unique(tx, name, table, previous.values, id)
+			return err
+		}
 	}
 	if trigger_err := trigger_fire(
 		tx,
@@ -1717,7 +1723,7 @@ tx_update_row :: proc(tx: ^Tx, name: string, id: Row_Id, values: []Value) -> Err
 		undo_note_update(tx, writes, id)
 		writes.updates[id] = row_values
 	}
-	tx_register_unique(tx, name, table, row_values, id)
+	if !keys_kept do tx_register_unique(tx, name, table, row_values, id)
 	// ON UPDATE cascades run after the new key is staged, so the children see it.
 	if fk_err := fk_parent_update(tx, name, previous.values, row_values); fk_err.kind != .None {
 		return fk_err
@@ -2145,11 +2151,11 @@ tx_committed_key_taken :: proc(
 	ignore: Row_Id,
 	writes: ^Table_Writes,
 ) -> bool {
-	holds :: proc(id: Row_Id, ignore: Row_Id, writes: ^Table_Writes) -> bool {
+	holds :: proc(tx: ^Tx, committed: ^Table, index: int, values: []Value, id: Row_Id, ignore: Row_Id, writes: ^Table_Writes) -> bool {
 		if id == ignore do return false
 		if writes != nil {
 			if writes.deletes[id] do return false
-			if _, changed := writes.updates[id]; changed do return false
+			if staged, changed := writes.updates[id]; changed do return tx_rewrite_keeps_key(tx, committed, index, staged, values)
 		}
 		return true
 	}
@@ -2157,15 +2163,37 @@ tx_committed_key_taken :: proc(
 		prefix := index_prefix_in(committed, index, values, tx.alloc)
 		for node := lower_bound(&committed.indexes[index].tree, prefix); node != nil; node = node_next(node) {
 			if !strings.has_prefix(node.key, prefix) do break
-			if holds(node.value.first, ignore, writes) do return true
-			for id in node.value.more do if holds(id, ignore, writes) do return true
+			if holds(tx, committed, index, values, node.value.first, ignore, writes) do return true
+			for id in node.value.more do if holds(tx, committed, index, values, id, ignore, writes) do return true
 		}
 		return false
 	}
 	ids := table_index_lookup(committed, index, values)
 	defer delete(ids)
-	for id in ids do if holds(id, ignore, writes) do return true
+	for id in ids do if holds(tx, committed, index, values, id, ignore, writes) do return true
 	return false
+}
+
+// tx_rewrite_keeps_key reports whether a committed row the transaction rewrote
+// still holds the key `values` has under a unique index. An update that keeps
+// the row's unique keys registers none (tx_update_row): its row is still found
+// under its key in the committed index, and is asked here. Only a row the
+// committed index files under the key is asked, so a lookup that finds none
+// pays nothing.
+tx_rewrite_keeps_key :: proc(tx: ^Tx, table: ^Table, index: int, staged: []Value, values: []Value) -> bool {
+	if !index_row_included(table, index, staged) || index_key_has_null(table, index, staged) do return false
+	return unique_key(tx, table, index, staged) == unique_key(tx, table, index, values)
+}
+
+// tx_unique_keys_kept reports an update that leaves every unique key of the row
+// as it was, under plain indexes, in a transaction that changed no index.
+@(private)
+tx_unique_keys_kept :: proc(tx: ^Tx, table: ^Table, old: []Value, new: []Value) -> bool {
+	if len(tx.state.index_ops) > 0 do return false
+	for idx, i in table.indexes {
+		if idx.unique && !index_key_unchanged(table, i, old, new) do return false
+	}
+	return true
 }
 
 // tx_register_keys records keys tx_check_unique computed for the same values.

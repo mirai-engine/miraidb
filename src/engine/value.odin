@@ -414,6 +414,34 @@ numeric_equal :: proc(a, b: Value) -> bool {
 	return numeric_compare_exact(a, b) == .Equal
 }
 
+// value_identical reports two values of the same kind with the same bits, so
+// every encoding of one is the encoding of the other. 1 and 1.0, or 0.0 and
+// -0.0, are equal (value_equal) and not identical. A list is never identical.
+value_identical :: proc(a, b: Value) -> bool {
+	if a.kind != b.kind do return false
+	switch a.kind {
+	case .Null, .Default:
+		return true
+	case .Bool:
+		return a.b == b.b
+	case .Int, .Uint, .Float, .Timestamp, .Duration, .Connection:
+		return a.u == b.u
+	case .Int128, .Uint128:
+		return a.big == b.big
+	case .String:
+		return a.s == b.s
+	case .Bytes:
+		return slice.equal(a.bytes, b.bytes)
+	case .Uuid:
+		return a.uuid == b.uuid
+	case .Identity:
+		return value_identity_of(a) == value_identity_of(b)
+	case .Array, .Product:
+		return false
+	}
+	return false
+}
+
 @(private)
 numeric_as_f64 :: proc(v: Value) -> (f64, bool) {
 	#partial switch v.kind {

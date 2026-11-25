@@ -8216,11 +8216,12 @@ unique_conflicts :: proc(tx: ^Tx, name: string, table: ^Table, values: []Value) 
 			found := table_index_lookup(committed, i, values)
 			defer delete(found)
 			for id in found {
-				// A committed row the transaction deleted or rewrote no longer
-				// holds its committed key.
+				// A committed row the transaction deleted no longer holds its
+				// committed key, and one it rewrote holds it only if the new
+				// values keep it.
 				if writes != nil {
 					if writes.deletes[id] do continue
-					if _, changed := writes.updates[id]; changed do continue
+					if staged, changed := writes.updates[id]; changed && !tx_rewrite_keeps_key(tx, table, i, staged, values) do continue
 				}
 				add(&ids, id)
 			}

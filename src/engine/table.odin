@@ -430,6 +430,20 @@ index_key_has_null :: proc(t: ^Table, index: int, values: []Value) -> bool {
 	return index_encode_parts(&w, t, index, values)
 }
 
+// index_key_unchanged reports whether two versions of a row have the same key
+// under a plain index: every key column holds an identical value, so the encoded
+// key is the same and the index already files the row under it. An index with an
+// expression or a WHERE answers false, since its key is not read from the
+// columns alone.
+index_key_unchanged :: proc(t: ^Table, index: int, old, new: []Value) -> bool {
+	if t.indexes[index].exprs != nil do return false
+	for col in t.indexes[index].schema.columns {
+		if col < 0 || col >= len(old) || col >= len(new) do return false
+		if !value_identical(old[col], new[col]) do return false
+	}
+	return true
+}
+
 // index_validate_row evaluates every WHERE and key expression of the table's
 // indexes for a row about to be written, so an expression that fails (a type it
 // cannot take) is the statement's error instead of a NULL key at apply time.
@@ -1386,10 +1400,12 @@ table_find_primary_key :: proc(t: ^Table, pk_values: []Value) -> (Row_Id, bool) 
 }
 
 // table_check_unique verifies that no other row holds the key of `values` in a
-// unique index. `ignore` is the row being replaced or updated.
-table_check_unique :: proc(t: ^Table, values: []Value, ignore: Row_Id = Row_Id(max(u64))) -> Error {
+// unique index. `ignore` is the row being replaced or updated, and `skip` names
+// the indexes whose key it keeps.
+table_check_unique :: proc(t: ^Table, values: []Value, ignore: Row_Id = Row_Id(max(u64)), skip: bit_set[0 ..< 64] = {}) -> Error {
 	for idx, i in t.indexes {
 		if !idx.unique do continue
+		if i < 64 && i in skip do continue
 		if !index_row_included(t, i, values) do continue
 		if index_key_has_null(t, i, values) do continue
 		ids := table_index_lookup(t, i, values)
@@ -1616,10 +1632,18 @@ table_update :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
 		return errf(.Internal, "row id %d is missing from table %s", u64(id), t.schema.name)
 	}
 	row := t.rows[at]
-	if err := table_check_unique(t, values, id); err.kind != .None {
+	// An index whose key the update leaves as it was keeps its entry: the row is
+	// filed under the same key and id, and a unique key it held is still its own,
+	// so it is neither checked nor removed and put back.
+	unchanged: bit_set[0 ..< 64]
+	if len(t.indexes) <= 64 {
+		for _, i in t.indexes do if index_key_unchanged(t, i, row.values, values) do unchanged += {i}
+	}
+	if err := table_check_unique(t, values, id, unchanged); err.kind != .None {
 		return err
 	}
 	for _, i in t.indexes {
+		if i < 64 && i in unchanged do continue
 		table_index_remove_row(t, i, row.values, id)
 	}
 	// The current values become a version, so a reader that started earlier
@@ -1648,6 +1672,7 @@ table_update :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
 		versions = row.versions,
 	}
 	for _, i in t.indexes {
+		if i < 64 && i in unchanged do continue
 		if put_err := table_index_put_row(t, i, stored, id); put_err.kind != .None do return put_err
 	}
 	return ERROR_NONE
