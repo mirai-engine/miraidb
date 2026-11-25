@@ -189,3 +189,90 @@ test_page_flush_kill :: proc(t: ^testing.T) {
 	}
 	testing.expectf(t, killed > 10, "only %d page writes were reached", killed)
 }
+
+@(private = "file")
+mirror_fault_summary :: proc(conn: ^db.Embed_Conn) -> string {
+	stmt := db.embed_prepare(conn, "SELECT count(*), coalesce(sum(id), 0), coalesce(sum(length(v)), 0), (SELECT count(*) FROM t WHERE v > 'a') FROM t")
+	if stmt == nil do return "(no table)"
+	defer db.embed_finalize(stmt)
+	has_row, err := db.embed_step(stmt)
+	if !db.error_ok(err) {
+		db.error_free(&err)
+		return "(error)"
+	}
+	if !has_row do return "(no row)"
+	return fmt.tprintf("%d|%d|%d|%d", db.embed_column_int(stmt, 0), db.embed_column_int(stmt, 1), db.embed_column_int(stmt, 2), db.embed_column_int(stmt, 3))
+}
+
+// A database opened from a .sqlite file has that file as its only copy. Every
+// operation of its writes (the whole file a schema change rewrites, the journal
+// and the pages a row commit patches, the journal's removal) is broken in turn:
+// a commit the file did not take fails, the connection goes on from what the
+// file holds, and reopening the file, which rolls a journal left behind back,
+// finds exactly the commits that reported success in a file that validates.
+@(test)
+test_sqlite_mirror_faults :: proc(t: ^testing.T) {
+	fault := db.vfs_fault_new(db.vfs_os())
+	defer db.vfs_fault_destroy(fault)
+	workload := [?]string {
+		"CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)",
+		"CREATE INDEX t_v ON t (v)",
+		"INSERT INTO t (v) SELECT printf('row %03d', value) FROM generate_series(1, 60)",
+		"UPDATE t SET v = 'a' || v WHERE id % 4 = 0",
+		"DELETE FROM t WHERE id % 5 = 0",
+		"INSERT INTO t (v) VALUES ('last')",
+	}
+	fired := 0
+	for kind in ([?]db.Fault_Kind{.Open, .Write, .Seek, .Truncate, .Sync, .Remove}) {
+		for nth in u64(1) ..< 300 {
+			path := fmt.tprintf("_test_mirror_fault_%v_%d.db", kind, nth)
+			journal := fmt.tprintf("%s-journal", path)
+			os.remove(path)
+			os.remove(journal)
+			defer os.remove(path)
+			defer os.remove(journal)
+			if !testing.expect(t, db.sqlite_create_empty_file(path)) do return
+			model, model_err := db.store_open("", {persistent = false})
+			if !testing.expectf(t, db.error_ok(model_err), "model: %s", model_err.message) do return
+			defer db.store_close(model)
+			conn, open_err := db.embed_open(path)
+			if !testing.expectf(t, db.error_ok(open_err), "%s: open: %s", path, open_err.message) do return
+			db.store_set_mirror_vfs(conn.store, fault)
+			db.vfs_fault_arm(fault, kind, nth)
+			for sql in workload {
+				err := db.embed_exec(conn, sql)
+				ok := db.error_ok(err)
+				db.error_free(&err)
+				if ok do testing.expectf(t, fault_exec(model, sql), "model: %s", sql)
+			}
+			reached := db.vfs_fault_calls(fault) >= nth
+			if db.vfs_fault_fired(fault) do fired += 1
+			db.vfs_fault_arm(fault, .None, 0)
+			// What the connection reads after the fault is the file's too.
+			model_conn := db.embed_wrap(model)
+			want := mirror_fault_summary(model_conn)
+			db.embed_close(model_conn)
+			testing.expectf(t, mirror_fault_summary(conn) == want, "%s: the connection holds %s, the commits that worked %s", path, mirror_fault_summary(conn), want)
+			db.embed_close(conn)
+			reopened, reopen_err := db.embed_open(path)
+			if !testing.expectf(t, db.error_ok(reopen_err), "%s: reopen: %s", path, reopen_err.message) {
+				db.error_free(&reopen_err)
+				return
+			}
+			got := mirror_fault_summary(reopened)
+			testing.expectf(t, got == want, "%s: got %s after reopening, the commits that worked %s", path, got, want)
+			// The file takes a commit again, and SQLite's invariants hold on it.
+			if want != "(no table)" && want != "(error)" {
+				err := db.embed_exec(reopened, "INSERT INTO t (v) VALUES ('again')")
+				testing.expectf(t, db.error_ok(err), "%s: write after reopening: %s", path, err.message)
+				db.error_free(&err)
+			}
+			db.embed_close(reopened)
+			valid, reason := db.sqlite_mirror_validate(path)
+			testing.expectf(t, valid || want == "(no table)", "%s: the file does not validate: %s", path, reason)
+			if !reached || testing.failed(t) do break
+		}
+		if testing.failed(t) do return
+	}
+	testing.expectf(t, fired > 0, "no fault was reached")
+}

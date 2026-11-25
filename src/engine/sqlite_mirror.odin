@@ -38,7 +38,6 @@ package engine
 // rewritten from the store.
 
 import "core:mem"
-import "core:os"
 import "core:slice"
 import "core:strings"
 import "core:fmt"
@@ -113,8 +112,13 @@ Sqlite_Mirror :: struct {
 	dirty_order:   [dynamic]int,
 	master_dirty:  bool,
 	// crash_before_header makes the next commit stop between its data pages and
-	// the header, which is what a process that dies mid-commit leaves behind.
+	// the header, which is what a process that dies mid-commit leaves behind;
+	// crashed says it did, so nothing after it runs, a rollback included.
 	crash_before_header: bool,
+	crashed:             bool,
+	// vfs is what the file is written through: the operating system, or a
+	// wrapper that breaks it (D8).
+	vfs:                 ^Vfs,
 	// why the last commit had to re-encode the whole file, for the tests
 	fallback_reason: string,
 	// sequence is sqlite_sequence's rows by table name: the rowid each lives
@@ -394,6 +398,7 @@ mirror_build :: proc(store: ^Store, path: string, recover := false, alloc := con
 
 	m := new(Sqlite_Mirror, alloc)
 	m.alloc = alloc
+	m.vfs = store.mirror_vfs
 	m.path = strings.clone(path, alloc)
 	m.page_size = int(file.page_size)
 	m.usable = int(file.usable)
@@ -1412,16 +1417,17 @@ mirror_write_journal :: proc(m: ^Sqlite_Mirror, original_count: int) -> Error {
 		mirror_put_be32(image, at + 4 + m.page_size, checksum)
 		at += stride
 	}
-	file, open_err := os.open(path, {.Read, .Write, .Create, .Trunc})
-	if open_err != nil {
-		return errf(.Io, "cannot write %s: %v", path, open_err)
+	fs := log_vfs_or_os(m.vfs)
+	file, open_err := fs.ops.open(fs, path, {.Read, .Write, .Create, .Trunc})
+	if open_err.kind != .None {
+		return error_wrap(open_err, .Io, "cannot write %s: %s", path, open_err.message)
 	}
-	defer os.close(file)
-	if _, write_err := os.write(file, image); write_err != nil {
-		return errf(.Io, "cannot write %s: %v", path, write_err)
+	defer fs.ops.close(file)
+	if write_err := vfs_write_all(file, image); write_err.kind != .None {
+		return error_wrap(write_err, .Io, "cannot write %s: %s", path, write_err.message)
 	}
-	if sync_err := os.sync(file); sync_err != nil {
-		return errf(.Io, "cannot flush %s: %v", path, sync_err)
+	if sync_err := fs.ops.sync(file); sync_err.kind != .None {
+		return error_wrap(sync_err, .Io, "cannot flush %s: %s", path, sync_err.message)
 	}
 	return ERROR_NONE
 }
@@ -1451,9 +1457,11 @@ mirror_commit_pages :: proc(m: ^Sqlite_Mirror) -> Error {
 	}
 	path := mirror_journal_path(m)
 	defer delete(path, m.alloc)
-	file, open_err := os.open(m.path, {.Read, .Write})
-	if open_err != nil do return errf(.Io, "cannot open %s: %v", m.path, open_err)
-	defer os.close(file)
+	fs := log_vfs_or_os(m.vfs)
+	file, open_err := fs.ops.open(fs, m.path, {.Read, .Write})
+	if open_err.kind != .None do return error_wrap(open_err, .Io, "cannot open %s: %s", m.path, open_err.message)
+	file_open := true
+	defer if file_open do fs.ops.close(file)
 	written: u64 = 0
 	// Page 1 goes last: until it lands, the file still describes the state the
 	// journal can restore.
@@ -1461,11 +1469,11 @@ mirror_commit_pages :: proc(m: ^Sqlite_Mirror) -> Error {
 		if page == 1 do continue
 		block := m.dirty[page]
 		if block == nil do continue
-		if _, seek_err := os.seek(file, i64(page - 1) * i64(m.page_size), .Start); seek_err != nil {
-			return errf(.Io, "cannot seek to page %d: %v", page, seek_err)
+		if _, seek_err := fs.ops.seek(file, i64(page - 1) * i64(m.page_size)); seek_err.kind != .None {
+			return error_wrap(seek_err, .Io, "cannot seek to page %d: %s", page, seek_err.message)
 		}
-		if _, write_err := os.write(file, block); write_err != nil {
-			return errf(.Io, "cannot write page %d: %v", page, write_err)
+		if write_err := vfs_write_all(file, block); write_err.kind != .None {
+			return error_wrap(write_err, .Io, "cannot write page %d: %s", page, write_err.message)
 		}
 		written += u64(m.page_size)
 		m.pages_written += 1
@@ -1475,19 +1483,23 @@ mirror_commit_pages :: proc(m: ^Sqlite_Mirror) -> Error {
 		// describes the state the journal can restore. That is exactly the window
 		// a crash lives in.
 		m.crash_before_header = false
+		m.crashed = true
 		return errf(.Io, "the mirror commit stopped before its header")
 	}
 	if block := m.dirty[1]; block != nil {
-		if _, seek_err := os.seek(file, 0, .Start); seek_err != nil {
-			return errf(.Io, "cannot seek to the header: %v", seek_err)
+		if _, seek_err := fs.ops.seek(file, 0); seek_err.kind != .None {
+			return error_wrap(seek_err, .Io, "cannot seek to the header: %s", seek_err.message)
 		}
-		if _, write_err := os.write(file, block); write_err != nil {
-			return errf(.Io, "cannot write the header: %v", write_err)
+		if write_err := vfs_write_all(file, block); write_err.kind != .None {
+			return error_wrap(write_err, .Io, "cannot write the header: %s", write_err.message)
 		}
 		written += u64(m.page_size)
 		m.pages_written += 1
 	}
-	if sync_err := os.sync(file); sync_err != nil do return errf(.Io, "cannot flush %s: %v", m.path, sync_err)
+	if sync_err := fs.ops.sync(file); sync_err.kind != .None do return error_wrap(sync_err, .Io, "cannot flush %s: %s", m.path, sync_err.message)
+	// The pages are durable: the file is closed before the journal goes.
+	fs.ops.close(file)
+	file_open = false
 	m.bytes_written += written
 	for page, block in m.dirty {
 		_ = page
@@ -1505,10 +1517,10 @@ mirror_commit_pages :: proc(m: ^Sqlite_Mirror) -> Error {
 	m.dirty_original = make(map[int][]u8, m.alloc)
 	clear(&m.dirty_order)
 	// The pages are durable, so the journal has done its job.
-	if remove_err := os.remove(path); remove_err != nil {
-		// A stale journal would roll the commit back on the next open, so this
-		// is worth reporting even though the commit itself is safe.
-		return errf(.Io, "cannot remove %s: %v", path, remove_err)
+	if remove_err := fs.ops.remove(fs, path); remove_err.kind != .None {
+		// A stale journal would roll the commit back on the next open, so the
+		// commit is not done until it goes.
+		return error_wrap(remove_err, .Io, "cannot remove %s: %s", path, remove_err.message)
 	}
 	return ERROR_NONE
 }

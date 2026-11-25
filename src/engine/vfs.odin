@@ -501,6 +501,14 @@ vfs_write_all :: proc(file: ^Vfs_File, data: []u8) -> Error {
 	return ERROR_NONE
 }
 
+// vfs_read_path reads a whole file.
+vfs_read_path :: proc(vfs: ^Vfs, path: string, alloc := context.allocator) -> ([]u8, Error) {
+	file, open_err := vfs.ops.open(vfs, path, {.Read})
+	if open_err.kind != .None do return nil, open_err
+	defer vfs.ops.close(file)
+	return vfs_read_all(file, int(vfs.ops.size(file)), alloc)
+}
+
 // vfs_read_all reads up to `size` bytes starting at the current position.
 vfs_read_all :: proc(file: ^Vfs_File, size: int, alloc := context.allocator) -> ([]u8, Error) {
 	buffer := make([]u8, size, alloc)

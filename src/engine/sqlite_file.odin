@@ -246,47 +246,203 @@ sqlite_wal_load :: proc(file: ^Sqlite_File, path: string) -> bool {
 	return len(file.wal_pages) > 0
 }
 
-// sqlite_journal_rollback restores the pages a hot rollback journal recorded.
-// SQLite writes the original page images there before touching the database, so
-// a journal next to the file means the transaction never committed and the
-// images win. Records start on sector boundaries. Once the images are back the
-// journal is deleted, which is what makes this recovery rather than a replay
-// that would undo the next commit as well.
+// Sqlite_Journal is what a rollback journal plays back: the page images it
+// holds and the page count the database had before the transaction.
 @(private)
-sqlite_journal_rollback :: proc(file: ^Sqlite_File, path: string, recover := false) -> bool {
+Sqlite_Journal :: struct {
+	page_size: int,
+	original:  int,
+	pages:     [dynamic]Sqlite_Journal_Page,
+}
+
+@(private)
+Sqlite_Journal_Page :: struct {
+	page:  int,
+	image: []u8,
+}
+
+// sqlite_journal_parse reads the records of a rollback journal as SQLite plays
+// them back: from the first sector on, each record whose checksum verifies, up
+// to the count the header gives. The first record that does not verify ends the
+// journal, so one torn while it was written restores nothing it does not hold
+// whole. The images point into `data`; the list is in the temporary allocator.
+@(private)
+sqlite_journal_parse :: proc(data: []u8) -> (journal: Sqlite_Journal, ok: bool) {
+	if len(data) < 28 || string(data[:8]) != SQLITE_MIRROR_JOURNAL_MAGIC do return {}, false
+	count := sqlite_be32(data, 8)
+	nonce := sqlite_be32(data, 12)
+	page_size := int(sqlite_be32(data, 24))
+	if page_size < 512 || page_size & (page_size - 1) != 0 do return {}, false
+	sector := int(sqlite_be32(data, 20))
+	if sector < 32 || sector & (sector - 1) != 0 do sector = 512
+	journal.page_size = page_size
+	journal.original = int(sqlite_be32(data, 16))
+	journal.pages = make([dynamic]Sqlite_Journal_Page, context.temp_allocator)
+	record := 4 + page_size + 4
+	stride := (record + sector - 1) / sector * sector
+	for at := sector; at + record <= len(data); at += stride {
+		// Zero and all ones both mean "as many as the file holds" to SQLite.
+		if count != 0 && count != 0xFFFFFFFF && len(journal.pages) >= int(count) do break
+		page_no := int(sqlite_be32(data, at))
+		if page_no == 0 do break
+		image := data[at + 4:at + 4 + page_size]
+		if mirror_page_checksum(image, nonce) != sqlite_be32(data, at + 4 + page_size) do break
+		append(&journal.pages, Sqlite_Journal_Page{page = page_no, image = image})
+	}
+	return journal, true
+}
+
+// sqlite_journal_rollback restores, in the image read into memory, the pages a
+// hot rollback journal recorded. SQLite writes the original page images there
+// before touching the database, so a journal next to the file means the
+// transaction never committed and the images win. The journal stays on disk: a
+// reader does not own the file, and the owner rolls it back into the file itself
+// (sqlite_journal_recover_file).
+@(private)
+sqlite_journal_rollback :: proc(file: ^Sqlite_File, path: string) -> bool {
 	data, read_err := os.read_entire_file(path, file.alloc)
 	if read_err != nil do return false
 	defer delete(data, file.alloc)
-	if len(data) < 28 do return false
-	magic := [8]u8{0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7}
-	for byte, i in magic {
-		if data[i] != byte do return false
-	}
-	page_size := u32(sqlite_be32(data, 24))
-	if page_size < 512 || page_size & (page_size - 1) != 0 do return false
-	sector := u32(sqlite_be32(data, 20))
-	if sector < 32 || sector & (sector - 1) != 0 do sector = 512
-	at := int(sector)
+	journal, ok := sqlite_journal_parse(data)
+	if !ok do return false
 	applied := false
-	for at + 4 + int(page_size) <= len(data) {
-		page_no := sqlite_be32(data, at)
-		if page_no == 0 do break
-		image := data[at + 4:at + 4 + int(page_size)]
-		offset := (int(page_no) - 1) * int(page_size)
-		if offset + int(page_size) <= len(file.data) {
-			copy(file.data[offset:offset + int(page_size)], image)
+	for page in journal.pages {
+		offset := (page.page - 1) * journal.page_size
+		if offset + journal.page_size <= len(file.data) {
+			copy(file.data[offset:offset + journal.page_size], page.image)
 			applied = true
 		}
-		record := 4 + int(page_size) + 4
-		at += (record + int(sector) - 1) / int(sector) * int(sector)
-	}
-	if applied && recover {
-		// The owner is about to write the file: the transaction is rolled back
-		// and keeping the journal would restore these pages over the next
-		// commit. A plain reader leaves it alone.
-		os.remove(path)
 	}
 	return applied
+}
+
+// sqlite_journal_recover_file rolls a hot journal back into the database file:
+// its pages are written over the ones the interrupted transaction changed, the
+// file goes back to its old length, and once that is durable the journal goes.
+// It is what the file's owner does before writing it, as SQLite does: patching a
+// file whose journal was simply deleted left the torn pages it did not touch in
+// place, with nothing left to restore them (D8). recovered says a journal was
+// there.
+sqlite_journal_recover_file :: proc(path: string, vfs: ^Vfs = nil) -> (recovered: bool, err: Error) {
+	journal_path := strings.concatenate({path, "-journal"}, context.temp_allocator)
+	if !log_file_exists(vfs, journal_path) do return false, ERROR_NONE
+	fs := log_vfs_or_os(vfs)
+	data, read_err := vfs_read_path(fs, journal_path)
+	if read_err.kind != .None do return true, error_wrap(read_err, .Io, "cannot read %s: %s", journal_path, read_err.message)
+	defer delete(data)
+	journal, ok := sqlite_journal_parse(data)
+	if ok {
+		file, open_err := fs.ops.open(fs, path, {.Read, .Write})
+		if open_err.kind != .None do return true, error_wrap(open_err, .Io, "cannot roll back %s: %s", path, open_err.message)
+		for page in journal.pages {
+			at := i64(page.page - 1) * i64(journal.page_size)
+			if _, seek_err := fs.ops.seek(file, at); seek_err.kind != .None {
+				fs.ops.close(file)
+				return true, error_wrap(seek_err, .Io, "cannot roll back %s: %s", path, seek_err.message)
+			}
+			if write_err := vfs_write_all(file, page.image); write_err.kind != .None {
+				fs.ops.close(file)
+				return true, error_wrap(write_err, .Io, "cannot roll back %s: %s", path, write_err.message)
+			}
+		}
+		// A file that was empty before the transaction is empty again.
+		if truncate_err := fs.ops.truncate(file, i64(journal.original) * i64(journal.page_size)); truncate_err.kind != .None {
+			fs.ops.close(file)
+			return true, error_wrap(truncate_err, .Io, "cannot roll back %s: %s", path, truncate_err.message)
+		}
+		if sync_err := fs.ops.sync(file); sync_err.kind != .None {
+			fs.ops.close(file)
+			return true, error_wrap(sync_err, .Io, "cannot roll back %s: %s", path, sync_err.message)
+		}
+		fs.ops.close(file)
+	}
+	// A journal that does not verify is not hot; it goes as well.
+	if remove_err := fs.ops.remove(fs, journal_path); remove_err.kind != .None {
+		return true, error_wrap(remove_err, .Io, "cannot remove %s: %s", journal_path, remove_err.message)
+	}
+	return true, ERROR_NONE
+}
+
+// sqlite_file_write_journaled replaces a database file with `image` the way a
+// SQLite commit does: every page of the old file goes into a rollback journal
+// that is durable before the first byte of the file moves, and the journal goes
+// once the new file is. Writing the image over the file directly lost the
+// database to a failure halfway (D8).
+sqlite_file_write_journaled :: proc(path: string, image: []u8, vfs: ^Vfs = nil) -> Error {
+	fs := log_vfs_or_os(vfs)
+	journal_path := strings.concatenate({path, "-journal"}, context.temp_allocator)
+	journaled := false
+	if log_file_exists(vfs, path) {
+		old, read_err := vfs_read_path(fs, path)
+		if read_err.kind != .None do return error_wrap(read_err, .Io, "cannot read %s: %s", path, read_err.message)
+		defer delete(old)
+		page_size := len(old) >= 100 && string(old[:16]) == SQLITE_MAGIC ? int(sqlite_be16(old, 16)) : 0
+		if page_size == 1 do page_size = 65536
+		// An empty file journals no page and an original size of zero, so a
+		// rollback empties it again, as SQLite's does.
+		if len(old) == 0 {
+			page_size = len(image) >= 100 ? int(sqlite_be16(image, 16)) : 4096
+			if page_size == 1 do page_size = 65536
+		}
+		if page_size >= 512 && page_size & (page_size - 1) == 0 && (len(old) == 0 || len(old) >= page_size) {
+			count := len(old) / page_size
+			sector := 512
+			stride := (4 + page_size + 4 + sector - 1) / sector * sector
+			journal := make([]u8, sector + count * stride)
+			defer delete(journal)
+			nonce := u32(len(old)) * 2654435761 + 1
+			copy(journal[:8], SQLITE_MIRROR_JOURNAL_MAGIC)
+			mirror_put_be32(journal, 8, u32(count))
+			mirror_put_be32(journal, 12, nonce)
+			mirror_put_be32(journal, 16, u32(count))
+			mirror_put_be32(journal, 20, u32(sector))
+			mirror_put_be32(journal, 24, u32(page_size))
+			for page in 0 ..< count {
+				at := sector + page * stride
+				original := old[page * page_size:(page + 1) * page_size]
+				mirror_put_be32(journal, at, u32(page + 1))
+				copy(journal[at + 4:at + 4 + page_size], original)
+				mirror_put_be32(journal, at + 4 + page_size, mirror_page_checksum(original, nonce))
+			}
+			file, open_err := fs.ops.open(fs, journal_path, {.Read, .Write, .Create, .Trunc})
+			if open_err.kind != .None do return error_wrap(open_err, .Io, "cannot write %s: %s", journal_path, open_err.message)
+			if write_err := vfs_write_all(file, journal); write_err.kind != .None {
+				fs.ops.close(file)
+				return error_wrap(write_err, .Io, "cannot write %s: %s", journal_path, write_err.message)
+			}
+			if sync_err := fs.ops.sync(file); sync_err.kind != .None {
+				fs.ops.close(file)
+				return error_wrap(sync_err, .Io, "cannot flush %s: %s", journal_path, sync_err.message)
+			}
+			fs.ops.close(file)
+			journaled = true
+		}
+	}
+	file, open_err := fs.ops.open(fs, path, {.Read, .Write, .Create})
+	if open_err.kind != .None do return error_wrap(open_err, .Io, "cannot write %s: %s", path, open_err.message)
+	if _, seek_err := fs.ops.seek(file, 0); seek_err.kind != .None {
+		fs.ops.close(file)
+		return error_wrap(seek_err, .Io, "cannot write %s: %s", path, seek_err.message)
+	}
+	if write_err := vfs_write_all(file, image); write_err.kind != .None {
+		fs.ops.close(file)
+		return error_wrap(write_err, .Io, "cannot write %s: %s", path, write_err.message)
+	}
+	if truncate_err := fs.ops.truncate(file, i64(len(image))); truncate_err.kind != .None {
+		fs.ops.close(file)
+		return error_wrap(truncate_err, .Io, "cannot size %s: %s", path, truncate_err.message)
+	}
+	if sync_err := fs.ops.sync(file); sync_err.kind != .None {
+		fs.ops.close(file)
+		return error_wrap(sync_err, .Io, "cannot flush %s: %s", path, sync_err.message)
+	}
+	fs.ops.close(file)
+	if journaled {
+		if remove_err := fs.ops.remove(fs, journal_path); remove_err.kind != .None {
+			return error_wrap(remove_err, .Io, "cannot remove %s: %s", journal_path, remove_err.message)
+		}
+	}
+	return ERROR_NONE
 }
 
 @(private)
@@ -876,6 +1032,10 @@ sqlite_file_open :: proc(
 	alloc := context.allocator,
 	recover := false,
 ) -> (Sqlite_File, Error) {
+	// The owner rolls a hot journal back into the file before reading it.
+	if recover {
+		if _, recover_err := sqlite_journal_recover_file(path); recover_err.kind != .None do return {}, recover_err
+	}
 	data, read_err := os.read_entire_file(path, alloc)
 	if read_err != nil {
 		return {}, errf(.Io, "cannot read %s: %v", path, read_err)
@@ -926,7 +1086,7 @@ sqlite_file_parse :: proc(
 		// must restore, so it wins over the database file.
 		journal_path := fmt.aprintf("%s-journal", path, allocator = alloc)
 		defer delete(journal_path, alloc)
-		sqlite_journal_rollback(&file, journal_path, recover)
+		sqlite_journal_rollback(&file, journal_path)
 		// A write-ahead log keeps the most recent commits out of the database
 		// file.
 		wal_path := fmt.aprintf("%s-wal", path, allocator = alloc)

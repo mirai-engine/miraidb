@@ -188,6 +188,11 @@ Store :: struct {
 	// then end): the shared-file layer takes SQLite's EXCLUSIVE lock there
 	// (sqlite_share.odin).
 	mirror_guard:        proc(ctx: rawptr, begin: bool),
+	// mirror_vfs is what the mirrored file is written through (nil: the
+	// operating system), and mirror_failed says the last commit could not write
+	// it, so the connection reads the file again before its next statement (D8).
+	mirror_vfs:          ^Vfs,
+	mirror_failed:       bool,
 	// temp_used says the temp schema has been read or written: SQLite makes
 	// it on first use, and PRAGMA database_list lists it from then on.
 	temp_used:           bool,
@@ -876,12 +881,22 @@ store_set_sqlite_mirror :: proc(store: ^Store, path: string) {
 // It patches the pages the commit touched; a commit it cannot express that way
 // (a schema change, a table it cannot address by rowid, a page that no longer
 // fits) re-encodes the file instead. It takes the read lock, so the commit path
-// calls it after releasing its own write lock; a failure is reported and never
-// fails the commit, because the log is the truth.
+// calls it after releasing its own write lock. A failure is the commit's failure
+// when the file is the database's only copy (a store without a log of its own);
+// a store with a log only reports it (D8).
 store_sqlite_mirror_flush :: proc(store: ^Store, ops: []Store_Op = nil) -> Error {
 	if store == nil || len(store.sqlite_mirror) == 0 do return ERROR_NONE
 	sync.shared_lock(&store.mutex)
 	defer sync.shared_unlock(&store.mutex)
+	// A journal a failed write left beside the file goes back into it first: the
+	// next commit's pages would otherwise land on a torn file that no journal
+	// covers any more (D8). The layout is then read again from the file.
+	recovered, recover_err := sqlite_journal_recover_file(store.sqlite_mirror, store.mirror_vfs)
+	if recover_err.kind != .None do return recover_err
+	if recovered {
+		mirror_destroy(store.mirror)
+		store.mirror = nil
+	}
 	if store.mirror == nil {
 		built, build_err := mirror_build(store, store.sqlite_mirror, true)
 		if build_err.kind != .None {
@@ -906,6 +921,29 @@ store_sqlite_mirror_flush :: proc(store: ^Store, ops: []Store_Op = nil) -> Error
 	return ERROR_NONE
 }
 
+// store_set_mirror_vfs writes the mirrored file through vfs from now on: a
+// wrapper that breaks it, in the tests (D8). Nil is the operating system.
+store_set_mirror_vfs :: proc(store: ^Store, vfs: ^Vfs) {
+	if store == nil do return
+	store.mirror_vfs = vfs
+	if store.mirror != nil do store.mirror.vfs = vfs
+}
+
+// store_mirror_failed answers a commit the file could not take, for a store
+// whose only durable copy is that file: the journal goes back into the file now,
+// while the commit still holds it (unless the failure was the crash seam, after
+// which nothing runs), and the layout is read again at the next commit.
+store_mirror_failed :: proc(store: ^Store) {
+	crashed := store.mirror != nil && store.mirror.crashed
+	if !crashed {
+		_, recover_err := sqlite_journal_recover_file(store.sqlite_mirror, store.mirror_vfs)
+		error_drop(recover_err)
+	}
+	mirror_destroy(store.mirror)
+	store.mirror = nil
+	store.mirror_failed = true
+}
+
 // store_mirror_crash_before_header arms the crash seam: the next mirror commit
 // writes its data pages and stops, leaving the journal behind, which is what a
 // process that dies mid-commit leaves on disk. Tests use it to prove the journal
@@ -923,10 +961,20 @@ store_sqlite_mirror_rewrite :: proc(store: ^Store) -> Error {
 	store.mirror_full_writes += 1
 	mirror_destroy(store.mirror)
 	store.mirror = nil
-	_, _, write_err := sqlite_file_write(store, store.sqlite_mirror)
-	if write_err.kind != .None do return write_err
+	image, _, _, image_err := sqlite_file_image(store)
+	if image_err.kind != .None do return image_err
+	defer delete(image)
+	sqlite_image_continue_counter(store.sqlite_mirror, image)
+	if write_err := sqlite_file_write_journaled(store.sqlite_mirror, image, store.mirror_vfs); write_err.kind != .None do return write_err
+	// The file is written. A layout this writer cannot patch (a WITHOUT ROWID
+	// table) only means the next commit rewrites it again; it is no failure of
+	// this one, whose file is whole; the next rewrite keeps the catalog again.
 	built, build_err := mirror_build(store, store.sqlite_mirror, true)
-	if build_err.kind != .None do return build_err
+	if build_err.kind != .None {
+		error_free(&build_err)
+		store.mirror_bytes_written += u64(len(image))
+		return ERROR_NONE
+	}
 	store.mirror = built
 	store.mirror_bytes_written += u64(store.mirror.page_count * store.mirror.page_size)
 	// The file now says what the rewrite wrote, so the catalog it is compared

@@ -1008,9 +1008,18 @@ sqlite_file_write :: proc(store: ^Store, path: string, alloc := context.allocato
 	image, tables, rows, err = sqlite_file_image(store, alloc)
 	if err.kind != .None do return
 	defer delete(image)
-	// The change counter goes on from the file being replaced: a connection in
-	// another process notices a commit by the counter moving, and a rewrite
-	// that started it over at 1 could land on the value it last saw.
+	sqlite_image_continue_counter(path, image)
+	if write_err := os.write_entire_file(path, image); write_err != nil {
+		return tables, rows, errf(.Io, "cannot write %s: %v", path, write_err)
+	}
+	return tables, rows, ERROR_NONE
+}
+
+// sqlite_image_continue_counter makes the change counter of an image that
+// replaces the file at path go on from the file's: a connection in another
+// process notices a commit by the counter moving, and a rewrite that started it
+// over at 1 could land on the value it last saw.
+sqlite_image_continue_counter :: proc(path: string, image: []u8) {
 	if previous, previous_ok := sqlite_file_change_counter(path); previous_ok && len(image) >= 96 {
 		next := previous + 1
 		for k in 0 ..< 4 {
@@ -1018,10 +1027,6 @@ sqlite_file_write :: proc(store: ^Store, path: string, alloc := context.allocato
 			image[92 + k] = u8(next >> uint(24 - 8 * k))
 		}
 	}
-	if write_err := os.write_entire_file(path, image); write_err != nil {
-		return tables, rows, errf(.Io, "cannot write %s: %v", path, write_err)
-	}
-	return tables, rows, ERROR_NONE
 }
 
 // sqlite_file_change_counter reads the file change counter at offset 24 of a

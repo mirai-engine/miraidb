@@ -369,6 +369,11 @@ sqlite_share_refresh :: proc(conn: ^Embed_Conn) -> Error {
 	store := conn.store
 	mirror := strings.clone(store.sqlite_mirror, context.temp_allocator)
 	if len(mirror) == 0 do return ERROR_NONE
+	// The rows read again are converted as a statement of this store converts
+	// them, SQLite's affinity included: outside its scope a real in an INTEGER
+	// column was read back as an integer (55.441 became 55).
+	previous_scope := aggregate_scope_enter(store)
+	defer aggregate_scope_leave(previous_scope)
 	// Another process committing past the wait is SQLite's BUSY: reading what
 	// the store held before would answer from an older database.
 	if !sqlite_share_read_begin(share, conn) do return errf(.Locked, "database is locked")
@@ -796,7 +801,14 @@ embed_run_shared :: proc(conn: ^Embed_Conn, prepared: ^Stmt_Prepared, params: []
 	if holds do sync.rw_mutex_lock(&share.file)
 	seq := conn.store.commit_seq
 	result, err := embed_run_statement(conn, prepared, params)
-	if conn.store.commit_seq != seq && holds {
+	if conn.store.mirror_failed {
+		// The file did not take the commit: this connection is behind it now,
+		// and its next statement reads it again.
+		conn.store.mirror_failed = false
+		sync.lock(&sqlite_shares_mutex)
+		share.generation += 1
+		sync.unlock(&sqlite_shares_mutex)
+	} else if conn.store.commit_seq != seq && holds {
 		sync.lock(&sqlite_shares_mutex)
 		share.generation += 1
 		conn.share_generation = share.generation

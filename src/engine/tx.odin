@@ -2351,19 +2351,30 @@ tx_commit :: proc(tx: ^Tx) -> Error {
 	}
 	tx_discard(tx)
 	// A database opened from a .sqlite file keeps that file current, so a client
-	// reading it with any SQLite driver sees the commit. O(state) per commit, by
-	// design: the file is a materialized export, the log is the truth.
+	// reading it with any SQLite driver sees the commit. Opened that way, the
+	// file is the database's only copy, so a commit it did not take fails.
 	guard, guard_ctx := store.mirror_guard, store.mirror_guard_ctx
 	// A commit that changed only TEMP tables leaves the file alone: no lock on
 	// it, no write.
 	writes_file := len(store.sqlite_mirror) > 0 && (notify_ops == nil || len(mirror_ops) > 0)
 	if guard != nil && writes_file do guard(guard_ctx, true)
 	mirror_err := writes_file ? store_sqlite_mirror_flush(store, mirror_ops) : ERROR_NONE
+	// A store with no log of its own has the file as its only copy: the file
+	// goes back to the state before this commit while the lock is still held.
+	if mirror_err.kind != .None && !store.persistent do store_mirror_failed(store)
 	if guard != nil && writes_file do guard(guard_ctx, false)
 	// A file other connections share: what this commit changed is news to the
 	// hashes its connection keeps of the file (sqlite_share.odin).
 	if guard != nil && writes_file do store_mirror_note_touched(store, mirror_ops, mirror_err.kind != .None)
 	if mirror_err.kind != .None {
+		if !store.persistent {
+			// The commit is what the file holds, and the file did not take it: it
+			// failed, and the rows it applied in memory are read back from the
+			// file before the next statement, or, with no connection to do that,
+			// refused until the database is opened again (D8).
+			if guard == nil do store_damage(store, mirror_err)
+			return mirror_err
+		}
 		store_note_error(store, mirror_err)
 	}
 	if notify != nil {

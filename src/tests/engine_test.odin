@@ -8226,10 +8226,10 @@ test_mirror_survives_a_torn_commit :: proc(t: ^testing.T) {
 	db.sql_result_destroy(&first)
 	db.store_mirror_crash_before_header(conn.store)
 	second, second_err := db.sql_execute(conn.store, "INSERT INTO t (id, v) VALUES (901, 'ten')")
-	// The commit itself is safe -- the log is the truth -- but the mirror says it
-	// could not finish.
-	testing.expect(t, db.error_ok(second_err))
-	testing.expect_value(t, conn.store.last_error.kind, db.Error_Kind.Io)
+	// The file is this database's only copy, so a commit it did not take
+	// failed (D8).
+	testing.expect_value(t, second_err.kind, db.Error_Kind.Io)
+	db.error_free(&second_err)
 	db.sql_result_destroy(&second)
 	_, journal_err := os.stat(journal, context.temp_allocator)
 	testing.expect(t, journal_err == nil, "the crash must leave its journal behind")
