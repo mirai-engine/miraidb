@@ -665,11 +665,20 @@ SELECT v FROM t AS OF 4 WHERE id = 1;    -- the value it had then
 The engine keeps the previous values of a row when it is updated, and keeps a
 deleted row as a tombstone, so the past is available without a second copy. A
 historical scan does not use an index: the keys of that commit are not the live
-ones. `AS OF` reads only the first table of a query (a join answer is refused),
-a sequence past the last commit is clamped to it, and `store_prune_versions` (the
-server calls it when readers fall behind) discards history that no one can ask
-for: after pruning, a read before that point sees only the rows whose versions
-survived.
+ones. Each table of a join may name its own commit (`FROM a AS OF 4 JOIN b AS OF
+6 ON …`), and a sequence past the last commit is clamped to it.
+
+How far back `AS OF` reaches is the store's retention, applied after each commit:
+
+```sql
+PRAGMA history_retention;                -- everything, readers, commits=N or seconds=N
+PRAGMA history_retention = 'commits=100';
+```
+
+`everything` is what a store the engine's API opens keeps; the C ABI and the
+`sqlite3_*` facade keep `readers`, the history an open or pinned read needs and
+nothing more. A read before what the retention kept sees only the rows whose
+versions survived.
 
 ## Full-text search
 

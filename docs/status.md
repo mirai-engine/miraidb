@@ -68,8 +68,10 @@ the gaps are named rather than left to be discovered.
 
 - `SELECT ... FROM t AS OF <seq>` reads the rows as they were at that commit,
   using the versions the table keeps; an index is not used for a past read.
-- `store_prune_versions(store, before_seq)` drops versions and tombstones no
-  reader can ask for; nothing prunes automatically yet.
+- The store's retention (`PRAGMA history_retention`: everything, readers,
+  commits=N, seconds=N) drops after each commit the versions it no longer keeps;
+  the C ABI and the `sqlite3_*` facade keep only what a reader needs (backlog
+  D3). `AS OF` names a commit for each table of a join.
 
 ### Transactions
 
@@ -153,7 +155,7 @@ the gaps are named rather than left to be discovered.
   `linux_arm64` and `darwin_arm64`. The POSIX lock is the reason it is checked:
   it carried a missing `core:sys/posix` import and two wrong integer types until
   this round, so the code that a Linux build would run had never been compiled.
-- 471 integration tests covering CRUD, recovery, constraints, transactions,
+- 476 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.

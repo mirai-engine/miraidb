@@ -36,7 +36,7 @@ Rules for this file:
 | R6 | closed: a statement's fixed cost, a rowid read and a scan's per-row lists | — | — |
 | R7 | a commit with a reader open copies the table it writes, in one pass, its index nodes from a pool | share the structure instead of copying it | L |
 | D2 | overlap on an `rtree` table is a scan | node pages and a descent | M |
-| D3 | versions stay until `store_prune_versions` is called | automatic retention, `AS OF` on a join | M |
+| D3 | closed: a retention per store (`PRAGMA history_retention`), applied after each commit; `AS OF` on every table of a join | — | — |
 | D4 | a table with a secondary index re-encodes the `.sqlite` mirror | patch the index b-trees | L |
 | D5 | paged tables: no leaf merge, one version per row | the rest of the page store (with D17) | L |
 | D8 | closed: every write path is walked by a fault (`src/tests/fault_walk_test.odin`), and the reopen holds exactly the commits that reported success | — | — |
@@ -248,9 +248,26 @@ last N commits or T seconds, or keep everything (today's default for the ABI).
 That policy, with a test that a long-lived database with updates stays bounded
 under it and that `AS OF` inside the kept window still answers, is this item.
 
-**Done when.** Retention follows the oldest open reader automatically, a test
-proves a long-lived database with updates stays bounded, and `AS OF` works on a
-join.
+**Closed.** A store has a retention (`src/engine/retention.odin`), applied after
+each commit once its lock is free: `everything` keeps every version (a store the
+engine's own API opens), `readers` keeps what an open or pinned read needs (the
+C ABI and the `sqlite3_*` facade, where nothing names an older commit),
+`commits=N` keeps what an `AS OF` up to N commits back reads, and `seconds=N` what
+an `AS OF` at a commit of the last N seconds reads. `PRAGMA history_retention`
+reads and sets it. A read transaction keeps the tables it shares and a pinned
+read holds the lock the prune only tries, so neither loses a version.
+`test_the_facade_keeps_no_history_nobody_reads` runs 100 000 updates through the
+facade and finds no superseded value kept (it kept all 100 000);
+`test_retention_keeps_its_window`, `test_retention_waits_for_an_open_read`.
+
+`AS OF` names a commit for each table of a join; a historical table is scanned,
+since its index holds the live keys (`test_as_of_on_a_join`).
+
+Found on the way: a commit made while a reader held the table writes into a copy,
+and the copy did not carry the commit's sequence, so the value that commit
+replaced was stamped as replaced at 0: an `AS OF` before the row's next update
+read the old value, and no prune dropped it
+(`test_as_of_reads_a_table_copied_for_a_reader`).
 
 ## D4 — Secondary indexes in the `.sqlite` mirror
 
