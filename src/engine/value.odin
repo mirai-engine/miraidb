@@ -7,6 +7,7 @@ import "core:strings"
 import "core:math"
 import "core:mem"
 import "base:runtime"
+import "base:intrinsics"
 import "core:sync"
 
 // Timestamp is microseconds since the Unix epoch, UTC.
@@ -475,10 +476,24 @@ numeric_as_f64 :: proc(v: Value) -> (f64, bool) {
 // on SQLite's file put two '' entries out of rowid order, which SQLite then
 // found missing (D24).
 text_compare :: proc "contextless" (a, b: string) -> int {
-	if len(a) == 0 || len(b) == 0 {
-		return len(a) == len(b) ? 0 : (len(a) == 0 ? -1 : 1)
+	// Eight bytes at a time, read big-endian so a word orders as its bytes do:
+	// every descent of an index tree compares keys this way, one call per level
+	// (R2).
+	n := min(len(a), len(b))
+	pa, pb := ([^]u8)(raw_data(a)), ([^]u8)(raw_data(b))
+	i := 0
+	for ; i + 8 <= n; i += 8 {
+		x := intrinsics.unaligned_load((^u64)(&pa[i]))
+		y := intrinsics.unaligned_load((^u64)(&pb[i]))
+		if x != y {
+			x, y = intrinsics.byte_swap(x), intrinsics.byte_swap(y)
+			return x < y ? -1 : 1
+		}
 	}
-	return strings.compare(a, b)
+	for ; i < n; i += 1 {
+		if pa[i] != pb[i] do return pa[i] < pb[i] ? -1 : 1
+	}
+	return len(a) == len(b) ? 0 : (len(a) < len(b) ? -1 : 1)
 }
 
 value_compare :: proc(a, b: Value) -> (order: slice.Ordering, ok: bool) {
