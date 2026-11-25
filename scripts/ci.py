@@ -38,6 +38,8 @@ DEFAULT_LINUX_ODIN = os.environ.get("MIRAIDB_LINUX_ODIN", "")
 # A gate that runs longer than this is stopped and fails: a hang (a test that
 # spins under a lock) used to keep the whole run waiting with no report.
 GATE_TIMEOUT_SECONDS = 1800
+# What Python prints when the system would not start a program at all (ENOEXEC).
+REFUSED_LAUNCH = "[Errno 8] Exec format error"
 PACKAGES = ["src/engine", "src/cli", "src/capi", "src/sqlite_compat", "src/server", "src/tests"]
 
 
@@ -77,6 +79,10 @@ class Gate:
                 partial = partial.decode(errors="replace")
             report = [partial.strip(), f"stopped after {self.timeout:.0f}s: the gate hung"]
             return False, "\n".join(line for line in report if line), elapsed
+        except OSError as error:
+            # The gate's own program did not start (main() runs it again when
+            # the system refused it); the rest of the gates still run.
+            return False, f"could not start {self.command[0]}: {error}", time.time() - started
         elapsed = time.time() - started
         output = (done.stdout + done.stderr).strip()
         refused = [line for line in output.splitlines() if any(word in line for word in self.refuse)]
@@ -280,6 +286,17 @@ def main() -> int:
     print(f"ci: {len(gates)} gates\n")
     for gate in gates:
         ok, output, elapsed = gate.run()
+        if not ok and REFUSED_LAUNCH in output:
+            # Under WSL a Windows program starts through the handler WSL
+            # registers for them, which something on the machine clears now and
+            # then (another distribution's shutdown does) until it is registered
+            # again; a gate that starts one in that gap fails with ENOEXEC
+            # before the program ran, so it proved nothing either way. It runs
+            # once more after a pause, and a failure of the code fails again.
+            print(f"     {gate.name}: a launch was refused (Exec format error); running it again")
+            time.sleep(5)
+            ok, output, again = gate.run()
+            elapsed += again
         mark = "ok  " if ok else "FAIL"
         print(f"{mark} {gate.name:<32} {elapsed:6.1f}s")
         if not ok:
