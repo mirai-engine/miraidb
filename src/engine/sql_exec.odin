@@ -351,6 +351,17 @@ conflict_skippable :: proc(kind: Error_Kind) -> bool {
 	return false
 }
 
+// as_of_sequence evaluates the commit an AS OF names: a constant, not negative,
+// and no later than the last commit.
+@(private)
+as_of_sequence :: proc(tx: ^Tx, expr: ^Expr, params: []Value) -> (u64, Error) {
+	moment, constant := eval_constant(expr, params)
+	if !constant do return 0, errf(.Invalid_Argument, "AS OF needs a constant commit sequence")
+	sequence, ok := value_to_i64(moment)
+	if !ok || sequence < 0 do return 0, errf(.Invalid_Argument, "AS OF needs a non-negative commit sequence")
+	return min(u64(sequence), tx.store.commit_seq), ERROR_NONE
+}
+
 // statement_shortfall is what a statement that did its work without an error
 // still fails with: it ran out of memory (D23), or a page it read could not be
 // loaded by a reader with no error to hand back (D8).
@@ -3997,16 +4008,9 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		if base_is_view {
 			return {}, errf(.Sql_Unsupported, "AS OF reads a table, not a view")
 		}
-		moment, constant := eval_constant(exec.from.as_of, params)
-		if !constant {
-			return {}, errf(.Invalid_Argument, "AS OF needs a constant commit sequence")
-		}
-		sequence, ok := value_to_i64(moment)
-		if !ok || sequence < 0 {
-			return {}, errf(.Invalid_Argument, "AS OF needs a non-negative commit sequence")
-		}
-		as_of_seq = u64(sequence)
-		if as_of_seq > tx.store.commit_seq do as_of_seq = tx.store.commit_seq
+		sequence, sequence_err := as_of_sequence(tx, exec.from.as_of, params)
+		if sequence_err.kind != .None do return {}, sequence_err
+		as_of_seq = sequence
 	}
 	// An index that matches the ORDER BY hands the rows over in order, so the sort
 	// that follows has nothing to do.
@@ -4147,9 +4151,15 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		// Only the last step can stop early: the rows it drops are rows later
 		// steps would have joined.
 		stop_at_limit := limit_rows > 0 && step_index == len(order.steps) - 2
+		// Each table of a join may name its own commit (D3).
+		step_as_of: u64 = 0
 		if step.ref.as_of != nil {
-			delete(partials)
-			return {}, errf(.Sql_Unsupported, "AS OF is only supported on the first table of a join")
+			sequence, sequence_err := as_of_sequence(tx, step.ref.as_of, params)
+			if sequence_err.kind != .None {
+				delete(partials)
+				return {}, sequence_err
+			}
+			step_as_of = sequence
 		}
 		// A JSON table function may take a column of the table before it, so it
 		// is materialized once per outer row (a lateral join). Everything else is
@@ -4188,8 +4198,19 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 			}
 			table = resolved
 			join_is_view = resolved_is_view
+			if join_is_view && step_as_of > 0 {
+				delete(rows)
+				delete(partials)
+				return {}, errf(.Sql_Unsupported, "AS OF reads a table, not a view")
+			}
 			if join_is_view {
 				table_collect(table, &rows, tx.read_seq)
+			} else if step_as_of > 0 {
+				if collect_err := tx_collect_at(tx, step.ref.name, &rows, step_as_of); collect_err.kind != .None {
+					delete(rows)
+					delete(partials)
+					return {}, collect_err
+				}
 			} else if collect_err := tx_collect(tx, step.ref.name, &rows); collect_err.kind != .None {
 				delete(partials)
 				return {}, collect_err
@@ -4201,7 +4222,8 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		// of the whole relation, once per outer row.
 		probe: Index_Probe
 		probe.index = -1
-		if !lateral && !join_is_view {
+		// A historical step cannot probe: the index holds the live keys.
+		if !lateral && !join_is_view && step_as_of == 0 {
 			_, staged := tx.state.writes[step.ref.name]
 			_, created := tx.state.created[step.ref.name]
 			if !staged && !created {
