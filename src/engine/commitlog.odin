@@ -328,7 +328,7 @@ log_rotate :: proc(log: ^Commit_Log, next_seq: u64) -> Error {
 	log_index_close(log)
 	if log.file != nil {
 		if log.durability == .Full {
-			_ = log_file_sync(log.file)
+			error_drop(log_file_sync(log.file))
 		}
 		log_file_close(log.file)
 		log.file = nil
@@ -391,7 +391,7 @@ log_close :: proc(log: ^Commit_Log) {
 	}
 	if log.file != nil {
 		if log.durability != .None {
-			log_file_sync(log.file)
+			error_drop(log_file_sync(log.file))
 		}
 		log_file_close(log.file)
 		log.file = nil
@@ -403,7 +403,10 @@ log_close :: proc(log: ^Commit_Log) {
 // log_records reports whether appending to this log keeps anything: a store in
 // memory without a recording log has neither a file nor a buffer.
 log_records :: proc(log: ^Commit_Log) -> bool {
-	return log.memory_mode || log.file != nil
+	// A database's log a failed rotation left closed still records: the next
+	// append opens the segment, and a commit encoded as nothing then wrote an
+	// empty record that lost its rows (D8).
+	return log.memory_mode || log.file != nil || len(log.directory) > 0
 }
 
 log_append :: proc(log: ^Commit_Log, commit_seq: u64, payload: []u8) -> Error {
@@ -423,26 +426,47 @@ log_append :: proc(log: ^Commit_Log, commit_seq: u64, payload: []u8) -> Error {
 			return rotate_err
 		}
 	}
-	if log.file == nil do return ERROR_NONE
-	if _, write_err := log_file_write(log.file, record); write_err.kind != .None {
-		// Keep the kind: a quota rejection is not an I/O failure.
-		return write_err
+	if log.file == nil {
+		// A database's log that a failed rotation or compaction left closed
+		// refuses the commit: reporting it applied would lose it (D8).
+		if len(log.directory) > 0 do return errf(.Io, "the log of %s is not open", log.directory)
+		return ERROR_NONE
 	}
 	record_offset := log.size
+	if _, write_err := log_file_write(log.file, record); write_err.kind != .None {
+		// Keep the kind: a quota rejection is not an I/O failure.
+		return log_append_undo(log, record_offset, write_err)
+	}
 	log.size += i64(len(record))
 	if log.vfs == nil do log_index_write(log, commit_seq, record_offset)
 	#partial switch log.durability {
 	case .Full:
-		if sync_err := log_file_sync(log.file); sync_err.kind != .None do return sync_err
+		if sync_err := log_file_sync(log.file); sync_err.kind != .None do return log_append_undo(log, record_offset, sync_err)
 	case .Batched:
 		log.pending += 1
 		if log.pending >= LOG_SYNC_BATCH {
-			if sync_err := log_file_sync(log.file); sync_err.kind != .None do return sync_err
+			if sync_err := log_file_sync(log.file); sync_err.kind != .None do return log_append_undo(log, record_offset, sync_err)
 			log.pending = 0
 		}
 	case .None:
 	}
 	return ERROR_NONE
+}
+
+// log_append_undo takes back a record whose write or sync failed, so the commit
+// that reports the failure leaves nothing a replay would apply, and the next
+// record starts where this one did: kept, the next commit took its sequence and
+// replay dropped that one instead (D8). A log that cannot be cut back is closed,
+// and refuses the commits after it.
+@(private)
+log_append_undo :: proc(log: ^Commit_Log, offset: i64, err: Error) -> Error {
+	if rewind_err := log_rewind(log, offset); rewind_err.kind != .None {
+		error_free(&rewind_err)
+		log_index_close(log)
+		log_file_close(log.file)
+		log.file = nil
+	}
+	return err
 }
 
 // log_rewind cuts the log back to a previous size. It is used when a commit
