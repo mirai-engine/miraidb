@@ -16,10 +16,12 @@ one process per statement as the CLI is used, and fails on any report.
 """
 
 import argparse
+import errno
 import os
 import shutil
 import subprocess
 import sys
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
@@ -46,6 +48,38 @@ def build_paths(odin: str) -> tuple[str, str]:
     windows = os.name == "nt" or os.path.basename(odin).lower().startswith("odin.exe")
     binary = os.path.join(ROOT, "bin", "miraidb-asan" + (".exe" if windows else ""))
     return binary, windows_path(binary) if windows else binary
+
+LAUNCH_TRIES = 5
+# How many launches Windows refused and were tried again, for the summary line.
+refused = 0
+
+
+def launch(command: list[str], env: dict[str, str]) -> subprocess.CompletedProcess:
+    """Run `command`, trying again when the system would not start it.
+
+    Run from WSL, a Windows executable starts through the handler WSL registers
+    for them (binfmt_misc's WSLInterop). Something on the machine clears that
+    handler now and then (another distribution's shutdown does) and it is
+    registered again; a launch in between is refused with ENOEXEC ("Exec format
+    error"). This gate starts the CLI some 260 times, one process per statement,
+    so it is the one that lands in that gap: once in a CI run, at a different
+    statement each time. The process never started, so it has nothing a
+    sanitizer could have reported, and trying again loses nothing; a crash or a
+    report of the binary itself is an exit code and a stderr, which this does
+    not touch. The tries wait 5 s in all, longer than a gap has lasted.
+    """
+    global refused
+    for attempt in range(LAUNCH_TRIES):
+        try:
+            return subprocess.run(command, cwd=ROOT, env=env, capture_output=True,
+                                  encoding="utf-8", errors="replace")
+        except OSError as error:
+            if error.errno != errno.ENOEXEC or attempt == LAUNCH_TRIES - 1:
+                raise
+            refused += 1
+            time.sleep(0.5 * (attempt + 1))
+    raise AssertionError("unreachable")
+
 
 EXTRA = [
     "UPDATE nums SET m = m * 2 WHERE n = 1",
@@ -85,26 +119,18 @@ def main() -> int:
     # A binary that cannot start reports nothing that looks like a sanitizer
     # finding, so the run would pass while proving nothing: this one statement
     # has to answer.
-    smoke = subprocess.run(
-        [binary, "sql", database, "SELECT 1 AS one", "--json"], cwd=ROOT, env=env,
-        capture_output=True, encoding="utf-8", errors="replace",
-    )
+    smoke = launch([binary, "sql", database, "SELECT 1 AS one", "--json"], env)
     if smoke.returncode != 0 or "1" not in smoke.stdout:
         print(f"asan_smoke: the sanitized CLI did not run\n{smoke.stdout}{smoke.stderr}"[:4000])
         return 1
     statements = differential.SETUP + [q if isinstance(q, str) else q[0] for q in differential.QUERIES] + EXTRA
     reports = []
     for statement in statements:
-        done = subprocess.run(
-            [binary, "sql", database, statement], cwd=ROOT, env=env,
-            capture_output=True, encoding="utf-8", errors="replace",
-        )
+        done = launch([binary, "sql", database, statement], env)
         if "AddressSanitizer" in done.stderr:
             reports.append(f"{statement}\n{done.stderr[:4000]}")
     for command in (["check", database], ["compact", database], ["check", database]):
-        done = subprocess.run(
-            [binary, *command], cwd=ROOT, env=env, capture_output=True, encoding="utf-8", errors="replace",
-        )
+        done = launch([binary, *command], env)
         if "AddressSanitizer" in done.stderr:
             reports.append(f"{' '.join(command)}\n{done.stderr[:4000]}")
     shutil.rmtree(WORK, ignore_errors=True)
@@ -112,7 +138,8 @@ def main() -> int:
     if reports:
         print(f"asan_smoke: {len(reports)} report(s); the first:\n{reports[0]}")
         return 1
-    print(f"asan_smoke: {len(statements) + 3} commands under AddressSanitizer, no report")
+    again = f" ({refused} launch(es) refused by the system and tried again)" if refused else ""
+    print(f"asan_smoke: {len(statements) + 3} commands under AddressSanitizer, no report{again}")
     return 0
 
 
