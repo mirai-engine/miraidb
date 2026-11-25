@@ -29,10 +29,12 @@ the gaps are named rather than left to be discovered.
   documents, ranks with BM25 (`rank`, best first) and marks matches with
   `snippet()`/`highlight()`.
 - Fault injection: `Fault_Vfs` fails the nth call of open/read/write/seek/
-  truncate/sync/remove, or makes a write land part of its bytes. The test arms the
-  fault at every write of a workload — log header, `CREATE TABLE` record, each
-  commit — reopens without it, and finds exactly the commits that reported
-  success. A short write is an error, never a silent success.
+  truncate/sync/remove/rename, or makes a write land part of its bytes. The walks
+  arm the fault at every operation of a workload — the log and its rotation, a
+  snapshot and a compaction, a `.sqlite` file's rewrites, journal and page
+  patches — and `page_fault_arm` kills a paged database at any page write; each
+  reopens without the fault and finds exactly the commits that reported success
+  (backlog D8). A short write is an error, never a silent success.
 - A benchmark baseline (`benchmarks/baseline.json`) records bytes per row, insert
   rate, read cost and compaction; `scripts/bench.py --check` runs as a CI gate.
 - Durability modes: `Full` (fsync per commit), `Batched` (every 64 commits and
@@ -151,7 +153,7 @@ the gaps are named rather than left to be discovered.
   `linux_arm64` and `darwin_arm64`. The POSIX lock is the reason it is checked:
   it carried a missing `core:sys/posix` import and two wrong integer types until
   this round, so the code that a Linux build would run had never been compiled.
-- 467 integration tests covering CRUD, recovery, constraints, transactions,
+- 471 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.

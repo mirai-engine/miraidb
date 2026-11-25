@@ -348,8 +348,10 @@ A `WITHOUT ROWID` table has no rowid to patch: a commit that writes one rewrites
 the file, which keeps its text.
 
 Rows, indexes the engine knows, and file integrity survive in every case; a table
-rebuilt this way loses its rules and says so. A failed mirror write is reported through `last_error` and
-never fails the commit.
+rebuilt this way loses its rules and says so. Opened from the file, the database
+has no other copy: a commit the file did not take fails (`SQLITE_IOERR`), the
+journal goes back into the file, and the connection reads it again (backlog D8).
+A rewrite of the whole file is journaled like a page commit.
 
 ## Keys in a written file
 

@@ -48,7 +48,6 @@ that way.
 | # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
 | 19 | **D34 — Linux suite and heap sanitizer** | The threaded suite is green on Linux and every script finds its binary; left is CI on Linux and macOS with `-sanitize:address` and the suite sanitized as a gate (the CLI already is, on Windows). | S | — |
-| 20 | **D8 — fault injection beyond the log** | Snapshot, rotation, the mirror, a kill during a page flush. | S | — |
 | 21 | **D3 — version retention** | Automatic retention tied to the oldest reader; `AS OF` on a join. | M | — |
 | 22 | **D5 — the rest of the page store** | Leaf merge, versions on paged tables, a read without the shared lock for its whole life; with D18, a reader that trusts the pages. | L | — |
 | 24 | **D2 — spatial tree** | Node pages and a descent instead of a scan over box columns. | M | — |
@@ -64,9 +63,8 @@ with peer-to-peer sync; its networked phases build on items 27 and 28.
 
 ## Suggested order
 
-1. **D8, D3** and the grants review: the ways the engine can still lose a
-   write to a crash outside the log, keep every old value of an embedded
-   database, or let any client do anything.
+1. **D3** and the grants review: the ways the engine can still keep every old
+   value of an embedded database, or let any client do anything.
 2. **R2**: the largest gap left against the reference (inserts and updates),
    starting from a profile of the write path. The parity gate
    (`scripts/parity.py`) records its gain with `--record` so it cannot slip back.

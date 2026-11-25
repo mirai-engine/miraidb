@@ -39,7 +39,7 @@ Rules for this file:
 | D3 | versions stay until `store_prune_versions` is called | automatic retention, `AS OF` on a join | M |
 | D4 | a table with a secondary index re-encodes the `.sqlite` mirror | patch the index b-trees | L |
 | D5 | paged tables: no leaf merge, one version per row | the rest of the page store (with D17) | L |
-| D8 | the fault walk covers the log | snapshot, rotation and mirror | S |
+| D8 | closed: every write path is walked by a fault (`src/tests/fault_walk_test.odin`), and the reopen holds exactly the commits that reported success | — | — |
 | D10 | decimals are floats, timestamps have no zone | decimal scale, `TIMESTAMPTZ`, streaming blobs | M |
 | D11 | closed: triggers and policies follow their transaction; RAISE; a dropped table takes its triggers and policies | — | — |
 | D12 | a module is a process with a work budget | a deterministic sandbox | L |
@@ -275,12 +275,47 @@ paged store run without holding the shared lock for its whole life.
 
 ## D8 — Fault injection beyond the log
 
-**Now.** `Fault_Vfs` fails any operation at any call, and `test_fault_injection`
-arms every write of a workload and proves the reopen sees exactly the commits
-that reported success.
+**Closed.** `Fault_Vfs` fails any operation at any call (open, read, write,
+seek, truncate, sync, remove and now rename), and `src/tests/fault_walk_test.odin`
+breaks each one in turn and reopens the database to find exactly the commits
+that reported success:
 
-**Done when.** The same walk covers snapshot writes, log rotation and the
-`.sqlite` mirror, and a kill during a dirty page flush.
+- `test_snapshot_and_compaction_faults`: a snapshot and a compaction, which now
+  run through the virtual file system as the log does.
+- `test_log_rotation_faults`: a workload that rotates its log twice.
+- `test_page_flush_kill`: a paged database killed at any page write of a
+  commit's evictions or of the flush at close (`page_fault_arm`, on the disk,
+  where an open trusts the pages).
+- `test_sqlite_mirror_faults`: a database opened from a `.sqlite` file, at any
+  operation of its whole-file rewrites, its journal, its page patches and the
+  journal's removal; the file validates after each reopen and takes a commit.
+
+What the walks found, each fixed:
+
+- A commit whose log write or sync failed left its record in the log; the next
+  commit took the same sequence and replay kept the failed one. A failed append
+  is now cut back (`log_append_undo`), and a log that cannot be cut back is closed
+  and refuses the commits after it.
+- A failed rotation left the log closed, and the next commit encoded no payload
+  for a closed log: it wrote an empty record and lost its rows.
+- Compaction deleted every segment before writing the new log; a failure there
+  left a closed log whose commits reported success and were never written. The
+  new log is now whole before any segment goes.
+- A page that could not be loaded read as a shorter table, so a `DELETE` deleted
+  nothing and reported success. The statement now fails with the page's error.
+- A commit that stopped halfway through its apply left half of its rows in
+  memory, and the statements after it built on them. The store now refuses every
+  statement until it is reopened, and drops its catalog so that open rebuilds the
+  pages from the log rather than trust pages the commit's evictions wrote.
+- A page flush wrote the header that promises its pages without syncing them
+  first.
+- A database opened from a `.sqlite` file reported a commit the file did not take
+  as a success, though the file is its only copy; it now fails, the journal goes
+  back into the file while the commit still holds it, and the connection reads
+  the file again. A rewrite of the whole file wrote it in place with no journal;
+  it is now journaled like a page commit. A journal record whose checksum fails
+  ends the journal, as in SQLite, and an owner that found a hot journal rolls it
+  back into the file instead of deleting it after reading it.
 
 ## D10 — Precision and time
 

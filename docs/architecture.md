@@ -424,8 +424,8 @@ three backends:
 `Store_Options.vfs` selects one. A virtual file system has no directories, so
 the path names the log file directly, and the offset index (`.index`) is an
 OS-only cache — a virtual log replays by scanning, which is what it does anyway.
-Snapshots, compaction and `VACUUM INTO` need real files and refuse a virtual
-one with `sql_unsupported`.
+Snapshots and compaction run through it like the log; `VACUUM INTO` needs real
+files and refuses a virtual one with `sql_unsupported`.
 
 The same seam is what a page backend and an encrypted store plug into later.
 

@@ -287,8 +287,9 @@ rows, and `PRAGMA database_list` reports it as `main`.
 - `store_set_sqlite_mirror` / `store_sqlite_mirror_flush` live in `store.odin`;
   the flush takes the read lock, so it runs after `tx_discard` and never inside
   the commit's write section.
-- A failed mirror write is **reported** (`last_error`) and never fails the commit:
-  the log is the truth, and a mirror is an export.
+- A failed mirror write fails the commit when the file is the database's only
+  copy (opened from the `.sqlite` file), and is **reported** (`last_error`) when
+  the store has a log of its own (backlog D8).
 - Cost: three pages (12 KiB) per commit at any table size, measured by
   `scripts/mirror_cost.py --check`. What the patcher cannot express — a table
   with no single INTEGER primary key, a secondary index, a schema change, a
