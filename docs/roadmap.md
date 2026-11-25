@@ -27,7 +27,7 @@ that way.
 
 | # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
-| 2 | **R2 — fixed-size index keys** | The index filters are under the reference since a key files its rows under one entry; an insert is 0.76–0.86× it with an index per column and 1.4–1.6× with one unique index, and an update 1.05–1.3×. The write path by stage is in RESULTS.md (2026-11-25); its five candidates took inserts from 1.2–2.7× and updates from 2.6–2.8×. Next: the gate by ratio (2.4), then what is left of the unique insert and the update. | M | — |
+| 2 | **R2 — fixed-size index keys** | The index filters are under the reference since a key files its rows under one entry; an insert is 0.76–0.86× it with an index per column and 1.4–1.6× with one unique index, and an update 1.05–1.3×. The write path by stage is in RESULTS.md (2026-11-25); its five candidates took inserts from 1.2–2.7× and updates from 2.6–2.8×. The seven workloads at or under the reference are held under 1.10x of it by `scripts/parity.py`. Next: what is left of the unique insert and the update. | M | — |
 | 5 | **R7 — share a table with its readers** | A commit with a reader open copies the table it writes: 13–17 ms over 50 000 rows, mostly new memory being touched. | L | — |
 | 6 | **D12 — module sandbox** | A module is a process with a work budget; the reference runs modules deterministically with enforced limits. | L | — |
 | 7 | **D16 — generated clients** | Deferred by months: generate the Python binding from the catalog, then a second language. Until then the C ABI, the `sqlite3_*` face and the Python wrapper stay gated, so a binding is a thin layer when it comes ([backlog](backlog.md#d16--clients-generated-from-the-catalog)). | M | — |
@@ -64,7 +64,8 @@ with peer-to-peer sync; its networked phases build on items 27 and 28.
 
 1. **R2**: the largest gap left against the reference (inserts and updates),
    starting from a profile of the write path. The parity gate
-   (`scripts/parity.py`) records its gain with `--record` so it cannot slip back.
+   (`scripts/parity.py`) records its gain with `--record` so it cannot slip back,
+   and holds a workload that reached the reference under 1.10x of it.
 2. **S8**, then **D37**, **D4** and **D36**.
 3. **D39**, then **D40**.
 4. **R7**, the disk workloads and the depth items of track C.

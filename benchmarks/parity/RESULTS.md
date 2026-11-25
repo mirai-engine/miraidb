@@ -621,6 +621,23 @@ Five interleaved rounds against the build before it (µs, medians):
 Reads within noise (0.92–1.00). The gate counts 7 of its 11 workloads at or
 under the reference now. Only the six write numbers went to `baseline.json`.
 
+## A gain over the reference is held (2026-11-25)
+
+The baseline's 15% follows this machine's own numbers, so a workload under the
+reference could give its lead back a step at a time, each step inside the
+budget: `empty` at 0.94× could reach 1.3× before it failed, and `update u64` at
+0.99× up to 1.14×. `baseline.json` now lists under `reached` the workloads at or
+under the reference, and `scripts/parity.py` fails when one of them is more than
+10% slower than the reference (with the same 0.2 µs of slack), whatever its
+baseline allows. A workload over either line is measured again first, as before.
+`--record` adds a workload to the list once its recorded number is at or under
+the reference and never takes one off; that is an edit by hand. The list has
+the seven of today: `empty`, both filters, both inserts with an index per
+column, `iterate u64` and `update u64`. `--self-test` checks the rules on
+made-up numbers (a workload inside its baseline but past 1.10×, one that never
+reached the reference, the timer's slack, what `--record` lists), and is a gate
+of its own, `parity rules`.
+
 To reproduce:
 
 ```sh
