@@ -114,6 +114,8 @@ index_ids_remove_at :: proc(ids: ^[dynamic]Row_Id, at: int) {
 // index_tree_free frees every slot's list and the tree's nodes.
 @(private)
 index_tree_free :: proc(index: ^Index) {
+	delete(index.ints)
+	index.ints = nil
 	tree := &index.tree
 	for node := rbtree.first(tree); node != nil; node = node_next(node) do delete(node.value.more)
 	if index.nodes == nil {
@@ -132,6 +134,7 @@ index_tree_free :: proc(index: ^Index) {
 index_tree_init :: proc(index: ^Index) {
 	if index.nodes == nil do index.nodes = node_pool_make(size_of(Index_Node))
 	rbtree.init_cmp(&index.tree, index_cmp, node_pool_allocator(index.nodes))
+	index.int_keyed = index_int_eligible(index)
 }
 
 // Node_Pool hands out the nodes of one index tree: slots of one size, carved
@@ -251,6 +254,97 @@ Index :: struct {
 	// exprs holds the parsed WHERE and key expressions of a partial or
 	// expression index; nil for an index over plain columns.
 	exprs: ^Index_Exprs,
+	// ints files, beside the tree, the row that holds each integer key of a
+	// UNIQUE index over one plain column (index_int_key), when the index lives in
+	// memory. The unique check and an equality lookup of an integer are then one
+	// hash probe, where a descent of the tree met a node per level (R2). It holds
+	// exactly the rows whose value has an integer key; the tree still holds every
+	// row and answers everything else. An index that cannot grow it drops it and
+	// answers from the tree (`int_keyed` false).
+	ints:      map[[2]u64]Row_Id,
+	int_keyed: bool,
+}
+
+// index_int_key is a value's key among the integer keys of an index, in the key
+// spaces value_encode_key gives it: an unsigned integer in its own, and a signed
+// integer or a real that holds one exactly in the space numbers share, where 5
+// and 5.0 are one key. Two values have the same integer key exactly when they
+// have the same encoded key. Any other value has none.
+@(private)
+index_int_key :: proc(v: Value) -> (key: [2]u64, ok: bool) {
+	#partial switch v.kind {
+	case .Uint:
+		return {1, v.u}, true
+	case .Int:
+		return {0, u64(v.i)}, true
+	case .Float:
+		// -0.0 is 0, as in the encoded key; NaN fails the range test.
+		if v.f >= -9223372036854775808.0 && v.f < 9223372036854775808.0 && f64(i64(v.f)) == v.f {
+			return {0, u64(i64(v.f))}, true
+		}
+	}
+	return {}, false
+}
+
+// index_int_eligible reports an index that files integer keys: a UNIQUE index
+// over one plain column.
+index_int_eligible :: proc(index: ^Index) -> bool {
+	return index.unique && index_is_plain(index.schema) && len(index.schema.columns) == 1 && index.schema.columns[0] >= 0
+}
+
+// index_int_holder answers, for an index that files integer keys, which row
+// holds the key of `values`. `known` is false when the index or the value has no
+// integer key, and the tree has to answer.
+@(private)
+index_int_holder :: proc(t: ^Table, index: int, values: []Value) -> (id: Row_Id, held: bool, known: bool) {
+	idx := &t.indexes[index]
+	if !idx.int_keyed || idx.pages != nil do return
+	column := idx.schema.columns[0]
+	if column < 0 || column >= len(values) do return
+	key, ok := index_int_key(values[column])
+	if !ok do return
+	id, held = idx.ints[key]
+	return id, held, true
+}
+
+// index_ints_put files a row under its integer key. When the map cannot grow,
+// the index gives it up and answers from its tree.
+@(private)
+index_ints_put :: proc(index: ^Index, values: []Value, id: Row_Id) {
+	key, ok := index_int_key(values[index.schema.columns[0]])
+	if !ok do return
+	if _, slot, _, err := map_entry(&index.ints, key); err == nil {
+		slot^ = id
+		return
+	}
+	delete(index.ints)
+	index.ints = nil
+	index.int_keyed = false
+}
+
+// index_ints_remove takes a row's integer key out, when the row holds it.
+@(private)
+index_ints_remove :: proc(index: ^Index, values: []Value, id: Row_Id) {
+	key, ok := index_int_key(values[index.schema.columns[0]])
+	if !ok do return
+	if held, found := index.ints[key]; found && held == id do delete_key(&index.ints, key)
+}
+
+// index_ints_clone copies the integer keys of an index; a copy that cannot be
+// made leaves the target answering from its tree.
+@(private)
+index_ints_clone :: proc(source: ^Index, target: ^Index) {
+	delete(target.ints)
+	target.ints = nil
+	target.int_keyed = source.int_keyed
+	if !target.int_keyed || len(source.ints) == 0 do return
+	if reserve(&target.ints, len(source.ints)) != nil {
+		delete(target.ints)
+		target.ints = nil
+		target.int_keyed = false
+		return
+	}
+	for key, id in source.ints do target.ints[key] = id
 }
 
 // Index_Exprs is what a partial or expression index evaluates for each row. The
@@ -491,6 +585,7 @@ table_index_put_row :: proc(t: ^Table, index: int, values: []Value, id: Row_Id) 
 				return errf(.Out_Of_Memory, "cannot grow index %s", t.indexes[index].schema.name)
 			}
 		}
+		if t.indexes[index].int_keyed do index_ints_put(&t.indexes[index], values, id)
 	}
 	return table_index_map_add(t, index, values, id)
 }
@@ -511,6 +606,7 @@ table_index_remove_row :: proc(t: ^Table, index: int, values: []Value, id: Row_I
 				rbtree.remove_node(tree, node, false)
 			}
 		}
+		if t.indexes[index].int_keyed do index_ints_remove(&t.indexes[index], values, id)
 	}
 	table_index_map_remove(t, index, values, id)
 }
@@ -1308,6 +1404,11 @@ lower_bound :: proc(tree: ^Index_Tree, key: string) -> ^Index_Node {
 
 // table_index_lookup returns every row whose indexed columns equal `values`.
 table_index_lookup :: proc(t: ^Table, index: int, values: []Value) -> [dynamic]Row_Id {
+	if id, held, known := index_int_holder(t, index, values); known {
+		ids := make([dynamic]Row_Id)
+		if held do append(&ids, id)
+		return ids
+	}
 	if t.indexes[index].schema.algorithm != .Btree {
 		ids := make([dynamic]Row_Id)
 		probe := index_prefix_temp(t, index, values)
@@ -1406,6 +1507,10 @@ table_check_unique :: proc(t: ^Table, values: []Value, ignore: Row_Id = Row_Id(m
 	for idx, i in t.indexes {
 		if !idx.unique do continue
 		if i < 64 && i in skip do continue
+		if holder, held, known := index_int_holder(t, i, values); known {
+			if held && holder != ignore do return unique_violation(t, i)
+			continue
+		}
 		if !index_row_included(t, i, values) do continue
 		if index_key_has_null(t, i, values) do continue
 		ids := table_index_lookup(t, i, values)
@@ -1850,6 +1955,7 @@ table_snapshot :: proc(source: ^Table) -> ^Table {
 		if index >= len(source.indexes) do break
 		index_tree_clone(&source.indexes[index].tree, &clone.indexes[index].tree, clone.arena_allocator)
 		index_lookup_clone(&source.indexes[index], &clone.indexes[index], context.allocator)
+		index_ints_clone(&source.indexes[index], &clone.indexes[index])
 	}
 	// The rows are already in order, so the clone is one pass with no hashing.
 	clone.rows = make([dynamic]Row, 0, len(source.rows))

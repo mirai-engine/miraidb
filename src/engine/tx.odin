@@ -171,6 +171,9 @@ Table_Writes :: struct {
 	deletes:     map[Row_Id]bool,
 	truncated:   bool,
 	unique_keys: map[string]Row_Id,
+	// unique_ints holds the staged keys of the indexes that file integer keys
+	// (Staged_Key); `unique_keys` every other.
+	unique_ints: map[[3]u64]Row_Id,
 	next_row_id: u64,
 	next_sequence: i64,
 }
@@ -182,6 +185,7 @@ Stage_Undo_Kind :: enum u8 {
 	Update,
 	Delete,
 	Unique,
+	Unique_Int,
 	Counters,
 }
 
@@ -190,6 +194,7 @@ Stage_Undo :: struct {
 	writes:        ^Table_Writes,
 	id:            Row_Id,
 	key:           string,
+	int_key:       [3]u64,
 	had:           bool,
 	row:           Row,
 	values:        []Value,
@@ -233,6 +238,9 @@ tx_statement_undo :: proc(tx: ^Tx, mark: int) {
 		case .Unique:
 			if u.had do w.unique_keys[u.key] = u.holder
 			else do map_erase(&w.unique_keys, u.key)
+		case .Unique_Int:
+			if u.had do w.unique_ints[u.int_key] = u.holder
+			else do map_erase(&w.unique_ints, u.int_key)
 		case .Counters:
 			w.next_row_id = u.next_row_id
 			w.next_sequence = u.next_sequence
@@ -265,10 +273,54 @@ undo_note_delete :: #force_inline proc(tx: ^Tx, w: ^Table_Writes, id: Row_Id) {
 }
 
 @(private)
-undo_note_unique :: #force_inline proc(tx: ^Tx, w: ^Table_Writes, key: string) {
+undo_note_unique :: #force_inline proc(tx: ^Tx, w: ^Table_Writes, key: Staged_Key) {
 	if tx.undo_depth == 0 do return
-	holder, had := w.unique_keys[key]
-	append(&tx.undo, Stage_Undo{kind = .Unique, writes = w, key = key, had = had, holder = holder})
+	holder, had := staged_holder(w, key)
+	if key.is_int {
+		append(&tx.undo, Stage_Undo{kind = .Unique_Int, writes = w, int_key = key.int, had = had, holder = holder})
+	} else {
+		append(&tx.undo, Stage_Undo{kind = .Unique, writes = w, key = key.text, had = had, holder = holder})
+	}
+}
+
+// Staged_Key is a unique key a transaction stages: the integer key of an index
+// that files them (index_int_key), named by the index's position in its table,
+// or the encoded key of any other index. A position changes only under an ALTER
+// in the transaction, which clears both maps. An integer key is two words to
+// hash, where the encoded key was the index's name and the value's bytes,
+// built in the arena for every row (R2).
+Staged_Key :: struct {
+	text:   string,
+	int:    [3]u64,
+	is_int: bool,
+}
+
+// staged_key is the key under which `values` holds index `index` of `table`.
+staged_key :: proc(tx: ^Tx, table: ^Table, index: int, values: []Value) -> Staged_Key {
+	if index_int_eligible(&table.indexes[index]) {
+		if key, ok := index_int_key(values[table.indexes[index].schema.columns[0]]); ok {
+			return Staged_Key{int = {u64(index), key[0], key[1]}, is_int = true}
+		}
+	}
+	return Staged_Key{text = unique_key(tx, table, index, values)}
+}
+
+// staged_holder answers which staged row holds a key.
+staged_holder :: proc(w: ^Table_Writes, key: Staged_Key) -> (Row_Id, bool) {
+	if key.is_int {
+		holder, ok := w.unique_ints[key.int]
+		return holder, ok
+	}
+	holder, ok := w.unique_keys[key.text]
+	return holder, ok
+}
+
+// staged_set files a staged key under `id`, noted for a statement's undo.
+@(private)
+staged_set :: proc(tx: ^Tx, w: ^Table_Writes, key: Staged_Key, id: Row_Id) {
+	undo_note_unique(tx, w, key)
+	if key.is_int do w.unique_ints[key.int] = id
+	else do w.unique_keys[key.text] = id
 }
 
 @(private)
@@ -339,6 +391,8 @@ tx_snapshot_clone :: proc(tx: ^Tx, from: Tx_Snapshot) -> Tx_Snapshot {
 		for id in writes.deletes do copied.deletes[id] = true
 		copied.unique_keys = make(map[string]Row_Id, len(writes.unique_keys), tx.alloc)
 		for key, id in writes.unique_keys do copied.unique_keys[key] = id
+		copied.unique_ints = make(map[[3]u64]Row_Id, len(writes.unique_ints), tx.alloc)
+		for key, id in writes.unique_ints do copied.unique_ints[key] = id
 		snapshot.writes[name] = copied
 	}
 	snapshot.created = make(map[string]^Table, len(from.created), tx.alloc)
@@ -361,6 +415,7 @@ tx_snapshot_destroy :: proc(tx: ^Tx, snapshot: ^Tx_Snapshot) {
 		delete(writes.updates)
 		delete(writes.deletes)
 		delete(writes.unique_keys)
+		delete(writes.unique_ints)
 		free(writes)
 	}
 	delete(snapshot.writes)
@@ -632,6 +687,7 @@ tx_discard :: proc(tx: ^Tx) {
 		delete(writes.updates)
 		delete(writes.deletes)
 		delete(writes.unique_keys)
+		delete(writes.unique_ints)
 		// tx_writes allocates the struct with `new`, not from the arena: a statement
 		// that wrote one table left 152 bytes behind for every commit.
 		free(writes)
@@ -1032,6 +1088,7 @@ tx_drop_column :: proc(tx: ^Tx, name, column_name: string) -> Error {
 		}
 		// The unique keys were built over the old shape; rebuild them.
 		clear(&writes.unique_keys)
+		clear(&writes.unique_ints)
 	}
 	tx.state.altered[strings.clone(name, tx.alloc)] = replacement
 	return ERROR_NONE
@@ -1148,6 +1205,7 @@ tx_writes :: proc(tx: ^Tx, name: string, table: ^Table) -> ^Table_Writes {
 	writes.updates = make(map[Row_Id][]Value)
 	writes.deletes = make(map[Row_Id]bool)
 	writes.unique_keys = make(map[string]Row_Id, 64)
+	writes.unique_ints = make(map[[3]u64]Row_Id, 64)
 	writes.next_row_id = table.next_row_id
 	writes.next_sequence = table.next_sequence
 	// The map key must outlive the caller's statement buffer, so it lives in the
@@ -1418,6 +1476,7 @@ tx_discard_writes :: proc(tx: ^Tx, name: string) {
 	delete(writes.updates)
 	delete(writes.deletes)
 	delete(writes.unique_keys)
+	delete(writes.unique_ints)
 	free(writes)
 	map_erase(&tx.state.writes, name)
 }
@@ -1572,7 +1631,7 @@ tx_insert_row :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error)
 	if fk_err := fk_check_child(tx, table, row_values); fk_err.kind != .None {
 		return 0, fk_err
 	}
-	keys := make([dynamic]string, 0, 2, tx.alloc)
+	keys := make([dynamic]Staged_Key, 0, 2, tx.alloc)
 	if err := tx_check_unique(tx, name, table, row_values, INVALID_ROW_ID, &keys); err.kind != .None {
 		return 0, err
 	}
@@ -1826,6 +1885,7 @@ tx_truncate :: proc(tx: ^Tx, name: string) -> Error {
 	clear(&writes.updates)
 	clear(&writes.deletes)
 	clear(&writes.unique_keys)
+	clear(&writes.unique_ints)
 	writes.truncated = true
 	return ERROR_NONE
 }
@@ -1940,7 +2000,7 @@ tx_check_unique :: proc(
 	table: ^Table,
 	values: []Value,
 	ignore: Row_Id,
-	keys: ^[dynamic]string = nil,
+	keys: ^[dynamic]Staged_Key = nil,
 ) -> Error {
 	writes := tx.state.writes[name]
 	for idx, i in table.indexes {
@@ -1952,7 +2012,7 @@ tx_check_unique :: proc(
 		// NULL constrains nothing.
 		if !index_row_included(table, i, values) do continue
 		if index_key_has_null(table, i, values) do continue
-		key := unique_key(tx, table, i, values)
+		key := staged_key(tx, table, i, values)
 		if keys != nil do append(keys, key)
 		// A key over a column with a program's collation: two values the
 		// comparison calls equal are the same key, which folded bytes cannot
@@ -1962,7 +2022,7 @@ tx_check_unique :: proc(
 			continue
 		}
 		if writes != nil {
-			if holder, taken := writes.unique_keys[key]; taken && holder != ignore {
+			if holder, taken := staged_holder(writes, key); taken && holder != ignore {
 				return unique_violation(table, i)
 			}
 		}
@@ -2159,6 +2219,10 @@ tx_committed_key_taken :: proc(
 		}
 		return true
 	}
+	// An index that files integer keys answers with one hash probe.
+	if holder, held, known := index_int_holder(committed, index, values); known {
+		return held && holds(tx, committed, index, values, holder, ignore, writes)
+	}
 	if committed.indexes[index].pages == nil && committed.indexes[index].schema.algorithm == .Btree {
 		prefix := index_prefix_in(committed, index, values, tx.alloc)
 		for node := lower_bound(&committed.indexes[index].tree, prefix); node != nil; node = node_next(node) {
@@ -2198,13 +2262,10 @@ tx_unique_keys_kept :: proc(tx: ^Tx, table: ^Table, old: []Value, new: []Value) 
 
 // tx_register_keys records keys tx_check_unique computed for the same values.
 @(private)
-tx_register_keys :: proc(tx: ^Tx, name: string, keys: []string, id: Row_Id) {
+tx_register_keys :: proc(tx: ^Tx, name: string, keys: []Staged_Key, id: Row_Id) {
 	writes, ok := tx.state.writes[name]
 	if !ok do return
-	for key in keys {
-		undo_note_unique(tx, writes, key)
-		writes.unique_keys[key] = id
-	}
+	for key in keys do staged_set(tx, writes, key, id)
 }
 
 @(private)
@@ -2217,9 +2278,7 @@ tx_register_unique :: proc(tx: ^Tx, name: string, table: ^Table, values: []Value
 		// NULL constrains nothing.
 		if !index_row_included(table, i, values) do continue
 		if index_key_has_null(table, i, values) do continue
-		key := unique_key(tx, table, i, values)
-		undo_note_unique(tx, writes, key)
-		writes.unique_keys[key] = id
+		staged_set(tx, writes, staged_key(tx, table, i, values), id)
 	}
 }
 
@@ -2233,10 +2292,11 @@ tx_unregister_unique :: proc(tx: ^Tx, name: string, table: ^Table, values: []Val
 		// NULL constrains nothing.
 		if !index_row_included(table, i, values) do continue
 		if index_key_has_null(table, i, values) do continue
-		key := unique_key(tx, table, i, values)
-		if holder, present := writes.unique_keys[key]; present && holder == id {
+		key := staged_key(tx, table, i, values)
+		if holder, present := staged_holder(writes, key); present && holder == id {
 			undo_note_unique(tx, writes, key)
-			map_erase(&writes.unique_keys, key)
+			if key.is_int do map_erase(&writes.unique_ints, key.int)
+			else do map_erase(&writes.unique_keys, key.text)
 		}
 	}
 }

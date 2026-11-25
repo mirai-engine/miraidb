@@ -8209,8 +8209,7 @@ unique_conflicts :: proc(tx: ^Tx, name: string, table: ^Table, values: []Value) 
 			continue
 		}
 		if writes != nil {
-			key := unique_key(tx, table, i, values)
-			if holder, taken := writes.unique_keys[key]; taken do add(&ids, holder)
+			if holder, taken := staged_holder(writes, staged_key(tx, table, i, values)); taken do add(&ids, holder)
 		}
 		if committed != nil && i < len(committed.indexes) {
 			found := table_index_lookup(committed, i, values)
