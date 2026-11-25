@@ -504,6 +504,35 @@ before it and dropped if it does not gain, as R2b was):
 
 The baseline is not changed: nothing here makes the engine faster yet.
 
+## R2, candidate 1: an update that keeps its keys moves none (2026-11-25)
+
+An update whose new values leave every key column of a plain index identical
+(same kind, same bits: `value_identical`) neither checks nor moves that key.
+While staging, `tx_update_row` skips the unregister, the check and the register
+of the row's unique keys; at the apply, `table_update` skips the second unique
+check and the index remove and put for every index whose key is kept. An index
+with an expression or a WHERE, and a transaction that created or dropped an
+index, still take the full path.
+
+A committed row the transaction rewrote used to give up its committed key for
+good (its new key was registered in the transaction's map). It now keeps it
+when its new values do: the two readers of that rule, the unique check
+(`tx_committed_key_taken`) and the rows an INSERT OR REPLACE deletes
+(`unique_conflicts`), ask the staged row (`tx_rewrite_keeps_key`), which only a
+row the committed index files under the probed key pays.
+`test_insert_or_replace_finds_a_key_an_update_kept` fails without that half.
+
+Five interleaved rounds against the build before it (µs, medians):
+
+| Workload | Before | After | After / before | Reference | Ratio now |
+|---|---:|---:|---:|---:|---:|
+| update_bulk u32_u64_str | 1 094 | 671 | 0.61 | 349 | 1.9× |
+| update_bulk u32_u64_u64 | 917 | 460 | 0.50 | 313 | 1.5× |
+
+Every other workload is within noise (0.93–1.03). `scripts/parity.py --record`
+then measured 642 and 436 µs (1.8× and 1.4× the reference); only those two
+numbers went to `baseline.json`, so the others keep their tighter baseline.
+
 To reproduce:
 
 ```sh
