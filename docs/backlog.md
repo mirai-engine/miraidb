@@ -66,9 +66,9 @@ machine, is the measure. In memory, with the baseline of
 `benchmarks/parity/baseline.json`, this engine is at or under it on an empty
 transaction (0.50 µs against 0.53), the index filters (2.7 against 3.25) and a
 256-row scan of the u64 table (1.4 against 1.99), at it on the other scan (1.4
-against 1.33), and slower on the writes: inserts 1.0–1.1× with an index per
-column and 1.7–2.1× with one unique index, updates 1.1–1.4× (inserts 1.2–2.7× and
-updates 2.6–2.8× before the R2 work of 2026-11-25). On
+against 1.33), and at or under it on inserts with an index per column (0.76–0.86×), and slower on
+the other writes: inserts 1.4–1.6× with one unique index, updates 1.05–1.3×
+(inserts 1.2–2.7× and updates 2.6–2.8× before the R2 work of 2026-11-25). On
 disk (written, not synced, the reference's own contract) inserts were 3.0–4.8×
 when last measured, on 2026-11-19.
 SQLite, measured in the same run, also beats this engine on inserts and on

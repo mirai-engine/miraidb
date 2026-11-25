@@ -586,6 +586,41 @@ What is left of the unique insert is mostly not the index: staging the row,
 converting and copying its values, building the commit's operations and the
 tree put. Candidates 3–5 are those.
 
+## R2, candidates 3–5: staging, conversion and the commit (2026-11-25)
+
+Taking stages away again (seven rounds, high priority) put conversion at
+about 9% of the u64 insert, and the growth of the staging map at 7%, while the
+permission check, the value copy and the trigger probes were each within 3%.
+The commit copied every 240-byte op three times and found its table by name
+for every row. Four changes:
+
+- `value_coerce_into` returns a value already of its column's kind (an
+  unsigned or signed integer within the column's width, a text) as the whole
+  conversion would, its subtype cleared, without the three calls and the
+  errors they return.
+- A transaction's inserted rows are `Staged_Rows`: an array in id order while
+  the ids run upward one at a time, as the ids a transaction hands out do, and
+  the map for any other. An insert is an append, and the commit walks the
+  array with no sort.
+- The commit sizes its op list once and returns it without a copy, builds the
+  list of logged ops only when the store logs, and asks whether a table is
+  TEMP once per table instead of once per row.
+- The apply finds the table of a run of row ops once (`Apply_Cache`).
+
+Five interleaved rounds against the build before it (µs, medians):
+
+| Workload | Before | After | After / before | Reference | Ratio now |
+|---|---:|---:|---:|---:|---:|
+| insert_bulk u32_u64_str unique_0 | 480 | 332 | 0.69 | 231 | 1.4× |
+| insert_bulk u32_u64_u64 unique_0 | 343 | 289 | 0.84 | 186 | 1.6× |
+| insert_bulk u32_u64_str btree_each_column | 546 | 406 | 0.74 | 534 | **0.76×** |
+| insert_bulk u32_u64_u64 btree_each_column | 413 | 314 | 0.76 | 363 | **0.86×** |
+| update_bulk u32_u64_str | 489 | 469 | 0.96 | 349 | 1.3× |
+| update_bulk u32_u64_u64 | 345 | 328 | 0.95 | 313 | 1.05× |
+
+Reads within noise (0.92–1.00). The gate counts 7 of its 11 workloads at or
+under the reference now. Only the six write numbers went to `baseline.json`.
+
 To reproduce:
 
 ```sh
