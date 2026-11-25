@@ -99,4 +99,4 @@ the CI gate checks; they are not a comparison with the reference.
 Every row of this table is met today and gated by `scripts/bench.py`, the read
 and commit numbers by `bench-read`, and the subscription row by
 `test_join_subscription_probes_the_join_key`. The engineering gates are listed in
-`docs/status.md` and run by `scripts/ci.py` (40 gates).
+`docs/status.md` and run by `scripts/ci.py` (41 gates).

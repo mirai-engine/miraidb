@@ -242,7 +242,9 @@ def build_gates(args: argparse.Namespace) -> list[Gate]:
     )
     # The parity workloads may not get slower than the baseline this machine
     # recorded (benchmarks/parity/baseline.json): a gain R1-R4 makes is recorded
-    # and held.
+    # and held. A workload that reached the reference is held under 1.10x of it;
+    # the self-test checks those rules on made-up numbers.
+    gates.append(Gate("parity rules", [sys.executable, "scripts/parity.py", "--self-test"]))
     gates.append(Gate("parity budget", [sys.executable, "scripts/parity.py", "--odin", args.odin]))
     # A library with symbols and no header is not an API: this compares each
     # header with what its package exports, and compiles both on their own.

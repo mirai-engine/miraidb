@@ -1,5 +1,14 @@
 {
-  "note": "In memory, best median of three runs, nanoseconds. engine_ns is this machine's, written by `python3 scripts/parity.py --record`; reference_ns and sqlite_ns were measured on the same machine on 2026-11-19 (benchmarks/parity/RESULTS.md).",
+  "note": "In memory, best median of three runs, nanoseconds. engine_ns is this machine's, written by `python3 scripts/parity.py --record`; reference_ns and sqlite_ns were measured on the same machine on 2026-11-19 (benchmarks/parity/RESULTS.md). reached lists the workloads at or under the reference; each is held under 1.10x of it (scripts/parity.py).",
+  "reached": [
+    "miraidb/mem/empty",
+    "miraidb/mem/filter/string/index/load=2048/count=256",
+    "miraidb/mem/filter/u64/index/load=2048/count=256",
+    "miraidb/mem/insert_bulk/u32_u64_str/btree_each_column/load=2048/count=256",
+    "miraidb/mem/insert_bulk/u32_u64_u64/btree_each_column/load=2048/count=256",
+    "miraidb/mem/iterate/u32_u64_u64/unique_0/count=256",
+    "miraidb/mem/update_bulk/u32_u64_u64/unique_0/load=2048/count=256"
+  ],
   "engine_ns": {
     "miraidb/mem/empty": 500,
     "miraidb/mem/filter/string/index/load=2048/count=256": 2700,
