@@ -166,7 +166,7 @@ Tx :: struct {
 }
 
 Table_Writes :: struct {
-	inserts:     map[Row_Id]Row,
+	inserts:     Staged_Rows,
 	updates:     map[Row_Id][]Value,
 	deletes:     map[Row_Id]bool,
 	truncated:   bool,
@@ -227,8 +227,8 @@ tx_statement_undo :: proc(tx: ^Tx, mark: int) {
 		w := u.writes
 		switch u.kind {
 		case .Insert:
-			if u.had do w.inserts[u.id] = u.row
-			else do map_erase(&w.inserts, u.id)
+			if u.had do srows_set(&w.inserts, u.row)
+			else do srows_erase(&w.inserts, u.id)
 		case .Update:
 			if u.had do w.updates[u.id] = u.values
 			else do map_erase(&w.updates, u.id)
@@ -254,7 +254,7 @@ tx_statement_undo :: proc(tx: ^Tx, mark: int) {
 @(private)
 undo_note_insert :: #force_inline proc(tx: ^Tx, w: ^Table_Writes, id: Row_Id) {
 	if tx.undo_depth == 0 do return
-	row, had := w.inserts[id]
+	row, had := srows_get(&w.inserts, id)
 	append(&tx.undo, Stage_Undo{kind = .Insert, writes = w, id = id, had = had, row = row})
 }
 
@@ -383,8 +383,7 @@ tx_snapshot_clone :: proc(tx: ^Tx, from: Tx_Snapshot) -> Tx_Snapshot {
 		// ROLLBACK TO restores becomes the live state, which tx_discard frees.
 		copied := new(Table_Writes)
 		copied^ = writes^
-		copied.inserts = make(map[Row_Id]Row, len(writes.inserts), tx.alloc)
-		for id, row in writes.inserts do copied.inserts[id] = row
+		srows_copy(&copied.inserts, &writes.inserts, tx.alloc)
 		copied.updates = make(map[Row_Id][]Value, len(writes.updates), tx.alloc)
 		for id, values in writes.updates do copied.updates[id] = values
 		copied.deletes = make(map[Row_Id]bool, len(writes.deletes), tx.alloc)
@@ -411,7 +410,7 @@ tx_snapshot_destroy :: proc(tx: ^Tx, snapshot: ^Tx_Snapshot) {
 	// The maps carry their own allocator; the struct is the heap's (tx_writes,
 	// tx_snapshot_clone).
 	for _, writes in snapshot.writes {
-		delete(writes.inserts)
+		srows_destroy(&writes.inserts)
 		delete(writes.updates)
 		delete(writes.deletes)
 		delete(writes.unique_keys)
@@ -683,7 +682,7 @@ tx_discard :: proc(tx: ^Tx) {
 		// The staged values may live in the transaction arena (a statement that
 		// validates against a typed column builds them there), so this frees the maps
 		// and the struct, and the arena reclaims the values with the transaction.
-		delete(writes.inserts)
+		srows_destroy(&writes.inserts)
 		delete(writes.updates)
 		delete(writes.deletes)
 		delete(writes.unique_keys)
@@ -820,7 +819,7 @@ tx_paged_alter_guard :: proc(tx: ^Tx, name: string) -> Error {
 tx_reshape_staged :: proc(tx: ^Tx, name: string, current: ^Table_Schema, next_schema: Table_Schema) -> Error {
 	writes, has_writes := tx.state.writes[name]
 	if !has_writes do return ERROR_NONE
-	for _, &row in writes.inserts {
+	for row in srows_ptrs(&writes.inserts) {
 		values, convert_err := alter_row_values(current, next_schema, row.values, tx.alloc)
 		if convert_err.kind != .None do return convert_err
 		row.values = values
@@ -1068,11 +1067,11 @@ tx_drop_column :: proc(tx: ^Tx, name, column_name: string) -> Error {
 	replacement.next_sequence = current.next_sequence
 	// Staged rows lose the column as well, so later statements see the new shape.
 	if writes, ok := tx.state.writes[name]; ok {
-		for id, row in writes.inserts {
+		for row in srows_ptrs(&writes.inserts) {
 			next := make([]Value, len(row.values) - 1, tx.alloc)
 			copy(next, row.values[:index])
 			copy(next[index:], row.values[index + 1:])
-			writes.inserts[id] = Row {
+			row^ = Row {
 				id           = row.id,
 				values       = next,
 				created_seq  = row.created_seq,
@@ -1199,9 +1198,8 @@ tx_writes :: proc(tx: ^Tx, name: string, table: ^Table) -> ^Table_Writes {
 		return writes
 	}
 	writes := new(Table_Writes)
-	// Sized for a statement that writes a batch: growing a map of 80-byte rows
-	// from empty rehashed it six times over 256 inserts.
-	writes.inserts = make(map[Row_Id]Row, 64)
+	// Sized for a statement that writes a batch (Staged_Rows).
+	srows_init(&writes.inserts, 64)
 	writes.updates = make(map[Row_Id][]Value)
 	writes.deletes = make(map[Row_Id]bool)
 	writes.unique_keys = make(map[string]Row_Id, 64)
@@ -1216,7 +1214,7 @@ tx_writes :: proc(tx: ^Tx, name: string, table: ^Table) -> ^Table_Writes {
 
 tx_get :: proc(tx: ^Tx, name: string, id: Row_Id) -> (Row, bool) {
 	if writes, ok := tx.state.writes[name]; ok {
-		if row, inserted := writes.inserts[id]; inserted do return row, true
+		if row := srows_ptr(&writes.inserts, id); row != nil do return row^, true
 		if values, updated := writes.updates[id]; updated do return Row{id = id, values = values}, true
 		if writes.deletes[id] do return {}, false
 		if writes.truncated do return {}, false
@@ -1245,7 +1243,7 @@ tx_collect :: proc(tx: ^Tx, name: string, out: ^[dynamic]Row) -> Error {
 		table_collect(table, out, tx.read_seq, tx.alloc)
 	}
 	if writes == nil do return ERROR_NONE
-	seen := make(map[Row_Id]bool, len(writes.inserts) + len(out))
+	seen := make(map[Row_Id]bool, srows_len(&writes.inserts) + len(out))
 	defer delete(seen)
 	// Replace updated rows and drop deleted ones.
 	for i in 0 ..< len(out) {
@@ -1259,9 +1257,9 @@ tx_collect :: proc(tx: ^Tx, name: string, out: ^[dynamic]Row) -> Error {
 		}
 		seen[id] = true
 	}
-	for id, row in writes.inserts {
-		if seen[id] do continue
-		append(out, row)
+	for row in srows_ptrs(&writes.inserts) {
+		if seen[row.id] do continue
+		append(out, row^)
 	}
 	// Remove the tombstoned slots the delete pass marked.
 	write := 0
@@ -1323,7 +1321,7 @@ tx_scan_visit :: proc(tx: ^Tx, name: string, ctx: rawptr, visit: Tx_Scan_Visitor
 	overlay := false
 	if writes, has := tx.state.writes[name]; has {
 		overlay = writes.truncated ||
-			len(writes.inserts) > 0 ||
+			srows_len(&writes.inserts) > 0 ||
 			len(writes.updates) > 0 ||
 			len(writes.deletes) > 0
 	}
@@ -1472,7 +1470,7 @@ tx_discard_schema_changes :: proc(tx: ^Tx, name: string) {
 tx_discard_writes :: proc(tx: ^Tx, name: string) {
 	writes, has_writes := tx.state.writes[name]
 	if !has_writes do return
-	delete(writes.inserts)
+	srows_destroy(&writes.inserts)
 	delete(writes.updates)
 	delete(writes.deletes)
 	delete(writes.unique_keys)
@@ -1517,7 +1515,7 @@ tx_next_int_key :: proc(table: ^Table, writes: ^Table_Writes, position: int) -> 
 			if !found^ || values[position].i > largest^ do largest^ = values[position].i
 			found^ = true
 		}
-		for _, row in writes.inserts do weigh(row.values, position, &largest, &found)
+		for row in srows_ptrs(&writes.inserts) do weigh(row.values, position, &largest, &found)
 		for _, values in writes.updates do weigh(values, position, &largest, &found)
 	}
 	return found ? largest + 1 : 1
@@ -1655,7 +1653,7 @@ tx_insert_row :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error)
 	}
 	undo_note_insert(tx, writes, id)
 	undo_note_counters(tx, writes)
-	writes.inserts[id] = Row{id = id, values = row_values}
+	srows_set(&writes.inserts, Row{id = id, values = row_values})
 	// A named rowid below the next one leaves the next one where it was.
 	writes.next_row_id = max(writes.next_row_id, u64(id) + 1)
 	if has_triggers {
@@ -1775,9 +1773,9 @@ tx_update_row :: proc(tx: ^Tx, name: string, id: Row_Id, values: []Value) -> Err
 	); trigger_err.kind != .None {
 		return trigger_err
 	}
-	if _, staged := writes.inserts[id]; staged {
+	if srows_has(&writes.inserts, id) {
 		undo_note_insert(tx, writes, id)
-		writes.inserts[id] = Row{id = id, values = row_values}
+		srows_set(&writes.inserts, Row{id = id, values = row_values})
 	} else {
 		undo_note_update(tx, writes, id)
 		writes.updates[id] = row_values
@@ -1843,9 +1841,9 @@ tx_delete_impl :: proc(tx: ^Tx, name: string, id: Row_Id, fire_triggers: bool) -
 	}
 	writes := tx_writes(tx, name, table)
 	tx_unregister_unique(tx, name, table, previous.values, id)
-	if _, staged := writes.inserts[id]; staged {
+	if srows_has(&writes.inserts, id) {
 		undo_note_insert(tx, writes, id)
-		map_erase(&writes.inserts, id)
+		srows_erase(&writes.inserts, id)
 	} else {
 		if _, updated := writes.updates[id]; updated {
 			undo_note_update(tx, writes, id)
@@ -1881,7 +1879,7 @@ tx_truncate :: proc(tx: ^Tx, name: string) -> Error {
 		return errf(.Sql_Unsupported, "TRUNCATE cannot run inside another statement")
 	}
 	writes := tx_writes(tx, name, table)
-	clear(&writes.inserts)
+	srows_clear(&writes.inserts)
 	clear(&writes.updates)
 	clear(&writes.deletes)
 	clear(&writes.unique_keys)
@@ -2529,7 +2527,7 @@ tx_build_ops :: proc(tx: ^Tx) -> []Store_Op {
 	// instead of doubling its way there and being copied again at the end.
 	count := len(tx.state.dropped) + len(tx.state.created) + len(tx.state.altered) + len(tx.state.index_ops)
 	for _, writes in tx.state.writes {
-		count += len(writes.deletes) + len(writes.updates) + len(writes.inserts) + 1
+		count += len(writes.deletes) + len(writes.updates) + srows_len(&writes.inserts) + 1
 	}
 	ops := make([dynamic]Store_Op, 0, count)
 	// Drops go first: a table this transaction dropped and created again is
@@ -2581,14 +2579,21 @@ tx_build_ops :: proc(tx: ^Tx) -> []Store_Op {
 			)
 		}
 		delete(update_ids)
-		insert_ids := map_keys_sorted(writes.inserts)
-		for id in insert_ids {
-			append(
-				&ops,
-				Store_Op{kind = .Insert, name = name, row_id = id, values = writes.inserts[id].values},
-			)
+		// The staged rows a transaction numbered itself are in id order
+		// already; only the ones a statement named need a sort.
+		if len(writes.inserts.sparse) == 0 {
+			for row in writes.inserts.dense {
+				if row.id == INVALID_ROW_ID do continue
+				append(&ops, Store_Op{kind = .Insert, name = name, row_id = row.id, values = row.values})
+			}
+		} else {
+			insert_ids := srows_ids_sorted(&writes.inserts)
+			for id in insert_ids {
+				row, _ := srows_get(&writes.inserts, id)
+				append(&ops, Store_Op{kind = .Insert, name = name, row_id = id, values = row.values})
+			}
+			delete(insert_ids)
 		}
-		delete(insert_ids)
 	}
 	for op in tx.state.index_ops {
 		if op.drop {

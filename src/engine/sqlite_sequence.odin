@@ -87,7 +87,7 @@ sequence_largest :: proc(tx: ^Tx, name: string, table: ^Table) -> i64 {
 	column := table.schema.auto_increment_column
 	largest := table_max_int(table, column)
 	if writes, staged := tx.state.writes[name]; staged {
-		for _, row in writes.inserts {
+		for row in srows_ptrs(&writes.inserts) {
 			if column < len(row.values) && row.values[column].kind == .Int do largest = max(largest, row.values[column].i)
 		}
 	}

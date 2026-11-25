@@ -3685,7 +3685,7 @@ sql_exec_stream_select :: proc(
 	if tx.state.dropped[stmt.from.name] do return {}, false, ERROR_NONE
 	if writes, has := tx.state.writes[stmt.from.name]; has {
 		if writes.truncated ||
-		   len(writes.inserts) > 0 ||
+		   srows_len(&writes.inserts) > 0 ||
 		   len(writes.updates) > 0 ||
 		   len(writes.deletes) > 0 {
 			return {}, false, ERROR_NONE
