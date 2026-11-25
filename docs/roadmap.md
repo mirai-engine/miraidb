@@ -27,7 +27,7 @@ that way.
 
 | # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
-| 2 | **R2 — fixed-size index keys** | The index filters are under the reference since a key files its rows under one entry; an insert is 1.2–1.3× it with an index per column and 2.6–2.7× with one unique index, and an update 1.4–1.8×. The write path by stage is in RESULTS.md (2026-11-25); its first candidate, an update that keeps its keys moving none, took the update from 2.6–2.8×. Next: a unique index over one integer column keyed by the integer. | M | — |
+| 2 | **R2 — fixed-size index keys** | The index filters are under the reference since a key files its rows under one entry; an insert is 1.0–1.1× it with an index per column and 1.7–2.1× with one unique index, and an update 1.1–1.4×. The write path by stage is in RESULTS.md (2026-11-25); its first two candidates (an update that keeps its keys moves none; integer keys by hash and keys compared by the word) took inserts from 1.2–2.7× and updates from 2.6–2.8×. Next: staging, conversion and the commit's operations, which are most of what is left. | M | — |
 | 5 | **R7 — share a table with its readers** | A commit with a reader open copies the table it writes: 13–17 ms over 50 000 rows, mostly new memory being touched. | L | — |
 | 6 | **D12 — module sandbox** | A module is a process with a work budget; the reference runs modules deterministically with enforced limits. | L | — |
 | 7 | **D16 — generated clients** | Deferred by months: generate the Python binding from the catalog, then a second language. Until then the C ABI, the `sqlite3_*` face and the Python wrapper stay gated, so a binding is a thin layer when it comes ([backlog](backlog.md#d16--clients-generated-from-the-catalog)). | M | — |
@@ -78,7 +78,7 @@ model in every measurable dimension. **It does not meet that today**: on the
 reference's own suite ([RESULTS.md](../benchmarks/parity/RESULTS.md)) this engine
 is at or under it on an empty transaction, the index filters and one of the two
 256-row scans, at it on the other scan, and behind on the writes: inserts
-1.2–2.7× in memory, updates 1.4–1.8×.
+1.0–2.1× in memory, updates 1.1–1.4×.
 Track A is the plan to close it.
 
 The rows below are this engine against its own recorded baseline, which is what

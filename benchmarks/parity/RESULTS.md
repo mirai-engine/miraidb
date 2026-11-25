@@ -533,6 +533,59 @@ Every other workload is within noise (0.93–1.03). `scripts/parity.py --record`
 then measured 642 and 436 µs (1.8× and 1.4× the reference); only those two
 numbers went to `baseline.json`, so the others keep their tighter baseline.
 
+## R2, candidate 2: integer keys by hash (2026-11-25)
+
+The stage probes overstated where an insert's time goes: each probe costs a
+clock read, and the unique check holds several. Taking one stage away at a time
+(a build that skips it, wrong on purpose, timed in five interleaved rounds of
+the u64 insert) gave the real weights, in µs per 256 rows:
+
+| Build | µs | Of the build before |
+|---|---:|---:|
+| `main` | 461 | 1.00 |
+| A: index keys compared eight bytes at a time | 388 | 0.84 |
+| A without the probe of the committed index | 326 | 0.84 of A |
+| A without the unique index's put at the apply | 335 | 0.86 of A |
+| A without any unique check or registration | 276 | 0.71 of A |
+
+The committed probe is a descent of a red-black tree, a node per level, and
+the staged check built the index's name and the encoded value in the arena for
+every row to hash it.
+
+Three changes came of it:
+
+- `text_compare`, which every descent of an index tree calls once per level,
+  compares eight bytes at a time.
+- A UNIQUE index over one plain column keeps, beside its tree, a hash from each
+  integer key to the row holding it (`Index.ints`). The unique check, the
+  apply's check and an equality lookup ask it instead of the tree. Its keys
+  follow `value_encode_key`'s spaces (`index_int_key`): an unsigned integer in
+  its own, a signed one or a real that holds one exactly in the space numbers
+  share, so 5 and 5.0 are one key and 2^53 + 1 and 2^53.0 are two, as in
+  SQLite. Every other value, and every ordered question, is the tree's. An
+  index whose hash cannot grow drops it and answers from the tree.
+- A transaction stages the integer keys of those indexes in a map of their own
+  (`Table_Writes.unique_ints`), keyed by the index's position and the integer.
+
+Five interleaved rounds against the build before it (µs, medians):
+
+| Workload | Before | After | After / before | Reference | Ratio now |
+|---|---:|---:|---:|---:|---:|
+| insert_bulk u32_u64_str unique_0 | 609 | 490 | 0.81 | 231 | 2.1× |
+| insert_bulk u32_u64_u64 unique_0 | 438 | 325 | 0.74 | 186 | 1.7× |
+| insert_bulk u32_u64_str btree_each_column | 597 | 537 | 0.90 | 534 | 1.0× |
+| insert_bulk u32_u64_u64 btree_each_column | 442 | 393 | 0.89 | 363 | 1.1× |
+| update_bulk u32_u64_str | 589 | 495 | 0.84 | 349 | 1.4× |
+| update_bulk u32_u64_u64 | 387 | 332 | 0.86 | 313 | 1.1× |
+
+The reads stay within noise (0.93–1.04). `scripts/parity.py --record` took the
+six write workloads only (it measured the u64 unique insert at 399 µs, a looser
+number than the rounds above); the others keep their tighter baseline.
+
+What is left of the unique insert is mostly not the index: staging the row,
+converting and copying its values, building the commit's operations and the
+tree put. Candidates 3–5 are those.
+
 To reproduce:
 
 ```sh
