@@ -2355,22 +2355,36 @@ tx_commit :: proc(tx: ^Tx) -> Error {
 	}
 	// Ephemeral operations are applied to the live store but never logged, so
 	// temporary tables and their rows vanish on reopen.
-	logged := make([dynamic]Store_Op, 0, len(ops))
 	// Which ops are TEMP is asked now, before the apply: a dropped TEMP table is
-	// gone afterwards, and its drop would look like a main table's.
+	// gone afterwards, and its drop would look like a main table's. The rows of
+	// one table follow each other, so the answer is asked once per table, not
+	// once per row.
 	ephemeral := make([]bool, len(ops), context.temp_allocator)
+	logged_count := 0
+	asked_name: string
+	asked_answer, asked := false, false
 	for op, i in ops {
-		ephemeral[i] = tx_op_is_ephemeral(tx, op)
-		if ephemeral[i] do continue
-		append(&logged, op)
+		row_op := op.kind == .Insert || op.kind == .Update || op.kind == .Delete
+		if row_op && asked && op.name == asked_name {
+			ephemeral[i] = asked_answer
+		} else {
+			ephemeral[i] = tx_op_is_ephemeral(tx, op)
+			asked = row_op
+			asked_name, asked_answer = op.name, ephemeral[i]
+		}
+		if !ephemeral[i] do logged_count += 1
 	}
-	logged_count := len(logged)
 	// A store without a log (in memory, not recording) gets no payload: encoding
 	// every value of the commit to throw the bytes away was a third of the cost
-	// of a small write.
+	// of a small write. Nor does it get the list of logged ops, a copy of every
+	// op.
 	payload: []u8
-	if log_records(&tx.store.log) do payload = tx_encode_ops(logged[:])
-	delete(logged)
+	if log_records(&tx.store.log) {
+		logged := make([dynamic]Store_Op, 0, logged_count)
+		for op, i in ops do if !ephemeral[i] do append(&logged, op)
+		payload = tx_encode_ops(logged[:])
+		delete(logged)
+	}
 	defer delete(payload)
 	next_seq := tx.store.commit_seq + 1
 	log_before := tx.store.log.size
@@ -2394,8 +2408,9 @@ tx_commit :: proc(tx: ^Tx) -> Error {
 	validating_store := tx.store
 	validating_store.apply_validated = true
 	defer validating_store.apply_validated = false
+	apply_cache: Apply_Cache
 	for op in ops {
-		if apply_err := store_apply(tx.store, op); apply_err.kind != .None {
+		if apply_err := store_apply(tx.store, op, &apply_cache); apply_err.kind != .None {
 			// Applying a validated transaction must not fail. If it does, undo
 			// the log record so the file still matches the live state, and
 			// refuse the half-applied rows until the database is reopened.
@@ -2510,7 +2525,13 @@ tx_free_ops :: proc(ops: []Store_Op) {
 
 @(private)
 tx_build_ops :: proc(tx: ^Tx) -> []Store_Op {
-	ops := make([dynamic]Store_Op)
+	// An op is 240 bytes; the array is sized once, for every op the commit has,
+	// instead of doubling its way there and being copied again at the end.
+	count := len(tx.state.dropped) + len(tx.state.created) + len(tx.state.altered) + len(tx.state.index_ops)
+	for _, writes in tx.state.writes {
+		count += len(writes.deletes) + len(writes.updates) + len(writes.inserts) + 1
+	}
+	ops := make([dynamic]Store_Op, 0, count)
 	// Drops go first: a table this transaction dropped and created again is
 	// applied in that order, on replay and at commit alike.
 	for name in tx.state.dropped {
@@ -2576,10 +2597,8 @@ tx_build_ops :: proc(tx: ^Tx) -> []Store_Op {
 			append(&ops, Store_Op{kind = .Create_Index, name = op.table, index = op.index})
 		}
 	}
-	out := make([]Store_Op, len(ops))
-	copy(out, ops[:])
-	delete(ops)
-	return out
+	// The slice keeps the array's block, which the caller deletes.
+	return ops[:]
 }
 
 @(private)

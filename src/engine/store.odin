@@ -1546,7 +1546,26 @@ store_table_writable :: proc(store: ^Store, name: string) -> (^Table, Error) {
 	return clone, ERROR_NONE
 }
 
-store_apply :: proc(store: ^Store, op: Store_Op) -> Error {
+// Apply_Cache keeps the table the last row op of a commit wrote: the rows of
+// one table follow each other, and each found it by its name (R2).
+Apply_Cache :: struct {
+	name:  string,
+	table: ^Table,
+}
+
+// store_row_table is the writable table a row op names, from the cache when
+// the op before it wrote the same one.
+@(private)
+store_row_table :: proc(store: ^Store, name: string, cache: ^Apply_Cache) -> (^Table, Error) {
+	if cache != nil && cache.table != nil && cache.name == name do return cache.table, ERROR_NONE
+	table, err := store_table_writable(store, name)
+	if cache != nil && err.kind == .None do cache^ = Apply_Cache{name = name, table = table}
+	return table, err
+}
+
+store_apply :: proc(store: ^Store, op: Store_Op, cache: ^Apply_Cache = nil) -> Error {
+	// Any other op may create, replace or drop a table: the cache forgets.
+	if cache != nil && op.kind != .Insert && op.kind != .Update && op.kind != .Delete do cache^ = {}
 	switch op.kind {
 	case .Create_Table:
 		if _, exists := store.tables[op.name]; exists {
@@ -1618,7 +1637,7 @@ store_apply :: proc(store: ^Store, op: Store_Op) -> Error {
 		}
 		return ERROR_NONE
 	case .Insert:
-		table, table_err := store_table_writable(store, op.name)
+		table, table_err := store_row_table(store, op.name, cache)
 		if table_err.kind != .None do return table_err
 		if insert_err := table_insert(table, op.row_id, op.values, store.apply_validated); insert_err.kind != .None {
 			return insert_err
@@ -1628,13 +1647,13 @@ store_apply :: proc(store: ^Store, op: Store_Op) -> Error {
 		if op.name == SEQUENCE_TABLE do store_apply_sequence(store, op.values)
 		return ERROR_NONE
 	case .Update:
-		table, table_err := store_table_writable(store, op.name)
+		table, table_err := store_row_table(store, op.name, cache)
 		if table_err.kind != .None do return table_err
 		update_err := table_update(table, op.row_id, op.values)
 		if update_err.kind == .None && op.name == SEQUENCE_TABLE do store_apply_sequence(store, op.values)
 		return update_err
 	case .Delete:
-		table, table_err := store_table_writable(store, op.name)
+		table, table_err := store_row_table(store, op.name, cache)
 		if table_err.kind != .None do return table_err
 		table_delete(table, op.row_id)
 		return ERROR_NONE
