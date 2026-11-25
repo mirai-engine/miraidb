@@ -146,6 +146,10 @@ Store :: struct {
 	// drop all of it. Before this, a commit kept every version it replaced for the
 	// life of the process: an UPDATE cost ~900 bytes per statement.
 	pinned_reads:  [dynamic]u64,
+	// retention is how much row history the store keeps, and commit_times when
+	// its commits landed, for a retention in seconds (retention.odin, D3).
+	retention:     Retention,
+	commit_times:  [dynamic]Commit_Time,
 	// host_access allows the statements that reach outside the database: ATTACH
 	// reads a file path, LOAD EXTENSION runs host code, VACUUM INTO writes one.
 	// An embedded caller is the host and starts with it enabled; a server turns it
@@ -560,6 +564,7 @@ store_close :: proc(store: ^Store) {
 	for key in store.listeners do delete(key.channel)
 	delete(store.listeners)
 	delete(store.pinned_reads)
+	delete(store.commit_times)
 	for &arena in store.arenas do virtual.arena_destroy(&arena)
 	delete(store.arenas)
 	for text, entry in store.expr_cache {
@@ -2180,6 +2185,7 @@ store_commit_prepared :: proc(store: ^Store, prepared: []^Prepared_Tx) -> (int, 
 	store.log.durability = saved_durability
 	store.commit_seq = seq
 	store.last_commit_us = now_microseconds()
+	store_note_commit_time(store, seq, store.last_commit_us)
 	flush_err := log_flush(&store.log)
 	if flush_err.kind == .None {
 		// A page-flush failure is not a commit failure: the log holds the change
@@ -2198,5 +2204,6 @@ store_commit_prepared :: proc(store: ^Store, prepared: []^Prepared_Tx) -> (int, 
 			notify(notify_ctx, store, group.ops)
 		}
 	}
+	store_retain(store)
 	return written, ERROR_NONE
 }

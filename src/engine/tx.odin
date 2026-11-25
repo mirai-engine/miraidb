@@ -663,10 +663,8 @@ tx_discard :: proc(tx: ^Tx) {
 	tx_arena_give(tx.store, &tx.arena)
 	pinned := tx.pinned
 	pinned_seq := tx.pinned_seq
-	// Row history is kept by default: a caller may pin a read to an older sequence
-	// at any time, and a pin nobody announced yet would find the history gone. A
-	// caller that knows it keeps no history - the CLI - calls store_prune_history
-	// itself; the C ABI does not yet (D3).
+	// How much row history stays is the store's retention, applied after each
+	// commit (retention.odin, D3); a pinned read keeps what it reads.
 	store := tx.store
 	if tx.locked {
 		if tx.read_only {
@@ -2322,6 +2320,7 @@ tx_commit :: proc(tx: ^Tx) -> Error {
 	}
 	committed_us := now_microseconds()
 	tx.store.last_commit_us = committed_us
+	if has_log_record do store_note_commit_time(tx.store, next_seq, committed_us)
 	if started_us > 0 do store_record_commit_latency(tx.store, committed_us - started_us)
 	if has_log_record do tx.store.commit_seq = next_seq
 	notify := tx.store.on_commit
@@ -2380,6 +2379,8 @@ tx_commit :: proc(tx: ^Tx) -> Error {
 	if notify != nil {
 		notify(notify_ctx, store, notify_ops)
 	}
+	// The history the retention no longer keeps goes now (D3).
+	store_retain(store)
 	return ERROR_NONE
 }
 

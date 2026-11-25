@@ -163,6 +163,9 @@ miraidb_open_ex :: proc "c" (path: cstring, flags: c.int) -> rawptr {
 	}
 	delete(last_open_error)
 	last_open_error = ""
+	// An embedded process keeps the history a pinned read needs, unless PRAGMA
+	// history_retention asks for more (D3).
+	if conn.store.retention.kind == .Everything do engine.store_set_retention(conn.store, {kind = .Readers})
 	handle := new(Capi_Connection)
 	handle.embed = conn
 	handle.statements = make(map[rawptr]^Capi_Statement)

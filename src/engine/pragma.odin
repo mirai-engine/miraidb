@@ -596,6 +596,17 @@ sql_exec_pragma :: proc(store: ^Store, body: string, locked: bool, tx: ^Tx = nil
 		return pragma_single("data_version", value_int(i64(store.commit_seq)), store.commit_seq), ERROR_NONE
 	case "max_page_count":
 		return pragma_single("max_page_count", value_int(1073741823), store.commit_seq), ERROR_NONE
+	case "history_retention":
+		// How much row history AS OF can read (D3): everything, readers,
+		// commits=N or seconds=N.
+		if has_argument {
+			retention, ok := retention_parse(argument)
+			if !ok do return {}, errf(.Invalid_Argument, "history_retention takes everything, readers, commits=N or seconds=N")
+			if locked do store.retention = retention
+			else do store_set_retention(store, retention)
+			return Sql_Result{kind = .Ack, message = strings.clone("ok"), commit_seq = store.commit_seq}, ERROR_NONE
+		}
+		return pragma_single("history_retention", pragma_text(retention_format(store.retention)), store.commit_seq), ERROR_NONE
 	case "foreign_keys":
 		// Inside a transaction the setting is left alone, as SQLite leaves it.
 		if has_argument && tx == nil {

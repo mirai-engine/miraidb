@@ -556,6 +556,9 @@ open_database :: proc(filename: cstring, ppDb: ^rawptr, open_flags: c.int) -> c.
 	}
 	db := new(Database)
 	if flags & SQLITE_OPEN_READONLY != 0 do conn.store.read_only = true
+	// SQLite reads no older commit: the history kept is what a pinned read
+	// needs, unless PRAGMA history_retention asks for more (D3).
+	if conn.store.retention.kind == .Everything do engine.store_set_retention(conn.store, {kind = .Readers})
 	db.conn = conn
 	db.error_offset = -1
 	// An expression column is named by its text, as SQLite names it.
