@@ -53,7 +53,7 @@ that way.
 | 25 | **D10 — precision and time** | Decimal scale, `TIMESTAMPTZ`, streaming blobs. | M | — |
 | 27 | **D15 — network hardening** | TLS, HTTP/2, backpressure, per-route timeouts, a load test. | M | — |
 | 28 | **D14 — replication** | `GET /log?since=<seq>` and a follower applying through replay. | XL | 27 |
-| 29 | **Auth review** | Rate limits, token lifetime, adversarial tests over subscriptions and budgets; tokens travel in clear until TLS; **grants are opt-in**, so a database with no grant rows accepts every statement from every client. | S | — |
+| 29 | **Auth review** | Rate limits, token lifetime, adversarial tests over subscriptions and budgets; tokens travel in clear until TLS. Done: a server with credentials refuses anonymous clients on every front, and no client reaches the token key, the grants or its own identity (`docs/security.md`). | S | — |
 | 30 | **Release and packaging** | `scripts/package.py` builds and checks one archive. Left: one archive per target, a version policy, a byte-for-byte reproducible build. | M | 19 |
 | 31 | **Licence and notice review** | MIT/Apache-2.0 with no vendored third-party source; confirm before each release. | external | — |
 
@@ -62,14 +62,13 @@ with peer-to-peer sync; its networked phases build on items 27 and 28.
 
 ## Suggested order
 
-1. The grants review: a server without grant rows lets any client do anything.
-2. **R2**: the largest gap left against the reference (inserts and updates),
+1. **R2**: the largest gap left against the reference (inserts and updates),
    starting from a profile of the write path. The parity gate
    (`scripts/parity.py`) records its gain with `--record` so it cannot slip back.
-3. **S8**, then **D37**, **D4** and **D36**.
-4. **D39**, then **D40**.
-5. **R7**, the disk workloads and the depth items of track C.
-6. **D15, D14** and the release gates, in that order; **D34** when its image is
+2. **S8**, then **D37**, **D4** and **D36**.
+3. **D39**, then **D40**.
+4. **R7**, the disk workloads and the depth items of track C.
+5. **D15, D14** and the release gates, in that order; **D34** when its image is
    ready.
 
 ## Efficiency contract and current baseline
@@ -100,4 +99,4 @@ the CI gate checks; they are not a comparison with the reference.
 Every row of this table is met today and gated by `scripts/bench.py`, the read
 and commit numbers by `bench-read`, and the subscription row by
 `test_join_subscription_probes_the_join_key`. The engineering gates are listed in
-`docs/status.md` and run by `scripts/ci.py` (39 gates).
+`docs/status.md` and run by `scripts/ci.py` (40 gates).

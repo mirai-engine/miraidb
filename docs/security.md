@@ -35,17 +35,54 @@ $ miraidb-server data/db --port=8080 --statement-timeout-ms=2000 --budget=100000
 
 ## Identity and grants
 
-A request runs under the identity its bearer token authenticated, or under none.
-Policies are checked against that identity when the database has any:
-`CREATE POLICY` and `GRANT` decide who may read or write what.
+A request runs under the identity its bearer token authenticated, or under none,
+never under the identity a previous request left behind. Policies are checked
+against that identity when the database has any: `CREATE POLICY` and `GRANT`
+decide who may read or write what.
 
-**Grants are opt-in.** A database with no grant rows allows everything to
-everyone, which is the state of a fresh database: create, read, write and drop.
-A deployment that must not accept anonymous writes creates its grants first, and
-then the same statements are refused for a client without the right.
+**Credentials close the server.** It is closed when it has a PostgreSQL password
+(`--password` or `MIRAIDB_PG_PASSWORD`), when its database has issued a token
+that has not expired, or with `--closed`. A closed server answers a client that
+does not prove who it is with nothing but `GET /health`:
 
-`WIRE_AUTH` inside a request, and `SET identity`, change the identity of that
-connection only; two clients never see each other's.
+| Front | Proof | Without it |
+|---|---|---|
+| HTTP | `Authorization: Bearer mt_...` on every request | `401` |
+| WebSocket | the bearer token on the upgrade, or an `AUTH` message first | every other message answers an error |
+| PostgreSQL | SCRAM-SHA-256 with the server's password | the startup is refused (`28000`); a closed server with no password refuses every PostgreSQL client |
+
+A token that does not check out is refused on every server, open or closed: the
+client asked to be someone and is not. A server without credentials accepts
+every client and says so on stderr when it starts.
+
+```text
+$ miraidb-server data/db --issue-token=<64 hex digits>   # prints mt_..., then exits
+$ miraidb-server data/db --port=8080                     # closed: the database has a token
+```
+
+A PostgreSQL session proves the password, not an identity, so it runs as no
+identity: the grants and policies it meets are those of `'*'`.
+
+**What a client never reaches.** Grants decide only if a client cannot rewrite
+them, so a server's client, closed or open, is refused (`Permission_Denied`,
+nothing changes) when it:
+
+- reads `_token` or `_meta`: `_meta` holds the key that signs every token and
+  JWT, and reading it was minting any identity;
+- creates, writes, alters, renames or drops `_token`, `_meta`, `_role`,
+  `_grant` or `_policy`, directly or through a trigger or a view;
+- runs `GRANT`, `REVOKE`, `CREATE POLICY` or `DROP POLICY`;
+- runs `SET identity`, which named any identity without a token.
+
+The host sets these up: the CLI or an embedded `store_open` on the directory
+while the server is stopped, or a server started with `--allow-host`, which
+trusts every client with them as it does with files. An embedded caller is the
+host and is not refused.
+
+**Grants are opt-in.** A database with no grant rows allows everything to every
+client that is let in: create, read, write and drop. A deployment that must keep
+an authenticated client from writing creates its grants first, and then the
+same statements are refused for a client without the right.
 
 ## What is not defended
 

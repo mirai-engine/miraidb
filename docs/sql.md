@@ -750,10 +750,11 @@ cases. Each spelling maps onto a construct the engine already has.
 `miraidb-server` answers a PostgreSQL client on its port. With `--password` (or
 `MIRAIDB_PG_PASSWORD`) it authenticates with **SCRAM-SHA-256**: the client proves
 it knows the password without sending it, and the server proves it knows it too.
-Without a password the port accepts every client, which is worth saying out loud
-when the port is reachable from anywhere but this machine. A statement on the
-command line is visible to whoever lists the processes; the environment variable
-is the quieter way.
+Without a password a server that is closed anyway (its database issued a token,
+or `--closed`) refuses PostgreSQL clients, which have no other way to prove who
+they are; an open one accepts every client and warns when it starts
+(`docs/security.md`). A password on the command line is visible to whoever lists
+the processes; the environment variable is the quieter way.
 
 Two connections are served at once as far as the protocol goes: a second client
 completes its startup while the first holds a transaction open. Statements still

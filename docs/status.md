@@ -126,7 +126,7 @@ the gaps are named rather than left to be discovered.
 ### Tooling
 
 - `python3 scripts/ci.py` runs every gate in one command and reports each one;
-  it is what "green" means. 39 gates (`--list` prints them): the suite, the
+  it is what "green" means. 40 gates (`--list` prints them): the suite, the
   corpus, the smokes, CPython's own sqlite3 tests on the facade, the
   measurements, the SQLite surface count, the heap sanitizer and the
   document check.
@@ -155,7 +155,7 @@ the gaps are named rather than left to be discovered.
   `linux_arm64` and `darwin_arm64`. The POSIX lock is the reason it is checked:
   it carried a missing `core:sys/posix` import and two wrong integer types until
   this round, so the code that a Linux build would run had never been compiled.
-- 476 integration tests covering CRUD, recovery, constraints, transactions,
+- 477 integration tests covering CRUD, recovery, constraints, transactions,
   aggregates, indexes, joins, window functions, triggers, bind parameters,
   snapshots, compaction, migrations, reducers, subscriptions, the scheduler,
   the SQLite reader and writer, the C ABI facade and idempotency.
@@ -380,10 +380,14 @@ than 1000 bytes cannot be indexed and the insert says so.
   slow query queues the others instead of running beside them.
   **What it refuses:** `ATTACH`, `LOAD EXTENSION` and `VACUUM INTO` to a client,
   because each names a path or a module the client chose; `--allow-host` turns
-  them back on for a deployment that trusts every client. Reading, writing and
-  DDL stay available, and grants still decide who may do them (a database with no
-  grants allows everyone, which is the default). `docs/security.md` states the
-  model. `--statement-timeout-ms` cancels a statement that outlives it — the
+  them back on for a deployment that trusts every client. A server with a
+  password or an issued token (or `--closed`) refuses a client that does not
+  prove who it is on HTTP (401), WebSocket and PostgreSQL; an open one warns when
+  it starts. No client reads the token key or the token digests, writes the
+  roles, grants or policies, or runs `SET identity` (`scripts/auth_smoke.py`).
+  Reading, writing and DDL stay available, and grants still decide who may do
+  them (a database with no grants allows every client let in, which is the
+  default). `docs/security.md` states the model. `--statement-timeout-ms` cancels a statement that outlives it — the
   watchdog sets the store's atomic cancel flag, the executor answers `cancelled`,
   and the next statement runs — while `--budget` refuses a statement that
   overspends (after the work, not during). **What is still open:** the transport
