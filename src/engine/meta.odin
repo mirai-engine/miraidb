@@ -15,6 +15,7 @@ META_SCHEMA_SQL :: `
 
 // host_ensure_meta creates the metadata table and seeds the schema version.
 host_ensure_meta :: proc(host: ^Host) -> Error {
+	catalog_scope()
 	result, create_err := sql_execute(host.store, META_SCHEMA_SQL)
 	if create_err.kind != .None do return create_err
 	sql_result_destroy(&result)
@@ -40,6 +41,7 @@ host_ensure_meta :: proc(host: ^Host) -> Error {
 // The value is copied into `alloc`: the result it comes from is freed on return,
 // and the text used to point into it.
 store_meta :: proc(store: ^Store, key: string, alloc := context.temp_allocator) -> (string, bool) {
+	catalog_scope()
 	result, query_err := sql_execute_params(
 		store,
 		"SELECT value FROM _meta WHERE key = ?",

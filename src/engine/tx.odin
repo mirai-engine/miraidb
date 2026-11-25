@@ -680,6 +680,7 @@ tx_discard :: proc(tx: ^Tx) {
 // --- Lookup ----------------------------------------------------------------
 
 tx_table :: proc(tx: ^Tx, name: string) -> (^Table, Error) {
+	if client_untrusted(tx.store) && credential_table(name) do return nil, client_credential_refusal(name)
 	// The key must outlive the statement's query arena. It is cloned once per
 	// table: an insert looks up four tables (its own, grants and triggers twice),
 	// and cloning the name on every lookup cost more than the lookup.
@@ -710,6 +711,7 @@ tx_table :: proc(tx: ^Tx, name: string) -> (^Table, Error) {
 // every statement, which `tools/leakcheck` counted as two live allocations per
 // statement. Ask with this when the answer is a bool.
 tx_table_probe :: proc(tx: ^Tx, name: string) -> ^Table {
+	if client_untrusted(tx.store) && credential_table(name) do return nil
 	// The key must outlive the statement's query arena. It is cloned once per
 	// table: an insert looks up four tables (its own, grants and triggers twice),
 	// and cloning the name on every lookup cost more than the lookup.
@@ -810,6 +812,7 @@ tx_alter_created :: proc(tx: ^Tx, name: string, created: ^Table, next_schema: Ta
 // the extra columns for every existing row, so the commit only records the
 // schema and the store rebuilds the same way on replay.
 tx_alter_table :: proc(tx: ^Tx, name: string, next_schema: Table_Schema) -> Error {
+	if refusal := client_authority_check(tx.store, name); refusal.kind != .None do return refusal
 	tx_forget_catalog_cache(tx)
 	if tx_write_refused(tx, name) do return errf(.Transaction_Read_Only, "cannot alter a table in a read transaction")
 	if tx.store.mirror_kept_indexes > 0 {
@@ -1037,6 +1040,8 @@ tx_drop_column :: proc(tx: ^Tx, name, column_name: string) -> Error {
 // tx_rename_table moves a table to a new name. The rows keep their ids; the
 // staged writes follow the table, so a commit applies the rename before them.
 tx_rename_table :: proc(tx: ^Tx, from, to: string) -> Error {
+	if refusal := client_authority_check(tx.store, from); refusal.kind != .None do return refusal
+	if refusal := client_authority_check(tx.store, to); refusal.kind != .None do return refusal
 	tx_forget_catalog_cache(tx)
 	if tx_write_refused(tx, from) do return errf(.Transaction_Read_Only, "cannot alter a table in a read transaction")
 	if tx.store.mirror_kept_indexes > 0 {
@@ -1336,6 +1341,7 @@ tx_kept_index_refusal :: proc(tx: ^Tx, name: string) -> Error {
 // --- DDL -------------------------------------------------------------------
 
 tx_create_table :: proc(tx: ^Tx, schema: ^Table_Schema) -> Error {
+	if refusal := client_authority_check(tx.store, schema.name); refusal.kind != .None do return refusal
 	tx_forget_catalog_cache(tx)
 	if tx.read_only || (tx.temp_only && !schema.ephemeral) {
 		return errf(.Transaction_Read_Only, "cannot create a table in a read transaction")
@@ -1360,6 +1366,7 @@ tx_create_table :: proc(tx: ^Tx, schema: ^Table_Schema) -> Error {
 }
 
 tx_drop_table :: proc(tx: ^Tx, name: string) -> Error {
+	if refusal := client_authority_check(tx.store, name); refusal.kind != .None do return refusal
 	tx_forget_catalog_cache(tx)
 	if tx_write_refused(tx, name) do return errf(.Transaction_Read_Only, "cannot drop a table in a read transaction")
 	if tx.store.mirror_kept_indexes > 0 {
@@ -1791,6 +1798,7 @@ tx_delete_impl :: proc(tx: ^Tx, name: string, id: Row_Id, fire_triggers: bool) -
 }
 
 tx_truncate :: proc(tx: ^Tx, name: string) -> Error {
+	if refusal := client_authority_check(tx.store, name); refusal.kind != .None do return refusal
 	if tx_write_refused(tx, name) do return errf(.Transaction_Read_Only, "cannot truncate in a read transaction")
 	if tx.store.mirror_kept_indexes > 0 {
 		if kept_err := tx_kept_index_refusal(tx, name); kept_err.kind != .None do return kept_err

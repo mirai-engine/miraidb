@@ -24,6 +24,8 @@ host_schema_version :: proc(host: ^Host) -> u32 {
 // host_migrate applies every migration above the stored version. Each step must
 // be exactly the next version; a gap or a failing statement stops the run.
 host_migrate :: proc(host: ^Host, migrations: []Migration) -> (applied: int, err: Error) {
+	// A migration is the host's code, not a client's statement.
+	catalog_scope()
 	if ensure_err := host_ensure_meta(host); ensure_err.kind != .None do return 0, ensure_err
 	current := host_schema_version(host)
 	for migration in migrations {

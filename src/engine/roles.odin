@@ -15,6 +15,81 @@ import "core:strings"
 ROLE_TABLE :: "_role"
 GRANT_TABLE :: "_grant"
 
+// --- What a server's client may not reach -----------------------------------
+//
+// A store without host access serves clients it does not trust (the server's
+// default). A statement runs as the identity a token authenticated, so a client
+// must not reach what decides identities and rights:
+//
+// - the credentials: `_token` (the token digests) and `_meta`, which holds the
+//   key that signs every token and JWT: reading it is minting any identity;
+// - the authority: creating, writing, altering or dropping `_role`, `_grant`,
+//   `_policy` or the credentials, and GRANT, REVOKE and policy DDL;
+// - SET identity, which names any identity without a token.
+//
+// The engine reaches those tables for itself (a token check, the rows GRANT
+// writes, the policies of a dropped table) inside catalog_scope, which counts
+// per thread: a statement the client wrote never runs inside one, even when a
+// trigger or a view runs it on the client's behalf.
+
+@(thread_local, private)
+catalog_depth: int
+
+@(private, deferred_none = catalog_scope_end)
+catalog_scope :: proc() {
+	catalog_depth += 1
+}
+
+@(private)
+catalog_scope_end :: proc() {
+	catalog_depth -= 1
+}
+
+// client_untrusted reports a statement a client wrote, on a store that does not
+// trust its clients.
+@(private)
+client_untrusted :: proc(store: ^Store) -> bool {
+	return store != nil && !store.host_access && catalog_depth == 0
+}
+
+// credential_table names a table a client may not even read.
+@(private)
+credential_table :: proc(name: string) -> bool {
+	return strings.equal_fold(name, TOKEN_TABLE) || strings.equal_fold(name, META_TABLE)
+}
+
+// authority_table names a table a client may not create, write or drop.
+@(private)
+authority_table :: proc(name: string) -> bool {
+	if credential_table(name) do return true
+	return strings.equal_fold(name, ROLE_TABLE) || strings.equal_fold(name, GRANT_TABLE) || strings.equal_fold(name, POLICY_TABLE)
+}
+
+// client_authority_refusal is the one answer a client gets for reaching the
+// authority: it changes nothing and says how a deployment trusts its clients.
+@(private)
+client_authority_refusal :: proc(what: string) -> Error {
+	return errf(
+		.Permission_Denied,
+		"%s is the host's: a client may not change who it is or what it may do (start the server with --allow-host to trust every client)",
+		what,
+	)
+}
+
+// client_credential_refusal answers a client that names a credential table.
+@(private)
+client_credential_refusal :: proc(name: string) -> Error {
+	return errf(.Permission_Denied, "%s holds the server's credentials: a client may not read it", name)
+}
+
+// client_authority_check refuses a client's create, write, alter or drop of an
+// authority table.
+@(private)
+client_authority_check :: proc(store: ^Store, name: string) -> Error {
+	if !client_untrusted(store) || !authority_table(name) do return ERROR_NONE
+	return client_authority_refusal(name)
+}
+
 ROLE_SCHEMA_SQL :: `
 	CREATE TABLE IF NOT EXISTS _role (
 		role TEXT NOT NULL,
@@ -61,6 +136,8 @@ roles_row_exists :: proc(tx: ^Tx, sql: string, params: []Value) -> (bool, Error)
 //	GRANT role TO identity          REVOKE role FROM identity
 //	GRANT action ON table TO role   REVOKE action ON table FROM role
 sql_exec_grant :: proc(tx: ^Tx, stmt: Grant_Stmt) -> (Sql_Result, Error) {
+	if client_untrusted(tx.store) do return {}, client_authority_refusal(stmt.revoke ? "REVOKE" : "GRANT")
+	catalog_scope()
 	if len(stmt.role) == 0 do return {}, errf(.Sql_Syntax, "GRANT needs a role name")
 	if ensure_err := roles_ensure_tables(tx); ensure_err.kind != .None {
 		return {}, ensure_err
@@ -187,6 +264,9 @@ permission_allows :: proc(tx: ^Tx, table_name, action: string) -> (bool, Error) 
 // tx_check_permission is the write gate: the caller turns a refused action into
 // a Permission_Denied error that names the table.
 tx_check_permission :: proc(tx: ^Tx, table_name, action: string) -> Error {
+	if tx != nil {
+		if refusal := client_authority_check(tx.store, table_name); refusal.kind != .None do return refusal
+	}
 	allowed, err := permission_allows(tx, table_name, action)
 	if err.kind != .None do return err
 	if allowed do return ERROR_NONE

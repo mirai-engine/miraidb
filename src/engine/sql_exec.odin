@@ -1081,6 +1081,8 @@ sql_exec_set :: proc(store: ^Store, stmt: Set_Stmt, params: []Value, locked := f
 	)
 	if eval_err.kind != .None do return {}, eval_err
 	if strings.equal_fold(stmt.name, "identity") {
+		// A client is the identity its token proved; naming another is the host's.
+		if client_untrusted(store) do return {}, client_authority_refusal("SET identity")
 		coerced, coerce_err := value_coerce(value, Column_Type{kind = .Identity})
 		if coerce_err.kind != .None {
 			return {}, error_wrap(coerce_err, .Invalid_Type, "SET identity needs a 32-byte hex string")

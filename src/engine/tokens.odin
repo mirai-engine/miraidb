@@ -21,6 +21,7 @@ TOKEN_SCHEMA_SQL :: `
 
 @(private)
 tokens_ensure_table :: proc(host: ^Host) -> Error {
+	catalog_scope()
 	if _, exists := host.store.tables[TOKEN_TABLE]; exists do return ERROR_NONE
 	result, create_err := sql_execute(host.store, TOKEN_SCHEMA_SQL)
 	if create_err.kind != .None do return create_err
@@ -73,6 +74,7 @@ hex_digit :: proc(c: u8) -> (u8, bool) {
 // host (the C ABI) authenticates with the same key the server would use.
 store_token_key :: proc(store: ^Store) -> []u8 {
 	if len(store.token_key) == 32 do return store.token_key
+	catalog_scope()
 	// The key is a row in _meta, and a database opened by an embedder has no host
 	// to create that table: without this the insert below would fail and every
 	// connection would invent a key of its own, which no other connection could
@@ -137,6 +139,7 @@ host_issue_token :: proc(host: ^Host, identity: Identity, ttl_us: i64) -> (strin
 // store_issue_token is host_issue_token for a store with no host, with the clock
 // passed in so a caller can also issue an already-expired token on purpose.
 store_issue_token :: proc(store: ^Store, identity: Identity, ttl_us, now_us: i64) -> (string, Error) {
+	catalog_scope()
 	result, create_err := sql_execute(store, TOKEN_SCHEMA_SQL)
 	if create_err.kind != .None do return "", create_err
 	sql_result_destroy(&result)
@@ -170,6 +173,7 @@ host_authenticate :: proc(host: ^Host, token: string) -> (Identity, bool) {
 // against the store and the host wrapper passes its own clock.
 store_authenticate :: proc(store: ^Store, token: string, now_us: i64) -> (Identity, bool) {
 	if len(token) == 0 do return Identity{}, false
+	catalog_scope()
 	// A JWT header is the base64url of `{"alg":...}`, always starting with eyJ.
 	if strings.has_prefix(token, "eyJ") {
 		if identity, valid := jwt_identity_store(store, token, now_us); valid {
@@ -199,6 +203,7 @@ store_authenticate :: proc(store: ^Store, token: string, now_us: i64) -> (Identi
 
 // host_revoke_token drops one token. It reports whether a row was removed.
 host_revoke_token :: proc(host: ^Host, token: string) -> bool {
+	catalog_scope()
 	if err := tokens_ensure_table(host); err.kind != .None do return false
 	digest := token_digest(host, token)
 	result, delete_err := sql_execute_params(

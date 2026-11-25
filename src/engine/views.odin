@@ -18,6 +18,8 @@ VIEW_MAX_DEPTH :: 8
 VIEW_SCHEMA_SQL :: "CREATE TABLE IF NOT EXISTS _view (name TEXT PRIMARY KEY, sql TEXT NOT NULL)"
 
 sql_exec_create_view :: proc(tx: ^Tx, stmt: Create_View_Stmt) -> (Sql_Result, Error) {
+	// A view named like the grants would be read as them.
+	if refusal := client_authority_check(tx.store, stmt.name); refusal.kind != .None do return {}, refusal
 	if len(stmt.sql) == 0 {
 		return {}, errf(.Sql_Syntax, "a view needs a SELECT body")
 	}

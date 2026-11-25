@@ -28,6 +28,8 @@ Policy_Set :: struct {
 }
 
 sql_exec_create_policy :: proc(tx: ^Tx, stmt: Create_Policy_Stmt) -> (Sql_Result, Error) {
+	if client_untrusted(tx.store) do return {}, client_authority_refusal("CREATE POLICY")
+	catalog_scope()
 	if len(stmt.using_sql) == 0 && len(stmt.check_sql) == 0 {
 		return {}, errf(.Sql_Syntax, "a policy needs USING, CHECK or both")
 	}
@@ -69,6 +71,8 @@ sql_exec_create_policy :: proc(tx: ^Tx, stmt: Create_Policy_Stmt) -> (Sql_Result
 }
 
 sql_exec_drop_policy :: proc(tx: ^Tx, stmt: Drop_Policy_Stmt) -> (Sql_Result, Error) {
+	if client_untrusted(tx.store) do return {}, client_authority_refusal("DROP POLICY")
+	catalog_scope()
 	if _, err := tx_table(tx, POLICY_TABLE); err.kind != .None {
 		error_free(&err)
 		if stmt.if_exists do return Sql_Result{kind = .Ack, commit_seq = tx.store.commit_seq}, ERROR_NONE
@@ -92,6 +96,9 @@ sql_exec_drop_policy :: proc(tx: ^Tx, stmt: Drop_Policy_Stmt) -> (Sql_Result, Er
 // stayed, and held the next table of that name.
 @(private)
 policies_drop_on :: proc(tx: ^Tx, table_name: string) -> Error {
+	// The client dropped its own table; the policies that named it are the
+	// engine's to remove.
+	catalog_scope()
 	if tx_table_probe(tx, POLICY_TABLE) == nil do return ERROR_NONE
 	result, err := sql_execute_in_tx_params(tx, "DELETE FROM _policy WHERE lower(table_name) = lower(?)", []Value{value_string(table_name)})
 	if err.kind != .None do return err
