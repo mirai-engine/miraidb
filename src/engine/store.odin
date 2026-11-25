@@ -248,6 +248,11 @@ Store :: struct {
 	vfs:           ^Vfs,
 	persistent:    bool,
 	last_error:    Error,
+	// damaged is why a commit stopped halfway through applying (a page it could
+	// not read or write back): the rows in memory are then neither the old state
+	// nor the new one, so every statement is refused until the database is
+	// opened again from its log (D8).
+	damaged:       Error,
 	// compact_thread, compact_stop and compact_bytes drive the opt-in
 	// background compactor. The worker holds the same write lock compaction
 	// always takes, so a writer pauses instead of failing.
@@ -507,7 +512,8 @@ store_close :: proc(store: ^Store) {
 	store_stop_background_compaction(store)
 	// A paged table is flushed before it is closed so a clean shutdown leaves the
 	// page files current; a crash leaves them stale, which the next open rebuilds.
-	if !store.read_only {
+	// A damaged store writes none of what it holds.
+	if !store.read_only && store.damaged.kind == .None {
 		if flush_err := store_flush_pages(store, store.commit_seq); flush_err.kind != .None {
 			store_note_error(store, flush_err)
 		}
@@ -561,7 +567,31 @@ store_close :: proc(store: ^Store) {
 	log_close(&store.log)
 	db_lock_release(&store.lock)
 	error_free(&store.last_error)
+	error_free(&store.damaged)
+	// A page failure no statement answered (one of the flush above) dies here.
+	page_failure_clear()
 	free(store)
+}
+
+// store_damage records that a commit stopped halfway through its apply. The
+// catalog goes, so the next open rebuilds the pages from the log rather than
+// trust pages an eviction of that commit may have written.
+store_damage :: proc(store: ^Store, cause: Error) {
+	if store.damaged.kind != .None do return
+	store.damaged = errf(.Io, "the database must be reopened: a commit failed halfway (%s)", cause.message)
+	if !store.persistent do return
+	path := store_catalog_path(store)
+	defer delete(path)
+	if log_file_exists(store.vfs, path) {
+		fs := log_vfs_or_os(store.vfs)
+		error_drop(fs.ops.remove(fs, path))
+	}
+}
+
+// store_refusal is the error a damaged store answers every statement with.
+store_refusal :: proc(store: ^Store) -> Error {
+	if store == nil || store.damaged.kind == .None do return ERROR_NONE
+	return errf(store.damaged.kind, "%s", store.damaged.message)
 }
 
 // store_note_error records a failure the store reports instead of returning: a
@@ -2086,6 +2116,7 @@ store_commit_prepared :: proc(store: ^Store, prepared: []^Prepared_Tx) -> (int, 
 		store.apply_seq = seq
 		for op in group.ops {
 			if apply_err := store_apply(store, op); apply_err.kind != .None {
+				store_damage(store, apply_err)
 				// The commit already failed; a rewind that fails too is not the error to report.
 				error_drop(log_rewind(&store.log, log_before))
 				store.log.durability = saved_durability

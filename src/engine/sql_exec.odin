@@ -101,15 +101,19 @@ sql_execute_priced :: proc(store: ^Store, sql: string, params: []Value) -> (Sql_
 sql_run_statement :: proc(store: ^Store, statement: Statement, params: []Value) -> (Sql_Result, Error) {
 	// A statement runs once the ballast is held again (D23).
 	if !oom_settle() do return {}, oom_error()
+	if refusal := store_refusal(store); refusal.kind != .None do return {}, refusal
+	page_failure_clear()
 	previous := aggregate_scope_enter(store)
 	defer aggregate_scope_leave(previous)
 	switch stmt in statement {
 	case Select_Stmt, With_Stmt:
 		tx := tx_begin_read(store)
 		result, exec_err := sql_run_query(tx, stmt, params)
-		if exec_err.kind == .None && oom_short() {
-			sql_result_destroy(&result)
-			exec_err = oom_error()
+		if exec_err.kind == .None {
+			if short := statement_shortfall(); short.kind != .None {
+				sql_result_destroy(&result)
+				exec_err = short
+			}
 		}
 		tx_end(tx)
 		result.commit_seq = store.commit_seq
@@ -127,16 +131,22 @@ sql_run_statement :: proc(store: ^Store, statement: Statement, params: []Value) 
 		store.statement_tx, store.statement_thread = tx, sync.current_thread_id()
 		result, exec_err := sql_exec_mutation(tx, stmt, params)
 		store.statement_tx, store.statement_thread = outer_tx, outer_thread
-		// A statement that needed the ballast is taken back whole (D23).
-		if exec_err.kind == .None && oom_short() {
-			sql_result_destroy(&result)
-			exec_err = oom_error()
+		// A statement that needed the ballast (D23), or that could not read a
+		// page (D8), is taken back whole.
+		taken_back := false
+		if exec_err.kind == .None {
+			if short := statement_shortfall(); short.kind != .None {
+				sql_result_destroy(&result)
+				exec_err = short
+				taken_back = true
+			}
 		}
+		if exec_err.kind == .Out_Of_Memory do taken_back = true
 		if fail_mode do tx_statement_end(tx, mark, false)
 		if exec_err.kind != .None {
 			// A constraint's ON CONFLICT FAIL keeps the rows before the failing
 			// one, as an OR FAIL does.
-			if (fail_mode || tx.keep_partial) && exec_err.kind != .Out_Of_Memory {
+			if (fail_mode || tx.keep_partial) && !taken_back {
 				// The rows before the failing one stay, as SQLite keeps them.
 				if commit_err := tx_commit(tx); commit_err.kind != .None {
 					error_free(&exec_err)
@@ -341,19 +351,33 @@ conflict_skippable :: proc(kind: Error_Kind) -> bool {
 	return false
 }
 
+// statement_shortfall is what a statement that did its work without an error
+// still fails with: it ran out of memory (D23), or a page it read could not be
+// loaded by a reader with no error to hand back (D8).
+@(private)
+statement_shortfall :: proc() -> Error {
+	if oom_short() do return oom_error()
+	return page_failure_take()
+}
+
 // sql_run_statement_in_tx dispatches an already parsed statement inside a
 // transaction.
 @(private)
 sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sql_Result, Error) {
 	if !oom_settle() do return {}, oom_error()
+	if refusal := store_refusal(tx.store); refusal.kind != .None do return {}, refusal
+	// A statement a trigger runs leaves the failure to the one that fired it.
+	if tx.trigger_depth == 0 do page_failure_clear()
 	previous := aggregate_scope_enter(tx.store)
 	defer aggregate_scope_leave(previous)
 	switch stmt in statement {
 	case Select_Stmt, With_Stmt:
 		result, err := sql_run_query(tx, stmt, params)
-		if err.kind == .None && oom_short() {
-			sql_result_destroy(&result)
-			err = oom_error()
+		if err.kind == .None {
+			if short := statement_shortfall(); short.kind != .None {
+				sql_result_destroy(&result)
+				err = short
+			}
 		}
 		return result, err
 	case Insert_Stmt, Update_Stmt, Delete_Stmt, Merge_Stmt, Copy_Stmt:
@@ -366,13 +390,16 @@ sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value) 
 		outer := tx.trigger_depth == 0
 		if outer do tx.keep_partial = false
 		result, err := sql_exec_mutation(tx, stmt, params)
-		if err.kind == .None && oom_short() {
-			sql_result_destroy(&result)
-			err = oom_error()
+		taken_back := err.kind == .Out_Of_Memory
+		if err.kind == .None {
+			if short := statement_shortfall(); short.kind != .None {
+				sql_result_destroy(&result)
+				err = short
+				taken_back = true
+			}
 		}
 		keeps := err.kind != .None && insert_without_statement_journal(tx, stmt)
-		out_of_memory := err.kind == .Out_Of_Memory
-		tx_statement_end(tx, mark, out_of_memory || (err.kind != .None && !statement_fails_partially(stmt) && !tx.keep_partial && !keeps))
+		tx_statement_end(tx, mark, taken_back || (err.kind != .None && !statement_fails_partially(stmt) && !tx.keep_partial && !keeps))
 		if outer do tx.keep_partial = false
 		// OR ROLLBACK: a broken constraint ends the whole transaction, which the
 		// connection that holds it rolls back (embed_run).

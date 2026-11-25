@@ -1077,12 +1077,7 @@ table_index_map_free :: proc(t: ^Table, index: int) {
 table_index_put :: proc(t: ^Table, index: int, key: string, id: Row_Id) -> Error {
 	if t.indexes[index].pages != nil {
 		if put_err := ordered_put(t.indexes[index].pages, key, u64(id)); put_err.kind != .None {
-			return errf(
-				put_err.kind,
-				"cannot grow index %s: %s",
-				t.indexes[index].schema.name,
-				put_err.message,
-			)
+			return error_wrap(put_err, put_err.kind, "cannot grow index %s: %s", t.indexes[index].schema.name, put_err.message)
 		}
 		return ERROR_NONE
 	}
@@ -1682,11 +1677,11 @@ table_delete :: proc(t: ^Table, id: Row_Id) -> bool {
 
 table_truncate :: proc(t: ^Table) {
 	if t.paged != nil {
-		_ = page_rows_truncate(t.paged)
+		error_drop(page_rows_truncate(t.paged))
 		t.next_int_key = 0
 		for _, i in t.indexes {
 			if t.indexes[i].pages != nil {
-				_ = ordered_clear(t.indexes[i].pages)
+				error_drop(ordered_clear(t.indexes[i].pages))
 			} else {
 				index_tree_free(&t.indexes[i])
 				index_tree_init(&t.indexes[i])
@@ -1909,7 +1904,8 @@ table_collect :: proc(
 ) {
 	if t.paged != nil {
 		ctx := Paged_Collect_Ctx{out = out}
-		_ = page_rows_scan(t.paged, alloc, &ctx, paged_collect_visit)
+		// A page it cannot load is the statement's failure (page_note_failure).
+		error_drop(page_rows_scan(t.paged, alloc, &ctx, paged_collect_visit))
 		rows_sort_by_id(out[:])
 		return
 	}
@@ -1930,7 +1926,7 @@ table_max_int :: proc(t: ^Table, column: int) -> i64 {
 	best := i64(0)
 	if t.paged != nil {
 		ctx := Max_Column_Ctx{column = column}
-		_ = page_rows_each(t.paged, &ctx, max_column_visit)
+		error_drop(page_rows_each(t.paged, &ctx, max_column_visit))
 		return ctx.best
 	}
 	for row in t.rows {

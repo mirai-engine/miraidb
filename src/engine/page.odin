@@ -303,8 +303,58 @@ page_file_magic_ok :: proc(data: []u8) -> bool {
 	return get_u32_le(data[20:24]) == PAGE_MAGIC && get_u32_le(data[24:28]) == PAGE_VERSION && get_u32_le(data[28:32]) == u32(PAGE_SIZE)
 }
 
+// A test's process killed in the middle of writing pages: from the nth page
+// write of this thread on, every one fails, as nothing more reaches the disk
+// after a kill (D8).
+@(private = "file", thread_local)
+page_fail_from: int
+@(private = "file", thread_local)
+page_write_calls: int
+
+// The first page this thread's statement could not load. Some readers of a
+// paged table have no error to hand back (a collect, a row lookup) and used to
+// read the failure as a shorter table, so a DELETE that could not read its pages
+// deleted nothing and reported success; the statement answers it instead (D8).
+@(private = "file", thread_local)
+page_failure: Error
+
+// page_note_failure keeps the first failure of the statement; err stays the
+// caller's.
+page_note_failure :: proc(err: Error) {
+	if page_failure.kind != .None do return
+	page_failure = errf(err.kind, "%s", err.message)
+}
+
+// page_failure_take hands the statement its page failure, if any, and forgets it.
+page_failure_take :: proc() -> Error {
+	err := page_failure
+	page_failure = ERROR_NONE
+	return err
+}
+
+// page_failure_clear forgets a failure no statement answered.
+page_failure_clear :: proc() {
+	error_free(&page_failure)
+}
+
+// page_fault_arm makes this thread's nth page write and every later one fail;
+// zero disarms. Tests only.
+page_fault_arm :: proc(nth: int) {
+	page_fail_from = nth
+	page_write_calls = 0
+}
+
+// page_fault_calls is how many page writes ran since page_fault_arm.
+page_fault_calls :: proc() -> int {
+	return page_write_calls
+}
+
 @(private)
 page_write_raw :: proc(pf: ^Page_File, id: Page_Id, data: []u8) -> Error {
+	if page_fail_from > 0 {
+		page_write_calls += 1
+		if page_write_calls >= page_fail_from do return errf(.Io, "injected fault: page write %d", page_write_calls)
+	}
 	seek, seek_err := pf.vfs.ops.seek(pf.file, i64(id) * PAGE_SIZE)
 	if seek_err.kind != .None do return seek_err
 	if seek != i64(id) * PAGE_SIZE {
@@ -340,6 +390,7 @@ page_read_raw :: proc(pf: ^Page_File, id: Page_Id, into: []u8) -> Error {
 // sequence. The order matters: a header that names a sequence is a promise that
 // every page of that sequence is on disk.
 page_flush :: proc(pf: ^Page_File, applied_seq: u64) -> Error {
+	wrote := false
 	for &frame in pf.frames {
 		if !frame.valid || !frame.dirty do continue
 		if frame.id == 0 do continue
@@ -348,6 +399,13 @@ page_flush :: proc(pf: ^Page_File, applied_seq: u64) -> Error {
 			return write_err
 		}
 		frame.dirty = false
+		wrote = true
+	}
+	// The pages are durable before the header that promises them: a system that
+	// wrote the header first and then died left a header naming pages that never
+	// landed, and the next open trusted them (D8).
+	if wrote {
+		if sync_err := pf.vfs.ops.sync(pf.file); sync_err.kind != .None do return sync_err
 	}
 	if pf.applied_seq != applied_seq do pf.applied_seq = applied_seq
 	header := pf.frames[0].data
@@ -387,7 +445,10 @@ page_load :: proc(pf: ^Page_File, id: Page_Id) -> (^Page_Frame, Error) {
 	}
 	if slot < 0 {
 		evicted, evict_err := page_evict(pf)
-		if evict_err.kind != .None do return nil, evict_err
+		if evict_err.kind != .None {
+			page_note_failure(evict_err)
+			return nil, evict_err
+		}
 		slot = evicted
 	}
 	frame := &pf.frames[slot]
@@ -402,13 +463,16 @@ page_load :: proc(pf: ^Page_File, id: Page_Id) -> (^Page_Frame, Error) {
 		frame.valid = false
 		delete_key(&pf.frame_map, id)
 		pf.pins_live -= 1
+		page_note_failure(read_err)
 		return nil, read_err
 	}
 	if !page_valid(frame.data) {
 		frame.valid = false
 		delete_key(&pf.frame_map, id)
 		pf.pins_live -= 1
-		return nil, errf(.Corrupt_Log, "page %d of %s fails its checksum", id, pf.path)
+		corrupt := errf(.Corrupt_Log, "page %d of %s fails its checksum", id, pf.path)
+		page_note_failure(corrupt)
+		return nil, corrupt
 	}
 	return frame, ERROR_NONE
 }
@@ -492,7 +556,10 @@ page_frame_new :: proc(pf: ^Page_File, id: Page_Id) -> (^Page_Frame, Error) {
 	}
 	if slot < 0 {
 		evicted, evict_err := page_evict(pf)
-		if evict_err.kind != .None do return nil, evict_err
+		if evict_err.kind != .None {
+			page_note_failure(evict_err)
+			return nil, evict_err
+		}
 		slot = evicted
 	}
 	frame := &pf.frames[slot]

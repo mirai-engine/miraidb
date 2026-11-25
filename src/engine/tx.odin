@@ -2213,6 +2213,10 @@ tx_unregister_unique :: proc(tx: ^Tx, name: string, table: ^Table, values: []Val
 // applied and the transaction is rolled back.
 tx_commit :: proc(tx: ^Tx) -> Error {
 	if tx == nil || !tx.active do return errf(.Transaction_Closed, "transaction is already closed")
+	if refusal := store_refusal(tx.store); refusal.kind != .None {
+		tx_discard(tx)
+		return refusal
+	}
 	// An index the commit builds or fills evaluates its expressions with the
 	// program's functions of this store (index_eval).
 	previous_scope := aggregate_scope_enter(tx.store)
@@ -2299,7 +2303,9 @@ tx_commit :: proc(tx: ^Tx) -> Error {
 	for op in ops {
 		if apply_err := store_apply(tx.store, op); apply_err.kind != .None {
 			// Applying a validated transaction must not fail. If it does, undo
-			// the log record so the file still matches the live state.
+			// the log record so the file still matches the live state, and
+			// refuse the half-applied rows until the database is reopened.
+			store_damage(tx.store, apply_err)
 			rewind_err := log_rewind(&tx.store.log, log_before)
 			tx_discard(tx)
 			if rewind_err.kind != .None {
