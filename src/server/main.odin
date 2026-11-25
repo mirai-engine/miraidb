@@ -16,15 +16,26 @@ import db "../engine"
 USAGE :: `miraidb-server - HTTP front end for a miraidb database
 
 Usage:
-  miraidb-server <database> [--port=8080] [--any] [--allow-host]
+  miraidb-server <database> [--port=8080] [--any] [--allow-host] [--closed]
                             [--password=PASS] [--statement-timeout-ms=N] [--budget=N]
+  miraidb-server <database> --issue-token=IDENTITY [--token-ttl-seconds=N]
+
+A server with credentials is closed: when it has a PostgreSQL password, when its
+database has issued a token, or with --closed, a client that does not prove who
+it is gets nothing but GET /health. An HTTP request carries a bearer token
+("Authorization: Bearer mt_..."), a WebSocket sends it on the upgrade or in an
+AUTH message before anything else, and a PostgreSQL client answers SCRAM. A
+server without credentials accepts every client and says so when it starts.
+
+--issue-token prints a token for IDENTITY (64 hex digits) and exits; the server
+must not be running, since it holds the database.
 
 The PostgreSQL front end authenticates with SCRAM-SHA-256 when --password is
 given (or MIRAIDB_PG_PASSWORD is in the environment): the password never crosses
-the socket, only proofs over a transcript the server salts. Without it the port
-accepts every client, which is what the HTTP front end does too; say so out loud
-when it is reachable from anywhere but this machine. A password on the command
-line is visible to whoever lists the processes: prefer the environment variable.
+the socket, only proofs over a transcript the server salts. A closed server with
+no password refuses PostgreSQL clients, which have no other way to prove who they
+are. A password on the command line is visible to whoever lists the processes:
+prefer the environment variable.
 
 The three statements that reach outside the database are refused to clients
 unless --allow-host is given: ATTACH reads a file path, LOAD EXTENSION runs host
@@ -62,6 +73,9 @@ main :: proc() {
 	statement_timeout_ms := i64(0)
 	budget := u64(0)
 	password := ""
+	closed := false
+	issue_for := ""
+	token_ttl_seconds := i64(0)
 	for arg in os.args[1:] {
 		switch {
 		case strings.has_prefix(arg, "--port="):
@@ -75,6 +89,17 @@ main :: proc() {
 			any_interface = true
 		case arg == "--allow-host":
 			allow_host = true
+		case arg == "--closed":
+			closed = true
+		case strings.has_prefix(arg, "--issue-token="):
+			issue_for = arg[len("--issue-token="):]
+		case strings.has_prefix(arg, "--token-ttl-seconds="):
+			parsed, ok := strconv.parse_int(arg[len("--token-ttl-seconds="):])
+			if !ok || parsed < 0 {
+				fmt.eprintln("miraidb-server: --token-ttl-seconds needs a number of seconds")
+				os.exit(2)
+			}
+			token_ttl_seconds = i64(parsed)
 		case strings.has_prefix(arg, "--password="):
 			password = arg[len("--password="):]
 		case strings.has_prefix(arg, "--statement-timeout-ms="):
@@ -108,6 +133,9 @@ main :: proc() {
 		os.exit(1)
 	}
 	defer db.store_close(store)
+	if len(issue_for) > 0 {
+		os.exit(issue_token(store, issue_for, token_ttl_seconds))
+	}
 	// The default refuses the statements that reach outside the database; a
 	// deployment that trusts every client it serves says so on the command line.
 	db.store_set_host_access(store, allow_host)
@@ -120,6 +148,17 @@ main :: proc() {
 		server.pg_password = os.get_env("MIRAIDB_PG_PASSWORD", context.allocator)
 	}
 	server.timeout_us = statement_timeout_ms * 1000
+	// Credentials close the server: a client that does not prove who it is gets
+	// refused. Without them every client may do everything, which is worth
+	// saying where the operator reads.
+	server.closed = closed || len(server.pg_password) > 0 || db.store_has_tokens(store, time.now()._nsec / 1000)
+	if !server.closed {
+		reach := any_interface ? "every network this machine is on" : "this machine"
+		fmt.eprintfln(
+			"miraidb-server: warning: no password and no tokens: every client on %s may read and write everything (give --password, issue a token with --issue-token, or pass --closed)",
+			reach,
+		)
+	}
 	// NOTIFY reaches a listener through the connection the server registered under
 	// the owner the statement carried.
 	host.store.on_notify = server_deliver_notification
@@ -141,7 +180,7 @@ main :: proc() {
 		os.exit(1)
 	}
 	defer net.close(listener)
-	fmt.printfln("miraidb-server listening on port %d (database %s)", port, path)
+	fmt.printfln("miraidb-server listening on port %d (database %s, %s)", port, path, server.closed ? "closed" : "open")
 	client_counter := u64(0)
 	for {
 		client, _, accept_err := net.accept_tcp(listener)
@@ -170,6 +209,9 @@ Server :: struct {
 	// pg_password is what the PostgreSQL front end verifies with SCRAM; empty
 	// means it asks for nothing.
 	pg_password: string,
+	// closed refuses a client that has not proved who it is (a token or the
+	// password): set when the server has credentials, or by --closed.
+	closed:      bool,
 	// timeout_us is how long one statement may run before the watchdog cancels
 	// it; zero leaves it unbounded. The three fields below are the watchdog's
 	// view of the statement in flight.
@@ -338,23 +380,28 @@ serve :: proc(connection: ^Connection) {
 		}
 		return
 	}
+	// A bearer token decides the identity the request (or the WebSocket) runs
+	// under. A token that does not check out is refused rather than ignored: the
+	// client asked to be someone and is not.
+	identity: db.Identity
+	proved := false
+	if token, has_token := db.http_bearer_token(buffer[:n]); has_token {
+		statement_begin(connection.port)
+		identity, proved = db.host_authenticate(host, token)
+		statement_end(connection.port)
+		if !proved {
+			refuse_unauthorized(connection, "invalid or expired token")
+			return
+		}
+	}
 	if db.ws_is_upgrade(buffer[:n]) {
 		if handshake, ok := db.ws_handshake(buffer[:n]); ok {
 			defer delete(handshake)
 			_ = send(connection, handshake)
-			serve_frames(connection)
+			if proved do db.host_client_set_identity(host, owner, identity)
+			serve_frames(connection, proved)
 			return
 		}
-	}
-	// The token decides the identity the request runs under, and the store
-	// carries it while the statement executes: both happen inside the statement
-	// lock so two clients never see each other's identity.
-	if token, has_token := db.http_bearer_token(buffer[:n]); has_token {
-		statement_begin(connection.port)
-		if identity, valid := db.host_authenticate(host, token); valid {
-			db.store_set_identity(host.store, identity)
-		}
-		statement_end(connection.port)
 	}
 	// A request may arrive in more than one segment. Reading once and parsing
 	// would reject a body that has not landed yet, so the loop keeps reading
@@ -388,7 +435,15 @@ serve :: proc(connection: ^Connection) {
 		n += read
 	}
 	_ = used
+	if connection.port.closed && !proved && !(request.method == "GET" && request.path == "/health") {
+		db.http_request_destroy(&request)
+		refuse_unauthorized(connection, "this server needs a bearer token")
+		return
+	}
 	statement_begin(connection.port)
+	// The request runs as its token's identity or as nobody, never as the
+	// identity the previous request left on the store.
+	db.store_set_identity(host.store, identity)
 	response := db.http_handle(host, request)
 	db.http_request_destroy(&request)
 	statement_end(connection.port)
@@ -510,6 +565,12 @@ serve_postgres :: proc(connection: ^Connection) {
 	auth := Pg_Auth.Ready
 	scram: db.Pg_Scram
 	defer db.pg_scram_destroy(&scram)
+	if connection.port.closed && len(connection.port.pg_password) == 0 {
+		refusal := db.pg_error_response("this server needs credentials, and a PostgreSQL client proves itself with the password the server was started with (--password)", "28000")
+		_ = send(connection, refusal)
+		delete(refusal)
+		return
+	}
 	if len(connection.port.pg_password) > 0 {
 		scram = db.pg_scram_start(connection.port.pg_password)
 		offer := db.pg_authentication_sasl()
@@ -571,6 +632,9 @@ serve_postgres :: proc(connection: ^Connection) {
 			// The statement runs on behalf of this connection: LISTEN and NOTIFY
 			// read the identity from the store while the statement lock is held.
 			host.store.session_owner = connection.owner
+			// A PostgreSQL session proves the server's password, not an identity:
+			// it runs as nobody, never as whoever ran the previous statement.
+			db.store_set_identity(host.store, {})
 			response, close := db.pg_handle_session_message(host, session, pending[:total])
 			holding = db.pg_session_in_transaction(session)
 			if holding {
@@ -610,10 +674,13 @@ policy_send :: proc(connection: ^Connection, bytes: []u8) -> bool {
 }
 
 @(private)
-serve_frames :: proc(connection: ^Connection) {
+serve_frames :: proc(connection: ^Connection, proved: bool) {
 	host := connection.port.host
 	client := connection.socket
 	owner := connection.owner
+	// On a closed server a WebSocket that did not bring a token on its upgrade
+	// sends AUTH first; anything else is answered with an error until it does.
+	proved := proved
 	buffer: [64 * 1024]u8
 	// A read may carry several frames, or the first half of one: the loop keeps
 	// the bytes it has not used and reads again until a whole frame is here.
@@ -640,9 +707,16 @@ serve_frames :: proc(connection: ^Connection) {
 			return
 		}
 		if opcode == 1 || opcode == 2 {
-			statement_begin(connection.port)
-			response := db.wire_request_owned(host, payload, owner)
-			statement_end(connection.port)
+			response: []u8
+			is_auth := len(payload) >= 4 && u32(payload[0]) | u32(payload[1]) << 8 | u32(payload[2]) << 16 | u32(payload[3]) << 24 == db.WIRE_AUTH
+			if connection.port.closed && !proved && !is_auth {
+				response = db.wire_encode_error(db.errf(.Permission_Denied, "this server needs a token: send AUTH first"))
+			} else {
+				statement_begin(connection.port)
+				response = db.wire_request_owned(host, payload, owner)
+				statement_end(connection.port)
+				if is_auth && len(response) >= 4 && response[0] == u8(db.WIRE_RESULT) do proved = true
+			}
 			framed := db.ws_frame(response)
 			sent := policy_send(connection, framed)
 			delete(framed)
@@ -661,6 +735,35 @@ serve_frames :: proc(connection: ^Connection) {
 			held = n
 		}
 	}
+}
+
+// refuse_unauthorized answers 401 and closes: the client did not prove who it is.
+@(private)
+refuse_unauthorized :: proc(connection: ^Connection, reason: string) {
+	body := text_bytes(reason)
+	defer delete(body)
+	response := db.http_response(401, "text/plain", body)
+	defer delete(response)
+	_ = send(connection, response)
+}
+
+// issue_token prints a token for `identity_hex` and answers the exit code: the
+// operator hands it to a client, which sends it as its bearer token.
+@(private)
+issue_token :: proc(store: ^db.Store, identity_hex: string, ttl_seconds: i64) -> int {
+	identity, ok := db.identity_from_hex(identity_hex)
+	if !ok {
+		fmt.eprintln("miraidb-server: --issue-token needs an identity of 64 hex digits")
+		return 2
+	}
+	token, err := db.store_issue_token(store, identity, ttl_seconds * 1_000_000, time.now()._nsec / 1000)
+	if !db.error_ok(err) {
+		fmt.eprintfln("miraidb-server: %s: %s", db.error_kind_name(err.kind), err.message)
+		return 1
+	}
+	defer delete(token)
+	fmt.println(token)
+	return 0
 }
 
 @(private)

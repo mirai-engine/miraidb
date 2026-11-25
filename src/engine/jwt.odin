@@ -112,7 +112,6 @@ jwt_number_claim :: proc(claims: string, name: string) -> (i64, bool) {
 	return value, digits > 0
 }
 
-@(private)
 identity_from_hex :: proc(text: string) -> (Identity, bool) {
 	if len(text) != 64 do return Identity{}, false
 	bytes, ok := token_unhex(text)

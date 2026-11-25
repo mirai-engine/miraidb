@@ -35,6 +35,7 @@ __pycache__/
 /_br/
 /_cw/
 /_broker_tmp/
+/_auth_tmp/
 
 # package.py output
 /dist/

@@ -201,6 +201,24 @@ store_authenticate :: proc(store: ^Store, token: string, now_us: i64) -> (Identi
 	return value_identity_of(row[0]), true
 }
 
+// store_has_tokens reports whether the database issued a token that has not
+// expired: a server whose database has one refuses anonymous clients.
+store_has_tokens :: proc(store: ^Store, now_us: i64) -> bool {
+	if _, exists := store.tables[TOKEN_TABLE]; !exists do return false
+	catalog_scope()
+	result, err := sql_execute_params(
+		store,
+		"SELECT 1 FROM _token WHERE expires_us = 0 OR expires_us >= ? LIMIT 1",
+		[]Value{value_int(now_us)},
+	)
+	if err.kind != .None {
+		error_free(&err)
+		return false
+	}
+	defer sql_result_destroy(&result)
+	return len(result.rows) > 0
+}
+
 // host_revoke_token drops one token. It reports whether a row was removed.
 host_revoke_token :: proc(host: ^Host, token: string) -> bool {
 	catalog_scope()

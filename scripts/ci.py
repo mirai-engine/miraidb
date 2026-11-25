@@ -193,6 +193,12 @@ def build_gates(args: argparse.Namespace) -> list[Gate]:
             gates.append(
                 Gate("broker (two processes)", [args.windows_python, "scripts/broker_smoke.py"])
             )
+            # Who a client is, on HTTP, WebSocket and PostgreSQL: a server with
+            # credentials refuses one that does not prove it, and no client reaches
+            # the key that signs tokens or the grants.
+            gates.append(
+                Gate("auth (three fronts)", [args.windows_python, "scripts/auth_smoke.py"])
+            )
             # COPY moves rows through the wire's own messages; the gate speaks
             # them, so it needs no driver installed.
             gates.append(

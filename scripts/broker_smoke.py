@@ -155,12 +155,13 @@ def send_pg_message(sock, kind: bytes, body: bytes) -> None:
     sock.sendall(kind + struct.pack("!i", len(body) + 4) + body)
 
 
-def scram_login(port: int, password: str, user: str = "root") -> bytes:
+def scram_login(port: int, password: str, user: str = "root", keep: bool = False):
     """A SCRAM-SHA-256 client in the standard library, so the gate needs no driver.
 
     Answers the SASLInitialResponse, checks the server's signature, and returns
-    the server-final text. Raises when the server refuses or proves a different
-    password than the one this function was given.
+    the server-final text (with the socket, still open, when `keep` is set).
+    Raises when the server refuses or proves a different password than the one
+    this function was given.
     """
     import base64
     import hashlib
@@ -218,6 +219,9 @@ def scram_login(port: int, password: str, user: str = "root") -> bytes:
     if final[9:].decode() != "v=" + expected:
         sock.close()
         raise AssertionError("the server proved a different password")
+    if keep:
+        return final[9:], sock
+    sock.close()
     return final[9:]
 
 

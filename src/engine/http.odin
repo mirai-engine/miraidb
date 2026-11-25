@@ -126,6 +126,8 @@ http_response :: proc(status: int, content_type: string, body: []u8) -> []u8 {
 	case 200:
 	case 400:
 		reason = "Bad Request"
+	case 401:
+		reason = "Unauthorized"
 	case 404:
 		reason = "Not Found"
 	case 405:
