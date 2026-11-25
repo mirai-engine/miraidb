@@ -1654,6 +1654,21 @@ sqlite_strict_type :: proc(declared: string) -> (Column_Type, bool) {
 // INTEGER column included, in SQLite's words.
 value_coerce_into :: proc(v: Value, schema: ^Table_Schema, index: int) -> (Value, Error) {
 	column := &schema.columns[index]
+	// A value already of the column's kind, in its width, is what the whole
+	// conversion below gives back, its subtype cleared: the common write skips
+	// three calls and the errors they return (R2).
+	#partial switch column.type.kind {
+	case .Uint:
+		if v.kind == .Uint && column.type.width != 16 && u64_fits_width(v.u, column.type.width) do return value_uint(v.u), ERROR_NONE
+	case .Int:
+		if v.kind == .Int && column.type.width != 16 && i64_fits_width(v.i, column.type.width) do return value_int(v.i), ERROR_NONE
+	case .String:
+		if v.kind == .String {
+			out := v
+			out.subtype = 0
+			return out, ERROR_NONE
+		}
+	}
 	out, err := value_coerce(v, column.type)
 	// A stored value has no subtype, as in SQLite.
 	out.subtype = 0
