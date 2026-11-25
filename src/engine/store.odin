@@ -1529,6 +1529,10 @@ store_table_writable :: proc(store: ^Store, name: string) -> (^Table, Error) {
 	if sync.atomic_load(&table.refs) == 1 do return table, ERROR_NONE
 	clone := table_cow_clone(table)
 	if clone == nil do return table, ERROR_NONE
+	// The copy stamps the versions this commit supersedes: without the commit's
+	// sequence it stamped them 0, a value no AS OF could see replaced and no
+	// prune could drop (D3).
+	clone.apply_seq = store.apply_seq
 	// The map key lives in the old table's arena, so the entry is replaced by the
 	// clone's own key.
 	map_erase(&store.tables, name)
