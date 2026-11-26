@@ -15,7 +15,18 @@ normative description of the invariants; the code follows it.
 | `store.odin` | Table registry, operation encoding, apply and replay |
 | `tx.odin` | Transactions: staging, read-your-writes, commit and rollback |
 | `sql_lexer.odin`, `sql_ast.odin`, `sql_parser.odin` | SQL front end |
-| `sql_exec.odin` | Statement execution: SELECT planning, DML, DDL |
+| `resolve.odin` | The names a statement uses, checked against what the transaction sees |
+| `plan.odin` | Join order and access paths |
+| `sql_exec.odin` | Entry points, the statement cache, dispatch, prepared statements, DESCRIBE, SET, SHOW, EXPLAIN |
+| `sql_query.odin` | The evaluation context, queries with CTEs, derived and lateral tables, compound and recursive queries, natural joins |
+| `sql_select.odin` | `SELECT`: the streamed scan, then access, joins, WHERE, grouping, ordering and limits |
+| `sql_window.odin` | Window functions |
+| `sql_eval.odin` | Expressions and operators, collations and affinity |
+| `sql_functions.odin` | Scalar and aggregate functions |
+| `sql_dml.odin` | `INSERT`, `MERGE`, `UPDATE`, `DELETE`, RETURNING, conflicts, defaults, CHECK and generated columns |
+| `sql_ddl.odin` | `CREATE`/`ALTER`/`DROP` of tables, types and indexes |
+| `sql_access.odin` | Reading through an index: rowid, full-text and index candidates, ranges, join probes |
+| `resolve_counters.odin` | What a run still resolves (names, parses, plans), counted per thread for tests |
 | `host.odin` | Reducers and subscriptions |
 
 ## Data model
