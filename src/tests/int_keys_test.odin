@@ -33,7 +33,8 @@ ik_taken :: proc(t: ^testing.T, conn: ^db.Embed_Conn, sql: string, loc := #calle
 
 @(private = "file")
 ik_count :: proc(t: ^testing.T, conn: ^db.Embed_Conn, sql: string, want: i64, loc := #caller_location) {
-	testing.expectf(t, scalar(t, conn.store, sql).i == want, "%s: want %d", sql, want, loc = loc)
+	got := scalar(t, conn.store, sql)
+	testing.expectf(t, got.i == want, "%s: got %v, want %d", sql, got, want, loc = loc)
 }
 
 @(test)

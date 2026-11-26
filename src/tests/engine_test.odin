@@ -9512,12 +9512,13 @@ test_recursive_cte :: proc(t: ^testing.T) {
 	defer db.sql_result_destroy(&factorial)
 	testing.expect_value(t, factorial.rows[0][0].i, i64(120))
 	// A query that never stops fails at the step quota instead of running away.
-	previous := db.recursion_limit
-	db.recursion_limit = 25
+	// The limit is this store's: lowered for it, it is not lowered for the
+	// recursive queries other tests run at the same time.
+	store.recursion_limit = 25
 	dropped_result_9160, runaway := db.sql_execute(store, "WITH RECURSIVE r(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM r) SELECT count(*) FROM r")
 	defer db.error_free(&runaway)
 	defer db.sql_result_destroy(&dropped_result_9160)
-	db.recursion_limit = previous
+	store.recursion_limit = 0
 	testing.expect_value(t, runaway.kind, db.Error_Kind.Cancelled)
 }
 

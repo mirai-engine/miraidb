@@ -2059,9 +2059,11 @@ sql_exec_compound :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_R
 	return result, ERROR_NONE
 }
 
-// recursion_limit bounds WITH RECURSIVE: a query that never stops adding rows
-// fails instead of running forever. It is a variable so tests can lower it.
-recursion_limit: int = 10000
+// RECURSION_LIMIT bounds WITH RECURSIVE: a query that never stops adding rows
+// fails instead of running forever. A store can lower it (Store.recursion_limit).
+// It was a variable of the package that a test lowered to 25 for a moment, and
+// a recursive query of another test on another thread failed at 25 steps.
+RECURSION_LIMIT :: 10000
 
 @(private)
 recursive_insert :: proc(table: ^Table, seen: ^map[string]bool, values: []Value, next_id: ^Row_Id) -> (bool, Error) {
@@ -2122,6 +2124,7 @@ tx_materialize_recursive_cte :: proc(tx: ^Tx, cte: Cte, params: []Value) -> (^Ta
 	}
 
 	steps := 0
+	recursion_limit := tx.store != nil && tx.store.recursion_limit > 0 ? tx.store.recursion_limit : RECURSION_LIMIT
 	for steps < recursion_limit {
 		term := parts[0].select_stmt
 		term.compound = nil

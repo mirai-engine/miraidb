@@ -66,6 +66,9 @@ Cached_Expression :: struct {
 }
 
 Store :: struct {
+	// recursion_limit, when set, lowers the steps a WITH RECURSIVE may take
+	// below RECURSION_LIMIT for this store alone.
+	recursion_limit: int,
 	// host is the process that owns this store, when there is one. It lets a
 	// statement reach the module registry (LOAD EXTENSION); a store used without a
 	// host simply records the catalog row.
