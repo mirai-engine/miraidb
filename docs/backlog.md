@@ -150,6 +150,16 @@ and dropped index.
 What is left is the copy itself: 4 MB of rows and 5.6 MB of nodes at 50 000
 rows, most of it first-touch page faults of new memory, and the walk.
 
+The integer keys a UNIQUE index files beside its tree (R2) were an Odin map,
+which seeds its hashes with the address of its cells: the copy filed every key
+again, 10-48 ms of the commit, and took a 50 000-row commit with a reader open
+to 22-60 ms. They are an open-addressed table of their own now (`Int_Keys`,
+`src/engine/int_keys.odin`), where a key's slot depends on the key alone, so
+the copy is one copy of the slots: the commit is 14 ms again (5.8-6.0 ms over
+20 000 rows), and the parity inserts with a unique index are 5-8% faster.
+`test_integer_keys_table_answers_as_a_map` runs the table against a map, and
+`test_a_copied_key_map_answers_as_its_original` a copy against its original.
+
 **Done when.** A reader and the writer share what the commit did not change
 (persistent index nodes and a row slice copied by chunk, or versions read in
 place under a reader count), so a commit costs the rows it writes whatever the
