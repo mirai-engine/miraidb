@@ -147,6 +147,9 @@ Tx :: struct {
 	insert_name:         string,
 	insert_table:        ^Table,
 	insert_writes:       ^Table_Writes,
+	// insert_committed is the committed table of that name a unique key may
+	// collide with: nil when there is none or this transaction dropped it.
+	insert_committed:    ^Table,
 	// explicit_row_id is the rowid an INSERT names (`INSERT INTO t (rowid, x)`)
 	// for the next row it stores, when has_explicit_row_id is set.
 	explicit_row_id:     Row_Id,
@@ -516,6 +519,7 @@ tx_forget_catalog_cache :: proc(tx: ^Tx) {
 	tx.insert_name = ""
 	tx.insert_table = nil
 	tx.insert_writes = nil
+	tx.insert_committed = nil
 }
 
 // TX_ARENA_POOL is how many emptied arenas a store keeps: one per transaction
@@ -1572,12 +1576,14 @@ tx_insert_row :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error)
 		)
 	}
 	writes := cached ? tx.insert_writes : tx_writes(tx, name, table)
+	committed := cached ? tx.insert_committed : tx_unique_committed(tx, name)
 	if !cached && len(tx.cte_tables) == 0 {
 		// The name may live in the caller's statement buffer; the arena copy
 		// outlives it.
 		tx.insert_name = strings.clone(name, tx.alloc)
 		tx.insert_table = table
 		tx.insert_writes = writes
+		tx.insert_committed = committed
 	}
 	id := Row_Id(writes.next_row_id)
 	if tx.has_explicit_row_id {
@@ -1653,7 +1659,8 @@ tx_insert_row :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error)
 		return 0, fk_err
 	}
 	keys := make([dynamic]Staged_Key, 0, 2, tx.alloc)
-	if err := tx_check_unique(tx, name, table, row_values, INVALID_ROW_ID, &keys); err.kind != .None {
+	unique := Unique_Context{writes = writes, committed = committed}
+	if err := tx_check_unique(tx, name, table, row_values, INVALID_ROW_ID, &keys, &unique); err.kind != .None {
 		return 0, err
 	}
 	// With no trigger table, nothing runs between the check and the registration,
@@ -1682,7 +1689,7 @@ tx_insert_row :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error)
 	if has_triggers {
 		tx_register_unique(tx, name, table, row_values, id)
 	} else {
-		tx_register_keys(tx, name, keys[:], id)
+		tx_register_keys(tx, writes, keys[:], id)
 	}
 	if trigger_err := trigger_fire(
 		tx,
@@ -1738,10 +1745,12 @@ tx_update_row :: proc(tx: ^Tx, name: string, id: Row_Id, values: []Value) -> Err
 		)
 	}
 	writes := cached ? tx.insert_writes : tx_writes(tx, name, table)
+	committed := cached ? tx.insert_committed : tx_unique_committed(tx, name)
 	if !cached && len(tx.cte_tables) == 0 {
 		tx.insert_name = strings.clone(name, tx.alloc)
 		tx.insert_table = table
 		tx.insert_writes = writes
+		tx.insert_committed = committed
 	}
 	previous, exists := tx_get_in(tx, table, writes, id)
 	if !exists {
@@ -1792,7 +1801,8 @@ tx_update_row :: proc(tx: ^Tx, name: string, id: Row_Id, values: []Value) -> Err
 	keys_kept := tx_unique_keys_kept(tx, table, previous.values, row_values)
 	if !keys_kept {
 		tx_unregister_unique(tx, name, table, previous.values, id)
-		if err := tx_check_unique(tx, name, table, row_values, id); err.kind != .None {
+		unique := Unique_Context{writes = writes, committed = committed}
+		if err := tx_check_unique(tx, name, table, row_values, id, nil, &unique); err.kind != .None {
 			tx_register_unique(tx, name, table, previous.values, id)
 			return err
 		}
@@ -2034,8 +2044,17 @@ tx_check_unique :: proc(
 	values: []Value,
 	ignore: Row_Id,
 	keys: ^[dynamic]Staged_Key = nil,
+	resolved: ^Unique_Context = nil,
 ) -> Error {
-	writes := tx.state.writes[name]
+	writes: ^Table_Writes
+	committed: ^Table
+	if resolved != nil {
+		writes = resolved.writes
+		committed = resolved.committed
+	} else {
+		writes = tx.state.writes[name] or_else nil
+		committed = tx_unique_committed(tx, name)
+	}
 	for idx, i in table.indexes {
 		if !idx.unique do continue
 		// An index this transaction dropped holds nothing to its rows: the rows
@@ -2061,7 +2080,7 @@ tx_check_unique :: proc(
 		}
 		// A table this transaction dropped (and perhaps made again) or emptied
 		// with TRUNCATE has no committed rows left to collide with.
-		if committed, ok := tx.store.tables[name]; ok && !tx.state.dropped[name] && (writes == nil || !writes.truncated) {
+		if committed != nil && (writes == nil || !writes.truncated) {
 			if tx_committed_key_taken(tx, committed, i, values, ignore, writes) {
 				return unique_violation(table, i)
 			}
@@ -2296,10 +2315,26 @@ tx_unique_keys_kept :: proc(tx: ^Tx, table: ^Table, old: []Value, new: []Value) 
 
 // tx_register_keys records keys tx_check_unique computed for the same values.
 @(private)
-tx_register_keys :: proc(tx: ^Tx, name: string, keys: []Staged_Key, id: Row_Id) {
-	writes, ok := tx.state.writes[name]
-	if !ok do return
+tx_register_keys :: proc(tx: ^Tx, writes: ^Table_Writes, keys: []Staged_Key, id: Row_Id) {
+	if writes == nil do return
 	for key in keys do staged_set(tx, writes, key, id)
+}
+
+// Unique_Context is what a unique check reads about its table that a caller
+// resolved already: its staged writes and the committed table its keys may
+// collide with (nil when there is none, or the transaction dropped it).
+Unique_Context :: struct {
+	writes:    ^Table_Writes,
+	committed: ^Table,
+}
+
+// tx_unique_committed is the committed table of `name` a unique key may collide
+// with: nil when there is none or this transaction dropped it.
+@(private)
+tx_unique_committed :: proc(tx: ^Tx, name: string) -> ^Table {
+	committed, ok := tx.store.tables[name]
+	if !ok || tx.state.dropped[name] do return nil
+	return committed
 }
 
 @(private)
