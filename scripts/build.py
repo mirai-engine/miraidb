@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """Builds the CLI, the server, the shared libraries and runs the tests.
 
+`--no-tests` builds the binaries only: scripts/ci.py runs the suite as a gate of
+its own (the one that refuses a leak or a bad free), and the build ran it too,
+so every CI compiled and ran all of it twice, three of its eighteen minutes.
+
 Only Odin code ships in the engine; this script is the single auxiliary helper,
 kept in Python so the repository has no shell or make dependency.
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 import shutil
 import subprocess
@@ -22,6 +27,9 @@ def run(*args: str) -> None:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--no-tests", action="store_true", help="build the binaries, not the suite")
+    args = parser.parse_args()
     odin = os.environ.get("ODIN", "odin")
     if shutil.which(odin) is None:
         print(f"odin not found (looked for {odin!r}); set ODIN to its path", file=sys.stderr)
@@ -44,7 +52,8 @@ def main() -> int:
     library = ".dll" if odin.lower().endswith(".exe") or os.name == "nt" else ".so"
     run(odin, "build", "src/capi", "-build-mode:dll", speed, f"-out:bin/miraidb{library}")
     run(odin, "build", "src/sqlite_compat", "-build-mode:dll", speed, f"-out:bin/sqlite3_miraidb{library}")
-    run(odin, "test", "src/tests")
+    if not args.no_tests:
+        run(odin, "test", "src/tests")
     return 0
 
 

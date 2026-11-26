@@ -103,7 +103,8 @@ def build_gates(args: argparse.Namespace) -> list[Gate]:
     cli = binary_path("miraidb", args.odin)
     gates: list[Gate] = []
     if not args.skip_build:
-        gates.append(Gate("build (binaries + suite)", [sys.executable, "scripts/build.py"], odin_env))
+        # The suite is the next gate; the build does not run it a second time.
+        gates.append(Gate("build (binaries)", [sys.executable, "scripts/build.py", "--no-tests"], odin_env))
     gates.append(Gate("unit tests", [args.odin, "test", "src/tests"], refuse=("+++ bad free", "+++ leak"), timeout=900))
     gates.append(
         Gate("conformance (20 cases)", [sys.executable, "scripts/conformance.py", "--bin", cli])
