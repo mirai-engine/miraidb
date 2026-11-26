@@ -35,9 +35,9 @@ that way.
 
 | # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
-| 15 | **D4 — secondary indexes in the mirror** | A table with a secondary index re-encodes the `.sqlite` file per commit. | L | — |
+| 15 | **D4 — secondary indexes in the mirror** | An index of up to 16 pages is built again per commit; a larger or automatic one re-encodes the `.sqlite` file. Next: entries inserted and removed in place. | L | — |
 | 16 | **D36 — partial and expression indexes in plans** | The planner skips them; match a predicate to a partial index's WHERE and an expression to its index. | M | 8 |
-| 32 | **D37 — catching up with a shared file** | Five processes on one file run `multiwrite01` in a median 1.4× SQLite's time; reuse the parsed schema, explain the stalls, time it in CI. | S | — |
+| 32 | **D37 — catching up with a shared file** | Five processes on one file run `multiwrite01` in 1.5–1.7× SQLite's time: the stalls are traced and the locks held as SQLite holds them, mptest's own tables are patched. What is left is the catch-up reading the whole file: read only the pages that changed, time it in CI. | M | — |
 | 33 | **S8 — the rest of the C API** | 233 of SQLite's 309 functions are exported; 76 are left. | M | — |
 | 34 | **D39 — PostgreSQL's surface** | A probe gate for the dialect, the catalog drivers and ORMs read, PostgreSQL's spelling of grants and policies. | L | — |
 | 35 | **D40 — two writers** | A transaction holds the write lock until it commits; stage without it and conflict at commit. | L | — |

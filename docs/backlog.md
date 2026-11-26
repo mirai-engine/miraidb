@@ -37,7 +37,7 @@ Rules for this file:
 | R7 | closed: a reader shares the rows by block, the index trees and the table's arena; a commit with a reader open is 0.19 ms over 50 000 rows, gated at 1 ms by `scripts/bench.py` | — | — |
 | D2 | overlap on an `rtree` table is a scan | node pages and a descent | M |
 | D3 | closed: a retention per store (`PRAGMA history_retention`), applied after each commit; `AS OF` on every table of a join | — | — |
-| D4 | a table with a secondary index re-encodes the `.sqlite` mirror | patch the index b-trees | L |
+| D4 | an index of up to 16 pages is built again per commit; a larger one, or an automatic one, re-encodes the `.sqlite` mirror | insert and remove index entries in place | L |
 | D5 | paged tables: no leaf merge, one version per row | the rest of the page store (with D17) | L |
 | D8 | closed: every write path is walked by a fault (`src/tests/fault_walk_test.odin`), and the reopen holds exactly the commits that reported success | — | — |
 | D10 | decimals are floats, timestamps have no zone | decimal scale, `TIMESTAMPTZ`, streaming blobs | M |
@@ -51,7 +51,7 @@ Rules for this file:
 | D24 | closed: `scripts/mirror_fuzz.py` passes 20 seeds of 400 statements against SQLite, a CI gate | — | — |
 | D34 | the threaded suite is green on Linux and Windows; the sanitizer covers the Windows CLI, not the suite | run the suite sanitized on every platform, in CI | S |
 | D36 | a query never reads a partial or expression index | match a query's predicate to the index | M |
-| D37 | a connection catching up with another process's commit reads the whole file and its schema | reuse the parsed schema, explain the stalls, time `multiwrite01` in CI | S |
+| D37 | a connection catching up with another process's commit reads and hashes the whole file; `multiwrite01` is 1.5–1.7× SQLite | read only the pages that changed, time `multiwrite01` in CI | M |
 | S8 | the `sqlite3_*` facade exports 233 of the 309 functions SQLite declares | the other 76: statements, URIs, pre-update hooks, memory, WAL and snapshots, mutexes | M |
 | D39 | PostgreSQL's surface is not measured in CI; its catalog is `pg_tables` only | a probe gate, the catalog drivers and ORMs read, PostgreSQL's `GRANT` and `CREATE POLICY` | L |
 | D40 | a transaction holds the store's write lock until it commits | two writers that stage at once and conflict only at commit | L |
@@ -328,13 +328,22 @@ read the old value, and no prune dropped it
 
 ## D4 — Secondary indexes in the `.sqlite` mirror
 
-**Now.** The mirror patches the leaf of every changed row (three pages per
-commit at 250k rows), but only table b-trees are patched: a table with a
-secondary index re-encodes the whole file on every commit.
+**Now.** A commit to a table with indexes builds each index again from the
+table's rows into pages of its own, the old ones going to the free list, when
+the index is up to 16 pages (`MIRROR_INDEX_REBUILD_PAGES`); a larger one, an
+automatic `sqlite_autoindex_*` and one the engine keeps as the file had it
+(D24) still re-encode the file. `scripts/mirror_cost.py` writes a 200-row
+table with two indexes (one over two columns, one DESC) beside the 10 000-row
+one and requires no re-encoded commit; `test_a_table_with_an_index_is_patched`
+checks every index with `sqlite_mirror_validate`. The suspected bug of a
+UNIQUE column's automatic index left stale was checked and is not one: such a
+table re-encodes the file, which writes the index.
 
-**Done when.** Index b-trees are patched too (a moved key can jump leaves), and
-`scripts/mirror_cost.py` gains a table with a secondary index whose per-commit
-bytes stay flat as the table grows.
+**Done when.** An index entry is inserted and removed in its b-tree in place
+(leaf and interior pages, splits, keys with overflow chains), so a large index
+costs a commit a few pages; automatic indexes are patched too; and
+`mirror_cost.py` measures a commit to a table whose index is past the rebuild
+bound.
 
 ## D5 — The rest of the page store (with D17)
 
@@ -638,28 +647,41 @@ plans and the differential corpus keeps passing with the indexes present.
 
 ## D37 — Catching up with a shared file
 
-**Now.** A connection that shares a `.sqlite` file with another process reads
-the whole file again before its next statement whenever the change counter
-moved, parses its schema, and hashes again only the tables whose pages changed
-(each table it knows keeps its root, its pages and a sum of each page's bytes);
-it reloads only the tables whose rows changed, and the mirror keeps the place of
-every other table. After a one-row commit by another connection that costs
-1.4 ms, against 3.9 ms when every table was hashed and the mirror built again
-from the file (and 3.0 ms for SQLite's own commit on the same disk): 0.4 ms
-reading the file, 0.4 ms parsing its schema, 0.2 ms hashing, 0.3 ms reloading
-the row and following the mirror. `mptest`'s `multiwrite01` (five processes,
-one file) takes 2.8–4.1 s, median 3.6, against SQLite's 2.4–2.7; a writer holds
-RESERVED for its catch-up and its commit, and every other writer sleeps 10 ms
-in mptest's busy handler for each try that finds it held. Some runs of both
-the old and the new code take 1.5–3.5 s longer than the rest; the cause is not
-known.
+**Now.** `mptest`'s `multiwrite01` (five processes, one file) takes 3.8–4.5 s
+on Windows against SQLite's 2.4–2.8 (1.5–1.7×; it was 4.6–5.3 s, 1.8–2.0×).
+A trace of every lock each process took (2026-11-26) explained the stalls:
 
-**Done when.** A catch-up whose schema hash did not move reuses the schema it
-parsed last, with the root pages read again from `sqlite_master`, and a test
-counts one schema parse per schema change and none for a commit of rows; the
-stalls are explained by a trace of the lock each process waited on; and
-`scripts/sqlite_tools.py` times `multiwrite01` against SQLite over five
-interleaved runs and fails past 1.25× SQLite's median.
+- *Waiting, not working.* Reading, parsing and hashing the file came to
+  ~60 ms a process; waiting for the write lock and for SHARED to ~1.8 s, most
+  of it mptest's busy handler sleeping 10 ms a try. An mptest built to count
+  them called it 770–980 times a run through the facade, 250–290 through
+  SQLite. Parsing the file once less, or reusing its schema, would save ~1%,
+  and was left.
+- *Every coordination step re-encoded the file.* mptest's own tables are
+  written for each task: `task` has two indexes and `counters` no INTEGER
+  PRIMARY KEY, and the mirror patched neither, so 26 commits a process wrote
+  the whole file and the other processes read it all again. Both are patched
+  now: an index of up to 16 pages is built again from the table's rows, and a
+  table without an INTEGER PRIMARY KEY keeps the rowids the file gave its
+  rows (the import, the catch-up and the writer used to number them again
+  from 1). What is left re-encoded is the schema changes (6 a process).
+- *The locks were held longer than SQLite holds them.* A writer took RESERVED
+  before catching up, a reader kept SHARED through the whole catch-up, a
+  commit took EXCLUSIVE before working out its pages, and a commit that
+  changed nothing (mptest polls with BEGIN IMMEDIATE … COMMIT) wrote the file
+  under EXCLUSIVE all the same. Each now does as SQLite's pager does: catch up
+  under SHARED, let SHARED go once the file is read, take EXCLUSIVE only to
+  write, and leave the file alone when nothing changed.
+
+A lock is still held ~11 ms on average, against SQLite's ~3. The difference
+left is how a connection catches up: SQLite compares 16 bytes of page 1 and
+drops its page cache, then reads the pages a statement needs; this engine
+reads the whole file and hashes every tree to find the tables that changed.
+
+**Done when.** A catch-up reads the pages that changed rather than the file
+(the journal or the change counter names them, or each tree's pages are
+compared), and `scripts/sqlite_tools.py` times `multiwrite01` against SQLite
+over five interleaved runs and fails past 1.25× SQLite's median.
 
 ## S8 — The rest of SQLite's C API
 
