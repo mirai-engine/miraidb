@@ -370,6 +370,10 @@ sql_suite :: proc(store: ^db.Store, prefix: string) {
 	measure(fmt.aprintf("%s/sql/count/count=256", prefix), 2000, &b, nil, proc(data: rawptr) {
 		sql_run((^Bench)(data).store, "SELECT count(*) FROM sql_t")
 	})
+	// A WHERE no index answers: every row is read and the condition evaluated.
+	measure(fmt.aprintf("%s/sql/filter_scan/count=256", prefix), 2000, &b, nil, proc(data: rawptr) {
+		sql_run((^Bench)(data).store, "SELECT count(*) FROM sql_t WHERE age > 300 AND name <> 'x'")
+	})
 }
 
 // sql_run runs one statement and drops its answer; a failure stops the suite.
