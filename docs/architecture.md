@@ -272,6 +272,28 @@ Execution always goes through a transaction:
   for everything else, committing on success.
 - `sql_execute_in_tx` runs inside the caller's transaction (reducers).
 
+A statement's text is parsed into a tree, and the tree is resolved against the
+catalog every time it runs (`sql_resolve_names`). The resolution may rewrite
+the tree for that catalog: a table's name to its stored spelling, a `WHERE`'s
+reference to a select-list alias to the alias's expression. A tree that runs
+again is therefore valid for one **catalog generation**
+(`Store.catalog_generation`). The generation moves on with every commit that
+changes what a name resolves to (DDL, and the rows of `_view`, `_policy`,
+`_triggers`, `_type` and `_virtual`), with ATTACH and DETACH, and with a change
+to an attached database's catalog (`catalog_parent`). Writing rows does not.
+
+Three things keep a tree for later runs, and each parses its text again at
+another generation, as SQLite prepares a statement again after a schema change:
+
+- the store's statement cache, which keeps up to 16 queries by their text;
+- `sql_prepare`'s `Stmt_Prepared`;
+- the embedded API's statement, which also asks its authorizer again.
+
+A run inside a transaction that staged a catalog change (`tx_changes_catalog`)
+parses again too, and leaves the tree stale for the next run. What a
+resolution writes into a kept tree lives in the tree's own arena: the
+transaction's is freed at the end of the run.
+
 A query binds sources: `Source` pairs a table with one of its rows and an
 optional alias. Single-table statements build a one-source context; a join
 builds one source per table. Column resolution searches the bound sources
