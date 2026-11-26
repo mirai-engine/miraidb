@@ -114,8 +114,7 @@ index_ids_remove_at :: proc(ids: ^[dynamic]Row_Id, at: int) {
 // index_tree_free frees every slot's list and the tree's nodes.
 @(private)
 index_tree_free :: proc(index: ^Index) {
-	delete(index.ints)
-	index.ints = nil
+	int_keys_destroy(&index.ints)
 	tree := &index.tree
 	for node := rbtree.first(tree); node != nil; node = node_next(node) do delete(node.value.more)
 	if index.nodes == nil {
@@ -261,7 +260,7 @@ Index :: struct {
 	// exactly the rows whose value has an integer key; the tree still holds every
 	// row and answers everything else. An index that cannot grow it drops it and
 	// answers from the tree (`int_keyed` false).
-	ints:      map[[2]u64]Row_Id,
+	ints:      Int_Keys,
 	int_keyed: bool,
 }
 
@@ -303,7 +302,7 @@ index_int_holder :: proc(t: ^Table, index: int, values: []Value) -> (id: Row_Id,
 	if column < 0 || column >= len(values) do return
 	key, ok := index_int_key(values[column])
 	if !ok do return
-	id, held = idx.ints[key]
+	id, held = int_keys_get(&idx.ints, key)
 	return id, held, true
 }
 
@@ -313,12 +312,8 @@ index_int_holder :: proc(t: ^Table, index: int, values: []Value) -> (id: Row_Id,
 index_ints_put :: proc(index: ^Index, values: []Value, id: Row_Id) {
 	key, ok := index_int_key(values[index.schema.columns[0]])
 	if !ok do return
-	if _, slot, _, err := map_entry(&index.ints, key); err == nil {
-		slot^ = id
-		return
-	}
-	delete(index.ints)
-	index.ints = nil
+	if int_keys_put(&index.ints, key, id) == nil do return
+	int_keys_destroy(&index.ints)
 	index.int_keyed = false
 }
 
@@ -327,24 +322,21 @@ index_ints_put :: proc(index: ^Index, values: []Value, id: Row_Id) {
 index_ints_remove :: proc(index: ^Index, values: []Value, id: Row_Id) {
 	key, ok := index_int_key(values[index.schema.columns[0]])
 	if !ok do return
-	if held, found := index.ints[key]; found && held == id do delete_key(&index.ints, key)
+	int_keys_remove(&index.ints, key, id)
 }
 
 // index_ints_clone copies the integer keys of an index; a copy that cannot be
 // made leaves the target answering from its tree.
 @(private)
 index_ints_clone :: proc(source: ^Index, target: ^Index) {
-	delete(target.ints)
-	target.ints = nil
+	int_keys_destroy(&target.ints)
 	target.int_keyed = source.int_keyed
-	if !target.int_keyed || len(source.ints) == 0 do return
-	if reserve(&target.ints, len(source.ints)) != nil {
-		delete(target.ints)
-		target.ints = nil
+	if !target.int_keyed || int_keys_len(&source.ints) == 0 do return
+	// One copy of the slots, where an Odin map filed every key again (Int_Keys).
+	if int_keys_clone(&target.ints, &source.ints, context.allocator) != nil {
+		int_keys_destroy(&target.ints)
 		target.int_keyed = false
-		return
 	}
-	for key, id in source.ints do target.ints[key] = id
 }
 
 // Index_Exprs is what a partial or expression index evaluates for each row. The
