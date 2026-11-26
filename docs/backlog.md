@@ -240,7 +240,16 @@ readers, and an automatic prune is only safe against two of them:
 - *A read transaction* (`tx_begin_read`) shares the tables it reads and scans
   them without the store's lock. A prune skips a table anyone shares
   (`store_prune_table`), so its rows never move under a scan; before that skip a
-  prune compacted a table a reader could be walking. Safe.
+  prune compacted a table a reader could be walking. Safe for the rows, but not
+  for their values until 2026-11-25: a commit to a shared table writes a copy
+  that borrows the reader's values, an update moves them into the copy's
+  history, and the prune after the commit freed them while the reader still
+  read them (a heap that overwrote freed memory had the reader read `"||"` for
+  three texts). A table copied for a reader keeps the sequence of that commit
+  (`shared_before`), and a prune hands the values stored before it to the
+  shared store, freed when the last reader is gone
+  (`test_a_prune_leaves_a_reader_its_values`, under an allocator that poisons
+  what it frees).
 - *A pinned read* (`tx_begin_read_at`) reads the live tables at an older
   sequence. A prune does nothing while one is announced or reading: it reads the
   pins under the lock and only tries that lock, which a live pin holds shared.
