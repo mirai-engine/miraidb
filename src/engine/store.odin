@@ -892,13 +892,23 @@ store_set_sqlite_mirror :: proc(store: ^Store, path: string) {
 // calls it after releasing its own write lock. A failure is the commit's failure
 // when the file is the database's only copy (a store without a log of its own);
 // a store with a log only reports it (D8).
-store_sqlite_mirror_flush :: proc(store: ^Store, ops: []Store_Op = nil) -> Error {
+store_sqlite_mirror_flush :: proc(store: ^Store, ops: []Store_Op = nil, guarded: ^bool = nil) -> Error {
 	if store == nil || len(store.sqlite_mirror) == 0 do return ERROR_NONE
 	sync.shared_lock(&store.mutex)
 	defer sync.shared_unlock(&store.mutex)
+	// The guard (EXCLUSIVE, for a file other processes share) is taken right
+	// before the first write, and `guarded` tells the caller to let it go.
+	exclusive :: proc(store: ^Store, guarded: ^bool) {
+		if guarded == nil || guarded^ || store.mirror_guard == nil do return
+		store.mirror_guard(store.mirror_guard_ctx, true)
+		guarded^ = true
+	}
 	// A journal a failed write left beside the file goes back into it first: the
 	// next commit's pages would otherwise land on a torn file that no journal
 	// covers any more (D8). The layout is then read again from the file.
+	if store.mirror_vfs != nil || os.exists(strings.concatenate({store.sqlite_mirror, "-journal"}, context.temp_allocator)) {
+		exclusive(store, guarded)
+	}
 	recovered, recover_err := sqlite_journal_recover_file(store.sqlite_mirror, store.mirror_vfs)
 	if recover_err.kind != .None do return recover_err
 	if recovered {
@@ -911,6 +921,7 @@ store_sqlite_mirror_flush :: proc(store: ^Store, ops: []Store_Op = nil) -> Error
 			delete(store.mirror_reason)
 			store.mirror_reason = strings.clone(build_err.message)
 			error_free(&build_err)
+			exclusive(store, guarded)
 			return store_sqlite_mirror_rewrite(store)
 		}
 		store.mirror = built
@@ -921,12 +932,18 @@ store_sqlite_mirror_flush :: proc(store: ^Store, ops: []Store_Op = nil) -> Error
 	store.mirror_pages_written += store.mirror.pages_written - before_pages
 	store.mirror_bytes_written += store.mirror.bytes_written - before_bytes
 	if apply_err.kind != .None do return apply_err
+	exclusive(store, guarded)
 	if needs_full {
 		delete(store.mirror_reason)
 		store.mirror_reason = strings.clone(store.mirror.fallback_reason)
 		return store_sqlite_mirror_rewrite(store)
 	}
-	return ERROR_NONE
+	before_pages = store.mirror.pages_written
+	before_bytes = store.mirror.bytes_written
+	commit_err := mirror_commit_pages(store.mirror)
+	store.mirror_pages_written += store.mirror.pages_written - before_pages
+	store.mirror_bytes_written += store.mirror.bytes_written - before_bytes
+	return commit_err
 }
 
 // store_set_mirror_vfs writes the mirrored file through vfs from now on: a

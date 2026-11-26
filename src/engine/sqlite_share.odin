@@ -355,8 +355,12 @@ sqlite_share_mirror_guard :: proc(ctx: rawptr, begin: bool) {
 // sqlite_share_refresh reads the file again when another connection committed
 // since this one last read or wrote it: one of this process (the generation
 // moved) or of any other (the file's change counter moved).
+//
+// A commit of another process that lands while the file is being read is
+// read too: the refresh starts again (`attempt`), as a reader that met BUSY
+// would, and fails as SQLite's BUSY after SHARE_REFRESH_ATTEMPTS.
 @(private)
-sqlite_share_refresh :: proc(conn: ^Embed_Conn) -> Error {
+sqlite_share_refresh :: proc(conn: ^Embed_Conn, attempt := 0) -> Error {
 	share := conn.share
 	sync.lock(&sqlite_shares_mutex)
 	generation := share.generation
@@ -377,12 +381,26 @@ sqlite_share_refresh :: proc(conn: ^Embed_Conn) -> Error {
 	// Another process committing past the wait is SQLite's BUSY: reading what
 	// the store held before would answer from an older database.
 	if !sqlite_share_read_begin(share, conn) do return errf(.Locked, "database is locked")
-	defer sqlite_share_read_end(share)
+	shared := true
+	defer if shared do sqlite_share_read_end(share)
 	counter, counted := sqlite_share_counter(share)
 	if generation == conn.share_generation && (!counted || counter == conn.share_counter) do return ERROR_NONE
 	image, read_ok := sqlite_share_read_file(share, mirror)
 	if !read_ok do return errf(.Io, "disk I/O error")
 	defer delete(image)
+	// The file is in memory now: SHARED goes, and what follows reads the
+	// copy. Held through the parse, the hashes and the reload, it kept another
+	// process's commit waiting for EXCLUSIVE all that time (SQLite holds it
+	// while it reads pages). The paths that read the file from disk take it
+	// again, and go ahead only if no commit came in between (shared_again).
+	sqlite_share_read_end(share)
+	shared = false
+	shared_again :: proc(share: ^Sqlite_Share, conn: ^Embed_Conn, shared: ^bool, counter: u32, counted: bool) -> bool {
+		if !sqlite_share_read_begin(share, conn) do return false
+		shared^ = true
+		now, now_counted := sqlite_share_counter(share)
+		return !counted || (now_counted && now == counter)
+	}
 	// What the connection set for itself stays; the content is the file's.
 	foreign_keys_off, sqlite_rules := store.foreign_keys_off, store.sqlite_rules
 	last_changes, total_changes, last_row_id := store.last_changes, store.total_changes, store.last_row_id
@@ -397,13 +415,29 @@ sqlite_share_refresh :: proc(conn: ^Embed_Conn) -> Error {
 	same := make(map[string]bool, 16, context.temp_allocator)
 	if parsed do sqlite_share_hash_file(&file, &hashes, conn.share_hashes, &same)
 	caught_up := parsed && sqlite_share_catch_up(conn, &file, hashes, mirror)
+	stale := false
 	if caught_up {
-		sqlite_share_follow_mirror(store, mirror, &file, same)
+		if !sqlite_share_follow_mirror(store, mirror, &file, same, share, conn, &shared, counter, counted, shared_again) {
+			// Another commit came in before the mirror could be read again from
+			// the file: the store holds the copy's state, with no mirror, and
+			// the next statement reads the file whole.
+			stale = true
+		}
 		// Another process (one with the function a kept index needs) may have
 		// written its table: the kept entries are read again from the file, or
 		// a rewrite here would put back the ones it replaced (D24).
 		if store.mirror_kept_indexes > 0 do store_mirror_keep(store, &file)
 	} else {
+		// The whole file again, and its mirror read from disk: under SHARED, and
+		// only while the file is still the copy.
+		if !shared_again(share, conn, &shared, counter, counted) {
+			sqlite_share_hashes_clear(conn)
+			if !shared do return errf(.Locked, "database is locked")
+			sqlite_share_read_end(share)
+			shared = false
+			if attempt + 1 >= SHARE_REFRESH_ATTEMPTS do return errf(.Locked, "database is locked")
+			return sqlite_share_refresh(conn, attempt + 1)
+		}
 		if replace_err := store_replace_content(store, image, true); replace_err.kind != .None {
 			// The store keeps what it had and stays the file's, so the next
 			// statement tries again; this one fails rather than read it.
@@ -413,17 +447,30 @@ sqlite_share_refresh :: proc(conn: ^Embed_Conn) -> Error {
 		}
 		store_set_sqlite_mirror(store, mirror)
 	}
-	if parsed {
+	if parsed && !stale {
 		sqlite_share_hashes_keep(conn, hashes)
 	} else {
 		sqlite_share_hashes_clear(conn)
 	}
 	store.foreign_keys_off, store.sqlite_rules = foreign_keys_off, sqlite_rules
 	store.last_changes, store.total_changes, store.last_row_id = last_changes, total_changes, last_row_id
+	if stale {
+		if shared {
+			sqlite_share_read_end(share)
+			shared = false
+		}
+		if attempt + 1 >= SHARE_REFRESH_ATTEMPTS do return errf(.Locked, "database is locked")
+		return sqlite_share_refresh(conn, attempt + 1)
+	}
 	conn.share_generation = generation
 	if counted do conn.share_counter = counter
 	return ERROR_NONE
 }
+
+// SHARE_REFRESH_ATTEMPTS is how many times a refresh reads the file again when
+// another process commits while it reads.
+@(private)
+SHARE_REFRESH_ATTEMPTS :: 8
 
 // SHARE_HASH_SCHEMA and SHARE_HASH_SEQUENCE key the hashes of sqlite_master
 // (with the header integers a program sets) and of sqlite_sequence; no table
@@ -685,12 +732,32 @@ sqlite_share_catch_up :: proc(conn: ^Embed_Conn, file: ^Sqlite_File, hashes: map
 // it was before, change counter included, which could then match the counter
 // another process last read. A file with a hot journal beside it, or one the
 // mirror cannot follow, builds the mirror again from the file on disk.
+//
+// Reading the file from disk takes SHARED again first (`again`); it answers
+// false, leaving the store with no mirror, when the file moved on meanwhile.
 @(private)
-sqlite_share_follow_mirror :: proc(store: ^Store, mirror: string, file: ^Sqlite_File, same: map[string]bool) {
+sqlite_share_follow_mirror :: proc(
+	store: ^Store,
+	mirror: string,
+	file: ^Sqlite_File,
+	same: map[string]bool,
+	share: ^Sqlite_Share,
+	conn: ^Embed_Conn,
+	shared: ^bool,
+	counter: u32,
+	counted: bool,
+	again: proc(share: ^Sqlite_Share, conn: ^Embed_Conn, shared: ^bool, counter: u32, counted: bool) -> bool,
+) -> bool {
 	if store.mirror != nil && !os.is_file(strings.concatenate({mirror, "-journal"}, context.temp_allocator)) {
-		if mirror_refresh(store, store.mirror, file, same) do return
+		if mirror_refresh(store, store.mirror, file, same) do return true
+	}
+	if !again(share, conn, shared, counter, counted) {
+		mirror_destroy(store.mirror)
+		store.mirror = nil
+		return false
 	}
 	store_set_sqlite_mirror(store, mirror)
+	return true
 }
 
 // sqlite_share_hashes_keep makes `hashes` the ones the connection matches. They
@@ -796,8 +863,14 @@ embed_run_shared :: proc(conn: ^Embed_Conn, prepared: ^Stmt_Prepared, params: []
 	conn.share_depth += 1
 	defer conn.share_depth -= 1
 	if conn.tx == nil {
-		if embed_statement_writes(prepared) && !sqlite_share_acquire(conn) {
-			return {}, errf(.Locked, "database is locked")
+		if embed_statement_writes(prepared) {
+			// The catch-up comes first, under SHARED alone, as SQLite reads
+			// before it writes: holding RESERVED through it made every other
+			// writer wait for this one's reading too. Once the lock is taken
+			// the file is looked at again, which costs its change counter
+			// when no commit came in between.
+			if refresh_err := sqlite_share_refresh(conn); refresh_err.kind != .None do return {}, refresh_err
+			if !sqlite_share_acquire(conn) do return {}, errf(.Locked, "database is locked")
 		}
 		if refresh_err := sqlite_share_refresh(conn); refresh_err.kind != .None {
 			if share.writer == conn && conn.tx == nil do sqlite_share_release(conn)

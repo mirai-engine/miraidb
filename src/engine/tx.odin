@@ -2535,13 +2535,25 @@ tx_commit :: proc(tx: ^Tx) -> Error {
 	guard, guard_ctx := store.mirror_guard, store.mirror_guard_ctx
 	// A commit that changed only TEMP tables leaves the file alone: no lock on
 	// it, no write.
-	writes_file := len(store.sqlite_mirror) > 0 && (notify_ops == nil || len(mirror_ops) > 0)
-	if guard != nil && writes_file do guard(guard_ctx, true)
-	mirror_err := writes_file ? store_sqlite_mirror_flush(store, mirror_ops) : ERROR_NONE
+	// A commit that changed nothing leaves it alone too, as SQLite's: a
+	// BEGIN IMMEDIATE that only read took EXCLUSIVE at its COMMIT and waited for
+	// every reader of the file (mptest polls for its tasks that way).
+	writes_file := len(store.sqlite_mirror) > 0 && len(ops) > 0 && (notify_ops == nil || len(mirror_ops) > 0)
+	// The flush takes EXCLUSIVE (the guard) only when it has worked out what
+	// to write and is about to write it, as SQLite does: holding it while the
+	// pages were patched kept every reader of the file waiting that long too.
+	guarded := false
+	mirror_err := writes_file ? store_sqlite_mirror_flush(store, mirror_ops, &guarded) : ERROR_NONE
 	// A store with no log of its own has the file as its only copy: the file
 	// goes back to the state before this commit while the lock is still held.
-	if mirror_err.kind != .None && !store.persistent do store_mirror_failed(store)
-	if guard != nil && writes_file do guard(guard_ctx, false)
+	if mirror_err.kind != .None && !store.persistent {
+		if guard != nil && !guarded {
+			guard(guard_ctx, true)
+			guarded = true
+		}
+		store_mirror_failed(store)
+	}
+	if guard != nil && guarded do guard(guard_ctx, false)
 	// A file other connections share: what this commit changed is news to the
 	// hashes its connection keeps of the file (sqlite_share.odin).
 	if guard != nil && writes_file do store_mirror_note_touched(store, mirror_ops, mirror_err.kind != .None)

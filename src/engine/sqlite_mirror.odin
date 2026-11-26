@@ -1863,8 +1863,9 @@ mirror_apply_commit :: proc(store: ^Store, m: ^Sqlite_Mirror, ops: []Store_Op) -
 		m.fallback_reason = "master"
 		return true, ERROR_NONE
 	}
-	err = mirror_commit_pages(m)
-	return false, err
+	// The pages are staged; the caller writes them (mirror_commit_pages) once
+	// it holds the file exclusively.
+	return false, ERROR_NONE
 }
 
 // --- Checking the tree -----------------------------------------------------

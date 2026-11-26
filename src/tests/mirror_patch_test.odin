@@ -8,8 +8,8 @@ import db "../engine"
 
 // The mirror patches a commit into the file instead of re-encoding it (D37):
 // a table without an INTEGER PRIMARY KEY by the engine's row id, which is the
-// rowid the file gave the row, and a table with an index by building the
-// index again.
+// rowid the file gave the row; a table with an index by building the index
+// again; and a commit that changed nothing does not touch the file.
 
 @(private = "file")
 mp_export :: proc(t: ^testing.T, path: string, statements: []string) -> bool {
@@ -90,3 +90,25 @@ test_a_table_with_an_index_is_patched :: proc(t: ^testing.T) {
 	mp_valid(t, path)
 }
 
+@(test)
+test_a_commit_that_changed_nothing_leaves_the_file :: proc(t: ^testing.T) {
+	path := "_test_mirror_empty.db"
+	defer os.remove(path)
+	setup := []string{"CREATE TABLE e (id INTEGER PRIMARY KEY, v TEXT)", "INSERT INTO e VALUES (1, 'one')"}
+	if !mp_export(t, path, setup) do return
+	before, counted := db.sqlite_file_change_counter(path)
+	if !testing.expect(t, counted) do return
+	conn, open_err := db.embed_open(path, {persistent = true, create = false, durable = false})
+	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
+	defer db.embed_close(conn)
+	// The read goes through the connection: a statement on the store would wait
+	// for the transaction the connection holds.
+	mp_exec(t, conn, "BEGIN IMMEDIATE")
+	mp_exec(t, conn, "SELECT v FROM e WHERE id = 1")
+	mp_exec(t, conn, "COMMIT")
+	mp_exec(t, conn, "BEGIN")
+	mp_exec(t, conn, "COMMIT")
+	after, _ := db.sqlite_file_change_counter(path)
+	testing.expect_value(t, after, before)
+	testing.expect_value(t, conn.store.mirror_pages_written, 0)
+}
