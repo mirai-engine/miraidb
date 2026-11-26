@@ -15,6 +15,13 @@ What decides whether a change is a regression:
   than the baseline, which is the number the roadmap promises. Run it by hand
   after --record on an idle box.
 
+One time is a gate of its own, because it has a promise and not a baseline: a
+commit to a table a reader holds costs the rows it writes, not the table (R7).
+--check builds a 50 000-row table three times, takes the median of the commit
+made with a reader open, and fails above 1 ms. It was 10-21 ms while the commit
+copied the table and its index, and is under 0.2 ms with the rows, the trees and
+the arena shared; the gate keeps five times that for the machine's mood.
+
     python scripts/bench.py            # measure, print, compare, do not write
     python scripts/bench.py --check    # same, but exit 1 on a regression
     python scripts/bench.py --record   # rewrite benchmarks/baseline.json
@@ -58,6 +65,9 @@ TIME_TOLERANCE = 1.10
 # its life on the machine's mood instead of on the code.
 RUN_NOISE = 3.0
 BYTES_TOLERANCE = 1.10
+# The commit a reader forces to copy shared structure, at READER_ROWS rows.
+READER_ROWS = 50000
+READER_LIMIT_US = 1000.0
 
 
 def run(binary: str, *args: str) -> str:
@@ -134,6 +144,34 @@ def measure(binary: str, rows: int, iterations: int) -> dict:
         }
     finally:
         shutil.rmtree(directory, ignore_errors=True)
+
+
+def reader_commit_us(binary: str, rows: int, runs: int = 3) -> list[float]:
+    """The commit made with a reader open, on a fresh table of `rows`, `runs` times."""
+    directory = os.path.join(ROOT, "_bench_tmp")
+    times = []
+    for _ in range(runs):
+        shutil.rmtree(directory, ignore_errors=True)
+        os.makedirs(directory, exist_ok=True)
+        relative = os.path.relpath(os.path.join(directory, "db"), ROOT)
+        try:
+            out = run(binary, "bench-read", relative, str(rows), "10", "--no-sync")
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
+        found = re.search(r"commit with a read open: ([\d.]+) us", out)
+        if not found:
+            raise SystemExit(f"cannot read the commit with a reader open from: {out}")
+        times.append(float(found.group(1)))
+    return times
+
+
+def check_reader_commit(binary: str) -> int:
+    times = reader_commit_us(binary, READER_ROWS)
+    median = sorted(times)[len(times) // 2]
+    status = "ok  " if median <= READER_LIMIT_US else "FAIL"
+    print(f"{status} commit w/ reader at {READER_ROWS} rows: median {median:.1f} us of "
+          f"{', '.join(f'{t:.1f}' for t in times)} (limit {READER_LIMIT_US:.0f} us)")
+    return 0 if median <= READER_LIMIT_US else 1
 
 
 def machine() -> dict:
@@ -289,6 +327,7 @@ def main() -> int:
         print(json.dumps(second, indent=2))
         print("--- two runs of the same workload, minutes apart, on this machine ---")
         failures += compare_halves(current, second)
+        failures += check_reader_commit(binary)
     if not args.check:
         print("bench: report only (pass --check to gate)")
         return 0
