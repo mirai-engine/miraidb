@@ -6,10 +6,10 @@ import db "../engine"
 
 // Under SQLite's rules the resolution rewrites a table's name to its stored
 // spelling inside the tree, joins and subqueries included. A tree that runs
-// again (a prepared statement) keeps that name, so it must live as long as the
-// tree: in the transaction's arena it was freed at the end of the first run,
-// and a later run read whatever reused the memory ("no such table: " and
-// garbage).
+// again (a prepared statement, a query the store keeps by its text) keeps that
+// name, so it must live as long as the tree: in the transaction's arena it was
+// freed at the end of the first run, and a later run read whatever reused the
+// memory ("no such table: " and garbage).
 @(test)
 test_a_tree_run_again_keeps_the_names_its_resolution_wrote :: proc(t: ^testing.T) {
 	store, err := db.store_open("", {persistent = false})

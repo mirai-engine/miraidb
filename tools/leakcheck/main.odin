@@ -180,6 +180,18 @@ main :: proc() {
 
 	failed := 0
 	for shape in entries {
+		// The first run keeps the statement's parse in the store's statement
+		// cache, which is bounded (STATEMENT_CACHE_SIZE): what is measured is
+		// every run after it.
+		{
+			result, err := db.sql_execute(store, shape.statement)
+			if err.kind != .None {
+				fmt.eprintfln("leakcheck: %s failed: %s", shape.statement, err.message)
+				os.exit(2)
+			}
+			db.sql_result_destroy(&result)
+			db.store_prune_history(store)
+		}
 		mem.tracking_allocator_clear(&track)
 		for _ in 0 ..< repeat {
 			result, err := db.sql_execute(store, shape.statement)

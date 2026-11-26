@@ -89,10 +89,84 @@ sql_execute_priced :: proc(store: ^Store, sql: string, params: []Value) -> (Sql_
 	if body, is_pragma := sqlite_pragma_statement(sql); is_pragma {
 		return sql_exec_pragma(store, body, false)
 	}
-	query, parse_err := sql_parse(sql)
-	if parse_err.kind != .None do return {}, parse_err
-	defer query_destroy(&query)
-	return sql_run_statement(store, query.statement, params)
+	// A query run by its text again is not parsed again: the parse depends on
+	// the text alone (names are resolved at every run), and was 2 µs of a point
+	// lookup's 15. The resolution rewrites names in the tree (a table's stored
+	// spelling), so what it writes lives in the query's own arena, as long as
+	// the tree: in the transaction's it would be freed under the cached tree.
+	query := statement_cache_take(store, sql)
+	if query == nil {
+		parsed, parse_err := sql_parse(sql)
+		if parse_err.kind != .None do return {}, parse_err
+		query = new(Query)
+		query^ = parsed
+	}
+	defer statement_cache_give(store, sql, query)
+	return sql_run_statement(store, query.statement, params, arena_allocator_guarded(&query.arena))
+}
+
+// STATEMENT_CACHE_SIZE is how many parsed queries a store keeps by their text.
+// Each keeps its arena (pooled, QUERY_ARENA_POOL), so the number stays small.
+STATEMENT_CACHE_SIZE :: 16
+
+// Statement_Entry is one kept parse; `running` says a statement has it out.
+Statement_Entry :: struct {
+	query:   ^Query,
+	running: bool,
+}
+
+// statement_cache_take hands out the parse of `sql`, which is marked as running
+// until it is given back: two threads running the same text never share one
+// tree, the second parses its own. Nil when there is none or it is out.
+@(private)
+statement_cache_take :: proc(store: ^Store, sql: string) -> ^Query {
+	if store == nil do return nil
+	sync.mutex_lock(&store.statement_cache_mutex)
+	defer sync.mutex_unlock(&store.statement_cache_mutex)
+	entry, found := &store.statement_cache[sql]
+	if !found || entry.running do return nil
+	entry.running = true
+	return entry.query
+}
+
+// statement_cache_give keeps a query's parse for the next run of its text, or
+// frees it: only queries are kept (a write's text usually carries its values,
+// and repeats less), and a full cache keeps what it has.
+@(private)
+statement_cache_give :: proc(store: ^Store, sql: string, query: ^Query) {
+	keep := false
+	#partial switch _ in query.statement {
+	case Select_Stmt, With_Stmt:
+		keep = store != nil
+	}
+	if keep {
+		sync.mutex_lock(&store.statement_cache_mutex)
+		entry, found := &store.statement_cache[sql]
+		// The kept parse comes back under the key it already has.
+		returned := found && entry.query == query
+		if returned do entry.running = false
+		else if !found && len(store.statement_cache) < STATEMENT_CACHE_SIZE {
+			store.statement_cache[strings.clone(sql)] = Statement_Entry{query = query}
+			returned = true
+		}
+		sync.mutex_unlock(&store.statement_cache_mutex)
+		if returned do return
+	}
+	query_destroy(query)
+	free(query)
+}
+
+// statement_cache_clear frees every parse the store keeps.
+statement_cache_clear :: proc(store: ^Store) {
+	sync.mutex_lock(&store.statement_cache_mutex)
+	defer sync.mutex_unlock(&store.statement_cache_mutex)
+	for key, entry in store.statement_cache {
+		delete(key)
+		query_destroy(entry.query)
+		free(entry.query)
+	}
+	delete(store.statement_cache)
+	store.statement_cache = nil
 }
 
 // sql_run_statement dispatches an already parsed statement; prepared statements

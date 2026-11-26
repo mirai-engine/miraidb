@@ -126,6 +126,10 @@ Store :: struct {
 	functions:     map[string]Scalar_Function_Def,
 	// aggregates are the host's aggregates, keyed like functions.
 	aggregates:    map[string]Aggregate_Function_Def,
+	// statement_cache keeps the parse of the queries run by their text
+	// (sql_execute), up to STATEMENT_CACHE_SIZE, behind statement_cache_mutex.
+	statement_cache:       map[string]Statement_Entry,
+	statement_cache_mutex: sync.Mutex,
 	// collations holds the host comparisons a program registered. It is process
 	// state, not database state: nothing about it is logged.
 	collations:    map[string]Collation_Def,
@@ -566,6 +570,7 @@ store_close :: proc(store: ^Store) {
 		value_deep_free(value, context.allocator)
 	}
 	delete(store.variables)
+	statement_cache_clear(store)
 	for name, _ in store.functions do delete(name)
 	delete(store.functions)
 	for name, _ in store.aggregates do delete(name)
