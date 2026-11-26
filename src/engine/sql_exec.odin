@@ -1632,6 +1632,49 @@ Source :: struct {
 	hidden_unqualified: bool,
 }
 
+// Column_Memo is the column a reference names in a table's schema.
+Column_Memo :: struct {
+	schema: ^Table_Schema,
+	index:  int,
+}
+
+// single_source_column finds the column a reference names when the context has
+// one source, which is what a single-table statement evaluates its WHERE and
+// projection with: there is no ambiguity to settle and no USING to share, so
+// the name is looked up once per statement and remembered (column_memo, keyed
+// by the reference and checked against the source's schema). Anything else
+// answers false and the caller looks the name up as before. The memo is the
+// statement's, made once where the statement starts (column_memo_make): a
+// context made per row shares it and never makes its own, which would cost an
+// allocation per row that lives as long as the transaction.
+@(private)
+single_source_column :: proc(ctx: ^Eval_Ctx, key: ^Expr, column: Column_Expr) -> (source: ^Source, index: int, ok: bool) {
+	if len(ctx.sources) != 1 || ctx.tx == nil do return nil, -1, false
+	source = &ctx.sources[0]
+	if source.table == nil || source.hidden_unqualified do return nil, -1, false
+	schema := &source.table.schema
+	if ctx.column_memo != nil {
+		if memo, found := ctx.column_memo[key]; found && memo.schema == schema do return source, memo.index, true
+	}
+	if len(column.table) > 0 {
+		matches := strings.equal_fold(column.table, schema.name) || (len(source.alias) > 0 && strings.equal_fold(column.table, source.alias))
+		if !matches do return nil, -1, false
+	}
+	found: bool
+	index, found = schema_column_index(schema, column.name)
+	if !found do return nil, -1, false
+	if ctx.column_memo != nil do ctx.column_memo[key] = Column_Memo{schema = schema, index = index}
+	return source, index, true
+}
+
+// column_memo_make is a statement's column memo, in the transaction's arena.
+@(private)
+column_memo_make :: proc(tx: ^Tx) -> ^map[^Expr]Column_Memo {
+	memo := new(map[^Expr]Column_Memo, tx.alloc)
+	memo^ = make(map[^Expr]Column_Memo, 8, tx.alloc)
+	return memo
+}
+
 // quota_reached reports whether `produced` rows are already past the store's row
 // quota. It is checked where rows are produced, not when the result is finished,
 // because a quota read after the fact cannot prevent the spike it exists to cap.
@@ -1669,6 +1712,11 @@ Outer_Frame :: struct {
 }
 
 Eval_Ctx :: struct {
+	// column_memo remembers, for a column reference, which column of the one
+	// source it names (single_source_column), so a row does not look the name
+	// up again: comparing every column's name, for every reference of every row,
+	// was most of a filtered scan.
+	column_memo: ^map[^Expr]Column_Memo,
 	// using_names are the columns the query's JOIN ... USING (or NATURAL
 	// JOIN) shares: an unqualified one is the join's, not ambiguous.
 	using_names: []string,
@@ -3755,6 +3803,8 @@ Stream_Scan_Ctx :: struct {
 	alias:    string,
 	err:      Error,
 	now_us:   i64,
+	// column_memo is the statement's, which every row's context shares.
+	column_memo: ^map[^Expr]Column_Memo,
 }
 
 @(private)
@@ -3772,10 +3822,11 @@ stream_row_visit :: proc(raw: rawptr, row: Row) -> bool {
 	one: [1]Source
 	one[0] = Source{table = scan.base, row = row, alias = scan.alias}
 	ctx := Eval_Ctx {
-		tx      = scan.tx,
-		sources = one[:],
-		params  = scan.params,
-		now_us  = scan.now_us,
+		tx          = scan.tx,
+		sources     = one[:],
+		params      = scan.params,
+		now_us      = scan.now_us,
+		column_memo = scan.column_memo,
 	}
 	for &set in scan.policies^ {
 		allowed, policy_err := policy_allows(&set, &ctx, false)
@@ -4021,6 +4072,7 @@ sql_exec_stream_select :: proc(
 		base      = base,
 		alias     = stmt.from.alias,
 		now_us    = now_us,
+		column_memo = column_memo_make(tx),
 	}
 	if scan_err := tx_scan_visit(tx, stmt.from.name, &scan_ctx, stream_row_visit); scan_err.kind != .None {
 		return {}, false, scan_err
@@ -4143,10 +4195,11 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 	}
 	if system_name do base = &synthetic
 	ctx := Eval_Ctx {
-		tx     = tx,
-		params = params,
-		now_us = now_microseconds(),
-		outer  = tx.outer,
+		tx          = tx,
+		params      = params,
+		now_us      = now_microseconds(),
+		outer       = tx.outer,
+		column_memo = column_memo_make(tx),
 	}
 	for join in stmt.joins {
 		if len(join.using_columns) == 0 do continue
@@ -5649,6 +5702,10 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 					return row.values[index], ERROR_NONE
 				}
 			}
+			if source, index, single := single_source_column(ctx, expr, e); single {
+				if index >= len(source.row.values) do return value_null(), ERROR_NONE
+				return source.row.values[index], ERROR_NONE
+			}
 			for source in ctx.sources {
 				// A source the caller has not bound yet has no columns.
 				if source.table == nil do continue
@@ -5684,6 +5741,10 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 			}
 			if value, ok := outer_column(ctx, e.name, e.table); ok do return value, ERROR_NONE
 			return {}, errf(.Column_Not_Found, "table %s is not in the query", e.table)
+		}
+		if source, index, single := single_source_column(ctx, expr, e); single {
+			if index >= len(source.row.values) do return value_null(), ERROR_NONE
+			return source.row.values[index], ERROR_NONE
 		}
 		found_value: Value
 		found := false
@@ -9178,7 +9239,7 @@ sql_exec_update :: proc(tx: ^Tx, stmt: Update_Stmt, params: []Value) -> (Sql_Res
 			return {}, collect_join_err
 		}
 	}
-	ctx := Eval_Ctx{tx = tx, params = params, now_us = now_microseconds()}
+	ctx := Eval_Ctx{tx = tx, params = params, now_us = now_microseconds(), column_memo = column_memo_make(tx)}
 	policies, policy_err := policy_load(tx, stmt.table)
 	if policy_err.kind != .None do return {}, policy_err
 	defer policy_set_destroy(&policies)
@@ -9358,7 +9419,7 @@ sql_exec_delete :: proc(tx: ^Tx, stmt: Delete_Stmt, params: []Value) -> (Sql_Res
 			return {}, collect_using_err
 		}
 	}
-	ctx := Eval_Ctx{tx = tx, params = params, now_us = now_microseconds()}
+	ctx := Eval_Ctx{tx = tx, params = params, now_us = now_microseconds(), column_memo = column_memo_make(tx)}
 	policies, policy_err := policy_load(tx, stmt.table)
 	if policy_err.kind != .None do return {}, policy_err
 	defer policy_set_destroy(&policies)
@@ -11065,6 +11126,10 @@ column_collation :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (string, bool) {
 	if collate, ok := operand^.(Collate_Expr); ok do operand = collate.operand
 	column, ok := operand^.(Column_Expr)
 	if !ok do return "", false
+	if source, index, single := single_source_column(ctx, operand, column); single {
+		collation := source.table.schema.columns[index].collation
+		return collation, len(collation) > 0
+	}
 	for source in ctx.sources {
 		if len(column.table) > 0 {
 			matches := strings.equal_fold(column.table, source.table.schema.name) ||
@@ -11097,6 +11162,9 @@ column_affinity :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> Column_Affinity {
 	if collate, ok := operand^.(Collate_Expr); ok do operand = collate.operand
 	column, ok := operand^.(Column_Expr)
 	if !ok do return .None
+	if source, index, single := single_source_column(ctx, operand, column); single {
+		return declared_affinity(source.table.schema.columns[index].type)
+	}
 	for source in ctx.sources {
 		if source.table == nil do continue
 		if len(column.table) > 0 {
@@ -11106,16 +11174,21 @@ column_affinity :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> Column_Affinity {
 		}
 		index, found := schema_column_index(&source.table.schema, column.name)
 		if !found do continue
-		declared := source.table.schema.columns[index].type
-		#partial switch declared.kind {
-		case .Int, .Uint, .Float:
-			return .Numeric
-		case .String:
-			return .Text
-		case .Any:
-			return declared.width == SQLITE_NUMERIC_WIDTH ? .Numeric : .None
-		}
-		return .None
+		return declared_affinity(source.table.schema.columns[index].type)
+	}
+	return .None
+}
+
+// declared_affinity is the affinity a column's declared type gives a comparison.
+@(private)
+declared_affinity :: proc(declared: Column_Type) -> Column_Affinity {
+	#partial switch declared.kind {
+	case .Int, .Uint, .Float:
+		return .Numeric
+	case .String:
+		return .Text
+	case .Any:
+		return declared.width == SQLITE_NUMERIC_WIDTH ? .Numeric : .None
 	}
 	return .None
 }
