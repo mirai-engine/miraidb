@@ -6,7 +6,6 @@ import "core:mem/virtual"
 import "core:sync"
 import "core:strings"
 import "core:slice"
-import "core:container/rbtree"
 
 // Row_Id identifies a row inside one table. It is stable for the life of the
 // row and is never reused.
@@ -45,9 +44,6 @@ Index_Slot :: struct {
 	first: Row_Id,
 	more:  [dynamic]Row_Id,
 }
-
-Index_Tree :: rbtree.Tree(string, Index_Slot)
-Index_Node :: rbtree.Node(string, Index_Slot)
 
 // index_slot_append adds a slot's rows to `ids`, ascending.
 @(private)
@@ -111,116 +107,19 @@ index_ids_remove_at :: proc(ids: ^[dynamic]Row_Id, at: int) {
 	resize(ids, len(ids) - 1)
 }
 
-// index_tree_free frees every slot's list and the tree's nodes.
+// index_tree_free lets go of an index's tree: the nodes no other table shares
+// go, with the row lists of their slots.
 @(private)
 index_tree_free :: proc(index: ^Index) {
 	int_keys_destroy(&index.ints)
-	tree := &index.tree
-	for node := rbtree.first(tree); node != nil; node = node_next(node) do delete(node.value.more)
-	if index.nodes == nil {
-		rbtree.destroy(tree, false)
-		return
-	}
-	// The nodes are the pool's: releasing its chunks frees every one at once.
-	node_pool_destroy(index.nodes)
-	index.nodes = nil
-	tree^ = {}
+	ib_free(&index.tree)
 }
 
-// index_tree_init gives a memory index an empty tree whose nodes come from a
-// pool of its own.
+// index_tree_init gives a memory index an empty tree.
 @(private)
 index_tree_init :: proc(index: ^Index) {
-	if index.nodes == nil do index.nodes = node_pool_make(size_of(Index_Node))
-	rbtree.init_cmp(&index.tree, index_cmp, node_pool_allocator(index.nodes))
+	index.tree = {}
 	index.int_keyed = index_int_eligible(index)
-}
-
-// Node_Pool hands out the nodes of one index tree: slots of one size, carved
-// from chunks that grow from NODE_POOL_FIRST to NODE_POOL_LAST slots, with the
-// freed ones kept on a list for the next node. A node came from the heap, one
-// allocation each, and a commit with a reader open clones the whole tree, so a
-// 50 000-row table spent 10-16 ms of that commit allocating nodes (M4). The
-// chunks go back to the heap when the index does; until then a tree keeps the
-// slots of its largest size, which the inserts after a delete reuse.
-Node_Pool :: struct {
-	backing:   mem.Allocator,
-	slot:      int,
-	free_list: rawptr,
-	chunks:    [dynamic]rawptr,
-	chunk:     [^]u8,
-	used:      int,
-	capacity:  int,
-}
-
-NODE_POOL_FIRST :: 16
-NODE_POOL_LAST :: 1024
-NODE_POOL_ALIGN :: 16
-
-@(private)
-node_pool_make :: proc(slot: int) -> ^Node_Pool {
-	pool := new(Node_Pool)
-	pool.backing = context.allocator
-	pool.slot = mem.align_forward_int(max(slot, size_of(rawptr)), NODE_POOL_ALIGN)
-	pool.chunks = make([dynamic]rawptr, pool.backing)
-	return pool
-}
-
-@(private)
-node_pool_destroy :: proc(pool: ^Node_Pool) {
-	for chunk in pool.chunks do mem.free(chunk, pool.backing)
-	delete(pool.chunks)
-	backing := pool.backing
-	free(pool, backing)
-}
-
-@(private)
-node_pool_allocator :: proc(pool: ^Node_Pool) -> mem.Allocator {
-	return mem.Allocator{procedure = node_pool_proc, data = pool}
-}
-
-@(private)
-node_pool_proc :: proc(
-	data: rawptr,
-	mode: mem.Allocator_Mode,
-	size, alignment: int,
-	old_memory: rawptr,
-	old_size: int,
-	location := #caller_location,
-) -> (
-	[]byte,
-	mem.Allocator_Error,
-) {
-	pool := (^Node_Pool)(data)
-	#partial switch mode {
-	case .Alloc, .Alloc_Non_Zeroed:
-		if size > pool.slot || alignment > NODE_POOL_ALIGN do return nil, .Mode_Not_Implemented
-		slot: rawptr
-		if pool.free_list != nil {
-			slot = pool.free_list
-			pool.free_list = (^rawptr)(slot)^
-		} else {
-			if pool.used == pool.capacity {
-				next := pool.capacity == 0 ? NODE_POOL_FIRST : min(pool.capacity * 2, NODE_POOL_LAST)
-				chunk, chunk_err := mem.alloc(next * pool.slot, NODE_POOL_ALIGN, pool.backing)
-				if chunk_err != nil do return nil, chunk_err
-				append(&pool.chunks, chunk)
-				pool.chunk = ([^]u8)(chunk)
-				pool.used = 0
-				pool.capacity = next
-			}
-			slot = &pool.chunk[pool.used * pool.slot]
-			pool.used += 1
-		}
-		if mode == .Alloc do mem.zero(slot, size)
-		return ([^]u8)(slot)[:size], nil
-	case .Free:
-		if old_memory == nil do return nil, nil
-		(^rawptr)(old_memory)^ = pool.free_list
-		pool.free_list = old_memory
-		return nil, nil
-	}
-	return nil, .Mode_Not_Implemented
 }
 
 // index_tree_key encodes the key a memory index files `values` under: the indexed
@@ -240,9 +139,8 @@ index_tree_key :: proc(t: ^Table, index: int, values: []Value) -> (key: string, 
 Index :: struct {
 	schema: Index_Schema,
 	unique: bool,
+	// tree is the memory index, shared with the tables readers keep (Index_Tree).
 	tree:   Index_Tree,
-	// nodes is the pool the tree's nodes come from (Node_Pool).
-	nodes:  ^Node_Pool,
 	// lookup is the equality map for HASH and DIRECT indexes. The tree is still
 	// maintained so ordering, range scans and the primary-key path keep working.
 	lookup: map[string]^Index_Bucket,
@@ -558,24 +456,16 @@ table_index_put_row :: proc(t: ^Table, index: int, values: []Value, id: Row_Id) 
 		key := index_entry_key(t, index, values, id)
 		if put_err := table_index_put(t, index, key, id); put_err.kind != .None do return put_err
 	} else {
-		key, has_null := index_tree_key(t, index, values)
-		tree := &t.indexes[index].tree
-		// A UNIQUE key without NULL belongs to one row (the uniqueness check ran
-		// before), so it is filed in one descent, as before slots existed; a key
-		// others may share is looked up first and the row joins its slot.
-		shared := !t.indexes[index].unique || has_null
-		node: ^Index_Node
-		if shared do node = rbtree.find(tree^, key)
-		if node != nil {
-			index_slot_add(&node.value, id)
+		key, _ := index_tree_key(t, index, values)
+		// One descent files the key or finds it: a new key is copied into the key
+		// store at its exact length, and a row joins the slot of a key others
+		// hold.
+		slot, inserted, insert_err := ib_upsert(&t.indexes[index].tree, key, t.keys.allocator)
+		if insert_err != nil do return errf(.Out_Of_Memory, "cannot grow index %s", t.indexes[index].schema.name)
+		if inserted {
+			slot^ = Index_Slot{first = id}
 		} else {
-			// A new key is copied into the arena at its exact length; a key
-			// already filed copies nothing.
-			stored := make([]u8, len(key), t.arena_allocator)
-			copy(stored, key)
-			if _, _, insert_err := rbtree.upsert(tree, string(stored), Index_Slot{first = id}); insert_err != nil {
-				return errf(.Out_Of_Memory, "cannot grow index %s", t.indexes[index].schema.name)
-			}
+			index_slot_add(slot, id)
 		}
 		if t.indexes[index].int_keyed do index_ints_put(&t.indexes[index], values, id)
 	}
@@ -590,14 +480,10 @@ table_index_remove_row :: proc(t: ^Table, index: int, values: []Value, id: Row_I
 		key := index_entry_key(t, index, values, id)
 		table_index_remove_key(t, index, key)
 	} else {
-		tree := &t.indexes[index].tree
 		key, _ := index_tree_key(t, index, values)
-		if node := rbtree.find(tree^, key); node != nil {
-			if index_slot_remove(&node.value, id) {
-				delete(node.value.more)
-				rbtree.remove_node(tree, node, false)
-			}
-		}
+		// A failed copy leaves the row filed; the next write that reaches the key
+		// copies it again.
+		_ = ib_remove_id(&t.indexes[index].tree, key, id)
 		if t.indexes[index].int_keyed do index_ints_remove(&t.indexes[index], values, id)
 	}
 	table_index_map_remove(t, index, values, id)
@@ -663,8 +549,10 @@ Table :: struct {
 	// for a reader (table_cow_clone): values stored before it may be a reader's
 	// too, so the table does not free them while the store is shared.
 	shared_before:   u64,
-	arena:           virtual.Arena,
+	// arena_allocator is the table's arena (the schema, the index keys), kept
+	// by `keys` and shared with every table that shares the trees (Key_Store).
 	arena_allocator: mem.Allocator,
+	keys:            ^Key_Store,
 	store:           ^Row_Store,
 	// refs counts the owners of this table object: the store, and every read
 	// transaction that opened while it was current. A commit that has to change
@@ -706,11 +594,13 @@ table_create :: proc(schema: ^Table_Schema) -> (^Table, Error) {
 	}
 	t := new(Table)
 	t.refs = 1
-	if arena_err := virtual.arena_init_growing(&t.arena); arena_err != .None {
+	keys, keys_err := key_store_make()
+	if keys_err != nil {
 		free(t)
-		return nil, errf(.Out_Of_Memory, "cannot create the table arena: %v", arena_err)
+		return nil, errf(.Out_Of_Memory, "cannot create the table arena: %v", keys_err)
 	}
-	t.arena_allocator = arena_allocator_guarded(&t.arena)
+	t.keys = keys
+	t.arena_allocator = keys.allocator
 	t.schema = schema_copy(&normalized, t.arena_allocator)
 	t.store = new(Row_Store)
 	t.store.refs = 1
@@ -775,7 +665,7 @@ table_destroy :: proc(t: ^Table) {
 	page_rows_close(t.paged)
 	if len(t.index_dir) > 0 do delete(t.index_dir)
 	delete(t.key_scratch)
-	virtual.arena_destroy(&t.arena)
+	key_store_release(t.keys)
 	if t.store != nil do row_store_release(t.store)
 	free(t)
 }
@@ -1215,7 +1105,7 @@ table_index_map_free :: proc(t: ^Table, index: int) {
 // --- Index backends --------------------------------------------------------
 
 // table_index_put stores one entry. A paged index writes it to the B+tree of
-// pages; a memory index upserts the rbtree.
+// pages; a memory index files the key in its tree.
 @(private)
 table_index_put :: proc(t: ^Table, index: int, key: string, id: Row_Id) -> Error {
 	if t.indexes[index].pages != nil {
@@ -1238,11 +1128,7 @@ table_index_remove_key :: proc(t: ^Table, index: int, key: string) {
 table_index_count :: proc(t: ^Table, index: int) -> u64 {
 	if t.indexes[index].pages != nil do return ordered_entries(t.indexes[index].pages)
 	count: u64
-	node := rbtree.first(&t.indexes[index].tree)
-	for node != nil {
-		count += 1 + u64(len(node.value.more))
-		node = node_next(node)
-	}
+	for c := ib_first(&t.indexes[index].tree); c.valid; c.valid = ib_advance(&c) do count += 1 + u64(len(ib_slot(&c).more))
 	return count
 }
 
@@ -1384,57 +1270,6 @@ append_be_u64 :: proc(w: ^Byte_Writer, v: u64) {
 	)
 }
 
-// node_next returns the in-order successor of a node.
-@(private)
-node_next :: proc(n: ^Index_Node) -> ^Index_Node {
-	if n._right != nil {
-		next := n._right
-		for next._left != nil do next = next._left
-		return next
-	}
-	current := n
-	parent := current._parent
-	for parent != nil && current == parent._right {
-		current = parent
-		parent = parent._parent
-	}
-	return parent
-}
-
-// node_prev returns the in-order predecessor of a node, so an index can be read
-// backwards without materializing it.
-@(private)
-node_prev :: proc(n: ^Index_Node) -> ^Index_Node {
-	if n._left != nil {
-		prev := n._left
-		for prev._right != nil do prev = prev._right
-		return prev
-	}
-	current := n
-	parent := current._parent
-	for parent != nil && current == parent._left {
-		current = parent
-		parent = parent._parent
-	}
-	return parent
-}
-
-// lower_bound returns the first node whose key is >= `key`.
-@(private)
-lower_bound :: proc(tree: ^Index_Tree, key: string) -> ^Index_Node {
-	n := tree._root
-	best: ^Index_Node = nil
-	for n != nil {
-		if tree._cmp_fn(key, n.key) != .Greater {
-			best = n
-			n = n._left
-		} else {
-			n = n._right
-		}
-	}
-	return best
-}
-
 // --- Lookup ----------------------------------------------------------------
 
 // table_index_lookup returns every row whose indexed columns equal `values`.
@@ -1459,11 +1294,9 @@ table_index_lookup :: proc(t: ^Table, index: int, values: []Value) -> [dynamic]R
 		return ordered_lookup_prefix(t.indexes[index].pages, prefix)
 	}
 	ids := make([dynamic]Row_Id)
-	node := lower_bound(&t.indexes[index].tree, prefix)
-	for node != nil {
-		if !strings.has_prefix(node.key, prefix) do break
-		index_slot_append(&ids, node.value)
-		node = node_next(node)
+	for c := ib_lower_bound(&t.indexes[index].tree, prefix); c.valid; c.valid = ib_advance(&c) {
+		if !strings.has_prefix(ib_key(&c), prefix) do break
+		index_slot_append(&ids, ib_slot(&c)^)
 	}
 	return ids
 }
@@ -1476,12 +1309,9 @@ table_index_scan_prefix :: proc(t: ^Table, index: int, prefix: string) -> [dynam
 		return ordered_lookup_prefix(t.indexes[index].pages, prefix)
 	}
 	ids := make([dynamic]Row_Id)
-	tree := &t.indexes[index].tree
-	node := lower_bound(tree, prefix)
-	for node != nil {
-		if !strings.has_prefix(node.key, prefix) do break
-		index_slot_append(&ids, node.value)
-		node = node_next(node)
+	for c := ib_lower_bound(&t.indexes[index].tree, prefix); c.valid; c.valid = ib_advance(&c) {
+		if !strings.has_prefix(ib_key(&c), prefix) do break
+		index_slot_append(&ids, ib_slot(&c)^)
 	}
 	return ids
 }
@@ -1501,16 +1331,15 @@ table_index_scan :: proc(
 	}
 	ids := make([dynamic]Row_Id)
 	tree := &t.indexes[index].tree
-	node := start == "" ? rbtree.first(tree) : lower_bound(tree, start)
-	for node != nil {
+	for c := start == "" ? ib_first(tree) : ib_lower_bound(tree, start); c.valid; c.valid = ib_advance(&c) {
+		key := ib_key(&c)
 		if end != "" {
-			order := index_cmp(node.key, end)
-			if strings.has_prefix(node.key, end) do order = .Equal
+			order := index_cmp(key, end)
+			if strings.has_prefix(key, end) do order = .Equal
 			if order == .Greater do break
 			if order == .Equal && !inclusive_end do break
 		}
-		index_slot_append(&ids, node.value)
-		node = node_next(node)
+		index_slot_append(&ids, ib_slot(&c)^)
 	}
 	return ids
 }
@@ -1855,45 +1684,6 @@ table_insert_borrowed :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
 	return ERROR_NONE
 }
 
-// index_tree_clone copies an index tree into a tree of the same shape: every node
-// and every key is copied, nothing is compared and nothing is rebalanced. It is
-// what makes a snapshot cost a copy per entry instead of a lookup and an insert
-// per entry, which is where freezing a table used to spend its time.
-@(private)
-index_tree_clone :: proc(source: ^Index_Tree, target: ^Index_Tree, keys: mem.Allocator) {
-	target.user_data = source.user_data
-	target.on_remove = source.on_remove
-	target._cmp_fn = source._cmp_fn
-	// The target keeps its own node allocator: its nodes are its pool's.
-	target._size = source._size
-	target._root = index_node_clone(source._root, nil, target._node_allocator, keys)
-}
-
-@(private)
-index_node_clone :: proc(
-	node: ^Index_Node,
-	parent: ^Index_Node,
-	node_allocator: mem.Allocator,
-	key_allocator: mem.Allocator,
-) -> ^Index_Node {
-	if node == nil do return nil
-	// The rows of a slot are the clone's own: the source frees its list.
-	more: [dynamic]Row_Id
-	if len(node.value.more) > 0 {
-		more = make([dynamic]Row_Id, len(node.value.more))
-		copy(more[:], node.value.more[:])
-	}
-	copy := new_clone(Index_Node{
-		key = strings.clone(node.key, key_allocator),
-		value = Index_Slot{first = node.value.first, more = more},
-		_color = node._color,
-		_parent = parent,
-	}, node_allocator)
-	copy._left = index_node_clone(node._left, copy, node_allocator, key_allocator)
-	copy._right = index_node_clone(node._right, copy, node_allocator, key_allocator)
-	return copy
-}
-
 // index_lookup_clone copies the equality map of a HASH or DIRECT index. The keys
 // and the buckets are allocated the way table_index_map_add allocates them, so
 // table_index_map_free frees them the same way; the clone is independent of the
@@ -1940,25 +1730,46 @@ table_snapshot :: proc(source: ^Table) -> ^Table {
 		clone.next_sequence = source.next_sequence
 		return clone
 	}
-	schema := source.schema
-	clone, create_err := table_create(&schema)
-	if create_err.kind != .None {
-		error_free(&create_err)
-		return nil
-	}
-	// table_create opened its own store; hand it to the source's instead.
-	row_store_release(clone.store)
+	// The copy shares what it can and builds nothing it would throw away: the
+	// arena (its schema, its index keys), the row store, the blocks and the
+	// trees. Going through table_create made a new arena and a key store for it,
+	// 0.9-2.1 ms of a commit with a reader open, where the sharing took 12 us.
+	clone := new(Table)
+	if clone == nil do return nil
+	clone.refs = 1
+	clone.schema = source.schema
+	clone.keys = source.keys
+	key_store_acquire(clone.keys)
+	clone.arena_allocator = clone.keys.allocator
 	clone.store = source.store
 	row_store_acquire(clone.store)
 	clone.borrowed = true
 	clone.next_row_id = source.next_row_id
 	clone.next_sequence = source.next_sequence
 	clone.next_int_key = source.next_int_key
-	for _, index in clone.indexes {
-		if index >= len(source.indexes) do break
-		index_tree_clone(&source.indexes[index].tree, &clone.indexes[index].tree, clone.arena_allocator)
-		index_lookup_clone(&source.indexes[index], &clone.indexes[index], context.allocator)
-		index_ints_clone(&source.indexes[index], &clone.indexes[index])
+	clone.indexes = make([]Index, len(source.indexes))
+	for &target, index in clone.indexes {
+		from := &source.indexes[index]
+		target = Index {
+			schema    = from.schema,
+			unique    = from.unique,
+			lookup    = make(map[string]^Index_Bucket),
+			int_keyed = from.int_keyed,
+		}
+		// A partial or expression index evaluates its own parsed copy.
+		if from.exprs != nil {
+			exprs, exprs_err := index_exprs_make(from.schema)
+			if exprs_err.kind != .None {
+				error_free(&exprs_err)
+				table_destroy(clone)
+				return nil
+			}
+			target.exprs = exprs
+		}
+		// The tree is shared: the clone copies a node when it first writes one.
+		ib_share(&target.tree, &from.tree)
+		index_lookup_clone(from, &target, context.allocator)
+		index_ints_clone(from, &target)
 	}
 	// The rows are shared, block by block: the copy lists the same blocks and
 	// copies one only when it changes it (Row_Blocks).

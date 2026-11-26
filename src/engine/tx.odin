@@ -2227,10 +2227,11 @@ tx_committed_key_taken :: proc(
 	}
 	if committed.indexes[index].pages == nil && committed.indexes[index].schema.algorithm == .Btree {
 		prefix := index_prefix_in(committed, index, values, tx.alloc)
-		for node := lower_bound(&committed.indexes[index].tree, prefix); node != nil; node = node_next(node) {
-			if !strings.has_prefix(node.key, prefix) do break
-			if holds(tx, committed, index, values, node.value.first, ignore, writes) do return true
-			for id in node.value.more do if holds(tx, committed, index, values, id, ignore, writes) do return true
+		for c := ib_lower_bound(&committed.indexes[index].tree, prefix); c.valid; c.valid = ib_advance(&c) {
+			if !strings.has_prefix(ib_key(&c), prefix) do break
+			slot := ib_slot(&c)
+			if holds(tx, committed, index, values, slot.first, ignore, writes) do return true
+			for id in slot.more do if holds(tx, committed, index, values, id, ignore, writes) do return true
 		}
 		return false
 	}
