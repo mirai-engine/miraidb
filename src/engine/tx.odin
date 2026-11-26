@@ -1511,7 +1511,9 @@ tx_next_int_key :: proc(table: ^Table, writes: ^Table_Writes, position: int) -> 
 			_, updated := writes.updates[id]
 			return deleted || updated
 		}
-		largest, found = table_largest_int(table, position, writes != nil ? staged : nil, writes)
+		indexed: bool
+		largest, found, indexed = table_largest_int_indexed(table, position, writes != nil ? staged : nil, writes)
+		if !indexed do largest, found = table_largest_int(table, position, writes != nil ? staged : nil, writes)
 	}
 	if writes != nil {
 		weigh := proc(values: []Value, position: int, largest: ^i64, found: ^bool) {

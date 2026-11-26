@@ -214,3 +214,52 @@ test_integer_keys_table_answers_as_a_map :: proc(t: ^testing.T) {
 		testing.expect(t, found && got == id)
 	}
 }
+
+// An INSERT that leaves the INTEGER PRIMARY KEY out takes one past the largest
+// one held. That is read off the index now, walking back from past the
+// numbers, where every such insert walked every row; it has to answer as the
+// walk does, negatives, deletes and a transaction's own writes included.
+@(test)
+test_the_next_integer_key_comes_from_the_index :: proc(t: ^testing.T) {
+	conn := ik_open(t)
+	if conn == nil do return
+	defer db.embed_close(conn)
+	ik_ok(t, conn, "CREATE TABLE p (id INTEGER PRIMARY KEY, v TEXT)")
+	ik_ok(t, conn, "INSERT INTO p (id, v) VALUES (-5, 'a')")
+	ik_ok(t, conn, "INSERT INTO p (v) VALUES ('b')")
+	ik_count(t, conn, "SELECT id FROM p WHERE v = 'b'", -4)
+	ik_ok(t, conn, "WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 500) INSERT INTO p (id, v) SELECT i * 3, 'x' FROM s")
+	// The largest goes; the next is one past the largest left.
+	ik_ok(t, conn, "DELETE FROM p WHERE id = 1500")
+	ik_ok(t, conn, "INSERT INTO p (v) VALUES ('c')")
+	ik_count(t, conn, "SELECT id FROM p WHERE v = 'c'", 1498)
+	// In a transaction, its own delete and its own inserts count. (The checks
+	// read through the store, which waits for the transaction: they come after
+	// the commit.)
+	ik_ok(t, conn, "BEGIN")
+	ik_ok(t, conn, "DELETE FROM p WHERE id >= 1490")
+	ik_ok(t, conn, "INSERT INTO p (v) VALUES ('d')")
+	ik_ok(t, conn, "INSERT INTO p (id, v) VALUES (9000, 'e')")
+	ik_ok(t, conn, "INSERT INTO p (v) VALUES ('f')")
+	ik_ok(t, conn, "COMMIT")
+	ik_count(t, conn, "SELECT id FROM p WHERE v = 'd'", 1489)
+	ik_count(t, conn, "SELECT id FROM p WHERE v = 'f'", 9001)
+
+	// The index and the walk agree on the stored rows.
+	table := conn.store.tables["p"]
+	walked, walked_found := db.table_largest_int(table, 0)
+	indexed, indexed_found, ok := db.table_largest_int_indexed(table, 0)
+	testing.expect(t, ok)
+	testing.expect_value(t, indexed_found, walked_found)
+	testing.expect_value(t, indexed, walked)
+	testing.expect_value(t, indexed, 9001)
+	// Emptied, the table starts again at one.
+	ik_ok(t, conn, "DELETE FROM p")
+	ik_ok(t, conn, "INSERT INTO p (v) VALUES ('g')")
+	ik_count(t, conn, "SELECT id FROM p WHERE v = 'g'", 1)
+	// Without an index on the column there is nothing to read: the walk answers.
+	ik_ok(t, conn, "CREATE TABLE q (n INTEGER, v TEXT)")
+	_, _, q_ok := db.table_largest_int_indexed(conn.store.tables["q"], 0)
+	testing.expect(t, !q_ok)
+	testing.expect_value(t, scalar(t, conn.store, "PRAGMA integrity_check").s, "ok")
+}

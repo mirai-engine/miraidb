@@ -1871,6 +1871,53 @@ table_max_int :: proc(t: ^Table, column: int) -> i64 {
 	return best
 }
 
+// table_largest_int_indexed answers table_largest_int from an index over the
+// column alone, when the table has one: its keys are in order, numbers under
+// tag 0x02 (write_key_number) and every other kind after them or before, so
+// the largest integer is found walking back from the first key past the
+// numbers. Every INSERT that left an INTEGER PRIMARY KEY out walked all the
+// rows for it: 1 ms over 50 000 rows, the whole cost of such a commit, where
+// SQLite reads the last entry of its tree. `ok` is false without such an
+// index, or when the walk meets more than a few keys it cannot use (reals, or
+// rows the transaction changed), and the caller scans.
+table_largest_int_indexed :: proc(t: ^Table, column: int, skip: proc(id: Row_Id, user: rawptr) -> bool = nil, user: rawptr = nil) -> (largest: i64, found: bool, ok: bool) {
+	if t.paged != nil do return
+	for &index in t.indexes {
+		if index.pages != nil || index.schema.algorithm != .Btree || !index_is_plain(index.schema) do continue
+		if len(index.schema.columns) != 1 || index.schema.columns[0] != column do continue
+		if column < len(t.schema.columns) && len(t.schema.columns[column].collation) > 0 do continue
+		// The first key past the numbers: the first of any kind tagged above 0x02.
+		past_numbers := [1]u8{0x03}
+		c := ib_lower_bound(&index.tree, string(past_numbers[:]))
+		if c.valid {
+			ib_prev(&c)
+		} else {
+			c = ib_last(&index.tree)
+		}
+		for steps := 0; c.valid; steps += 1 {
+			if steps == 64 do return 0, false, false
+			key := ib_key(&c)
+			if len(key) == 0 || key[0] != 0x02 do return 0, false, true
+			slot := ib_slot(&c)
+			best: i64
+			held := false
+			consider :: proc(t: ^Table, column: int, id: Row_Id, skip: proc(id: Row_Id, user: rawptr) -> bool, user: rawptr, best: ^i64, held: ^bool) {
+				if skip != nil && skip(id, user) do return
+				row, exists := table_memory_row(t, id)
+				if !exists || row.deleted_seq != 0 || column >= len(row.values) || row.values[column].kind != .Int do return
+				if !held^ || row.values[column].i > best^ do best^ = row.values[column].i
+				held^ = true
+			}
+			consider(t, column, slot.first, skip, user, &best, &held)
+			for id in slot.more do consider(t, column, id, skip, user, &best, &held)
+			if held do return best, true, true
+			ib_prev(&c)
+		}
+		return 0, false, true
+	}
+	return
+}
+
 // table_largest_int is the largest integer a memory table's live rows hold in
 // a column, negative ones included, and whether any row holds one. `skip` is
 // called with each row's id first: a transaction leaves out the rows it
