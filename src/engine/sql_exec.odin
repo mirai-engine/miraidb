@@ -98,7 +98,9 @@ sql_execute_priced :: proc(store: ^Store, sql: string, params: []Value) -> (Sql_
 // sql_run_statement dispatches an already parsed statement; prepared statements
 // reuse it to avoid parsing on every execution.
 @(private)
-sql_run_statement :: proc(store: ^Store, statement: Statement, params: []Value) -> (Sql_Result, Error) {
+// `names` is where the names a query's resolution rewrites live, for a tree
+// that outlives the run; the transaction's arena when it is not given.
+sql_run_statement :: proc(store: ^Store, statement: Statement, params: []Value, names: mem.Allocator = {}) -> (Sql_Result, Error) {
 	// A statement runs once the ballast is held again (D23).
 	if !oom_settle() do return {}, oom_error()
 	if refusal := store_refusal(store); refusal.kind != .None do return {}, refusal
@@ -108,7 +110,7 @@ sql_run_statement :: proc(store: ^Store, statement: Statement, params: []Value) 
 	switch stmt in statement {
 	case Select_Stmt, With_Stmt:
 		tx := tx_begin_read(store)
-		result, exec_err := sql_run_query(tx, stmt, params)
+		result, exec_err := sql_run_query(tx, stmt, params, names)
 		if exec_err.kind == .None {
 			if short := statement_shortfall(); short.kind != .None {
 				sql_result_destroy(&result)
@@ -129,7 +131,7 @@ sql_run_statement :: proc(store: ^Store, statement: Statement, params: []Value) 
 		// this very thread.
 		outer_tx, outer_thread := store.statement_tx, store.statement_thread
 		store.statement_tx, store.statement_thread = tx, sync.current_thread_id()
-		result, exec_err := sql_exec_mutation(tx, stmt, params)
+		result, exec_err := sql_exec_mutation(tx, stmt, params, names)
 		store.statement_tx, store.statement_thread = outer_tx, outer_thread
 		// A statement that needed the ballast (D23), or that could not read a
 		// page (D8), is taken back whole.
@@ -374,7 +376,8 @@ statement_shortfall :: proc() -> Error {
 // sql_run_statement_in_tx dispatches an already parsed statement inside a
 // transaction.
 @(private)
-sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sql_Result, Error) {
+// `names` is as sql_run_statement takes it.
+sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value, names: mem.Allocator = {}) -> (Sql_Result, Error) {
 	if !oom_settle() do return {}, oom_error()
 	if refusal := store_refusal(tx.store); refusal.kind != .None do return {}, refusal
 	// A statement a trigger runs leaves the failure to the one that fired it.
@@ -383,7 +386,7 @@ sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value) 
 	defer aggregate_scope_leave(previous)
 	switch stmt in statement {
 	case Select_Stmt, With_Stmt:
-		result, err := sql_run_query(tx, stmt, params)
+		result, err := sql_run_query(tx, stmt, params, names)
 		if err.kind == .None {
 			if short := statement_shortfall(); short.kind != .None {
 				sql_result_destroy(&result)
@@ -400,7 +403,7 @@ sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value) 
 		// RAISE(FAIL) under it keeps the rows of that outer statement.
 		outer := tx.trigger_depth == 0
 		if outer do tx.keep_partial = false
-		result, err := sql_exec_mutation(tx, stmt, params)
+		result, err := sql_exec_mutation(tx, stmt, params, names)
 		taken_back := err.kind == .Out_Of_Memory
 		if err.kind == .None {
 			if short := statement_shortfall(); short.kind != .None {
@@ -421,7 +424,7 @@ sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value) 
 		}
 		return result, err
 	case Create_Table_Stmt, Alter_Table_Stmt, Create_Type_Stmt, Drop_Table_Stmt, Create_Index_Stmt, Drop_Index_Stmt, Create_View_Stmt, Drop_View_Stmt, Create_Policy_Stmt, Drop_Policy_Stmt, Truncate_Stmt, Create_Trigger_Stmt, Drop_Trigger_Stmt, Grant_Stmt, Create_Virtual_Table_Stmt, Load_Extension_Stmt:
-		return sql_exec_mutation(tx, stmt, params)
+		return sql_exec_mutation(tx, stmt, params, names)
 	case Listen_Stmt:
 		store_listen(tx.store, tx.store.session_owner, stmt.channel)
 		return Sql_Result{kind = .Ack, commit_seq = tx.store.commit_seq}, ERROR_NONE
@@ -692,7 +695,7 @@ sql_exec_vacuum :: proc(store: ^Store, stmt: Vacuum_Stmt) -> (Sql_Result, Error)
 	return Sql_Result{kind = .Ack, commit_seq = store.commit_seq}, ERROR_NONE
 }
 
-sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sql_Result, Error) {
+sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value, names: mem.Allocator = {}) -> (Sql_Result, Error) {
 	// A statement that writes an attached database runs in that database's
 	// transaction, which this one opens and ends.
 	if schema, object, local, attached := statement_attached_object(statement); attached {
@@ -702,7 +705,7 @@ sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sq
 		mark := tx_statement_begin(writer)
 		saved_target := writer.attach_target
 		writer.attach_target = object
-		result, err := sql_exec_mutation(writer, local, params)
+		result, err := sql_exec_mutation(writer, local, params, names)
 		writer.attach_target = saved_target
 		tx_statement_end(writer, mark, err.kind != .None)
 		return result, err
@@ -714,10 +717,10 @@ sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sq
 	case Insert_Stmt, Update_Stmt, Delete_Stmt, Create_Table_Stmt, Create_View_Stmt, Create_Index_Stmt, Drop_Table_Stmt, Drop_View_Stmt, Drop_Index_Stmt, Create_Trigger_Stmt, Alter_Table_Stmt:
 		// A name that is not there (or is already there, for a CREATE) is
 		// refused before anything is written (D37).
-		// The names it rewrites live in the transaction's arena: the heap kept
-		// them for good.
+		// The names it rewrites live in the transaction's arena (the heap kept
+		// them for good), or in the tree's own when the tree outlives the run.
 		statement := statement
-		if resolve_err := sql_resolve_names(tx, &statement, tx.alloc); resolve_err.kind != .None do return {}, resolve_err
+		if resolve_err := sql_resolve_names(tx, &statement, names.procedure != nil ? names : tx.alloc); resolve_err.kind != .None do return {}, resolve_err
 	}
 	// A write with CTEs materializes them for its own life, then runs as a
 	// plain write that reads them by name.
@@ -729,7 +732,7 @@ sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sq
 			if cte_err.kind != .None do return {}, cte_err
 			cte_scope_bind(tx, &scope, cte.name, table)
 		}
-		return sql_exec_mutation(tx, statement_without_ctes(statement), params)
+		return sql_exec_mutation(tx, statement_without_ctes(statement), params, names)
 	}
 	// A write to a table a program's module serves goes to the module.
 	target := ""
@@ -998,7 +1001,8 @@ sql_price :: proc(store: ^Store, result: ^Sql_Result) -> Error {
 prepared_execute :: proc(store: ^Store, prepared: ^Stmt_Prepared, params: []Value) -> (Sql_Result, Error) {
 	if prepared == nil do return {}, errf(.Invalid_Argument, "no prepared statement")
 	if prepared.is_pragma do return sql_exec_pragma(store, prepared.pragma_body, false)
-	result, exec_err := sql_run_statement(store, prepared.query.statement, params)
+	// The tree runs again: the names its resolution rewrites live with it.
+	result, exec_err := sql_run_statement(store, prepared.query.statement, params, arena_allocator_guarded(&prepared.query.arena))
 	if exec_err.kind != .None do return {}, exec_err
 	if price_err := sql_price(store, &result); price_err.kind != .None do return {}, price_err
 	return result, ERROR_NONE
@@ -1009,7 +1013,7 @@ prepared_execute :: proc(store: ^Store, prepared: ^Stmt_Prepared, params: []Valu
 prepared_execute_in_tx :: proc(tx: ^Tx, prepared: ^Stmt_Prepared, params: []Value) -> (Sql_Result, Error) {
 	if prepared == nil do return {}, errf(.Invalid_Argument, "no prepared statement")
 	if prepared.is_pragma do return sql_exec_pragma(tx.store, prepared.pragma_body, tx.locked, tx)
-	return sql_run_statement_in_tx(tx, prepared.query.statement, params)
+	return sql_run_statement_in_tx(tx, prepared.query.statement, params, arena_allocator_guarded(&prepared.query.arena))
 }
 
 // --- DESCRIBE --------------------------------------------------------------
@@ -1682,10 +1686,11 @@ rowid_value :: proc(source: Source) -> (Value, bool) {
 
 // sql_run_query executes a plain query or one prefixed with common table
 // expressions, which are materialized for the life of the statement.
-sql_run_query :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sql_Result, Error) {
+sql_run_query :: proc(tx: ^Tx, statement: Statement, params: []Value, names: mem.Allocator = {}) -> (Sql_Result, Error) {
 	// A name that is not there is refused before a row is read (D37).
 	statement := statement
-	if resolve_err := sql_resolve_names(tx, &statement, tx.alloc); resolve_err.kind != .None do return {}, resolve_err
+	resolve_alloc := names.procedure != nil ? names : tx.alloc
+	if resolve_err := sql_resolve_names(tx, &statement, resolve_alloc); resolve_err.kind != .None do return {}, resolve_err
 	if select_stmt, ok := statement.(Select_Stmt); ok {
 		return sql_exec_select(tx, select_stmt, params)
 	}
