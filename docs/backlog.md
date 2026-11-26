@@ -34,7 +34,7 @@ Rules for this file:
 | R3 | closed: a prune visits the rows that hold a version or are a tombstone | — | — |
 | R4 | closed: a stored row is one allocation; a full hand-over measured and not worth it | — | — |
 | R6 | closed: a statement's fixed cost, a rowid read and a scan's per-row lists | — | — |
-| R7 | a commit with a reader open copies the table it writes, in one pass, its index nodes from a pool | share the structure instead of copying it | L |
+| R7 | closed: a reader shares the rows by block, the index trees and the table's arena; a commit with a reader open is 0.19 ms over 50 000 rows, gated at 1 ms by `scripts/bench.py` | — | — |
 | D2 | overlap on an `rtree` table is a scan | node pages and a descent | M |
 | D3 | closed: a retention per store (`PRAGMA history_retention`), applied after each commit; `AS OF` on every table of a join | — | — |
 | D4 | a table with a secondary index re-encodes the `.sqlite` mirror | patch the index b-trees | L |
@@ -134,6 +134,28 @@ The parity gate holds four SQL workloads to their baseline, and
 writes included.
 
 ## R7 — The copy a commit makes for a reader
+
+**Closed.** A commit that changes a table a reader holds shares with it what it
+does not change: the rows by block (`Row_Blocks`), each index's tree by node
+(`Index_Tree`, a B+tree copied on write along the path to a key, in
+`src/engine/index_btree.odin`), the integer keys by page (`Int_Keys`) and the
+table's arena, which holds the schema and the index keys and lives as long as the
+last table that shares it (`Key_Store`). The copy of the table itself is a
+header, built without `table_create`, which made two new arenas for it. Over
+50 000 rows the commit went from 10-21 ms to 0.18-0.19 ms, and from 3.9-4.1 ms to
+0.14-0.16 ms over 20 000; `scripts/bench.py --check` builds 50 000 rows three
+times and fails when the median passes 1 ms. On the way, an INSERT that left an
+INTEGER PRIMARY KEY out walked every row for the largest key, 1 ms of each such
+commit over 50 000 rows: the key is read off the column's index now, walking
+back from past the numbers (`table_largest_int_indexed`), and a commit with no
+reader open over 50 000 rows is 47-116 us. Against the build before, the parity
+inserts with an index per column are 0.94-0.95x, the unique ones 0.98 (text) and
+1.04 (u64), the updates 1.00-1.01. `test_index_tree_answers_as_a_sorted_map`,
+`test_an_index_shares_its_tree_with_a_reader` and
+`test_the_next_integer_key_comes_from_the_index` cover them; the HASH and DIRECT
+equality maps are still copied, being rare.
+
+The history of the item:
 
 **Now.** A commit that changes a table a reader holds copies it
 (`table_cow_clone`), so the reader keeps a table nobody writes. Measured after

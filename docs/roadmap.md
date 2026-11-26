@@ -28,7 +28,6 @@ that way.
 | # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
 | 2 | **R2 — fixed-size index keys** | The index filters are under the reference since a key files its rows under one entry; an insert is 0.76–0.86× it with an index per column and 1.4–1.6× with one unique index. The write path by stage is in RESULTS.md (2026-11-25); its five candidates took inserts from 1.2–2.7× and updates from 2.6–2.8×. The six workloads at or under the reference are held under 1.10x of it by `scripts/parity.py`; an update is 1.05–1.3× it. Next: what is left of the unique insert and the update. | M | — |
-| 5 | **R7 — share a table with its readers** | A commit with a reader open shares the rows by block and copies the index trees: 10.7–13.7 ms over 50 000 rows, 8–10 of it the trees. Next: an index tree that shares its nodes. | L | — |
 | 6 | **D12 — module sandbox** | A module is a process with a work budget; the reference runs modules deterministically with enforced limits. | L | — |
 | 7 | **D16 — generated clients** | Deferred by months: generate the Python binding from the catalog, then a second language. Until then the C ABI, the `sqlite3_*` face and the Python wrapper stay gated, so a binding is a thin layer when it comes ([backlog](backlog.md#d16--clients-generated-from-the-catalog)). | M | — |
 
@@ -68,7 +67,7 @@ with peer-to-peer sync; its networked phases build on items 27 and 28.
    and holds a workload that reached the reference under 1.10x of it.
 2. **S8**, then **D37**, **D4** and **D36**.
 3. **D39**, then **D40**.
-4. **R7**, the disk workloads and the depth items of track C.
+4. The disk workloads and the depth items of track C.
 5. **D15, D14** and the release gates, in that order; **D34** when its image is
    ready.
 
@@ -89,7 +88,7 @@ the CI gate checks; they are not a comparison with the reference.
 |---|---|---|
 | Insert throughput | 46 838 /s on the 20k gate (baseline 42 219); 54 580 /s over 50k, run directly | not worse on the same hardware. CI fails on bytes per row (10%) only, and reports wall clock twice per run, because this machine alone moved a metric by 30x with no code change; `--strict-time` enforces 10% on a quiet machine |
 | Read transaction, anyone reading | **1.5 µs** on the gate (20 000 rows, warm); opening one after a commit is **6.2 µs**: it copies nothing | costs one reference per table |
-| Commit with a read open | **7.2 ms** over 20 000 rows on the gate (4.4–4.7 ms on Windows; 13–17 ms over 50 000): it copies the table it writes and leaves the old one to the reader (R7) | the copy is the rows of the table written, and only while a reader is open |
+| Commit with a read open | **0.19 ms** over 50 000 rows (0.15 over 20 000): it shares the rows by block, the index trees by node and the arena with the reader, and copies what it writes (R7) | under 1 ms over 50 000 rows, a gate of `scripts/bench.py --check` |
 | Commit record | one record, CRC32C, group commit | durability never traded for speed silently |
 | Compaction | 0.48 s for 50k rows, one file left | same |
 | Memory per row | `Row` 80 B, `Value` 24 B | no growth without a written reason |

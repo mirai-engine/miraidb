@@ -616,6 +616,7 @@ listed in `docs/status.md` and run by `scripts/ci.py` (27 gates).
 | **Sanitizer pass (bounds and stack)** | The suite runs under `-sanitize:address` with no bounds or stack report; the heap half is backlog D34, because Odin's allocator on Windows bypasses the sanitizer's interception (verified with a deliberate use-after-free). |
 | **Documentation consistency gate** | `scripts/docs_check.py`: version, test count, gate count, CLI commands, relative links, roadmap/backlog cross-references, orphan documents and the names the project does not use. Backlog D21. |
 | **Audit corrections** | Two items once written down as gaps (D7, D13) were already durable, two wrong answers in `IN`/`NOT IN` and `DISTINCT` aggregates were found and fixed with tests, and the capabilities that three documents understated (the README, the CLI usage and the SQLite matrix) were rewritten. |
+| **R7 — a table shared with its readers** | A commit to a table a reader holds shares the rows by block, the index trees by node (a B+tree copied on write along the path), the integer keys by page and the arena; 10-21 ms over 50 000 rows became 0.19 ms, gated at 1 ms by `scripts/bench.py --check`. The INSERT that leaves an INTEGER PRIMARY KEY out reads the largest key off the index instead of walking every row. |
 
 The three asks of the original plan — access from several processes, a per-term
 full-text index, and pages on disk — are all closed above. What remains is
