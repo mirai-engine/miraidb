@@ -16,7 +16,13 @@ package engine
 //   * the parent page, its parent, and a new root when a full page had to
 //     split, and
 //   * page 1, whose header carries the change counter, the database size and
-//     the free list, and whose cells name each table's root page.
+//     the free list, and whose cells name each table's root page, and
+//   * every index of a table the commit wrote, built again from the table's
+//     rows into pages of its own, the old ones going to the free list (D4).
+//     A row of an index is not patched in place: an index entry is the key
+//     itself, up to a page and more of it, and its tree splits by keys, not
+//     rowids. An index costs its own size per commit, the file's other trees
+//     nothing.
 //
 // Everything else stays where it is. Before a page is touched its original goes
 // into a rollback journal in SQLite's own format, so an interrupted commit
@@ -26,11 +32,13 @@ package engine
 //
 // What it cannot patch, it re-encodes:
 //
-//   * a table with no single INTEGER primary key: SQLite's rowid is the only
-//     thing a leaf is ordered by, and without that key a row's rowid is not
-//     stable across exports,
-//   * a table with a secondary index: the index b-trees would go stale, and
-//     updating them is the page-store work D5 does, not this file's,
+//   * a WITHOUT ROWID table, which is an index b-tree,
+//   * a table without an INTEGER PRIMARY KEY whose rowids are not the engine's
+//     row ids (the import and the writer keep them so; a file the engine did
+//     not read that way is re-encoded once and then patched),
+//   * a table with an index the file names otherwise than the engine does (an
+//     automatic `sqlite_autoindex_*`, or one the engine could not build and
+//     keeps as the file had it, D24),
 //   * any schema change, truncation or drop: `sqlite_file_write` handles those.
 //
 // The layout is read back from the file, never from a sidecar: a file written by
@@ -89,6 +97,9 @@ Mirror_Table :: struct {
 	// delete can find the row it removes and an update that moves the key can
 	// remove the old row before writing the new one.
 	rowid_of: map[Row_Id]i64,
+	// indexes names the table's indexes in sqlite_master, which a commit that
+	// writes the table builds again.
+	indexes: [dynamic]string,
 }
 
 // Sqlite_Mirror is the layout of one mirrored file plus the pages a commit has
@@ -376,6 +387,17 @@ mirror_rowid_column :: proc(schema: Table_Schema) -> int {
 	return position
 }
 
+// mirror_row_rowid is the rowid a row of the table has in the file: its INTEGER
+// PRIMARY KEY (`column`), or, for a table without one, the engine's row id,
+// which the import took from the file.
+@(private)
+mirror_row_rowid :: proc(schema: Table_Schema, column: int, id: Row_Id, values: []Value) -> (i64, bool) {
+	if schema.without_rowid do return 0, false
+	if column < 0 do return i64(id), true
+	if column >= len(values) || values[column].kind != .Int do return 0, false
+	return values[column].i, true
+}
+
 // mirror_build reads a mirrored file and returns the map a commit patches.
 // `recover` is for a caller about to write the file (sqlite_file_open): a
 // reader must leave a journal alone, which may be a live writer's.
@@ -472,6 +494,7 @@ mirror_table_entry :: proc(m: ^Sqlite_Mirror, store: ^Store, file: ^Sqlite_File,
 		root = row.root,
 	}
 	entry.rowid_of = make(map[Row_Id]i64, alloc)
+	entry.indexes = make([dynamic]string, 0, 0, alloc)
 	pages := make([dynamic]int, 0, 8, alloc)
 	walker_ok := mirror_collect_leaves(m, row.root, &pages, 0)
 	if walker_ok {
@@ -510,29 +533,49 @@ mirror_table_entry :: proc(m: ^Sqlite_Mirror, store: ^Store, file: ^Sqlite_File,
 		for leaf in entry.leaves do delete(leaf.rowids)
 		delete(entry.leaves)
 		delete(entry.rowid_of)
+		delete(entry.indexes)
 		delete(entry.name, alloc)
 		return {}, false
 	}
 	if row.name == "sqlite_sequence" do return entry, true
 	table := store.tables[row.name]
-	entry.supported = mirror_rowid_column(table.schema) >= 0
-	if entry.supported {
-		for index in table.schema.indexes {
-			if !index.implicit do entry.supported = false
-		}
-	}
+	entry.supported = !table.schema.without_rowid
+	if entry.supported do entry.supported = mirror_table_indexes(m, table, &entry)
 	if entry.supported {
 		column := mirror_rowid_column(table.schema)
 		collected := make([dynamic]Row)
 		table_collect(table, &collected, max(u64))
 		for row2 in collected {
-			if column < len(row2.values) && row2.values[column].kind == .Int {
-				entry.rowid_of[row2.id] = row2.values[column].i
+			if rowid, ok := mirror_row_rowid(table.schema, column, row2.id, row2.values); ok {
+				entry.rowid_of[row2.id] = rowid
 			}
 		}
 		table_collect_release(table, &collected)
+		// Without an INTEGER PRIMARY KEY the row ids have to be the file's
+		// rowids, every one: a file whose rows the engine numbered otherwise is
+		// re-encoded, which writes them under the row ids.
+		if column < 0 do entry.supported = mirror_rowids_match(&entry)
 	}
 	return entry, true
+}
+
+// mirror_rowids_match says the file's rowids of a table are the rowids its
+// store rows map to, every one and no other.
+@(private)
+mirror_rowids_match :: proc(entry: ^Mirror_Table) -> bool {
+	count := 0
+	file_rowids := make(map[i64]bool, 64, context.temp_allocator)
+	for leaf in entry.leaves {
+		for rowid in leaf.rowids {
+			file_rowids[rowid] = true
+			count += 1
+		}
+	}
+	if count != len(entry.rowid_of) do return false
+	for _, rowid in entry.rowid_of {
+		if !file_rowids[rowid] do return false
+	}
+	return true
 }
 
 // mirror_table_free lets one table's place go.
@@ -541,7 +584,123 @@ mirror_table_free :: proc(m: ^Sqlite_Mirror, table: Mirror_Table) {
 	for leaf in table.leaves do delete(leaf.rowids)
 	delete(table.leaves)
 	delete(table.rowid_of)
+	for name in table.indexes do delete(name, m.alloc)
+	delete(table.indexes)
 	delete(table.name, m.alloc)
+}
+
+// mirror_table_indexes lists in `entry` the indexes the mirror builds again
+// when the table changes: every one sqlite_master names for it must be an
+// index of the engine's of the same name, and every index of the engine's but
+// the rowid's own (and a WITHOUT ROWID table's key) must be in sqlite_master.
+// Otherwise the file names an index the engine does not (an automatic one, a
+// kept one) and the table is re-encoded with the rest of the file.
+@(private)
+mirror_table_indexes :: proc(m: ^Sqlite_Mirror, table: ^Table, entry: ^Mirror_Table) -> bool {
+	alias := sqlite_rowid_alias(table)
+	for row in m.master {
+		if row.kind != "index" || !strings.equal_fold(row.table, table.schema.name) do continue
+		if _, found := sqlite_index_by_name(&table.schema, row.name); !found do return false
+		append(&entry.indexes, strings.clone(row.name, m.alloc))
+	}
+	for &index in table.schema.indexes {
+		if index.implicit && len(index.columns) == 1 && index.columns[0] == alias do continue
+		if sqlite_is_table_key(table, &index) do continue
+		if !sqlite_name_in(entry.indexes[:], index.name) do return false
+	}
+	return true
+}
+
+// MIRROR_INDEX_REBUILD_PAGES is the largest index (its pages, overflow pages
+// included) a commit builds again instead of re-encoding the file.
+MIRROR_INDEX_REBUILD_PAGES :: 16
+
+// mirror_index_bytes is about what an index's entries take: each key column's
+// bytes, and a few for the record's header, the rowid and the cell's pointer.
+@(private)
+mirror_index_bytes :: proc(index: ^Index_Schema, rows: []Sqlite_Export_Row) -> int {
+	total := 0
+	for row in rows {
+		total += 16
+		for column in index.columns {
+			if column < 0 || column >= len(row.values) {
+				total += 8
+				continue
+			}
+			value := row.values[column]
+			#partial switch value.kind {
+			case .String:
+				total += len(value.s)
+			case .Bytes:
+				total += len(value.bytes)
+			case:
+				total += 8
+			}
+		}
+	}
+	return total
+}
+
+// mirror_rebuild_indexes builds every index of a table the commit wrote again
+// from the store's rows: the pages of the old tree are staged as they are,
+// which puts them in the journal, and go to the free list; the new tree takes
+// its pages from there first. sqlite_master names the new root.
+@(private)
+mirror_rebuild_indexes :: proc(store: ^Store, m: ^Sqlite_Mirror, entry: ^Mirror_Table) -> bool {
+	if len(entry.indexes) == 0 do return true
+	table, known := store.tables[entry.name]
+	if !known do return false
+	column := mirror_rowid_column(table.schema)
+	collected := make([dynamic]Row)
+	table_collect(table, &collected, max(u64))
+	defer table_collect_release(table, &collected)
+	rows := make([dynamic]Sqlite_Export_Row, 0, len(collected))
+	defer delete(rows)
+	for row in collected {
+		rowid, ok := mirror_row_rowid(table.schema, column, row.id, row.values)
+		if !ok do return false
+		append(&rows, Sqlite_Export_Row{rowid = rowid, values = row.values})
+	}
+	sort_export_rows(rows[:])
+	view := Sqlite_File{data = m.image, page_size = u32(m.page_size), usable = u32(m.usable), alloc = m.alloc}
+	for name in entry.indexes {
+		master: ^Mirror_Master_Row
+		for &row in m.master {
+			if row.kind == "index" && row.name == name do master = &row
+		}
+		index, found := sqlite_index_by_name(&table.schema, name)
+		if master == nil || !found do return false
+		// What the keys come to, before any of it is built: past the bound the
+		// file is re-encoded, and the tree it would have built is not made and
+		// thrown away.
+		if mirror_index_bytes(&index, rows[:]) > MIRROR_INDEX_REBUILD_PAGES * m.usable do return false
+		old := make([dynamic]u32, 0, 8)
+		defer delete(old)
+		skip := proc(user: rawptr, rowid: i64, payload: []u8) -> bool { return true }
+		if !sqlite_walk(&view, u32(master.root), false, skip, nil, 0, &old) do return false
+		// A large index costs its size per commit, which is the file's or more
+		// for keys of a page and up (each with its overflow chain): past
+		// MIRROR_INDEX_REBUILD_PAGES the file is re-encoded instead.
+		if len(old) > MIRROR_INDEX_REBUILD_PAGES do return false
+		for page in old {
+			if !mirror_stage(m, int(page), mirror_page(m, int(page))) do return false
+		}
+		for page in old {
+			if !mirror_free_page(m, int(page)) do return false
+		}
+		w := Sqlite_Writer{page_size = m.page_size, usable = m.usable, mirror = m}
+		defer sqlite_writer_destroy(&w)
+		root := sqlite_write_index_tree(&w, table, index, rows[:], m.alloc, store, master.sql)
+		if root <= 0 || w.failed || len(w.staged_order) > MIRROR_INDEX_REBUILD_PAGES do return false
+		for page in w.staged_order {
+			if !mirror_stage(m, page, w.staged[page]) do return false
+		}
+		master.root = root
+		m.master_dirty = true
+		// The image grew or moved while the tree was built.
+		view.data = m.image
+	}
+	return true
 }
 
 // mirror_refresh brings the mirror up to `file`, which another connection
@@ -1558,10 +1717,6 @@ mirror_apply_commit :: proc(store: ^Store, m: ^Sqlite_Mirror, ops: []Store_Op) -
 			return true, ERROR_NONE
 		}
 		column := mirror_rowid_column(schema.schema)
-		if column < 0 {
-			m.fallback_reason = "no rowid column"
-			return true, ERROR_NONE
-		}
 		at, seen := groups[op.name]
 		if !seen {
 			at = len(tables)
@@ -1570,11 +1725,11 @@ mirror_apply_commit :: proc(store: ^Store, m: ^Sqlite_Mirror, ops: []Store_Op) -
 		}
 		switch op.kind {
 		case .Insert:
-			if column >= len(op.values) || op.values[column].kind != .Int {
+			rowid, keyed := mirror_row_rowid(schema.schema, column, op.row_id, op.values)
+			if !keyed {
 				m.fallback_reason = "insert without an integer key"
 				return true, ERROR_NONE
 			}
-			rowid := op.values[column].i
 			payload := sqlite_encode_record(op.values, column, m.alloc)
 			if payload == nil do return true, ERROR_NONE
 			append(&tables[at].edits, Mirror_Edit{rowid = rowid, payload = payload})
@@ -1591,8 +1746,8 @@ mirror_apply_commit :: proc(store: ^Store, m: ^Sqlite_Mirror, ops: []Store_Op) -
 				m.fallback_reason = "update without a rowid"
 				return true, ERROR_NONE
 			}
-			if column >= len(op.values) || op.values[column].kind != .Int do return true, ERROR_NONE
-			new_rowid := op.values[column].i
+			new_rowid, keyed := mirror_row_rowid(schema.schema, column, op.row_id, op.values)
+			if !keyed do return true, ERROR_NONE
 			if new_rowid != old {
 				append(&tables[at].edits, Mirror_Edit{remove = true, rowid = old})
 			}
@@ -1684,25 +1839,22 @@ mirror_apply_commit :: proc(store: ^Store, m: ^Sqlite_Mirror, ops: []Store_Op) -
 				return true, ERROR_NONE
 			}
 		}
+		if !mirror_rebuild_indexes(store, m, table) {
+			m.fallback_reason = "index"
+			return true, ERROR_NONE
+		}
 		// The store's map follows the file: an insert teaches it a rowid, a
 		// delete forgets one, and an update may move one.
 		for op in ops {
 			if op.name != group.name do continue
 			switch op.kind {
-			case .Insert:
-				if column := mirror_rowid_column(store.tables[op.name].schema); column >= 0 {
-					if column < len(op.values) && op.values[column].kind == .Int {
-						table.rowid_of[op.row_id] = op.values[column].i
-					}
+			case .Insert, .Update:
+				schema := store.tables[op.name].schema
+				if rowid, ok := mirror_row_rowid(schema, mirror_rowid_column(schema), op.row_id, op.values); ok {
+					table.rowid_of[op.row_id] = rowid
 				}
 			case .Delete:
 				delete_key(&table.rowid_of, op.row_id)
-			case .Update:
-				if column := mirror_rowid_column(store.tables[op.name].schema); column >= 0 {
-					if column < len(op.values) && op.values[column].kind == .Int {
-						table.rowid_of[op.row_id] = op.values[column].i
-					}
-				}
 			case .Create_Table, .Truncate, .Drop_Table, .Create_Index, .Drop_Index, .Alter_Table:
 			}
 		}

@@ -640,7 +640,11 @@ sqlite_share_catch_up :: proc(conn: ^Embed_Conn, file: ^Sqlite_File, hashes: map
 			ok = false
 			break reload
 		}
-		rows, rows_err := sqlite_table_rows(file, table, context.allocator)
+		// A table without an INTEGER PRIMARY KEY keeps the file's rowids, as
+		// the import does: they are the engine's row ids.
+		keeps_rowid := !table.without_rowid && table.pk_position < 0
+		rowids := make([dynamic]i64, 0, 16, context.temp_allocator)
+		rows, rows_err := sqlite_table_rows(file, table, context.allocator, keeps_rowid ? &rowids : nil)
 		if rows_err.kind != .None {
 			error_free(&rows_err)
 			ok = false
@@ -653,7 +657,10 @@ sqlite_share_catch_up :: proc(conn: ^Embed_Conn, file: ^Sqlite_File, hashes: map
 			}
 			delete(rows)
 		}
-		for row in rows {
+		for row, at in rows {
+			if keeps_rowid {
+				tx.explicit_row_id, tx.has_explicit_row_id = Row_Id(rowids[at]), true
+			}
 			if _, insert_err := tx_insert(tx, table.name, row); insert_err.kind != .None {
 				error_free(&insert_err)
 				ok = false

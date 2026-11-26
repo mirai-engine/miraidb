@@ -44,24 +44,48 @@ Sqlite_Writer :: struct {
 	pages:     [dynamic][]u8,
 	page_size: int,
 	usable:    int,
+	// mirror, when set, numbers the pages the mirror hands out (its free list,
+	// then the end of its file) instead of 1, 2, 3...: a tree is built into a
+	// file that has pages already. The pages wait in `staged`, in the order
+	// they were made, for the mirror to stage them; failed says the mirror had
+	// no page to give.
+	mirror:       ^Sqlite_Mirror,
+	staged:       map[int][]u8,
+	staged_order: [dynamic]int,
+	failed:       bool,
 }
 
 @(private)
 sqlite_writer_destroy :: proc(w: ^Sqlite_Writer) {
 	for page in w.pages do delete(page)
 	delete(w.pages)
+	for _, page in w.staged do delete(page)
+	delete(w.staged)
+	delete(w.staged_order)
 	w^ = {}
 }
 
 @(private)
 sqlite_writer_new_page :: proc(w: ^Sqlite_Writer) -> int {
 	page := make([]u8, w.page_size)
+	if w.mirror != nil {
+		number := mirror_alloc_page(w.mirror)
+		if number == 0 {
+			// The tree goes on into a page nobody keeps, and the caller gives up.
+			w.failed = true
+			number = -1 - len(w.staged_order)
+		}
+		w.staged[number] = page
+		append(&w.staged_order, number)
+		return number
+	}
 	append(&w.pages, page)
 	return len(w.pages) // 1-based page numbers
 }
 
 @(private)
 sqlite_writer_page :: proc(w: ^Sqlite_Writer, number: int) -> []u8 {
+	if w.mirror != nil do return w.staged[number]
 	return w.pages[number - 1]
 }
 
@@ -1102,6 +1126,12 @@ sqlite_file_image :: proc(store: ^Store, alloc := context.allocator) -> (image: 
 			rowid := next_rowid
 			if rowid_column >= 0 && rowid_column < len(row.values) {
 				if row.values[rowid_column].kind == .Int do rowid = row.values[rowid_column].i
+			} else if rowid_column < 0 && !table.schema.without_rowid {
+				// Without an INTEGER PRIMARY KEY the rowid is the engine's row
+				// id, which the import took from the file: the file keeps the
+				// rowids SQLite gave, and the mirror finds each row under its
+				// own. They used to be numbered again from 1 at every rewrite.
+				rowid = i64(row.id)
 			}
 			values := make([]Value, len(row.values), alloc)
 			copy(values, row.values)

@@ -1166,16 +1166,18 @@ sqlite_file_destroy :: proc(file: ^Sqlite_File) {
 }
 
 // sqlite_table_rows reads every row of one table in storage order. Values are
-// allocated from `alloc`.
-sqlite_table_rows :: proc(file: ^Sqlite_File, table: ^Sqlite_Table, alloc: mem.Allocator) -> ([][]Value, Error) {
+// allocated from `alloc`. `rowids`, when given, gets each row's rowid, in the
+// same order.
+sqlite_table_rows :: proc(file: ^Sqlite_File, table: ^Sqlite_Table, alloc: mem.Allocator, rowids: ^[dynamic]i64 = nil) -> ([][]Value, Error) {
 	rows := make([dynamic][]Value, 0, 16, alloc)
 	Ctx :: struct {
-		file:  ^Sqlite_File,
-		rows:  ^[dynamic][]Value,
-		table: ^Sqlite_Table,
-		alloc: mem.Allocator,
+		file:   ^Sqlite_File,
+		rows:   ^[dynamic][]Value,
+		rowids: ^[dynamic]i64,
+		table:  ^Sqlite_Table,
+		alloc:  mem.Allocator,
 	}
-	ctx := Ctx{file = file, rows = &rows, table = table, alloc = alloc}
+	ctx := Ctx{file = file, rows = &rows, rowids = rowids, table = table, alloc = alloc}
 	visit := proc(user: rawptr, rowid: i64, payload: []u8) -> bool {
 		ctx := cast(^Ctx)user
 		values, ok := sqlite_record(payload, ctx.alloc)
@@ -1198,6 +1200,7 @@ sqlite_table_rows :: proc(file: ^Sqlite_File, table: ^Sqlite_Table, alloc: mem.A
 			if values[ctx.table.pk_position].kind == .Null do values[ctx.table.pk_position] = value_int(rowid)
 		}
 		append(ctx.rows, values)
+		if ctx.rowids != nil do append(ctx.rowids, rowid)
 		return true
 	}
 	if !sqlite_walk(file, table.root_page, !table.without_rowid, visit, &ctx, 0) {
@@ -1320,7 +1323,12 @@ sqlite_import_tx :: proc(
 	for at in sqlite_import_order(file) {
 		table := &file.tables[at]
 		if len(table.columns) == 0 do continue
-		rows_of_table, rows_err := sqlite_table_rows(file, table, alloc)
+		// A rowid table without an INTEGER PRIMARY KEY keeps the file's rowids:
+		// the engine's row id is the rowid SQLite reads, and the mirror writes
+		// the row back under it.
+		keeps_rowid := !table.without_rowid && table.pk_position < 0
+		rowids := make([dynamic]i64, 0, 16, context.temp_allocator)
+		rows_of_table, rows_err := sqlite_table_rows(file, table, alloc, keeps_rowid ? &rowids : nil)
 		if rows_err.kind != .None do return tables, rows, rows_err
 		// The rows are inserted through SQL, which copies them.
 		defer {
@@ -1443,19 +1451,23 @@ sqlite_import_tx :: proc(
 		strings.write_string(&insert, "INSERT INTO ")
 		sqlite_write_ident(&insert, table.name)
 		strings.write_string(&insert, " (")
+		if keeps_rowid do strings.write_string(&insert, "rowid, ")
 		for column, i in table.columns {
 			if i > 0 do strings.write_string(&insert, ", ")
 			sqlite_write_ident(&insert, column.name)
 		}
 		strings.write_string(&insert, ") VALUES (")
+		if keeps_rowid do strings.write_string(&insert, "?, ")
 		for i in 0 ..< len(table.columns) {
 			if i > 0 do strings.write_string(&insert, ", ")
 			strings.write_string(&insert, "?")
 		}
 		strings.write_string(&insert, ")")
-		for row in rows_of_table {
-			values := make([]Value, len(table.columns), context.temp_allocator)
-			copy(values, row)
+		first := keeps_rowid ? 1 : 0
+		for row, row_at in rows_of_table {
+			values := make([]Value, len(table.columns) + first, context.temp_allocator)
+			if keeps_rowid do values[0] = value_int(rowids[row_at])
+			copy(values[first:], row)
 			if _, insert_err := sql_execute_in_tx_params(tx, strings.to_string(insert), values); insert_err.kind != .None {
 				return tables, rows, insert_err
 			}

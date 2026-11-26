@@ -10,7 +10,10 @@ and reads the mirror counters the engine reports in `PRAGMA stats`.
     python scripts/mirror_cost.py --check         # fail when a commit is not a patch
 
 The check is the point: a one-row commit must write a handful of pages, not the
-file. It is the twentieth-first CI gate.
+file. It is the twentieth-first CI gate. A second, smaller table has an index
+of its own: a commit that writes it builds that index again in pages of its own
+(D4), so it may write the index but not the file, and no commit may fall back
+to re-encoding the file (`mirror-rewrites`).
 """
 
 import argparse
@@ -40,6 +43,14 @@ def build(rows: int, text: int) -> None:
         f"INSERT INTO items (id, name, score) SELECT i, {filler}, i % 10 FROM n"
     )
     raw.execute(statement, (rows, text // 2, text) if text else (rows,))
+    # The indexed table: two indexes, one of them over two columns, one DESC.
+    raw.execute("CREATE TABLE tags (id INTEGER PRIMARY KEY, tag TEXT, n INTEGER)")
+    raw.execute("CREATE INDEX tags_tag ON tags (tag)")
+    raw.execute("CREATE INDEX tags_n ON tags (n DESC, tag)")
+    raw.execute(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 200) "
+        "INSERT INTO tags (id, tag, n) SELECT i, 'tag' || (i * 7 % 200), i % 13 FROM n"
+    )
     raw.commit()
     raw.close()
 
@@ -90,6 +101,9 @@ def main() -> int:
         f"INSERT INTO items (id, name, score) VALUES ({late}, 'late', 3)",
         f"UPDATE items SET name = 'renamed' WHERE id = {late}",
         "DELETE FROM items WHERE id = 5",
+        "INSERT INTO tags (id, tag, n) VALUES (1000, 'aaa first', 99)",
+        "UPDATE tags SET tag = 'zzz last', n = -1 WHERE id = 7",
+        "DELETE FROM tags WHERE id = 8",
     ):
         statement_pages, statement_rewrites = mirror_counters(run_statement(binary, sql))
         pages += max(statement_pages, 0)
@@ -104,6 +118,9 @@ def main() -> int:
     count = raw.execute("SELECT count(*) FROM items").fetchone()[0]
     renamed = raw.execute("SELECT name FROM items WHERE id = ?", (late,)).fetchone()
     deleted = raw.execute("SELECT count(*) FROM items WHERE id = 5").fetchone()[0]
+    # SQLite reads the rows through each index, so a stale entry would answer.
+    by_tag = [r[0] for r in raw.execute("SELECT id FROM tags INDEXED BY tags_tag WHERE tag IN ('aaa first', 'zzz last', 'tag56') ORDER BY tag")]
+    by_n = raw.execute("SELECT count(*), min(n), max(n) FROM tags INDEXED BY tags_n WHERE n > -5").fetchone()
     raw.close()
     shutil.rmtree(WORK, ignore_errors=True)
     if integrity != "ok":
@@ -112,6 +129,9 @@ def main() -> int:
     if count != options.rows or not renamed or renamed[0] != "renamed" or deleted != 0:
         print(f"mirror_cost: SQLite reads the wrong rows ({count}, {renamed}, {deleted})", file=sys.stderr)
         return 1
+    if by_tag != [1000, 7] or by_n != (200, -1, 99):
+        print(f"mirror_cost: SQLite reads the wrong rows through the indexes ({by_tag}, {by_n})", file=sys.stderr)
+        return 1
     if not options.check:
         return 0
     # Four commits (three patches plus the counters read) at four pages each is
@@ -119,9 +139,12 @@ def main() -> int:
     if pages <= 0:
         print("mirror_cost: no pages were written, so nothing was patched", file=sys.stderr)
         return 1
+    if rewrites != 0:
+        print(f"mirror_cost: {rewrites} commit(s) re-encoded the whole file", file=sys.stderr)
+        return 1
     if written >= file_bytes:
         print(
-            f"mirror_cost: three commits wrote {written} bytes for a {file_bytes}-byte file",
+            f"mirror_cost: six commits wrote {written} bytes for a {file_bytes}-byte file",
             file=sys.stderr,
         )
         return 1
