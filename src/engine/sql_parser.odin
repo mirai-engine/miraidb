@@ -51,6 +51,7 @@ Pending_Window :: struct {
 // sql_parse turns one SQL statement into a Query tree. The Query owns an arena
 // with every node; destroy it with query_destroy.
 sql_parse :: proc(source: string) -> (Query, Error) {
+	resolve_counted.parses += 1
 	q: Query
 	if !query_arena_take(&q.arena) {
 		return q, errf(.Out_Of_Memory, "cannot allocate the query arena")

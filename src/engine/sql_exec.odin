@@ -7021,6 +7021,7 @@ eval_raise :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 }
 
 eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
+	resolve_counted.function_names += 1
 	// A row value is taken apart by the comparison that holds it; reaching it
 	// here means it stands alone, which SQLite refuses with the same words.
 	if call.name == ROW_VALUE_CALL do return {}, errf(.Sql_Syntax, "row value misused")

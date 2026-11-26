@@ -324,6 +324,7 @@ plan_join_order :: proc(
 	stmt: Select_Stmt,
 	params: []Value,
 ) -> Plan_Order {
+	resolve_counted.plans += 1
 	relations := make([dynamic]Plan_Relation, 0, len(stmt.joins) + 1)
 	defer delete(relations)
 	append(&relations, plan_relation(store, tx, stmt.from, stmt.where_clause, nil, params))

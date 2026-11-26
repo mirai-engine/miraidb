@@ -78,6 +78,7 @@ Res_Cte :: struct {
 // one that is not there.
 sql_resolve_names :: proc(tx: ^Tx, statement: ^Statement, alloc := context.allocator) -> Error {
 	if tx == nil || statement == nil do return ERROR_NONE
+	resolve_counted.resolutions += 1
 	// A statement that writes an attached database names that database's
 	// objects: it is checked there, through the transaction that writes it when
 	// there is one.

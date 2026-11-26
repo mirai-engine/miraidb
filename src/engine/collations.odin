@@ -117,6 +117,7 @@ store_collation_count :: proc(store: ^Store) -> int {
 // It is the one place that decides what a collation name means, so a comparison in
 // SQL and a comparison in the C ABI cannot drift apart.
 collation_compare :: proc(store: ^Store, name: string, a: string, b: string) -> (int, bool) {
+	if len(name) > 0 do resolve_counted.collation_names += 1
 	// A built-in name the program replaced answers with its comparison.
 	if len(name) > 0 && collation_is_builtin(name) && store != nil && len(store.collations) > 0 {
 		for stored, def in store.collations {

@@ -437,6 +437,7 @@ NO_COLUMN :: -1
 
 // schema_column_index finds a column by name, case-insensitively.
 schema_column_index :: proc(schema: ^Table_Schema, name: string) -> (int, bool) {
+	resolve_counted.column_names += 1
 	for col, i in schema.columns {
 		if strings.equal_fold(col.name, name) do return i, true
 	}
