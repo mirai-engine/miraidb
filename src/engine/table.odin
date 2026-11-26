@@ -660,6 +660,10 @@ Table :: struct {
 	// apply_seq is the commit sequence of the change being applied, stamped on
 	// the versions it creates.
 	apply_seq:       u64,
+	// shared_before is the sequence of the commit that last copied this table
+	// for a reader (table_cow_clone): values stored before it may be a reader's
+	// too, so the table does not free them while the store is shared.
+	shared_before:   u64,
 	arena:           virtual.Arena,
 	arena_allocator: mem.Allocator,
 	store:           ^Row_Store,
@@ -761,7 +765,7 @@ table_destroy :: proc(t: ^Table) {
 			continue
 		}
 		if shared {
-			append(&t.store.pending, row)
+			row_store_defer(t.store, row)
 			continue
 		}
 		table_free_row(row)
@@ -791,6 +795,15 @@ row_store_shared :: proc(store: ^Row_Store) -> bool {
 	sync.lock(&store.mutex)
 	defer sync.unlock(&store.mutex)
 	return store.refs > 1
+}
+
+// row_store_defer hands the store a row whose values a snapshot may still
+// read; the last owner frees it. The list is taken under the lock, by a reader
+// ending on its own thread, so it is added to under the lock too.
+row_store_defer :: proc(store: ^Row_Store, row: Row) {
+	sync.lock(&store.mutex)
+	defer sync.unlock(&store.mutex)
+	append(&store.pending, row)
 }
 
 row_store_acquire :: proc(store: ^Row_Store) {
@@ -921,6 +934,15 @@ row_values_at :: proc(row: Row, seq: u64) -> ([]Value, bool) {
 // so a commit that deleted nothing moves no row.
 table_prune_versions :: proc(t: ^Table, before_seq: u64) {
 	if len(t.history) == 0 do return
+	// A commit while a reader was open gave the reader the table as it was and
+	// kept writing a copy that borrows the same values (table_cow_clone): the
+	// values an update then moved into history are the ones that reader reads.
+	// No read pins its sequence, so the prune can drop that history while the
+	// reader is still reading; the values go to the shared store then, freed
+	// when the last reader of them is gone. They were freed here, and a reader
+	// read freed memory. Values stored after the last copy (`shared_before`)
+	// are this table's alone and are freed as before.
+	shared := t.store != nil && t.shared_before > 0 && row_store_shared(t.store)
 	kept := 0
 	first_gone := len(t.rows)
 	for id in t.history {
@@ -931,7 +953,11 @@ table_prune_versions :: proc(t: ^Table, before_seq: u64) {
 		write := 0
 		for version in row.versions {
 			if version.deleted_seq != 0 && version.deleted_seq <= before_seq {
-				row_values_free(version.values)
+				if shared && version.created_seq < t.shared_before {
+					row_store_defer(t.store, Row{values = version.values})
+				} else {
+					row_values_free(version.values)
+				}
 				continue
 			}
 			row.versions[write] = version
@@ -943,7 +969,11 @@ table_prune_versions :: proc(t: ^Table, before_seq: u64) {
 			// array that held their history are freed with it. Forgetting them is
 			// what made INSERT OR REPLACE leave the replaced row behind for the life
 			// of the process (tools/leakcheck counted 48 bytes per statement).
-			row_values_free(row.values)
+			if shared && row.created_seq < t.shared_before {
+				row_store_defer(t.store, Row{values = row.values})
+			} else {
+				row_values_free(row.values)
+			}
 			delete(row.versions)
 			row.values = nil
 			row.versions = nil
@@ -1818,7 +1848,7 @@ table_truncate :: proc(t: ^Table) {
 		// are handed to the shared store, which frees them when the last reader is
 		// gone.
 		if t.store != nil && row_store_shared(t.store) {
-			append(&t.store.pending, row)
+			row_store_defer(t.store, row)
 			continue
 		}
 		table_free_row(row)

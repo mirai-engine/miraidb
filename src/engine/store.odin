@@ -1538,6 +1538,8 @@ store_table_writable :: proc(store: ^Store, name: string) -> (^Table, Error) {
 	// sequence it stamped them 0, a value no AS OF could see replaced and no
 	// prune could drop (D3).
 	clone.apply_seq = store.apply_seq
+	// Every value the copy holds now is the readers' too, until they are gone.
+	clone.shared_before = store.apply_seq
 	// The map key lives in the old table's arena, so the entry is replaced by the
 	// clone's own key.
 	map_erase(&store.tables, name)

@@ -1,6 +1,9 @@
 package tests
 
 import "core:fmt"
+import "core:mem"
+import "core:strings"
+import "core:sync"
 import "core:testing"
 
 import db "../engine"
@@ -137,4 +140,76 @@ test_as_of_reads_a_table_copied_for_a_reader :: proc(t: ^testing.T) {
 	db.tx_end(reader)
 	testing.expect_value(t, scalar(t, store, fmt.tprintf("SELECT v FROM t AS OF %d WHERE id = 1", middle)).i, i64(1))
 	testing.expect_value(t, scalar(t, store, fmt.tprintf("SELECT v FROM t AS OF %d WHERE id = 1", middle - 1)).i, i64(0))
+}
+
+// Poison_Allocator overwrites a block as it is freed, so a read of freed memory
+// reads 0xdd instead of what was there: a use-after-free that a quiet heap
+// would answer correctly fails the test every time.
+@(private = "file")
+Poison_Allocator :: struct {
+	backing: mem.Allocator,
+	sizes:   map[rawptr]int,
+	mutex:   sync.Mutex,
+}
+
+@(private = "file")
+poison_proc :: proc(data: rawptr, mode: mem.Allocator_Mode, size, alignment: int, old_memory: rawptr, old_size: int, loc := #caller_location) -> ([]byte, mem.Allocator_Error) {
+	p := (^Poison_Allocator)(data)
+	sync.lock(&p.mutex)
+	defer sync.unlock(&p.mutex)
+	#partial switch mode {
+	case .Free:
+		if old_memory != nil {
+			if known, ok := p.sizes[old_memory]; ok {
+				mem.set(old_memory, 0xdd, known)
+				delete_key(&p.sizes, old_memory)
+			}
+		}
+	case .Resize, .Resize_Non_Zeroed:
+		if old_memory != nil do delete_key(&p.sizes, old_memory)
+	}
+	out, err := p.backing.procedure(p.backing.data, mode, size, alignment, old_memory, old_size, loc)
+	#partial switch mode {
+	case .Alloc, .Alloc_Non_Zeroed, .Resize, .Resize_Non_Zeroed:
+		if err == nil && out != nil do p.sizes[raw_data(out)] = len(out)
+	}
+	return out, err
+}
+
+// A commit while a reader is open writes a copy of the table that borrows the
+// reader's values; the update moves them into the copy's history, and the
+// retention prunes that history after the commit. Nothing pins the reader's
+// sequence, so the prune freed the values the reader was still reading: its
+// next statement read freed memory. They wait for the reader now.
+@(test)
+test_a_prune_leaves_a_reader_its_values :: proc(t: ^testing.T) {
+	poison := Poison_Allocator{backing = context.allocator}
+	poison.sizes = make(map[rawptr]int, 0, context.allocator)
+	defer delete(poison.sizes)
+	context.allocator = mem.Allocator{procedure = poison_proc, data = &poison}
+
+	store, open_err := db.store_open("", {persistent = false})
+	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
+	defer db.store_close(store)
+	db.store_set_retention(store, {kind = .Readers})
+	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+	run_done(t, store, "INSERT INTO t (id, v) VALUES (1, 'first row as the reader saw it'), (2, 'second row as the reader saw it'), (3, 'gone')")
+	reader := db.tx_begin_read(store)
+	run_done(t, store, "UPDATE t SET v = 'changed once' WHERE id = 1")
+	run_done(t, store, "DELETE FROM t WHERE id = 3")
+	for i in 1 ..= 20 do run_done(t, store, fmt.tprintf("UPDATE t SET v = 'changed %d'", i))
+	// What the writer stored after the copy is its own, and goes on being freed.
+	if testing.expect(t, store.tables["t"].store != nil) {
+		testing.expect(t, len(store.tables["t"].store.pending) <= 3)
+	}
+	result, err := db.sql_execute_in_tx(reader, "SELECT group_concat(v, '|') FROM t")
+	if testing.expectf(t, db.error_ok(err), "read: %s", err.message) {
+		testing.expectf(t, strings.compare(result.rows[0][0].s, "first row as the reader saw it|second row as the reader saw it|gone") == 0, "the reader read %q", result.rows[0][0].s)
+	}
+	db.sql_result_destroy(&result)
+	db.error_free(&err)
+	db.tx_end(reader)
+	testing.expect_value(t, scalar(t, store, "SELECT group_concat(v, '|') FROM t").s, "changed 20|changed 20")
+	run_done(t, store, "UPDATE t SET v = 'after' WHERE id = 1")
+	testing.expect_value(t, retention_versions(store, "t"), 0)
 }
