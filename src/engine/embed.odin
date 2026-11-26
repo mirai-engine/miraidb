@@ -806,6 +806,18 @@ embed_start :: proc(stmt: ^Embed_Statement) -> Error {
 		stmt.done = true
 		return embed_fail(stmt.conn, errf(.Cancelled, "interrupted"))
 	}
+	// A statement prepared before the catalog changed is prepared again from its
+	// text, its authorizer asked again, as SQLite does on SQLITE_SCHEMA: its
+	// names may resolve to something else now.
+	running := embed_current_tx(stmt.conn)
+	if prepared_stale(stmt.conn.store, stmt.prepared, running) {
+		reprepare_err := prepared_reprepare(stmt.conn.store, stmt.prepared)
+		if reprepare_err.kind == .None do reprepare_err = embed_authorize(stmt.conn, stmt.prepared)
+		if reprepare_err.kind != .None {
+			stmt.done = true
+			return embed_fail(stmt.conn, reprepare_err)
+		}
+	}
 	result, exec_err := embed_run(stmt.conn, stmt.prepared, stmt.params[:])
 	if exec_err.kind != .None {
 		// BUSY leaves the statement to run again: SQLite's next step retries

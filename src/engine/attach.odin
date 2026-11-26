@@ -207,6 +207,8 @@ store_attach_add :: proc(store: ^Store, name, path: string) -> Error {
 		return errf(open_err.kind, "cannot attach %s: %s", path, open_err.message)
 	}
 	store.attached[strings.clone(name, context.allocator)] = attached
+	attached.catalog_parent = store
+	store_catalog_changed(store)
 	return ERROR_NONE
 }
 
@@ -269,6 +271,8 @@ store_attach_remove :: proc(store: ^Store, name: string) -> Error {
 	}
 	// The key is the copy ATTACH made of the name.
 	key, _ := delete_key(&store.attached, name)
+	attached.catalog_parent = nil
+	store_catalog_changed(store)
 	sync.unlock(&store.mutex)
 	delete(key)
 	store_close(attached)
@@ -450,6 +454,8 @@ sql_exec_attach :: proc(store: ^Store, stmt: Attach_Stmt) -> (Sql_Result, Error)
 		attach_inherit_rules(store, memory)
 		sync.lock(&store.mutex)
 		store.attached[strings.clone(stmt.name, context.allocator)] = memory
+		memory.catalog_parent = store
+		store_catalog_changed(store)
 		sync.unlock(&store.mutex)
 		return Sql_Result{kind = .Ack, commit_seq = store.commit_seq}, ERROR_NONE
 	}

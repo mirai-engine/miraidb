@@ -88,14 +88,18 @@ sql_execute_priced :: proc(store: ^Store, sql: string, params: []Value) -> (Sql_
 	// lookup's 15. The resolution rewrites names in the tree (a table's stored
 	// spelling), so what it writes lives in the query's own arena, as long as
 	// the tree: in the transaction's it would be freed under the cached tree.
-	query := statement_cache_take(store, sql)
+	// A tree resolved against another catalog is parsed again (the generation
+	// is read before the parse, so a change in between makes it older, never
+	// newer, than what it was resolved against).
+	generation := store_catalog_generation(store)
+	query := statement_cache_take(store, sql, generation)
 	if query == nil {
 		parsed, parse_err := sql_parse(sql)
 		if parse_err.kind != .None do return {}, parse_err
 		query = new(Query)
 		query^ = parsed
 	}
-	defer statement_cache_give(store, sql, query)
+	defer statement_cache_give(store, sql, query, generation)
 	return sql_run_statement(store, query.statement, params, arena_allocator_guarded(&query.arena))
 }
 
@@ -103,22 +107,33 @@ sql_execute_priced :: proc(store: ^Store, sql: string, params: []Value) -> (Sql_
 // Each keeps its arena (pooled, QUERY_ARENA_POOL), so the number stays small.
 STATEMENT_CACHE_SIZE :: 16
 
-// Statement_Entry is one kept parse; `running` says a statement has it out.
+// Statement_Entry is one kept parse; `running` says a statement has it out,
+// and `generation` is the catalog generation its names were resolved at.
 Statement_Entry :: struct {
-	query:   ^Query,
-	running: bool,
+	query:      ^Query,
+	running:    bool,
+	generation: u64,
 }
 
 // statement_cache_take hands out the parse of `sql`, which is marked as running
 // until it is given back: two threads running the same text never share one
-// tree, the second parses its own. Nil when there is none or it is out.
+// tree, the second parses its own. Nil when there is none or it is out. A
+// parse resolved at another catalog generation is dropped: its names were
+// rewritten for a catalog that changed.
 @(private)
-statement_cache_take :: proc(store: ^Store, sql: string) -> ^Query {
+statement_cache_take :: proc(store: ^Store, sql: string, generation: u64) -> ^Query {
 	if store == nil do return nil
 	sync.mutex_lock(&store.statement_cache_mutex)
 	defer sync.mutex_unlock(&store.statement_cache_mutex)
 	entry, found := &store.statement_cache[sql]
 	if !found || entry.running do return nil
+	if entry.generation != generation {
+		key, dropped := delete_key(&store.statement_cache, sql)
+		delete(key)
+		query_destroy(dropped.query)
+		free(dropped.query)
+		return nil
+	}
 	entry.running = true
 	return entry.query
 }
@@ -127,7 +142,7 @@ statement_cache_take :: proc(store: ^Store, sql: string) -> ^Query {
 // frees it: only queries are kept (a write's text usually carries its values,
 // and repeats less), and a full cache keeps what it has.
 @(private)
-statement_cache_give :: proc(store: ^Store, sql: string, query: ^Query) {
+statement_cache_give :: proc(store: ^Store, sql: string, query: ^Query, generation: u64) {
 	keep := false
 	#partial switch _ in query.statement {
 	case Select_Stmt, With_Stmt:
@@ -140,7 +155,7 @@ statement_cache_give :: proc(store: ^Store, sql: string, query: ^Query) {
 		returned := found && entry.query == query
 		if returned do entry.running = false
 		else if !found && len(store.statement_cache) < STATEMENT_CACHE_SIZE {
-			store.statement_cache[strings.clone(sql)] = Statement_Entry{query = query}
+			store.statement_cache[strings.clone(sql)] = Statement_Entry{query = query, generation = generation}
 			returned = true
 		}
 		sync.mutex_unlock(&store.statement_cache_mutex)
@@ -997,9 +1012,18 @@ sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value, names:
 // --- Prepared statements ---------------------------------------------------
 
 // Prepared keeps the parsed statement so repeated executions do not parse
-// again. It is immutable after `sql_prepare` and safe to reuse with new params.
+// again, and is safe to reuse with new params. Its tree is resolved against one
+// catalog generation: a run at another one parses `sql` again first
+// (prepared_stale, prepared_reprepare), as SQLite prepares a statement again
+// after a schema change.
 Stmt_Prepared :: struct {
 	query:       Query,
+	// sql is the statement's text, which a new catalog parses again.
+	sql:         string,
+	// generation is the catalog generation the tree was parsed at; `fresh` says
+	// no run has resolved it yet.
+	generation:  u64,
+	fresh:       bool,
 	is_pragma:   bool,
 	pragma_body: string,
 	// param_count is how many positional parameters the statement binds, so a
@@ -1024,14 +1048,56 @@ sql_prepare :: proc(store: ^Store, sql: string) -> (^Stmt_Prepared, Error) {
 		prepared.pragma_body = strings.clone(body)
 		return prepared, ERROR_NONE
 	}
+	generation := store_catalog_generation(store)
 	query, parse_err := sql_parse(sql)
 	if parse_err.kind != .None {
 		free(prepared)
 		return nil, parse_err
 	}
 	prepared.query = query
+	prepared.sql = strings.clone(sql)
+	prepared.generation = generation
+	prepared.fresh = true
 	prepared.param_count = query.param_count
 	return prepared, ERROR_NONE
+}
+
+// prepared_stale says the statement's tree cannot run as it is in `tx` (nil for
+// a run in its own transaction): the catalog moved on since it was parsed, or
+// the transaction staged a change to it and the tree was resolved before.
+prepared_stale :: proc(store: ^Store, prepared: ^Stmt_Prepared, tx: ^Tx = nil) -> bool {
+	if prepared == nil || prepared.is_pragma || prepared.fresh do return false
+	return prepared.generation != store_catalog_generation(store) || tx_changes_catalog(tx)
+}
+
+// prepared_reprepare parses the statement's text again, for the catalog as it
+// is now. What an authorizer made of the old tree goes with it: a connection
+// that asks one asks it again (embed_authorize).
+prepared_reprepare :: proc(store: ^Store, prepared: ^Stmt_Prepared) -> Error {
+	generation := store_catalog_generation(store)
+	query, parse_err := sql_parse(prepared.sql)
+	if parse_err.kind != .None do return parse_err
+	query_destroy(&prepared.query)
+	for view in prepared.views {
+		query_destroy(view)
+		free(view)
+	}
+	clear(&prepared.views)
+	clear(&prepared.trigger_ignores)
+	prepared.ignored = false
+	prepared.query = query
+	prepared.param_count = query.param_count
+	prepared.generation = generation
+	prepared.fresh = true
+	return ERROR_NONE
+}
+
+// prepared_settle marks a run done: a tree resolved under a catalog change the
+// transaction has not committed holds for no other run.
+@(private)
+prepared_settle :: proc(prepared: ^Stmt_Prepared, tx: ^Tx = nil) {
+	prepared.fresh = false
+	if tx_changes_catalog(tx) do prepared.generation = max(u64)
 }
 
 stmt_prepared_destroy :: proc(prepared: ^Stmt_Prepared) {
@@ -1040,6 +1106,7 @@ stmt_prepared_destroy :: proc(prepared: ^Stmt_Prepared) {
 		delete(prepared.pragma_body)
 	} else {
 		query_destroy(&prepared.query)
+		delete(prepared.sql)
 	}
 	for view in prepared.views {
 		query_destroy(view)
@@ -1069,6 +1136,10 @@ sql_price :: proc(store: ^Store, result: ^Sql_Result) -> Error {
 prepared_execute :: proc(store: ^Store, prepared: ^Stmt_Prepared, params: []Value) -> (Sql_Result, Error) {
 	if prepared == nil do return {}, errf(.Invalid_Argument, "no prepared statement")
 	if prepared.is_pragma do return sql_exec_pragma(store, prepared.pragma_body, false)
+	if prepared_stale(store, prepared) {
+		if reprepare_err := prepared_reprepare(store, prepared); reprepare_err.kind != .None do return {}, reprepare_err
+	}
+	defer prepared_settle(prepared)
 	// The tree runs again: the names its resolution rewrites live with it.
 	result, exec_err := sql_run_statement(store, prepared.query.statement, params, arena_allocator_guarded(&prepared.query.arena))
 	if exec_err.kind != .None do return {}, exec_err
@@ -1081,6 +1152,10 @@ prepared_execute :: proc(store: ^Store, prepared: ^Stmt_Prepared, params: []Valu
 prepared_execute_in_tx :: proc(tx: ^Tx, prepared: ^Stmt_Prepared, params: []Value) -> (Sql_Result, Error) {
 	if prepared == nil do return {}, errf(.Invalid_Argument, "no prepared statement")
 	if prepared.is_pragma do return sql_exec_pragma(tx.store, prepared.pragma_body, tx.locked, tx)
+	if prepared_stale(tx.store, prepared, tx) {
+		if reprepare_err := prepared_reprepare(tx.store, prepared); reprepare_err.kind != .None do return {}, reprepare_err
+	}
+	defer prepared_settle(prepared, tx)
 	return sql_run_statement_in_tx(tx, prepared.query.statement, params, arena_allocator_guarded(&prepared.query.arena))
 }
 

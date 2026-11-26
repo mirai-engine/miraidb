@@ -2761,3 +2761,15 @@ prepared_destroy :: proc(prepared: ^Prepared_Tx) {
 	delete(prepared.payload)
 	free(prepared)
 }
+
+// tx_changes_catalog says whether the transaction staged a change to what a
+// statement's names resolve to, which nothing committed yet: a tree resolved in
+// it holds for it alone.
+tx_changes_catalog :: proc(tx: ^Tx) -> bool {
+	if tx == nil || tx.read_only do return false
+	if len(tx.state.created) > 0 || len(tx.state.altered) > 0 || len(tx.state.dropped) > 0 || len(tx.state.index_ops) > 0 do return true
+	for name in ([]string{VIEW_TABLE, POLICY_TABLE, TRIGGER_TABLE, TYPE_TABLE, VIRTUAL_TABLE}) {
+		if name in tx.state.writes do return true
+	}
+	return false
+}

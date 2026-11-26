@@ -130,6 +130,17 @@ Store :: struct {
 	// (sql_execute), up to STATEMENT_CACHE_SIZE, behind statement_cache_mutex.
 	statement_cache:       map[string]Statement_Entry,
 	statement_cache_mutex: sync.Mutex,
+	// catalog_generation moves on with every commit that changes what a
+	// statement's names resolve to (store_op_changes_catalog), and with every
+	// ATTACH and DETACH. A tree resolved at one generation is parsed again at
+	// another (store_catalog_generation), as SQLite prepares a statement again
+	// after a schema change. Atomic: a reader compares it without the lock,
+	// which a statement prepared inside a BEGIN holds already.
+	catalog_generation: u64,
+	// catalog_parent is the store this one is attached to: a change to this
+	// catalog changes what the parent's statements resolve to, so it moves the
+	// parent's generation too.
+	catalog_parent: ^Store,
 	// collations holds the host comparisons a program registered. It is process
 	// state, not database state: nothing about it is logged.
 	collations:    map[string]Collation_Def,
@@ -1600,6 +1611,7 @@ store_row_table :: proc(store: ^Store, name: string, cache: ^Apply_Cache) -> (^T
 }
 
 store_apply :: proc(store: ^Store, op: Store_Op, cache: ^Apply_Cache = nil) -> Error {
+	if store_op_changes_catalog(op) do store_catalog_changed(store)
 	// Any other op may create, replace or drop a table: the cache forgets.
 	if cache != nil && op.kind != .Insert && op.kind != .Update && op.kind != .Delete do cache^ = {}
 	switch op.kind {
@@ -2264,4 +2276,37 @@ store_commit_prepared :: proc(store: ^Store, prepared: []^Prepared_Tx) -> (int, 
 	}
 	store_retain(store)
 	return written, ERROR_NONE
+}
+
+// store_op_changes_catalog says whether an op changes what a name in a
+// statement resolves to: the DDL, and a row of a catalog the engine keeps as a
+// table (views, policies, triggers, types, virtual tables).
+@(private)
+store_op_changes_catalog :: proc(op: Store_Op) -> bool {
+	switch op.kind {
+	case .Create_Table, .Drop_Table, .Create_Index, .Drop_Index, .Alter_Table:
+		return true
+	case .Insert, .Update, .Delete, .Truncate:
+		if len(op.name) == 0 || op.name[0] != '_' do return false
+		switch op.name {
+		case VIEW_TABLE, POLICY_TABLE, TRIGGER_TABLE, TYPE_TABLE, VIRTUAL_TABLE:
+			return true
+		}
+	}
+	return false
+}
+
+// store_catalog_generation is the generation a statement resolved now would be
+// resolved at. It counts the changes to the databases attached to the store as
+// well (store_catalog_changed), whose names a statement may use too.
+store_catalog_generation :: proc(store: ^Store) -> u64 {
+	if store == nil do return 0
+	return sync.atomic_load(&store.catalog_generation)
+}
+
+// store_catalog_changed moves the generation of the store and of the store it
+// is attached to.
+store_catalog_changed :: proc(store: ^Store) {
+	sync.atomic_add(&store.catalog_generation, 1)
+	if parent := store.catalog_parent; parent != nil do sync.atomic_add(&parent.catalog_generation, 1)
 }
