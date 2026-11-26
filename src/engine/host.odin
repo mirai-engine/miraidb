@@ -844,7 +844,8 @@ host_join_index_build :: proc(entry: ^Subscription_Query, tables: []^Table) {
 	for level in 0 ..< len(tables) {
 		// A source with no equality of its own keeps no index.
 		if host_join_index_column(entry, level) < 0 do continue
-		for row in tables[level].rows {
+		row_rows := rows_iter(&tables[level].rows)
+		for row in rows_next(&row_rows) {
 			if row.deleted_seq != 0 do continue
 			host_join_index_add(entry, level, row.id, row.values)
 		}
@@ -1005,10 +1006,11 @@ host_join_walk :: proc(walk: ^Join_Walk, level: int) -> bool {
 	// The table cannot move under this transaction: a commit that has to change
 	// a table a reader holds copies it first, so walking the live rows is stable
 	// and costs no copy of its own.
-	for row in table.rows {
+	row_rows := rows_iter(&table.rows)
+	for row in rows_next(&row_rows) {
 		if row.deleted_seq != 0 do continue
 		if store_cancelled(walk.tx.store) do return false
-		walk.sources[level] = Source{table = table, row = row, alias = alias}
+		walk.sources[level] = Source{table = table, row = row^, alias = alias}
 		if walk.walked != nil do walk.walked^ += 1
 		if !host_join_walk(walk, level + 1) do return false
 	}

@@ -840,7 +840,8 @@ tx_alter_created :: proc(tx: ^Tx, name: string, created: ^Table, next_schema: Ta
 	schema := next_schema
 	replacement, create_err := table_create(&schema)
 	if create_err.kind != .None do return create_err
-	for row in created.rows {
+	row_rows := rows_iter(&created.rows)
+	for row in rows_next(&row_rows) {
 		if row.deleted_seq != 0 do continue
 		values, convert_err := alter_row_values(&created.schema, next_schema, row.values, tx.alloc)
 		if convert_err.kind == .None do convert_err = table_insert(replacement, row.id, values)
@@ -888,7 +889,8 @@ tx_alter_table :: proc(tx: ^Tx, name: string, next_schema: Table_Schema) -> Erro
 	replacement, create_err := table_create(&schema)
 	if create_err.kind != .None do return create_err
 	append(&tx.replaced, replacement)
-	for row in current.rows {
+	row_rows := rows_iter(&current.rows)
+	for row in rows_next(&row_rows) {
 		// A deleted row stays as a tombstone for older readers: copied, it came
 		// back to life in the altered table.
 		if row.deleted_seq != 0 do continue
@@ -1054,7 +1056,8 @@ tx_drop_column :: proc(tx: ^Tx, name, column_name: string) -> Error {
 	replacement, create_err := table_create(&schema)
 	if create_err.kind != .None do return create_err
 	append(&tx.replaced, replacement)
-	for row in current.rows {
+	row_rows := rows_iter(&current.rows)
+	for row in rows_next(&row_rows) {
 		id := row.id
 		values := make([]Value, len(row.values) - 1, tx.alloc)
 		copy(values, row.values[:index])
@@ -1118,7 +1121,8 @@ tx_rename_table :: proc(tx: ^Tx, from, to: string) -> Error {
 	replacement, create_err := table_create(&schema)
 	if create_err.kind != .None do return create_err
 	append(&tx.replaced, replacement)
-	for row in current.rows {
+	row_rows := rows_iter(&current.rows)
+	for row in rows_next(&row_rows) {
 		id := row.id
 		if insert_err := table_insert(replacement, id, row.values); insert_err.kind != .None {
 			return insert_err

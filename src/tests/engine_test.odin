@@ -11851,7 +11851,7 @@ test_paged_table_roundtrip :: proc(t: ^testing.T) {
 	table, table_err := db.store_table(store, "item")
 	testing.expect(t, db.error_ok(table_err))
 	testing.expect(t, table.paged != nil)
-	testing.expect_value(t, len(table.rows), 0)
+	testing.expect_value(t, db.rows_len(&table.rows), 0)
 	stats := db.page_rows_stats(table.paged)
 	testing.expectf(t, stats.pages > 4, "the file holds %d pages", stats.pages)
 	testing.expectf(t, stats.resident <= 4, "the pool holds %d pages", stats.resident)
@@ -11979,7 +11979,7 @@ test_paged_table_roundtrip :: proc(t: ^testing.T) {
 	rebuilt, rebuilt_err := db.store_table(again, "item")
 	testing.expect(t, db.error_ok(rebuilt_err))
 	testing.expect(t, rebuilt.paged != nil)
-	testing.expect_value(t, len(rebuilt.rows), 0)
+	testing.expect_value(t, db.rows_len(&rebuilt.rows), 0)
 	testing.expect_value(t, db.page_rows_stats(rebuilt.paged).resident <= 2, true)
 	testing.expect_value(t, scalar(t, again, "SELECT count(*) FROM item").i, i64(399))
 	testing.expect_value(t, scalar(t, again, "SELECT name FROM item WHERE id = 399").s, "name-399")
@@ -13910,7 +13910,8 @@ test_a_commit_copies_the_table_a_reader_holds :: proc(t: ^testing.T) {
 	frozen, frozen_err := db.tx_table(first, "c")
 	if testing.expect(t, db.error_ok(frozen_err)) {
 		seen := i64(0)
-		for row in frozen.rows do seen = row.values[1].i
+		row_rows := db.rows_iter(&frozen.rows)
+		for row in db.rows_next(&row_rows) do seen = row.values[1].i
 		testing.expect_value(t, seen, i64(10))
 	}
 	// The table the commit did not write is not copied.
@@ -14622,7 +14623,8 @@ test_prune_history_respects_a_pin :: proc(t: ^testing.T) {
 	table, found := store.tables["t"]
 	testing.expect(t, found)
 	if found {
-		for row in table.rows do testing.expect_value(t, len(row.versions), 0)
+		row_rows := db.rows_iter(&table.rows)
+		for row in db.rows_next(&row_rows) do testing.expect_value(t, len(row.versions), 0)
 	}
 }
 
@@ -15652,7 +15654,8 @@ test_a_prune_visits_only_the_rows_a_commit_touched :: proc(t: ^testing.T) {
 	run_done(t, store, "INSERT INTO small (v) VALUES (1), (2), (3)")
 	versions_of :: proc(table: ^db.Table) -> int {
 		total := 0
-		for row in table.rows do total += len(row.versions)
+		row_rows := db.rows_iter(&table.rows)
+		for row in db.rows_next(&row_rows) do total += len(row.versions)
 		return total
 	}
 
@@ -15678,9 +15681,9 @@ test_a_prune_visits_only_the_rows_a_commit_touched :: proc(t: ^testing.T) {
 	run_done(t, store, "DELETE FROM small WHERE v = 1")
 	db.store_prune_history(store)
 	small := store.tables["small"]
-	testing.expect_value(t, len(small.rows), 2)
+	testing.expect_value(t, db.rows_len(&small.rows), 2)
 	testing.expect_value(t, len(small.history), 0)
-	if len(small.rows) == 2 do testing.expect(t, small.rows[0].id < small.rows[1].id)
+	if db.rows_len(&small.rows) == 2 do testing.expect(t, db.rows_at(&small.rows, 0).id < db.rows_at(&small.rows, 1).id)
 	answer := run_temp(t, store, "SELECT v FROM small ORDER BY rowid")
 	testing.expect_value(t, len(answer.rows), 2)
 	if len(answer.rows) == 2 {
@@ -15803,7 +15806,7 @@ test_a_stored_row_keeps_every_kind_of_value :: proc(t: ^testing.T) {
 	commit_err = db.tx_commit(tx)
 	db.error_free(&commit_err)
 	db.store_prune_history(store)
-	testing.expect_value(t, len(store.tables["c"].rows), 1)
+	testing.expect_value(t, db.rows_len(&store.tables["c"].rows), 1)
 	expect_row(t, store, first_id, changed)
 }
 

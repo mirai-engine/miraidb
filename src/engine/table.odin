@@ -633,11 +633,10 @@ Row_Store :: struct {
 Table :: struct {
 	schema:          Table_Schema,
 	// rows holds every row of a memory table, tombstones included, in ascending id
-	// order (R1). A scan walks the slice; a lookup by id tries the slot the id
-	// would have if no id were missing, then searches (table_row_index). A map
-	// cost a hash and an 80-byte copy per row read, and a scan had to walk a
-	// separate list of ids beside it.
-	rows:            [dynamic]Row,
+	// order (R1), in blocks a reader's table shares with the copy a commit writes
+	// (Row_Blocks, R7). A scan walks the blocks; a lookup by id tries the place
+	// the id would have if no id were missing, then searches (rows_find).
+	rows:            Row_Blocks,
 	// history holds the id of every row that keeps a version or is a tombstone,
 	// once each: the only rows a prune has anything to drop from (R3). A prune
 	// walked every row of every table after each statement; it now visits these.
@@ -715,7 +714,6 @@ table_create :: proc(schema: ^Table_Schema) -> (^Table, Error) {
 	t.schema = schema_copy(&normalized, t.arena_allocator)
 	t.store = new(Row_Store)
 	t.store.refs = 1
-	t.rows = make([dynamic]Row)
 	// Row ids start at one, as SQLite's rowid does: a program that names a row by
 	// its rowid -- sqlite3_blob_open's iRow, or ORDER BY rowid with a literal --
 	// then finds the same row here as it did there.
@@ -758,19 +756,11 @@ table_release :: proc(t: ^Table) {
 
 table_destroy :: proc(t: ^Table) {
 	if t == nil do return
-	shared := t.store != nil && row_store_shared(t.store)
-	for row in t.rows {
-		if t.borrowed {
-			// The values belong to the store that this snapshot borrowed from.
-			continue
-		}
-		if shared {
-			row_store_defer(t.store, row)
-			continue
-		}
-		table_free_row(row)
-	}
-	delete(t.rows)
+	// The values belong to the table that stored them: a borrowed one (the table
+	// a reader kept) frees none. The blocks free the history arrays of their rows
+	// when the last table that lists them lets go.
+	if !t.borrowed do table_drop_values(t)
+	rows_destroy(&t.rows)
 	delete(t.history)
 	for i in 0 ..< len(t.indexes) {
 		index_tree_free(&t.indexes[i])
@@ -825,6 +815,23 @@ row_store_release :: proc(store: ^Row_Store) {
 	for row in pending do table_free_row(row)
 	delete(pending)
 	free(store)
+}
+
+// table_drop_values frees the values of every row and version this table
+// holds, or hands them to the shared store while a reader may read them.
+@(private)
+table_drop_values :: proc(t: ^Table) {
+	shared := t.store != nil && row_store_shared(t.store)
+	it := rows_iter(&t.rows)
+	for row in rows_next(&it) {
+		if shared {
+			row_store_defer(t.store, Row{values = row.values})
+			for version in row.versions do row_store_defer(t.store, Row{values = version.values})
+			continue
+		}
+		row_values_free(row.values)
+		for version in row.versions do row_values_free(version.values)
+	}
 }
 
 @(private)
@@ -944,12 +951,14 @@ table_prune_versions :: proc(t: ^Table, before_seq: u64) {
 	// are this table's alone and are freed as before.
 	shared := t.store != nil && t.shared_before > 0 && row_store_shared(t.store)
 	kept := 0
-	first_gone := len(t.rows)
+	// The blocks that hold a tombstone the prune frees, to compact after.
+	emptied := make([dynamic]int, context.temp_allocator)
 	for id in t.history {
-		at := table_row_index(t, id)
+		at := rows_find(&t.rows, id)
 		if at < 0 do continue
 		t.prune_visited += 1
-		row := &t.rows[at]
+		// A block a reader's table still lists is copied before it changes.
+		row := rows_mut(&t.rows, at)
 		write := 0
 		for version in row.versions {
 			if version.deleted_seq != 0 && version.deleted_seq <= before_seq {
@@ -977,7 +986,8 @@ table_prune_versions :: proc(t: ^Table, before_seq: u64) {
 			delete(row.versions)
 			row.values = nil
 			row.versions = nil
-			first_gone = min(first_gone, at)
+			block := at >> ROW_BLOCK_SHIFT
+			if len(emptied) == 0 || emptied[len(emptied) - 1] != block do append(&emptied, block)
 			continue
 		}
 		if len(row.versions) > 0 || row.deleted_seq != 0 {
@@ -986,18 +996,19 @@ table_prune_versions :: proc(t: ^Table, before_seq: u64) {
 		}
 	}
 	resize(&t.history, kept)
-	if first_gone == len(t.rows) do return
-	// Every tombstone old enough was in the list and is freed: the slice keeps
-	// the rest, in order.
-	write := first_gone
-	for i in first_gone ..< len(t.rows) {
-		t.prune_visited += 1
-		row := t.rows[i]
-		if row.deleted_seq != 0 && row.deleted_seq <= before_seq do continue
-		t.rows[write] = row
-		write += 1
+	if len(emptied) == 0 do return
+	// Every tombstone old enough was in the list and is freed: the blocks that
+	// held one keep the rest, in order, from the last so the earlier places hold.
+	slice.sort(emptied[:])
+	gone :: proc(row: ^Row, user: rawptr) -> bool {
+		before := (^u64)(user)^
+		return row.deleted_seq != 0 && row.deleted_seq <= before
 	}
-	resize(&t.rows, write)
+	cutoff := before_seq
+	for i := len(emptied) - 1; i >= 0; i -= 1 {
+		if i < len(emptied) - 1 && emptied[i] == emptied[i + 1] do continue
+		t.prune_visited += u64(rows_compact(&t.rows, emptied[i], gone, &cutoff))
+	}
 }
 
 // schema_normalize adds the implicit unique indexes for the primary key and for
@@ -1340,7 +1351,8 @@ table_memory :: proc(t: ^Table) -> Table_Memory {
 		}
 		return memory
 	}
-	for row in t.rows {
+	it := rows_iter(&t.rows)
+	for row in rows_next(&it) {
 		memory.rows += 1
 		memory.row_bytes += 48 // slot, slice header and row header
 		for value in row.values {
@@ -1348,7 +1360,8 @@ table_memory :: proc(t: ^Table) -> Table_Memory {
 		}
 	}
 	for _, position in t.indexes {
-		for row in t.rows {
+		each := rows_iter(&t.rows)
+		for row in rows_next(&each) {
 			memory.index_entries += 1
 			memory.index_bytes += 40 + index_key_len(t, position, row.values, row.id)
 		}
@@ -1574,11 +1587,11 @@ index_is_primary :: proc(t: ^Table, index: int) -> bool {
 
 // table_get_row returns one row. A memory table lends its values; a paged table
 // decodes them into `alloc`, and the caller owns them.
-table_get_row :: proc(t: ^Table, id: Row_Id, alloc: mem.Allocator) -> (Row, bool) {
+table_get_row :: #force_inline proc(t: ^Table, id: Row_Id, alloc: mem.Allocator) -> (Row, bool) {
 	if t.paged != nil do return page_rows_get(t.paged, id, alloc)
-	at := table_row_index(t, id)
+	at := rows_find(&t.rows, id)
 	if at < 0 do return {}, false
-	return t.rows[at], true
+	return t.rows.blocks[at >> ROW_BLOCK_SHIFT].rows[at & (ROW_BLOCK - 1)], true
 }
 
 // table_row_exists answers without decoding the values.
@@ -1587,27 +1600,11 @@ table_row_exists :: proc(t: ^Table, id: Row_Id) -> bool {
 	return table_row_index(t, id) >= 0
 }
 
-// table_row_index is where row `id` sits in t.rows, or -1. Ids are handed out in
-// increasing order, so with none missing the row is at `id - first`: that slot is
-// tried first, and a binary search answers when ids are missing.
+// table_row_index is where row `id` sits in t.rows (a Row_Pos), or -1. Ids are
+// handed out in increasing order, so with none missing the row is at `id -
+// first`: that place is tried first, and a search answers when ids are missing.
 table_row_index :: proc(t: ^Table, id: Row_Id) -> int {
-	n := len(t.rows)
-	if n == 0 do return -1
-	first := t.rows[0].id
-	if id < first || id > t.rows[n - 1].id do return -1
-	guess := int(id - first)
-	if guess < n && t.rows[guess].id == id do return guess
-	low, high := 0, n
-	for low < high {
-		middle := (low + high) / 2
-		if t.rows[middle].id < id {
-			low = middle + 1
-		} else {
-			high = middle
-		}
-	}
-	if low < n && t.rows[low].id == id do return low
-	return -1
+	return rows_find(&t.rows, id)
 }
 
 // table_memory_row is row `id` of a memory table, as the slice holds it (a paged
@@ -1615,35 +1612,22 @@ table_row_index :: proc(t: ^Table, id: Row_Id) -> int {
 table_memory_row :: proc(t: ^Table, id: Row_Id) -> (Row, bool) {
 	at := table_row_index(t, id)
 	if at < 0 do return {}, false
-	return t.rows[at], true
+	return rows_at(&t.rows, at)^, true
 }
 
-// table_row_find is row `id` in place, or nil. The pointer is good until the
-// slice next grows or shrinks (an insert, a prune, a truncate).
+// table_row_find is row `id` in place, to change, or nil: its block is this
+// table's own (a block a reader's table lists is copied first). The pointer is
+// good until a row is put or taken out (an insert, a prune, a truncate).
 table_row_find :: proc(t: ^Table, id: Row_Id) -> ^Row {
 	at := table_row_index(t, id)
-	return at < 0 ? nil : &t.rows[at]
+	return at < 0 ? nil : rows_mut(&t.rows, at)
 }
 
 // table_row_put adds a row that is not there, at its place: an append when the
 // id is the highest, which is every id the table hands out itself.
 @(private)
 table_row_put :: proc(t: ^Table, row: Row) {
-	n := len(t.rows)
-	if n == 0 || t.rows[n - 1].id < row.id {
-		append(&t.rows, row)
-		return
-	}
-	low, high := 0, n
-	for low < high {
-		middle := (low + high) / 2
-		if t.rows[middle].id < row.id {
-			low = middle + 1
-		} else {
-			high = middle
-		}
-	}
-	inject_at(&t.rows, low, row)
+	rows_put(&t.rows, row)
 }
 
 // table_touch_int_key remembers the largest integer primary key a paged table
@@ -1702,7 +1686,7 @@ table_insert :: proc(t: ^Table, id: Row_Id, values: []Value, validated := false)
 		return table_index_add_all(t, values, id)
 	}
 	at := table_row_index(t, id)
-	if at >= 0 && t.rows[at].deleted_seq == 0 {
+	if at >= 0 && rows_at(&t.rows, at).deleted_seq == 0 {
 		return errf(.Internal, "row id %d already exists in table %s", u64(id), t.schema.name)
 	}
 	if !validated {
@@ -1723,10 +1707,11 @@ table_insert :: proc(t: ^Table, id: Row_Id, values: []Value, validated := false)
 		// The id names a row deleted before a prune came: the tombstone becomes a
 		// version of the new row, so a read older than the delete still finds it.
 		// It is in `history` already, as every tombstone is.
-		old := t.rows[at]
+		slot := rows_mut(&t.rows, at)
+		old := slot^
 		versions := old.versions
 		append(&versions, Row_Version{values = old.values, created_seq = old.created_seq, deleted_seq = old.deleted_seq})
-		t.rows[at] = Row{id = id, values = stored, created_seq = t.apply_seq, versions = versions}
+		slot^ = Row{id = id, values = stored, created_seq = t.apply_seq, versions = versions}
 	} else {
 		table_row_put(t, Row{id = id, values = stored, created_seq = t.apply_seq})
 	}
@@ -1758,7 +1743,9 @@ table_update :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
 	if at < 0 {
 		return errf(.Internal, "row id %d is missing from table %s", u64(id), t.schema.name)
 	}
-	row := t.rows[at]
+	// The history array the update appends to is the block's: a block a
+	// reader's table lists is copied before it (rows_mut).
+	row := rows_mut(&t.rows, at)^
 	// An index whose key the update leaves as it was keeps its entry: the row is
 	// filed under the same key and id, and a unique key it held is still its own,
 	// so it is neither checked nor removed and put back.
@@ -1792,7 +1779,7 @@ table_update :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
 			if next > t.next_sequence do t.next_sequence = next
 		}
 	}
-	t.rows[at] = Row{
+	rows_mut(&t.rows, at)^ = Row{
 		id = id,
 		values = stored,
 		created_seq = t.apply_seq,
@@ -1843,17 +1830,11 @@ table_truncate :: proc(t: ^Table) {
 		}
 		return
 	}
-	for row in t.rows {
-		// Truncating while a snapshot reads the same values cannot free them: they
-		// are handed to the shared store, which frees them when the last reader is
-		// gone.
-		if t.store != nil && row_store_shared(t.store) {
-			row_store_defer(t.store, row)
-			continue
-		}
-		table_free_row(row)
-	}
-	clear(&t.rows)
+	// Truncating while a snapshot reads the same values cannot free them: they
+	// are handed to the shared store, which frees them when the last reader is
+	// gone (table_drop_values).
+	table_drop_values(t)
+	rows_clear(&t.rows)
 	clear(&t.history)
 	for _, i in t.indexes {
 		index_tree_free(&t.indexes[i])
@@ -1979,54 +1960,40 @@ table_snapshot :: proc(source: ^Table) -> ^Table {
 		index_lookup_clone(&source.indexes[index], &clone.indexes[index], context.allocator)
 		index_ints_clone(&source.indexes[index], &clone.indexes[index])
 	}
-	// The rows are already in order, so the clone is one pass with no hashing.
-	clone.rows = make([dynamic]Row, 0, len(source.rows))
-	for row in source.rows {
-		if row.deleted_seq != 0 do continue
-		// The snapshot keeps the values (borrowed) and the creation sequence; the
-		// version chain belongs to the source table and is not copied.
-		append(&clone.rows, Row{id = row.id, values = row.values, created_seq = row.created_seq})
-	}
+	// The rows are shared, block by block: the copy lists the same blocks and
+	// copies one only when it changes it (Row_Blocks).
+	rows_share(&clone.rows, &source.rows)
 	return clone
 }
 
 // table_cow_clone gives the store a writable table and leaves `source` to the
-// readers that hold it. The rows and the index trees are copied (a copy per
-// entry, and this is the only copy a commit takes); the source becomes read-only
-// for the rest of its life, because every row it shows now belongs to the clone.
-// Its history and its tombstones are not visible to a reader that began before
-// this commit, so they are freed here -- a borrowed table never frees anything.
+// readers that hold it. The index trees are copied (a copy per entry); the rows
+// are shared by block, and the clone copies a block when it first writes to it.
+// The source is read-only for the rest of its life, because every value it shows
+// now belongs to the clone: a borrowed table never frees anything. The history
+// goes with the clone, which prunes it once no reader can ask for it; it was
+// freed here, and a reader's own rows dropped it, which cost a pass over every
+// row of the table.
 table_cow_clone :: proc(source: ^Table) -> ^Table {
 	// A paged table has no rows to copy and no reader can hold one: reads of a
 	// store with pages keep the lock for their whole life.
 	if source.paged != nil do return nil
 	clone := table_snapshot(source)
 	if clone == nil do return nil
-	owning := !source.borrowed
 	clone.borrowed = false
 	source.borrowed = true
-	if !owning do return clone
-	clear(&source.history)
-	for &row in source.rows {
-		// Most rows have no history: freeing an empty list still called the
-		// allocator, 3.5 ms of a commit over 50 000 rows.
-		if row.versions != nil {
-			for version in row.versions do row_values_free(version.values)
-			delete(row.versions)
-			row.versions = nil
-		}
-		if row.deleted_seq != 0 {
-			row_values_free(row.values)
-			row.values = nil
-		}
-	}
+	// The history lists ids of rows the blocks hold, so the clone's is the
+	// source's; only a prune reads it, and only the store's table is pruned.
+	clone.history = source.history
+	source.history = nil
 	return clone
 }
 
 table_row_count :: proc(t: ^Table) -> int {
 	if t.paged != nil do return int(t.paged.rows)
 	live := 0
-	for row in t.rows {
+	it := rows_iter(&t.rows)
+	for row in rows_next(&it) {
 		if row.deleted_seq == 0 do live += 1
 	}
 	return live
@@ -2062,10 +2029,11 @@ table_collect :: proc(
 		rows_sort_by_id(out[:])
 		return
 	}
-	reserve(out, len(out) + len(t.rows))
-	// The slice is in id order, so the rows come out sorted.
-	for &row in t.rows {
-		values, visible := row_values_at(row, seq)
+	reserve(out, len(out) + rows_len(&t.rows))
+	// The blocks are in id order, so the rows come out sorted.
+	it := rows_iter(&t.rows)
+	for row in rows_next(&it) {
+		values, visible := row_values_at(row^, seq)
 		if !visible do continue
 		append(out, Row{id = row.id, values = values})
 	}
@@ -2082,7 +2050,8 @@ table_max_int :: proc(t: ^Table, column: int) -> i64 {
 		error_drop(page_rows_each(t.paged, &ctx, max_column_visit))
 		return ctx.best
 	}
-	for row in t.rows {
+	it := rows_iter(&t.rows)
+	for row in rows_next(&it) {
 		if column >= len(row.values) do continue
 		if row.values[column].kind == .Int && row.values[column].i > best {
 			best = row.values[column].i
@@ -2096,7 +2065,8 @@ table_max_int :: proc(t: ^Table, column: int) -> i64 {
 // called with each row's id first: a transaction leaves out the rows it
 // deleted or changed, and weighs its own versions itself.
 table_largest_int :: proc(t: ^Table, column: int, skip: proc(id: Row_Id, user: rawptr) -> bool = nil, user: rawptr = nil) -> (largest: i64, found: bool) {
-	for row in t.rows {
+	it := rows_iter(&t.rows)
+	for row in rows_next(&it) {
 		if row.deleted_seq != 0 || column >= len(row.values) || row.values[column].kind != .Int do continue
 		if skip != nil && skip(row.id, user) do continue
 		if !found || row.values[column].i > largest do largest = row.values[column].i
@@ -2129,7 +2099,9 @@ max_column_visit :: proc(ctx: rawptr, row: Row) -> bool {
 Table_Scan :: struct {
 	table:  ^Table,
 	seq:    u64,
+	// at is the next row of a paged scan's list; rows walks a memory table.
 	at:     int,
+	rows:   Rows_Iter,
 	paged:  [dynamic]Row,
 }
 
@@ -2137,13 +2109,13 @@ Table_Scan :: struct {
 // are the table's (a paged table's: the scan's) and stay good until
 // table_scan_end, or until the table is written.
 table_scan :: proc(t: ^Table, seq: u64 = max(u64)) -> Table_Scan {
-	scan := Table_Scan{table = t, seq = seq}
+	scan := Table_Scan{table = t, seq = seq, rows = rows_iter(&t.rows)}
 	if t.paged != nil do table_collect(t, &scan.paged, seq)
 	return scan
 }
 
 // table_scan_next answers the next visible row, or false at the end.
-table_scan_next :: proc(scan: ^Table_Scan) -> (id: Row_Id, values: []Value, ok: bool) {
+table_scan_next :: #force_inline proc(scan: ^Table_Scan) -> (id: Row_Id, values: []Value, ok: bool) {
 	t := scan.table
 	if t.paged != nil {
 		if scan.at >= len(scan.paged) do return 0, nil, false
@@ -2151,9 +2123,7 @@ table_scan_next :: proc(scan: ^Table_Scan) -> (id: Row_Id, values: []Value, ok: 
 		scan.at += 1
 		return row.id, row.values, true
 	}
-	for scan.at < len(t.rows) {
-		row := &t.rows[scan.at]
-		scan.at += 1
+	for row in rows_next(&scan.rows) {
 		if visible, shown := row_values_at(row^, scan.seq); shown do return row.id, visible, true
 	}
 	return 0, nil, false
@@ -2284,7 +2254,8 @@ table_add_index :: proc(t: ^Table, index: Index_Schema) -> Error {
 		}
 		return ERROR_NONE
 	}
-	for row in t.rows {
+	it := rows_iter(&t.rows)
+	for row in rows_next(&it) {
 		if row.deleted_seq != 0 do continue
 		if put_err := table_index_put_row(t, position, row.values, row.id); put_err.kind != .None {
 			return error_wrap(put_err, put_err.kind, "cannot grow index %s: %s", index.name, put_err.message)

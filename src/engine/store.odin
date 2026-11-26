@@ -1601,7 +1601,8 @@ store_apply :: proc(store: ^Store, op: Store_Op, cache: ^Apply_Cache = nil) -> E
 			return errf(.Out_Of_Memory, "cannot convert the rows of %s", op.name)
 		}
 		defer virtual.arena_destroy(&scratch)
-		for row in existing.rows {
+		row_rows := rows_iter(&existing.rows)
+		for row in rows_next(&row_rows) {
 			// A tombstone is for the readers of the table being replaced.
 			if row.deleted_seq != 0 do continue
 			id := row.id

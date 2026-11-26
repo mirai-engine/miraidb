@@ -17,7 +17,8 @@ retention_versions :: proc(store: ^db.Store, name: string) -> int {
 	table, found := store.tables[name]
 	if !found do return -1
 	count := 0
-	for row in table.rows do count += len(row.versions)
+	row_rows := db.rows_iter(&table.rows)
+	for row in db.rows_next(&row_rows) do count += len(row.versions)
 	return count
 }
 
