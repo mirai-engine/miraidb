@@ -2060,44 +2060,70 @@ sql_exec_compound :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_R
 }
 
 // RECURSION_LIMIT bounds WITH RECURSIVE: a query that never stops adding rows
-// fails instead of running forever. A store can lower it (Store.recursion_limit).
-// It was a variable of the package that a test lowered to 25 for a moment, and
-// a recursive query of another test on another thread failed at 25 steps.
-RECURSION_LIMIT :: 10000
+// fails after taking that many rows from its queue instead of running forever.
+// SQLite has no bound. A store can lower it (Store.recursion_limit). It was a
+// variable of the package that a test lowered to 25 for a moment, and a
+// recursive query of another test on another thread failed at 25 steps.
+RECURSION_LIMIT :: 1_000_000
 
+// Recursive_Queued is a row waiting in a recursive query's queue, with its
+// ORDER BY key when the query has one.
 @(private)
-recursive_insert :: proc(table: ^Table, seen: ^map[string]bool, values: []Value, next_id: ^Row_Id) -> (bool, Error) {
-	key := encode_output_key(values)
-	if key in seen^ {
-		delete(key)
-		return false, ERROR_NONE
-	}
-	seen^[key] = true
-	if err := table_insert(table, next_id^, values); err.kind != .None do return false, err
-	next_id^ += 1
-	return true, ERROR_NONE
+Recursive_Queued :: struct {
+	values: []Value,
+	key:    []u8,
 }
 
-// tx_materialize_recursive_cte evaluates `base UNION [ALL] step`: the base fills
-// the table, then the step runs against the accumulated rows until it adds
-// nothing. Rows are deduplicated, which also makes UNION ALL terminate.
+// tx_materialize_recursive_cte evaluates `base UNION [ALL] step` as SQLite does
+// (https://sqlite.org/lang_with.html): the base's rows go into a queue; each
+// row taken from it is added to the answer, and the step runs with the CTE's
+// name reading that one row, its rows going into the queue. UNION queues a row
+// only once; UNION ALL keeps every row. An ORDER BY makes the queue take the
+// smallest row first, and LIMIT and OFFSET count the rows taken, so a LIMIT
+// stops a recursion that would not end. The step used to read every row
+// accumulated so far, at every step: counting to 3000 read 4.5 million rows
+// (50 s), and UNION ALL dropped its duplicates.
 @(private)
 tx_materialize_recursive_cte :: proc(tx: ^Tx, cte: Cte, params: []Value) -> (^Table, Error) {
 	base := cte.select_stmt
 	parts := base.compound
+	order_by := base.order_by
+	limit_expr := base.limit
+	offset_expr := base.offset
 	base.compound = nil
 	base.order_by = nil
 	base.limit = nil
 	base.offset = nil
+	union_all := parts[0].op == .Union_All || parts[0].all
+	limit, offset := -1, 0
+	ctx := Eval_Ctx{tx = tx, params = params}
+	if limit_expr != nil {
+		value, value_err := eval_expr(&ctx, limit_expr)
+		if value_err.kind != .None do return nil, value_err
+		parsed, ok := value_to_i64(value)
+		if !ok do return nil, errf(.Invalid_Argument, "LIMIT must be an integer")
+		// A negative LIMIT is no limit, as in SQLite.
+		if parsed >= 0 do limit = int(parsed)
+	}
+	if offset_expr != nil {
+		value, value_err := eval_expr(&ctx, offset_expr)
+		if value_err.kind != .None do return nil, value_err
+		parsed, ok := value_to_i64(value)
+		if !ok do return nil, errf(.Invalid_Argument, "OFFSET must be an integer")
+		if parsed > 0 do offset = int(parsed)
+	}
+
 	first, first_err := sql_exec_select(tx, base, params)
 	if first_err.kind != .None do return nil, first_err
 	defer sql_result_destroy(&first)
 	if len(first.columns) == 0 do return nil, errf(.Internal, "recursive query without columns")
 
 	columns := make([]Column, len(first.columns), tx.alloc)
+	names := make([]string, len(first.columns), tx.alloc)
 	for column_name, i in first.columns {
 		name := column_name
 		if i < len(cte.columns) do name = cte.columns[i]
+		names[i] = name
 		columns[i] = Column {
 			name = strings.clone(name, tx.alloc),
 			type = view_column_type(first.rows, i),
@@ -2109,45 +2135,105 @@ tx_materialize_recursive_cte :: proc(tx: ^Tx, cte: Cte, params: []Value) -> (^Ta
 	})
 	if table_err.kind != .None do return nil, table_err
 	append(&tx.temp_tables, table)
-	tx.cte_tables[strings.clone(cte.name, tx.alloc)] = table
+	// The step reads the row taken from the queue through the CTE's name: a
+	// table of one row, emptied for each.
+	current, current_err := table_create(&Table_Schema {
+		name    = strings.clone(cte.name, tx.alloc),
+		columns = columns,
+	})
+	if current_err.kind != .None do return nil, current_err
+	append(&tx.temp_tables, current)
+	key := strings.clone(cte.name, tx.alloc)
+	tx.cte_tables[key] = current
+	defer tx.cte_tables[key] = table
 
 	seen := make(map[string]bool)
+	queue := make([dynamic]Recursive_Queued)
+	head := 0
 	defer {
-		for key in seen do delete(key)
+		for k in seen do delete(k)
 		delete(seen)
-	}
-	next_id := Row_Id(1)
-	for row in first.rows {
-		if _, insert_err := recursive_insert(table, &seen, row, &next_id); insert_err.kind != .None {
-			return nil, insert_err
+		for queued in queue[head:] {
+			free_values(queued.values)
+			delete(queued.key)
 		}
+		delete(queue)
 	}
+	sequence := Row_Id(0)
+	enqueue :: proc(
+		ctx: ^Eval_Ctx,
+		queue: ^[dynamic]Recursive_Queued,
+		seen: ^map[string]bool,
+		union_all: bool,
+		order_by: []Order_Item,
+		names: []string,
+		sequence: ^Row_Id,
+		values: []Value,
+	) {
+		if !union_all {
+			row_key := encode_output_key(values)
+			if row_key in seen^ {
+				delete(row_key)
+				return
+			}
+			seen^[row_key] = true
+		}
+		sequence^ += 1
+		queued := Recursive_Queued{values = clone_values(values)}
+		// Rows of the same key leave in the order they came: the sequence is
+		// the key's last part.
+		if len(order_by) > 0 do queued.key = build_order_key(ctx, order_by, nil, queued.values, names, sequence^)
+		append(queue, queued)
+	}
+	for row in first.rows do enqueue(&ctx, &queue, &seen, union_all, order_by, names, &sequence, row)
+	if ctx.order_err.kind != .None do return nil, ctx.order_err
 
-	steps := 0
+	term := parts[0].select_stmt
+	term.compound = nil
+	term.order_by = nil
+	term.limit = nil
+	term.offset = nil
 	recursion_limit := tx.store != nil && tx.store.recursion_limit > 0 ? tx.store.recursion_limit : RECURSION_LIMIT
-	for steps < recursion_limit {
-		term := parts[0].select_stmt
-		term.compound = nil
-		term.order_by = nil
-		term.limit = nil
-		term.offset = nil
-		result, term_err := sql_exec_select(tx, term, params)
-		if term_err.kind != .None do return nil, term_err
-		added := 0
-		for row in result.rows {
-			inserted, insert_err := recursive_insert(table, &seen, row, &next_id)
-			if insert_err.kind != .None {
-				sql_result_destroy(&result)
+	taken, added := 0, 0
+	for head < len(queue) {
+		if limit >= 0 && added >= limit do break
+		if taken >= recursion_limit {
+			return nil, errf(.Cancelled, "WITH RECURSIVE %s exceeded %d rows", cte.name, recursion_limit)
+		}
+		if len(order_by) > 0 {
+			// The smallest key goes first; it trades places with the head.
+			least := head
+			for i in head + 1 ..< len(queue) {
+				if string(queue[i].key) < string(queue[least].key) do least = i
+			}
+			queue[head], queue[least] = queue[least], queue[head]
+		}
+		row := queue[head]
+		head += 1
+		taken += 1
+		defer {
+			free_values(row.values)
+			delete(row.key)
+		}
+		if taken > offset {
+			if insert_err := table_insert(table, Row_Id(added + 1), row.values); insert_err.kind != .None {
 				return nil, insert_err
 			}
-			if inserted do added += 1
+			added += 1
 		}
+		table_truncate(current)
+		if insert_err := table_insert(current, 1, row.values); insert_err.kind != .None do return nil, insert_err
+		result, term_err := sql_exec_select(tx, term, params)
+		if term_err.kind != .None do return nil, term_err
+		for produced in result.rows do enqueue(&ctx, &queue, &seen, union_all, order_by, names, &sequence, produced)
 		sql_result_destroy(&result)
-		if added == 0 do break
-		steps += 1
-	}
-	if steps >= recursion_limit {
-		return nil, errf(.Cancelled, "WITH RECURSIVE %s exceeded %d steps", cte.name, recursion_limit)
+		if ctx.order_err.kind != .None do return nil, ctx.order_err
+		// The rows already taken are dropped from the front now and then, so a
+		// long recursion does not hold its whole history.
+		if head >= 1024 && head * 2 >= len(queue) {
+			remove_range(&queue, 0, head)
+			head = 0
+		}
 	}
 	return table, ERROR_NONE
 }

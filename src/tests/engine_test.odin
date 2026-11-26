@@ -9507,7 +9507,7 @@ test_recursive_cte :: proc(t: ^testing.T) {
 	defer db.sql_result_destroy(&counting)
 	testing.expect_value(t, counting.rows[0][0].i, i64(10))
 	testing.expect_value(t, counting.rows[0][1].i, i64(10))
-	// The step reads the accumulated rows: 5! = 120.
+	// Each step reads the row before it: 5! = 120.
 	factorial := run(t, store, "WITH RECURSIVE f(n, value) AS (SELECT 1, 1 UNION ALL SELECT n + 1, value * (n + 1) FROM f WHERE n < 5) SELECT value FROM f ORDER BY n DESC LIMIT 1")
 	defer db.sql_result_destroy(&factorial)
 	testing.expect_value(t, factorial.rows[0][0].i, i64(120))

@@ -294,6 +294,26 @@ QUERIES = [
     # A CTE's body may be a VALUES list, with the materialization hints.
     "WITH t(n) AS (VALUES (1), (2), (3)) SELECT sum(n) FROM t",
     "WITH t(a, b) AS MATERIALIZED (VALUES (1, 'x'), (2, 'y')) SELECT b FROM t WHERE a = 2",
+    # WITH RECURSIVE as SQLite runs it: a queue of rows, the step reading the one
+    # row taken; group_concat shows the order they were taken in. LIMIT and
+    # OFFSET count the rows taken, UNION ALL keeps duplicates, UNION ends a
+    # cycle, and ORDER BY takes the smallest row first (depth or breadth first).
+    "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c LIMIT 5) SELECT group_concat(x) FROM c",
+    "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c LIMIT 3 OFFSET 2) SELECT group_concat(x) FROM c",
+    "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c LIMIT 0) SELECT count(*) FROM c",
+    "WITH RECURSIVE c(x) AS (SELECT column1 FROM (VALUES (1), (1)) UNION ALL SELECT x + 1 FROM c WHERE x < 3) SELECT group_concat(x) FROM c",
+    "WITH RECURSIVE c(x) AS (SELECT column1 FROM (VALUES (1), (10)) UNION ALL SELECT x + 1 FROM c WHERE x % 10 < 2) SELECT group_concat(x) FROM c",
+    "WITH RECURSIVE r(x) AS (SELECT 1 UNION SELECT x % 4 + 1 FROM r) SELECT group_concat(x) FROM r",
+    "WITH RECURSIVE f(a, b) AS (SELECT 0, 1 UNION ALL SELECT b, a + b FROM f LIMIT 10) SELECT group_concat(a) FROM f",
+    "WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 3000) SELECT count(*), sum(i) FROM s",
+    "WITH RECURSIVE c(x) AS (SELECT 5 UNION ALL SELECT x - 1 FROM c WHERE x > 0 ORDER BY 1 LIMIT 3) SELECT group_concat(x) FROM c",
+    "WITH RECURSIVE t(id, parent) AS (VALUES (1, NULL), (2, 1), (3, 1), (4, 2), (5, 3), (6, 2)), "
+    "w(id, depth) AS (SELECT 1, 0 UNION ALL SELECT t.id, w.depth + 1 FROM w JOIN t ON t.parent = w.id ORDER BY 2 DESC) "
+    "SELECT group_concat(id || ':' || depth) FROM w",
+    "WITH RECURSIVE t(id, parent) AS (VALUES (1, NULL), (2, 1), (3, 1), (4, 2), (5, 3), (6, 2)), "
+    "w(id, depth) AS (SELECT 1, 0 UNION ALL SELECT t.id, w.depth + 1 FROM w JOIN t ON t.parent = w.id ORDER BY 2) "
+    "SELECT group_concat(id || ':' || depth) FROM w",
+    "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 6) SELECT count(*) FROM emp JOIN c ON emp.id = c.x",
     # Common table expressions on a write (D38): in front of it, and inside an
     # INSERT's SELECT; recursive too; seen by the WHERE of an UPDATE and a DELETE.
     "WITH c AS (SELECT 'd' AS k, 4 AS v) INSERT INTO kv (k, v) SELECT k, v FROM c RETURNING k, v",
