@@ -37,8 +37,9 @@ sqlite_pragma_statement :: proc(sql: string) -> (body: string, is_pragma: bool) 
 			break
 		}
 	}
-	upper := strings.to_upper(trimmed, context.temp_allocator)
-	if !strings.has_prefix(upper, "PRAGMA") do return "", false
+	// The first six bytes, without case: upper-casing the whole statement for
+	// them cost every statement a copy of its text (1 µs of a point lookup).
+	if len(trimmed) < 6 || !strings.equal_fold(trimmed[:6], "PRAGMA") do return "", false
 	if len(trimmed) > 6 {
 		next := trimmed[6]
 		if next != ' ' && next != '\t' && next != '(' && next != '=' && next != '\n' {
