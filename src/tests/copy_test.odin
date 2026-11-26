@@ -13,7 +13,7 @@ import db "../engine"
 @(private)
 copy_store :: proc(t: ^testing.T, name: string) -> ^db.Store {
 	path := name
-	os.remove_all(path)
+	db.remove_tree(path)
 	store, open_err := db.store_open(path, {persistent = true, create = true, durable = false})
 	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return nil
 	return store
@@ -24,7 +24,7 @@ test_copy_text_and_csv_roundtrip :: proc(t: ^testing.T) {
 	store := copy_store(t, "_test_copy_db_text")
 	if store == nil do return
 	defer db.store_close(store)
-	defer os.remove_all("_test_copy_db_text")
+	defer db.remove_tree("_test_copy_db_text")
 	defer os.remove("_test_copy.txt")
 	defer os.remove("_test_copy.csv")
 
@@ -85,7 +85,7 @@ test_copy_options_and_column_lists :: proc(t: ^testing.T) {
 	store := copy_store(t, "_test_copy_db_options")
 	if store == nil do return
 	defer db.store_close(store)
-	defer os.remove_all("_test_copy_db_options")
+	defer db.remove_tree("_test_copy_db_options")
 	defer os.remove("_test_copy_opts.txt")
 
 	// A column list leaves the others to their defaults, and DELIMITER and NULL
@@ -112,7 +112,7 @@ test_copy_refuses_a_bad_row :: proc(t: ^testing.T) {
 	store := copy_store(t, "_test_copy_db_bad")
 	if store == nil do return
 	defer db.store_close(store)
-	defer os.remove_all("_test_copy_db_bad")
+	defer db.remove_tree("_test_copy_db_bad")
 	defer os.remove("_test_copy_bad.txt")
 
 	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")

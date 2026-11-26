@@ -1355,7 +1355,7 @@ store_discard_pages :: proc(store: ^Store) -> Error {
 	for suffix in dirs {
 		dir := strings.concatenate({store.path, suffix})
 		defer delete(dir)
-		if remove_err := os.remove_all(dir); remove_err != nil && os.exists(dir) {
+		if remove_err := remove_tree(dir); remove_err != nil && os.exists(dir) {
 			return errf(.Io, "cannot clear %s: %v", dir, remove_err)
 		}
 		if mkdir_err := os.make_directory_all(dir); mkdir_err != nil {

@@ -152,8 +152,8 @@ test_page_flush_kill :: proc(t: ^testing.T) {
 	// a few hundred writes of the same kind.
 	for nth := 1; nth < 2000; nth += nth < 30 ? 1 : 13 {
 		path := fmt.tprintf("_test_page_kill_%d", nth)
-		os.remove_all(path)
-		defer os.remove_all(path)
+		db.remove_tree(path)
+		defer db.remove_tree(path)
 		model, model_err := db.store_open("", {persistent = false})
 		if !testing.expectf(t, db.error_ok(model_err), "model: %s", model_err.message) do return
 		defer db.store_close(model)

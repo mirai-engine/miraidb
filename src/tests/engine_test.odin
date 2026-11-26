@@ -22,7 +22,7 @@ import sdk "../client"
 fresh_db :: proc(t: ^testing.T, name: string) -> ^db.Store {
 	path := fmt.aprintf("_test_%s", name)
 	defer delete(path)
-	os.remove_all(path)
+	db.remove_tree(path)
 	store, err := db.store_open(path, {persistent = true, create = true, durable = false})
 	if !testing.expectf(t, db.error_ok(err), "open %s failed: %s", path, err.message) {
 		return nil
@@ -35,7 +35,7 @@ cleanup_db :: proc(store: ^db.Store, name: string) {
 	path := fmt.aprintf("_test_%s", name)
 	defer delete(path)
 	db.store_close(store)
-	os.remove_all(path)
+	db.remove_tree(path)
 }
 
 @(private)
@@ -1698,8 +1698,8 @@ test_durability_after_restart :: proc(t: ^testing.T) {
 	// time because that time is a column of _schedule.
 	path := fmt.aprintf("_test_%s", "durab")
 	defer delete(path)
-	defer os.remove_all(path)
-	os.remove_all(path)
+	defer db.remove_tree(path)
+	db.remove_tree(path)
 
 	bump :: proc(ctx: ^db.Reducer_Ctx, args: []db.Value) -> db.Error {
 		dropped_result_1691, err := db.sql_execute_in_tx(ctx.tx, "UPDATE counter SET value = value + 1 WHERE id = 0")
@@ -2223,8 +2223,8 @@ strings_contains_index :: proc(haystack, needle: string) -> int {
 @(test)
 test_snapshot_restore :: proc(t: ^testing.T) {
 	path := "_test_snapshot"
-	os.remove_all(path)
-	defer os.remove_all(path)
+	db.remove_tree(path)
+	defer db.remove_tree(path)
 
 	store, err := db.store_open(path, {persistent = true, create = true, durable = false})
 	if !testing.expectf(t, db.error_ok(err), "open failed: %s", err.message) do return
@@ -2333,8 +2333,8 @@ test_views :: proc(t: ^testing.T) {
 @(test)
 test_view_persistence :: proc(t: ^testing.T) {
 	path := "_test_viewpersist"
-	os.remove_all(path)
-	defer os.remove_all(path)
+	db.remove_tree(path)
+	defer db.remove_tree(path)
 
 	store, err := db.store_open(path, {persistent = true, create = true, durable = false})
 	if !testing.expectf(t, db.error_ok(err), "open failed: %s", err.message) do return
@@ -2503,8 +2503,8 @@ test_policies :: proc(t: ^testing.T) {
 @(test)
 test_durability_modes :: proc(t: ^testing.T) {
 	path := "_test_durability"
-	os.remove_all(path)
-	defer os.remove_all(path)
+	db.remove_tree(path)
+	defer db.remove_tree(path)
 
 	store, err := db.store_open(path, {persistent = true, create = true, durable = true, durability = .Batched})
 	if !testing.expectf(t, db.error_ok(err), "open: %s", err.message) do return
@@ -2529,8 +2529,8 @@ test_durability_modes :: proc(t: ^testing.T) {
 @(test)
 test_log_offset_index :: proc(t: ^testing.T) {
 	path := "_test_logindex"
-	os.remove_all(path)
-	defer os.remove_all(path)
+	db.remove_tree(path)
+	defer db.remove_tree(path)
 
 	store, err := db.store_open(path, {persistent = true, create = true, durable = false})
 	if !testing.expectf(t, db.error_ok(err), "open: %s", err.message) do return
@@ -2571,8 +2571,8 @@ test_log_index_kept_open_matches_the_log :: proc(t: ^testing.T) {
 	// the cut: the file holds exactly one entry per record the log keeps, in
 	// order, with no hole of zeros.
 	path :: "_test_logindex_open"
-	os.remove_all(path)
-	defer os.remove_all(path)
+	db.remove_tree(path)
+	defer db.remove_tree(path)
 	testing.expect(t, os.make_directory(path) == nil)
 	log, open_err := db.log_open(path, true, .None, .CRC32C)
 	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
@@ -2638,8 +2638,8 @@ test_in_memory_log :: proc(t: ^testing.T) {
 @(test)
 test_log_segments :: proc(t: ^testing.T) {
 	path := "_test_segments"
-	os.remove_all(path)
-	defer os.remove_all(path)
+	db.remove_tree(path)
+	defer db.remove_tree(path)
 
 	store, err := db.store_open(path, {persistent = true, create = true, durable = false})
 	if !testing.expectf(t, db.error_ok(err), "open: %s", err.message) do return
@@ -2854,8 +2854,8 @@ test_background_compaction :: proc(t: ^testing.T) {
 
 	path := fmt.aprintf("_test_%s", "bgcompact")
 	defer delete(path)
-	defer os.remove_all(path)
-	os.remove_all(path)
+	defer db.remove_tree(path)
+	db.remove_tree(path)
 	store, open_err := db.store_open(path, {persistent = true, create = true, durable = false})
 	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
 	defer db.store_close(store)
@@ -3424,8 +3424,8 @@ test_commit_ops_hook :: proc(t: ^testing.T) {
 @(test)
 test_log_bit_flip :: proc(t: ^testing.T) {
 	path := "_test_bitflip"
-	os.remove_all(path)
-	defer os.remove_all(path)
+	db.remove_tree(path)
+	defer db.remove_tree(path)
 
 	store, err := db.store_open(path, {persistent = true, create = true, durable = false})
 	if !testing.expectf(t, db.error_ok(err), "open: %s", err.message) do return
@@ -3891,7 +3891,7 @@ test_system_tables :: proc(t: ^testing.T) {
 test_alter_table_add_column :: proc(t: ^testing.T) {
 	path := fmt.aprintf("_test_%s", "alter")
 	defer delete(path)
-	defer os.remove_all(path)
+	defer db.remove_tree(path)
 	store := fresh_db(t, "alter")
 	if store == nil do return
 
@@ -4207,7 +4207,7 @@ test_module_identity :: proc(t: ^testing.T) {
 test_ephemeral_tables :: proc(t: ^testing.T) {
 	path := fmt.aprintf("_test_%s", "ephemeral")
 	defer delete(path)
-	defer os.remove_all(path)
+	defer db.remove_tree(path)
 	store := fresh_db(t, "ephemeral")
 	if store == nil do return
 
@@ -4279,8 +4279,8 @@ test_transaction_read_set :: proc(t: ^testing.T) {
 test_checksum_modes :: proc(t: ^testing.T) {
 	path := fmt.aprintf("_test_%s", "checksum")
 	defer delete(path)
-	defer os.remove_all(path)
-	os.remove_all(path)
+	defer db.remove_tree(path)
+	db.remove_tree(path)
 	store, open_err := db.store_open(path, {persistent = true, create = true, durable = false, checksum = db.Checksum.None})
 	testing.expect(t, db.error_ok(open_err))
 	testing.expect_value(t, store.log.checksum, db.Checksum.None)
@@ -4684,7 +4684,7 @@ test_client_sdk :: proc(t: ^testing.T) {
 test_log_stream_reader :: proc(t: ^testing.T) {
 	path := fmt.aprintf("_test_%s", "stream")
 	defer delete(path)
-	defer os.remove_all(path)
+	defer db.remove_tree(path)
 	store := fresh_db(t, "stream")
 	if store == nil do return
 	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -4982,7 +4982,7 @@ test_schema_migrations :: proc(t: ^testing.T) {
 test_named_types :: proc(t: ^testing.T) {
 	path := fmt.aprintf("_test_%s", "named_types")
 	defer delete(path)
-	defer os.remove_all(path)
+	defer db.remove_tree(path)
 	store, host := fresh_host(t, "named_types")
 	if store == nil do return
 
@@ -5132,7 +5132,7 @@ test_postgres_wire :: proc(t: ^testing.T) {
 test_structural_types :: proc(t: ^testing.T) {
 	path := fmt.aprintf("_test_%s", "structural")
 	defer delete(path)
-	defer os.remove_all(path)
+	defer db.remove_tree(path)
 	store, host := fresh_host(t, "structural")
 	if store == nil do return
 	// The store and the host are closed below and reopened; the cleanup at the
@@ -5291,8 +5291,8 @@ test_row_versions :: proc(t: ^testing.T) {
 test_hash_and_direct_indexes :: proc(t: ^testing.T) {
 	path := fmt.aprintf("_test_%s", "hash_index")
 	defer delete(path)
-	defer os.remove_all(path)
-	os.remove_all(path)
+	defer db.remove_tree(path)
+	db.remove_tree(path)
 	store, host := fresh_host(t, "hash_index")
 	if store == nil do return
 	// Closed and reopened below: one owner per handle.
@@ -5626,7 +5626,7 @@ test_postgres_session_transactions :: proc(t: ^testing.T) {
 test_array_and_product_types :: proc(t: ^testing.T) {
 	path := fmt.aprintf("_test_%s", "containers")
 	defer delete(path)
-	defer os.remove_all(path)
+	defer db.remove_tree(path)
 	store, host := fresh_host(t, "containers")
 	if store == nil do return
 
@@ -5691,7 +5691,7 @@ test_array_and_product_types :: proc(t: ^testing.T) {
 test_named_type_references :: proc(t: ^testing.T) {
 	path := fmt.aprintf("_test_%s", "named_refs")
 	defer delete(path)
-	defer os.remove_all(path)
+	defer db.remove_tree(path)
 	store, host := fresh_host(t, "named_refs")
 	if store == nil do return
 
@@ -5841,7 +5841,7 @@ test_postgres_binary_and_describe :: proc(t: ^testing.T) {
 test_product_arity :: proc(t: ^testing.T) {
 	path := fmt.aprintf("_test_%s", "product_arity")
 	defer delete(path)
-	defer os.remove_all(path)
+	defer db.remove_tree(path)
 	store, host := fresh_host(t, "product_arity")
 	if store == nil do return
 
@@ -6100,7 +6100,7 @@ test_incremental_subscriptions :: proc(t: ^testing.T) {
 test_foreign_key_catalog :: proc(t: ^testing.T) {
 	path := fmt.aprintf("_test_%s", "fk_catalog")
 	defer delete(path)
-	defer os.remove_all(path)
+	defer db.remove_tree(path)
 	store, host := fresh_host(t, "fk_catalog")
 	if store == nil do return
 
@@ -6446,7 +6446,7 @@ test_delete_releases_versions :: proc(t: ^testing.T) {
 	// value and as a version), so closing the table freed them twice.
 	path := fmt.aprintf("_test_%s", "delete_versions")
 	defer delete(path)
-	defer os.remove_all(path)
+	defer db.remove_tree(path)
 	store, host := fresh_host(t, "delete_versions")
 	if store == nil do return
 
@@ -6524,7 +6524,7 @@ dump_database :: proc(t: ^testing.T, store: ^db.Store) -> string {
 test_kitchen_sink_replay :: proc(t: ^testing.T) {
 	path := fmt.aprintf("_test_%s", "kitchen_sink")
 	defer delete(path)
-	defer os.remove_all(path)
+	defer db.remove_tree(path)
 	store, host := fresh_host(t, "kitchen_sink")
 	if store == nil do return
 
@@ -6634,7 +6634,7 @@ test_soak_update_delete_prune :: proc(t: ^testing.T) {
 	// handle this test leaves behind must not refuse that one.
 	path := fmt.aprintf("_test_%s", "soak_prune")
 	defer delete(path)
-	defer os.remove_all(path)
+	defer db.remove_tree(path)
 	store, host := fresh_host(t, "soak_prune")
 	if store == nil do return
 
@@ -7061,7 +7061,7 @@ test_embed_opens_sqlite_file :: proc(t: ^testing.T) {
 test_not_null_survives_replay :: proc(t: ^testing.T) {
 	path := fmt.aprintf("_test_%s", "not_null_replay")
 	defer delete(path)
-	defer os.remove_all(path)
+	defer db.remove_tree(path)
 	store, host := fresh_host(t, "not_null_replay")
 	if store == nil do return
 	run_done(t, store, "CREATE TABLE strict (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
@@ -7170,7 +7170,7 @@ test_glob_operator :: proc(t: ^testing.T) {
 test_returning_clause :: proc(t: ^testing.T) {
 	path := fmt.aprintf("_test_%s", "returning")
 	defer delete(path)
-	defer os.remove_all(path)
+	defer db.remove_tree(path)
 	store, host := fresh_host(t, "returning")
 	if store == nil do return
 	run_done(t, store, "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)")
@@ -7261,7 +7261,7 @@ test_any_column_affinity :: proc(t: ^testing.T) {
 	reopened, open_err := db.store_open("_test_any_column", {persistent = true, create = true, durable = false})
 	testing.expect(t, db.error_ok(open_err))
 	defer db.store_close(reopened)
-	defer os.remove_all("_test_any_column")
+	defer db.remove_tree("_test_any_column")
 	testing.expect_value(t, scalar(t, reopened, "SELECT v FROM mixed WHERE id = 2").s, "text")
 	testing.expect_value(t, scalar(t, reopened, "SELECT count(*) FROM mixed").i, i64(5))
 }
@@ -7498,15 +7498,15 @@ test_remote_module :: proc(t: ^testing.T) {
 
 	db.host_destroy(host)
 	remote_listener_stop(&state, bound.port, worker)
-	os.remove_all("_test_remote_mod")
+	db.remove_tree("_test_remote_mod")
 }
 
 @(test)
 test_spatial_rtree :: proc(t: ^testing.T) {
 	path := fmt.aprintf("_test_%s", "rtree")
 	defer delete(path)
-	defer os.remove_all(path)
-	os.remove_all(path)
+	defer db.remove_tree(path)
+	db.remove_tree(path)
 	store, open_err := db.store_open(path, {persistent = true, create = true, durable = false})
 	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
 
@@ -7600,8 +7600,8 @@ test_extension_load :: proc(t: ^testing.T) {
 
 	path := fmt.aprintf("_test_%s", "extension")
 	defer delete(path)
-	defer os.remove_all(path)
-	os.remove_all(path)
+	defer db.remove_tree(path)
+	db.remove_tree(path)
 	store, open_err := db.store_open(path, {persistent = true, create = true, durable = false})
 	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
 	host := db.host_init(store)
@@ -7663,8 +7663,8 @@ test_extension_load :: proc(t: ^testing.T) {
 test_full_text_search :: proc(t: ^testing.T) {
 	path := fmt.aprintf("_test_%s", "fts")
 	defer delete(path)
-	defer os.remove_all(path)
-	os.remove_all(path)
+	defer db.remove_tree(path)
+	db.remove_tree(path)
 	store, open_err := db.store_open(path, {persistent = true, create = true, durable = false})
 	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
 
@@ -7734,7 +7734,7 @@ test_sqlite_live_mirror :: proc(t: ^testing.T) {
 	_, _, export_err := db.sqlite_file_write(store, path)
 	testing.expect(t, db.error_ok(export_err))
 	db.store_close(store)
-	os.remove_all("_test_mirror_source")
+	db.remove_tree("_test_mirror_source")
 
 	conn, open_err := db.embed_open(path, {persistent = true, create = false, durable = false})
 	if !testing.expectf(t, db.error_ok(open_err), "embed_open: %s", open_err.message) do return
@@ -7787,7 +7787,7 @@ test_keys_cross_a_sqlite_file_both_ways :: proc(t: ^testing.T) {
 	_, _, export_err := db.sqlite_file_write(source, path)
 	testing.expect(t, db.error_ok(export_err))
 	db.store_close(source)
-	os.remove_all("_test_keys_source")
+	db.remove_tree("_test_keys_source")
 
 	file, file_err := db.sqlite_file_open(path)
 	if !testing.expectf(t, db.error_ok(file_err), "sqlite_file_open: %s", file_err.message) do return
@@ -8127,7 +8127,7 @@ test_mirror_patches_only_the_pages_it_touched :: proc(t: ^testing.T) {
 	_, _, export_err := db.sqlite_file_write(source, path)
 	testing.expect(t, db.error_ok(export_err), "export must succeed")
 	db.store_close(source)
-	os.remove_all("_test_mirror_patch_source")
+	db.remove_tree("_test_mirror_patch_source")
 
 	conn, open_err := db.embed_open(path, {persistent = true, create = false, durable = false})
 	if !testing.expectf(t, db.error_ok(open_err), "embed_open: %s", open_err.message) do return
@@ -8214,7 +8214,7 @@ test_mirror_survives_a_torn_commit :: proc(t: ^testing.T) {
 	_, _, export_err := db.sqlite_file_write(source, path)
 	testing.expect(t, db.error_ok(export_err))
 	db.store_close(source)
-	os.remove_all("_test_mirror_torn_source")
+	db.remove_tree("_test_mirror_torn_source")
 
 	conn, open_err := db.embed_open(path, {persistent = true, create = false, durable = false})
 	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
@@ -8316,7 +8316,7 @@ test_mirror_grows_and_reopens :: proc(t: ^testing.T) {
 	_, _, export_err := db.sqlite_file_write(source, path)
 	testing.expect(t, db.error_ok(export_err))
 	db.store_close(source)
-	os.remove_all("_test_mirror_grow_source")
+	db.remove_tree("_test_mirror_grow_source")
 
 	conn, open_err := db.embed_open(path, {persistent = true, create = false, durable = false})
 	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
@@ -8421,8 +8421,8 @@ test_mirror_grows_and_reopens :: proc(t: ^testing.T) {
 test_column_collation_and_generated :: proc(t: ^testing.T) {
 	path := fmt.aprintf("_test_%s", "collgen")
 	defer delete(path)
-	defer os.remove_all(path)
-	os.remove_all(path)
+	defer db.remove_tree(path)
+	db.remove_tree(path)
 	store, open_err := db.store_open(path, {persistent = true, create = true, durable = false})
 	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
 
@@ -8686,7 +8686,7 @@ test_scalar_subquery_text_outlives_it :: proc(t: ^testing.T) {
 test_attach_and_detach :: proc(t: ^testing.T) {
 	other_path := fmt.aprintf("_test_%s", "attached_other")
 	defer delete(other_path)
-	os.remove_all(other_path)
+	db.remove_tree(other_path)
 	other, open_err := db.store_open(other_path, {persistent = true, create = true, durable = false})
 	if !testing.expectf(t, db.error_ok(open_err), "open other: %s", open_err.message) do return
 	run_done(t, other, "CREATE TABLE other_items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
@@ -8780,8 +8780,8 @@ test_attach_and_detach :: proc(t: ^testing.T) {
 	testing.expect_value(t, still_gone.kind, db.Error_Kind.Table_Not_Found)
 	db.store_close(again)
 	db.host_destroy(host)
-	os.remove_all("_test_attach_principal")
-	os.remove_all(other_path)
+	db.remove_tree("_test_attach_principal")
+	db.remove_tree(other_path)
 }
 
 @(test)
@@ -9945,7 +9945,7 @@ test_vacuum_into :: proc(t: ^testing.T) {
 	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)")
 	run_done(t, store, "INSERT INTO t (a) VALUES ('x'), ('y'), ('z')")
 	target := "_test_vacuum_copy"
-	os.remove_all(target)
+	db.remove_tree(target)
 	run_done(t, store, "VACUUM INTO './_test_vacuum_copy'")
 	// The copy is a database of its own: it reads and takes new commits.
 	copy_store, open_err := db.store_open(target, {persistent = true, create = false, durable = false})
@@ -10451,8 +10451,8 @@ test_writer_lock :: proc(t: ^testing.T) {
 	// the refusal names the pid that holds it; closing the owner releases both.
 	path := fmt.aprintf("_test_%s", "writer_lock")
 	defer delete(path)
-	os.remove_all(path)
-	defer os.remove_all(path)
+	db.remove_tree(path)
+	defer db.remove_tree(path)
 
 	first, first_err := db.store_open(path, {persistent = true, create = true, durable = false})
 	if !testing.expectf(t, db.error_ok(first_err), "first open: %s", first_err.message) do return
@@ -10478,7 +10478,7 @@ test_writer_lock :: proc(t: ^testing.T) {
 	// locked: the lock is taken after the directory exists.
 	missing := fmt.aprintf("_test_%s_missing", "writer_lock")
 	defer delete(missing)
-	os.remove_all(missing)
+	db.remove_tree(missing)
 	_, missing_err := db.store_open(missing, {persistent = true, create = false, durable = false})
 	defer db.error_free(&missing_err)
 	testing.expect_value(t, missing_err.kind, db.Error_Kind.Io)
@@ -11689,7 +11689,7 @@ test_alter_rename_column :: proc(t: ^testing.T) {
 	// columns by position, not by name.
 	store := fresh_db(t, "rename_column")
 	if store == nil do return
-	defer os.remove_all("_test_rename_column")
+	defer db.remove_tree("_test_rename_column")
 	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT NOT NULL, score INTEGER)")
 	run_done(t, store, "CREATE UNIQUE INDEX t_label ON t (label)")
 	run_done(t, store, "INSERT INTO t (id, label, score) VALUES (1, 'a', 10), (2, 'b', 20)")
@@ -11824,8 +11824,8 @@ test_paged_table_roundtrip :: proc(t: ^testing.T) {
 	// lookups by key, updates, deletes, constraints and a reopen. The row map
 	// stays empty and the pool stays small, which is the point of the exercise.
 	path := "_test_paged_roundtrip"
-	os.remove_all(path)
-	defer os.remove_all(path)
+	db.remove_tree(path)
+	defer db.remove_tree(path)
 	store, open_err := db.store_open(path, {
 		persistent = true,
 		create = true,
@@ -11992,8 +11992,8 @@ test_paged_table_churn :: proc(t: ^testing.T) {
 	// them, and it must not move the slot a row is indexed by: this walks enough
 	// churn to force compaction many times and then checks every value.
 	path := "_test_paged_churn"
-	os.remove_all(path)
-	defer os.remove_all(path)
+	db.remove_tree(path)
+	defer db.remove_tree(path)
 	store, open_err := db.store_open(path, {
 		persistent = true,
 		create = true,
@@ -12183,8 +12183,8 @@ test_paged_index_pages :: proc(t: ^testing.T) {
 	// arena: the point-lookup path, the range path, constraints, updates,
 	// deletes, TRUNCATE and a reopen all have to work through those pages.
 	path := "_test_paged_index"
-	os.remove_all(path)
-	defer os.remove_all(path)
+	db.remove_tree(path)
+	defer db.remove_tree(path)
 	options := db.Store_Options {
 		persistent   = true,
 		create       = true,
@@ -12293,8 +12293,8 @@ test_replay_streams_the_log :: proc(t: ^testing.T) {
 	// checks the replay never had to grow past its starting buffer, then tears the
 	// tail off and checks the record that was cut is the only one dropped.
 	path := "_test_replay_stream"
-	os.remove_all(path)
-	defer os.remove_all(path)
+	db.remove_tree(path)
+	defer db.remove_tree(path)
 	options := db.Store_Options {
 		persistent = true,
 		create     = true,
@@ -12428,8 +12428,8 @@ test_read_only_opens_beside_a_writer :: proc(t: ^testing.T) {
 	// lock has two bytes: the writer byte is exclusive, the reader byte is shared,
 	// so a reader joins and a second writer is still refused.
 	path := "_test_read_only"
-	os.remove_all(path)
-	defer os.remove_all(path)
+	db.remove_tree(path)
+	defer db.remove_tree(path)
 	writer, open_err := db.store_open(path, {persistent = true, create = true, durable = false})
 	if !testing.expectf(t, db.error_ok(open_err), "writer: %s", open_err.message) do return
 	writer_open := true
@@ -12502,8 +12502,8 @@ test_trusted_open_skips_the_replay :: proc(t: ^testing.T) {
 	// every page file and in the end of its log. Opening it should read those,
 	// not walk the log: the counters below are the proof.
 	path := "_test_trusted_open"
-	os.remove_all(path)
-	defer os.remove_all(path)
+	db.remove_tree(path)
+	defer db.remove_tree(path)
 	options := db.Store_Options {
 		persistent   = true,
 		create       = true,
@@ -13577,8 +13577,8 @@ test_aggregate_distinct :: proc(t: ^testing.T) {
 	db.sql_result_destroy(&grouped)
 
 	paged_path := "_test_agg_distinct_paged"
-	os.remove_all(paged_path)
-	defer os.remove_all(paged_path)
+	db.remove_tree(paged_path)
+	defer db.remove_tree(paged_path)
 	paged, open_err := db.store_open(paged_path, {
 		persistent  = true,
 		create      = true,
@@ -14180,7 +14180,7 @@ test_imported_indexes_are_planned_and_droppable :: proc(t: ^testing.T) {
 	_, _, export_err := db.sqlite_file_write(source, path)
 	testing.expectf(t, db.error_ok(export_err), "export: %s", export_err.message)
 	db.store_close(source)
-	os.remove_all("_test_indexes_source")
+	db.remove_tree("_test_indexes_source")
 
 	file, open_err := db.sqlite_file_open(path)
 	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
@@ -14242,7 +14242,7 @@ test_empty_export_is_a_readable_file :: proc(t: ^testing.T) {
 	_, _, export_err := db.sqlite_file_write(store, path)
 	testing.expectf(t, db.error_ok(export_err), "export: %s", export_err.message)
 	db.store_close(store)
-	os.remove_all("_test_empty_export")
+	db.remove_tree("_test_empty_export")
 
 	file, open_err := db.sqlite_file_open(path)
 	if !testing.expectf(t, db.error_ok(open_err), "the empty file is not readable: %s", open_err.message) do return
@@ -14944,8 +14944,8 @@ test_update_keeps_the_row_in_place :: proc(t: ^testing.T) {
 @(test)
 test_log_format_is_negotiated :: proc(t: ^testing.T) {
 	path := "_test_log_version"
-	os.remove_all(path)
-	defer os.remove_all(path)
+	db.remove_tree(path)
+	defer db.remove_tree(path)
 
 	store, err := db.store_open(path, {persistent = true, create = true, durable = false})
 	if !testing.expectf(t, db.error_ok(err), "open: %s", err.message) do return
@@ -15247,8 +15247,8 @@ test_array_text_form :: proc(t: ^testing.T) {
 @(test)
 test_drop_and_create_in_one_transaction :: proc(t: ^testing.T) {
 	path := "_test_drop_create"
-	os.remove_all(path)
-	defer os.remove_all(path)
+	db.remove_tree(path)
+	defer db.remove_tree(path)
 	store, open_err := db.store_open(path, {persistent = true, create = true, durable = false})
 	if !testing.expectf(t, db.error_ok(open_err), "open: %s", open_err.message) do return
 

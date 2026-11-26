@@ -106,8 +106,8 @@ expect_nothing_left :: proc(
 	loc := #caller_location,
 ) {
 	path := name
-	os.remove_all(path)
-	defer os.remove_all(path)
+	db.remove_tree(path)
+	defer db.remove_tree(path)
 	if mode == .Sqlite_File do testing.expect(t, db.sqlite_create_empty_file(path), loc = loc)
 
 	track: mem.Tracking_Allocator
@@ -650,8 +650,8 @@ test_a_streamed_aggregate_leaves_nothing :: proc(t: ^testing.T) {
 	// An aggregate over a paged table streams its rows; it cloned its column
 	// names and kept them.
 	path := "_test_memory_stream"
-	os.remove_all(path)
-	defer os.remove_all(path)
+	db.remove_tree(path)
+	defer db.remove_tree(path)
 	track: mem.Tracking_Allocator
 	mem.tracking_allocator_init(&track, context.allocator)
 	defer mem.tracking_allocator_destroy(&track)
