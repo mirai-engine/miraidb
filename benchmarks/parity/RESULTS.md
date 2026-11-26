@@ -682,6 +682,61 @@ the unique inserts 1.38x and 1.44x. What is left of those is the index itself
 (the B+tree descent and the integer key table, 77 of 121 us of a commit's
 apply) and the per-row work of staging; neither has a cheap part left.
 
+## Disk and SQL (2026-11-26)
+
+**On disk** (`bin/parity.exe disk`, the minimum of 60 runs, five times; the
+reference's figures are the ones above). A median commit took 2.6–2.9 ms where
+its minimum took 0.3–0.5: the log rotated at 256 KiB, every few commits of 256
+rows, and creating the next segment and its index costs milliseconds on
+Windows (writing 100 KiB to the same disk takes 30 µs). Built with 64 MiB
+segments the medians came down to the minimums; that is the default now
+(`LOG_SEGMENT_MAX`, a store may set its own: `Store_Options.log_segment_bytes`,
+which the tests that rotate use).
+
+| workload | min, µs | median, µs | reference | min ÷ reference |
+|---|---:|---:|---:|---:|
+| empty transaction | 0.60 | 0.7 | 0.53 | 1.13× |
+| insert_bulk u32_u64_str unique_0 | 441.9 | 488.6 (2 861 before) | 335 | 1.32× |
+| insert_bulk u32_u64_u64 unique_0 | 297.5 | 340.1 (2 652 before) | 208 | 1.43× |
+| update_bulk u32_u64_str | 398.4 | 557.2 (2 858 before) | 417 | 0.96× |
+| update_bulk u32_u64_u64 | 326.8 | 359.9 (2 695 before) | 352 | 0.93× |
+| iterate 256 rows (u32_u64_str) | 1.30 | 1.4 | 1.41 | 0.92× |
+| filter, string index | 2.10 | 2.4 | 3.29 | 0.64× |
+
+**Through SQL**, against SQLite 3.54.1 built `-O2` on the same machine and
+running the same statements from their text (prepare, step, finalize: what
+`sql_execute` does), median of 2000 runs:
+
+| statement | before | after | SQLite | after ÷ SQLite |
+|---|---:|---:|---:|---:|
+| `SELECT 1` | 5.8 µs | 4.4 | 0.70 | 6.3× |
+| `... WHERE rowid = 77` | 12.3 | 9.1 | 2.0 | 4.6× |
+| `... WHERE id = 77` (unique index) | 12.8 | 9.8 | 2.3 | 4.3× |
+| `SELECT count(*)`, 256 rows | 35.1 | 5.1 | 1.25 | 4.1× |
+| `count(*) WHERE age > 300 AND name <> 'x'`, no index | 125.2 | 99.1 | 13.7 | 7.2× |
+
+Timed by stage on Windows, a point lookup was 1 µs telling whether it was a
+PRAGMA, 2 µs parsing, 1.2 µs opening its read transaction, 1 µs resolving
+names and 10 µs executing. What changed:
+
+- `sqlite_pragma_statement` upper-cased the whole statement to read six
+  letters; it compares them without case now.
+- `sql_execute` keeps the parse of up to 16 queries by their text
+  (`STATEMENT_CACHE_SIZE`): the parse depends on the text alone, names are
+  resolved at every run, and a query leaves the cache while it runs, so two
+  threads never share one tree. `test_a_query_run_again_follows_the_schema`.
+- `SELECT count(*) FROM t` counts the rows the transaction sees, as SQLite's
+  OP_Count counts the b-tree, when nothing else could change the answer (no
+  WHERE, no staged write to the table, no policy, no program function).
+  `test_count_star_counts_the_rows_a_transaction_sees`.
+- A column reference in a statement over one table remembers which column it
+  names (`single_source_column`): the WHERE looked every name up for every
+  row, comparing it with each column's (9% of a filtered scan in `equal_fold`).
+
+`sql/filter_scan` joined the suite, so the baseline holds it too. What is left
+of the gap is the executor's shape, not one hot spot: a source and a Value copy
+per row, and an evaluator that walks a tree where SQLite runs byte code.
+
 To reproduce:
 
 ```sh

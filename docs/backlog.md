@@ -51,7 +51,7 @@ Rules for this file:
 | D24 | closed: `scripts/mirror_fuzz.py` passes 20 seeds of 400 statements against SQLite, a CI gate | — | — |
 | D34 | the threaded suite is green on Linux and Windows; the sanitizer covers the Windows CLI, not the suite | run the suite sanitized on every platform, in CI | S |
 | D36 | a query never reads a partial or expression index | match a query's predicate to the index | M |
-| D37 | a connection catching up with another process's commit reads and hashes the whole file; `multiwrite01` is 1.5–1.7× SQLite | read only the pages that changed, time `multiwrite01` in CI | M |
+| D37 | `multiwrite01` is 1.5–1.7× SQLite (speed only, traced for a later audit): a writer holds the lock ~9 ms where SQLite holds it ~3 | cheaper leaf repacking, schema changes the mirror patches, time it in CI | M |
 | S8 | the `sqlite3_*` facade exports 233 of the 309 functions SQLite declares | the other 76: statements, URIs, pre-update hooks, memory, WAL and snapshots, mutexes | M |
 | D39 | PostgreSQL's surface is not measured in CI; its catalog is `pg_tables` only | a probe gate, the catalog drivers and ORMs read, PostgreSQL's `GRANT` and `CREATE POLICY` | L |
 | D40 | a transaction holds the store's write lock until it commits | two writers that stage at once and conflict only at commit | L |
@@ -69,8 +69,11 @@ transaction (0.50 µs against 0.53), the index filters (2.4 against 3.25), both
 column (0.73–0.79×) and the u64 update (0.87×), and slower on the other writes:
 inserts 1.38–1.44× with one unique index, the str update 1.24× (inserts
 1.2–2.7× and updates 2.6–2.8× before the R2 work of 2026-11-25). On
-disk (written, not synced, the reference's own contract) inserts were 3.0–4.8×
-when last measured, on 2026-11-19.
+disk (written, not synced, the reference's own contract; the minimum of 60
+runs, 2026-11-26) the reads are 0.64–0.92× it, the updates 0.93–0.96× and the
+unique inserts 1.32–1.43× (3.0–5.6× on 2026-11-19), and the medians are now
+within 1.5× of the minimums: the log opened a new 256 KiB segment every few
+commits, which on Windows made the median commit ~2.7 ms.
 SQLite, measured in the same run, also beats this engine on inserts and on
 updates by a wide margin, so the target is not only the reference. Where the
 time goes is measured in [RESULTS.md](../benchmarks/parity/RESULTS.md); the four
@@ -678,10 +681,31 @@ left is how a connection catches up: SQLite compares 16 bytes of page 1 and
 drops its page cache, then reads the pages a statement needs; this engine
 reads the whole file and hashes every tree to find the tables that changed.
 
-**Done when.** A catch-up reads the pages that changed rather than the file
-(the journal or the change counter names them, or each tree's pages are
-compared), and `scripts/sqlite_tools.py` times `multiwrite01` against SQLite
-over five interleaved runs and fails past 1.25× SQLite's median.
+**For a later audit (2026-11-26).** Only speed is at stake: `multiwrite01` and
+the other mptest scripts pass every check SQLite passes (`sqlite_tools.py`),
+and the file stays valid. A trace of the build at `9cbb196`, per process and
+averaged over three runs (3.5–4.0 s each):
+
+| where | ms |
+|---|---:|
+| the write lock held (43 times) | ~400 |
+| waiting for the write lock or for SHARED (busy handler, 10 ms a try) | ~1 100 |
+| a reader's catch-up (parse, hashes, reload, mirror), outside the locks | ~90 |
+| reading the whole file again after a schema change | ~100 |
+
+Inside a hold, per commit that writes (28 a process): ~3 ms working out the
+patch (repacking leaves, 0.35 ms an edit), ~4.2 ms writing it (journal 1.7, pages
+1.0, sync 1.1, removing the journal 0.3; SQLite's own commit is ~3 ms on the
+same disk), ~2 ms waiting for EXCLUSIVE; and each of the 6 schema changes
+re-encodes the file (~15 ms). A catch-up by pages, as SQLite's pager does it,
+would save the readers' ~190 ms of work but not the time the others wait, so
+the next levers are the hold: cheaper leaf repacking and schema changes the
+mirror patches.
+
+**Done when.** A writer holds the lock about as long as SQLite's does (the
+leaf repacking and the schema changes above), and `scripts/sqlite_tools.py`
+times `multiwrite01` against SQLite over five interleaved runs and fails past
+1.25× SQLite's median.
 
 ## S8 — The rest of SQLite's C API
 
