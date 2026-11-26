@@ -96,7 +96,7 @@ test_log_rotation_faults :: proc(t: ^testing.T) {
 	for kind in ([?]db.Fault_Kind{.Open, .Write, .Sync}) {
 		for nth in u64(1) ..< 200 {
 			path := fmt.tprintf("_rotation_fault_%v_%d", kind, nth)
-			store, open_err := db.store_open(path, {persistent = true, create = true, durable = true, vfs = fault})
+			store, open_err := db.store_open(path, {persistent = true, create = true, durable = true, vfs = fault, log_segment_bytes = 256 << 10})
 			if !testing.expectf(t, db.error_ok(open_err), "%s: open: %s", path, open_err.message) {
 				db.error_free(&open_err)
 				return

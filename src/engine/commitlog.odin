@@ -46,8 +46,12 @@ Durability :: enum u8 {
 LOG_SYNC_BATCH :: 64
 
 // Segments cap the size of one file. Rotation appends, never splits a record:
-// the new segment's header records the last commit before it.
-LOG_SEGMENT_MAX :: i64(256 << 10)
+// the new segment's header records the last commit before it. A store may
+// set its own (Store_Options.log_segment_bytes); the tests that rotate do.
+// It was 256 KiB: a commit of 256 rows rotated the log every few commits, and
+// creating a segment and its index on Windows took a commit on disk from
+// ~0.4 ms to a median of ~2.7 ms.
+LOG_SEGMENT_MAX :: i64(64 << 20)
 
 // The offset index is a sidecar: <log>.index holds one (seq, offset) pair per
 // record, so replay can seek straight to the first record after a snapshot
@@ -193,6 +197,13 @@ Commit_Log :: struct {
 	// commit (D35). It is closed with the log, on rotation and before a rewind
 	// cuts the sidecar through another handle.
 	index_file: ^os.File,
+	// segment_max is where this log rotates; 0 is LOG_SEGMENT_MAX.
+	segment_max: i64,
+}
+
+// log_segment_max is the size at which the log opens its next segment.
+log_segment_max :: proc(log: ^Commit_Log) -> i64 {
+	return log.segment_max > 0 ? log.segment_max : LOG_SEGMENT_MAX
 }
 
 // log_segment_path names segment 0 `<db>/log` (so databases from before
@@ -421,7 +432,7 @@ log_append :: proc(log: ^Commit_Log, commit_seq: u64, payload: []u8) -> Error {
 		log.size += i64(len(record))
 		return ERROR_NONE
 	}
-	if log.size >= LOG_SEGMENT_MAX {
+	if log.size >= log_segment_max(log) {
 		if rotate_err := log_rotate(log, commit_seq); rotate_err.kind != .None {
 			return rotate_err
 		}

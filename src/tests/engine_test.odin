@@ -2641,7 +2641,9 @@ test_log_segments :: proc(t: ^testing.T) {
 	db.remove_tree(path)
 	defer db.remove_tree(path)
 
-	store, err := db.store_open(path, {persistent = true, create = true, durable = false})
+	// Segments of 256 KiB, not the default's, so a few hundred rows rotate.
+	segment := i64(256 << 10)
+	store, err := db.store_open(path, {persistent = true, create = true, durable = false, log_segment_bytes = segment})
 	if !testing.expectf(t, db.error_ok(err), "open: %s", err.message) do return
 	run_done(t, store, "CREATE TABLE doc (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL)")
 	// About 410 KB of records rotate the 256 KiB segment at least once.
@@ -2657,7 +2659,7 @@ test_log_segments :: proc(t: ^testing.T) {
 	db.store_close(store)
 
 	// Reopen: records from every segment replay in order.
-	store, err = db.store_open(path, {persistent = true, durable = false})
+	store, err = db.store_open(path, {persistent = true, durable = false, log_segment_bytes = segment})
 	if !testing.expectf(t, db.error_ok(err), "reopen: %s", err.message) do return
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM doc").i, i64(400))
 	run_done(t, store, "INSERT INTO doc (body) VALUES ('tail')")
@@ -2671,7 +2673,7 @@ test_log_segments :: proc(t: ^testing.T) {
 	delete(second)
 	db.store_close(store)
 
-	store, err = db.store_open(path, {persistent = true, durable = false})
+	store, err = db.store_open(path, {persistent = true, durable = false, log_segment_bytes = segment})
 	defer db.store_close(store)
 	if !testing.expectf(t, db.error_ok(err), "reopen after compact: %s", err.message) do return
 	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM doc").i, i64(401))

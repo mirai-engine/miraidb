@@ -48,6 +48,9 @@ Store_Options :: struct {
 	// page_frames is how many 4 KiB pages of each table file stay in the buffer
 	// pool. Zero means the default.
 	page_frames: int,
+	// log_segment_bytes is where the log opens its next file; zero means
+	// LOG_SEGMENT_MAX.
+	log_segment_bytes: i64,
 }
 
 // STORE_DEFAULT_PAGE_FRAMES is the pool size when the caller does not set one.
@@ -69,6 +72,9 @@ Store :: struct {
 	// recursion_limit, when set, lowers the steps a WITH RECURSIVE may take
 	// below RECURSION_LIMIT for this store alone.
 	recursion_limit: int,
+	// log_segment_bytes is the store's Store_Options.log_segment_bytes, given
+	// to the log again whenever it is reopened.
+	log_segment_bytes: i64,
 	// host is the process that owns this store, when there is one. It lets a
 	// statement reach the module registry (LOAD EXTENSION); a store used without a
 	// host simply records the catalog row.
@@ -460,6 +466,8 @@ store_open :: proc(path: string, options: Store_Options) -> (^Store, Error) {
 		return nil, log_err
 	}
 	store.log = log
+	store.log_segment_bytes = settings.log_segment_bytes
+	store.log.segment_max = store.log_segment_bytes
 	// A paged database whose page files and catalog name the sequence the log
 	// ends at needs no replay: the pages are the rows and the catalog is the
 	// schema. Anything short of that falls back to discarding the pages and
@@ -1024,7 +1032,8 @@ store_log_bytes :: proc(store: ^Store) -> u64 {
 	if store.log.memory_mode do return u64(len(store.log.memory))
 	if !store.persistent do return 0
 	total := u64(max(store.log.size, 0))
-	if store.log.segment > 0 do total += u64(store.log.segment) * u64(LOG_SEGMENT_MAX)
+	// A segment closes once it is full, so each earlier one is about this size.
+	if store.log.segment > 0 do total += u64(store.log.segment) * u64(log_segment_max(&store.log))
 	return total
 }
 
@@ -1856,6 +1865,7 @@ store_compact :: proc(store: ^Store) -> Error {
 		return open_err
 	}
 	store.log = reopened
+	store.log.segment_max = store.log_segment_bytes
 	// The rewritten log starts with the same payload the snapshot file holds, so
 	// the standalone copy is now redundant. Keeping it doubles the size of a
 	// compacted database; a failed remove only leaves the old file behind and
@@ -1896,6 +1906,7 @@ reopen_after_failure :: proc(store: ^Store, durability: Durability) {
 	reopened, open_err := log_open(store.path, false, durability, store.log.checksum, store.vfs)
 	if open_err.kind == .None {
 		store.log = reopened
+		store.log.segment_max = store.log_segment_bytes
 	} else {
 		log_close(&reopened)
 		error_free(&open_err)
