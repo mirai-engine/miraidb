@@ -160,6 +160,21 @@ the copy is one copy of the slots: the commit is 14 ms again (5.8-6.0 ms over
 `test_integer_keys_table_answers_as_a_map` runs the table against a map, and
 `test_a_copied_key_map_answers_as_its_original` a copy against its original.
 
+The rows are in blocks of 256 now (`Row_Blocks`, `src/engine/row_blocks.odin`):
+the copy lists the reader's blocks with one more reference each and copies a
+block only when it first writes one of its rows, with the history arrays of
+those rows; the last table that lists a block frees it. The copy keeps the
+history and the tombstones as they are and prunes them later, where it dropped
+them and freed them in a pass over every row. A commit with a reader open is
+4.1 ms over 20 000 rows (5.3-6.0 before) and 10.7-13.7 ms over 50 000
+(13.5-16): what is left is the copy of the index trees, 8-10 ms of it, which a
+tree that shares its nodes takes away next. A lookup by id is two loads when no
+id is missing (`dense`), and the scan keeps the block it is in: the index
+filters went 0.89-0.93x of the slice, and a scan as fast as it.
+`test_row_blocks_answer_as_one_sorted_slice` puts rows in any order against a
+sorted list, then changes a shared copy; `test_a_reader_keeps_its_rows_while_the_writer_changes_shared_blocks`
+updates, deletes, puts rows between others and prunes while a reader reads.
+
 **Done when.** A reader and the writer share what the commit did not change
 (persistent index nodes and a row slice copied by chunk, or versions read in
 place under a reader count), so a commit costs the rows it writes whatever the
