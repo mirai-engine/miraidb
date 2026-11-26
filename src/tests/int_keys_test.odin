@@ -263,3 +263,55 @@ test_the_next_integer_key_comes_from_the_index :: proc(t: ^testing.T) {
 	testing.expect(t, !q_ok)
 	testing.expect_value(t, scalar(t, conn.store, "PRAGMA integrity_check").s, "ok")
 }
+
+// A transaction keeps the table its last insert or update resolved, the rows it
+// staged for it, and the committed table its unique keys may collide with,
+// from one call to the next. A change to the schema inside the transaction has
+// to drop all three: a table dropped and made again has no committed keys left,
+// and an ALTER makes a new table under the same name.
+@(test)
+test_a_schema_change_drops_the_table_a_transaction_kept :: proc(t: ^testing.T) {
+	conn := ik_open(t)
+	if conn == nil do return
+	defer db.embed_close(conn)
+	store := conn.store
+	ik_ok(t, conn, "CREATE TABLE k (id INTEGER NOT NULL UNIQUE, n INTEGER)")
+	ik_ok(t, conn, "INSERT INTO k VALUES (1, 10), (5, 50)")
+	first := db.Row_Id(scalar(t, store, "SELECT rowid FROM k WHERE id = 1").i)
+
+	tx := db.tx_begin_write(store)
+	two := []db.Value{db.value_int(1), db.value_int(11)}
+	testing.expect(t, db.error_ok(db.tx_update(tx, "k", first, two)))
+	_, taken := db.tx_insert(tx, "k", []db.Value{db.value_int(5), db.value_int(0)})
+	defer db.error_free(&taken)
+	testing.expect(t, strings.contains(taken.message, "UNIQUE constraint failed"))
+	// Dropped, the table takes no more rows: not through the table the update
+	// before kept.
+	testing.expect(t, db.error_ok(db.tx_drop_table(tx, "k")))
+	_, gone := db.tx_insert(tx, "k", []db.Value{db.value_int(7), db.value_int(0)})
+	defer db.error_free(&gone)
+	testing.expectf(t, gone.kind == .Table_Not_Found, "insert into a dropped table: %v %s", gone.kind, gone.message)
+	gone_update := db.tx_update(tx, "k", first, two)
+	defer db.error_free(&gone_update)
+	testing.expectf(t, gone_update.kind == .Table_Not_Found, "update of a dropped table: %v %s", gone_update.kind, gone_update.message)
+	// Made again: 5 was the old table's, and is free now.
+	created, create_err := db.sql_execute_in_tx(tx, "CREATE TABLE k (id INTEGER NOT NULL UNIQUE, n INTEGER)")
+	db.sql_result_destroy(&created)
+	testing.expect(t, db.error_ok(create_err))
+	id, insert_err := db.tx_insert(tx, "k", []db.Value{db.value_int(5), db.value_int(500)})
+	testing.expectf(t, db.error_ok(insert_err), "insert into the new table: %s", insert_err.message)
+	db.error_free(&insert_err)
+	// An ALTER between two updates: the second writes the altered table.
+	altered, alter_err := db.sql_execute_in_tx(tx, "ALTER TABLE k ADD COLUMN m INTEGER DEFAULT 7")
+	db.sql_result_destroy(&altered)
+	testing.expect(t, db.error_ok(alter_err))
+	update_err := db.tx_update(tx, "k", id, []db.Value{db.value_int(5), db.value_int(501), db.value_int(8)})
+	testing.expectf(t, db.error_ok(update_err), "update of the altered table: %s", update_err.message)
+	db.error_free(&update_err)
+	testing.expect(t, db.error_ok(db.tx_commit(tx)))
+
+	ik_count(t, conn, "SELECT count(*) FROM k", 1)
+	ik_count(t, conn, "SELECT n FROM k WHERE id = 5", 501)
+	ik_count(t, conn, "SELECT m FROM k WHERE id = 5", 8)
+	testing.expect_value(t, scalar(t, store, "PRAGMA integrity_check").s, "ok")
+}

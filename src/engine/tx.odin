@@ -141,9 +141,9 @@ Tx :: struct {
 	grant_probe:         Probe_State,
 	trigger_probe:       Probe_State,
 	// insert_name, insert_table and insert_writes are the table the last insert
-	// resolved and its staging record: a statement that inserts many rows names
-	// one table, and resolving it went through six maps keyed by name per row.
-	// The same changes that reset the probes reset these.
+	// or update resolved and its staging record: a statement that writes many
+	// rows names one table, and resolving it went through six maps keyed by name
+	// per row. The same changes that reset the probes reset these.
 	insert_name:         string,
 	insert_table:        ^Table,
 	insert_writes:       ^Table_Writes,
@@ -1217,13 +1217,30 @@ tx_writes :: proc(tx: ^Tx, name: string, table: ^Table) -> ^Table_Writes {
 }
 
 tx_get :: proc(tx: ^Tx, name: string, id: Row_Id) -> (Row, bool) {
-	if writes, ok := tx.state.writes[name]; ok {
-		if row := srows_ptr(&writes.inserts, id); row != nil do return row^, true
-		if values, updated := writes.updates[id]; updated do return Row{id = id, values = values}, true
-		if writes.deletes[id] do return {}, false
-		if writes.truncated do return {}, false
+	writes := tx.state.writes[name] or_else nil
+	if writes != nil {
+		if row, found, staged := tx_get_staged(writes, id); staged do return row, found
 	}
-	table := tx_table_probe(tx, name)
+	return tx_get_in(tx, tx_table_probe(tx, name), nil, id)
+}
+
+// tx_get_staged answers from what the transaction staged for the row, when it
+// staged anything (`staged`).
+@(private)
+tx_get_staged :: proc(writes: ^Table_Writes, id: Row_Id) -> (row: Row, found: bool, staged: bool) {
+	if row := srows_ptr(&writes.inserts, id); row != nil do return row^, true, true
+	if values, updated := writes.updates[id]; updated do return Row{id = id, values = values}, true, true
+	if writes.deletes[id] do return {}, false, true
+	if writes.truncated do return {}, false, true
+	return {}, false, false
+}
+
+// tx_get_in is tx_get for a table and its staged writes already resolved.
+@(private)
+tx_get_in :: proc(tx: ^Tx, table: ^Table, writes: ^Table_Writes, id: Row_Id) -> (Row, bool) {
+	if writes != nil {
+		if row, found, staged := tx_get_staged(writes, id); staged do return row, found
+	}
 	if table == nil do return {}, false
 	row, found := table_get_row(table, id, tx.alloc)
 	if !found || table.paged != nil do return row, found
@@ -1698,8 +1715,15 @@ tx_update_row :: proc(tx: ^Tx, name: string, id: Row_Id, values: []Value) -> Err
 	if tx.store.mirror_kept_indexes > 0 {
 		if kept_err := tx_kept_index_refusal(tx, name); kept_err.kind != .None do return kept_err
 	}
-	table, table_err := tx_table(tx, name)
-	if table_err.kind != .None do return table_err
+	table: ^Table
+	cached := tx.insert_table != nil && len(tx.cte_tables) == 0 && tx.insert_name == name
+	if cached {
+		table = tx.insert_table
+	} else {
+		table_err: Error
+		table, table_err = tx_table(tx, name)
+		if table_err.kind != .None do return table_err
+	}
 	if table.schema.event do return errf(.Sql_Unsupported, "event table %s is append-only", name)
 	if permission_err := tx_check_permission(tx, name, "update"); permission_err.kind != .None {
 		return permission_err
@@ -1713,8 +1737,13 @@ tx_update_row :: proc(tx: ^Tx, name: string, id: Row_Id, values: []Value) -> Err
 			len(values),
 		)
 	}
-	writes := tx_writes(tx, name, table)
-	previous, exists := tx_get(tx, name, id)
+	writes := cached ? tx.insert_writes : tx_writes(tx, name, table)
+	if !cached && len(tx.cte_tables) == 0 {
+		tx.insert_name = strings.clone(name, tx.alloc)
+		tx.insert_table = table
+		tx.insert_writes = writes
+	}
+	previous, exists := tx_get_in(tx, table, writes, id)
 	if !exists {
 		return errf(.Invalid_Argument, "row %d does not exist in table %s", u64(id), name)
 	}
