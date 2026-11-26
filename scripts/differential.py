@@ -294,6 +294,21 @@ QUERIES = [
     # A CTE's body may be a VALUES list, with the materialization hints.
     "WITH t(n) AS (VALUES (1), (2), (3)) SELECT sum(n) FROM t",
     "WITH t(a, b) AS MATERIALIZED (VALUES (1, 'x'), (2, 'y')) SELECT b FROM t WHERE a = 2",
+    # VALUES stands for a select: compound terms before and after it, ORDER BY
+    # and LIMIT, IN, a scalar subquery. A VALUES of several rows is one term:
+    # SELECT 1 UNION VALUES (2), (1) is 1 UNION (2 UNION ALL 1), so {1, 2}.
+    "VALUES (1), (2) UNION ALL SELECT 3",
+    "VALUES (1), (1) UNION SELECT 2",
+    "SELECT 1 UNION VALUES (2), (1)",
+    "SELECT 1 UNION ALL VALUES (2), (1) UNION ALL SELECT 4",
+    "VALUES (3), (1), (2) UNION ALL SELECT 0 ORDER BY 1 LIMIT 3",
+    "VALUES (1), (2) EXCEPT VALUES (2)",
+    "VALUES (1), (2), (3) INTERSECT SELECT 2",
+    "SELECT 2 IN (VALUES (1), (2)), 5 IN (VALUES (1), (2))",
+    "SELECT (VALUES (5))",
+    "SELECT * FROM (VALUES (1, 'a'), (2, 'b') UNION ALL SELECT 3, 'c') ORDER BY 1",
+    "WITH t(a) AS (VALUES (1), (2) UNION SELECT 3) SELECT sum(a) FROM t",
+    "WITH RECURSIVE c(x) AS (VALUES (1), (10) UNION ALL SELECT x + 1 FROM c WHERE x % 10 < 2) SELECT group_concat(x) FROM c",
     # WITH RECURSIVE as SQLite runs it: a queue of rows, the step reading the one
     # row taken; group_concat shows the order they were taken in. LIMIT and
     # OFFSET count the rows taken, UNION ALL keeps duplicates, UNION ends a
@@ -404,6 +419,8 @@ REFUSED = {
 # Both engines refuse these. A name that is not there is refused before the
 # statement runs, so an empty table does not hide it (D37).
 REJECTED = {
+    "VALUES (3), (1), (2) ORDER BY 1": "a VALUES takes no ORDER BY of its own",
+    "SELECT 3 UNION VALUES (2), (1) LIMIT 1": "a VALUES term takes no LIMIT",
     "SELECT nope FROM empty_t": "a misspelled column in the projection",
     "SELECT a FROM empty_t WHERE nope = 1": "a misspelled column in WHERE",
     "SELECT a FROM empty_t ORDER BY nope": "a misspelled column in ORDER BY",

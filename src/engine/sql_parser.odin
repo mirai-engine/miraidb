@@ -330,11 +330,8 @@ parse_statement :: proc(p: ^Parser) -> Statement {
 		}
 		return with
 	}
-	if p_is_keyword(p, "values") {
-		values := parse_values_select(p)
-		// ORDER BY and LIMIT may follow, as after any query.
-		return values
-	}
+	// VALUES stands for a select: ORDER BY, LIMIT and compound terms may follow.
+	if p_is_keyword(p, "values") do return parse_select(p)
 	if p_is_keyword(p, "copy") do return parse_copy(p)
 	if p_is_keyword(p, "insert") || p_is_keyword(p, "replace") do return parse_insert(p)
 	if p_is_keyword(p, "update") do return parse_update(p)
@@ -954,8 +951,24 @@ parse_scalar_subquery :: proc(p: ^Parser) -> ^Select_Stmt {
 	return nil
 }
 
-parse_select :: proc(p: ^Parser) -> Statement {
+// parse_select reads a SELECT, or a VALUES in its place, and the clauses and
+// compound terms after it. `term` is set for a later term of a compound.
+parse_select :: proc(p: ^Parser, term := false) -> Statement {
 	select: Select_Stmt
+	if p_is_keyword(p, "values") {
+		select = parse_values_select(p)
+		// A VALUES of several rows is one term of a compound, as in SQLite:
+		// `SELECT 1 UNION VALUES (2), (1)` is 1 UNION (2 UNION ALL 1). Its rows
+		// are a chain of UNION ALL inside it, so it is read as a derived table
+		// when another term comes before or after it.
+		if len(select.compound) > 0 && (term || p_is_keyword(p, "union") || p_is_keyword(p, "intersect") || p_is_keyword(p, "except")) {
+			select = values_as_derived(p, select)
+		}
+		// As in SQLite, a VALUES takes no ORDER BY or LIMIT of its own: only a
+		// compound term may follow it, and the last term's apply to the whole.
+		parse_select_tail(p, &select, clauses = false)
+		return select
+	}
 	windows_mark := len(p.windows)
 	p_expect_keyword(p, "select")
 	if p_match_keyword(p, "distinct") do select.is_distinct = true
@@ -1092,21 +1105,32 @@ parse_select :: proc(p: ^Parser) -> Statement {
 		}
 	}
 	resize(&p.windows, windows_mark)
-	if p_match_keyword(p, "limit") {
-		select.limit = parse_expression(p)
+	parse_select_tail(p, &select)
+	return select
+}
+
+// parse_select_tail reads what may follow a select's core: LIMIT and OFFSET
+// (unless `clauses` is false), and the UNION, INTERSECT and EXCEPT terms that
+// chain more selects.
+@(private)
+parse_select_tail :: proc(p: ^Parser, select: ^Select_Stmt, clauses := true) {
+	if clauses && p_match_keyword(p, "limit") {
+		select^.limit = parse_expression(p)
 		// SQLite's `LIMIT <offset>, <count>`: the first number is the offset.
 		if p_match_punct(p, ",") {
-			select.offset = select.limit
-			select.limit = parse_expression(p)
+			select^.offset = select^.limit
+			select^.limit = parse_expression(p)
 		}
 	}
-	if select.offset == nil && p_match_keyword(p, "offset") {
-		select.offset = parse_expression(p)
+	if clauses && select^.offset == nil && p_match_keyword(p, "offset") {
+		select^.offset = parse_expression(p)
 	}
 	// UNION [ALL | DISTINCT], INTERSECT and EXCEPT chain more terms, applied left
 	// to right. ORDER BY, LIMIT and OFFSET of any term apply to the compound as a
-	// whole, so they move to this select.
+	// whole, so they move to this select. A VALUES of several rows comes with
+	// its rows as terms already; the terms after it follow them.
 	parts := make([dynamic]Compound_Select, 0, 2, p.alloc)
+	for held in select^.compound do append(&parts, held)
 	for {
 		op: Compound_Op
 		all := false
@@ -1121,18 +1145,18 @@ parse_select :: proc(p: ^Parser) -> Statement {
 		} else {
 			break
 		}
-		select_stmt, ok := parse_select(p).(Select_Stmt)
+		select_stmt, ok := parse_select(p, true).(Select_Stmt)
 		if !ok do break
-		if len(select_stmt.order_by) > 0 && len(select.order_by) == 0 {
-			select.order_by = select_stmt.order_by
+		if len(select_stmt.order_by) > 0 && len(select^.order_by) == 0 {
+			select^.order_by = select_stmt.order_by
 			select_stmt.order_by = nil
 		}
-		if select_stmt.limit != nil && select.limit == nil {
-			select.limit = select_stmt.limit
+		if select_stmt.limit != nil && select^.limit == nil {
+			select^.limit = select_stmt.limit
 			select_stmt.limit = nil
 		}
-		if select_stmt.offset != nil && select.offset == nil {
-			select.offset = select_stmt.offset
+		if select_stmt.offset != nil && select^.offset == nil {
+			select^.offset = select_stmt.offset
 			select_stmt.offset = nil
 		}
 		// Flatten a chain the nested parse may have collected, so every term ends
@@ -1142,8 +1166,7 @@ parse_select :: proc(p: ^Parser) -> Statement {
 		append(&parts, Compound_Select{all = all, op = op, select_stmt = select_stmt})
 		for extra in inner do append(&parts, extra)
 	}
-	select.compound = parts[:]
-return select
+	select^.compound = parts[:]
 }
 
 // parse_fk_clauses reads what may follow REFERENCES t (cols): ON DELETE / ON
@@ -1242,6 +1265,21 @@ parse_values_select :: proc(p: ^Parser) -> Select_Stmt {
 	}
 	first.compound = parts[:]
 	return first
+}
+
+// values_as_derived is `SELECT * FROM (VALUES …)`: the rows of a VALUES kept
+// together as one select.
+@(private)
+values_as_derived :: proc(p: ^Parser, values: Select_Stmt) -> Select_Stmt {
+	sub := new(Select_Stmt, p.alloc)
+	sub^ = values
+	p.derived_count += 1
+	star := make([]Select_Item, 1, p.alloc)
+	star[0] = Select_Item{star = true}
+	return Select_Stmt {
+		projections = star,
+		from = Table_Ref{name = fmt.aprintf("(subquery-%d)", p.derived_count, allocator = p.alloc), subquery = sub},
+	}
 }
 
 // parse_nulls_order reads an optional NULLS FIRST / NULLS LAST.
@@ -1352,9 +1390,7 @@ parse_table_ref :: proc(p: ^Parser) -> Table_Ref {
 	// names an unaliased one itself, and so does this.
 	if p_match_punct(p, "(") {
 		sub := new(Select_Stmt, p.alloc)
-		if p_is_keyword(p, "values") {
-			sub^ = parse_values_select(p)
-		} else if select_stmt, ok := parse_select(p).(Select_Stmt); ok {
+		if select_stmt, ok := parse_select(p).(Select_Stmt); ok {
 			sub^ = select_stmt
 		}
 		p_expect_punct(p, ")")
@@ -1468,10 +1504,8 @@ parse_with_ctes :: proc(p: ^Parser) -> (ctes: []Cte, recursive: bool) {
 			_ = p_match_keyword(p, "materialized")
 		}
 		p_expect_punct(p, "(")
-		if p_is_keyword(p, "values") {
-			// A CTE's body may be a VALUES list, its columns named by the CTE.
-			cte.select_stmt = parse_values_select(p)
-		} else if select_stmt, ok := parse_select(p).(Select_Stmt); ok {
+		// A CTE's body may be a VALUES list, its columns named by the CTE.
+		if select_stmt, ok := parse_select(p).(Select_Stmt); ok {
 			cte.select_stmt = select_stmt
 		}
 		p_expect_punct(p, ")")
@@ -2327,7 +2361,7 @@ parse_create_table :: proc(p: ^Parser, ephemeral: bool, event: bool) -> Statemen
 	p.object_start = p.ident_start
 	// CREATE TABLE name AS SELECT ...: the columns come from the query.
 	if p_match_keyword(p, "as") {
-		if !p_is_keyword(p, "select") {
+		if !p_is_keyword(p, "select") && !p_is_keyword(p, "values") {
 			p_fail(p, .Sql_Syntax, "near \"%s\": syntax error", p.current.text)
 			return stmt
 		}
@@ -3071,7 +3105,7 @@ parse_comparison :: proc(p: ^Parser) -> ^Expr {
 		}
 		if p_match_keyword(p, "in") {
 			p_expect_punct(p, "(")
-			if p_is_keyword(p, "select") {
+			if p_is_keyword(p, "select") || p_is_keyword(p, "values") {
 				subquery := parse_scalar_subquery(p)
 				p_expect_punct(p, ")")
 				e := new(Expr, p.alloc)
@@ -3512,7 +3546,7 @@ parse_primary :: proc(p: ^Parser) -> ^Expr {
 		}
 		if token.text == "(" {
 			p_advance(p)
-			if p_is_keyword(p, "select") {
+			if p_is_keyword(p, "select") || p_is_keyword(p, "values") {
 				subquery := parse_scalar_subquery(p)
 				p_expect_punct(p, ")")
 				e := new(Expr, p.alloc)
