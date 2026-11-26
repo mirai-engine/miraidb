@@ -6,8 +6,7 @@
     "miraidb/mem/filter/u64/index/load=2048/count=256",
     "miraidb/mem/insert_bulk/u32_u64_str/btree_each_column/load=2048/count=256",
     "miraidb/mem/insert_bulk/u32_u64_u64/btree_each_column/load=2048/count=256",
-    "miraidb/mem/iterate/u32_u64_u64/unique_0/count=256",
-    "miraidb/mem/update_bulk/u32_u64_u64/unique_0/load=2048/count=256"
+    "miraidb/mem/iterate/u32_u64_u64/unique_0/count=256"
   ],
   "engine_ns": {
     "miraidb/mem/empty": 500,

@@ -632,11 +632,17 @@ under the reference, and `scripts/parity.py` fails when one of them is more than
 baseline allows. A workload over either line is measured again first, as before.
 `--record` adds a workload to the list once its recorded number is at or under
 the reference and never takes one off; that is an edit by hand. The list has
-the seven of today: `empty`, both filters, both inserts with an index per
-column, `iterate u64` and `update u64`. `--self-test` checks the rules on
+the six of today: `empty`, both filters, both inserts with an index per
+column and `iterate u64`. `--self-test` checks the rules on
 made-up numbers (a workload inside its baseline but past 1.10×, one that never
 reached the reference, the timer's slack, what `--record` lists), and is a gate
 of its own, `parity rules`.
+
+`update u64` was on the list at first, from a recorded 0.99×, and failed the
+gate twice the same day at 1.11× on a quiet machine. Measured alternating with
+the build before it, it is 1.05–1.06× the reference: the 0.99 was one good
+round, not where the workload is. It left the list by hand (2026-11-26) and is
+held to its baseline only, with the other workloads still behind the reference.
 
 To reproduce:
 
