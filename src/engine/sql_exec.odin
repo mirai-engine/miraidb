@@ -3836,6 +3836,63 @@ stream_row_visit :: proc(raw: rawptr, row: Row) -> bool {
 // pages, so the table never sits in memory; LIMIT stops the scan early. When the
 // first aggregate is not a plain projection call the query falls back to the
 // materializing path (handled is false).
+
+// select_count_only answers `SELECT count(*) FROM t` from the table's row count
+// when nothing else can change it: one memory table, no WHERE, GROUP BY,
+// HAVING, DISTINCT, ORDER BY, LIMIT or OFFSET, no row policy, no program
+// function that could be called count, and nothing the transaction staged for
+// the table. Anything else answers false and the statement runs as before.
+@(private)
+select_count_only :: proc(
+	tx: ^Tx,
+	stmt: Select_Stmt,
+	exec: Select_Stmt,
+	base: ^Table,
+	base_is_view: bool,
+	system_name: bool,
+	empty_row: bool,
+	has_policies: bool,
+) -> (Sql_Result, bool) {
+	if base == nil || base.paged != nil || base_is_view || system_name || empty_row || has_policies do return {}, false
+	if base.schema.without_rowid || exec.from.as_of != nil || exec.from.subquery != nil do return {}, false
+	if len(stmt.joins) > 0 || len(stmt.compound) > 0 || stmt.where_clause != nil || len(stmt.group_by) > 0 do return {}, false
+	if stmt.having != nil || stmt.is_distinct || len(stmt.order_by) > 0 || stmt.limit != nil || stmt.offset != nil do return {}, false
+	if len(stmt.projections) != 1 || stmt.projections[0].star do return {}, false
+	call, is_call := stmt.projections[0].expr^.(Call_Expr)
+	if !is_call || !call.star || call.is_distinct || call.filter != nil || len(call.order_by) > 0 || len(call.args) > 0 do return {}, false
+	if !strings.equal_fold(call.name, "count") do return {}, false
+	if len(tx.store.functions) > 0 || len(tx.store.aggregates) > 0 do return {}, false
+	if tx.state.dropped[exec.from.name] do return {}, false
+	if _, staged := tx.state.writes[exec.from.name]; staged do return {}, false
+	if _, created := tx.state.created[exec.from.name]; created do return {}, false
+	if _, altered := tx.state.altered[exec.from.name]; altered do return {}, false
+	count := 0
+	it := rows_iter(&base.rows)
+	for row in rows_next(&it) {
+		if _, visible := row_values_at(row^, tx.read_seq); visible do count += 1
+	}
+	tx.rows_scanned += u64(count)
+	// The column is named as the materializing path names it.
+	probe := make([]Source, 1, tx.alloc)
+	probe[0] = Source{table = base, alias = exec.from.alias}
+	names := make([dynamic]string, 0, 1, tx.alloc)
+	_ = expand_projections(probe, stmt.joins, stmt.projections, &names, tx.alloc)
+	if len(names) != 1 {
+		for name in names do delete(name)
+		return {}, false
+	}
+	result := Sql_Result{kind = .Rows}
+	result.columns = make([]string, 1)
+	result.columns[0] = strings.clone(names[0])
+	delete(names[0])
+	result.rows = make([][]Value, 1)
+	result.rows[0] = make([]Value, 1)
+	result.rows[0][0] = value_int(i64(count))
+	result.row_ids = make([]Row_Id, 1)
+	result.row_ids[0] = NO_ROW_ID
+	return result, true
+}
+
 @(private)
 sql_exec_stream_select :: proc(
 	tx: ^Tx,
@@ -4130,6 +4187,13 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		if policy_err.kind != .None do return {}, policy_err
 		if len(set.using_exprs) > 0 do has_policies = true
 		append(&policies, set)
+	}
+
+	// `SELECT count(*) FROM t` counts the rows the transaction sees, as SQLite's
+	// OP_Count counts the b-tree: building a source and folding an aggregate per
+	// row cost 32 µs over 256 rows (28× SQLite).
+	if counted, count_ok := select_count_only(tx, stmt, exec, base, base_is_view, system_name, empty_row, has_policies); count_ok {
+		return counted, ERROR_NONE
 	}
 
 	// LIMIT n, on a statement that neither filters nor shrinks, means the scan can

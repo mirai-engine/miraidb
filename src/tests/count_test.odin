@@ -4,6 +4,65 @@ import "core:testing"
 
 import db "../engine"
 
+// `SELECT count(*) FROM t` counts the rows the transaction sees without
+// reading them (as SQLite's OP_Count): the deleted rows a prune has not taken
+// yet do not count, a reader counts its own snapshot, and a transaction that
+// staged rows for the table counts them through the usual path.
+
+@(private = "file")
+count_in :: proc(t: ^testing.T, tx: ^db.Tx, sql: string, loc := #caller_location) -> i64 {
+	result, err := db.sql_execute_in_tx(tx, sql)
+	defer db.sql_result_destroy(&result)
+	defer db.error_free(&err)
+	if !testing.expectf(t, db.error_ok(err) && len(result.rows) == 1, "%s: %s", sql, err.message, loc = loc) do return -1
+	return result.rows[0][0].i
+}
+
+@(test)
+test_count_star_counts_the_rows_a_transaction_sees :: proc(t: ^testing.T) {
+	store, err := db.store_open("", {persistent = false})
+	if !testing.expectf(t, db.error_ok(err), "open: %s", err.message) do return
+	defer db.store_close(store)
+	run_done(t, store, "CREATE TABLE c (id INTEGER PRIMARY KEY, v TEXT)")
+	run_done(t, store, "WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 10) INSERT INTO c SELECT i, 'v' || i FROM s")
+	run_done(t, store, "DELETE FROM c WHERE id <= 3")
+	// The deleted rows are still kept, for readers before the delete.
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM c").i, i64(7))
+	// The same answer the scan gives, which the WHERE makes it take.
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM c WHERE 1").i, i64(7))
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) AS n FROM c").i, i64(7))
+
+	// A reader keeps counting its snapshot while a writer deletes.
+	reader := db.tx_begin_read(store)
+	run_done(t, store, "DELETE FROM c WHERE id <= 5")
+	testing.expect_value(t, count_in(t, reader, "SELECT count(*) FROM c"), i64(7))
+	db.tx_end(reader)
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM c").i, i64(5))
+
+	// A transaction counts what it staged.
+	tx := db.tx_begin_write(store)
+	inserted, insert_err := db.sql_execute_in_tx(tx, "INSERT INTO c VALUES (100, 'x'), (101, 'y')")
+	db.sql_result_destroy(&inserted)
+	testing.expect(t, db.error_ok(insert_err))
+	testing.expect_value(t, count_in(t, tx, "SELECT count(*) FROM c"), i64(7))
+	deleted, delete_err := db.sql_execute_in_tx(tx, "DELETE FROM c WHERE id = 10")
+	db.sql_result_destroy(&deleted)
+	testing.expect(t, db.error_ok(delete_err))
+	testing.expect_value(t, count_in(t, tx, "SELECT count(*) FROM c"), i64(6))
+	db.tx_rollback(tx)
+	testing.expect_value(t, scalar(t, store, "SELECT count(*) FROM c").i, i64(5))
+
+	// The column is named as the usual path names it (the WHERE sends the
+	// statement there).
+	named := run(t, store, "SELECT count(*) FROM c")
+	defer db.sql_result_destroy(&named)
+	usual := run(t, store, "SELECT count(*) FROM c WHERE 1")
+	defer db.sql_result_destroy(&usual)
+	if testing.expect(t, len(named.columns) == 1 && len(usual.columns) == 1) {
+		testing.expect_value(t, named.columns[0], usual.columns[0])
+	}
+}
+
 // A query's text run again is not parsed again; the names are resolved at each
 // run, so the same text follows the schema and its parameters.
 @(test)
