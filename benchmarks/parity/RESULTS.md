@@ -631,8 +631,8 @@ under the reference, and `scripts/parity.py` fails when one of them is more than
 10% slower than the reference (with the same 0.2 µs of slack), whatever its
 baseline allows. A workload over either line is measured again first, as before.
 `--record` adds a workload to the list once its recorded number is at or under
-the reference and never takes one off; that is an edit by hand. The list has
-the six of today: `empty`, both filters, both inserts with an index per
+the reference and never takes one off; that is an edit by hand. The list had
+six then: `empty`, both filters, both inserts with an index per
 column and `iterate u64`. `--self-test` checks the rules on
 made-up numbers (a workload inside its baseline but past 1.10×, one that never
 reached the reference, the timer's slack, what `--record` lists), and is a gate
@@ -643,6 +643,44 @@ gate twice the same day at 1.11× on a quiet machine. Measured alternating with
 the build before it, it is 1.05–1.06× the reference: the 0.99 was one good
 round, not where the workload is. It left the list by hand (2026-11-26) and is
 held to its baseline only, with the other workloads still behind the reference.
+
+## The update and the unique insert resolve their table once (2026-11-26)
+
+With the indexes in a B+tree the reader shares (R7), the update and the insert
+with one unique index were what was left behind the reference: 1.41x and
+1.47-1.55x. Timed by section on Windows, a row of either spent most of its
+time finding, again and again, what it had found for the row before it: the
+update resolved its table through six maps keyed by name, then `tx_get` did it
+again, and the unique check looked up the staged writes, the committed table
+and the dropped tables by name for every row.
+
+- An update keeps the table it resolved, its staged writes and the committed
+  table a key may collide with, as the insert already kept the first two, and
+  reads the row it rewrites with them (`tx_get_in`). A change to the schema in
+  the transaction forgets all three, as before:
+  `test_a_schema_change_drops_the_table_a_transaction_kept` writes through the
+  kept table after a DROP and fails when they are not forgotten.
+- The unique check and the key registration take the writes and the committed
+  table their caller resolved (`Unique_Context`) instead of looking them up.
+
+Measured alternating with the build before each change, five rounds:
+
+| workload | before | after | |
+|---|---:|---:|---:|
+| update str | 503.7 us | 456.7 us | 0.91 |
+| update u64 | 320.5 us | 279.8 us | 0.87 |
+| insert str, unique | 329.7 us | 315.3 us | 0.96 |
+| insert u64, unique | 282.5 us | 267.9 us | 0.95 |
+
+Two others measured and dropped: skipping the trigger calls when there is no
+trigger table (0.97-1.03, nothing), and staging the integer keys in an
+open-addressed table instead of a map (u64 0.94, str 1.04 twice: a wash).
+
+Recorded (`--record`), against the reference: update u64 0.87x and the str scan
+0.98x joined the workloads held there, eight of eleven; update str is 1.24x,
+the unique inserts 1.38x and 1.44x. What is left of those is the index itself
+(the B+tree descent and the integer key table, 77 of 121 us of a commit's
+apply) and the per-row work of staging; neither has a cheap part left.
 
 To reproduce:
 

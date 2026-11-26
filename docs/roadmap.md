@@ -27,7 +27,7 @@ that way.
 
 | # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
-| 2 | **R2 — fixed-size index keys** | The index filters are under the reference since a key files its rows under one entry; an insert is 0.76–0.86× it with an index per column and 1.4–1.6× with one unique index. The write path by stage is in RESULTS.md (2026-11-25); its five candidates took inserts from 1.2–2.7× and updates from 2.6–2.8×. The six workloads at or under the reference are held under 1.10x of it by `scripts/parity.py`; an update is 1.05–1.3× it. Next: what is left of the unique insert and the update. | M | — |
+| 2 | **R2 — fixed-size index keys** | The index filters are under the reference since a key files its rows under one entry; an insert is 0.73–0.79× it with an index per column and 1.38–1.44× with one unique index. The write path by stage is in RESULTS.md (2026-11-25); its five candidates took inserts from 1.2–2.7× and updates from 2.6–2.8×, and resolving the table once per transaction (2026-11-26) the updates to 0.87× (u64) and 1.24× (str). The eight workloads at or under the reference are held under 1.10x of it by `scripts/parity.py`. Next: the unique insert and the str update, which are the index itself now. | M | — |
 | 6 | **D12 — module sandbox** | A module is a process with a work budget; the reference runs modules deterministically with enforced limits. | L | — |
 | 7 | **D16 — generated clients** | Deferred by months: generate the Python binding from the catalog, then a second language. Until then the C ABI, the `sqlite3_*` face and the Python wrapper stay gated, so a binding is a thin layer when it comes ([backlog](backlog.md#d16--clients-generated-from-the-catalog)). | M | — |
 
