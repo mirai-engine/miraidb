@@ -139,6 +139,11 @@ Tx :: struct {
 	// (statement_resolve): every context it makes reads them (eval_context).
 	// A node of another query is outside their block.
 	bindings:            ^Statement_Bindings,
+	// catalog_seen is the catalog generation (store_catalog_generation) the
+	// transaction began at, read under the store's lock with its view of the
+	// catalog: a tree resolved in it holds for another transaction that began
+	// at the same one (tx_catalog_generation).
+	catalog_seen:        u64,
 	// no_triggers loads rows that another connection already wrote (catching up
 	// with a shared SQLite file): its triggers ran there, and must not run twice.
 	no_triggers:         bool,
@@ -591,6 +596,7 @@ tx_begin_write :: proc(store: ^Store) -> ^Tx {
 	tx.state.index_ops = make([dynamic]Tx_Index_Op)
 	tx.locked = true
 	sync.lock(&store.mutex)
+	tx.catalog_seen = store_catalog_generation(store)
 	return tx
 }
 
@@ -609,6 +615,7 @@ tx_begin_read :: proc(store: ^Store) -> ^Tx {
 	// statement then runs without it, so a long read never blocks a commit.
 	sync.shared_lock(&store.mutex)
 	tx.read_seq = store.commit_seq
+	tx.catalog_seen = store_catalog_generation(store)
 	// A store with page-backed tables cannot take a snapshot without decoding
 	// every row, which is exactly what pages exist to avoid. Such a read holds
 	// the shared lock for its whole life and reads the live tables: writers wait,
@@ -2769,6 +2776,17 @@ prepared_destroy :: proc(prepared: ^Prepared_Tx) {
 	tx_free_ops(prepared.ops)
 	delete(prepared.payload)
 	free(prepared)
+}
+
+// tx_catalog_generation is the catalog generation a resolution made in the
+// transaction holds for, and false when it holds for this transaction alone:
+// the transaction staged a change to the catalog, or the catalog moved since it
+// began (an ATTACH, or a change to an attached database, which it reads live).
+tx_catalog_generation :: proc(tx: ^Tx) -> (generation: u64, ok: bool) {
+	if tx == nil || tx.store == nil do return 0, false
+	if tx.catalog_seen != store_catalog_generation(tx.store) do return 0, false
+	if tx_changes_catalog(tx) do return 0, false
+	return tx.catalog_seen, true
 }
 
 // tx_changes_catalog says whether the transaction staged a change to what a
