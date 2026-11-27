@@ -89,9 +89,14 @@ def run(binary: str, *args: str) -> str:
 
 
 def database_bytes(path: str) -> int:
+    # The lock file is not data: it holds the owner's pid as text, so its size
+    # moves by a byte when the pid gains a digit, and at 20 000 rows that byte
+    # turned 80.0835 bytes per row into 80.083 or 80.084 from one run to the next.
     total = 0
     for base, _, files in os.walk(path):
         for name in files:
+            if base == path and name == "lock":
+                continue
             total += os.path.getsize(os.path.join(base, name))
     return total
 
