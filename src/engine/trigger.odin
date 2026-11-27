@@ -6,6 +6,7 @@ package engine
 
 import "core:mem"
 import "core:strings"
+import "core:sync"
 
 TRIGGER_TABLE :: "_triggers"
 // TRIGGER_MAX_DEPTH stops a trigger that fires itself from looping forever.
@@ -123,6 +124,126 @@ trigger_create :: proc(tx: ^Tx, stmt: Create_Trigger_Stmt) -> Error {
 
 // trigger_restore puts the transaction back the way it was before one trigger
 // ran, whether it fired, was skipped by its WHEN, or failed.
+// Trigger_Def is one trigger a write fires: its body, its WHEN, its name and
+// the columns of an UPDATE OF ("" for none), as the catalog stores them.
+Trigger_Def :: struct {
+	body:      string,
+	when_text: string,
+	name:      string,
+	columns:   string,
+}
+
+// Trigger_List is the triggers of one table, event and timing, in the order
+// they fire, as the catalog of `generation` has them. Its strings are the
+// store's, in the heap.
+Trigger_List :: struct {
+	generation: u64,
+	defs:       []Trigger_Def,
+}
+
+// TRIGGER_LISTS_SIZE is how many lists a store keeps; past it a list is read
+// from the catalog at every firing.
+TRIGGER_LISTS_SIZE :: 256
+
+// trigger_def_clone is `def` in `alloc`.
+@(private)
+trigger_def_clone :: proc(def: Trigger_Def, alloc: mem.Allocator) -> Trigger_Def {
+	return Trigger_Def {
+		body = strings.clone(def.body, alloc),
+		when_text = strings.clone(def.when_text, alloc),
+		name = strings.clone(def.name, alloc),
+		columns = strings.clone(def.columns, alloc),
+	}
+}
+
+// trigger_list is the triggers a write of `event_name` to `table_name` fires
+// at `timing`, in the transaction's memory: the store's list for the
+// transaction's catalog generation (tx_catalog_generation), else read from the
+// catalog. A row read the catalog once per timing, the rows of a table with no
+// trigger too (A1.10).
+@(private)
+trigger_list :: proc(tx: ^Tx, table_name, event_name: string, timing: Trigger_Timing) -> ([]Trigger_Def, Error) {
+	timing_name := trigger_timing_name(timing)
+	key := strings.concatenate({table_name, "\x00", event_name, "\x00", timing_name}, tx.alloc)
+	generation, holds := tx_catalog_generation(tx)
+	store := tx.store
+	if holds {
+		sync.mutex_lock(&store.trigger_lists_mutex)
+		if list, found := store.trigger_lists[key]; found && list.generation == generation {
+			// Copied out: another transaction, at another generation, may
+			// replace the list while this one's bodies run.
+			defs := make([]Trigger_Def, len(list.defs), tx.alloc)
+			for def, i in list.defs do defs[i] = trigger_def_clone(def, tx.alloc)
+			sync.mutex_unlock(&store.trigger_lists_mutex)
+			return defs, ERROR_NONE
+		}
+		sync.mutex_unlock(&store.trigger_lists_mutex)
+	}
+	// A catalog written before UPDATE OF existed has no columns column until
+	// the next CREATE TRIGGER adds it.
+	query := "SELECT body, when_text, name, '' FROM _triggers WHERE table_name = ? AND event = ? AND timing = ? ORDER BY name"
+	if catalog := tx_table_probe(tx, TRIGGER_TABLE); catalog != nil {
+		if _, found := schema_column_index(&catalog.schema, "columns"); found {
+			query = "SELECT body, when_text, name, columns FROM _triggers WHERE table_name = ? AND event = ? AND timing = ? ORDER BY name"
+		}
+	}
+	result, query_err := sql_execute_in_tx_kept(
+		tx,
+		.Internal,
+		query,
+		[]Value{value_string(table_name), value_string(event_name), value_string(timing_name)},
+	)
+	if query_err.kind != .None do return nil, query_err
+	defer sql_result_destroy(&result)
+	defs := make([dynamic]Trigger_Def, 0, len(result.rows), tx.alloc)
+	for row in result.rows {
+		if len(row) == 0 || row[0].kind != .String do continue
+		def := Trigger_Def{body = row[0].s}
+		if len(row) > 1 && row[1].kind == .String do def.when_text = row[1].s
+		if len(row) > 2 && row[2].kind == .String do def.name = row[2].s
+		if len(row) > 3 && row[3].kind == .String do def.columns = row[3].s
+		append(&defs, trigger_def_clone(def, tx.alloc))
+	}
+	if holds {
+		sync.mutex_lock(&store.trigger_lists_mutex)
+		defer sync.mutex_unlock(&store.trigger_lists_mutex)
+		if _, found := store.trigger_lists[key]; found {
+			old_key, old := delete_key(&store.trigger_lists, key)
+			delete(old_key)
+			trigger_list_free(old)
+		}
+		if len(store.trigger_lists) < TRIGGER_LISTS_SIZE {
+			kept := make([]Trigger_Def, len(defs))
+			for def, i in defs do kept[i] = trigger_def_clone(def, context.allocator)
+			store.trigger_lists[strings.clone(key)] = Trigger_List{generation = generation, defs = kept}
+		}
+	}
+	return defs[:], ERROR_NONE
+}
+
+@(private)
+trigger_list_free :: proc(list: Trigger_List) {
+	for def in list.defs {
+		delete(def.body)
+		delete(def.when_text)
+		delete(def.name)
+		delete(def.columns)
+	}
+	delete(list.defs)
+}
+
+// trigger_lists_clear frees every list the store keeps.
+trigger_lists_clear :: proc(store: ^Store) {
+	sync.mutex_lock(&store.trigger_lists_mutex)
+	defer sync.mutex_unlock(&store.trigger_lists_mutex)
+	for key, list in store.trigger_lists {
+		delete(key)
+		trigger_list_free(list)
+	}
+	delete(store.trigger_lists)
+	store.trigger_lists = nil
+}
+
 @(private)
 trigger_restore :: proc(
 	tx: ^Tx,
@@ -238,34 +359,13 @@ trigger_fire :: proc(
 	case .Delete:
 		event_name = "delete"
 	}
-	// A catalog written before UPDATE OF existed has no columns column until
-	// the next CREATE TRIGGER adds it.
-	query := "SELECT body, when_text, name, '' FROM _triggers WHERE table_name = ? AND event = ? AND timing = ? ORDER BY name"
-	if catalog := tx_table_probe(tx, TRIGGER_TABLE); catalog != nil {
-		if _, found := schema_column_index(&catalog.schema, "columns"); found {
-			query = "SELECT body, when_text, name, columns FROM _triggers WHERE table_name = ? AND event = ? AND timing = ? ORDER BY name"
-		}
-	}
-	result, query_err := sql_execute_in_tx_kept(
-		tx,
-		.Internal,
-		query,
-		[]Value {
-			value_string(table_name),
-			value_string(event_name),
-			value_string(trigger_timing_name(timing)),
-		},
-	)
-	if query_err.kind != .None do return query_err
-	defer sql_result_destroy(&result)
-	if len(result.rows) == 0 do return ERROR_NONE
-	for row in result.rows {
-		if len(row) == 0 || row[0].kind != .String do continue
-		name := ""
-		if len(row) > 2 && row[2].kind == .String do name = row[2].s
+	defs, list_err := trigger_list(tx, table_name, event_name, timing)
+	if list_err.kind != .None do return list_err
+	for def in defs {
+		name := def.name
 		// UPDATE OF fires only for an UPDATE whose SET names one of its columns.
-		if event == .Update && len(row) > 3 && row[3].kind == .String && len(row[3].s) > 0 {
-			if !trigger_columns_set(row[3].s, tx.update_set) do continue
+		if event == .Update && len(def.columns) > 0 {
+			if !trigger_columns_set(def.columns, tx.update_set) do continue
 		}
 		// An authorizer may have answered Ignore about this body when the
 		// statement firing it was prepared (authorize.odin).
@@ -286,8 +386,7 @@ trigger_fire :: proc(
 		tx.trigger_depth = saved_depth + 1
 		// The WHEN condition runs with NEW and OLD bound; a false condition means
 		// this trigger does not fire for this row, which is not an error.
-		when_text := ""
-		if len(row) > 1 && row[1].kind == .String do when_text = row[1].s
+		when_text := def.when_text
 		if len(when_text) > 0 {
 			// The condition is kept by the store, as a CHECK is (store_expression);
 			// an authorizer's answers rewrite their own copy.
@@ -316,7 +415,7 @@ trigger_fire :: proc(
 				continue
 			}
 		}
-		statements := trigger_split(row[0].s, tx.alloc)
+		statements := trigger_split(def.body, tx.alloc)
 		body_err := ERROR_NONE
 		for statement in statements {
 			text := strings.trim_space(statement)

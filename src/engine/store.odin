@@ -135,6 +135,11 @@ Store :: struct {
 	// TREE_CACHE_SIZE, behind tree_cache_mutex (tree_cache.odin).
 	tree_cache:            map[string]Tree_Entry,
 	tree_cache_mutex:      sync.Mutex,
+	// trigger_lists keeps the triggers a write fires, by table, event and
+	// timing, for a catalog generation, behind trigger_lists_mutex
+	// (trigger_list).
+	trigger_lists:         map[string]Trigger_List,
+	trigger_lists_mutex:   sync.Mutex,
 	// catalog_generation moves on with every commit that changes what a
 	// statement's names resolve to (store_op_changes_catalog), and with every
 	// ATTACH and DETACH. A tree resolved at one generation is parsed again at
@@ -588,6 +593,7 @@ store_close :: proc(store: ^Store) {
 	delete(store.variables)
 	statement_cache_clear(store)
 	tree_cache_clear(store)
+	trigger_lists_clear(store)
 	for name, _ in store.functions do delete(name)
 	delete(store.functions)
 	for name, _ in store.aggregates do delete(name)
