@@ -197,7 +197,7 @@ Table_Writes :: struct {
 	unique_keys: map[string]Row_Id,
 	// unique_ints holds the staged keys of the indexes that file integer keys
 	// (Staged_Key); `unique_keys` every other.
-	unique_ints: map[[3]u64]Row_Id,
+	unique_ints: Staged_Ints,
 	next_row_id: u64,
 	next_sequence: i64,
 	// int_key_* is the largest integer the staged inserts hold in an INTEGER
@@ -292,8 +292,8 @@ tx_statement_undo :: proc(tx: ^Tx, mark: int) {
 			if u.had do w.unique_keys[u.key] = u.holder
 			else do map_erase(&w.unique_keys, u.key)
 		case .Unique_Int:
-			if u.had do w.unique_ints[u.int_key] = u.holder
-			else do map_erase(&w.unique_ints, u.int_key)
+			if u.had do staged_ints_put(&w.unique_ints, u.int_key, u.holder)
+			else do staged_ints_erase(&w.unique_ints, u.int_key)
 		case .Counters:
 			w.next_row_id = u.next_row_id
 			w.next_sequence = u.next_sequence
@@ -359,7 +359,7 @@ staged_key :: proc(tx: ^Tx, table: ^Table, index: int, values: []Value) -> Stage
 // staged_holder answers which staged row holds a key.
 staged_holder :: proc(w: ^Table_Writes, key: Staged_Key) -> (Row_Id, bool) {
 	if key.is_int {
-		holder, ok := w.unique_ints[key.int]
+		holder, ok := staged_ints_get(&w.unique_ints, key.int)
 		return holder, ok
 	}
 	holder, ok := w.unique_keys[key.text]
@@ -370,7 +370,7 @@ staged_holder :: proc(w: ^Table_Writes, key: Staged_Key) -> (Row_Id, bool) {
 @(private)
 staged_set :: proc(tx: ^Tx, w: ^Table_Writes, key: Staged_Key, id: Row_Id) {
 	undo_note_unique(tx, w, key)
-	if key.is_int do w.unique_ints[key.int] = id
+	if key.is_int do staged_ints_put(&w.unique_ints, key.int, id)
 	else do w.unique_keys[key.text] = id
 }
 
@@ -441,8 +441,7 @@ tx_snapshot_clone :: proc(tx: ^Tx, from: Tx_Snapshot) -> Tx_Snapshot {
 		for id in writes.deletes do copied.deletes[id] = true
 		copied.unique_keys = make(map[string]Row_Id, len(writes.unique_keys), tx.alloc)
 		for key, id in writes.unique_keys do copied.unique_keys[key] = id
-		copied.unique_ints = make(map[[3]u64]Row_Id, len(writes.unique_ints), tx.alloc)
-		for key, id in writes.unique_ints do copied.unique_ints[key] = id
+		staged_ints_copy(&copied.unique_ints, &writes.unique_ints, tx.alloc)
 		snapshot.writes[name] = copied
 	}
 	snapshot.created = make(map[string]^Table, len(from.created), tx.alloc)
@@ -465,7 +464,7 @@ tx_snapshot_destroy :: proc(tx: ^Tx, snapshot: ^Tx_Snapshot) {
 		delete(writes.updates)
 		delete(writes.deletes)
 		delete(writes.unique_keys)
-		delete(writes.unique_ints)
+		staged_ints_destroy(&writes.unique_ints)
 		free(writes)
 	}
 	delete(snapshot.writes)
@@ -744,7 +743,7 @@ tx_discard :: proc(tx: ^Tx) {
 		delete(writes.updates)
 		delete(writes.deletes)
 		delete(writes.unique_keys)
-		delete(writes.unique_ints)
+		staged_ints_destroy(&writes.unique_ints)
 		// tx_writes allocates the struct with `new`, not from the arena: a statement
 		// that wrote one table left 152 bytes behind for every commit.
 		free(writes)
@@ -1149,7 +1148,7 @@ tx_drop_column :: proc(tx: ^Tx, name, column_name: string) -> Error {
 		}
 		// The unique keys were built over the old shape; rebuild them.
 		clear(&writes.unique_keys)
-		clear(&writes.unique_ints)
+		staged_ints_clear(&writes.unique_ints)
 	}
 	tx.state.altered[strings.clone(name, tx.alloc)] = replacement
 	return ERROR_NONE
@@ -1266,7 +1265,7 @@ tx_writes :: proc(tx: ^Tx, name: string, table: ^Table) -> ^Table_Writes {
 	writes.updates = make(map[Row_Id][]Value)
 	writes.deletes = make(map[Row_Id]bool)
 	writes.unique_keys = make(map[string]Row_Id, 64)
-	writes.unique_ints = make(map[[3]u64]Row_Id, 64)
+	staged_ints_init(&writes.unique_ints)
 	writes.next_row_id = table.next_row_id
 	writes.next_sequence = table.next_sequence
 	// The map key must outlive the caller's statement buffer, so it lives in the
@@ -1554,7 +1553,7 @@ tx_discard_writes :: proc(tx: ^Tx, name: string) {
 	delete(writes.updates)
 	delete(writes.deletes)
 	delete(writes.unique_keys)
-	delete(writes.unique_ints)
+	staged_ints_destroy(&writes.unique_ints)
 	free(writes)
 	map_erase(&tx.state.writes, name)
 }
@@ -1997,7 +1996,7 @@ tx_truncate :: proc(tx: ^Tx, name: string) -> Error {
 	clear(&writes.updates)
 	clear(&writes.deletes)
 	clear(&writes.unique_keys)
-	clear(&writes.unique_ints)
+	staged_ints_clear(&writes.unique_ints)
 	writes.truncated = true
 	return ERROR_NONE
 }
@@ -2428,7 +2427,7 @@ tx_unregister_unique :: proc(tx: ^Tx, name: string, table: ^Table, values: []Val
 		key := staged_key(tx, table, i, values)
 		if holder, present := staged_holder(writes, key); present && holder == id {
 			undo_note_unique(tx, writes, key)
-			if key.is_int do map_erase(&writes.unique_ints, key.int)
+			if key.is_int do staged_ints_erase(&writes.unique_ints, key.int)
 			else do map_erase(&writes.unique_keys, key.text)
 		}
 	}

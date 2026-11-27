@@ -15,6 +15,7 @@ normative description of the invariants; the code follows it.
 | `index.odin` | An index: `Index`, its backend (`Index_Backend`, memory or pages), the keys it files a row under, and the procedures the rest of the engine asks it |
 | `row_blocks.odin` | A memory table's rows in id order, in blocks a reader's table shares with the copy a commit writes |
 | `staged_rows.odin` | The rows a transaction inserted into one table, by id |
+| `staged_ints.odin` | The integer unique keys a transaction stages, in an open-addressed table |
 | `index_btree.odin` | A memory index: a B+tree of encoded keys, shared between a reader and a commit's copy |
 | `int_keys.odin` | The integer keys of an index, in an open-addressed table |
 | `index_page.odin` | An index over pages: a B+tree of 4 KiB pages with chained leaves |
