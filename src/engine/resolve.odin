@@ -543,7 +543,9 @@ res_column :: proc(walk: ^Res_Walk, column: Column_Expr) {
 	if len(column.table) > 0 {
 		// NEW and OLD in a trigger body, excluded in an upsert.
 		for special in ([]string{"new", "old", "excluded"}) {
-			if strings.equal_fold(column.table, special) do return
+			if !strings.equal_fold(column.table, special) do continue
+			if special != "excluded" do res_bind_trigger_column(walk, column, special == "new")
+			return
 		}
 		for i := len(walk.scopes) - 1; i >= 0; i -= 1 {
 			for source, from in walk.scopes[i].sources {
@@ -1072,6 +1074,27 @@ res_bind_column :: proc(walk: ^Res_Walk, column: Column_Expr, source: Res_Source
 		if !strings.equal_fold(name, column.name) do continue
 		bindings.columns[local] = Column_Binding{ident = source.ident, from = u16(from), column = i32(position), scope = scope.select}
 		return
+	}
+}
+
+// res_bind_trigger_column links a NEW or OLD reference of a trigger's body to
+// its column in the schema of the table the trigger fires for: the body is
+// resolved while the trigger runs, and kept by that table (Tree_Use.Trigger_Body).
+// A column the table has not is left unlinked, for the run to refuse by name.
+@(private)
+res_bind_trigger_column :: proc(walk: ^Res_Walk, column: Column_Expr, is_new: bool) {
+	bindings := walk.bindings
+	if bindings == nil || !walk.tx.trigger_active || column.id <= bindings.base do return
+	schema := &walk.tx.trigger_schema
+	if schema.ident == 0 do return
+	local := column.id - bindings.base
+	if local >= Node_Id(len(bindings.columns)) do return
+	position, found := schema_column_index(schema, column.name)
+	if !found do return
+	bindings.columns[local] = Column_Binding {
+		ident  = schema.ident,
+		from   = is_new ? TRIGGER_NEW_FROM : TRIGGER_OLD_FROM,
+		column = i32(position),
 	}
 }
 

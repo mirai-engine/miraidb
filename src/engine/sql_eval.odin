@@ -54,6 +54,14 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 		if len(e.table) > 0 {
 			// Inside a trigger body NEW and OLD name the rows of the event.
 			if ctx.tx != nil && ctx.tx.trigger_active {
+				// The column its resolution linked it to (res_bind_trigger_column).
+				if index, linked_new, linked := trigger_column_bound(ctx, e.id); linked {
+					present := linked_new ? ctx.tx.trigger_new_present : ctx.tx.trigger_old_present
+					if !present do return value_null(), ERROR_NONE
+					row := linked_new ? ctx.tx.trigger_new : ctx.tx.trigger_old
+					if index >= len(row.values) do return value_null(), ERROR_NONE
+					return row.values[index], ERROR_NONE
+				}
 				is_new := strings.equal_fold(e.table, "new")
 				if is_new || strings.equal_fold(e.table, "old") {
 					index, found := schema_column_index(&ctx.tx.trigger_schema, e.name)

@@ -83,4 +83,9 @@ test_the_names_a_statement_resolves_while_it_runs :: proc(t: ^testing.T) {
 	run_done(t, store, "CREATE TRIGGER w_logged AFTER INSERT ON w WHEN NEW.x > 2 BEGIN INSERT INTO w_log VALUES (NEW.id, NEW.x * 2); END")
 	trigger := rc_measure(t, store, "INSERT INTO w SELECT id + (SELECT coalesce(max(id), 0) FROM w), x FROM a")
 	testing.expectf(t, trigger.parses <= 2, "trigger: %d parses", trigger.parses)
+	// The triggers a row fires are the store's list for the catalog, not a
+	// query of it per row and timing, and NEW and OLD in the body read the
+	// column their link names: 836 names for these 100 rows. The WHEN's NEW.x,
+	// evaluated outside any statement, is the one left by name.
+	testing.expectf(t, trigger.column_names <= RC_ROWS + 20, "trigger: %d column lookups", trigger.column_names)
 }

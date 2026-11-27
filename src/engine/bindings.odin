@@ -150,6 +150,28 @@ statement_resolve :: proc(tx: ^Tx, statement: ^Statement, query: ^Query) -> Erro
 	return err
 }
 
+// TRIGGER_NEW_FROM and TRIGGER_OLD_FROM are the `from` of a link to a column
+// of the row a trigger fires for (NEW, OLD): no FROM item has those numbers,
+// so column_bound never answers for them, and the trigger's branch of the
+// evaluation reads them (trigger_column_bound).
+TRIGGER_NEW_FROM :: max(u16)
+TRIGGER_OLD_FROM :: max(u16) - 1
+
+// trigger_column_bound is the column of the event's row a NEW or OLD reference
+// is linked to, when the trigger running has the schema the link was made
+// against; anything else answers false and the caller looks the name up.
+trigger_column_bound :: #force_inline proc(ctx: ^Eval_Ctx, id: Node_Id) -> (column: int, is_new: bool, ok: bool) {
+	bindings := ctx.bindings
+	if bindings == nil || id <= bindings.base do return -1, false, false
+	local := id - bindings.base
+	if local >= Node_Id(len(bindings.columns)) do return -1, false, false
+	binding := bindings.columns[local]
+	if binding.column < 0 || binding.scope != 0 do return -1, false, false
+	if binding.from != TRIGGER_NEW_FROM && binding.from != TRIGGER_OLD_FROM do return -1, false, false
+	if binding.ident != ctx.tx.trigger_schema.ident do return -1, false, false
+	return int(binding.column), binding.from == TRIGGER_NEW_FROM, true
+}
+
 // column_bound is the source and column a linked reference reads, when the
 // link holds for the context's sources: the FROM item's source, at the
 // position the plan runs it in (Eval_Ctx.positions), with the schema the link
