@@ -93,8 +93,11 @@ test_unsigned_keys_follow_every_write :: proc(t: ^testing.T) {
 	index := -1
 	for idx, i in table.indexes do if idx.schema.name == "u_id" do index = i
 	if testing.expect(t, index >= 0) {
-		testing.expect(t, table.indexes[index].int_keyed)
-		testing.expect_value(t, table.indexes[index].ints.count, 3)
+		memory := db.index_memory(&table.indexes[index])
+		if testing.expect(t, memory != nil) {
+			testing.expect(t, memory.int_keyed)
+			testing.expect_value(t, memory.ints.count, 3)
+		}
 	}
 
 	// A commit while a reader is open writes a copy of the table: its keys
@@ -147,8 +150,8 @@ test_a_copied_key_map_answers_as_its_original :: proc(t: ^testing.T) {
 	// The writer's copy.
 	table := conn.store.tables["k"]
 	keyed := -1
-	for idx, i in table.indexes do if idx.int_keyed do keyed = i
-	if testing.expect(t, keyed >= 0) do testing.expect_value(t, table.indexes[keyed].ints.count, 2001)
+	for &idx, i in table.indexes do if memory := db.index_memory(&idx); memory != nil && memory.int_keyed do keyed = i
+	if testing.expect(t, keyed >= 0) do testing.expect_value(t, db.index_memory(&table.indexes[keyed]).ints.count, 2001)
 	ik_count(t, conn, "SELECT count(*) FROM k WHERE id = 3", 1)
 	ik_count(t, conn, "SELECT count(*) FROM k WHERE id = 1", 0)
 	ik_count(t, conn, "SELECT count(*) FROM k WHERE id = 6", 0)

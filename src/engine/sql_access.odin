@@ -313,7 +313,7 @@ index_order_for :: proc(
 		if item.nulls != .Default do return index, false, false
 	}
 	for &candidate, position in table.indexes {
-		if candidate.pages != nil do continue
+		if index_is_paged(&candidate) do continue
 		// A partial or expression index does not hold every row by its columns.
 		if !index_is_plain(candidate.schema) do continue
 		if len(candidate.schema.columns) != len(stmt.order_by) do continue
@@ -338,36 +338,6 @@ index_order_for :: proc(
 		if matched do return position, direction, true
 	}
 	return index, false, false
-}
-
-// index_order_ids lists the row ids of one index in key order, or in the reverse
-// order when the statement is descending. `max_rows` stops the walk early, which
-// is what turns `ORDER BY id LIMIT 5` into five reads instead of a pass over the
-// whole table; zero means no stop.
-@(private)
-index_order_ids :: proc(
-	table: ^Table,
-	index: int,
-	descending: bool,
-	max_rows: int,
-) -> [dynamic]Row_Id {
-	ids := make([dynamic]Row_Id)
-	tree := &table.indexes[index].tree
-	// A key's rows come out ascending by id, or descending for a descending walk,
-	// as they did when each row had its own entry.
-	if descending {
-		for c := ib_last(tree); c.valid && (max_rows <= 0 || len(ids) < max_rows); c.valid = ib_retreat(&c) {
-			slot := ib_slot(&c)
-			#reverse for id in slot.more do append(&ids, id)
-			append(&ids, slot.first)
-		}
-	} else {
-		for c := ib_first(tree); c.valid && (max_rows <= 0 || len(ids) < max_rows); c.valid = ib_advance(&c) {
-			index_slot_append(&ids, ib_slot(&c)^)
-		}
-	}
-	if max_rows > 0 && len(ids) > max_rows do resize(&ids, max_rows)
-	return ids
 }
 
 // Index_Probe is how a nested loop finds the inner rows one outer row joins to:

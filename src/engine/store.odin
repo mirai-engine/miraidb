@@ -1512,8 +1512,7 @@ store_table_open_paged :: proc(store: ^Store, entry: ^Catalog_Entry, seq: u64) -
 			table_destroy(table)
 			return nil, attach_err
 		}
-		if table.indexes[i].pages.file.applied_seq != seq {
-			page_seq := table.indexes[i].pages.file.applied_seq
+		if page_seq, paged := index_applied_seq(&table.indexes[i]); paged && page_seq != seq {
 			table_destroy(table)
 			return nil, errf(.Io, "index %s is at sequence %d, not %d", table.indexes[i].schema.name, page_seq, seq)
 		}
@@ -1536,8 +1535,7 @@ store_flush_pages :: proc(store: ^Store, seq: u64) -> Error {
 			return flush_err
 		}
 		for &index in table.indexes {
-			if index.pages == nil do continue
-			if flush_err := ordered_flush(index.pages, seq); flush_err.kind != .None {
+			if flush_err := index_flush(&index, seq); flush_err.kind != .None {
 				return flush_err
 			}
 		}
@@ -1689,8 +1687,9 @@ store_apply :: proc(store: ^Store, op: Store_Op, cache: ^Apply_Cache = nil) -> E
 			if paged {
 				system := log_vfs_or_os(store.vfs)
 				for &index in table.indexes {
-					if index.pages == nil do continue
-					_ = system.ops.remove(system, index.pages.path)
+					if path, paged_index := index_file_path(&index); paged_index {
+						_ = system.ops.remove(system, path)
+					}
 				}
 			}
 			table_release(table)

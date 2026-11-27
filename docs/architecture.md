@@ -11,7 +11,8 @@ normative description of the invariants; the code follows it.
 |---|---|
 | `value.odin` | The dynamic `Value` type, comparisons, ordering, hashing, formatting |
 | `schema.odin` | Column types, table schemas, schema validation and serialization |
-| `table.odin` | A table's rows and indexes: insert, update, delete, lookups, uniqueness checks, scans |
+| `table.odin` | A table's rows: insert, update, delete, lookups, uniqueness checks, scans; its indexes through `index.odin` |
+| `index.odin` | An index: `Index`, its backend (`Index_Backend`, memory or pages), the keys it files a row under, and the procedures the rest of the engine asks it |
 | `row_blocks.odin` | A memory table's rows in id order, in blocks a reader's table shares with the copy a commit writes |
 | `staged_rows.odin` | The rows a transaction inserted into one table, by id |
 | `index_btree.odin` | A memory index: a B+tree of encoded keys, shared between a reader and a commit's copy |
@@ -146,11 +147,15 @@ A table is a `Table_Schema` plus:
   matching the schema columns. A scan walks the blocks in place (`table_scan`).
 - One `Index` per index in the schema, keyed by the order-preserving encoding. A
   unique index stores the key alone; a non-unique index appends the row id, so
-  every entry is distinct and iteration is ordered. The keys live in a B+tree
-  (`index_btree.odin`, with `int_keys.odin` for integer keys), or, for a paged
-  table, in a B+tree of 4 KiB pages (`index_page.odin`, one file per index with
+  every entry is distinct and iteration is ordered. The keys live in its
+  backend, a union (`Index_Backend`, `index.odin`): in memory, a B+tree
+  (`index_btree.odin`, with `int_keys.odin` for integer keys); for a paged
+  table, a B+tree of 4 KiB pages (`index_page.odin`, one file per index with
   its own pool), where leaves are chained in key order and a range scan is a
-  cursor over that chain.
+  cursor over that chain. A `HASH` or `DIRECT` index adds an equality map
+  beside either backend. Nothing outside the index's files reaches into a
+  backend: `scripts/index_boundary.py` counts what does, and CI fails when the
+  count grows.
 - `next_row_id`, the id the next inserted row receives.
 
 The primary key and every `UNIQUE` column get an implicit unique index during

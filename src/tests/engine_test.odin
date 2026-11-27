@@ -15834,7 +15834,7 @@ test_an_index_shares_its_tree_with_a_reader :: proc(t: ^testing.T) {
 		run_done(t, store, strings.to_string(builder))
 	}
 	tree_of :: proc(table: ^db.Table) -> ^db.Index_Tree {
-		for &index in table.indexes do if index.schema.name == "n_k" do return &index.tree
+		for &index in table.indexes do if index.schema.name == "n_k" do if memory := db.index_memory(&index); memory != nil do return &memory.tree
 		return nil
 	}
 	count_of :: proc(t: ^testing.T, store: ^db.Store, sql: string) -> i64 {

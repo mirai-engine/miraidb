@@ -88,15 +88,16 @@ index_ids_remove_at :: proc(ids: ^[dynamic]Row_Id, at: int) {
 // go, with the row lists of their slots.
 @(private)
 index_tree_free :: proc(index: ^Index) {
-	int_keys_destroy(&index.ints)
-	ib_free(&index.tree)
+	memory := index_memory(index)
+	if memory == nil do return
+	int_keys_destroy(&memory.ints)
+	ib_free(&memory.tree)
 }
 
 // index_tree_init gives a memory index an empty tree.
 @(private)
 index_tree_init :: proc(index: ^Index) {
-	index.tree = {}
-	index.int_keyed = index_int_eligible(index)
+	index.backend = Memory_Index{int_keyed = index_int_eligible(index)}
 }
 
 // index_tree_key encodes the key a memory index files `values` under: the indexed
@@ -114,29 +115,59 @@ index_tree_key :: proc(t: ^Table, index: int, values: []Value) -> (key: string, 
 // indexed columns. A unique index stores the key alone; a non-unique index
 // appends the row id, so every entry is distinct and range scans stay ordered.
 Index :: struct {
-	schema: Index_Schema,
-	unique: bool,
-	// tree is the memory index, shared with the tables readers keep (Index_Tree).
-	tree:   Index_Tree,
-	// lookup is the equality map for HASH and DIRECT indexes. The tree is still
-	// maintained so ordering, range scans and the primary-key path keep working.
-	lookup: map[string]^Index_Bucket,
-	// pages holds the same keys in a B+tree of pages. It is set for the indexes
-	// of a paged table: the keys then live in the index file and the pool bounds
-	// what a lookup costs, instead of every key staying in RAM.
-	pages: ^Ordered_Pages,
+	schema:  Index_Schema,
+	unique:  bool,
+	// backend is where the keys live: in memory, or in the pages of a paged
+	// table (Index_Backend).
+	backend: Index_Backend,
+	// lookup is the equality map for HASH and DIRECT indexes, beside either
+	// backend: it answers table_index_lookup, and the backend still answers
+	// ordering, ranges and every SELECT (A2.2, to be audited again).
+	lookup:  map[string]^Index_Bucket,
 	// exprs holds the parsed WHERE and key expressions of a partial or
 	// expression index; nil for an index over plain columns.
-	exprs: ^Index_Exprs,
+	exprs:   ^Index_Exprs,
+}
+
+// Index_Backend is the structure an index keeps its keys in (A2): a union, so
+// a write switches on it where a table of procedures would stop every call
+// from being inlined. A new kind of index (an R-tree, full text) is another
+// variant.
+Index_Backend :: union {
+	Memory_Index,
+	^Ordered_Pages,
+}
+
+// Memory_Index is an index of a memory table: its tree, shared with the
+// tables readers keep (Index_Tree), and its integer keys.
+Memory_Index :: struct {
+	tree:      Index_Tree,
 	// ints files, beside the tree, the row that holds each integer key of a
-	// UNIQUE index over one plain column (index_int_key), when the index lives in
-	// memory. The unique check and an equality lookup of an integer are then one
-	// hash probe, where a descent of the tree met a node per level (R2). It holds
-	// exactly the rows whose value has an integer key; the tree still holds every
-	// row and answers everything else. An index that cannot grow it drops it and
-	// answers from the tree (`int_keyed` false).
+	// UNIQUE index over one plain column (index_int_key). The unique check and
+	// an equality lookup of an integer are then one hash probe, where a descent
+	// of the tree met a node per level (R2). It holds exactly the rows whose
+	// value has an integer key; the tree still holds every row and answers
+	// everything else. An index that cannot grow it drops it and answers from
+	// the tree (`int_keyed` false).
 	ints:      Int_Keys,
 	int_keyed: bool,
+}
+
+// index_memory is the memory backend of `index`, nil for a paged one.
+index_memory :: #force_inline proc "contextless" (index: ^Index) -> ^Memory_Index {
+	if memory, ok := &index.backend.(Memory_Index); ok do return memory
+	return nil
+}
+
+// index_pages is the pages of a paged index, nil for a memory one.
+index_pages :: #force_inline proc "contextless" (index: ^Index) -> ^Ordered_Pages {
+	if pages, ok := index.backend.(^Ordered_Pages); ok do return pages
+	return nil
+}
+
+// index_is_paged says the index keeps its keys in pages.
+index_is_paged :: #force_inline proc "contextless" (index: ^Index) -> bool {
+	return index_pages(index) != nil
 }
 
 // index_int_key is a value's key among the integer keys of an index, in the key
@@ -172,38 +203,39 @@ index_int_eligible :: proc(index: ^Index) -> bool {
 @(private)
 index_int_holder :: proc(t: ^Table, index: int, values: []Value) -> (id: Row_Id, held: bool, known: bool) {
 	idx := &t.indexes[index]
-	if !idx.int_keyed || idx.pages != nil do return
+	memory := index_memory(idx)
+	if memory == nil || !memory.int_keyed do return
 	column := idx.schema.columns[0]
 	if column < 0 || column >= len(values) do return
 	key, ok := index_int_key(values[column])
 	if !ok do return
-	id, held = int_keys_get(&idx.ints, key)
+	id, held = int_keys_get(&memory.ints, key)
 	return id, held, true
 }
 
 // index_ints_put files a row under its integer key. When the map cannot grow,
 // the index gives it up and answers from its tree.
 @(private)
-index_ints_put :: proc(index: ^Index, values: []Value, id: Row_Id) {
+index_ints_put :: proc(index: ^Index, memory: ^Memory_Index, values: []Value, id: Row_Id) {
 	key, ok := index_int_key(values[index.schema.columns[0]])
 	if !ok do return
-	if int_keys_put(&index.ints, key, id) == nil do return
-	int_keys_destroy(&index.ints)
-	index.int_keyed = false
+	if int_keys_put(&memory.ints, key, id) == nil do return
+	int_keys_destroy(&memory.ints)
+	memory.int_keyed = false
 }
 
 // index_ints_remove takes a row's integer key out, when the row holds it.
 @(private)
-index_ints_remove :: proc(index: ^Index, values: []Value, id: Row_Id) {
+index_ints_remove :: proc(index: ^Index, memory: ^Memory_Index, values: []Value, id: Row_Id) {
 	key, ok := index_int_key(values[index.schema.columns[0]])
 	if !ok do return
-	int_keys_remove(&index.ints, key, id)
+	int_keys_remove(&memory.ints, key, id)
 }
 
 // index_ints_clone copies the integer keys of an index; a copy that cannot be
 // made leaves the target answering from its tree.
 @(private)
-index_ints_clone :: proc(source: ^Index, target: ^Index) {
+index_ints_clone :: proc(source: ^Memory_Index, target: ^Memory_Index) {
 	int_keys_destroy(&target.ints)
 	target.int_keyed = source.int_keyed
 	if !target.int_keyed || int_keys_len(&source.ints) == 0 do return
@@ -429,22 +461,23 @@ index_validate_row :: proc(tx: ^Tx, t: ^Table, values: []Value) -> Error {
 @(private)
 table_index_put_row :: proc(t: ^Table, index: int, values: []Value, id: Row_Id) -> Error {
 	if !index_row_included(t, index, values) do return ERROR_NONE
-	if t.indexes[index].pages != nil {
+	switch &backend in t.indexes[index].backend {
+	case ^Ordered_Pages:
 		key := index_entry_key(t, index, values, id)
 		if put_err := table_index_put(t, index, key, id); put_err.kind != .None do return put_err
-	} else {
+	case Memory_Index:
 		key, _ := index_tree_key(t, index, values)
 		// One descent files the key or finds it: a new key is copied into the key
 		// store at its exact length, and a row joins the slot of a key others
 		// hold.
-		slot, inserted, insert_err := ib_upsert(&t.indexes[index].tree, key, t.keys.allocator)
+		slot, inserted, insert_err := ib_upsert(&backend.tree, key, t.keys.allocator)
 		if insert_err != nil do return errf(.Out_Of_Memory, "cannot grow index %s", t.indexes[index].schema.name)
 		if inserted {
 			slot^ = Index_Slot{first = id}
 		} else {
 			index_slot_add(slot, id)
 		}
-		if t.indexes[index].int_keyed do index_ints_put(&t.indexes[index], values, id)
+		if backend.int_keyed do index_ints_put(&t.indexes[index], &backend, values, id)
 	}
 	return table_index_map_add(t, index, values, id)
 }
@@ -453,15 +486,16 @@ table_index_put_row :: proc(t: ^Table, index: int, values: []Value, id: Row_Id) 
 @(private)
 table_index_remove_row :: proc(t: ^Table, index: int, values: []Value, id: Row_Id) {
 	if !index_row_included(t, index, values) do return
-	if t.indexes[index].pages != nil {
+	switch &backend in t.indexes[index].backend {
+	case ^Ordered_Pages:
 		key := index_entry_key(t, index, values, id)
 		table_index_remove_key(t, index, key)
-	} else {
+	case Memory_Index:
 		key, _ := index_tree_key(t, index, values)
 		// A failed copy leaves the row filed; the next write that reaches the key
 		// copies it again.
-		_ = ib_remove_id(&t.indexes[index].tree, key, id)
-		if t.indexes[index].int_keyed do index_ints_remove(&t.indexes[index], values, id)
+		_ = ib_remove_id(&backend.tree, key, id)
+		if backend.int_keyed do index_ints_remove(&t.indexes[index], &backend, values, id)
 	}
 	table_index_map_remove(t, index, values, id)
 }
@@ -590,8 +624,8 @@ table_index_map_free :: proc(t: ^Table, index: int) {
 // pages; a memory index files the key in its tree.
 @(private)
 table_index_put :: proc(t: ^Table, index: int, key: string, id: Row_Id) -> Error {
-	if t.indexes[index].pages != nil {
-		if put_err := ordered_put(t.indexes[index].pages, key, u64(id)); put_err.kind != .None {
+	if pages := index_pages(&t.indexes[index]); pages != nil {
+		if put_err := ordered_put(pages, key, u64(id)); put_err.kind != .None {
 			return error_wrap(put_err, put_err.kind, "cannot grow index %s: %s", t.indexes[index].schema.name, put_err.message)
 		}
 		return ERROR_NONE
@@ -601,16 +635,18 @@ table_index_put :: proc(t: ^Table, index: int, key: string, id: Row_Id) -> Error
 
 @(private)
 table_index_remove_key :: proc(t: ^Table, index: int, key: string) {
-	if t.indexes[index].pages != nil {
-		_ = ordered_remove(t.indexes[index].pages, key)
+	if pages := index_pages(&t.indexes[index]); pages != nil {
+		_ = ordered_remove(pages, key)
 	}
 }
 
 // table_index_count is how many entries an index holds.
 table_index_count :: proc(t: ^Table, index: int) -> u64 {
-	if t.indexes[index].pages != nil do return ordered_entries(t.indexes[index].pages)
+	if pages := index_pages(&t.indexes[index]); pages != nil do return ordered_entries(pages)
+	memory := index_memory(&t.indexes[index])
+	if memory == nil do return 0
 	count: u64
-	for c := ib_first(&t.indexes[index].tree); c.valid; c.valid = ib_advance(&c) do count += 1 + u64(len(ib_slot(&c).more))
+	for c := ib_first(&memory.tree); c.valid; c.valid = ib_advance(&c) do count += 1 + u64(len(ib_slot(&c).more))
 	return count
 }
 
@@ -633,7 +669,8 @@ table_index_attach_pages :: proc(t: ^Table, index: int) -> Error {
 	if frames <= 0 do frames = INDEX_PAGE_FRAMES
 	pages, create_err := ordered_create(t.index_vfs, path, frames)
 	if create_err.kind != .None do return create_err
-	t.indexes[index].pages = pages
+	index_tree_free(&t.indexes[index])
+	t.indexes[index].backend = pages
 	return ERROR_NONE
 }
 
@@ -650,17 +687,18 @@ table_index_open_pages :: proc(t: ^Table, index: int) -> Error {
 	if frames <= 0 do frames = INDEX_PAGE_FRAMES
 	pages, open_err := ordered_open(t.index_vfs, path, frames)
 	if open_err.kind != .None do return open_err
-	t.indexes[index].pages = pages
+	index_tree_free(&t.indexes[index])
+	t.indexes[index].backend = pages
 	return ERROR_NONE
 }
 
 @(private)
 table_index_detach_pages :: proc(t: ^Table, index: int, remove_file: bool) {
-	pages := t.indexes[index].pages
+	pages := index_pages(&t.indexes[index])
 	if pages == nil do return
 	path := strings.clone(pages.path)
 	ordered_close(pages)
-	t.indexes[index].pages = nil
+	t.indexes[index].backend = nil
 	defer delete(path)
 	if remove_file {
 		system := log_vfs_or_os(t.index_vfs)
@@ -698,11 +736,13 @@ table_index_lookup :: proc(t: ^Table, index: int, values: []Value) -> [dynamic]R
 	}
 	prefix := index_prefix_temp(t, index, values)
 	defer delete(prefix)
-	if t.indexes[index].pages != nil {
-		return ordered_lookup_prefix(t.indexes[index].pages, prefix)
+	if pages := index_pages(&t.indexes[index]); pages != nil {
+		return ordered_lookup_prefix(pages, prefix)
 	}
 	ids := make([dynamic]Row_Id)
-	for c := ib_lower_bound(&t.indexes[index].tree, prefix); c.valid; c.valid = ib_advance(&c) {
+	memory := index_memory(&t.indexes[index])
+	if memory == nil do return ids
+	for c := ib_lower_bound(&memory.tree, prefix); c.valid; c.valid = ib_advance(&c) {
 		if !strings.has_prefix(ib_key(&c), prefix) do break
 		index_slot_append(&ids, ib_slot(&c)^)
 	}
@@ -713,11 +753,13 @@ table_index_lookup :: proc(t: ^Table, index: int, values: []Value) -> [dynamic]R
 // `prefix`. It is the equality lookup for a non-unique index, whose stored keys
 // carry the row id after the tuple.
 table_index_scan_prefix :: proc(t: ^Table, index: int, prefix: string) -> [dynamic]Row_Id {
-	if t.indexes[index].pages != nil {
-		return ordered_lookup_prefix(t.indexes[index].pages, prefix)
+	if pages := index_pages(&t.indexes[index]); pages != nil {
+		return ordered_lookup_prefix(pages, prefix)
 	}
 	ids := make([dynamic]Row_Id)
-	for c := ib_lower_bound(&t.indexes[index].tree, prefix); c.valid; c.valid = ib_advance(&c) {
+	memory := index_memory(&t.indexes[index])
+	if memory == nil do return ids
+	for c := ib_lower_bound(&memory.tree, prefix); c.valid; c.valid = ib_advance(&c) {
 		if !strings.has_prefix(ib_key(&c), prefix) do break
 		index_slot_append(&ids, ib_slot(&c)^)
 	}
@@ -734,11 +776,13 @@ table_index_scan :: proc(
 	end: string,
 	inclusive_end: bool,
 ) -> [dynamic]Row_Id {
-	if t.indexes[index].pages != nil {
-		return ordered_scan(t.indexes[index].pages, start, end, inclusive_end)
+	if pages := index_pages(&t.indexes[index]); pages != nil {
+		return ordered_scan(pages, start, end, inclusive_end)
 	}
 	ids := make([dynamic]Row_Id)
-	tree := &t.indexes[index].tree
+	memory := index_memory(&t.indexes[index])
+	if memory == nil do return ids
+	tree := &memory.tree
 	for c := start == "" ? ib_first(tree) : ib_lower_bound(tree, start); c.valid; c.valid = ib_advance(&c) {
 		key := ib_key(&c)
 		if end != "" {
@@ -792,19 +836,25 @@ index_make :: proc(schema: Index_Schema) -> (index: Index, err: Error) {
 // evaluates its own parsed copy.
 index_share :: proc(from: ^Index) -> (target: Index, err: Error) {
 	target = Index {
-		schema    = from.schema,
-		unique    = from.unique,
-		lookup    = make(map[string]^Index_Bucket),
-		int_keyed = from.int_keyed,
+		schema  = from.schema,
+		unique  = from.unique,
+		backend = Memory_Index{},
+		lookup  = make(map[string]^Index_Bucket),
 	}
 	if from.exprs != nil {
 		exprs, exprs_err := index_exprs_make(from.schema)
 		if exprs_err.kind != .None do return target, exprs_err
 		target.exprs = exprs
 	}
-	ib_share(&target.tree, &from.tree)
+	// The copy of a paged index is an empty memory one, as it always was: the
+	// pages stay the source's.
+	if source := index_memory(from); source != nil {
+		copy := index_memory(&target)
+		copy.int_keyed = source.int_keyed
+		ib_share(&copy.tree, &source.tree)
+		index_ints_clone(source, copy)
+	}
 	index_lookup_clone(from, &target, context.allocator)
-	index_ints_clone(from, &target)
 	return target, ERROR_NONE
 }
 
@@ -821,8 +871,8 @@ table_index_free :: proc(t: ^Table, index: int, remove_file: bool) {
 // table_index_clear empties the index at `index` of `t`, keeping what it is: a
 // paged index clears its pages, a memory one starts a new tree.
 table_index_clear :: proc(t: ^Table, index: int) {
-	if t.indexes[index].pages != nil {
-		error_drop(ordered_clear(t.indexes[index].pages))
+	if pages := index_pages(&t.indexes[index]); pages != nil {
+		error_drop(ordered_clear(pages))
 	} else {
 		index_tree_free(&t.indexes[index])
 		index_tree_init(&t.indexes[index])
@@ -835,8 +885,9 @@ table_index_clear :: proc(t: ^Table, index: int) {
 // pool's resident pages. A memory index answers 0: its keys are counted with
 // the rows (table_memory).
 index_paged_memory :: proc(index: ^Index) -> (entries: int, bytes: int) {
-	if index.pages == nil do return 0, 0
-	return int(ordered_entries(index.pages)), page_resident(index.pages.file) * PAGE_SIZE
+	pages := index_pages(index)
+	if pages == nil do return 0, 0
+	return int(ordered_entries(pages)), page_resident(pages.file) * PAGE_SIZE
 }
 
 // table_largest_int_indexed answers table_largest_int from an index over the
@@ -851,16 +902,17 @@ index_paged_memory :: proc(index: ^Index) -> (entries: int, bytes: int) {
 table_largest_int_indexed :: proc(t: ^Table, column: int, skip: proc(id: Row_Id, user: rawptr) -> bool = nil, user: rawptr = nil) -> (largest: i64, found: bool, ok: bool) {
 	if t.paged != nil do return
 	for &index in t.indexes {
-		if index.pages != nil || index.schema.algorithm != .Btree || !index_is_plain(index.schema) do continue
+		memory := index_memory(&index)
+		if memory == nil || index.schema.algorithm != .Btree || !index_is_plain(index.schema) do continue
 		if len(index.schema.columns) != 1 || index.schema.columns[0] != column do continue
 		if column < len(t.schema.columns) && len(t.schema.columns[column].collation) > 0 do continue
 		// The first key past the numbers: the first of any kind tagged above 0x02.
 		past_numbers := [1]u8{0x03}
-		c := ib_lower_bound(&index.tree, string(past_numbers[:]))
+		c := ib_lower_bound(&memory.tree, string(past_numbers[:]))
 		if c.valid {
 			ib_prev(&c)
 		} else {
-			c = ib_last(&index.tree)
+			c = ib_last(&memory.tree)
 		}
 		for steps := 0; c.valid; steps += 1 {
 			if steps == 64 do return 0, false, false
@@ -884,4 +936,111 @@ table_largest_int_indexed :: proc(t: ^Table, column: int, skip: proc(id: Row_Id,
 		return 0, false, true
 	}
 	return
+}
+
+// --- What the rest of the engine asks an index -------------------------------
+
+// index_applied_seq is the commit a paged index's file was last written at;
+// false for a memory index, whose keys are rebuilt from the rows.
+index_applied_seq :: proc(index: ^Index) -> (seq: u64, paged: bool) {
+	pages := index_pages(index)
+	if pages == nil do return 0, false
+	return pages.file.applied_seq, true
+}
+
+// index_flush writes a paged index's dirty pages for commit `seq`; a memory
+// index has none.
+index_flush :: proc(index: ^Index, seq: u64) -> Error {
+	pages := index_pages(index)
+	if pages == nil do return ERROR_NONE
+	return ordered_flush(pages, seq)
+}
+
+// index_file_path is the file a paged index keeps its pages in; false for a
+// memory index.
+index_file_path :: proc(index: ^Index) -> (path: string, paged: bool) {
+	pages := index_pages(index)
+	if pages == nil do return "", false
+	return pages.path, true
+}
+
+// Index_Prefix_Walk walks, in place, the rows a memory index files under the
+// keys that start with a prefix: in key order, and in a key's slot the first
+// row then the others, with no list of ids made.
+Index_Prefix_Walk :: struct {
+	cursor: Ib_Cursor,
+	prefix: string,
+	slot:   ^Index_Slot,
+	at:     int,
+}
+
+// table_index_walks says the index at `index` of `t` can be walked in place
+// by prefix (table_index_walk_prefix): an ordered memory index. Any other is
+// asked with table_index_lookup.
+table_index_walks :: #force_inline proc(t: ^Table, index: int) -> bool {
+	return index_memory(&t.indexes[index]) != nil && t.indexes[index].schema.algorithm == .Btree
+}
+
+// table_index_walk_prefix starts a walk of the rows under the keys that start
+// with `prefix`, for an index table_index_walks accepts.
+table_index_walk_prefix :: proc(t: ^Table, index: int, prefix: string) -> (walk: Index_Prefix_Walk) {
+	memory := index_memory(&t.indexes[index])
+	if memory == nil do return
+	walk.prefix = prefix
+	walk.cursor = ib_lower_bound(&memory.tree, prefix)
+	return walk
+}
+
+// index_walk_next is the next row of the walk.
+index_walk_next :: proc(walk: ^Index_Prefix_Walk) -> (id: Row_Id, ok: bool) {
+	for {
+		if walk.slot != nil {
+			if walk.at < 0 {
+				walk.at = 0
+				return walk.slot.first, true
+			}
+			if walk.at < len(walk.slot.more) {
+				id = walk.slot.more[walk.at]
+				walk.at += 1
+				return id, true
+			}
+			walk.slot = nil
+			walk.cursor.valid = ib_advance(&walk.cursor)
+		}
+		if !walk.cursor.valid || !strings.has_prefix(ib_key(&walk.cursor), walk.prefix) do return 0, false
+		walk.slot = ib_slot(&walk.cursor)
+		walk.at = -1
+	}
+}
+
+// index_order_ids lists the row ids of one index in key order, or in the reverse
+// order when the statement is descending. `max_rows` stops the walk early, which
+// is what turns `ORDER BY id LIMIT 5` into five reads instead of a pass over the
+// whole table; zero means no stop.
+@(private)
+index_order_ids :: proc(
+	table: ^Table,
+	index: int,
+	descending: bool,
+	max_rows: int,
+) -> [dynamic]Row_Id {
+	ids := make([dynamic]Row_Id)
+	memory := index_memory(&table.indexes[index])
+	if memory == nil do return ids
+	tree := &memory.tree
+	// A key's rows come out ascending by id, or descending for a descending walk,
+	// as they did when each row had its own entry.
+	if descending {
+		for c := ib_last(tree); c.valid && (max_rows <= 0 || len(ids) < max_rows); c.valid = ib_retreat(&c) {
+			slot := ib_slot(&c)
+			#reverse for id in slot.more do append(&ids, id)
+			append(&ids, slot.first)
+		}
+	} else {
+		for c := ib_first(tree); c.valid && (max_rows <= 0 || len(ids) < max_rows); c.valid = ib_advance(&c) {
+			index_slot_append(&ids, ib_slot(&c)^)
+		}
+	}
+	if max_rows > 0 && len(ids) > max_rows do resize(&ids, max_rows)
+	return ids
 }

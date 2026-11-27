@@ -2346,14 +2346,9 @@ tx_committed_key_taken :: proc(
 	if holder, held, known := index_int_holder(committed, index, values); known {
 		return held && holds(tx, committed, index, values, holder, ignore, writes)
 	}
-	if committed.indexes[index].pages == nil && committed.indexes[index].schema.algorithm == .Btree {
-		prefix := index_prefix_in(committed, index, values, tx.alloc)
-		for c := ib_lower_bound(&committed.indexes[index].tree, prefix); c.valid; c.valid = ib_advance(&c) {
-			if !strings.has_prefix(ib_key(&c), prefix) do break
-			slot := ib_slot(&c)
-			if holds(tx, committed, index, values, slot.first, ignore, writes) do return true
-			for id in slot.more do if holds(tx, committed, index, values, id, ignore, writes) do return true
-		}
+	if table_index_walks(committed, index) {
+		walk := table_index_walk_prefix(committed, index, index_prefix_in(committed, index, values, tx.alloc))
+		for id in index_walk_next(&walk) do if holds(tx, committed, index, values, id, ignore, writes) do return true
 		return false
 	}
 	ids := table_index_lookup(committed, index, values)
