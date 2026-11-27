@@ -383,6 +383,20 @@ sees another catalog (its own DDL, or a read that began before a change)
 parses and keeps nothing. A run's view tree depends on its text alone, so the
 generation guards what the resolver wrote into its own trees.
 
+A correlated subquery reads the row of the query around it through a link as
+well (A1.8g). Every select the parser reads has a number in its query's block
+(`Select_Stmt.id`). The transaction knows which select it is running
+(`Tx.select_scope`), every context takes it, and the frame a subquery pushes
+is tagged with it along with the plan's positions (`Outer_Frame.scope`,
+`positions`). A column of an enclosing query is linked to that select
+(`Column_Binding.scope`), and the run reads it from the frame carrying that
+select's number, never from a frame counted outward. A frame laid out
+otherwise (the same table inside and out, at the same place) therefore cannot
+be read by mistake; a missing frame falls back to the lookup by name. A
+select's join plan is kept for the statement under its number
+(`Tx.select_plans`, cleared when a statement starts), so a subquery run for
+every outer row plans once.
+
 A query binds sources: `Source` pairs a table with one of its rows and an
 optional alias. Single-table statements build a one-source context; a join
 builds one source per table. Column resolution searches the bound sources
