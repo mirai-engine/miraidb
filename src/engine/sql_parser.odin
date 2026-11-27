@@ -12,7 +12,9 @@ Parser :: struct {
 	query:       ^Query,
 	err:         Error,
 	param_count: int,
-	// node_count is the last Node_Id given (p_node_id).
+	// node_base is the query's block of node numbers and node_count how many
+	// of them p_node_id gave.
+	node_base:   Node_Id,
 	node_count:  Node_Id,
 	// param_names names each parameter slot: "?3", ":id", "@id", "$id", or ""
 	// for a bare `?`. It lives in the query's arena.
@@ -69,6 +71,7 @@ sql_parse :: proc(source: string) -> (Query, Error) {
 		// and nothing freed it.
 		windows     = make([dynamic]Pending_Window, q.alloc),
 	}
+	p.node_base = node_block_next()
 	p.current = lexer_next(&p.lexer)
 	statement := parse_statement(&p)
 	// A window name outside any SELECT that defines it.
@@ -91,6 +94,7 @@ sql_parse :: proc(source: string) -> (Query, Error) {
 	}
 	q.statement = statement
 	q.param_count = p.param_count
+	q.node_base = p.node_base
 	q.node_count = p.node_count
 	for len(p.param_names) < p.param_count do append(&p.param_names, "")
 	q.param_names = p.param_names[:]
@@ -1386,11 +1390,13 @@ column_expr :: proc(p: ^Parser, table: string, column: string) -> ^Expr {
 	return expr
 }
 
-// p_node_id is the next node number of the query being parsed (Node_Id).
+// p_node_id is the next node number of the query being parsed (Node_Id): 0
+// past the query's block.
 @(private)
 p_node_id :: proc(p: ^Parser) -> Node_Id {
+	if p.node_count + 1 >= NODE_BLOCK do return 0
 	p.node_count += 1
-	return p.node_count
+	return p.node_base + p.node_count
 }
 
 // node_call and node_column make the numbered nodes of the parse functions that

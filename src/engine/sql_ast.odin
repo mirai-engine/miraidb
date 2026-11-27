@@ -147,13 +147,27 @@ Literal_Expr :: struct {
 	value: Value,
 }
 
-// Node_Id numbers the nodes of one parsed query that a resolution links
-// (Column_Expr, Call_Expr, Binary_Expr): the parser gives each a number from 1,
-// dense, and Query.node_count says how many there are, so what the resolution
-// works out for a node can live in an array beside the tree, read by that
-// number (the resolved statement, A1.8). 0 is a node the parser did not make
-// (a rewrite, an expansion of `*`): it has no link and is resolved by name.
-Node_Id :: u32
+// Node_Id numbers the nodes of a parsed query that a resolution links
+// (Column_Expr, Call_Expr, Binary_Expr): each query takes a block of numbers of
+// its own (Query.node_base, from a process-wide counter) and its nodes are
+// node_base + 1 .. node_base + node_count, dense, so what the resolution works
+// out for a node lives in an array beside the tree, read by that number (the
+// resolved statement, A1.8). A node of another query (a policy, a CHECK, a
+// view evaluated inside the statement) is outside the block and has no link
+// there. 0 is a node the parser did not make (a rewrite, an expansion of `*`):
+// it has no link either and is resolved by name.
+Node_Id :: u64
+
+// NODE_BLOCK is how many numbers one query may take; a node past it is 0.
+NODE_BLOCK :: Node_Id(1 << 20)
+
+@(private)
+node_block_counter: Node_Id
+
+// node_block_next is the base of a new query's block of node numbers.
+node_block_next :: proc() -> Node_Id {
+	return sync.atomic_add(&node_block_counter, NODE_BLOCK)
+}
 
 Column_Expr :: struct {
 	table: string,
@@ -914,8 +928,9 @@ Query :: struct {
 	// param_names has one entry per parameter: its name as written ("?3", ":id",
 	// "@id", "$id") or "" for a bare `?`. It lives in the query's arena.
 	param_names: []string,
-	// node_count is how many nodes the parser numbered (Node_Id): the ids run
-	// from 1 to node_count.
+	// node_base and node_count are the query's block of node numbers
+	// (Node_Id): its nodes are node_base + 1 .. node_base + node_count.
+	node_base:  Node_Id,
 	node_count: Node_Id,
 }
 

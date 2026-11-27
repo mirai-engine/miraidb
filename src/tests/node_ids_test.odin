@@ -6,8 +6,8 @@ import db "../engine"
 
 // A resolved statement links a node by its number (A1.8): every node the
 // parser makes that a resolution links (a column, a call, a binary operator)
-// has a number of its own in its query, from 1 to Query.node_count with none
-// missing.
+// has a number of its own, from the query's block (node_base + 1 ..
+// node_base + node_count) with none missing, and no two queries share one.
 
 @(private = "file")
 Ni_Seen :: struct {
@@ -63,16 +63,17 @@ test_the_parser_numbers_the_nodes_a_resolution_links :: proc(t: ^testing.T) {
 	defer delete(seen.ids)
 	ni_select(&seen, &select)
 	testing.expect(t, seen.nodes > 10)
-	// Every node numbered, each number once, and the numbers 1..node_count.
+	// Every node numbered, each number once, and the numbers the whole block.
 	testing.expect_value(t, seen.ids[0], 0)
 	testing.expect_value(t, len(seen.ids), seen.nodes)
 	testing.expect_value(t, int(query.node_count), seen.nodes)
 	for id in seen.ids {
-		testing.expectf(t, id >= 1 && id <= query.node_count, "node %d outside 1..%d", id, query.node_count)
+		testing.expectf(t, id > query.node_base && id <= query.node_base + query.node_count, "node %d outside its block", id)
 	}
-	// Another query numbers its own from 1.
+	// Another query has a block of its own: none of its numbers is the first's.
 	other, other_err := db.sql_parse("SELECT y FROM a")
 	if !testing.expect(t, db.error_ok(other_err)) do return
 	defer db.query_destroy(&other)
 	testing.expect_value(t, other.node_count, db.Node_Id(1))
+	testing.expect(t, other.node_base >= query.node_base + db.NODE_BLOCK || other.node_base + db.NODE_BLOCK <= query.node_base)
 }
