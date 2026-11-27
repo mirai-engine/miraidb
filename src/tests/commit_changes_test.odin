@@ -20,24 +20,101 @@ Replica :: struct {
 
 // replicate applies each commit's list to the replica as it is published. The
 // changes say which are a TEMP table's (only `scratch` is) and which commit
-// they are.
+// they are, and each update and delete carries the row it replaced: the row
+// the replica, still at the state before the commit, holds under that id. A
+// commit of rows only is also applied backwards, from the old rows, and has to
+// give the state before it back.
 @(private = "file")
 replicate :: proc(ctx: rawptr, store: ^db.Store, changes: ^db.Commit_Changes) {
 	replica := (^Replica)(ctx)
-	if changes.seq != store.commit_seq && len(replica.err) == 0 {
-		replica.err = fmt.aprintf("published as commit %d, the store is at %d", changes.seq, store.commit_seq)
+	fail :: proc(replica: ^Replica, message: string) {
+		if len(replica.err) == 0 do replica.err = message
+		else do delete(message)
 	}
-	replica.target.apply_seq = changes.seq
+	if changes.seq != store.commit_seq do fail(replica, fmt.aprintf("published as commit %d, the store is at %d", changes.seq, store.commit_seq))
+	target := replica.target
+	target.apply_seq = changes.seq
+	// The commit's changes were validated together: a key two rows swap
+	// collides halfway through, as it does in the commit's own apply.
+	target.apply_validated = true
+	defer target.apply_validated = false
+	before := dump(target)
+	rows_only := true
 	cache: db.Apply_Cache
 	for op, i in changes.ops {
-		if changes.temp[i] != (op.name == "scratch") && len(replica.err) == 0 {
-			replica.err = fmt.aprintf("commit %d, %v %s: TEMP is %v", changes.seq, op.kind, op.name, changes.temp[i])
+		if changes.temp[i] != (op.name == "scratch") {
+			fail(replica, fmt.aprintf("commit %d, %v %s: TEMP is %v", changes.seq, op.kind, op.name, changes.temp[i]))
 		}
-		if err := db.store_apply(replica.target, op, &cache); err.kind != .None && len(replica.err) == 0 {
-			replica.err = fmt.aprintf("commit %d, %v %s: %s", changes.seq, op.kind, op.name, err.message)
+		#partial switch op.kind {
+		case .Update, .Delete:
+			held, found := db.table_get_row(target.tables[op.name], op.row_id, context.temp_allocator)
+			if !found || !same_values(held.values, changes.old[i]) {
+				fail(replica, fmt.aprintf("commit %d, %v %s row %d: the old row is not the row replaced", changes.seq, op.kind, op.name, op.row_id))
+			}
+		case .Insert:
+			if changes.old[i] != nil do fail(replica, fmt.aprintf("commit %d: an insert carries an old row", changes.seq))
+		case:
+			rows_only = false
+		}
+		if err := db.store_apply(target, op, &cache); err.kind != .None {
+			fail(replica, fmt.aprintf("commit %d, %v %s: %s", changes.seq, op.kind, op.name, err.message))
 		}
 	}
-	replica.target.commit_seq = changes.seq
+	if rows_only && len(changes.ops) > 0 {
+		after := dump(target)
+		back: db.Apply_Cache
+		for i := len(changes.ops) - 1; i >= 0; i -= 1 {
+			op := changes.ops[i]
+			undo := op
+			#partial switch op.kind {
+			case .Insert:
+				undo.kind = .Delete
+			case .Update:
+				undo.values = changes.old[i]
+			case .Delete:
+				undo.kind = .Insert
+				undo.values = changes.old[i]
+			}
+			if err := db.store_apply(target, undo, &back); err.kind != .None {
+				fail(replica, fmt.aprintf("commit %d backwards, %v %s: %s", changes.seq, undo.kind, undo.name, err.message))
+			}
+		}
+		if dump(target) != before do fail(replica, fmt.aprintf("commit %d applied backwards does not give the state before it", changes.seq))
+		again: db.Apply_Cache
+		for op in changes.ops do db.error_drop(db.store_apply(target, op, &again))
+		if dump(target) != after do fail(replica, fmt.aprintf("commit %d applied again does not give the state after it", changes.seq))
+	}
+	target.commit_seq = changes.seq
+}
+
+@(private = "file")
+same_values :: proc(a, b: []db.Value) -> bool {
+	if len(a) != len(b) do return false
+	for v, i in a do if v.kind != b[i].kind || !db.value_equal(v, b[i]) do return false
+	return true
+}
+
+// dump is a store's tables and their live rows, as text.
+@(private = "file")
+dump :: proc(store: ^db.Store) -> string {
+	names := make([dynamic]string, context.temp_allocator)
+	for name in store.tables do append(&names, name)
+	slice.sort(names[:])
+	b := strings.builder_make(context.temp_allocator)
+	for name in names {
+		table := store.tables[name]
+		strings.write_string(&b, name)
+		strings.write_byte(&b, '\n')
+		rows := make([dynamic]db.Row)
+		db.table_collect(table, &rows, max(u64))
+		for row in rows {
+			fmt.sbprintf(&b, "  %d:", row.id)
+			for v in row.values do fmt.sbprintf(&b, " %s", db.value_format(v, context.temp_allocator))
+			strings.write_byte(&b, '\n')
+		}
+		db.table_collect_release(table, &rows)
+	}
+	return strings.to_string(b)
 }
 
 // The statements of the corpus: every kind of change a commit carries, each
@@ -265,4 +342,3 @@ test_a_group_commit_publishes_each_transaction :: proc(t: ^testing.T) {
 	db.error_free(&hooked_err)
 	store.hooks.commit = nil
 }
-

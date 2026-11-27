@@ -1620,7 +1620,9 @@ store_row_table :: proc(store: ^Store, name: string, cache: ^Apply_Cache) -> (^T
 	return table, err
 }
 
-store_apply :: proc(store: ^Store, op: Store_Op, cache: ^Apply_Cache = nil) -> Error {
+// store_apply applies one change. With `old`, an update or a delete hands back
+// there the row it replaced or removed, in `old_alloc` (Commit_Changes.old).
+store_apply :: proc(store: ^Store, op: Store_Op, cache: ^Apply_Cache = nil, old: ^[]Value = nil, old_alloc := context.allocator) -> Error {
 	if store_op_changes_catalog(op) do store_catalog_changed(store)
 	// Any other op may create, replace or drop a table: the cache forgets.
 	if cache != nil && op.kind != .Insert && op.kind != .Update && op.kind != .Delete do cache^ = {}
@@ -1709,13 +1711,13 @@ store_apply :: proc(store: ^Store, op: Store_Op, cache: ^Apply_Cache = nil) -> E
 	case .Update:
 		table, table_err := store_row_table(store, op.name, cache)
 		if table_err.kind != .None do return table_err
-		update_err := table_update(table, op.row_id, op.values)
+		update_err := table_update(table, op.row_id, op.values, old, old_alloc)
 		if update_err.kind == .None && op.name == SEQUENCE_TABLE do store_apply_sequence(store, op.values)
 		return update_err
 	case .Delete:
 		table, table_err := store_row_table(store, op.name, cache)
 		if table_err.kind != .None do return table_err
-		table_delete(table, op.row_id)
+		table_delete(table, op.row_id, old, old_alloc)
 		return ERROR_NONE
 	case .Truncate:
 		table, table_err := store_table_writable(store, op.name)
@@ -2253,8 +2255,10 @@ store_commit_prepared :: proc(store: ^Store, prepared: []^Prepared_Tx) -> (int, 
 		}
 		store.apply_seq = seq
 		group.changes.seq = seq
-		for op in group.changes.ops {
-			if apply_err := store_apply(store, op); apply_err.kind != .None {
+		old_alloc := commit_changes_allocator(&group.changes)
+		for op, i in group.changes.ops {
+			old: ^[]Value = group.changes.old != nil ? &group.changes.old[i] : nil
+			if apply_err := store_apply(store, op, nil, old, old_alloc); apply_err.kind != .None {
 				store_damage(store, apply_err)
 				// The commit already failed; a rewind that fails too is not the error to report.
 				error_drop(log_rewind(&store.log, log_before))

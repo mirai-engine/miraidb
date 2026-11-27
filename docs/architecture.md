@@ -267,8 +267,11 @@ rows ordered by `Row_Id`, which keeps unsorted output deterministic.
 5. Apply the operations to the committed state, in order.
 6. Set `commit_seq`.
 7. Release the lock and publish what the commit changed (`store_publish`):
-   `Store.on_commit` gets a `Commit_Changes`, the commit's sequence, its list
-   and which changes are a TEMP table's, in a copy of its own (`Op_Copy`: the
+   `Store.on_commit` gets a `Commit_Changes`, the commit's sequence, its list,
+   which changes are a TEMP table's and, for each update and delete, the row it
+   replaced or removed (`old`, which the apply hands back from the row it read
+   anyway: the row in memory, or the one decoded from its page), in a copy of
+   its own made before the apply when someone watches the store (`Op_Copy`: the
    names, values, schemas and indexes in one arena, since the transaction's
    memory is gone by then). The `.sqlite` mirror takes the same list without
    the TEMP changes (`commit_changes_durable`). The list is the

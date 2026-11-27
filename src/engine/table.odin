@@ -504,6 +504,13 @@ clone_values :: proc(values: []Value) -> []Value {
 	return out
 }
 
+// values_clone_in copies `values` and what they point at into `alloc`.
+values_clone_in :: proc(values: []Value, alloc: mem.Allocator) -> []Value {
+	out := make([]Value, len(values), alloc)
+	for value, i in values do out[i] = value_clone(value, alloc)
+	return out
+}
+
 free_values :: proc(values: []Value) {
 	for value in values {
 		value_deep_free(value, context.allocator)
@@ -792,13 +799,20 @@ table_insert :: proc(t: ^Table, id: Row_Id, values: []Value, validated := false)
 	return ERROR_NONE
 }
 
-table_update :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
+// table_update replaces row `id` with `values`. With `replaced`, the values it
+// replaces are handed back there (Commit_Changes.old): the row the update read
+// anyway. A paged row is decoded into `replaced_alloc`; a memory row is lent,
+// as the version the update keeps of it, which lives until the retention
+// prunes it (store_retain, after the commit is published). Copying it cost a
+// watched update 14%.
+table_update :: proc(t: ^Table, id: Row_Id, values: []Value, replaced: ^[]Value = nil, replaced_alloc := context.allocator) -> Error {
 	if t.paged != nil {
-		old, exists := page_rows_get(t.paged, id, context.allocator)
+		old, exists := page_rows_get(t.paged, id, replaced != nil ? replaced_alloc : context.allocator)
 		if !exists {
 			return errf(.Internal, "row id %d is missing from table %s", u64(id), t.schema.name)
 		}
-		defer free_values(old.values)
+		if replaced != nil do replaced^ = old.values
+		defer if replaced == nil do free_values(old.values)
 		if err := table_check_unique(t, values, id); err.kind != .None {
 			return err
 		}
@@ -817,6 +831,7 @@ table_update :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
 	// The history array the update appends to is the block's: a block a
 	// reader's table lists is copied before it (rows_mut).
 	row := rows_mut(&t.rows, at)^
+	if replaced != nil do replaced^ = row.values
 	// An index whose key the update leaves as it was keeps its entry: the row is
 	// filed under the same key and id, and a unique key it held is still its own,
 	// so it is neither checked nor removed and put back.
@@ -863,17 +878,22 @@ table_update :: proc(t: ^Table, id: Row_Id, values: []Value) -> Error {
 	return ERROR_NONE
 }
 
-table_delete :: proc(t: ^Table, id: Row_Id) -> bool {
+// table_delete removes row `id`. With `removed`, its values are handed back
+// there, as table_update hands back the row it replaces: a memory row is lent
+// (the tombstone keeps them), a paged one decoded into `removed_alloc`.
+table_delete :: proc(t: ^Table, id: Row_Id, removed: ^[]Value = nil, removed_alloc := context.allocator) -> bool {
 	if t.paged != nil {
 		if !page_rows_contains(t.paged, id) do return false
-		old, decoded := page_rows_get(t.paged, id, context.allocator)
+		old, decoded := page_rows_get(t.paged, id, removed != nil ? removed_alloc : context.allocator)
 		if !decoded do return false
-		defer free_values(old.values)
+		if removed != nil do removed^ = old.values
+		defer if removed == nil do free_values(old.values)
 		table_index_remove_all(t, old.values, id)
 		return page_rows_delete(t.paged, id)
 	}
 	row := table_row_find(t, id)
 	if row == nil do return false
+	if removed != nil do removed^ = row.values
 	for _, i in t.indexes {
 		table_index_remove_row(t, i, row.values, id)
 	}

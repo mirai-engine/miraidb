@@ -2540,9 +2540,18 @@ tx_commit :: proc(tx: ^Tx) -> Error {
 	validating_store := tx.store
 	validating_store.apply_validated = true
 	defer validating_store.apply_validated = false
+	// What the commit changed is copied before the apply when someone watches
+	// the store (the hook, the mirror): the apply hands each update and delete
+	// the row it replaces (Commit_Changes.old), into the copy. A store nobody
+	// watches copies nothing.
+	changes: Commit_Changes
+	if tx.store.on_commit != nil || len(tx.store.sqlite_mirror) > 0 do changes = commit_changes_make(ops, ephemeral)
+	defer commit_changes_free(&changes)
+	old_alloc := commit_changes_allocator(&changes)
 	apply_cache: Apply_Cache
-	for op in ops {
-		if apply_err := store_apply(tx.store, op, &apply_cache); apply_err.kind != .None {
+	for op, i in ops {
+		old: ^[]Value = changes.old != nil ? &changes.old[i] : nil
+		if apply_err := store_apply(tx.store, op, &apply_cache, old, old_alloc); apply_err.kind != .None {
 			// Applying a validated transaction must not fail. If it does, undo
 			// the log record so the file still matches the live state, and
 			// refuse the half-applied rows until the database is reopened.
@@ -2569,12 +2578,8 @@ tx_commit :: proc(tx: ^Tx) -> Error {
 	notify := tx.store.on_commit
 	store := tx.store
 	// The staged values die with the transaction, so the hook and the mirror get
-	// a copy - and only they do: a store nobody watches skips the copy of every
-	// value it just wrote.
-	changes: Commit_Changes
-	if notify != nil || len(store.sqlite_mirror) > 0 do changes = commit_changes_make(ops, ephemeral)
+	// the copy made before the apply.
 	changes.seq = store.commit_seq
-	defer commit_changes_free(&changes)
 	notify_ops := changes.ops
 	// A TEMP table is not in the file: the mirror hears only the rest. A temp
 	// table's write used to reach it as an unknown table and rewrite the whole
@@ -2651,23 +2656,24 @@ tx_clone_ops :: proc(ops: []Store_Op) -> Op_Copy {
 	}
 	alloc := arena_allocator_guarded(arena)
 	out := make([]Store_Op, len(ops), alloc)
-	for op, i in ops {
-		out[i] = op
-		out[i].name = strings.clone(op.name, alloc)
-		if len(op.values) > 0 {
-			values := make([]Value, len(op.values), alloc)
-			for value, v in op.values do values[v] = value_clone(value, alloc)
-			out[i].values = values
-		}
-		#partial switch op.kind {
-		case .Create_Table, .Alter_Table:
-			schema := op.schema
-			out[i].schema = schema_copy(&schema, alloc)
-		case .Create_Index, .Drop_Index:
-			out[i].index = schema_index_copy(op.index, alloc)
-		}
-	}
+	for op, i in ops do out[i] = store_op_clone(op, alloc)
 	return Op_Copy{ops = out, arena = arena}
+}
+
+// store_op_clone copies one change and everything it points at (its name,
+// values, schema and index) into `alloc`.
+store_op_clone :: proc(op: Store_Op, alloc: mem.Allocator) -> Store_Op {
+	out := op
+	out.name = strings.clone(op.name, alloc)
+	if len(op.values) > 0 do out.values = values_clone_in(op.values, alloc)
+	#partial switch op.kind {
+	case .Create_Table, .Alter_Table:
+		schema := op.schema
+		out.schema = schema_copy(&schema, alloc)
+	case .Create_Index, .Drop_Index:
+		out.index = schema_index_copy(op.index, alloc)
+	}
+	return out
 }
 
 @(private)
@@ -2688,13 +2694,19 @@ tx_free_ops :: proc(copied: ^Op_Copy) {
 }
 
 // Commit_Changes is what a commit changed, as it publishes it (store_publish):
-// its sequence, its list of changes in the order the log has them, and which
-// of them are a TEMP table's, which the log and the file never see. It owns a
-// copy of the list (Op_Copy), so it outlives the transaction (A3).
+// its sequence, its list of changes in the order the log has them, which of
+// them are a TEMP table's (which the log and the file never see), and for each
+// update and delete the row it replaced or removed, as the apply found it
+// (`old`, nil for any other change). It owns a copy of the list (Op_Copy), so
+// it outlives the transaction (A3). An old row of a memory table is the
+// table's own version of it, lent until the publish returns (the retention
+// runs after it): a consumer that keeps one copies it. The log keeps the new
+// values only.
 Commit_Changes :: struct {
 	seq:    u64,
 	ops:    []Store_Op,
 	temp:   []bool,
+	old:    [][]Value,
 	copied: Op_Copy,
 }
 
@@ -2703,9 +2715,17 @@ Commit_Changes :: struct {
 commit_changes_make :: proc(ops: []Store_Op, temp: []bool) -> Commit_Changes {
 	copied := tx_clone_ops(ops)
 	if copied.arena == nil do return {}
-	marks := make([]bool, len(ops), arena_allocator_guarded(copied.arena))
+	alloc := arena_allocator_guarded(copied.arena)
+	marks := make([]bool, len(ops), alloc)
 	copy(marks, temp)
-	return Commit_Changes{ops = copied.ops, temp = marks, copied = copied}
+	return Commit_Changes{ops = copied.ops, temp = marks, old = make([][]Value, len(ops), alloc), copied = copied}
+}
+
+// commit_changes_allocator is where the old rows of the changes go: the
+// changes' own arena.
+commit_changes_allocator :: proc(changes: ^Commit_Changes) -> mem.Allocator {
+	if changes.copied.arena == nil do return context.allocator
+	return arena_allocator_guarded(changes.copied.arena)
 }
 
 commit_changes_free :: proc(changes: ^Commit_Changes) {
