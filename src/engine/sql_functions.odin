@@ -9,6 +9,8 @@ import "core:unicode/utf8"
 import "base:intrinsics"
 
 eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
+	// A call its resolution linked goes straight to what it reaches (A1.8d).
+	if link, linked := call_bound(ctx, call.id); linked do return eval_call_linked(ctx, call, link)
 	resolve_counted.function_names += 1
 	// A row value is taken apart by the comparison that holds it; reaching it
 	// here means it stands alone, which SQLite refuses with the same words.
@@ -66,6 +68,61 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 	return value, err
 }
 
+// eval_call_linked runs a call through its link: the arguments, then what
+// the link says it reaches, without looking the name up. A virtual table's
+// overload depends on the first argument's table and is checked as before.
+@(private)
+eval_call_linked :: proc(ctx: ^Eval_Ctx, call: Call_Expr, link: ^Call_Link) -> (Value, Error) {
+	CALL_ARGS_INLINE :: 8
+	inline: [CALL_ARGS_INLINE]Value
+	args: []Value
+	heap: []Value
+	if len(call.args) <= CALL_ARGS_INLINE {
+		args = inline[:len(call.args)]
+	} else {
+		heap = make([]Value, len(call.args))
+		args = heap
+	}
+	defer if heap != nil do delete(heap)
+	for arg, i in call.args {
+		value, arg_err := eval_expr(ctx, arg)
+		if arg_err.kind != .None do return {}, arg_err
+		args[i] = value
+	}
+	if ctx.tx == nil do return eval_call_link_body(ctx, call, link, args, context.allocator)
+	// What the function answers lives in the statement's memory (eval_call).
+	outer := context.allocator
+	value: Value
+	err: Error
+	{
+		context.allocator = ctx.tx.alloc
+		value, err = eval_call_link_body(ctx, call, link, args, outer)
+	}
+	if len(err.message) > 0 do err.message = strings.clone(err.message, outer)
+	return value, err
+}
+
+@(private)
+eval_call_link_body :: proc(ctx: ^Eval_Ctx, call: Call_Expr, link: ^Call_Link, args: []Value, outer: mem.Allocator) -> (Value, Error) {
+	if ctx.tx != nil && ctx.tx.store != nil && len(ctx.tx.store.vtab_modules) > 0 && len(call.args) > 0 {
+		context.allocator = outer
+		if fn, user, overloaded := vtab_overload(ctx, call); overloaded do return program_call(ctx, fn, args, user, outer)
+		context.allocator = ctx.tx != nil ? ctx.tx.alloc : outer
+	}
+	switch link.kind {
+	case .Host:
+		return program_call(ctx, link.host.handler, args, link.host.user, outer)
+	case .Json:
+		return eval_call_json(call, args)
+	case .Time:
+		return eval_call_time(ctx, call, args)
+	case .Builtin:
+		return eval_call_builtin(ctx, call, link.lowered, link.dispatch, args, outer)
+	case .None:
+	}
+	return {}, errf(.Internal, "call %s has no link", call.name)
+}
+
 // program_call runs a program's function with `outer`, the caller's allocator,
 // and moves the message of an error it answers into the statement's arena:
 // eval_call copies every message out of the arena, and a message the program
@@ -113,47 +170,68 @@ eval_call_body :: proc(ctx: ^Eval_Ctx, call: Call_Expr, args: []Value, outer: me
 		}
 	}
 
-	// JSON functions parse the document in json.odin.
-	if json_call_name(call.name) {
-		value, handled, json_err := json_call(call.name, args[:])
-		if !handled do return {}, errf(.Internal, "unhandled JSON function %s", call.name)
-		// What a function that builds or edits JSON answers is JSON, as SQLite
-		// marks it with its subtype (json_extract marks its own containers).
-		for builder in ([]string{"json", "json_array", "json_object", "json_set", "json_insert", "json_replace", "json_remove", "json_patch", "json_quote", "json_array_insert"}) {
-			if strings.equal_fold(call.name, builder) do return value_json(value), json_err
-		}
-		return value, json_err
-	}
-	// Date and time functions share the argument parsing in datetime.odin.
-	if db_time_has_functions(call.name) {
-		if strings.equal_fold(call.name, "strftime") {
-			if len(args) < 2 {
-				return {}, errf(.Invalid_Argument, "strftime() takes a format and a time")
-			}
-			if args[0].kind != .String {
-				return {}, errf(.Invalid_Type, "strftime() expects a text format")
-			}
-			moment, ok := db_time_parse(args[1:], ctx.now_us)
-			if !ok do return value_null(), ERROR_NONE
-			text, known := db_time_strftime(args[0].s, moment)
-			if !known do return value_null(), ERROR_NONE
-			return value_string(text), ERROR_NONE
-		}
-		value, _ := db_time_call(call.name, args[:], ctx.now_us)
-		return value, ERROR_NONE
-	}
+	if json_call_name(call.name) do return eval_call_json(call, args)
+	if db_time_has_functions(call.name) do return eval_call_time(ctx, call, args)
 	lowered := strings.to_lower(call.name)
 	defer delete(lowered)
-	// SQLite's other spellings of functions the engine has.
-	dispatch := lowered
+	return eval_call_builtin(ctx, call, lowered, builtin_dispatch_name(lowered), args, outer)
+}
+
+// builtin_dispatch_name is the name the builtin dispatch switches on for a
+// lowered call name: SQLite's other spellings of functions the engine has are
+// the engine's.
+builtin_dispatch_name :: proc(lowered: string) -> string {
 	switch lowered {
 	case "if":
-		dispatch = "iif"
+		return "iif"
 	case "ceiling":
-		dispatch = "ceil"
+		return "ceil"
 	case "power":
-		dispatch = "pow"
+		return "pow"
 	}
+	return lowered
+}
+
+// eval_call_json answers a JSON function: they parse the document in
+// json.odin.
+@(private)
+eval_call_json :: proc(call: Call_Expr, args: []Value) -> (Value, Error) {
+	value, handled, json_err := json_call(call.name, args[:])
+	if !handled do return {}, errf(.Internal, "unhandled JSON function %s", call.name)
+	// What a function that builds or edits JSON answers is JSON, as SQLite
+	// marks it with its subtype (json_extract marks its own containers).
+	for builder in ([]string{"json", "json_array", "json_object", "json_set", "json_insert", "json_replace", "json_remove", "json_patch", "json_quote", "json_array_insert"}) {
+		if strings.equal_fold(call.name, builder) do return value_json(value), json_err
+	}
+	return value, json_err
+}
+
+// eval_call_time answers a date and time function: they share the argument
+// parsing in datetime.odin.
+@(private)
+eval_call_time :: proc(ctx: ^Eval_Ctx, call: Call_Expr, args: []Value) -> (Value, Error) {
+	if strings.equal_fold(call.name, "strftime") {
+		if len(args) < 2 {
+			return {}, errf(.Invalid_Argument, "strftime() takes a format and a time")
+		}
+		if args[0].kind != .String {
+			return {}, errf(.Invalid_Type, "strftime() expects a text format")
+		}
+		moment, ok := db_time_parse(args[1:], ctx.now_us)
+		if !ok do return value_null(), ERROR_NONE
+		text, known := db_time_strftime(args[0].s, moment)
+		if !known do return value_null(), ERROR_NONE
+		return value_string(text), ERROR_NONE
+	}
+	value, _ := db_time_call(call.name, args[:], ctx.now_us)
+	return value, ERROR_NONE
+}
+
+// eval_call_builtin answers one of the engine's scalar functions by its
+// dispatch name (builtin_dispatch_name), and a name it does not have from the
+// program's functions; `lowered` is the name as written, lowered.
+@(private)
+eval_call_builtin :: proc(ctx: ^Eval_Ctx, call: Call_Expr, lowered: string, dispatch: string, args: []Value, outer: mem.Allocator) -> (Value, Error) {
 	switch dispatch {
 	case "ln":
 		if len(args) != 1 do return {}, errf(.Invalid_Argument, "ln() takes one argument")

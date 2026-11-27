@@ -54,9 +54,9 @@ test_the_names_a_statement_resolves_while_it_runs :: proc(t: ^testing.T) {
 	join := rc_measure(t, store, "SELECT count(*) FROM a JOIN b ON b.a_id = a.id WHERE a.x > 2")
 	testing.expectf(t, join.column_names < 20, "join: %d column lookups", join.column_names)
 
-	// A function is found by its name at every call (A1.5).
+	// A call is linked to its function when its statement is resolved (A1.8d).
 	call := rc_measure(t, store, "SELECT count(*) FROM a WHERE lower(name) = 'n5'")
-	testing.expectf(t, call.function_names >= RC_ROWS, "function: %d lookups", call.function_names)
+	testing.expectf(t, call.function_names < 20, "function: %d lookups", call.function_names)
 
 	// A collation is found by its name at every comparison (A1.5).
 	collated := rc_measure(t, store, "SELECT count(*) FROM a WHERE name = 'n5' COLLATE NOCASE")

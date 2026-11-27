@@ -695,6 +695,7 @@ res_expr :: proc(walk: ^Res_Walk, expr: ^Expr) {
 			walk.err = errf(.Invalid_Argument, "too many arguments on function %s", e.name)
 		}
 		if walk.tx.store.sqlite_names && walk.err.kind == .None do res_function(walk, e)
+		res_bind_call(walk, e)
 		for arg in e.args do res_expr(walk, arg)
 		res_expr(walk, e.filter)
 		for item in e.order_by do res_expr(walk, item.expr)
@@ -1051,4 +1052,36 @@ res_bind_column :: proc(walk: ^Res_Walk, column: Column_Expr, source: Res_Source
 		bindings.columns[local] = Column_Binding{ident = source.ident, from = u16(from), column = i32(position)}
 		return
 	}
+}
+
+// res_bind_call links a call to what it reaches (Call_Link), deciding once
+// what eval_call works out by name at every row: whether it aggregates, which
+// program's function answers before a builtin, and the builtin's dispatch name.
+// What is decided at run time instead (a virtual table's overload, which
+// depends on the first argument's table) is still checked there. A call that
+// eval_call takes elsewhere before its dispatch keeps no link.
+@(private)
+res_bind_call :: proc(walk: ^Res_Walk, e: Call_Expr) {
+	bindings := walk.bindings
+	if bindings == nil || e.id <= bindings.base do return
+	local := e.id - bindings.base
+	if local >= Node_Id(len(bindings.calls)) do return
+	if e.name == ROW_VALUE_CALL || e.name == RAISE_CALL || e.star do return
+	if e.filter != nil || len(e.order_by) > 0 || scalar_minmax(e) do return
+	if strings.equal_fold(e.name, "grouping") || strings.equal_fold(e.name, "grouping_id") do return
+	store := walk.tx.store
+	if builtin_aggregate_name(e.name) || store_has_aggregate(store, e.name) do return
+	link := Call_Link{kind = .Builtin}
+	if def, found, _ := store_function(store, e.name, len(e.args)); found && def.overrides {
+		link = Call_Link{kind = .Host, host = def}
+	} else if json_call_name(e.name) {
+		link.kind = .Json
+	} else if db_time_has_functions(e.name) {
+		link.kind = .Time
+	} else {
+		alloc := res_alloc(walk)
+		link.lowered = strings.to_lower(e.name, alloc)
+		link.dispatch = builtin_dispatch_name(link.lowered)
+	}
+	bindings.calls[local] = link
 }

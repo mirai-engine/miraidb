@@ -24,11 +24,41 @@ Column_Binding :: struct {
 	column: i32,
 }
 
+// Call_Kind is what a call reaches, decided by its resolution (A1.8d). .None
+// is no link: the call is found by its name when it runs, as before (an
+// aggregate, a min or max of several arguments, grouping, RAISE, a call with
+// FILTER or ORDER BY, a call outside a kept statement).
+Call_Kind :: enum u8 {
+	None,
+	// Host is a program's function registered to answer before a builtin of
+	// its name (Scalar_Function_Def.overrides), kept in the link.
+	Host,
+	Json,
+	Time,
+	// Builtin is one of the engine's scalar functions, or a name it does not
+	// have, which its dispatch hands to the program's functions at the end.
+	Builtin,
+}
+
+// Call_Link is the function a call reaches: its kind, and for a builtin the
+// name the dispatch switches on, lowered and with SQLite's other spellings
+// made the engine's (`lowered` is the name as written, lowered, for the words
+// of an error). The registry it was read from is part of the catalog: a
+// function registered or dropped moves the generation, so a link never
+// outlives the function it names.
+Call_Link :: struct {
+	kind:     Call_Kind,
+	lowered:  string,
+	dispatch: string,
+	host:     Scalar_Function_Def,
+}
+
 // Statement_Bindings are the links of one parsed query: `columns[id - base]`
-// for a node of its block (Node_Id).
+// and `calls[id - base]` for a node of its block (Node_Id).
 Statement_Bindings :: struct {
 	base:    Node_Id,
 	columns: []Column_Binding,
+	calls:   []Call_Link,
 }
 
 // statement_resolve checks the names `statement` uses (sql_resolve_names) and
@@ -64,8 +94,10 @@ statement_resolve :: proc(tx: ^Tx, statement: ^Statement, query: ^Query) -> Erro
 	if len(bindings.columns) != count {
 		bindings.base = query.node_base
 		bindings.columns = make([]Column_Binding, count, alloc)
+		bindings.calls = make([]Call_Link, count, alloc)
 	}
 	for &binding in bindings.columns do binding = Column_Binding{column = -1}
+	for &link in bindings.calls do link = {}
 	tx.bindings = bindings
 	err := sql_resolve_names(tx, statement, alloc, bindings)
 	// The catalog is read again after the walk: one that moved during it (an
@@ -111,4 +143,14 @@ statement_is_root :: proc(statement: ^Statement, query: ^Query) -> bool {
 	kind := reflect.union_variant_typeid(statement^)
 	if kind == nil || kind != reflect.union_variant_typeid(query.statement) do return false
 	return mem.compare_ptrs(statement, &query.statement, type_info_of(kind).size) == 0
+}
+
+// call_bound is the link of a call, when its resolution made one.
+call_bound :: #force_inline proc(ctx: ^Eval_Ctx, id: Node_Id) -> (^Call_Link, bool) {
+	bindings := ctx.bindings
+	if bindings == nil || id <= bindings.base do return nil, false
+	local := id - bindings.base
+	if local >= Node_Id(len(bindings.calls)) do return nil, false
+	link := &bindings.calls[local]
+	return link, link.kind != .None
 }
