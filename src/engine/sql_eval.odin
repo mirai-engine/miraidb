@@ -27,7 +27,10 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 			}
 		}
 	}
-	switch e in expr^ {
+	// By reference: the node copied into `e` on every evaluation was a few
+	// percent of a scan, and grew with every field a node kind gains. Nothing
+	// below writes through it.
+	switch &e in expr^ {
 	case Literal_Expr:
 		return e.value, ERROR_NONE
 	case Column_Expr:
