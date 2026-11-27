@@ -340,9 +340,10 @@ Index_Schema :: struct {
 	exprs:     []string,
 }
 
-// index_is_plain reports an index over plain columns with no WHERE: the only
-// kind the planner reads. A partial or expression index is maintained and
-// enforced, but a query never walks it.
+// index_is_plain reports an index over plain columns with no WHERE. A partial
+// or expression index is read only where plan_index.odin finds a query's terms
+// imply its WHERE or name its expression; ranges, ORDER BY and join probes read
+// plain indexes.
 index_is_plain :: proc(index: Index_Schema) -> bool {
 	return len(index.where_sql) == 0 && len(index.exprs) == 0
 }

@@ -163,6 +163,9 @@ candidates_from_range :: proc(
 	params: []Value,
 ) -> ([dynamic]Row_Id, bool) {
 	if companion == nil {
+		if table_index_part_expr(table, index_position, 0) != nil {
+			return candidates_from_expression(tx, expr, table, table_alias, index_position, params)
+		}
 		return candidates_from_conjunct(tx, expr, table, table_alias, index_position, params)
 	}
 	first, first_ok := range_key(tx, table, table_alias, expr, params)
@@ -535,17 +538,6 @@ comparison_sides :: proc(
 		return ref.table, ref.name, binary.left, true, true
 	}
 	return "", "", nil, false, false
-}
-
-@(private)
-index_for_single_column :: proc(table: ^Table, column: int) -> (int, bool) {
-	for index, i in table.indexes {
-		if !index_is_plain(index.schema) do continue
-		if len(index.schema.columns) == 1 && index.schema.columns[0] == column {
-			return i, true
-		}
-	}
-	return -1, false
 }
 
 // eval_constant evaluates an expression that does not depend on a row.

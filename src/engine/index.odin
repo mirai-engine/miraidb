@@ -988,6 +988,23 @@ table_largest_int_indexed :: proc(t: ^Table, column: int, skip: proc(id: Row_Id,
 
 // --- What the rest of the engine asks an index -------------------------------
 
+// table_index_where_expr is the parsed WHERE of the partial index at `index` of
+// `t`, nil for a full index. The planner reads it, and does not change it, to
+// see whether a query's terms imply it (plan_index.odin).
+table_index_where_expr :: proc(t: ^Table, index: int) -> ^Expr {
+	exprs := t.indexes[index].exprs
+	if exprs == nil do return nil
+	return exprs.where_expr
+}
+
+// table_index_part_expr is the parsed expression of key part `part` of the
+// index at `index` of `t`, nil for a part that is a plain column.
+table_index_part_expr :: proc(t: ^Table, index: int, part: int) -> ^Expr {
+	exprs := t.indexes[index].exprs
+	if exprs == nil || part >= len(exprs.parts) do return nil
+	return exprs.parts[part]
+}
+
 // table_index_int_key is the integer key the index at `index` of `t` files
 // `values` under, for an index that files integer keys (index_int_eligible);
 // false for any other index or value.

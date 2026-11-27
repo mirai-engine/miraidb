@@ -53,6 +53,7 @@ normative description of the invariants; the code follows it.
 | `tree_cache.odin` | The trees a statement reads beside its own (views, policies, trigger bodies), kept per catalog generation |
 | `resolve_counters.odin` | What a run still resolves (names, parses, plans, row counts), counted per thread for tests |
 | `plan.odin` | Join order and access paths |
+| `plan_index.odin` | When a partial or an expression index answers a term (D36) |
 | `stats.odin` | ANALYZE statistics and the estimates a plan reads |
 
 ### SQL execution

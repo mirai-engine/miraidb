@@ -34,6 +34,10 @@ import "core:mem"
 PLAN_PROBE :: 6.0      // one descent through an index tree
 PLAN_INDEX_ROW :: 4.5  // fetching one row through an id: read plus bookkeeping
 PLAN_SCAN_ROW :: 1.0   // reading one row of a scan and evaluating the filter
+// PLAN_EXPRESSION_ROWS is what an equality with an indexed expression keeps
+// when nothing measured the expression: ANALYZE measures columns. It is
+// SQLite's guess for an index sqlite_stat1 does not cover.
+PLAN_EXPRESSION_ROWS :: 10
 PLAN_JOIN_ROW :: 50.0  // one row a join step produces: ON again plus projection
 
 // Plan_Kind is how one relation is read.
@@ -90,10 +94,18 @@ plan_access :: proc(
 	defer delete(conjuncts)
 	split_and(predicate, &conjuncts)
 	for expr in conjuncts {
-		column_index, ok := plan_conjunct_column(table, ref, expr, bindings)
-		if !ok do continue
-		index_position, has_index := index_for_single_column(table, column_index)
-		if !has_index do continue
+		// A term over a column reads that column's index, a partial one included
+		// when the query implies its WHERE; an equality with an indexed
+		// expression reads that expression's (plan_index.odin).
+		index_position := -1
+		on_expression := false
+		if column_index, ok := plan_conjunct_column(table, ref, expr, bindings); ok {
+			index_position, _ = plan_index_for_column(table, ref, column_index, conjuncts[:])
+		}
+		if index_position < 0 {
+			index_position, on_expression = plan_expression_index(store, table, ref, expr, conjuncts[:], params)
+		}
+		if index_position < 0 do continue
 		// Without statistics every estimate is the full row count, so a probe
 		// would look as expensive as the scan it replaces and the engine would
 		// stop using indexes nobody measured. A table nobody ran ANALYZE on keeps
@@ -110,6 +122,7 @@ plan_access :: proc(
 		// What this index hands over, not what the whole predicate keeps: the
 		// filter that is left runs anyway.
 		kept := stats_estimate_rows(store, table, expr, params)
+		if on_expression do kept = min(kept, PLAN_EXPRESSION_ROWS)
 		companion: ^Expr = nil
 		if !is_equality(expr) {
 			if other, found := plan_range_companion(table, ref, expr, conjuncts[:]); found {
