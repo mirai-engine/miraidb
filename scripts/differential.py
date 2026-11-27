@@ -196,6 +196,15 @@ QUERIES = [
     # IN and BETWEEN compare under the left operand's collation.
     "SELECT id FROM emp WHERE name COLLATE NOCASE IN ('ANA', 'Zoe') ORDER BY id",
     "SELECT id FROM emp WHERE name COLLATE NOCASE BETWEEN 'L' AND 'MARIA' ORDER BY id",
+    # The planner reads a partial or expression index only where the query
+    # implies its WHERE (D36): zoe has no dept, and emp_lower_name misses her.
+    "SELECT id FROM emp WHERE lower(name) = 'ana' AND dept IS NOT NULL ORDER BY id",
+    "SELECT id FROM emp WHERE lower(name) = 'zoe' ORDER BY id",
+    "SELECT id FROM emp WHERE lower(name) = 'zoe' AND dept IS NOT NULL ORDER BY id",
+    "SELECT id FROM emp WHERE lower(name) = 'ana' AND dept = 2 ORDER BY id",
+    "SELECT count(*) FROM nums WHERE n = 2",
+    "SELECT count(*) FROM nums WHERE n = 2 AND m > 2",
+    "SELECT t FROM nums WHERE n = 3 AND m > 2",
     # NATURAL joins (S3): USING over the names both sides share.
     "SELECT emp.id FROM emp NATURAL JOIN dept ORDER BY 1",
     "SELECT * FROM emp NATURAL JOIN dept ORDER BY id",

@@ -93,6 +93,10 @@ def main() -> int:
             "CREATE INDEX ev_amount ON ev (amount)",
             "CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT)",
             "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER, code INTEGER)",
+            # A partial and an expression index (D36).
+            "CREATE TABLE tag (id INTEGER PRIMARY KEY, label TEXT, live INTEGER)",
+            "CREATE INDEX tag_live ON tag (label) WHERE live = 1",
+            "CREATE INDEX tag_lower ON tag (lower(label))",
         ]
         for i in range(EVENTS):
             fixture.append(f"INSERT INTO ev (id, kind, amount) VALUES ({i}, 'k{i % 2}', {i})")
@@ -102,6 +106,8 @@ def main() -> int:
             fixture.append(
                 f"INSERT INTO child (id, parent_id, code) VALUES ({i}, {i % 10}, {i % 10})"
             )
+        for i in range(EVENTS):
+            fixture.append(f"INSERT INTO tag (id, label, live) VALUES ({i}, 'T{i}', {i % 2})")
         fixture.append("ANALYZE")
         run_repl(args.bin, database, fixture)
 
@@ -191,6 +197,24 @@ def main() -> int:
             0 <= scanned <= 2,
             f"rows_scanned = {scanned}",
         )
+
+        # A partial index answers a query that implies its WHERE, and only such
+        # a query: without `live = 1` it misses rows, and the table is scanned.
+        partial = plan_line(
+            run_repl(args.bin, database, ["EXPLAIN SELECT * FROM tag WHERE label = 'T7' AND live = 1"]),
+            "scan tag",
+        )
+        check(checks, "a partial index answers what implies its WHERE", "using index tag_live" in partial, partial or "no plan")
+        unimplied = plan_line(
+            run_repl(args.bin, database, ["EXPLAIN SELECT * FROM tag WHERE label = 'T7'"]),
+            "scan tag",
+        )
+        check(checks, "a partial index is not read past its WHERE", "full scan" in unimplied, unimplied or "no plan")
+        expression = plan_line(
+            run_repl(args.bin, database, ["EXPLAIN SELECT * FROM tag WHERE lower(label) = 't7'"]),
+            "scan tag",
+        )
+        check(checks, "an expression index answers an equality with its expression", "using index tag_lower" in expression, expression or "no plan")
 
         # ANALYZE is what makes the estimates exist, and it is a cache: a table it
         # never measured keeps working (with the index, as before).
