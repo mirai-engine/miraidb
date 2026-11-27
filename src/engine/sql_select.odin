@@ -1706,9 +1706,7 @@ expand_projections :: proc(
 			for source, index in sources {
 				qualifier := len(source.alias) > 0 ? source.alias : source.table.schema.name
 				if len(star_qualifier) > 0 {
-					matches := strings.equal_fold(star_qualifier, source.table.schema.name) ||
-						(len(source.alias) > 0 && strings.equal_fold(star_qualifier, source.alias))
-					if !matches do continue
+					if !qualifier_names(star_qualifier, source.table.schema.name, source.alias) do continue
 				}
 				// A `JOIN ... USING (c)` merges c: the right side does not repeat
 				// it in `SELECT *`. A qualified `b.*` still lists every column of b.
@@ -2009,9 +2007,7 @@ outer_column :: proc(ctx: ^Eval_Ctx, name, table: string) -> (Value, bool) {
 		for source in frame.sources {
 			if source.table == nil do continue
 			if len(table) > 0 {
-				matches := strings.equal_fold(table, source.table.schema.name) ||
-					(len(source.alias) > 0 && strings.equal_fold(table, source.alias))
-				if !matches do continue
+				if !qualifier_names(table, source.table.schema.name, source.alias) do continue
 			} else if source.hidden_unqualified {
 				continue
 			}

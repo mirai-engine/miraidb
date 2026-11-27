@@ -11,6 +11,16 @@ Column_Memo :: struct {
 	index:  int,
 }
 
+// qualifier_names says whether a qualifier names a source: by its alias when it
+// has one, by its table's name otherwise. A table given an alias is known by
+// the alias alone, in SQLite and in PostgreSQL: `FROM q AS r` hides q, so a
+// subquery that reads q under another name still reaches the enclosing query's
+// q by that name. Every place that matches a qualifier asks this.
+qualifier_names :: proc(qualifier, name, alias: string) -> bool {
+	if len(alias) > 0 do return strings.equal_fold(qualifier, alias)
+	return strings.equal_fold(qualifier, name)
+}
+
 // single_source_column finds the column a reference names when the context has
 // one source, which is what a single-table statement evaluates its WHERE and
 // projection with: there is no ambiguity to settle and no USING to share, so
@@ -30,7 +40,7 @@ single_source_column :: proc(ctx: ^Eval_Ctx, key: ^Expr, column: Column_Expr) ->
 		if memo, found := ctx.column_memo[key]; found && memo.schema == schema do return source, memo.index, true
 	}
 	if len(column.table) > 0 {
-		matches := strings.equal_fold(column.table, schema.name) || (len(source.alias) > 0 && strings.equal_fold(column.table, source.alias))
+		matches := qualifier_names(column.table, schema.name, source.alias)
 		if !matches do return nil, -1, false
 	}
 	found: bool

@@ -484,7 +484,7 @@ res_item_name :: proc(item: Select_Item) -> string {
 
 @(private)
 res_source_named :: proc(source: Res_Source, name: string) -> bool {
-	return strings.equal_fold(name, source.name) || (len(source.alias) > 0 && strings.equal_fold(name, source.alias))
+	return qualifier_names(name, source.name, source.alias)
 }
 
 // res_star_ambiguous is SQLite's refusal of a bare `*` over one table named

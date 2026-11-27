@@ -1,7 +1,6 @@
 package engine
 
 import "core:mem"
-import "core:strings"
 
 // The planner prices the ways one table can be read and the order a join runs
 // in. It answers a question the executor already had to answer — index or scan,
@@ -276,8 +275,7 @@ plan_conjunct_column :: proc(table: ^Table, ref: Table_Ref, expr: ^Expr) -> (int
 @(private)
 plan_names_relation :: proc(qualifier: string, ref: Table_Ref) -> bool {
 	if len(qualifier) == 0 do return true
-	if strings.equal_fold(qualifier, ref.name) do return true
-	return len(ref.alias) > 0 && strings.equal_fold(qualifier, ref.alias)
+	return qualifier_names(qualifier, ref.name, ref.alias)
 }
 
 // --- Join order ------------------------------------------------------------

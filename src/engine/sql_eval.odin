@@ -71,9 +71,7 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 			for source in ctx.sources {
 				// A source the caller has not bound yet has no columns.
 				if source.table == nil do continue
-				matches := strings.equal_fold(e.table, source.table.schema.name) ||
-					(len(source.alias) > 0 && strings.equal_fold(e.table, source.alias))
-				if !matches do continue
+				if !qualifier_names(e.table, source.table.schema.name, source.alias) do continue
 				index, found := schema_column_index(&source.table.schema, e.name)
 				if !found {
 					// rank is a hidden column of a full-text table: it is the
@@ -1406,9 +1404,7 @@ column_collation :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (string, bool) {
 	}
 	for source in ctx.sources {
 		if len(column.table) > 0 {
-			matches := strings.equal_fold(column.table, source.table.schema.name) ||
-				(len(source.alias) > 0 && strings.equal_fold(column.table, source.alias))
-			if !matches do continue
+			if !qualifier_names(column.table, source.table.schema.name, source.alias) do continue
 		}
 		index, found := schema_column_index(&source.table.schema, column.name)
 		if !found do continue
@@ -1442,9 +1438,7 @@ column_affinity :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> Column_Affinity {
 	for source in ctx.sources {
 		if source.table == nil do continue
 		if len(column.table) > 0 {
-			matches := strings.equal_fold(column.table, source.table.schema.name) ||
-				(len(source.alias) > 0 && strings.equal_fold(column.table, source.alias))
-			if !matches do continue
+			if !qualifier_names(column.table, source.table.schema.name, source.alias) do continue
 		}
 		index, found := schema_column_index(&source.table.schema, column.name)
 		if !found do continue

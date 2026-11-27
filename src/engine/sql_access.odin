@@ -323,9 +323,7 @@ index_order_for :: proc(
 				matched = false
 				break
 			}
-			if len(reference.table) > 0 &&
-			   !strings.equal_fold(reference.table, table.schema.name) &&
-			   !(len(ref.alias) > 0 && strings.equal_fold(reference.table, ref.alias)) {
+			if len(reference.table) > 0 && !qualifier_names(reference.table, table.schema.name, ref.alias) {
 				matched = false
 				break
 			}
@@ -404,11 +402,7 @@ join_index_probe :: proc(
 		for side in sides {
 			reference, is_column := side[0]^.(Column_Expr)
 			if !is_column do continue
-			if len(reference.table) > 0 &&
-			   !strings.equal_fold(reference.table, table.schema.name) &&
-			   !(len(alias) > 0 && strings.equal_fold(reference.table, alias)) {
-				continue
-			}
+			if len(reference.table) > 0 && !qualifier_names(reference.table, table.schema.name, alias) do continue
 			column_index, found := schema_column_index(&table.schema, reference.name)
 			if !found do continue
 			for &index, i in table.indexes {
@@ -539,11 +533,7 @@ candidates_from_conjunct :: proc(
 	if is_between && !between.negated {
 		column, ok := between.operand^.(Column_Expr)
 		if !ok do return nil, false
-		if len(column.table) > 0 &&
-		   !strings.equal_fold(column.table, table.schema.name) &&
-		   !(len(table_alias) > 0 && strings.equal_fold(column.table, table_alias)) {
-			return nil, false
-		}
+		if len(column.table) > 0 && !qualifier_names(column.table, table.schema.name, table_alias) do return nil, false
 		column_index, found := schema_column_index(&table.schema, column.name)
 		if !found do return nil, false
 		low, low_ok := eval_constant(between.low, params)

@@ -131,9 +131,7 @@ describe_column_source :: proc(sources: []Source, column: Column_Expr) -> (Sourc
 	for source in sources {
 		if source.table == nil || source.hidden_unqualified && len(column.table) == 0 do continue
 		if len(column.table) > 0 {
-			qualified := strings.equal_fold(column.table, source.table.schema.name) ||
-				(len(source.alias) > 0 && strings.equal_fold(column.table, source.alias))
-			if !qualified do continue
+			if !qualifier_names(column.table, source.table.schema.name, source.alias) do continue
 		}
 		index, exists := schema_column_index(&source.table.schema, column.name)
 		if !exists do continue

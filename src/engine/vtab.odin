@@ -669,7 +669,7 @@ vtab_overload :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Scalar_Function, rawp
 		columns := source.table.schema.columns
 		// A materialized module table ends with its hidden rowid column.
 		if len(columns) == 0 || columns[len(columns) - 1].name != VTAB_ROWID_COLUMN do continue
-		if len(column.table) > 0 && !strings.equal_fold(column.table, source.table.schema.name) && !(len(source.alias) > 0 && strings.equal_fold(column.table, source.alias)) do continue
+		if len(column.table) > 0 && !qualifier_names(column.table, source.table.schema.name, source.alias) do continue
 		if _, found := schema_column_index(&source.table.schema, column.name); !found do continue
 		vtab, is_vtab, err := vtab_find(ctx.tx, source.table.schema.name)
 		error_drop(err)
