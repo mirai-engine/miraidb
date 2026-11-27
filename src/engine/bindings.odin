@@ -53,12 +53,44 @@ Call_Link :: struct {
 	host:     Scalar_Function_Def,
 }
 
-// Statement_Bindings are the links of one parsed query: `columns[id - base]`
-// and `calls[id - base]` for a node of its block (Node_Id).
+// Collation_Kind is the comparison a collation name stands for (collation_ref).
+Collation_Kind :: enum u8 {
+	Binary,
+	Nocase,
+	Rtrim,
+	Host,
+}
+
+// Collation_Ref is a decided collation: its kind, and a program's comparison.
+Collation_Ref :: struct {
+	kind: Collation_Kind,
+	host: Collation_Def,
+}
+
+// Compare_Link is what a comparison (=, <>, <, <=, >, >=, IS, IS NOT) works out
+// from its operands when its statement is resolved (A1.8e): the collation that
+// decides it and each side's affinity, which come from an explicit COLLATE and
+// from the declared type and collation of a column of the query's own
+// sources. Those columns are the ones its link names, and the run uses the
+// comparison's link only while theirs hold (compare_bound); otherwise it works
+// them out by name, as before.
+Compare_Link :: struct {
+	linked:         bool,
+	collation:      Collation_Ref,
+	left_affinity:  Column_Affinity,
+	right_affinity: Column_Affinity,
+	left_column:    Node_Id,
+	right_column:   Node_Id,
+}
+
+// Statement_Bindings are the links of one parsed query: `columns[id - base]`,
+// `calls[id - base]` and `compares[id - base]` for a node of its block
+// (Node_Id).
 Statement_Bindings :: struct {
-	base:    Node_Id,
-	columns: []Column_Binding,
-	calls:   []Call_Link,
+	base:     Node_Id,
+	columns:  []Column_Binding,
+	calls:    []Call_Link,
+	compares: []Compare_Link,
 }
 
 // statement_resolve checks the names `statement` uses (sql_resolve_names) and
@@ -95,9 +127,11 @@ statement_resolve :: proc(tx: ^Tx, statement: ^Statement, query: ^Query) -> Erro
 		bindings.base = query.node_base
 		bindings.columns = make([]Column_Binding, count, alloc)
 		bindings.calls = make([]Call_Link, count, alloc)
+		bindings.compares = make([]Compare_Link, count, alloc)
 	}
 	for &binding in bindings.columns do binding = Column_Binding{column = -1}
 	for &link in bindings.calls do link = {}
+	for &link in bindings.compares do link = {}
 	tx.bindings = bindings
 	err := sql_resolve_names(tx, statement, alloc, bindings)
 	// The catalog is read again after the walk: one that moved during it (an
@@ -153,4 +187,22 @@ call_bound :: #force_inline proc(ctx: ^Eval_Ctx, id: Node_Id) -> (^Call_Link, bo
 	if local >= Node_Id(len(bindings.calls)) do return nil, false
 	link := &bindings.calls[local]
 	return link, link.kind != .None
+}
+
+// compare_bound is the link of a comparison, when its resolution made one and
+// the column links it was made from hold for the context's sources.
+compare_bound :: #force_inline proc(ctx: ^Eval_Ctx, id: Node_Id) -> (^Compare_Link, bool) {
+	bindings := ctx.bindings
+	if bindings == nil || id <= bindings.base do return nil, false
+	local := id - bindings.base
+	if local >= Node_Id(len(bindings.compares)) do return nil, false
+	link := &bindings.compares[local]
+	if !link.linked do return nil, false
+	if link.left_column != 0 {
+		if _, _, held := column_bound(ctx, link.left_column); !held do return nil, false
+	}
+	if link.right_column != 0 {
+		if _, _, held := column_bound(ctx, link.right_column); !held do return nil, false
+	}
+	return link, true
 }

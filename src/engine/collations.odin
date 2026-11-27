@@ -2,6 +2,8 @@ package engine
 
 import "core:slice"
 import "core:strings"
+import "core:unicode"
+import "core:unicode/utf8"
 
 // A collation decides when two texts are equal and which one comes first. Three
 // are built in and they are the ones the engine can *fold*: BINARY compares bytes,
@@ -62,6 +64,7 @@ store_register_collation :: proc(
 	for stored, _ in store.collations {
 		if strings.equal_fold(stored, name) {
 			store.collations[stored] = Collation_Def{compare = compare, user = user}
+			store_catalog_changed(store)
 			return ERROR_NONE
 		}
 	}
@@ -69,6 +72,9 @@ store_register_collation :: proc(
 	key := strings.clone(lowercased)
 	if raw_data(lowercased) != raw_data(name) do delete(lowercased)
 	store.collations[key] = Collation_Def{compare = compare, user = user}
+	// A comparison is linked to its collation when its statement is resolved
+	// (Compare_Link): the registry is part of the catalog.
+	store_catalog_changed(store)
 	return ERROR_NONE
 }
 
@@ -86,6 +92,7 @@ store_unregister_collation :: proc(store: ^Store, name: string) -> bool {
 	if len(stored_key) == 0 do return false
 	map_erase(&store.collations, stored_key)
 	delete(stored_key)
+	store_catalog_changed(store)
 	return true
 }
 
@@ -364,4 +371,64 @@ collation_folds :: proc(store: ^Store, name: string) -> bool {
 	if store == nil || len(store.collations) == 0 do return true
 	for stored, _ in store.collations do if strings.equal_fold(stored, name) do return false
 	return true
+}
+
+// collation_ref is the comparison a collation name stands for, decided the way
+// collation_compare decides it at every call: a builtin name a program
+// replaced is the program's, then BINARY (or no name), NOCASE and RTRIM, then a
+// program's collation. False for a name nobody has, which is refused by name.
+collation_ref :: proc(store: ^Store, name: string) -> (Collation_Ref, bool) {
+	if len(name) > 0 && collation_is_builtin(name) && store != nil && len(store.collations) > 0 {
+		for stored, def in store.collations {
+			if strings.equal_fold(stored, name) do return Collation_Ref{kind = .Host, host = def}, true
+		}
+	}
+	if len(name) == 0 || strings.equal_fold(name, "binary") do return Collation_Ref{kind = .Binary}, true
+	if strings.equal_fold(name, "nocase") do return Collation_Ref{kind = .Nocase}, true
+	if strings.equal_fold(name, "rtrim") do return Collation_Ref{kind = .Rtrim}, true
+	if def, found := store_collation(store, name); found do return Collation_Ref{kind = .Host, host = def}, true
+	return {}, false
+}
+
+// collation_ref_compare is collation_compare through a decided collation.
+collation_ref_compare :: proc(ref: ^Collation_Ref, a, b: string) -> int {
+	switch ref.kind {
+	case .Binary:
+		return text_compare(a, b)
+	case .Nocase:
+		return nocase_compare(a, b)
+	case .Rtrim:
+		return text_compare(strings.trim_right(a, " "), strings.trim_right(b, " "))
+	case .Host:
+		return ref.host.compare(a, b, ref.host.user)
+	}
+	return text_compare(a, b)
+}
+
+// nocase_compare orders two texts as NOCASE does, the texts lowered and then
+// compared as bytes (collation_compare), without making the lowered copies: a
+// lowered character's UTF-8 orders as its code point, so comparing the lowered
+// characters one by one is comparing the lowered texts.
+nocase_compare :: proc(a, b: string) -> int {
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		x, y := a[i], b[j]
+		if x < 0x80 && y < 0x80 {
+			if x >= 'A' && x <= 'Z' do x += 'a' - 'A'
+			if y >= 'A' && y <= 'Z' do y += 'a' - 'A'
+			if x != y do return x < y ? -1 : 1
+			i += 1
+			j += 1
+			continue
+		}
+		r, rw := utf8.decode_rune_in_string(a[i:])
+		s, sw := utf8.decode_rune_in_string(b[j:])
+		r, s = unicode.to_lower(r), unicode.to_lower(s)
+		if r != s do return r < s ? -1 : 1
+		i += rw
+		j += sw
+	}
+	if i < len(a) do return 1
+	if j < len(b) do return -1
+	return 0
 }
