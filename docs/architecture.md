@@ -319,6 +319,19 @@ view's or a CTE's column, a hidden column, a column USING shares, a source not
 bound yet — has no link or fails the check and is looked up by name as
 before, so a link never answers another column's value.
 
+A kept tree is resolved once per catalog generation. What a resolution works out
+depends on the catalog alone, so `statement_resolve` keeps the statement as it
+left it (`Query.resolved`, with the generation it holds for), and a run at that
+generation takes it and the links instead of walking the tree again. A
+transaction records the generation it began at, read under the store's lock
+with its view of the catalog (`Tx.catalog_seen`). Its resolution holds for
+another run only while that is still the generation and it staged no change to
+the catalog itself (`tx_catalog_generation`). So a read that began before a
+change resolves for itself and leaves nothing kept, as does a transaction that
+ran DDL. Only the query's own statement is kept: a part of it that runs on its
+own, such as a write's body without its CTEs or the statement an attached
+database runs, is resolved at every run.
+
 A query binds sources: `Source` pairs a table with one of its rows and an
 optional alias. Single-table statements build a one-source context; a join
 builds one source per table. Column resolution searches the bound sources
