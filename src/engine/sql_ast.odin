@@ -351,6 +351,11 @@ Select_Stmt :: struct {
 	offset:      ^Expr,
 	// compound holds the UNION [ALL] terms that follow this select.
 	compound:    []Compound_Select,
+	// id is the select's number in its query's block (Node_Id; 0 for one the
+	// parser did not read): the rows of its sources are tagged with it when a
+	// query inside it reads them (Outer_Frame.scope), and its plan is kept by
+	// it for the statement (A1.8g).
+	id:          Node_Id,
 }
 
 // Compound_Op joins a term to everything before it, left to right.

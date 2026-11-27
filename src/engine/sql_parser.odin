@@ -975,6 +975,7 @@ parse_select :: proc(p: ^Parser, term := false) -> Statement {
 		// As in SQLite, a VALUES takes no ORDER BY or LIMIT of its own: only a
 		// compound term may follow it, and the last term's apply to the whole.
 		parse_select_tail(p, &select, clauses = false)
+		select.id = p_node_id(p)
 		return select
 	}
 	windows_mark := len(p.windows)
@@ -1114,6 +1115,7 @@ parse_select :: proc(p: ^Parser, term := false) -> Statement {
 	}
 	resize(&p.windows, windows_mark)
 	parse_select_tail(p, &select)
+	select.id = p_node_id(p)
 	return select
 }
 

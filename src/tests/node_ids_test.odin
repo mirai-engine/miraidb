@@ -5,7 +5,8 @@ import "core:testing"
 import db "../engine"
 
 // A resolved statement links a node by its number (A1.8): every node the
-// parser makes that a resolution links (a column, a call, a binary operator)
+// parser makes that a resolution links (a column, a call, a binary operator, a
+// select)
 // has a number of its own, from the query's block (node_base + 1 ..
 // node_base + node_count) with none missing, and no two queries share one.
 
@@ -17,6 +18,9 @@ Ni_Seen :: struct {
 
 @(private = "file")
 ni_select :: proc(seen: ^Ni_Seen, select: ^db.Select_Stmt) {
+	// A select is numbered too: its rows are tagged with it (A1.8g).
+	seen.nodes += 1
+	seen.ids[select.id] += 1
 	for item in select.projections do ni_expr(seen, item.expr)
 	for join in select.joins do ni_expr(seen, join.on)
 	ni_expr(seen, select.where_clause)
@@ -74,6 +78,6 @@ test_the_parser_numbers_the_nodes_a_resolution_links :: proc(t: ^testing.T) {
 	other, other_err := db.sql_parse("SELECT y FROM a")
 	if !testing.expect(t, db.error_ok(other_err)) do return
 	defer db.query_destroy(&other)
-	testing.expect_value(t, other.node_count, db.Node_Id(1))
+	testing.expect_value(t, other.node_count, db.Node_Id(2))
 	testing.expect(t, other.node_base >= query.node_base + db.NODE_BLOCK || other.node_base + db.NODE_BLOCK <= query.node_base)
 }
