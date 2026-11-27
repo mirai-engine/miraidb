@@ -442,6 +442,13 @@ The engine never reads the clock while encoding state or applying operations.
 `now()` in SQL and `Reducer_Ctx.now_us` read the host clock, which tests can
 override. Replaying the same log always produces the same state.
 
+A statement reads the clock once (`statement_now`, kept in
+`Tx.statement_now_us`): `now()`, the date functions' `'now'`, a column's
+`DEFAULT` and the triggers the statement fires all see that instant, as SQLite
+fixes the time per statement. The next statement, in the same transaction or
+not, has its own. Every evaluation context is made by `eval_context`, which
+takes the time from there; contexts made per row used to read the clock each.
+
 ## Virtual file system
 
 The commit log never touches `core:os` directly. Every read, append, rewind,
