@@ -261,6 +261,9 @@ def build_gates(args: argparse.Namespace) -> list[Gate]:
     gates.append(Gate("function table", [sys.executable, "scripts/function_table.py", "--check"]))
     gates.append(Gate("documentation consistency", [sys.executable, "scripts/docs_check.py"]))
     gates.append(Gate("roadmap is consistent", [sys.executable, "scripts/roadmap.py", "--check"]))
+    # An index is one structure behind its contract (A2): what reaches into one
+    # from outside its module is counted, and may only go down.
+    gates.append(Gate("index boundary", [sys.executable, "scripts/index_boundary.py"]))
     return gates
 
 
