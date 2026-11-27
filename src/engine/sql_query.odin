@@ -84,6 +84,24 @@ Outer_Frame :: struct {
 	next:    ^Outer_Frame,
 }
 
+// eval_context is how every evaluation context is made: it is given the
+// fields its caller sets and takes the time from the statement, so one
+// statement has one now however many contexts it makes (one per row in some
+// paths). It is the one place that builds an Eval_Ctx.
+eval_context :: proc(fields: Eval_Ctx) -> Eval_Ctx {
+	ctx := fields
+	ctx.now_us = statement_now(fields.tx)
+	return ctx
+}
+
+// statement_now is the time of the statement `tx` runs: read once, then kept.
+// Without a transaction (an index's expression, a SET) it is the clock's.
+statement_now :: proc(tx: ^Tx) -> i64 {
+	if tx == nil do return now_microseconds()
+	if tx.statement_now_us == 0 do tx.statement_now_us = now_microseconds()
+	return tx.statement_now_us
+}
+
 Eval_Ctx :: struct {
 	// column_memo remembers, for a column reference, which column of the one
 	// source it names (single_source_column), so a row does not look the name
@@ -596,7 +614,7 @@ tx_materialize_recursive_cte :: proc(tx: ^Tx, cte: Cte, params: []Value) -> (^Ta
 	base.offset = nil
 	union_all := parts[0].op == .Union_All || parts[0].all
 	limit, offset := -1, 0
-	ctx := Eval_Ctx{tx = tx, params = params}
+	ctx := eval_context(Eval_Ctx{tx = tx, params = params})
 	if limit_expr != nil {
 		value, value_err := eval_expr(&ctx, limit_expr)
 		if value_err.kind != .None do return nil, value_err

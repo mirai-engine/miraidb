@@ -463,8 +463,15 @@ statement_shortfall :: proc() -> Error {
 sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value, names: mem.Allocator = {}) -> (Sql_Result, Error) {
 	if !oom_settle() do return {}, oom_error()
 	if refusal := store_refusal(tx.store); refusal.kind != .None do return {}, refusal
-	// A statement a trigger runs leaves the failure to the one that fired it.
-	if tx.trigger_depth == 0 do page_failure_clear()
+	// A statement a trigger runs leaves the failure to the one that fired it,
+	// and keeps its time; any other has its own, and gives the time of the one
+	// it ran inside back to it.
+	outer_now := tx.statement_now_us
+	defer tx.statement_now_us = outer_now
+	if tx.trigger_depth == 0 {
+		page_failure_clear()
+		tx.statement_now_us = 0
+	}
 	previous := aggregate_scope_enter(tx.store)
 	defer aggregate_scope_leave(previous)
 	switch stmt in statement {
@@ -1222,10 +1229,8 @@ sql_exec_set :: proc(store: ^Store, stmt: Set_Stmt, params: []Value, locked := f
 		sync.lock(&store.mutex)
 		defer sync.unlock(&store.mutex)
 	}
-	value, eval_err := eval_expr(
-		&Eval_Ctx{params = params, now_us = now_microseconds()},
-		stmt.value,
-	)
+	set_ctx := eval_context(Eval_Ctx{params = params})
+	value, eval_err := eval_expr(&set_ctx, stmt.value)
 	if eval_err.kind != .None do return {}, eval_err
 	if strings.equal_fold(stmt.name, "identity") {
 		// A client is the identity its token proved; naming another is the host's.

@@ -133,13 +133,13 @@ eval_call_body :: proc(ctx: ^Eval_Ctx, call: Call_Expr, args: []Value, outer: me
 			if args[0].kind != .String {
 				return {}, errf(.Invalid_Type, "strftime() expects a text format")
 			}
-			moment, ok := db_time_parse(args[1:])
+			moment, ok := db_time_parse(args[1:], ctx.now_us)
 			if !ok do return value_null(), ERROR_NONE
 			text, known := db_time_strftime(args[0].s, moment)
 			if !known do return value_null(), ERROR_NONE
 			return value_string(text), ERROR_NONE
 		}
-		value, _ := db_time_call(call.name, args[:])
+		value, _ := db_time_call(call.name, args[:], ctx.now_us)
 		return value, ERROR_NONE
 	}
 	lowered := strings.to_lower(call.name)
@@ -457,8 +457,8 @@ eval_call_body :: proc(ctx: ^Eval_Ctx, call: Call_Expr, args: []Value, outer: me
 		// The difference as a signed calendar span, which is the form SQLite
 		// answers: +YYYY-MM-DD HH:MM:SS.SSS.
 		if len(args) != 2 do return {}, errf(.Invalid_Argument, "timediff() takes two times")
-		first, first_ok := db_time_parse(args[0:1])
-		second, second_ok := db_time_parse(args[1:2])
+		first, first_ok := db_time_parse(args[0:1], ctx.now_us)
+		second, second_ok := db_time_parse(args[1:2], ctx.now_us)
 		if !first_ok || !second_ok do return value_null(), ERROR_NONE
 		return value_string(timediff_text(first, second)), ERROR_NONE
 	case "soundex":

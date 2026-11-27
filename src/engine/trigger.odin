@@ -294,7 +294,7 @@ trigger_fire :: proc(
 				return condition_err
 			}
 			if replayed do auth_replay_condition(tx, name, &condition, &condition_expr)
-			eval_ctx := Eval_Ctx{tx = tx}
+			eval_ctx := eval_context(Eval_Ctx{tx = tx})
 			value, value_err := eval_expr(&eval_ctx, condition_expr)
 			query_destroy(&condition)
 			if value_err.kind != .None {

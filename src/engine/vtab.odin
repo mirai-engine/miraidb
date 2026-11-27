@@ -419,7 +419,7 @@ vtab_write :: proc(tx: ^Tx, vtab: ^Vtab, statement: Statement, params: []Value) 
 			rows = selected.rows
 		} else {
 			evaluated := make([][]Value, len(s.rows), tx.alloc)
-			ctx := Eval_Ctx{tx = tx, params = params, now_us = now_microseconds()}
+			ctx := eval_context(Eval_Ctx{tx = tx, params = params})
 			for row, i in s.rows {
 				evaluated[i] = make([]Value, len(row), tx.alloc)
 				for expr, j in row {
@@ -568,7 +568,7 @@ vtab_where_terms :: proc(tx: ^Tx, vtab: ^Vtab, constraints: ^[dynamic]Vtab_Const
 			// A column of a table bound before this one, or of the query around
 			// it, is a constant for this scan.
 			if names_vtab(tx, vtab, c.table) && (len(c.table) > 0 || vtab_has_column(vtab, c.name)) do continue
-			ctx := Eval_Ctx{tx = tx, params = tx.vtab_params, sources = tx.vtab_sources, outer = tx.outer, now_us = now_microseconds()}
+			ctx := eval_context(Eval_Ctx{tx = tx, params = tx.vtab_params, sources = tx.vtab_sources, outer = tx.outer})
 			value, eval_err := eval_expr(&ctx, constant_side)
 			if eval_err.kind != .None {
 				error_free(&eval_err)

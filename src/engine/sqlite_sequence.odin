@@ -138,7 +138,7 @@ store_apply_sequence :: proc(store: ^Store, values: []Value) {
 sqlite_sequence_write :: proc(tx: ^Tx, statement: Statement, params: []Value) -> (Sql_Result, Error) {
 	view, view_err := tx_materialize_sqlite_sequence(tx, "sqlite_sequence")
 	if view_err.kind != .None do return {}, view_err
-	ctx := Eval_Ctx{tx = tx, params = params, now_us = now_microseconds()}
+	ctx := eval_context(Eval_Ctx{tx = tx, params = params})
 	affected := 0
 	#partial switch s in statement {
 	case Insert_Stmt:

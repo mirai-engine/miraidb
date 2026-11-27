@@ -301,7 +301,7 @@ index_eval :: proc(t: ^Table, exprs: ^Index_Exprs, expr: ^Expr, values: []Value)
 	// keeps that scope, tx_commit): without them a call to one answered NULL
 	// for every row, its index held NULL keys, a UNIQUE one enforced nothing,
 	// and SQLite found the file's index missing every row (D24).
-	ctx := Eval_Ctx{sources = sources[:], index_store = statement_store()}
+	ctx := eval_context(Eval_Ctx{sources = sources[:], index_store = statement_store()})
 	context.allocator = arena_allocator_guarded(&exprs.scratch)
 	value, err := eval_expr(&ctx, expr)
 	if err.kind != .None {
@@ -436,7 +436,7 @@ index_validate_row :: proc(tx: ^Tx, t: ^Table, values: []Value) -> Error {
 		if index.exprs == nil do continue
 		sources: [1]Source
 		sources[0] = Source{table = t, row = Row{values = values}}
-		ctx := Eval_Ctx{tx = tx, sources = sources[:]}
+		ctx := eval_context(Eval_Ctx{tx = tx, sources = sources[:]})
 		if index.exprs.where_expr != nil {
 			if _, err := eval_expr(&ctx, index.exprs.where_expr); err.kind != .None do return err
 		}

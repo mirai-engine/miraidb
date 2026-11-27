@@ -52,7 +52,7 @@ view_write :: proc(tx: ^Tx, name: string, statement: Statement, params: []Value)
 	if view_err.kind != .None do return {}, view_err
 	schema := view.schema
 	width := len(schema.columns)
-	ctx := Eval_Ctx{tx = tx, params = params, now_us = now_microseconds()}
+	ctx := eval_context(Eval_Ctx{tx = tx, params = params})
 	result := Sql_Result{kind = .Affected}
 	returned := make([dynamic][]Value, 0, 4)
 	returning: ^Returning

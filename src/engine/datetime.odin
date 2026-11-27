@@ -17,14 +17,16 @@ Db_Time :: struct {
 	jd: f64,
 }
 
-db_time_now :: proc() -> Db_Time {
-	return Db_Time{jd = JD_UNIX_EPOCH + f64(now_microseconds()) / (SECONDS_PER_DAY * 1e6)}
+// db_time_now is the instant `now_us` (microseconds since the epoch) names:
+// the statement's time, so 'now' is one instant in a statement, as in SQLite.
+db_time_now :: proc(now_us: i64) -> Db_Time {
+	return Db_Time{jd = JD_UNIX_EPOCH + f64(now_us) / (SECONDS_PER_DAY * 1e6)}
 }
 
 // db_time_parse reads the first argument of a date function (text, a Julian day
 // or 'now') and applies the modifiers that follow. It reports whether a usable
 // instant came out; a NULL or unparsable input yields false, as in SQLite.
-db_time_parse :: proc(args: []Value) -> (Db_Time, bool) {
+db_time_parse :: proc(args: []Value, now_us: i64) -> (Db_Time, bool) {
 	if len(args) == 0 do return {}, false
 	input := args[0]
 	#partial switch input.kind {
@@ -44,7 +46,7 @@ db_time_parse :: proc(args: []Value) -> (Db_Time, bool) {
 	case .String:
 		text := strings.trim_space(input.s)
 		if strings.equal_fold(text, "now") {
-			moment = db_time_now()
+			moment = db_time_now(now_us)
 			parsed = true
 		} else if db_time_parse_text(text, &moment) {
 			parsed = true
@@ -446,8 +448,8 @@ db_time_space_pad :: proc(builder: ^strings.Builder, n: int) {
 
 // datetime_call evaluates the date and time functions. It returns a NULL value
 // with ok = false when the input cannot be understood.
-db_time_call :: proc(name: string, args: []Value) -> (Value, bool) {
-	moment, ok := db_time_parse(args)
+db_time_call :: proc(name: string, args: []Value, now_us: i64) -> (Value, bool) {
+	moment, ok := db_time_parse(args, now_us)
 	if !ok do return value_null(), false
 	switch {
 	case strings.equal_fold(name, "date"):

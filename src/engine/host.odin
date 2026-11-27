@@ -943,10 +943,9 @@ host_project_sources :: proc(
 	expanded: []^Expr,
 	sources: []Source,
 ) -> (values: []Value, matched: bool, err: Error) {
-	ctx := Eval_Ctx {
+	ctx := eval_context(Eval_Ctx {
 		tx     = tx,
-		now_us = now_microseconds(),
-	}
+	})
 	ctx.sources = sources
 	if stmt.where_clause != nil {
 		value, eval_err := eval_expr(&ctx, stmt.where_clause)
@@ -1044,10 +1043,9 @@ host_join_level_probe :: proc(walk: ^Join_Walk, level: int) -> (Join_Probe, bool
 @(private)
 host_join_walk_probe :: proc(walk: ^Join_Walk, level: int, probe: Join_Probe) -> bool {
 	table := walk.tables[level]
-	ctx := Eval_Ctx {
+	ctx := eval_context(Eval_Ctx {
 		tx     = walk.tx,
-		now_us = now_microseconds(),
-	}
+	})
 	ctx.sources = walk.sources
 	value, eval_err := eval_expr(&ctx, probe.left)
 	if eval_err.kind != .None {
@@ -1075,10 +1073,9 @@ host_join_walk_probe :: proc(walk: ^Join_Walk, level: int, probe: Join_Probe) ->
 // it when it matches the WHERE and the projection.
 @(private)
 host_join_emit :: proc(walk: ^Join_Walk) -> bool {
-	ctx := Eval_Ctx {
+	ctx := eval_context(Eval_Ctx {
 		tx     = walk.tx,
-		now_us = now_microseconds(),
-	}
+	})
 	ctx.sources = walk.sources
 	for join in walk.stmt.joins {
 		if join.on == nil do continue
@@ -1131,10 +1128,9 @@ host_agg_shaped :: proc(entry: ^Subscription_Query) -> bool {
 @(private)
 host_agg_key :: proc(tx: ^Tx, stmt: Select_Stmt, source: Source) -> (key: string, ok: bool) {
 	if len(stmt.group_by) == 0 do return "", true
-	ctx := Eval_Ctx {
+	ctx := eval_context(Eval_Ctx {
 		tx     = tx,
-		now_us = now_microseconds(),
-	}
+	})
 	ctx.sources = []Source{source}
 	w: Byte_Writer
 	bw_init(&w)
@@ -1154,10 +1150,9 @@ host_agg_key :: proc(tx: ^Tx, stmt: Select_Stmt, source: Source) -> (key: string
 @(private)
 host_agg_matches :: proc(tx: ^Tx, stmt: Select_Stmt, source: Source) -> bool {
 	if stmt.where_clause == nil do return true
-	ctx := Eval_Ctx {
+	ctx := eval_context(Eval_Ctx {
 		tx     = tx,
-		now_us = now_microseconds(),
-	}
+	})
 	ctx.sources = []Source{source}
 	value, eval_err := eval_expr(&ctx, stmt.where_clause)
 	if eval_err.kind != .None {
@@ -1176,10 +1171,9 @@ host_agg_values :: proc(
 	expanded: []^Expr,
 	group: [][]Source,
 ) -> (values: []Value, ok: bool) {
-	ctx := Eval_Ctx {
+	ctx := eval_context(Eval_Ctx {
 		tx     = tx,
-		now_us = now_microseconds(),
-	}
+	})
 	ctx.group = group
 	ctx.grouped = true
 	if len(group) > 0 do ctx.sources = group[0]
@@ -1920,10 +1914,9 @@ host_project_row :: proc(
 ) -> (values: []Value, matched: bool, err: Error) {
 	table, table_err := tx_table(tx, stmt.from.name)
 	if table_err.kind != .None do return nil, false, table_err
-	ctx := Eval_Ctx {
+	ctx := eval_context(Eval_Ctx {
 		tx     = tx,
-		now_us = now_microseconds(),
-	}
+	})
 	source := Source{table = table, row = row, alias = stmt.from.alias}
 	ctx.sources = []Source{source}
 	if stmt.where_clause != nil {

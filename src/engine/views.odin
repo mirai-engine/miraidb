@@ -214,7 +214,7 @@ view_args :: proc(
 ) -> ([]Value, Error) {
 	if len(ref.args) == 0 do return nil, ERROR_NONE
 	// A correlated subquery's arguments may read the row of the query around it.
-	ctx := Eval_Ctx{tx = tx, params = params, sources = sources, now_us = now_microseconds(), outer = tx.outer}
+	ctx := eval_context(Eval_Ctx{tx = tx, params = params, sources = sources, outer = tx.outer})
 	// The values live as long as the statement's transaction: the reference
 	// they are for is read within it.
 	out := make([]Value, len(ref.args), tx.alloc)

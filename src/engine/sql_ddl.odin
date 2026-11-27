@@ -216,10 +216,8 @@ sql_exec_create_table :: proc(tx: ^Tx, stmt: Create_Table_Stmt, params: []Value)
 			query_destroy(&check_query)
 			column.default_sql = strings.clone(definition.default_sql, tx.alloc)
 		} else if definition.default != nil {
-			value, eval_err := eval_expr(
-				&Eval_Ctx{params = params, now_us = now_microseconds()},
-				definition.default,
-			)
+			default_ctx := eval_context(Eval_Ctx{tx = tx, params = params})
+			value, eval_err := eval_expr(&default_ctx, definition.default)
 			if eval_err.kind != .None do return {}, eval_err
 			coerced, coerce_err := value_coerce(value, column.type)
 			if coerce_err.kind != .None do return {}, coerce_err

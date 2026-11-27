@@ -130,7 +130,7 @@ returning_append :: proc(
 	if prepare_err := returning_prepare(result, returning, table); prepare_err.kind != .None do return prepare_err
 	values := make([dynamic]Value, 0, len(result.columns))
 	sources := [1]Source{Source{table = table, row = row}}
-	ctx := Eval_Ctx{tx = tx, sources = sources[:], now_us = now_microseconds()}
+	ctx := eval_context(Eval_Ctx{tx = tx, sources = sources[:]})
 	for item in returning.items {
 		if item.star {
 			for column in 0 ..< len(table.schema.columns) {
@@ -263,11 +263,10 @@ sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Res
 			positions[i] = index
 		}
 	}
-	ctx := Eval_Ctx {
+	ctx := eval_context(Eval_Ctx {
 		tx     = tx,
 		params = params,
-		now_us = now_microseconds(),
-	}
+	})
 	policies, policy_err := policy_load(tx, stmt.table)
 	if policy_err.kind != .None do return {}, policy_err
 	defer policy_set_destroy(&policies)
@@ -559,11 +558,10 @@ sql_exec_merge :: proc(tx: ^Tx, stmt: Merge_Stmt, params: []Value) -> (Sql_Resul
 	} else if collect_err := tx_collect(tx, stmt.source, &source_rows); collect_err.kind != .None {
 		return {}, collect_err
 	}
-	ctx := Eval_Ctx {
+	ctx := eval_context(Eval_Ctx {
 		tx     = tx,
 		params = params,
-		now_us = now_microseconds(),
-	}
+	})
 	policies, policy_err := policy_load(tx, stmt.target)
 	if policy_err.kind != .None do return {}, policy_err
 	defer policy_set_destroy(&policies)
@@ -797,7 +795,7 @@ sql_exec_update :: proc(tx: ^Tx, stmt: Update_Stmt, params: []Value) -> (Sql_Res
 			return {}, collect_join_err
 		}
 	}
-	ctx := Eval_Ctx{tx = tx, params = params, now_us = now_microseconds(), column_memo = column_memo_make(tx)}
+	ctx := eval_context(Eval_Ctx{tx = tx, params = params, column_memo = column_memo_make(tx)})
 	policies, policy_err := policy_load(tx, stmt.table)
 	if policy_err.kind != .None do return {}, policy_err
 	defer policy_set_destroy(&policies)
@@ -977,7 +975,7 @@ sql_exec_delete :: proc(tx: ^Tx, stmt: Delete_Stmt, params: []Value) -> (Sql_Res
 			return {}, collect_using_err
 		}
 	}
-	ctx := Eval_Ctx{tx = tx, params = params, now_us = now_microseconds(), column_memo = column_memo_make(tx)}
+	ctx := eval_context(Eval_Ctx{tx = tx, params = params, column_memo = column_memo_make(tx)})
 	policies, policy_err := policy_load(tx, stmt.table)
 	if policy_err.kind != .None do return {}, policy_err
 	defer policy_set_destroy(&policies)
@@ -1112,7 +1110,7 @@ checks_enforce :: proc(tx: ^Tx, table: ^Table, values: []Value) -> Error {
 	if len(table.schema.checks) == 0 do return ERROR_NONE
 	sources: [1]Source
 	sources[0] = Source{table = table, row = Row{values = values}}
-	ctx := Eval_Ctx{tx = tx, sources = sources[:], now_us = now_microseconds()}
+	ctx := eval_context(Eval_Ctx{tx = tx, sources = sources[:]})
 	for check in table.schema.checks {
 		expr, parse_err := store_expression(tx.store, check.sql)
 		if parse_err.kind != .None do return parse_err
@@ -1160,7 +1158,7 @@ column_default_for_row :: proc(tx: ^Tx, column: Column) -> (Value, Error) {
 	if len(column.default_sql) == 0 do return column_default(column), ERROR_NONE
 	expr, parse_err := store_expression(tx.store, column.default_sql)
 	if parse_err.kind != .None do return {}, parse_err
-	ctx := Eval_Ctx{tx = tx, now_us = now_microseconds()}
+	ctx := eval_context(Eval_Ctx{tx = tx})
 	value, eval_err := eval_expr(&ctx, expr)
 	if eval_err.kind != .None do return {}, eval_err
 	return value_clone(value, tx.alloc), ERROR_NONE

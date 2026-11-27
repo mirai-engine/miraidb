@@ -1117,7 +1117,7 @@ pragma_arg_term :: proc(tx: ^Tx, name, column: string) -> (Value, bool) {
 			if !is_column || !strings.equal_fold(reference.name, column) || !names_it(tx, name, reference.table) do continue
 			// The value may not read the function's own row.
 			if other_column, other_is_column := other^.(Column_Expr); other_is_column && names_it(tx, name, other_column.table) && len(other_column.table) > 0 do continue
-			ctx := Eval_Ctx{tx = tx, params = tx.vtab_params, sources = tx.vtab_sources, outer = tx.outer, now_us = now_microseconds()}
+			ctx := eval_context(Eval_Ctx{tx = tx, params = tx.vtab_params, sources = tx.vtab_sources, outer = tx.outer})
 			value, eval_err := eval_expr(&ctx, other)
 			if eval_err.kind != .None {
 				error_free(&eval_err)

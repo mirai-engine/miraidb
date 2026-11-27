@@ -229,13 +229,12 @@ stream_row_visit :: proc(raw: rawptr, row: Row) -> bool {
 	// arena would make a streamed scan cost the table again in memory.
 	one: [1]Source
 	one[0] = Source{table = scan.base, row = row, alias = scan.alias}
-	ctx := Eval_Ctx {
+	ctx := eval_context(Eval_Ctx {
 		tx          = scan.tx,
 		sources     = one[:],
 		params      = scan.params,
-		now_us      = scan.now_us,
 		column_memo = scan.column_memo,
-	}
+	})
 	for &set in scan.policies^ {
 		allowed, policy_err := policy_allows(&set, &ctx, false)
 		if policy_err.kind != .None {
@@ -383,7 +382,7 @@ sql_exec_stream_select :: proc(
 		return {}, false, ERROR_NONE
 	}
 
-	now_us := now_microseconds()
+	now_us := statement_now(tx)
 	statement := stmt
 	stream := Agg_Stream{}
 	defer agg_stream_destroy(&stream)
@@ -437,14 +436,16 @@ sql_exec_stream_select :: proc(
 	limit := -1
 	offset := 0
 	if stmt.offset != nil {
-		value, value_err := eval_expr(&Eval_Ctx{tx = tx, params = params, now_us = now_us}, stmt.offset)
+		offset_ctx := eval_context(Eval_Ctx{tx = tx, params = params})
+		value, value_err := eval_expr(&offset_ctx, stmt.offset)
 		if value_err.kind != .None do return {}, false, value_err
 		parsed, ok := value_to_i64(value)
 		if !ok || parsed < 0 do return {}, false, errf(.Invalid_Argument, "OFFSET must be a non-negative integer")
 		offset = int(parsed)
 	}
 	if stmt.limit != nil {
-		value, value_err := eval_expr(&Eval_Ctx{tx = tx, params = params, now_us = now_us}, stmt.limit)
+		limit_ctx := eval_context(Eval_Ctx{tx = tx, params = params})
+		value, value_err := eval_expr(&limit_ctx, stmt.limit)
 		if value_err.kind != .None do return {}, false, value_err
 		parsed, ok := value_to_i64(value)
 		if !ok || parsed < 0 do return {}, false, errf(.Invalid_Argument, "LIMIT must be a non-negative integer")
@@ -490,7 +491,7 @@ sql_exec_stream_select :: proc(
 	// One aggregate row is still subject to OFFSET and LIMIT, the same way the
 	// materializing path cuts the single row it built.
 	if aggregate && offset == 0 && limit != 0 {
-		final := Eval_Ctx{tx = tx, params = params, now_us = now_us, stream = &stream}
+		final := eval_context(Eval_Ctx{tx = tx, params = params, stream = &stream})
 		if stream.have_first {
 			final.sources = make([]Source, 1, tx.alloc)
 			final.sources[0] = Source {
@@ -602,13 +603,12 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		base_is_view = source_view
 	}
 	if system_name do base = &synthetic
-	ctx := Eval_Ctx {
+	ctx := eval_context(Eval_Ctx {
 		tx          = tx,
 		params      = params,
-		now_us      = now_microseconds(),
 		outer       = tx.outer,
 		column_memo = column_memo_make(tx),
-	}
+	})
 	for join in stmt.joins {
 		if len(join.using_columns) == 0 do continue
 		shared := make([dynamic]string, 0, len(ctx.using_names) + len(join.using_columns), tx.alloc)

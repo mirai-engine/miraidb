@@ -130,6 +130,11 @@ Tx :: struct {
 	trigger_new_present: bool,
 	trigger_old_present: bool,
 	trigger_depth:       int,
+	// statement_now_us is the time of the statement running in the
+	// transaction, read from the clock once, at its first use
+	// (statement_now): every row, default and trigger of one statement sees
+	// the same now, as in SQLite. Zero until a statement asks for it.
+	statement_now_us:    i64,
 	// no_triggers loads rows that another connection already wrote (catching up
 	// with a shared SQLite file): its triggers ran there, and must not run twice.
 	no_triggers:         bool,
