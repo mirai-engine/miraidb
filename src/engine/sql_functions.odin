@@ -73,6 +73,7 @@ eval_call :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 // overload depends on the first argument's table and is checked as before.
 @(private)
 eval_call_linked :: proc(ctx: ^Eval_Ctx, call: Call_Expr, link: ^Call_Link) -> (Value, Error) {
+	if link.kind == .Aggregate do return eval_aggregate_linked(ctx, call, link)
 	CALL_ARGS_INLINE :: 8
 	inline: [CALL_ARGS_INLINE]Value
 	args: []Value
@@ -102,6 +103,22 @@ eval_call_linked :: proc(ctx: ^Eval_Ctx, call: Call_Expr, link: ^Call_Link) -> (
 	return value, err
 }
 
+// eval_aggregate_linked runs one of the engine's aggregates by the name its
+// link lowered, its answer in the statement's memory as eval_call keeps it.
+@(private)
+eval_aggregate_linked :: proc(ctx: ^Eval_Ctx, call: Call_Expr, link: ^Call_Link) -> (Value, Error) {
+	if ctx.tx == nil do return eval_aggregate_named(ctx, call, link.lowered, true)
+	outer := context.allocator
+	value: Value
+	err: Error
+	{
+		context.allocator = ctx.tx.alloc
+		value, err = eval_aggregate_named(ctx, call, link.lowered, true)
+	}
+	if len(err.message) > 0 do err.message = strings.clone(err.message, outer)
+	return value, err
+}
+
 @(private)
 eval_call_link_body :: proc(ctx: ^Eval_Ctx, call: Call_Expr, link: ^Call_Link, args: []Value, outer: mem.Allocator) -> (Value, Error) {
 	if ctx.tx != nil && ctx.tx.store != nil && len(ctx.tx.store.vtab_modules) > 0 && len(call.args) > 0 {
@@ -118,7 +135,8 @@ eval_call_link_body :: proc(ctx: ^Eval_Ctx, call: Call_Expr, link: ^Call_Link, a
 		return eval_call_time(ctx, call, args)
 	case .Builtin:
 		return eval_call_builtin(ctx, call, link.lowered, link.dispatch, args, outer)
-	case .None:
+	case .None, .Aggregate:
+		// An aggregate's link is run before its arguments (eval_aggregate_linked).
 	}
 	return {}, errf(.Internal, "call %s has no link", call.name)
 }
@@ -983,6 +1001,16 @@ eval_scalar_minmax :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 
 eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 	if call.filter != nil || len(call.order_by) > 0 do return eval_aggregate_chosen(ctx, call)
+	name := strings.to_lower(call.name)
+	defer delete(name)
+	return eval_aggregate_named(ctx, call, name, builtin_aggregate_name(name))
+}
+
+// eval_aggregate_named is eval_aggregate of a call without FILTER or ORDER BY
+// whose name is `name`, lowered, and `builtin` when it is one of the engine's
+// aggregates.
+@(private)
+eval_aggregate_named :: proc(ctx: ^Eval_Ctx, call: Call_Expr, name: string, builtin: bool) -> (Value, Error) {
 	if ctx.stream != nil {
 		acc := agg_stream_lookup(ctx.stream, call)
 		if acc == nil {
@@ -990,15 +1018,13 @@ eval_aggregate :: proc(ctx: ^Eval_Ctx, call: Call_Expr) -> (Value, Error) {
 		}
 		return agg_stream_value(acc)
 	}
-	name := strings.to_lower(call.name)
-	defer delete(name)
 	rows := ctx.group
 	single_rows: [1][]Source
 	if !ctx.grouped {
 		single_rows[0] = ctx.sources
 		rows = single_rows[:]
 	}
-	if !builtin_aggregate_name(name) do return eval_host_aggregate(ctx, call, rows)
+	if !builtin do return eval_host_aggregate(ctx, call, rows)
 	// jsonb_group_array and jsonb_group_object build what their json_ forms
 	// build, as JSONB.
 	if plain, is_jsonb := jsonb_aggregate_plain(call); is_jsonb {

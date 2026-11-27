@@ -74,6 +74,11 @@ test_the_names_a_statement_resolves_while_it_runs :: proc(t: ^testing.T) {
 	testing.expectf(t, correlated.column_names <= RC_ROWS + 20, "correlated: %d column lookups", correlated.column_names)
 	testing.expectf(t, correlated.plans <= 2, "correlated: %d plans", correlated.plans)
 
+	// An aggregate of the engine's is linked by its lowered name (A1.10): every
+	// group asked the name of each aggregate in it, 300 for these 100 groups.
+	grouped := rc_measure(t, store, "SELECT id, count(*), sum(x), max(name) FROM a GROUP BY id")
+	testing.expectf(t, grouped.function_names < 20, "grouped: %d function lookups", grouped.function_names)
+
 	// A row that fires a trigger runs the trees the store keeps of the query
 	// that finds the trigger, its WHEN and its body (A1.10): each row parsed
 	// them again, 469 parses for these 100 rows. What is left is the

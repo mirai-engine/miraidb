@@ -1132,11 +1132,17 @@ res_bind_call :: proc(walk: ^Res_Walk, e: Call_Expr) {
 	if bindings == nil || e.id <= bindings.base do return
 	local := e.id - bindings.base
 	if local >= Node_Id(len(bindings.calls)) do return
-	if e.name == ROW_VALUE_CALL || e.name == RAISE_CALL || e.star do return
+	if e.name == ROW_VALUE_CALL || e.name == RAISE_CALL do return
 	if e.filter != nil || len(e.order_by) > 0 || scalar_minmax(e) do return
 	if strings.equal_fold(e.name, "grouping") || strings.equal_fold(e.name, "grouping_id") do return
 	store := walk.tx.store
-	if builtin_aggregate_name(e.name) || store_has_aggregate(store, e.name) do return
+	// A program's aggregate is found by its name, and arity, as before.
+	if store_has_aggregate(store, e.name) do return
+	if builtin_aggregate_name(e.name) {
+		bindings.calls[local] = Call_Link{kind = .Aggregate, lowered = strings.to_lower(e.name, res_alloc(walk))}
+		return
+	}
+	if e.star do return
 	link := Call_Link{kind = .Builtin}
 	if def, found, _ := store_function(store, e.name, len(e.args)); found && def.overrides {
 		link = Call_Link{kind = .Host, host = def}

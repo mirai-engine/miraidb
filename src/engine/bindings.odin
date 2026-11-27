@@ -30,9 +30,9 @@ Column_Binding :: struct {
 }
 
 // Call_Kind is what a call reaches, decided by its resolution (A1.8d). .None
-// is no link: the call is found by its name when it runs, as before (an
-// aggregate, a min or max of several arguments, grouping, RAISE, a call with
-// FILTER or ORDER BY, a call outside a kept statement).
+// is no link: the call is found by its name when it runs, as before (a
+// program's aggregate, a min or max of several arguments, grouping, RAISE, a
+// call with FILTER or ORDER BY, a call outside a kept statement).
 Call_Kind :: enum u8 {
 	None,
 	// Host is a program's function registered to answer before a builtin of
@@ -43,6 +43,9 @@ Call_Kind :: enum u8 {
 	// Builtin is one of the engine's scalar functions, or a name it does not
 	// have, which its dispatch hands to the program's functions at the end.
 	Builtin,
+	// Aggregate is one of the engine's aggregates, by its lowered name
+	// (A1.10): a group asked its name of every aggregate in it.
+	Aggregate,
 }
 
 // Call_Link is the function a call reaches: its kind, and for a builtin the
