@@ -50,6 +50,10 @@ Res_Scope :: struct {
 	// whose shared columns the pass does not list.
 	shared:  [dynamic]string,
 	natural: bool,
+	// select is the select whose scope this is (Select_Stmt.id), 0 for any
+	// other (a write's target): a column of an enclosing query is linked to
+	// it, and read from that select's frame at run time.
+	select:  Node_Id,
 }
 
 // Res_Source is one relation: its name, alias and columns. `known` is false
@@ -421,7 +425,7 @@ res_view_columns :: proc(walk: ^Res_Walk, sql: string) -> ([]string, bool) {
 @(private)
 res_select :: proc(walk: ^Res_Walk, select: ^Select_Stmt, names: ^[dynamic]string = nil) -> bool {
 	if walk.err.kind != .None do return false
-	scope := Res_Scope{sources = make([dynamic]Res_Source, 0, 2, context.temp_allocator)}
+	scope := Res_Scope{sources = make([dynamic]Res_Source, 0, 2, context.temp_allocator), select = select.id}
 	if len(select.from.name) > 0 || select.from.subquery != nil do res_ref(walk, &scope, &select.from)
 	for &join in select.joins {
 		res_ref(walk, &scope, &join.table)
@@ -545,7 +549,7 @@ res_column :: proc(walk: ^Res_Walk, column: Column_Expr) {
 			for source, from in walk.scopes[i].sources {
 				if !res_source_named(source, column.table) do continue
 				if !source.known || res_has_column(source, column.name) {
-					if i == len(walk.scopes) - 1 do res_bind_column(walk, column, source, from)
+					res_bind_column(walk, column, source, from, res_link_scope(walk, i))
 					return
 				}
 				res_no_column(walk, column)
@@ -580,10 +584,10 @@ res_column :: proc(walk: ^Res_Walk, column: Column_Expr) {
 		if matches == 0 do continue
 		// One source has the name, of its own query, not shared by a join: the
 		// run reads that source's column.
-		if i == len(walk.scopes) - 1 && real == 1 && matches == 1 && !scope.natural {
+		if real == 1 && matches == 1 && !scope.natural {
 			shared := false
 			for name in scope.shared do if strings.equal_fold(name, column.name) do shared = true
-			if !shared do res_bind_column(walk, column, scope.sources[found_at], found_at)
+			if !shared do res_bind_column(walk, column, scope.sources[found_at], found_at, res_link_scope(walk, i))
 		}
 		// Two relations of one query that both have the name make it ambiguous
 		// at prepare, as in SQLite; a USING or NATURAL column is the join's.
@@ -1059,16 +1063,34 @@ relation_columns :: proc(tx: ^Tx, ref: ^Table_Ref) -> ([]string, bool) {
 // table of the database and the name one of its columns (not its rowid, rank
 // or own name).
 @(private)
-res_bind_column :: proc(walk: ^Res_Walk, column: Column_Expr, source: Res_Source, from: int) {
+res_bind_column :: proc(walk: ^Res_Walk, column: Column_Expr, source: Res_Source, from: int, scope: Res_Link_Scope) {
 	bindings := walk.bindings
-	if bindings == nil || source.ident == 0 || column.id <= bindings.base || from > int(max(u16)) do return
+	if bindings == nil || !scope.ok || source.ident == 0 || column.id <= bindings.base || from > int(max(u16)) do return
 	local := column.id - bindings.base
 	if local >= Node_Id(len(bindings.columns)) do return
 	for name, position in source.columns {
 		if !strings.equal_fold(name, column.name) do continue
-		bindings.columns[local] = Column_Binding{ident = source.ident, from = u16(from), column = i32(position)}
+		bindings.columns[local] = Column_Binding{ident = source.ident, from = u16(from), column = i32(position), scope = scope.select}
 		return
 	}
+}
+
+// Res_Link_Scope is where a linked column's row comes from: the reference's
+// own query (`select` 0), or the frame of the enclosing select `select`.
+@(private)
+Res_Link_Scope :: struct {
+	select: Node_Id,
+	ok:     bool,
+}
+
+// res_link_scope is the link scope of a name found in scope `i`: the
+// reference's own query when it is the innermost, else the enclosing select,
+// which a link can name only when it is a select of a number of its own.
+@(private)
+res_link_scope :: proc(walk: ^Res_Walk, i: int) -> Res_Link_Scope {
+	if i == len(walk.scopes) - 1 do return {ok = true}
+	select := walk.scopes[i].select
+	return {select = select, ok = select != 0}
 }
 
 // res_bind_call links a call to what it reaches (Call_Link), deciding once
@@ -1136,7 +1158,9 @@ res_bind_compare :: proc(walk: ^Res_Walk, e: Binary_Expr) {
 		local := column.id - bindings.base
 		if local >= Node_Id(len(bindings.columns)) do return {}, false
 		binding := bindings.columns[local]
-		if binding.column < 0 do return {}, false
+		// A column of an enclosing query is read from its frame: the
+		// comparison is worked out by name.
+		if binding.column < 0 || binding.scope != 0 do return {}, false
 		scope := &walk.scopes[len(walk.scopes) - 1]
 		if int(binding.from) >= len(scope.sources) do return {}, false
 		schema := scope.sources[binding.from].schema

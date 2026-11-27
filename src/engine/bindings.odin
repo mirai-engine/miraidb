@@ -22,6 +22,11 @@ Column_Binding :: struct {
 	ident:  u32,
 	from:   u16,
 	column: i32,
+	// scope is the enclosing select the row comes from (Select_Stmt.id), 0
+	// for the reference's own query: the run reads it from the frame that
+	// select pushed for the subquery (Outer_Frame.scope), never from a frame
+	// counted outward, so a frame laid out otherwise is not one it can read.
+	scope:  Node_Id,
 }
 
 // Call_Kind is what a call reaches, decided by its resolution (A1.8d). .None
@@ -157,13 +162,20 @@ column_bound :: #force_inline proc(ctx: ^Eval_Ctx, id: Node_Id) -> (source: ^Sou
 	if local >= Node_Id(len(bindings.columns)) do return nil, -1, false
 	binding := bindings.columns[local]
 	if binding.column < 0 do return nil, -1, false
-	at := int(binding.from)
-	if ctx.positions != nil {
-		if at >= len(ctx.positions) do return nil, -1, false
-		at = ctx.positions[at]
+	sources, positions := ctx.sources, ctx.positions
+	if binding.scope != 0 {
+		frame := ctx.outer
+		for frame != nil && frame.scope != binding.scope do frame = frame.next
+		if frame == nil do return nil, -1, false
+		sources, positions = frame.sources, frame.positions
 	}
-	if at >= len(ctx.sources) do return nil, -1, false
-	source = &ctx.sources[at]
+	at := int(binding.from)
+	if positions != nil {
+		if at >= len(positions) do return nil, -1, false
+		at = positions[at]
+	}
+	if at >= len(sources) do return nil, -1, false
+	source = &sources[at]
 	if source.table == nil || source.table.schema.ident != binding.ident do return nil, -1, false
 	return source, int(binding.column), true
 }

@@ -92,6 +92,12 @@ select_output_may_shrink :: proc(stmt: Select_Stmt) -> bool {
 Outer_Frame :: struct {
 	sources: []Source,
 	next:    ^Outer_Frame,
+	// scope is the select these are the sources of (Select_Stmt.id; 0 when
+	// unknown), and positions where its plan runs each FROM item: a column of
+	// an enclosing query is linked to its select (Column_Binding.scope), and
+	// read from the frame of that select.
+	scope:     Node_Id,
+	positions: []int,
 }
 
 // eval_context is how every evaluation context is made: it is given the
@@ -101,7 +107,10 @@ Outer_Frame :: struct {
 eval_context :: proc(fields: Eval_Ctx) -> Eval_Ctx {
 	ctx := fields
 	ctx.now_us = statement_now(fields.tx)
-	if ctx.bindings == nil && fields.tx != nil do ctx.bindings = fields.tx.bindings
+	if fields.tx != nil {
+		if ctx.bindings == nil do ctx.bindings = fields.tx.bindings
+		if ctx.scope == 0 do ctx.scope = fields.tx.select_scope
+	}
 	return ctx
 }
 
@@ -123,6 +132,9 @@ Eval_Ctx :: struct {
 	// the plan runs each FROM item (Plan_Order.positions; nil when it runs
 	// them as written): column_bound reads a linked reference through both.
 	bindings:    ^Statement_Bindings,
+	// scope is the select whose sources `sources` are (Tx.select_scope), the
+	// tag of the frame a subquery run from here pushes.
+	scope:       Node_Id,
 	positions:   []int,
 	// using_names are the columns the query's JOIN ... USING (or NATURAL
 	// JOIN) shares: an unqualified one is the join's, not ambiguous.

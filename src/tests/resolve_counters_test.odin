@@ -66,9 +66,10 @@ test_the_names_a_statement_resolves_while_it_runs :: proc(t: ^testing.T) {
 	view := rc_measure(t, store, "SELECT count(*) FROM small")
 	testing.expect_value(t, view.parses, 0)
 
-	// A correlated subquery looks the enclosing row's column up by name per
-	// inner row (A1.8g links it next), and plans once per statement.
+	// A correlated subquery reads the enclosing row's column through its link,
+	// from the frame of the select it names, and plans once per statement
+	// (A1.8g).
 	correlated := rc_measure(t, store, "SELECT count(*) FROM a WHERE x >= (SELECT count(*) FROM b WHERE b.a_id = a.id)")
-	testing.expectf(t, correlated.column_names >= RC_ROWS * RC_ROWS, "correlated: %d column lookups", correlated.column_names)
+	testing.expectf(t, correlated.column_names <= RC_ROWS + 20, "correlated: %d column lookups", correlated.column_names)
 	testing.expectf(t, correlated.plans <= 2, "correlated: %d plans", correlated.plans)
 }

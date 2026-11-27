@@ -533,6 +533,10 @@ sql_exec_stream_select :: proc(
 }
 
 sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Result, Error) {
+	// The contexts made from here read this select's rows (Eval_Ctx.scope).
+	outer_scope := tx.select_scope
+	tx.select_scope = stmt.id
+	defer tx.select_scope = outer_scope
 	// A NATURAL join becomes the USING it stands for, now the tables are known.
 	if select_has_natural_join(stmt) {
 		resolved, natural_err := natural_joins_resolve(tx, stmt)
@@ -2054,7 +2058,7 @@ outer_column :: proc(ctx: ^Eval_Ctx, name, table: string) -> (Value, bool) {
 @(private)
 subquery_run :: proc(ctx: ^Eval_Ctx, stmt: Select_Stmt) -> (Sql_Result, Error) {
 	if ctx.tx == nil do return {}, errf(.Sql_Unsupported, "subqueries need a transaction")
-	frame := Outer_Frame{sources = ctx.sources, next = ctx.outer}
+	frame := Outer_Frame{sources = ctx.sources, next = ctx.outer, scope = ctx.scope, positions = ctx.positions}
 	saved := ctx.tx.outer
 	ctx.tx.outer = &frame
 	result, err := sql_exec_select(ctx.tx, stmt, ctx.params)
