@@ -397,6 +397,22 @@ select's join plan is kept for the statement under its number
 (`Tx.select_plans`, cleared when a statement starts), so a subquery run for
 every outer row plans once.
 
+For one run of a correlated subquery, the outer row's column is a constant, so
+it keys an index probe of the subquery's table as a literal does (`eval_key`).
+The column has to be one its link names, read from the frame of its select. It
+keys the probe only where the probe still finds every row the comparison keeps.
+A column brings its own affinity (`'05' = 5` between a TEXT column and an
+INTEGER one) and its own collation, which a literal does not, so a probe needs
+the same affinity as the indexed column, or a numeric indexed column, and no
+collation other than the indexed column's. The comparison may name the indexed
+column on either side (`comparison_sides_on`). Before, every outer row scanned
+the subquery's table whole.
+
+A comparison's collation follows SQLite's precedence (`collation_precedence`).
+An explicit COLLATE wins, the left operand's first. Otherwise the collation of
+a column operand decides, the left one's first, and a column that declares none
+is BINARY: `plain = nocase_column` compares as BINARY.
+
 A query binds sources: `Source` pairs a table with one of its rows and an
 optional alias. Single-table statements build a one-source context; a join
 builds one source per table. Column resolution searches the bound sources
