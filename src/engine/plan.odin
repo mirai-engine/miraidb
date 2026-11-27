@@ -416,6 +416,16 @@ plan_ordered_join :: proc(
 		}
 		predicates[latest] = plan_and(predicates[latest], relations[i].on, alloc)
 	}
+	// The first relation is read, not joined: no step answers a condition
+	// there, and the executor runs the steps after it. An ON that names only
+	// the relation the order put first (`JOIN a ON a.p = 'ab'`) is answered by
+	// the next step instead, which an inner join, the only one reordered, does
+	// not tell apart. Kept on the first step it was dropped, and the join kept
+	// every row.
+	if len(predicates) > 1 && predicates[0] != nil {
+		predicates[1] = plan_and(predicates[1], predicates[0], alloc)
+		predicates[0] = nil
+	}
 	// The steps go back to the caller, in the statement's allocator, as the
 	// unordered plan's do.
 	steps := make([]Plan_Step, len(best_order), alloc)
