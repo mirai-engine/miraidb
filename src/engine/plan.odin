@@ -69,6 +69,7 @@ plan_access :: proc(
 	predicate: ^Expr,
 	params: []Value,
 	estimate := true,
+	bindings: ^Statement_Bindings = nil,
 ) -> Plan_Access {
 	stats, has_stats := stats_get(store, table.schema.name)
 	rows, scan_rows: u64
@@ -89,7 +90,7 @@ plan_access :: proc(
 	defer delete(conjuncts)
 	split_and(predicate, &conjuncts)
 	for expr in conjuncts {
-		column_index, ok := plan_conjunct_column(table, ref, expr)
+		column_index, ok := plan_conjunct_column(table, ref, expr, bindings)
 		if !ok do continue
 		index_position, has_index := index_for_single_column(table, column_index)
 		if !has_index do continue
@@ -249,18 +250,24 @@ plan_range_rows :: proc(
 }
 
 // plan_conjunct_column returns the column a conjunct filters on, when the
-// conjunct is one an index can answer and it names this relation.
+// conjunct is one an index can answer and it names this relation: the column
+// the statement's resolution linked it to (`bindings`, the running
+// statement's), else found by its name. A correlated subquery is planned at
+// each of its runs, and looked its column up by name at each.
 @(private)
-plan_conjunct_column :: proc(table: ^Table, ref: Table_Ref, expr: ^Expr) -> (int, bool) {
+plan_conjunct_column :: proc(table: ^Table, ref: Table_Ref, expr: ^Expr, bindings: ^Statement_Bindings = nil) -> (int, bool) {
 	if binary, is_binary := expr^.(Binary_Expr); is_binary {
 		#partial switch binary.op {
 		case .Eq, .Lt, .Le, .Gt, .Ge:
 		case:
 			return -1, false
 		}
-		qualifier, column_name, _, _, ok := comparison_sides_on(binary, ref.name, ref.alias)
+		qualifier, column_name, _, reversed, ok := comparison_sides_on(binary, ref.name, ref.alias)
 		if !ok do return -1, false
 		if !plan_names_relation(qualifier, ref) do return -1, false
+		if position, linked := plan_column_linked(table, reversed ? binary.right : binary.left, bindings); linked {
+			return position, true
+		}
 		column_index, found := schema_column_index(&table.schema, column_name)
 		if !found do return -1, false
 		return column_index, true
@@ -274,6 +281,23 @@ plan_conjunct_column :: proc(table: ^Table, ref: Table_Ref, expr: ^Expr) -> (int
 		return column_index, true
 	}
 	return -1, false
+}
+
+// plan_column_linked is the position in `table` of the column `expr` names,
+// read from its link (Column_Binding): one of its own query's sources, made
+// against this table's schema.
+@(private)
+plan_column_linked :: proc(table: ^Table, expr: ^Expr, bindings: ^Statement_Bindings) -> (int, bool) {
+	if bindings == nil || expr == nil do return -1, false
+	column, is_column := expr^.(Column_Expr)
+	if !is_column || column.id <= bindings.base do return -1, false
+	local := column.id - bindings.base
+	if local >= Node_Id(len(bindings.columns)) do return -1, false
+	binding := bindings.columns[local]
+	if binding.column < 0 || binding.scope != 0 || binding.ident != table.schema.ident do return -1, false
+	if binding.from == TRIGGER_NEW_FROM || binding.from == TRIGGER_OLD_FROM do return -1, false
+	if int(binding.column) >= len(table.schema.columns) do return -1, false
+	return int(binding.column), true
 }
 
 // plan_names_relation says whether a qualifier can only mean this relation: an

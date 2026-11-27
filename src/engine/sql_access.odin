@@ -137,7 +137,7 @@ index_candidates :: proc(
 	if _, created := tx.state.created[table_name]; created do return nil, false
 	// The planner compares every index the predicate could use against the scan
 	// and hands back the cheapest one, or none when the scan wins.
-	plan := plan_access(tx.store, table, Table_Ref{name = table_name, alias = table_alias}, predicate, params, estimate = false)
+	plan := plan_access(tx.store, table, Table_Ref{name = table_name, alias = table_alias}, predicate, params, estimate = false, bindings = tx.bindings)
 	if plan.kind != .Index do return nil, false
 	// Both ends of a range travel together: `v >= 5 AND v < 9` is one scan over
 	// [5, 9), which is what the plan priced.
