@@ -297,8 +297,10 @@ transaction's is freed at the end of the run.
 A query binds sources: `Source` pairs a table with one of its rows and an
 optional alias. Single-table statements build a one-source context; a join
 builds one source per table. Column resolution searches the bound sources
-(qualified names match a table name or alias; unqualified names must be
-unique).
+(a qualified name matches a source's alias when it has one, and its table's
+name otherwise, as in SQLite and PostgreSQL: `FROM q AS r` hides q, so a
+subquery's `q.v` is the enclosing query's; unqualified names must be unique).
+Every place that matches a qualifier asks `qualifier_names`.
 
 Joins expand a list of partial bindings, one nested loop per joined table.
 `LEFT JOIN` keeps a partial with a NULL row when nothing matches. `WHERE`
