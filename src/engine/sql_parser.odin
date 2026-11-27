@@ -1665,10 +1665,20 @@ parse_insert :: proc(p: ^Parser) -> Statement {
 	if p_match_keyword(p, "on") {
 		p_expect_keyword(p, "conflict")
 		if p_match_punct(p, "(") {
+			// The target names the key by its columns. One written another way (a
+			// COLLATE, an expression) is read as any key, as before.
+			target := make([dynamic]string, 0, 2, p.alloc)
+			plain := true
 			for !p_is_punct(p, ")") && p.current.kind != .EOF {
+				if p.current.kind == .Ident || p.current.kind == .Quoted_Ident {
+					append(&target, strings.clone(p.current.text, p.alloc))
+				} else if !p_is_punct(p, ",") {
+					plain = false
+				}
 				p_advance(p)
 			}
 			p_expect_punct(p, ")")
+			if plain do insert.conflict_target = target[:]
 		}
 		if !p_expect_keyword(p, "do") do return insert
 		if p_match_keyword(p, "nothing") {

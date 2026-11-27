@@ -392,6 +392,9 @@ Insert_Stmt :: struct {
 	// UPSERT: DO NOTHING, or DO UPDATE SET over the conflicting row.
 	conflict_do_nothing: bool,
 	conflict_assignments: []Assignment,
+	// conflict_target is ON CONFLICT (columns): the unique key whose collision
+	// the clause answers; empty for any key.
+	conflict_target: []string,
 	// INSERT OR REPLACE: the rows the new one collides with are deleted first.
 	conflict_replace: bool,
 	// INSERT OR IGNORE skips a row that breaks a UNIQUE, PRIMARY KEY, NOT NULL or

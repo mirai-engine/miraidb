@@ -5,10 +5,39 @@ import "core:sync"
 
 // --- INSERT / UPDATE / DELETE ----------------------------------------------
 
-// find_conflict_row locates the row an UPSERT collided with: the primary key
-// columns compared against the incoming values.
+// find_conflict_row locates the row an UPSERT collided with: the row that holds
+// the key of `values` in a unique index the clause's target names (any unique
+// index when it names none), found through the index. Only the primary key
+// was compared, by reading every row, so a collision on another UNIQUE column
+// was never found and the insert's error stood, DO NOTHING included.
 @(private)
-find_conflict_row :: proc(tx: ^Tx, name: string, table: ^Table, values: []Value) -> (Row, bool) {
+find_conflict_row :: proc(tx: ^Tx, name: string, table: ^Table, values: []Value, target: []string) -> (Row, bool) {
+	for id in unique_conflicts(tx, name, table, values, target) {
+		if row, found := tx_get(tx, name, id); found do return row, true
+	}
+	if len(target) > 0 && !conflict_target_is_key(table, table.schema.primary_key, target) do return {}, false
+	return find_conflict_by_primary_key(tx, name, table, values)
+}
+
+// conflict_target_is_key reports whether an ON CONFLICT target names exactly
+// the columns at `positions`, in any order.
+@(private)
+conflict_target_is_key :: proc(table: ^Table, positions: []int, target: []string) -> bool {
+	if len(positions) == 0 || len(positions) != len(target) do return false
+	for name in target {
+		position, found := schema_column_index(&table.schema, name)
+		if !found do return false
+		named := false
+		for column in positions do if column == position do named = true
+		if !named do return false
+	}
+	return true
+}
+
+// find_conflict_by_primary_key compares the primary key with every row the
+// transaction sees: the answer for a key no index files.
+@(private)
+find_conflict_by_primary_key :: proc(tx: ^Tx, name: string, table: ^Table, values: []Value) -> (Row, bool) {
 	if len(table.schema.primary_key) == 0 do return {}, false
 	// The rows are the ones the transaction sees: a row it staged collides as
 	// much as a committed one.
@@ -41,7 +70,7 @@ find_conflict_row :: proc(tx: ^Tx, name: string, table: ^Table, values: []Value)
 // index, a row it staged as much as a committed one. One row can collide under
 // two indexes, so it is listed once.
 @(private)
-unique_conflicts :: proc(tx: ^Tx, name: string, table: ^Table, values: []Value) -> [dynamic]Row_Id {
+unique_conflicts :: proc(tx: ^Tx, name: string, table: ^Table, values: []Value, target: []string = nil) -> [dynamic]Row_Id {
 	ids := make([dynamic]Row_Id, 0, 2, tx.alloc)
 	add :: proc(ids: ^[dynamic]Row_Id, id: Row_Id) {
 		for existing in ids do if existing == id do return
@@ -51,6 +80,8 @@ unique_conflicts :: proc(tx: ^Tx, name: string, table: ^Table, values: []Value) 
 	committed := tx.store.tables[name]
 	for idx, i in table.indexes {
 		if !idx.unique do continue
+		// An UPSERT's target answers the collisions on its own key only.
+		if len(target) > 0 && !conflict_target_is_key(table, idx.schema.columns, target) do continue
 		// The rules tx_check_unique keeps: a row outside a partial index, or a
 		// key with a NULL, constrains nothing.
 		if !index_row_included(table, i, values) do continue
@@ -435,7 +466,7 @@ sql_exec_insert :: proc(tx: ^Tx, stmt: Insert_Stmt, params: []Value) -> (Sql_Res
 		}
 		if insert_err.kind != .None {
 			// UPSERT: a collision on the target columns is not an error.
-			conflict, found := find_conflict_row(tx, stmt.table, table, row_with_defaults(tx, table, values))
+			conflict, found := find_conflict_row(tx, stmt.table, table, row_with_defaults(tx, table, values), stmt.conflict_target)
 			if !found do return {}, insert_err
 			if stmt.conflict_do_nothing {
 				error_free(&insert_err)
