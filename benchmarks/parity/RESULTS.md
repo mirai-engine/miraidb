@@ -847,3 +847,40 @@ insert dearer, and was dropped.
 | insert_bulk u32_u64_str unique_0 | 312.8 | 309.2 | −1.2% | 231 | 1.34× (was 1.35×) |
 | update_bulk u32_u64_u64 | 278.2 | 260.5 | −6.4% | 352 | 0.74× |
 | the other workloads | | | −2.6 to +1.4% | | |
+
+## After A2 (2026-11-27)
+
+Where the engine stands once the index is one structure behind a contract (A2):
+`bin/parity.exe mem` at `89419bd`, three rounds alternating with SQLite's
+program (3.54.1, `-O2`, prepare, step and finalize from the text, median of
+2000), each figure the median of the three.
+
+Through SQL:
+
+| statement | after A1.9 | now | SQLite | now ÷ SQLite |
+|---|---:|---:|---:|---:|
+| `SELECT 1` | 3.55 µs | 3.70 | 0.80 | 4.6× |
+| `... WHERE rowid = 77` | 6.85 | 6.80 | 2.1 | 3.2× |
+| `... WHERE id = 77` (unique index) | 8.00 | 7.30 | 2.3 | 3.2× |
+| `SELECT count(*)`, 256 rows | 3.60 | 3.60 | 1.3 | 2.8× |
+| `count(*) WHERE age > 300 AND name <> 'x'`, no index | 85.0 | 84.8 | 14.1 | 6.0× |
+
+Against the reference (its figures as recorded above):
+
+| workload | now, µs | reference | ratio |
+|---|---:|---:|---:|
+| insert_bulk u32_u64_str unique_0 | 312.1 | 231 | 1.35× |
+| insert_bulk u32_u64_u64 unique_0 | 248.2 | 186 | 1.33× |
+| insert_bulk u32_u64_str btree_each_column | 410.8 | 534 | 0.77× |
+| insert_bulk u32_u64_u64 btree_each_column | 298.1 | 363 | 0.82× |
+| update_bulk u32_u64_str | 443.4 | 349 | 1.27× |
+| update_bulk u32_u64_u64 | 264.0 | 313 | 0.84× |
+| empty transaction | 0.50 | 0.53 | 0.94× |
+| iterate 256 rows (u32_u64_str) | 1.30 | 1.41 | 0.92× |
+| filter, string index | 2.20 | 3.29 | 0.67× |
+
+The unique inserts measured 1.31× (u64) interleaved against the build before
+A2.6; three plain rounds put them at 1.33–1.35×, which is the spread of this
+workload. Behind the reference are the unique inserts and the string update;
+behind SQLite, every statement's fixed cost (`SELECT 1`) and the scan's 0.33 µs
+a row.
