@@ -142,7 +142,7 @@ index_candidates :: proc(
 	// Both ends of a range travel together: `v >= 5 AND v < 9` is one scan over
 	// [5, 9), which is what the plan priced.
 	conjunct, companion := plan.conjunct, plan.conjunct2
-	if candidates, ok := candidates_from_range(conjunct, companion, table, table_alias, plan.index, params); ok {
+	if candidates, ok := candidates_from_range(tx, conjunct, companion, table, table_alias, plan.index, params); ok {
 		return candidates, true
 	}
 	return nil, false
@@ -154,6 +154,7 @@ index_candidates :: proc(
 // the single-comparison path.
 @(private)
 candidates_from_range :: proc(
+	tx: ^Tx,
 	expr: ^Expr,
 	companion: ^Expr,
 	table: ^Table,
@@ -162,10 +163,10 @@ candidates_from_range :: proc(
 	params: []Value,
 ) -> ([dynamic]Row_Id, bool) {
 	if companion == nil {
-		return candidates_from_conjunct(expr, table, table_alias, index_position, params)
+		return candidates_from_conjunct(tx, expr, table, table_alias, index_position, params)
 	}
-	first, first_ok := range_key(table, table_alias, expr, params)
-	second, second_ok := range_key(table, table_alias, companion, params)
+	first, first_ok := range_key(tx, table, table_alias, expr, params)
+	second, second_ok := range_key(tx, table, table_alias, companion, params)
 	if !first_ok || !second_ok {
 		if first_ok do delete(first.key)
 		if second_ok do delete(second.key)
@@ -194,6 +195,7 @@ Range_Key :: struct {
 
 @(private)
 range_key :: proc(
+	tx: ^Tx,
 	table: ^Table,
 	table_alias: string,
 	expr: ^Expr,
@@ -217,7 +219,7 @@ range_key :: proc(
 	case:
 		return {}, false
 	}
-	qualifier, column_name, value_expr, reversed, sides_ok := comparison_sides(binary)
+	qualifier, column_name, value_expr, reversed, sides_ok := comparison_sides_on(binary, table.schema.name, table_alias)
 	if !sides_ok do return {}, false
 	if len(qualifier) > 0 &&
 	   !strings.equal_fold(qualifier, table.schema.name) &&
@@ -226,7 +228,7 @@ range_key :: proc(
 	}
 	column_index, found := schema_column_index(&table.schema, column_name)
 	if !found do return {}, false
-	value, constant := eval_constant(value_expr, params)
+	value, constant := eval_key(tx, value_expr, params, table.schema.columns[column_index])
 	if !constant do return {}, false
 	coerced, coerce_err := value_coerce(value, table.schema.columns[column_index].type)
 	if coerce_err.kind != .None {
@@ -468,6 +470,7 @@ split_and :: proc(expr: ^Expr, out: ^[dynamic]^Expr) {
 
 @(private)
 candidates_from_conjunct :: proc(
+	tx: ^Tx,
 	expr: ^Expr,
 	table: ^Table,
 	table_alias: string,
@@ -477,7 +480,7 @@ candidates_from_conjunct :: proc(
 	binary, is_binary := expr^.(Binary_Expr)
 	if !is_binary do return nil, false
 	if binary.op == .Eq || binary.op == .Lt || binary.op == .Le || binary.op == .Gt || binary.op == .Ge {
-		qualifier, column_name, value_expr, reversed, ok := comparison_sides(binary)
+		qualifier, column_name, value_expr, reversed, ok := comparison_sides_on(binary, table.schema.name, table_alias)
 		if !ok do return nil, false
 		// A column of a joined table has its own index (and its own scan); only
 		// the base table can use this shortcut.
@@ -488,7 +491,7 @@ candidates_from_conjunct :: proc(
 		}
 		column_index, found := schema_column_index(&table.schema, column_name)
 		if !found do return nil, false
-		value, constant := eval_constant(value_expr, params)
+		value, constant := eval_key(tx, value_expr, params, table.schema.columns[column_index])
 		if !constant do return nil, false
 		coerced, coerce_err := value_coerce(value, table.schema.columns[column_index].type)
 		if coerce_err.kind != .None {
@@ -536,8 +539,8 @@ candidates_from_conjunct :: proc(
 		if len(column.table) > 0 && !qualifier_names(column.table, table.schema.name, table_alias) do return nil, false
 		column_index, found := schema_column_index(&table.schema, column.name)
 		if !found do return nil, false
-		low, low_ok := eval_constant(between.low, params)
-		high, high_ok := eval_constant(between.high, params)
+		low, low_ok := eval_key(tx, between.low, params, table.schema.columns[column_index])
+		high, high_ok := eval_key(tx, between.high, params, table.schema.columns[column_index])
 		if !low_ok || !high_ok do return nil, false
 		low_value, low_err := value_coerce(low, table.schema.columns[column_index].type)
 		high_value, high_err := value_coerce(high, table.schema.columns[column_index].type)
@@ -691,4 +694,56 @@ value_compare_decided :: #force_inline proc(a, b: Value, collation: string, stor
 	if ref == nil do return value_compare_collated(a, b, collation, store)
 	if a.kind == .String && b.kind == .String do return string_ordering(collation_ref_compare(ref, a.s, b.s)), true
 	return value_compare(a, b)
+}
+
+// comparison_sides_on is comparison_sides for a comparison an index of `table`
+// may answer: the side that is a column naming the table, whichever side it
+// is written on. In `a.id = c.a_id` the column of c is on the right, where
+// comparison_sides, reading the left first, took a's.
+@(private)
+comparison_sides_on :: proc(
+	binary: Binary_Expr,
+	table_name: string,
+	table_alias: string,
+) -> (qualifier: string, column: string, value: ^Expr, reversed: bool, ok: bool) {
+	names :: proc(qualifier, table_name, table_alias: string) -> bool {
+		return len(qualifier) == 0 || qualifier_names(qualifier, table_name, table_alias)
+	}
+	if ref, is_column := binary.left^.(Column_Expr); is_column && names(ref.table, table_name, table_alias) {
+		return ref.table, ref.name, binary.right, false, true
+	}
+	if ref, is_column := binary.right^.(Column_Expr); is_column && names(ref.table, table_name, table_alias) {
+		return ref.table, ref.name, binary.left, true, true
+	}
+	return comparison_sides(binary)
+}
+
+// eval_key is the value an index is probed with: a constant (eval_constant),
+// or a column of the query around this one, which is constant for the rows of
+// this run of it. That column is the one its link names (Column_Binding.scope),
+// read from the frame of the select it comes from; a column of this query, or
+// one without a link, is not a key. A column brings its own affinity and
+// collation to the comparison, where a literal brings none, so it keys the
+// probe only where the probe still finds every row the comparison keeps: the
+// same affinity as `column`, or a numeric `column`, which makes both sides
+// numbers; and no collation of its own but `column`'s.
+@(private)
+eval_key :: proc(tx: ^Tx, expr: ^Expr, params: []Value, column: Column) -> (Value, bool) {
+	if value, constant := eval_constant(expr, params); constant do return value, true
+	if tx == nil || tx.bindings == nil || expr == nil do return {}, false
+	reference, is_column := expr^.(Column_Expr)
+	if !is_column do return {}, false
+	bindings := tx.bindings
+	if reference.id <= bindings.base do return {}, false
+	local := reference.id - bindings.base
+	if local >= Node_Id(len(bindings.columns)) || bindings.columns[local].scope == 0 do return {}, false
+	ctx := Eval_Ctx{tx = tx, outer = tx.outer, bindings = bindings}
+	source, index, bound := column_bound(&ctx, reference.id)
+	if !bound do return {}, false
+	outer := source.table.schema.columns[index]
+	inner_affinity, outer_affinity := declared_affinity(column.type), declared_affinity(outer.type)
+	if inner_affinity != .Numeric && outer_affinity != inner_affinity do return {}, false
+	if len(outer.collation) > 0 && !strings.equal_fold(outer.collation, column.collation) do return {}, false
+	if index >= len(source.row.values) do return value_null(), true
+	return source.row.values[index], true
 }

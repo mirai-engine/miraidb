@@ -175,7 +175,7 @@ plan_range_bound :: proc(table: ^Table, ref: Table_Ref, expr: ^Expr) -> (Range_B
 	case:
 		return {}, false
 	}
-	qualifier, column_name, _, reversed, sides_ok := comparison_sides(binary)
+	qualifier, column_name, _, reversed, sides_ok := comparison_sides_on(binary, ref.name, ref.alias)
 	if !sides_ok do return {}, false
 	if !plan_names_relation(qualifier, ref) do return {}, false
 	column_index, found := schema_column_index(&table.schema, column_name)
@@ -251,7 +251,7 @@ plan_conjunct_column :: proc(table: ^Table, ref: Table_Ref, expr: ^Expr) -> (int
 		case:
 			return -1, false
 		}
-		qualifier, column_name, _, _, ok := comparison_sides(binary)
+		qualifier, column_name, _, _, ok := comparison_sides_on(binary, ref.name, ref.alias)
 		if !ok do return -1, false
 		if !plan_names_relation(qualifier, ref) do return -1, false
 		column_index, found := schema_column_index(&table.schema, column_name)
