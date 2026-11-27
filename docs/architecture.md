@@ -294,6 +294,18 @@ parses again too, and leaves the tree stale for the next run. What a
 resolution writes into a kept tree lives in the tree's own arena: the
 transaction's is freed at the end of the run.
 
+The pieces a resolved statement will link by are in place (A1.8). The parser
+numbers every node a resolution links (`Column_Expr`, `Call_Expr`,
+`Binary_Expr`) from 1 to `Query.node_count`, building them in their own small
+constructors (`node_call`, `node_column`): built in place, each was a
+temporary the size of an `Expr` in the frame of a parse function that recurses
+through parentheses, and an unoptimized build ran out of stack right at
+`MAX_EXPRESSION_DEPTH`. A node made elsewhere (a rewrite, an expansion of `*`)
+is 0. And a table's schema has an identity (`Table_Schema.ident`): a new one
+when the table is made (CREATE, ALTER, replay), the same one in a copy of it
+(copy-on-write, a reader's snapshot), so a link can name a schema without
+holding a pointer a copy changes.
+
 A query binds sources: `Source` pairs a table with one of its rows and an
 optional alias. Single-table statements build a one-source context; a join
 builds one source per table. Column resolution searches the bound sources
