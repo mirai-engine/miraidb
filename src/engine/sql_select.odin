@@ -608,6 +608,8 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 		params      = params,
 		outer       = tx.outer,
 		column_memo = column_memo_make(tx),
+		// A row's sources are in the order the plan runs them.
+		positions   = order.positions,
 	})
 	for join in stmt.joins {
 		if len(join.using_columns) == 0 do continue

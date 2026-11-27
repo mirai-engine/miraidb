@@ -2,7 +2,6 @@ package engine
 
 import "core:fmt"
 import "core:slice"
-import "core:mem"
 import "core:strings"
 import "core:sync"
 
@@ -100,7 +99,7 @@ sql_execute_priced :: proc(store: ^Store, sql: string, params: []Value) -> (Sql_
 		query^ = parsed
 	}
 	defer statement_cache_give(store, sql, query, generation)
-	return sql_run_statement(store, query.statement, params, arena_allocator_guarded(&query.arena))
+	return sql_run_statement(store, query.statement, params, query)
 }
 
 // STATEMENT_CACHE_SIZE is how many parsed queries a store keeps by their text.
@@ -181,9 +180,11 @@ statement_cache_clear :: proc(store: ^Store) {
 // sql_run_statement dispatches an already parsed statement; prepared statements
 // reuse it to avoid parsing on every execution.
 @(private)
-// `names` is where the names a query's resolution rewrites live, for a tree
-// that outlives the run; the transaction's arena when it is not given.
-sql_run_statement :: proc(store: ^Store, statement: Statement, params: []Value, names: mem.Allocator = {}) -> (Sql_Result, Error) {
+// `query` is the parse `statement` is the tree of, when the caller has it: what
+// its resolution rewrites and the links it makes (Statement_Bindings) live in
+// the query's arena, as long as the tree. Without it they live in the
+// transaction's and the run makes no links.
+sql_run_statement :: proc(store: ^Store, statement: Statement, params: []Value, query: ^Query = nil) -> (Sql_Result, Error) {
 	// A statement runs once the ballast is held again (D23).
 	if !oom_settle() do return {}, oom_error()
 	if refusal := store_refusal(store); refusal.kind != .None do return {}, refusal
@@ -193,7 +194,7 @@ sql_run_statement :: proc(store: ^Store, statement: Statement, params: []Value, 
 	switch stmt in statement {
 	case Select_Stmt, With_Stmt:
 		tx := tx_begin_read(store)
-		result, exec_err := sql_run_query(tx, stmt, params, names)
+		result, exec_err := sql_run_query(tx, stmt, params, query)
 		if exec_err.kind == .None {
 			if short := statement_shortfall(); short.kind != .None {
 				sql_result_destroy(&result)
@@ -214,7 +215,7 @@ sql_run_statement :: proc(store: ^Store, statement: Statement, params: []Value, 
 		// this very thread.
 		outer_tx, outer_thread := store.statement_tx, store.statement_thread
 		store.statement_tx, store.statement_thread = tx, sync.current_thread_id()
-		result, exec_err := sql_exec_mutation(tx, stmt, params, names)
+		result, exec_err := sql_exec_mutation(tx, stmt, params, query)
 		store.statement_tx, store.statement_thread = outer_tx, outer_thread
 		// A statement that needed the ballast (D23), or that could not read a
 		// page (D8), is taken back whole.
@@ -324,7 +325,7 @@ sql_execute_in_tx_params :: proc(tx: ^Tx, sql: string, params: []Value) -> (Sql_
 	query, parse_err := sql_parse(sql)
 	if parse_err.kind != .None do return {}, parse_err
 	defer query_destroy(&query)
-	result, exec_err := sql_run_statement_in_tx(tx, query.statement, params)
+	result, exec_err := sql_run_statement_in_tx(tx, query.statement, params, &query)
 	if exec_err.kind != .None do return {}, exec_err
 	// Price the statement inside the transaction too: the transaction owns the
 	// store lock here, so this uses the same units without touching the mutex.
@@ -459,8 +460,8 @@ statement_shortfall :: proc() -> Error {
 // sql_run_statement_in_tx dispatches an already parsed statement inside a
 // transaction.
 @(private)
-// `names` is as sql_run_statement takes it.
-sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value, names: mem.Allocator = {}) -> (Sql_Result, Error) {
+// `query` is as sql_run_statement takes it.
+sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value, query: ^Query = nil) -> (Sql_Result, Error) {
 	if !oom_settle() do return {}, oom_error()
 	if refusal := store_refusal(tx.store); refusal.kind != .None do return {}, refusal
 	// A statement a trigger runs leaves the failure to the one that fired it,
@@ -476,7 +477,7 @@ sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value, 
 	defer aggregate_scope_leave(previous)
 	switch stmt in statement {
 	case Select_Stmt, With_Stmt:
-		result, err := sql_run_query(tx, stmt, params, names)
+		result, err := sql_run_query(tx, stmt, params, query)
 		if err.kind == .None {
 			if short := statement_shortfall(); short.kind != .None {
 				sql_result_destroy(&result)
@@ -493,7 +494,7 @@ sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value, 
 		// RAISE(FAIL) under it keeps the rows of that outer statement.
 		outer := tx.trigger_depth == 0
 		if outer do tx.keep_partial = false
-		result, err := sql_exec_mutation(tx, stmt, params, names)
+		result, err := sql_exec_mutation(tx, stmt, params, query)
 		taken_back := err.kind == .Out_Of_Memory
 		if err.kind == .None {
 			if short := statement_shortfall(); short.kind != .None {
@@ -514,7 +515,7 @@ sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value, 
 		}
 		return result, err
 	case Create_Table_Stmt, Alter_Table_Stmt, Create_Type_Stmt, Drop_Table_Stmt, Create_Index_Stmt, Drop_Index_Stmt, Create_View_Stmt, Drop_View_Stmt, Create_Policy_Stmt, Drop_Policy_Stmt, Truncate_Stmt, Create_Trigger_Stmt, Drop_Trigger_Stmt, Grant_Stmt, Create_Virtual_Table_Stmt, Load_Extension_Stmt:
-		return sql_exec_mutation(tx, stmt, params, names)
+		return sql_exec_mutation(tx, stmt, params, query)
 	case Listen_Stmt:
 		store_listen(tx.store, tx.store.session_owner, stmt.channel)
 		return Sql_Result{kind = .Ack, commit_seq = tx.store.commit_seq}, ERROR_NONE
@@ -785,7 +786,10 @@ sql_exec_vacuum :: proc(store: ^Store, stmt: Vacuum_Stmt) -> (Sql_Result, Error)
 	return Sql_Result{kind = .Ack, commit_seq = store.commit_seq}, ERROR_NONE
 }
 
-sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value, names: mem.Allocator = {}) -> (Sql_Result, Error) {
+sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value, query: ^Query = nil) -> (Sql_Result, Error) {
+	// The statement's links are the transaction's while it runs (statement_resolve).
+	outer_bindings := tx.bindings
+	defer tx.bindings = outer_bindings
 	// A statement that writes an attached database runs in that database's
 	// transaction, which this one opens and ends.
 	if schema, object, local, attached := statement_attached_object(statement); attached {
@@ -795,7 +799,7 @@ sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value, names:
 		mark := tx_statement_begin(writer)
 		saved_target := writer.attach_target
 		writer.attach_target = object
-		result, err := sql_exec_mutation(writer, local, params, names)
+		result, err := sql_exec_mutation(writer, local, params, query)
 		writer.attach_target = saved_target
 		tx_statement_end(writer, mark, err.kind != .None)
 		return result, err
@@ -810,7 +814,7 @@ sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value, names:
 		// The names it rewrites live in the transaction's arena (the heap kept
 		// them for good), or in the tree's own when the tree outlives the run.
 		statement := statement
-		if resolve_err := sql_resolve_names(tx, &statement, names.procedure != nil ? names : tx.alloc); resolve_err.kind != .None do return {}, resolve_err
+		if resolve_err := statement_resolve(tx, &statement, query); resolve_err.kind != .None do return {}, resolve_err
 	}
 	// A write with CTEs materializes them for its own life, then runs as a
 	// plain write that reads them by name.
@@ -822,7 +826,7 @@ sql_exec_mutation :: proc(tx: ^Tx, statement: Statement, params: []Value, names:
 			if cte_err.kind != .None do return {}, cte_err
 			cte_scope_bind(tx, &scope, cte.name, table)
 		}
-		return sql_exec_mutation(tx, statement_without_ctes(statement), params, names)
+		return sql_exec_mutation(tx, statement_without_ctes(statement), params, query)
 	}
 	// A write to a table a program's module serves goes to the module.
 	target := ""
@@ -1148,7 +1152,7 @@ prepared_execute :: proc(store: ^Store, prepared: ^Stmt_Prepared, params: []Valu
 	}
 	defer prepared_settle(prepared)
 	// The tree runs again: the names its resolution rewrites live with it.
-	result, exec_err := sql_run_statement(store, prepared.query.statement, params, arena_allocator_guarded(&prepared.query.arena))
+	result, exec_err := sql_run_statement(store, prepared.query.statement, params, &prepared.query)
 	if exec_err.kind != .None do return {}, exec_err
 	if price_err := sql_price(store, &result); price_err.kind != .None do return {}, price_err
 	return result, ERROR_NONE
@@ -1163,7 +1167,7 @@ prepared_execute_in_tx :: proc(tx: ^Tx, prepared: ^Stmt_Prepared, params: []Valu
 		if reprepare_err := prepared_reprepare(tx.store, prepared); reprepare_err.kind != .None do return {}, reprepare_err
 	}
 	defer prepared_settle(prepared, tx)
-	return sql_run_statement_in_tx(tx, prepared.query.statement, params, arena_allocator_guarded(&prepared.query.arena))
+	return sql_run_statement_in_tx(tx, prepared.query.statement, params, &prepared.query)
 }
 
 // --- DESCRIBE --------------------------------------------------------------

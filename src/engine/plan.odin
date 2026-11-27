@@ -306,6 +306,11 @@ Plan_Order :: struct {
 	steps:     []Plan_Step,
 	reordered: bool,
 	cost:      f64,
+	// positions says where each relation runs, by its place in the statement
+	// (the FROM item first, then each join): the executor lays a row's sources
+	// out in execution order, and a linked column names its FROM item
+	// (Column_Binding.from). Set when the order is not the written one.
+	positions: []int,
 }
 
 // plan_join_order decides in which order the relations of a join run. A nested
@@ -443,11 +448,17 @@ plan_ordered_join :: proc(
 	for index, position in best_order {
 		if position != index do reordered = true
 	}
+	positions: []int
+	if reordered {
+		positions = make([]int, len(relations), alloc)
+		copy(positions, position_of)
+	}
 	return Plan_Order {
 		from = relations[best_order[0]].ref,
 		joins = stmt.joins,
 		steps = steps,
 		reordered = reordered,
+		positions = positions,
 	}
 }
 

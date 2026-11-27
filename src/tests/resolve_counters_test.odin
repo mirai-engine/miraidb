@@ -8,8 +8,10 @@ import db "../engine"
 // The line A1 starts from: what a statement run again still works out while it
 // runs (db.Resolve_Counters). Each expectation below that grows with the rows
 // is one a later step of A1 makes a constant, and that step changes it here:
-// columns over several sources (A1.4), functions and collations (A1.5), the
-// view parsed and the plan made per run or per outer row (A1.6, A1.7).
+// a column of an enclosing query, functions and collations, the view parsed
+// and the plan made per run or per outer row (A1.8). A column of the query's
+// own sources is read through the link its resolution made (A1.8b): a join of
+// 100 rows looked 609 names up.
 
 @(private = "file")
 RC_ROWS :: 100
@@ -47,9 +49,10 @@ test_the_names_a_statement_resolves_while_it_runs :: proc(t: ^testing.T) {
 	testing.expect_value(t, one.plans, 1)
 	testing.expectf(t, one.column_names < 20, "one table: %d column lookups", one.column_names)
 
-	// Two tables: every reference of every row is looked up by its name (A1.4).
+	// Two tables: each reference reads the column it is linked to; what is
+	// left is the planner's, once per statement.
 	join := rc_measure(t, store, "SELECT count(*) FROM a JOIN b ON b.a_id = a.id WHERE a.x > 2")
-	testing.expectf(t, join.column_names >= RC_ROWS, "join: %d column lookups", join.column_names)
+	testing.expectf(t, join.column_names < 20, "join: %d column lookups", join.column_names)
 
 	// A function is found by its name at every call (A1.5).
 	call := rc_measure(t, store, "SELECT count(*) FROM a WHERE lower(name) = 'n5'")
@@ -63,8 +66,9 @@ test_the_names_a_statement_resolves_while_it_runs :: proc(t: ^testing.T) {
 	view := rc_measure(t, store, "SELECT count(*) FROM small")
 	testing.expectf(t, view.parses >= 1, "view: %d parses", view.parses)
 
-	// A correlated subquery plans its join order again for every outer row
-	// (A1.6, A1.7).
+	// A correlated subquery looks the enclosing row's column up by name per
+	// inner row, and plans its join order again for every outer row (A1.8).
 	correlated := rc_measure(t, store, "SELECT count(*) FROM a WHERE x >= (SELECT count(*) FROM b WHERE b.a_id = a.id)")
+	testing.expectf(t, correlated.column_names >= RC_ROWS * RC_ROWS, "correlated: %d column lookups", correlated.column_names)
 	testing.expectf(t, correlated.plans >= RC_ROWS, "correlated: %d plans", correlated.plans)
 }

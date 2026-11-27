@@ -135,6 +135,10 @@ Tx :: struct {
 	// (statement_now): every row, default and trigger of one statement sees
 	// the same now, as in SQLite. Zero until a statement asks for it.
 	statement_now_us:    i64,
+	// bindings are the links of the statement running in the transaction
+	// (statement_resolve): every context it makes reads them (eval_context).
+	// A node of another query is outside their block.
+	bindings:            ^Statement_Bindings,
 	// no_triggers loads rows that another connection already wrote (catching up
 	// with a shared SQLite file): its triggers ran there, and must not run twice.
 	no_triggers:         bool,

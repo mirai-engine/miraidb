@@ -101,6 +101,7 @@ Outer_Frame :: struct {
 eval_context :: proc(fields: Eval_Ctx) -> Eval_Ctx {
 	ctx := fields
 	ctx.now_us = statement_now(fields.tx)
+	if ctx.bindings == nil && fields.tx != nil do ctx.bindings = fields.tx.bindings
 	return ctx
 }
 
@@ -118,6 +119,11 @@ Eval_Ctx :: struct {
 	// up again: comparing every column's name, for every reference of every row,
 	// was most of a filtered scan.
 	column_memo: ^map[^Expr]Column_Memo,
+	// bindings are the statement's links (Tx.bindings), and positions where
+	// the plan runs each FROM item (Plan_Order.positions; nil when it runs
+	// them as written): column_bound reads a linked reference through both.
+	bindings:    ^Statement_Bindings,
+	positions:   []int,
 	// using_names are the columns the query's JOIN ... USING (or NATURAL
 	// JOIN) shares: an unqualified one is the join's, not ambiguous.
 	using_names: []string,
@@ -209,11 +215,12 @@ rowid_value :: proc(source: Source) -> (Value, bool) {
 
 // sql_run_query executes a plain query or one prefixed with common table
 // expressions, which are materialized for the life of the statement.
-sql_run_query :: proc(tx: ^Tx, statement: Statement, params: []Value, names: mem.Allocator = {}) -> (Sql_Result, Error) {
+sql_run_query :: proc(tx: ^Tx, statement: Statement, params: []Value, query: ^Query = nil) -> (Sql_Result, Error) {
 	// A name that is not there is refused before a row is read (D37).
 	statement := statement
-	resolve_alloc := names.procedure != nil ? names : tx.alloc
-	if resolve_err := sql_resolve_names(tx, &statement, resolve_alloc); resolve_err.kind != .None do return {}, resolve_err
+	outer_bindings := tx.bindings
+	defer tx.bindings = outer_bindings
+	if resolve_err := statement_resolve(tx, &statement, query); resolve_err.kind != .None do return {}, resolve_err
 	if select_stmt, ok := statement.(Select_Stmt); ok {
 		return sql_exec_select(tx, select_stmt, params)
 	}

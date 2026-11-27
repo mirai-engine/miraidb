@@ -34,6 +34,9 @@ Res_Walk :: struct {
 	// as SQLite allows, while that WHERE (scope where_scope) is walked.
 	where_projections: []Select_Item,
 	where_scope:       int,
+	// bindings, when given, take the column each reference names among its
+	// own query's sources (res_bind_column).
+	bindings: ^Statement_Bindings,
 }
 
 // Res_Scope is one query's relations and the aliases its projections give,
@@ -64,6 +67,10 @@ Res_Source :: struct {
 	// qualified_only is set on an upsert's `excluded`: it answers a name
 	// written with its qualifier, never a bare one.
 	qualified_only: bool,
+	// ident is the schema's identity of a table of the database
+	// (Table_Schema.ident), whose columns are `columns` in their order; 0 for
+	// anything else, which a link does not name.
+	ident:   u32,
 }
 
 @(private)
@@ -76,7 +83,7 @@ Res_Cte :: struct {
 // sql_resolve_names checks every table and column `statement` names against
 // what `tx` sees, and answers the error SQLite gives at prepare for the first
 // one that is not there.
-sql_resolve_names :: proc(tx: ^Tx, statement: ^Statement, alloc := context.allocator) -> Error {
+sql_resolve_names :: proc(tx: ^Tx, statement: ^Statement, alloc := context.allocator, bindings: ^Statement_Bindings = nil) -> Error {
 	if tx == nil || statement == nil do return ERROR_NONE
 	resolve_counted.resolutions += 1
 	// A statement that writes an attached database names that database's
@@ -98,7 +105,7 @@ sql_resolve_names :: proc(tx: ^Tx, statement: ^Statement, alloc := context.alloc
 		reader.attach_target = object
 		return sql_resolve_names(reader, &local, alloc)
 	}
-	walk := Res_Walk{tx = tx, alloc = alloc}
+	walk := Res_Walk{tx = tx, alloc = alloc, bindings = bindings}
 	walk.scopes = make([dynamic]Res_Scope, 0, 4, context.temp_allocator)
 	walk.ctes = make([dynamic]Res_Cte, 0, 2, context.temp_allocator)
 	res_statement(&walk, statement)
@@ -231,7 +238,7 @@ res_internal :: proc(name: string) -> bool {
 res_table_source :: proc(table: ^Table, alias: string) -> Res_Source {
 	columns := make([]string, len(table.schema.columns), context.temp_allocator)
 	for column, i in table.schema.columns do columns[i] = column.name
-	return Res_Source{name = table.schema.name, alias = alias, columns = columns, known = true, table = true, no_rowid = table.schema.without_rowid}
+	return Res_Source{name = table.schema.name, alias = alias, columns = columns, known = true, table = true, no_rowid = table.schema.without_rowid, ident = table.schema.ident}
 }
 
 // res_vtab_source is a program's virtual table: its declared columns, hidden
@@ -529,9 +536,12 @@ res_column :: proc(walk: ^Res_Walk, column: Column_Expr) {
 			if strings.equal_fold(column.table, special) do return
 		}
 		for i := len(walk.scopes) - 1; i >= 0; i -= 1 {
-			for source in walk.scopes[i].sources {
+			for source, from in walk.scopes[i].sources {
 				if !res_source_named(source, column.table) do continue
-				if !source.known || res_has_column(source, column.name) do return
+				if !source.known || res_has_column(source, column.name) {
+					if i == len(walk.scopes) - 1 do res_bind_column(walk, column, source, from)
+					return
+				}
 				res_no_column(walk, column)
 				return
 			}
@@ -547,19 +557,28 @@ res_column :: proc(walk: ^Res_Walk, column: Column_Expr) {
 		// A real column wins over a row id's name (rowid, oid, _rowid_) and a
 		// full-text table's own names: only one of a kind can be ambiguous.
 		matches, real := 0, 0
-		for source in scope.sources {
+		found_at := -1
+		for source, from in scope.sources {
 			if source.qualified_only do continue
 			if !source.known do return
 			if !res_has_column(source, column.name) do continue
 			matches += 1
 			for name in source.columns do if strings.equal_fold(name, column.name) {
 				real += 1
+				found_at = from
 				break
 			}
 		}
 		if real > 0 do matches = real
 		for alias in scope.aliases do if strings.equal_fold(alias, column.name) do return
 		if matches == 0 do continue
+		// One source has the name, of its own query, not shared by a join: the
+		// run reads that source's column.
+		if i == len(walk.scopes) - 1 && real == 1 && matches == 1 && !scope.natural {
+			shared := false
+			for name in scope.shared do if strings.equal_fold(name, column.name) do shared = true
+			if !shared do res_bind_column(walk, column, scope.sources[found_at], found_at)
+		}
 		// Two relations of one query that both have the name make it ambiguous
 		// at prepare, as in SQLite; a USING or NATURAL column is the join's.
 		if matches > 1 && walk.tx.store.sqlite_names && !scope.natural && walk.err.kind == .None {
@@ -1015,4 +1034,21 @@ relation_columns :: proc(tx: ^Tx, ref: ^Table_Ref) -> ([]string, bool) {
 		return names[:], true
 	}
 	return source.columns, true
+}
+
+// res_bind_column links a reference to the column of `source` it names, the
+// FROM item `from` of its own query (Statement_Bindings), when the source is a
+// table of the database and the name one of its columns (not its rowid, rank
+// or own name).
+@(private)
+res_bind_column :: proc(walk: ^Res_Walk, column: Column_Expr, source: Res_Source, from: int) {
+	bindings := walk.bindings
+	if bindings == nil || source.ident == 0 || column.id <= bindings.base || from > int(max(u16)) do return
+	local := column.id - bindings.base
+	if local >= Node_Id(len(bindings.columns)) do return
+	for name, position in source.columns {
+		if !strings.equal_fold(name, column.name) do continue
+		bindings.columns[local] = Column_Binding{ident = source.ident, from = u16(from), column = i32(position)}
+		return
+	}
 }

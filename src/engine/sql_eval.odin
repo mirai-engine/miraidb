@@ -46,6 +46,11 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 			if value, ok := outer_column(ctx, e.name, e.table); ok do return value, ERROR_NONE
 			return value_null(), ERROR_NONE
 		}
+		// The column the resolution linked the reference to, read in place.
+		if source, column, bound := column_bound(ctx, e.id); bound {
+			if column >= len(source.row.values) do return value_null(), ERROR_NONE
+			return source.row.values[column], ERROR_NONE
+		}
 		if len(e.table) > 0 {
 			// Inside a trigger body NEW and OLD name the rows of the event.
 			if ctx.tx != nil && ctx.tx.trigger_active {
@@ -1401,6 +1406,10 @@ column_collation :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (string, bool) {
 	if collate, ok := operand^.(Collate_Expr); ok do operand = collate.operand
 	column, ok := operand^.(Column_Expr)
 	if !ok do return "", false
+	if source, index, bound := column_bound(ctx, column.id); bound {
+		collation := source.table.schema.columns[index].collation
+		return collation, len(collation) > 0
+	}
 	if source, index, single := single_source_column(ctx, operand, column); single {
 		collation := source.table.schema.columns[index].collation
 		return collation, len(collation) > 0
@@ -1435,6 +1444,9 @@ column_affinity :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> Column_Affinity {
 	if collate, ok := operand^.(Collate_Expr); ok do operand = collate.operand
 	column, ok := operand^.(Column_Expr)
 	if !ok do return .None
+	if source, index, bound := column_bound(ctx, column.id); bound {
+		return declared_affinity(source.table.schema.columns[index].type)
+	}
 	if source, index, single := single_source_column(ctx, operand, column); single {
 		return declared_affinity(source.table.schema.columns[index].type)
 	}

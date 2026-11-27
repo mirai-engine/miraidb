@@ -932,6 +932,9 @@ Query :: struct {
 	// (Node_Id): its nodes are node_base + 1 .. node_base + node_count.
 	node_base:  Node_Id,
 	node_count: Node_Id,
+	// bindings are the links its resolution made (statement_resolve), in the
+	// query's arena.
+	bindings:   Statement_Bindings,
 }
 
 query_destroy :: proc(q: ^Query) {
