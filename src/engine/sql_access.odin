@@ -746,7 +746,7 @@ eval_key :: proc(tx: ^Tx, expr: ^Expr, params: []Value, column: Column) -> (Valu
 	if reference.id <= bindings.base do return {}, false
 	local := reference.id - bindings.base
 	if local >= Node_Id(len(bindings.columns)) || bindings.columns[local].scope == 0 do return {}, false
-	ctx := Eval_Ctx{tx = tx, outer = tx.outer, bindings = bindings}
+	ctx := eval_context(Eval_Ctx{tx = tx, outer = tx.outer, bindings = bindings})
 	source, index, bound := column_bound(&ctx, reference.id)
 	if !bound do return {}, false
 	outer := source.table.schema.columns[index]
