@@ -264,6 +264,9 @@ def build_gates(args: argparse.Namespace) -> list[Gate]:
     # An index is one structure behind its contract (A2): what reaches into one
     # from outside its module is counted, and may only go down.
     gates.append(Gate("index boundary", [sys.executable, "scripts/index_boundary.py"]))
+    # What recomputes a commit's changes instead of reading them, held to a
+    # baseline that only goes down (A3).
+    gates.append(Gate("change consumers", [sys.executable, "scripts/change_consumers.py"]))
     return gates
 
 

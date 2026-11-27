@@ -257,14 +257,22 @@ rows ordered by `Row_Id`, which keeps unsorted output deterministic.
 ### Commit protocol
 
 1. Compute the new commit sequence (`commit_seq + 1`).
-2. Build the operation list in a deterministic order: create tables, then per
-   table (truncate, deletes sorted by id, updates sorted by id, inserts sorted by
-   id), then drops.
+2. Build the operation list (`tx_build_ops`) in a deterministic order: the
+   tables dropped, created and altered, each kind by name; then each table by
+   name (truncate, deletes, updates and inserts, each by id); then the index
+   DDL in the order it was staged. Two stores that run the same transaction
+   list the same operations, byte for byte (`test_two_stores_publish_the_same_changes`).
 3. Encode the operations into one payload.
 4. Append one log record and, if durable, `fsync`.
 5. Apply the operations to the committed state, in order.
 6. Set `commit_seq`.
-7. Release the lock and run the commit hook (subscriptions).
+7. Release the lock and run the commit hook (subscriptions) with a copy of the
+   list (`Op_Copy`): its names, values, schemas and indexes in an arena of its
+   own, since the transaction's memory is gone by then. The list is the
+   commit: applied to a copy of the state before it, it gives the state after
+   it (`test_a_commit_is_reproduced_from_its_list_of_changes`).
+   `scripts/change_consumers.py` counts the consumers that still recompute
+   what a commit changed instead of reading the list.
 
 If step 5 fails, the log is rewound to the size it had before step 4, so a
 transaction is never half-present in the log. Staged values live in a
