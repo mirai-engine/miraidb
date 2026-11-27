@@ -6,9 +6,11 @@ memory tree, the integer accelerator, the equality map and the pages are its
 own business. Two things are counted in the engine's files outside the
 index's module:
 
-- fields: a structure field of `Index` (`tree`, `pages`, `lookup`, `ints`,
-  `int_keyed`) read or written, on `indexes[...]` or on a name bound to an
-  element of `.indexes` in the same file, table.odin included;
+- fields: a structure field of `Index` (`backend`, `lookup`, and the
+  backends' `tree`, `pages`, `ints`, `int_keyed`) read or written, on
+  `indexes[...]` or on a name bound to an element of `.indexes` in the same
+  file, table.odin included. Its `exprs` is not counted: an `Index_Schema` has
+  an `exprs` too, the texts, and a name does not say which it is;
 - table indexes: `.indexes[...]` on a table, which is a `[]Index`. The
   `indexes` of a `Table_Schema` and of the other catalog records are
   `[]Index_Schema`, metadata, and do not count; neither do `schema` and
@@ -35,7 +37,7 @@ ENGINE = "src/engine"
 MODULE = {"int_keys.odin"}
 BASELINE = {"fields": 0, "table indexes": 0}
 
-FIELDS = r"(?:tree|pages|lookup|ints|int_keyed)"
+FIELDS = r"(?:tree|pages|lookup|ints|int_keyed|backend)"
 # A name bound to an element of `.indexes`: `for index in t.indexes`,
 # `for &index in ...`, `candidate := &table.indexes[i]`.
 BIND_RE = re.compile(
