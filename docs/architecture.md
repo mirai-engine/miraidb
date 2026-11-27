@@ -294,17 +294,30 @@ parses again too, and leaves the tree stale for the next run. What a
 resolution writes into a kept tree lives in the tree's own arena: the
 transaction's is freed at the end of the run.
 
-The pieces a resolved statement will link by are in place (A1.8). The parser
-numbers every node a resolution links (`Column_Expr`, `Call_Expr`,
-`Binary_Expr`) from 1 to `Query.node_count`, building them in their own small
-constructors (`node_call`, `node_column`): built in place, each was a
-temporary the size of an `Expr` in the frame of a parse function that recurses
-through parentheses, and an unoptimized build ran out of stack right at
-`MAX_EXPRESSION_DEPTH`. A node made elsewhere (a rewrite, an expansion of `*`)
-is 0. And a table's schema has an identity (`Table_Schema.ident`): a new one
-when the table is made (CREATE, ALTER, replay), the same one in a copy of it
-(copy-on-write, a reader's snapshot), so a link can name a schema without
-holding a pointer a copy changes.
+A statement's resolution also links what it works out to the tree, so a run
+reads it instead of working it out per row (the resolved statement, A1.8;
+`bindings.odin`). The parser numbers every node a resolution links
+(`Column_Expr`, `Call_Expr`, `Binary_Expr`) within a block of numbers of the
+query's own (`Query.node_base`, from a process-wide counter), so a node of
+another query evaluated inside the statement (a policy, a CHECK, a view) has
+no link in it. It builds them in small constructors (`node_call`,
+`node_column`): built in place, each was a temporary the size of an `Expr` in
+the frame of a parse function that recurses, and an unoptimized build ran out
+of stack right at `MAX_EXPRESSION_DEPTH`.
+
+A column reference to the query's own sources is linked to `{from, column,
+ident}`: the FROM item it names in the written order, the column's position,
+and the schema's identity (`Table_Schema.ident`: new when the table is made,
+kept by a copy of it, so a link names a schema without a pointer a
+copy-on-write changes). The links live in the query's arena
+(`Query.bindings`) and are the transaction's while the statement runs
+(`Tx.bindings`, which every `eval_context` reads). A run reads a linked column
+with `column_bound`: the FROM item's position in the order the plan runs it
+(`Plan_Order.positions`), and the value if the source there has the schema
+the link names. Anything else — a reference to an enclosing query's row, a
+view's or a CTE's column, a hidden column, a column USING shares, a source not
+bound yet — has no link or fails the check and is looked up by name as
+before, so a link never answers another column's value.
 
 A query binds sources: `Source` pairs a table with one of its rows and an
 optional alias. Single-table statements build a one-source context; a join
