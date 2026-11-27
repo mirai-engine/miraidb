@@ -134,11 +134,7 @@ collation_compare :: proc(store: ^Store, name: string, a: string, b: string) -> 
 	if len(name) == 0 || strings.equal_fold(name, "binary") {
 		return text_compare(a, b), true
 	}
-	if strings.equal_fold(name, "nocase") {
-		left := strings.to_lower(a, context.temp_allocator)
-		right := strings.to_lower(b, context.temp_allocator)
-		return text_compare(left, right), true
-	}
+	if strings.equal_fold(name, "nocase") do return nocase_compare(a, b), true
 	if strings.equal_fold(name, "rtrim") {
 		left := strings.trim_right(a, " ")
 		right := strings.trim_right(b, " ")
