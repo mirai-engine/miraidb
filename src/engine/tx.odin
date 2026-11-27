@@ -2572,9 +2572,10 @@ tx_commit :: proc(tx: ^Tx) -> Error {
 	// The staged values die with the transaction, so the hook and the mirror get
 	// a copy - and only they do: a store nobody watches skips the copy of every
 	// value it just wrote.
-	notify_ops: []Store_Op
-	if notify != nil || len(store.sqlite_mirror) > 0 do notify_ops = tx_clone_ops(ops)
-	defer if notify_ops != nil do tx_free_ops(notify_ops)
+	copied: Op_Copy
+	if notify != nil || len(store.sqlite_mirror) > 0 do copied = tx_clone_ops(ops)
+	defer tx_free_ops(&copied)
+	notify_ops := copied.ops
 	// A TEMP table is not in the file: the mirror hears only the rest. A temp
 	// table's write used to reach it as an unknown table and rewrite the whole
 	// file at every commit.
@@ -2640,14 +2641,41 @@ tx_commit :: proc(tx: ^Tx) -> Error {
 }
 
 @(private)
-tx_clone_ops :: proc(ops: []Store_Op) -> []Store_Op {
-	out := make([]Store_Op, len(ops))
+// Op_Copy is a commit's changes copied out of its transaction, which frees
+// what they point at when it ends: every name, value, schema and index of the
+// copy is in its own arena. The copy kept the names and the values only, and a
+// Create_Table's or an Alter_Table's schema still pointed into the
+// transaction's memory once it was gone (A3).
+Op_Copy :: struct {
+	ops:   []Store_Op,
+	arena: ^virtual.Arena,
+}
+
+tx_clone_ops :: proc(ops: []Store_Op) -> Op_Copy {
+	arena := new(virtual.Arena)
+	if virtual.arena_init_growing(arena) != .None {
+		free(arena)
+		return {}
+	}
+	alloc := arena_allocator_guarded(arena)
+	out := make([]Store_Op, len(ops), alloc)
 	for op, i in ops {
 		out[i] = op
-		out[i].name = strings.clone(op.name)
-		out[i].values = clone_values(op.values)
+		out[i].name = strings.clone(op.name, alloc)
+		if len(op.values) > 0 {
+			values := make([]Value, len(op.values), alloc)
+			for value, v in op.values do values[v] = value_clone(value, alloc)
+			out[i].values = values
+		}
+		#partial switch op.kind {
+		case .Create_Table, .Alter_Table:
+			schema := op.schema
+			out[i].schema = schema_copy(&schema, alloc)
+		case .Create_Index, .Drop_Index:
+			out[i].index = schema_index_copy(op.index, alloc)
+		}
 	}
-	return out
+	return Op_Copy{ops = out, arena = arena}
 }
 
 @(private)
@@ -2659,12 +2687,12 @@ tx_op_is_ephemeral :: proc(tx: ^Tx, op: Store_Op) -> bool {
 }
 
 @(private)
-tx_free_ops :: proc(ops: []Store_Op) {
-	for op in ops {
-		delete(op.name)
-		free_values(op.values)
+tx_free_ops :: proc(copied: ^Op_Copy) {
+	if copied.arena != nil {
+		virtual.arena_destroy(copied.arena)
+		free(copied.arena)
 	}
-	delete(ops)
+	copied^ = {}
 }
 
 @(private)
@@ -2791,6 +2819,7 @@ tx_encode_ops :: proc(ops: []Store_Op) -> []u8 {
 Prepared_Tx :: struct {
 	ops:     []Store_Op,
 	payload: []u8,
+	copied:  Op_Copy,
 }
 
 // tx_prepare closes the transaction and returns its operations. The caller owns
@@ -2813,14 +2842,15 @@ tx_prepare :: proc(tx: ^Tx) -> (^Prepared_Tx, Error) {
 	delete(ops)
 	tx_discard(tx)
 	prepared := new(Prepared_Tx)
-	prepared.ops = stable
+	prepared.ops = stable.ops
+	prepared.copied = stable
 	prepared.payload = payload
 	return prepared, ERROR_NONE
 }
 
 prepared_destroy :: proc(prepared: ^Prepared_Tx) {
 	if prepared == nil do return
-	tx_free_ops(prepared.ops)
+	tx_free_ops(&prepared.copied)
 	delete(prepared.payload)
 	free(prepared)
 }
