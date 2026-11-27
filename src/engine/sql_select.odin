@@ -577,7 +577,18 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 	// order of `SELECT *` stays the written one (star_sources below reads the
 	// statement), so only what is executed moves.
 	exec := stmt
-	order := plan_join_order(tx.store, tx, stmt, params)
+	// A select's plan is kept for its statement: a subquery run for every row
+	// of the query around it plans once.
+	order: Plan_Order
+	if planned, kept := tx.select_plans[stmt.id]; kept && stmt.id != 0 {
+		order = planned
+	} else {
+		order = plan_join_order(tx.store, tx, stmt, params)
+		if stmt.id != 0 {
+			if tx.select_plans == nil do tx.select_plans = make(map[Node_Id]Plan_Order, 4, tx.alloc)
+			tx.select_plans[stmt.id] = order
+		}
+	}
 	if order.reordered {
 		exec.from = order.from
 		exec.joins = order.joins

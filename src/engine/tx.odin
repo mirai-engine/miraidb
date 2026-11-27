@@ -139,6 +139,10 @@ Tx :: struct {
 	// (statement_resolve): every context it makes reads them (eval_context).
 	// A node of another query is outside their block.
 	bindings:            ^Statement_Bindings,
+	// select_plans are the join plans of the selects of the running
+	// statement, by their number (Select_Stmt.id): a subquery run for every
+	// row of the query around it plans once (A1.8g).
+	select_plans:        map[Node_Id]Plan_Order,
 	// catalog_seen is the catalog generation (store_catalog_generation) the
 	// transaction began at, read under the store's lock with its view of the
 	// catalog: a tree resolved in it holds for another transaction that began

@@ -472,6 +472,8 @@ sql_run_statement_in_tx :: proc(tx: ^Tx, statement: Statement, params: []Value, 
 	if tx.trigger_depth == 0 {
 		page_failure_clear()
 		tx.statement_now_us = 0
+		// A plan holds for the statement it was made for.
+		if tx.select_plans != nil do clear(&tx.select_plans)
 	}
 	previous := aggregate_scope_enter(tx.store)
 	defer aggregate_scope_leave(previous)
