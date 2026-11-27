@@ -2867,6 +2867,15 @@ tx_prepare :: proc(tx: ^Tx) -> (^Prepared_Tx, Error) {
 		tx_discard(tx)
 		return nil, errf(.Transaction_Read_Only, "a read transaction cannot be prepared")
 	}
+	// A group commit publishes what each transaction changed (store_publish),
+	// and does nothing else tx_commit does around the apply: a commit hook that
+	// may refuse it, a .sqlite file kept current, virtual tables that commit
+	// their part. A transaction that needs one commits by itself; it used to be
+	// grouped and skip them.
+	if tx.store.hooks.commit != nil || len(tx.store.sqlite_mirror) > 0 || len(tx.vtabs_written) > 0 {
+		tx_discard(tx)
+		return nil, errf(.Sql_Unsupported, "a transaction with a commit hook, a .sqlite file or virtual tables commits by itself, not in a group")
+	}
 	ops := tx_build_ops(tx)
 	temp := make([]bool, len(ops), context.temp_allocator)
 	logged: [dynamic]Store_Op

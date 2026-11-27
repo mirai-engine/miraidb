@@ -733,4 +733,10 @@ survives `COMMIT_QUEUE_AGING` (16) drains competes at the highest priority, so a
 steady stream of urgent work cannot starve background writes: the wait of any
 entry is bounded, and `commit_queue_stats` reports how many were promoted.
 Draining a batch hands it to `store_commit_prepared`, which appends every record
-and syncs the log once, so a batch costs one fsync instead of one per commit.
+and syncs the log once, so a batch costs one fsync instead of one per commit:
+64 one-row durable commits took 59 µs each in a group and 870-980 µs each on
+their own (2026-11-27). Each transaction of the group is published as a commit
+is (`store_publish`), with its own sequence. A transaction that needs what only
+a commit of its own runs (a commit hook that may refuse it, a `.sqlite` file
+kept current, virtual tables) is refused by `tx_prepare`; it used to be grouped
+and skip them.

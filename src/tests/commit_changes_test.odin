@@ -194,3 +194,75 @@ test_two_stores_publish_the_same_changes :: proc(t: ^testing.T) {
 		testing.expectf(t, slice.equal(payload, recorders[1].payloads[i]), "commit %d: the two stores listed different changes", i + 1)
 	}
 }
+
+@(private = "file")
+Published :: struct {
+	seqs:   [dynamic]u64,
+	tables: [dynamic]string,
+}
+
+@(private = "file")
+note_published :: proc(ctx: rawptr, store: ^db.Store, changes: ^db.Commit_Changes) {
+	published := (^Published)(ctx)
+	append(&published.seqs, changes.seq)
+	for op in changes.ops do if op.kind == .Create_Table do append(&published.tables, strings.clone(op.schema.name))
+}
+
+// A group commit publishes each of its transactions as a commit does, through
+// the same step: its sequence, and its changes with their schemas, which a
+// Create_Table's still pointed into the transaction freed before the apply
+// read them. A transaction that needs what only a commit of its own runs (a
+// commit hook here) is refused a place in a group.
+@(test)
+test_a_group_commit_publishes_each_transaction :: proc(t: ^testing.T) {
+	store, err := db.store_open("", {persistent = false})
+	if !testing.expectf(t, db.error_ok(err), "open: %s", err.message) do return
+	defer db.store_close(store)
+	run_done(t, store, "CREATE TABLE kept (n INTEGER)")
+	published: Published
+	defer {
+		for name in published.tables do delete(name)
+		delete(published.tables)
+		delete(published.seqs)
+	}
+	store.on_commit = note_published
+	store.on_commit_ctx = &published
+	first := db.tx_begin_write(store)
+	created, create_err := db.sql_execute_in_tx(first, "CREATE TABLE fresh (n INTEGER)")
+	db.sql_result_destroy(&created)
+	testing.expect(t, db.error_ok(create_err))
+	inserted, insert_err := db.sql_execute_in_tx(first, "INSERT INTO fresh VALUES (1)")
+	db.sql_result_destroy(&inserted)
+	testing.expect(t, db.error_ok(insert_err))
+	prepared_first, first_err := db.tx_prepare(first)
+	if !testing.expectf(t, db.error_ok(first_err), "prepare: %s", first_err.message) do return
+	second := db.tx_begin_write(store)
+	more, more_err := db.sql_execute_in_tx(second, "INSERT INTO kept VALUES (2)")
+	db.sql_result_destroy(&more)
+	testing.expect(t, db.error_ok(more_err))
+	prepared_second, second_err := db.tx_prepare(second)
+	if !testing.expectf(t, db.error_ok(second_err), "prepare: %s", second_err.message) do return
+	before := store.commit_seq
+	_, commit_err := db.store_commit_prepared(store, []^db.Prepared_Tx{prepared_first, prepared_second})
+	db.prepared_destroy(prepared_first)
+	db.prepared_destroy(prepared_second)
+	store.on_commit = nil
+	if !testing.expectf(t, db.error_ok(commit_err), "group commit: %s", commit_err.message) do return
+	testing.expect_value(t, len(published.seqs), 2)
+	if len(published.seqs) == 2 {
+		testing.expect_value(t, published.seqs[0], before + 1)
+		testing.expect_value(t, published.seqs[1], before + 2)
+	}
+	testing.expect(t, len(published.tables) == 1 && published.tables[0] == "fresh")
+	testing.expect_value(t, scalar(t, store, "SELECT n FROM fresh").i, 1)
+	testing.expect_value(t, scalar(t, store, "SELECT n FROM kept").i, 2)
+
+	refuse :: proc(ctx: rawptr) -> bool { return false }
+	store.hooks.commit = refuse
+	hooked := db.tx_begin_write(store)
+	_, hooked_err := db.tx_prepare(hooked)
+	testing.expect_value(t, hooked_err.kind, db.Error_Kind.Sql_Unsupported)
+	db.error_free(&hooked_err)
+	store.hooks.commit = nil
+}
+
