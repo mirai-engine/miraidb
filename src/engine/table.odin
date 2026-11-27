@@ -594,8 +594,8 @@ append_be_u64 :: proc(w: ^Byte_Writer, v: u64) {
 table_primary_key_index :: proc(t: ^Table) -> (int, bool) {
 	if len(t.schema.primary_key) == 0 do return -1, false
 	for i in 0 ..< len(t.indexes) {
-		if t.indexes[i].schema.unique && index_is_plain(t.indexes[i].schema) &&
-		   schema_index_matches(&t.indexes[i].schema, t.schema.primary_key) {
+		index := table_index_schema(t, i)
+		if index.unique && index_is_plain(index^) && schema_index_matches(index, t.schema.primary_key) {
 			return i, true
 		}
 	}
@@ -639,7 +639,7 @@ table_check_unique :: proc(t: ^Table, values: []Value, ignore: Row_Id = Row_Id(m
 // over an expression.
 unique_violation :: proc(t: ^Table, i: int) -> Error {
 	kind := index_is_primary(t, i) ? Error_Kind.Duplicate_Primary_Key : Error_Kind.Duplicate_Unique
-	index := t.indexes[i].schema
+	index := table_index_schema(t, i)
 	for expr in index.exprs {
 		if len(expr) > 0 do return errf(kind, "UNIQUE constraint failed: index '%s'", index.name)
 	}
@@ -656,7 +656,7 @@ unique_violation :: proc(t: ^Table, i: int) -> Error {
 @(private)
 index_is_primary :: proc(t: ^Table, index: int) -> bool {
 	if len(t.schema.primary_key) == 0 do return false
-	return schema_index_matches(&t.indexes[index].schema, t.schema.primary_key)
+	return schema_index_matches(table_index_schema(t, index), t.schema.primary_key)
 }
 
 // --- Maintenance -----------------------------------------------------------

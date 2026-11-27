@@ -940,6 +940,13 @@ table_largest_int_indexed :: proc(t: ^Table, column: int, skip: proc(id: Row_Id,
 
 // --- What the rest of the engine asks an index -------------------------------
 
+// table_index_schema is what the index at `index` of `t` is: its name, its
+// columns, its method and whether it is unique. Reading it is the catalog's
+// business; the keys behind it are the index's.
+table_index_schema :: #force_inline proc "contextless" (t: ^Table, index: int) -> ^Index_Schema {
+	return &t.indexes[index].schema
+}
+
 // index_applied_seq is the commit a paged index's file was last written at;
 // false for a memory index, whose keys are rebuilt from the rows.
 index_applied_seq :: proc(index: ^Index) -> (seq: u64, paged: bool) {

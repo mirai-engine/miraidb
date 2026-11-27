@@ -2096,7 +2096,7 @@ tx_drop_index :: proc(tx: ^Tx, table_name: string, name: string) -> Error {
 unique_key :: proc(tx: ^Tx, table: ^Table, index: int, values: []Value) -> string {
 	// Encoded straight into the transaction arena: one bump allocation, where the
 	// key used to go through a heap buffer, a heap copy and a concatenation.
-	name := table.indexes[index].schema.name
+	name := table_index_schema(table, index).name
 	w := Byte_Writer{data = make([dynamic]u8, 0, len(name) + 40, tx.alloc)}
 	append(&w.data, ..transmute([]u8)name)
 	append(&w.data, 0)
@@ -2249,7 +2249,7 @@ tx_staged_index_key :: proc(table: ^Table, index: Index_Schema, exprs: ^Index_Ex
 // index_host_collated reports an index over a column whose collation is a
 // program's.
 index_host_collated :: proc(store: ^Store, table: ^Table, index: int) -> bool {
-	for column in table.indexes[index].schema.columns {
+	for column in table_index_schema(table, index).columns {
 		if column >= 0 && column < len(table.schema.columns) && column_host_collated(store, table.schema.columns[column]) do return true
 	}
 	return false
@@ -2268,7 +2268,7 @@ tx_host_key_taken :: proc(tx: ^Tx, name: string, table: ^Table, index: int, valu
 	for row in rows {
 		if row.id == ignore do continue
 		same := true
-		for column in table.indexes[index].schema.columns {
+		for column in table_index_schema(table, index).columns {
 			a, b := values[column], row.values[column]
 			collation := table.schema.columns[column].collation
 			if a.kind == .String && b.kind == .String && len(collation) > 0 {
@@ -2300,7 +2300,7 @@ tx_host_key_holders :: proc(tx: ^Tx, name: string, table: ^Table, index: int, va
 	}
 	for row in rows {
 		same := true
-		for column in table.indexes[index].schema.columns {
+		for column in table_index_schema(table, index).columns {
 			a, b := values[column], row.values[column]
 			collation := table.schema.columns[column].collation
 			if a.kind == .String && b.kind == .String && len(collation) > 0 {

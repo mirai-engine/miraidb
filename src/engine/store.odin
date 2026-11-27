@@ -1514,7 +1514,7 @@ store_table_open_paged :: proc(store: ^Store, entry: ^Catalog_Entry, seq: u64) -
 		}
 		if page_seq, paged := index_applied_seq(&table.indexes[i]); paged && page_seq != seq {
 			table_destroy(table)
-			return nil, errf(.Io, "index %s is at sequence %d, not %d", table.indexes[i].schema.name, page_seq, seq)
+			return nil, errf(.Io, "index %s is at sequence %d, not %d", table_index_schema(table, i).name, page_seq, seq)
 		}
 	}
 	table.next_row_id = entry.next_row_id

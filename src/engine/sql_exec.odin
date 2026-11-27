@@ -1468,7 +1468,7 @@ sql_exec_explain :: proc(tx: ^Tx, stmt: Explain_Stmt, params: []Value) -> (Sql_R
 					append(&lines, fmt.aprintf(
 						"join %s using index %s (nested loop, est. %d rows)",
 						step.name,
-						inner_table.indexes[probe.index].schema.name,
+						table_index_schema(inner_table, probe.index).name,
 						step.rows,
 					))
 					continue
@@ -1491,7 +1491,7 @@ sql_exec_explain :: proc(tx: ^Tx, stmt: Explain_Stmt, params: []Value) -> (Sql_R
 				if index, _, ordered_ok := index_order_for(tx, ordered_table, order.from, inner); ordered_ok {
 					append(&lines, fmt.aprintf(
 						"order by (index %s)",
-						ordered_table.indexes[index].schema.name,
+						table_index_schema(ordered_table, index).name,
 					))
 					ordered = true
 				}
@@ -1687,7 +1687,7 @@ explain_access :: proc(
 	if access.kind == .Index && access.index >= 0 && access.index < len(table.indexes) {
 		return fmt.aprintf(
 			" using index %s (est. %d rows, cost %.1f)",
-			table.indexes[access.index].schema.name,
+			table_index_schema(table, access.index).name,
 			access.rows,
 			access.cost,
 		)
