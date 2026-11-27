@@ -791,3 +791,25 @@ bin/parity.exe disk
 python scripts/parity.py            # the gate
 python scripts/parity.py --record   # after a change that makes it faster
 ```
+
+## Index methods: the equality map of HASH and DIRECT (A2.2, 2026-11-27)
+
+A `HASH` or `DIRECT` index keeps its B+tree and adds an equality map
+(`Index.lookup`) beside it. Measured on 50 000 rows of a memory table, one index
+on `k`, each figure the median of 5 runs, two runs that agree:
+
+| Key | Insert, BTREE | Insert, HASH | `table_index_lookup`, BTREE | `table_index_lookup`, HASH | `SELECT v FROM t WHERE k = ?` |
+|---|---:|---:|---:|---:|---|
+| integer | 1.85 µs | 2.57 µs (+39%) | 0.69 µs | 0.50 µs (−27%) | the same (12–13 µs) |
+| text, 8 bytes | 2.1 µs | 3.0 µs (+42%) | 0.88 µs | 0.74 µs (−15%) | the same (13 µs) |
+| text, 208 bytes | 3.1 µs | 5.1 µs (+62%) | 2.36 µs | 1.75 µs (−26%) | the same (15 µs) |
+
+- The map answers `table_index_lookup` alone: the checks a write makes by key
+  (uniqueness, foreign keys, integrity, an upsert's conflict). A `SELECT` by
+  equality reads the tree (`table_index_scan_prefix`) whatever the method, so it
+  gains nothing.
+- A `UNIQUE` index over one column files integer keys by hash already
+  (`Index.ints`, R2), whatever its method, and `table_index_lookup` asks that
+  first: on an integer `DIRECT` index the map is not reached.
+- Kept as it is: it becomes the memory backend's accelerator when the index
+  contract lands (A2.3), and is audited again once the engine is more mature.

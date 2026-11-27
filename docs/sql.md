@@ -138,6 +138,15 @@ CREATE UNIQUE INDEX by_code ON t USING DIRECT (code); -- unique, one row per key
 CREATE INDEX by_id ON t (id);                        -- btree, the default
 ```
 
+Every index keeps its B+tree, which is what a `SELECT`, a range and an `ORDER BY`
+read, whatever the method. `HASH` and `DIRECT` add an equality map beside it in a
+memory table: it answers the checks a write makes by key (a unique key, a foreign
+key, an upsert's conflict) a little faster, and every write to the table pays to
+keep it. Measured on 50 000 rows (`benchmarks/parity/RESULTS.md`): the check
+12–28 % faster, the insert 39–62 % slower, an equality `SELECT` the same. A
+`UNIQUE` index over one column already files integer keys by hash, whatever its
+method. Use `HASH` for a table looked up by key far more often than written.
+
 ## Correlated subqueries and LATERAL
 
 A subquery may read a column of the statement it is written in. The column it
