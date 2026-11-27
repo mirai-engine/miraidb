@@ -266,9 +266,12 @@ rows ordered by `Row_Id`, which keeps unsorted output deterministic.
 4. Append one log record and, if durable, `fsync`.
 5. Apply the operations to the committed state, in order.
 6. Set `commit_seq`.
-7. Release the lock and run the commit hook (subscriptions) with a copy of the
-   list (`Op_Copy`): its names, values, schemas and indexes in an arena of its
-   own, since the transaction's memory is gone by then. The list is the
+7. Release the lock and publish what the commit changed (`store_publish`):
+   `Store.on_commit` gets a `Commit_Changes`, the commit's sequence, its list
+   and which changes are a TEMP table's, in a copy of its own (`Op_Copy`: the
+   names, values, schemas and indexes in one arena, since the transaction's
+   memory is gone by then). The `.sqlite` mirror takes the same list without
+   the TEMP changes (`commit_changes_durable`). The list is the
    commit: applied to a copy of the state before it, it gives the state after
    it (`test_a_commit_is_reproduced_from_its_list_of_changes`).
    `scripts/change_consumers.py` counts the consumers that still recompute

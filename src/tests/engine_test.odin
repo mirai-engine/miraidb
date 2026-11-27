@@ -3394,9 +3394,9 @@ test_commit_ops_hook :: proc(t: ^testing.T) {
 	defer cleanup_db(store, "opshook")
 
 	seen: ^[3]int = &{0, 0, 0}
-	hook :: proc(ctx: rawptr, store: ^db.Store, ops: []db.Store_Op) {
+	hook :: proc(ctx: rawptr, store: ^db.Store, changes: ^db.Commit_Changes) {
 		counters := (^[3]int)(ctx)
-		for op in ops {
+		for op in changes.ops {
 			// The stream carries the engine's own tables too (the CREATE text).
 			if op.name != "t" do continue
 			#partial switch op.kind {

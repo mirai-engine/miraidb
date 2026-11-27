@@ -2567,26 +2567,20 @@ tx_commit :: proc(tx: ^Tx) -> Error {
 	if started_us > 0 do store_record_commit_latency(tx.store, committed_us - started_us)
 	if has_log_record do tx.store.commit_seq = next_seq
 	notify := tx.store.on_commit
-	notify_ctx := tx.store.on_commit_ctx
 	store := tx.store
 	// The staged values die with the transaction, so the hook and the mirror get
 	// a copy - and only they do: a store nobody watches skips the copy of every
 	// value it just wrote.
-	copied: Op_Copy
-	if notify != nil || len(store.sqlite_mirror) > 0 do copied = tx_clone_ops(ops)
-	defer tx_free_ops(&copied)
-	notify_ops := copied.ops
+	changes: Commit_Changes
+	if notify != nil || len(store.sqlite_mirror) > 0 do changes = commit_changes_make(ops, ephemeral)
+	changes.seq = store.commit_seq
+	defer commit_changes_free(&changes)
+	notify_ops := changes.ops
 	// A TEMP table is not in the file: the mirror hears only the rest. A temp
 	// table's write used to reach it as an unknown table and rewrite the whole
 	// file at every commit.
 	mirror_ops := notify_ops
-	if len(store.sqlite_mirror) > 0 && notify_ops != nil {
-		kept := make([dynamic]Store_Op, 0, len(notify_ops), context.temp_allocator)
-		for op, i in notify_ops {
-			if !ephemeral[i] do append(&kept, op)
-		}
-		mirror_ops = kept[:]
-	}
+	if len(store.sqlite_mirror) > 0 && notify_ops != nil do mirror_ops = commit_changes_durable(&changes, context.temp_allocator)
 	// The engine's part is durable: the virtual tables commit theirs.
 	if len(tx.vtabs_written) > 0 {
 		tx.vtabs_done = true
@@ -2632,9 +2626,7 @@ tx_commit :: proc(tx: ^Tx) -> Error {
 		}
 		store_note_error(store, mirror_err)
 	}
-	if notify != nil {
-		notify(notify_ctx, store, notify_ops)
-	}
+	if notify != nil do store_publish(store, &changes)
 	// The history the retention no longer keeps goes now (D3).
 	store_retain(store)
 	return ERROR_NONE
@@ -2693,6 +2685,40 @@ tx_free_ops :: proc(copied: ^Op_Copy) {
 		free(copied.arena)
 	}
 	copied^ = {}
+}
+
+// Commit_Changes is what a commit changed, as it publishes it (store_publish):
+// its sequence, its list of changes in the order the log has them, and which
+// of them are a TEMP table's, which the log and the file never see. It owns a
+// copy of the list (Op_Copy), so it outlives the transaction (A3).
+Commit_Changes :: struct {
+	seq:    u64,
+	ops:    []Store_Op,
+	temp:   []bool,
+	copied: Op_Copy,
+}
+
+// commit_changes_make copies `ops` and their TEMP marks out of the
+// transaction.
+commit_changes_make :: proc(ops: []Store_Op, temp: []bool) -> Commit_Changes {
+	copied := tx_clone_ops(ops)
+	if copied.arena == nil do return {}
+	marks := make([]bool, len(ops), arena_allocator_guarded(copied.arena))
+	copy(marks, temp)
+	return Commit_Changes{ops = copied.ops, temp = marks, copied = copied}
+}
+
+commit_changes_free :: proc(changes: ^Commit_Changes) {
+	tx_free_ops(&changes.copied)
+	changes^ = {}
+}
+
+// commit_changes_durable is the part of the changes the log and the file
+// have: every change but a TEMP table's, in `alloc`.
+commit_changes_durable :: proc(changes: ^Commit_Changes, alloc: mem.Allocator) -> []Store_Op {
+	kept := make([dynamic]Store_Op, 0, len(changes.ops), alloc)
+	for op, i in changes.ops do if !changes.temp[i] do append(&kept, op)
+	return kept[:]
 }
 
 @(private)
@@ -2829,9 +2855,8 @@ tx_encode_ops :: proc(ops: []Store_Op) -> []u8 {
 // yet. Preparing releases the store lock, so several transactions can be
 // prepared and then committed together with one fsync.
 Prepared_Tx :: struct {
-	ops:     []Store_Op,
+	changes: Commit_Changes,
 	payload: []u8,
-	copied:  Op_Copy,
 }
 
 // tx_prepare closes the transaction and returns its operations. The caller owns
@@ -2843,26 +2868,27 @@ tx_prepare :: proc(tx: ^Tx) -> (^Prepared_Tx, Error) {
 		return nil, errf(.Transaction_Read_Only, "a read transaction cannot be prepared")
 	}
 	ops := tx_build_ops(tx)
-	stable := tx_clone_ops(ops)
+	temp := make([]bool, len(ops), context.temp_allocator)
 	logged: [dynamic]Store_Op
-	for op in ops {
-		if tx_op_is_ephemeral(tx, op) do continue
+	for op, i in ops {
+		temp[i] = tx_op_is_ephemeral(tx, op)
+		if temp[i] do continue
 		append(&logged, op)
 	}
+	stable := commit_changes_make(ops, temp)
 	payload := tx_encode_ops(logged[:])
 	delete(logged)
 	delete(ops)
 	tx_discard(tx)
 	prepared := new(Prepared_Tx)
-	prepared.ops = stable.ops
-	prepared.copied = stable
+	prepared.changes = stable
 	prepared.payload = payload
 	return prepared, ERROR_NONE
 }
 
 prepared_destroy :: proc(prepared: ^Prepared_Tx) {
 	if prepared == nil do return
-	tx_free_ops(&prepared.copied)
+	commit_changes_free(&prepared.changes)
 	delete(prepared.payload)
 	free(prepared)
 }

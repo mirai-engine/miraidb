@@ -1,6 +1,7 @@
 package tests
 
 import "core:fmt"
+import "core:strings"
 import "core:slice"
 import "core:testing"
 
@@ -17,18 +18,26 @@ Replica :: struct {
 	err:    string,
 }
 
-// replicate applies each commit's list to the replica as it is published.
+// replicate applies each commit's list to the replica as it is published. The
+// changes say which are a TEMP table's (only `scratch` is) and which commit
+// they are.
 @(private = "file")
-replicate :: proc(ctx: rawptr, store: ^db.Store, ops: []db.Store_Op) {
+replicate :: proc(ctx: rawptr, store: ^db.Store, changes: ^db.Commit_Changes) {
 	replica := (^Replica)(ctx)
-	replica.target.apply_seq = store.commit_seq
+	if changes.seq != store.commit_seq && len(replica.err) == 0 {
+		replica.err = fmt.aprintf("published as commit %d, the store is at %d", changes.seq, store.commit_seq)
+	}
+	replica.target.apply_seq = changes.seq
 	cache: db.Apply_Cache
-	for op in ops {
+	for op, i in changes.ops {
+		if changes.temp[i] != (op.name == "scratch") && len(replica.err) == 0 {
+			replica.err = fmt.aprintf("commit %d, %v %s: TEMP is %v", changes.seq, op.kind, op.name, changes.temp[i])
+		}
 		if err := db.store_apply(replica.target, op, &cache); err.kind != .None && len(replica.err) == 0 {
-			replica.err = fmt.aprintf("commit %d, %v %s: %s", store.commit_seq, op.kind, op.name, err.message)
+			replica.err = fmt.aprintf("commit %d, %v %s: %s", changes.seq, op.kind, op.name, err.message)
 		}
 	}
-	replica.target.commit_seq = store.commit_seq
+	replica.target.commit_seq = changes.seq
 }
 
 // The statements of the corpus: every kind of change a commit carries, each
@@ -145,11 +154,11 @@ Recorder :: struct {
 }
 
 @(private = "file")
-record :: proc(ctx: rawptr, store: ^db.Store, ops: []db.Store_Op) {
+record :: proc(ctx: rawptr, store: ^db.Store, changes: ^db.Commit_Changes) {
 	recorder := (^Recorder)(ctx)
 	w: db.Byte_Writer
 	db.bw_init(&w)
-	for op in ops do db.store_op_encode(&w, op)
+	for op in changes.ops do db.store_op_encode(&w, op)
 	append(&recorder.payloads, db.bw_bytes(&w))
 }
 

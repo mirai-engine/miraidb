@@ -309,10 +309,10 @@ Store :: struct {
 	// compact_count counts successful background rewrites; a test can wait on it
 	// instead of inferring from a file size.
 	compact_count:      u64,
-	// on_commit runs after a transaction is durable and visible, with a copy of
-	// the applied ops (kind, name, row id and values are valid; schema and index
-	// references are borrowed). Subscriptions use it to publish deltas.
-	on_commit:     proc(ctx: rawptr, store: ^Store, ops: []Store_Op),
+	// on_commit runs after a transaction is durable and visible, with what it
+	// changed (Commit_Changes: its own copy of the list, TEMP marked), from
+	// either commit path (store_publish). Subscriptions use it to publish deltas.
+	on_commit:     proc(ctx: rawptr, store: ^Store, changes: ^Commit_Changes),
 	// hooks are the row-change, commit and rollback callbacks an embedding
 	// layer installs (hooks.odin).
 	hooks:         Store_Hooks,
@@ -2252,7 +2252,8 @@ store_commit_prepared :: proc(store: ^Store, prepared: []^Prepared_Tx) -> (int, 
 			written += 1
 		}
 		store.apply_seq = seq
-		for op in group.ops {
+		group.changes.seq = seq
+		for op in group.changes.ops {
 			if apply_err := store_apply(store, op); apply_err.kind != .None {
 				store_damage(store, apply_err)
 				// The commit already failed; a rewind that fails too is not the error to report.
@@ -2275,15 +2276,10 @@ store_commit_prepared :: proc(store: ^Store, prepared: []^Prepared_Tx) -> (int, 
 			store_note_error(store, page_err)
 		}
 	}
-	notify := store.on_commit
-	notify_ctx := store.on_commit_ctx
 	sync.unlock(&store.mutex)
 	if flush_err.kind != .None do return written, flush_err
-	if notify != nil {
-		for group in prepared {
-			if group == nil do continue
-			notify(notify_ctx, store, group.ops)
-		}
+	for group in prepared {
+		if group != nil do store_publish(store, &group.changes)
 	}
 	store_retain(store)
 	return written, ERROR_NONE
@@ -2320,4 +2316,12 @@ store_catalog_generation :: proc(store: ^Store) -> u64 {
 store_catalog_changed :: proc(store: ^Store) {
 	sync.atomic_add(&store.catalog_generation, 1)
 	if parent := store.catalog_parent; parent != nil do sync.atomic_add(&parent.catalog_generation, 1)
+}
+
+// store_publish hands what a commit changed to whoever watches the store
+// (Store.on_commit), once the commit is durable and visible and the store lock
+// is released. Both commit paths publish through it: tx_commit, and
+// store_commit_prepared for each transaction of a group (A3).
+store_publish :: proc(store: ^Store, changes: ^Commit_Changes) {
+	if store.on_commit != nil do store.on_commit(store.on_commit_ctx, store, changes)
 }

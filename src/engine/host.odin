@@ -2050,9 +2050,10 @@ host_apply_incremental :: proc(
 
 // host_on_commit refreshes every query whose tables changed and publishes one
 // delta per query.
-host_on_commit :: proc(ctx: rawptr, store: ^Store, ops: []Store_Op) {
+host_on_commit :: proc(ctx: rawptr, store: ^Store, changes: ^Commit_Changes) {
 	host := (^Host)(ctx)
 	if host == nil do return
+	ops := changes.ops
 	changed_tables := make([dynamic]string)
 	defer delete(changed_tables)
 	for op in ops {
