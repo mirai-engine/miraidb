@@ -32,6 +32,12 @@ Tree_Use :: enum u8 {
 	View_Columns,
 	// Policy is a policy's predicate, as `SELECT 1 FROM t WHERE (...)`.
 	Policy,
+	// Trigger_Body is one statement of a trigger's body, kept by its table
+	// too: NEW and OLD name another table's row in a trigger of another.
+	Trigger_Body,
+	// Internal is a statement the engine runs on its own catalog (the
+	// triggers a write fires), by its text.
+	Internal,
 }
 
 Tree_Entry :: struct {
@@ -49,20 +55,22 @@ Kept_Tree :: struct {
 }
 
 @(private)
-tree_key :: proc(use: Tree_Use, text: string, alloc := context.allocator) -> string {
+tree_key :: proc(use: Tree_Use, text: string, scope := "", alloc := context.allocator) -> string {
 	prefix := [Tree_Use]string {
 		.View         = "v\x00",
 		.View_Columns = "r\x00",
 		.Policy       = "p\x00",
+		.Trigger_Body = "t\x00",
+		.Internal     = "i\x00",
 	}
-	return strings.concatenate({prefix[use], text}, alloc)
+	return strings.concatenate({prefix[use], scope, "\x00", text}, alloc)
 }
 
 // tree_parse is the tree of `text` for `use`: the store's kept one when it is
 // there for the transaction's generation and nobody holds it, else a parse of
 // its own. The caller gives it back with tree_give, under the same key.
-tree_parse :: proc(tx: ^Tx, use: Tree_Use, text: string) -> (tree: Kept_Tree, err: Error) {
-	tree.key = tree_key(use, text)
+tree_parse :: proc(tx: ^Tx, use: Tree_Use, text: string, scope := "") -> (tree: Kept_Tree, err: Error) {
+	tree.key = tree_key(use, text, scope)
 	store := tx != nil ? tx.store : nil
 	if generation, holds := tx_catalog_generation(tx); holds && store != nil {
 		sync.mutex_lock(&store.tree_cache_mutex)

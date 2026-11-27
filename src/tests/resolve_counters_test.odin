@@ -73,4 +73,14 @@ test_the_names_a_statement_resolves_while_it_runs :: proc(t: ^testing.T) {
 	correlated := rc_measure(t, store, "SELECT count(*) FROM a WHERE x >= (SELECT count(*) FROM b WHERE b.a_id = a.id)")
 	testing.expectf(t, correlated.column_names <= RC_ROWS + 20, "correlated: %d column lookups", correlated.column_names)
 	testing.expectf(t, correlated.plans <= 2, "correlated: %d plans", correlated.plans)
+
+	// A row that fires a trigger runs the trees the store keeps of the query
+	// that finds the trigger, its WHEN and its body (A1.10): each row parsed
+	// them again, 469 parses for these 100 rows. What is left is the
+	// INSERT's own text, which a write does not keep.
+	run_done(t, store, "CREATE TABLE w (id INTEGER PRIMARY KEY, x INTEGER)")
+	run_done(t, store, "CREATE TABLE w_log (id INTEGER, x INTEGER)")
+	run_done(t, store, "CREATE TRIGGER w_logged AFTER INSERT ON w WHEN NEW.x > 2 BEGIN INSERT INTO w_log VALUES (NEW.id, NEW.x * 2); END")
+	trigger := rc_measure(t, store, "INSERT INTO w SELECT id + (SELECT coalesce(max(id), 0) FROM w), x FROM a")
+	testing.expectf(t, trigger.parses <= 2, "trigger: %d parses", trigger.parses)
 }

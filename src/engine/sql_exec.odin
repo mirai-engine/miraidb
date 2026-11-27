@@ -325,7 +325,25 @@ sql_execute_in_tx_params :: proc(tx: ^Tx, sql: string, params: []Value) -> (Sql_
 	query, parse_err := sql_parse(sql)
 	if parse_err.kind != .None do return {}, parse_err
 	defer query_destroy(&query)
-	result, exec_err := sql_run_statement_in_tx(tx, query.statement, params, &query)
+	return sql_execute_in_tx_query(tx, &query, params)
+}
+
+// sql_execute_in_tx_kept runs, inside `tx`, a statement the engine runs again
+// and again (a trigger's body, its own catalog query), from the tree the store
+// keeps of it (tree_parse): a row that fired a trigger parsed every statement
+// of its body, and the query that found the trigger, again.
+sql_execute_in_tx_kept :: proc(tx: ^Tx, use: Tree_Use, sql: string, params: []Value, scope := "") -> (Sql_Result, Error) {
+	if _, is_pragma := sqlite_pragma_statement(sql); is_pragma do return sql_execute_in_tx_params(tx, sql, params)
+	tree, parse_err := tree_parse(tx, use, sql, scope)
+	if parse_err.kind != .None do return {}, parse_err
+	defer tree_give(tx, tree)
+	return sql_execute_in_tx_query(tx, tree.query, params)
+}
+
+// sql_execute_in_tx_query runs a parsed statement inside `tx` and prices it.
+@(private)
+sql_execute_in_tx_query :: proc(tx: ^Tx, query: ^Query, params: []Value) -> (Sql_Result, Error) {
+	result, exec_err := sql_run_statement_in_tx(tx, query.statement, params, query)
 	if exec_err.kind != .None do return {}, exec_err
 	// Price the statement inside the transaction too: the transaction owns the
 	// store lock here, so this uses the same units without touching the mutex.

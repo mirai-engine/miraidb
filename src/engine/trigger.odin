@@ -246,8 +246,9 @@ trigger_fire :: proc(
 			query = "SELECT body, when_text, name, columns FROM _triggers WHERE table_name = ? AND event = ? AND timing = ? ORDER BY name"
 		}
 	}
-	result, query_err := sql_execute_in_tx_params(
+	result, query_err := sql_execute_in_tx_kept(
 		tx,
+		.Internal,
 		query,
 		[]Value {
 			value_string(table_name),
@@ -288,7 +289,16 @@ trigger_fire :: proc(
 		when_text := ""
 		if len(row) > 1 && row[1].kind == .String do when_text = row[1].s
 		if len(when_text) > 0 {
-			condition, condition_expr, condition_err := sql_parse_expression(when_text)
+			// The condition is kept by the store, as a CHECK is (store_expression);
+			// an authorizer's answers rewrite their own copy.
+			condition: Query
+			condition_expr: ^Expr
+			condition_err: Error
+			if replayed {
+				condition, condition_expr, condition_err = sql_parse_expression(when_text)
+			} else {
+				condition_expr, condition_err = store_expression(tx.store, when_text)
+			}
 			if condition_err.kind != .None {
 				trigger_restore(tx, saved_active, saved_schema, saved_new, saved_old, saved_new_present, saved_old_present, saved_depth)
 				return condition_err
@@ -296,7 +306,7 @@ trigger_fire :: proc(
 			if replayed do auth_replay_condition(tx, name, &condition, &condition_expr)
 			eval_ctx := eval_context(Eval_Ctx{tx = tx})
 			value, value_err := eval_expr(&eval_ctx, condition_expr)
-			query_destroy(&condition)
+			if replayed do query_destroy(&condition)
 			if value_err.kind != .None {
 				trigger_restore(tx, saved_active, saved_schema, saved_new, saved_old, saved_new_present, saved_old_present, saved_depth)
 				return trigger_ignored(value_err, timing)
@@ -318,7 +328,7 @@ trigger_fire :: proc(
 				// A SELECT in the body (a RAISE's, often) answers rows nobody reads,
 				// which are freed here: they leaked.
 				answered: Sql_Result
-				answered, exec_err = sql_execute_in_tx(tx, text)
+				answered, exec_err = sql_execute_in_tx_kept(tx, .Trigger_Body, text, nil, table_name)
 				sql_result_destroy(&answered)
 			}
 			if exec_err.kind != .None {
