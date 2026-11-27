@@ -940,6 +940,19 @@ table_largest_int_indexed :: proc(t: ^Table, column: int, skip: proc(id: Row_Id,
 
 // --- What the rest of the engine asks an index -------------------------------
 
+// table_index_int_key is the integer key the index at `index` of `t` files
+// `values` under, for an index that files integer keys (index_int_eligible);
+// false for any other index or value.
+table_index_int_key :: proc(t: ^Table, index: int, values: []Value) -> (key: [2]u64, ok: bool) {
+	if !index_int_eligible(&t.indexes[index]) do return {}, false
+	return index_int_key(values[t.indexes[index].schema.columns[0]])
+}
+
+// table_index_applied_seq is index_applied_seq of the index at `index` of `t`.
+table_index_applied_seq :: proc(t: ^Table, index: int) -> (seq: u64, paged: bool) {
+	return index_applied_seq(&t.indexes[index])
+}
+
 // table_index_schema is what the index at `index` of `t` is: its name, its
 // columns, its method and whether it is unique. Reading it is the catalog's
 // business; the keys behind it are the index's.

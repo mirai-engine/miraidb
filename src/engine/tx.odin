@@ -350,10 +350,8 @@ Staged_Key :: struct {
 
 // staged_key is the key under which `values` holds index `index` of `table`.
 staged_key :: proc(tx: ^Tx, table: ^Table, index: int, values: []Value) -> Staged_Key {
-	if index_int_eligible(&table.indexes[index]) {
-		if key, ok := index_int_key(values[table.indexes[index].schema.columns[0]]); ok {
-			return Staged_Key{int = {u64(index), key[0], key[1]}, is_int = true}
-		}
+	if key, ok := table_index_int_key(table, index, values); ok {
+		return Staged_Key{int = {u64(index), key[0], key[1]}, is_int = true}
 	}
 	return Staged_Key{text = unique_key(tx, table, index, values)}
 }

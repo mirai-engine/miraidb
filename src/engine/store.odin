@@ -1512,7 +1512,7 @@ store_table_open_paged :: proc(store: ^Store, entry: ^Catalog_Entry, seq: u64) -
 			table_destroy(table)
 			return nil, attach_err
 		}
-		if page_seq, paged := index_applied_seq(&table.indexes[i]); paged && page_seq != seq {
+		if page_seq, paged := table_index_applied_seq(table, i); paged && page_seq != seq {
 			table_destroy(table)
 			return nil, errf(.Io, "index %s is at sequence %d, not %d", table_index_schema(table, i).name, page_seq, seq)
 		}
