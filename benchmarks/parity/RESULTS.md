@@ -737,6 +737,51 @@ names and 10 µs executing. What changed:
 of the gap is the executor's shape, not one hot spot: a source and a Value copy
 per row, and an evaluator that walks a tree where SQLite runs byte code.
 
+## After the resolved statement (A1.8, 2026-11-27)
+
+The statement is resolved once per catalog generation and runs through links: columns,
+calls, comparisons, the outer row of a correlated subquery, and views and policies
+parsed once. Measured on the same machine as above, `scripts/parity.py` and the same
+SQLite program (median of 2000 runs, from the text):
+
+| statement | 2.7 | now | SQLite | now ÷ SQLite |
+|---|---:|---:|---:|---:|
+| `SELECT 1` | 4.4 µs | 4.5 | 0.80 | 5.6× |
+| `... WHERE rowid = 77` | 9.1 | 8.4 | 2.0 | 4.2× |
+| `... WHERE id = 77` (unique index) | 9.8 | 9.2 | 2.3 | 4.0× |
+| `SELECT count(*)`, 256 rows | 5.1 | 4.8 | 1.3 | 3.7× |
+| `count(*) WHERE age > 300 AND name <> 'x'`, no index | 99.1 | 85.6 | 14.0 | 6.1× |
+
+The links were worth 7-14% here, where they were worth 20-97% on wider rows,
+functions, collations and correlated subqueries. What these short statements
+pay is elsewhere: about 4 µs a statement before any row (`SELECT 1` has none),
+and 0.33 µs a row in the scan against SQLite's 0.055. Against the reference,
+8 of 11 workloads are at or under it, as before; the three behind are the
+unique-index inserts (1.29-1.37×) and the string update (1.31×).
+
+Timed by stage (tick probes on Windows), a point lookup spent 0.9-1.5 µs
+planning a join order for a statement that has one relation, about 1.5 µs
+opening and ending its read transaction, and the rest in pieces of 0.1-0.6 µs
+(the result's rows and names, `*` expanded again, the policy check). Two
+changes (A1.9), measured interleaved against the build before them:
+
+- a select of one relation takes its single step without planning: the
+  estimates were only ever printed by EXPLAIN, which plans by itself;
+- a read transaction's maps live in its arena instead of the heap.
+
+| statement | before | after | SQLite | after ÷ SQLite |
+|---|---:|---:|---:|---:|
+| `SELECT 1` | 4.60 µs | 3.55 | 0.80 | 4.4× |
+| `... WHERE rowid = 77` | 8.65 | 6.85 | 2.0 | 3.4× |
+| `... WHERE id = 77` | 9.60 | 8.00 | 2.3 | 3.5× |
+| `SELECT count(*)` | 5.00 | 3.60 | 1.3 | 2.8× |
+| scan with `WHERE` | 86.9 | 85.0 | 14.0 | 6.1× |
+
+A read transaction still shares every table of the store when it opens: with
+40 more tables, opening one went from 0.43 to 2.8 µs. That is a structure to
+change (a published snapshot of the catalog a reader takes whole), not a cost
+to trim.
+
 To reproduce:
 
 ```sh
