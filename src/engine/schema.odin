@@ -2,6 +2,7 @@ package engine
 
 import "core:mem"
 import "core:strings"
+import "core:sync"
 import "core:slice"
 import "core:strconv"
 
@@ -413,6 +414,21 @@ Table_Schema :: struct {
 	without_rowid:        bool,
 	// pk_conflict is the primary key's ON CONFLICT, which its index takes.
 	pk_conflict:          Conflict_Resolution,
+	// ident names this shape of the table for the life of the process: a table
+	// gets a new one when it is made (CREATE, ALTER, replay, table_create), and
+	// a copy of it (copy-on-write, a reader's snapshot) keeps its source's,
+	// since its columns are the same. A resolved statement links a column to
+	// the schema by this number instead of a pointer, which a copy changes
+	// (A1.8). Never written to a file.
+	ident:                u32,
+}
+
+@(private)
+schema_ident_counter: u32
+
+// schema_ident_next is a new Table_Schema.ident, never 0.
+schema_ident_next :: proc() -> u32 {
+	return sync.atomic_add(&schema_ident_counter, 1) + 1
 }
 
 // SCHEMA_HAS_EXTRAS marks a schema record that carries the section written after

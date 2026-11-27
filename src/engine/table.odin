@@ -602,6 +602,7 @@ table_create :: proc(schema: ^Table_Schema) -> (^Table, Error) {
 	t.keys = keys
 	t.arena_allocator = keys.allocator
 	t.schema = schema_copy(&normalized, t.arena_allocator)
+	t.schema.ident = schema_ident_next()
 	t.store = new(Row_Store)
 	t.store.refs = 1
 	// Row ids start at one, as SQLite's rowid does: a program that names a row by
@@ -1717,6 +1718,8 @@ table_snapshot :: proc(source: ^Table) -> ^Table {
 			error_free(&create_err)
 			return nil
 		}
+		// The same columns as its source: the same shape.
+		clone.schema.ident = source.schema.ident
 		rows := make([dynamic]Row)
 		table_collect(source, &rows, max(u64))
 		defer table_collect_release(source, &rows)
