@@ -355,6 +355,21 @@ so a kept statement links its calls again. Calls that `eval_call` takes
 elsewhere before dispatching keep no link: an aggregate, a `min`/`max` of
 several arguments, `grouping`, RAISE, and a call with FILTER or ORDER BY.
 
+A comparison (`=`, `<>`, `<`, `<=`, `>`, `>=`, `IS`, `IS NOT`) is linked to
+what its operands give it (`Compare_Link`, A1.8e): the collation decided
+(`collation_ref`: BINARY, NOCASE, RTRIM or a program's comparison) and each
+side's affinity. Both come from an explicit COLLATE and from the declared type
+and collation of a column of the query's own sources. The run uses that link
+only while the column links it was made from still hold (`compare_bound`), and
+otherwise works them out by name. NOCASE compares the lowered characters one by
+one (`nocase_compare`) instead of making two lowered copies per comparison. The
+collation registry is part of the catalog, as the function registry is. Two
+integers compare without looking at either, since neither a collation nor an
+affinity applies to them. An operator is evaluated in its own frame
+(`eval_binary_expr`) rather than in `eval_expr`'s, which recurses for every node.
+The resolver walks a chain of operators in a loop and links the chain's
+comparisons once both sides of each are resolved.
+
 A query binds sources: `Source` pairs a table with one of its rows and an
 optional alias. Single-table statements build a one-source context; a join
 builds one source per table. Column resolution searches the bound sources
