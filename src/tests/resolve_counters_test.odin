@@ -41,12 +41,13 @@ test_the_names_a_statement_resolves_while_it_runs :: proc(t: ^testing.T) {
 	run_done(t, store, "INSERT INTO b SELECT id, id, 'l' || id FROM a")
 	run_done(t, store, "CREATE VIEW small AS SELECT id, x FROM a WHERE x < 3")
 
-	// One table: the text is not parsed again, nor resolved again (A1.8c), and
-	// a column's name is looked up once per statement, not per row.
+	// One table: the text is not parsed again, nor resolved again (A1.8c), nor
+	// planned, there being no join order to decide (A1.9); a column's name is
+	// looked up once per statement, not per row.
 	one := rc_measure(t, store, "SELECT count(*) FROM a WHERE x > 2 AND name <> 'q'")
 	testing.expect_value(t, one.parses, 0)
 	testing.expect_value(t, one.resolutions, 0)
-	testing.expect_value(t, one.plans, 1)
+	testing.expect_value(t, one.plans, 0)
 	testing.expectf(t, one.column_names < 20, "one table: %d column lookups", one.column_names)
 
 	// Two tables: each reference reads the column it is linked to; what is

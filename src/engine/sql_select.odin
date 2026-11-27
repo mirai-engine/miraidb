@@ -584,7 +584,13 @@ sql_exec_select :: proc(tx: ^Tx, stmt: Select_Stmt, params: []Value) -> (Sql_Res
 	// A select's plan is kept for its statement: a subquery run for every row
 	// of the query around it plans once.
 	order: Plan_Order
-	if planned, kept := tx.select_plans[stmt.id]; kept && stmt.id != 0 {
+	if len(stmt.joins) == 0 {
+		// One relation has no order to decide, and what the planner estimates
+		// of it only EXPLAIN prints, which plans by itself: pricing it here was
+		// a microsecond of a point lookup's eight (A1.9).
+		order = Plan_Order{from = stmt.from, joins = stmt.joins, steps = make([]Plan_Step, 1, tx.alloc)}
+		order.steps[0] = Plan_Step{name = stmt.from.name, alias = stmt.from.alias, ref = stmt.from}
+	} else if planned, kept := tx.select_plans[stmt.id]; kept && stmt.id != 0 {
 		order = planned
 	} else {
 		order = plan_join_order(tx.store, tx, stmt, params)
