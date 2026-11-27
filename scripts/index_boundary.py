@@ -8,7 +8,7 @@ index's module:
 
 - fields: a structure field of `Index` (`tree`, `pages`, `lookup`, `ints`,
   `int_keyed`) read or written, on `indexes[...]` or on a name bound to an
-  element of `.indexes` in the same file;
+  element of `.indexes` in the same file, table.odin included;
 - table indexes: `.indexes[...]` on a table, which is a `[]Index`. The
   `indexes` of a `Table_Schema` and of the other catalog records are
   `[]Index_Schema`, metadata, and do not count; neither do `schema` and
@@ -29,10 +29,11 @@ import re
 import sys
 
 ENGINE = "src/engine"
-# The index's module. A2.3 moves Index into index.odin; every index*.odin
-# file belongs to it.
-MODULE = {"table.odin", "index_btree.odin", "index_page.odin", "int_keys.odin"}
-BASELINE = {"fields": 10, "table indexes": 16}
+# The index's module: index.odin (Index and its procedures), index_btree.odin,
+# index_page.odin, every other index*.odin, and int_keys.odin. table.odin keeps
+# the rows and reaches the index through index.odin's procedures.
+MODULE = {"int_keys.odin"}
+BASELINE = {"fields": 10, "table indexes": 26}
 
 FIELDS = r"(?:tree|pages|lookup|ints|int_keyed)"
 # A name bound to an element of `.indexes`: `for index in t.indexes`,
@@ -45,7 +46,7 @@ INDEXED_FIELD_RE = re.compile(r"\bindexes\s*\[[^\]]*\]\s*\.\s*" + FIELDS + r"\b"
 TABLE_INDEXES_RE = re.compile(r"(\w+)\s*\.\s*indexes\s*\[")
 # Receivers whose `indexes` are `[]Index_Schema`: a schema, and the catalog
 # records the SQLite file code and the schema copy keep.
-SCHEMA_RECEIVERS = re.compile(r"schema|^entry$|^ctx$|^out$")
+SCHEMA_RECEIVERS = re.compile(r"schema|^entry$|^ctx$|^out$|^normalized$|^original$")
 
 
 def code_lines(path: str):

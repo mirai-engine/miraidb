@@ -767,3 +767,121 @@ index_lookup_clone :: proc(source: ^Index, target: ^Index, keys: mem.Allocator) 
 		target.lookup[strings.clone(key, keys)] = copied
 	}
 }
+
+// --- An index's life ---------------------------------------------------------
+
+// index_make is a new, empty index for `schema`. An index that failed to parse
+// its partial or expression parts comes back with what was made, for the
+// caller's table to free with the rest.
+index_make :: proc(schema: Index_Schema) -> (index: Index, err: Error) {
+	index = Index {
+		schema = schema,
+		unique = schema.unique,
+		lookup = make(map[string]^Index_Bucket),
+	}
+	index_tree_init(&index)
+	exprs, exprs_err := index_exprs_make(schema)
+	if exprs_err.kind != .None do return index, exprs_err
+	index.exprs = exprs
+	return index, ERROR_NONE
+}
+
+// index_share is a copy of `from` for the table a commit writes: the memory
+// tree is shared, and the copy copies a node when it first writes one; the
+// equality map and the integer keys are copied; a partial or expression index
+// evaluates its own parsed copy.
+index_share :: proc(from: ^Index) -> (target: Index, err: Error) {
+	target = Index {
+		schema    = from.schema,
+		unique    = from.unique,
+		lookup    = make(map[string]^Index_Bucket),
+		int_keyed = from.int_keyed,
+	}
+	if from.exprs != nil {
+		exprs, exprs_err := index_exprs_make(from.schema)
+		if exprs_err.kind != .None do return target, exprs_err
+		target.exprs = exprs
+	}
+	ib_share(&target.tree, &from.tree)
+	index_lookup_clone(from, &target, context.allocator)
+	index_ints_clone(from, &target)
+	return target, ERROR_NONE
+}
+
+// table_index_free frees what the index at `index` of `t` holds: its tree, its
+// integer keys, its equality map, its pages (and their file, with
+// `remove_file`) and its parsed parts.
+table_index_free :: proc(t: ^Table, index: int, remove_file: bool) {
+	index_tree_free(&t.indexes[index])
+	table_index_map_free(t, index)
+	table_index_detach_pages(t, index, remove_file)
+	index_exprs_destroy(t.indexes[index].exprs)
+}
+
+// table_index_clear empties the index at `index` of `t`, keeping what it is: a
+// paged index clears its pages, a memory one starts a new tree.
+table_index_clear :: proc(t: ^Table, index: int) {
+	if t.indexes[index].pages != nil {
+		error_drop(ordered_clear(t.indexes[index].pages))
+	} else {
+		index_tree_free(&t.indexes[index])
+		index_tree_init(&t.indexes[index])
+	}
+	table_index_map_free(t, index)
+	t.indexes[index].lookup = make(map[string]^Index_Bucket)
+}
+
+// index_paged_memory is what a paged index costs: its entries, and its buffer
+// pool's resident pages. A memory index answers 0: its keys are counted with
+// the rows (table_memory).
+index_paged_memory :: proc(index: ^Index) -> (entries: int, bytes: int) {
+	if index.pages == nil do return 0, 0
+	return int(ordered_entries(index.pages)), page_resident(index.pages.file) * PAGE_SIZE
+}
+
+// table_largest_int_indexed answers table_largest_int from an index over the
+// column alone, when the table has one: its keys are in order, numbers under
+// tag 0x02 (write_key_number) and every other kind after them or before, so
+// the largest integer is found walking back from the first key past the
+// numbers. Every INSERT that left an INTEGER PRIMARY KEY out walked all the
+// rows for it: 1 ms over 50 000 rows, the whole cost of such a commit, where
+// SQLite reads the last entry of its tree. `ok` is false without such an
+// index, or when the walk meets more than a few keys it cannot use (reals, or
+// rows the transaction changed), and the caller scans.
+table_largest_int_indexed :: proc(t: ^Table, column: int, skip: proc(id: Row_Id, user: rawptr) -> bool = nil, user: rawptr = nil) -> (largest: i64, found: bool, ok: bool) {
+	if t.paged != nil do return
+	for &index in t.indexes {
+		if index.pages != nil || index.schema.algorithm != .Btree || !index_is_plain(index.schema) do continue
+		if len(index.schema.columns) != 1 || index.schema.columns[0] != column do continue
+		if column < len(t.schema.columns) && len(t.schema.columns[column].collation) > 0 do continue
+		// The first key past the numbers: the first of any kind tagged above 0x02.
+		past_numbers := [1]u8{0x03}
+		c := ib_lower_bound(&index.tree, string(past_numbers[:]))
+		if c.valid {
+			ib_prev(&c)
+		} else {
+			c = ib_last(&index.tree)
+		}
+		for steps := 0; c.valid; steps += 1 {
+			if steps == 64 do return 0, false, false
+			key := ib_key(&c)
+			if len(key) == 0 || key[0] != 0x02 do return 0, false, true
+			slot := ib_slot(&c)
+			best: i64
+			held := false
+			consider :: proc(t: ^Table, column: int, id: Row_Id, skip: proc(id: Row_Id, user: rawptr) -> bool, user: rawptr, best: ^i64, held: ^bool) {
+				if skip != nil && skip(id, user) do return
+				row, exists := table_memory_row(t, id)
+				if !exists || row.deleted_seq != 0 || column >= len(row.values) || row.values[column].kind != .Int do return
+				if !held^ || row.values[column].i > best^ do best^ = row.values[column].i
+				held^ = true
+			}
+			consider(t, column, slot.first, skip, user, &best, &held)
+			for id in slot.more do consider(t, column, id, skip, user, &best, &held)
+			if held do return best, true, true
+			ib_prev(&c)
+		}
+		return 0, false, true
+	}
+	return
+}

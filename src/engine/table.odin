@@ -148,18 +148,12 @@ table_create :: proc(schema: ^Table_Schema) -> (^Table, Error) {
 	}
 	t.indexes = make([]Index, len(t.schema.indexes))
 	for _, i in t.schema.indexes {
-		t.indexes[i] = Index {
-			schema = t.schema.indexes[i],
-			unique = t.schema.indexes[i].unique,
-			lookup = make(map[string]^Index_Bucket),
-		}
-		index_tree_init(&t.indexes[i])
-		exprs, exprs_err := index_exprs_make(t.schema.indexes[i])
-		if exprs_err.kind != .None {
+		made, made_err := index_make(t.schema.indexes[i])
+		t.indexes[i] = made
+		if made_err.kind != .None {
 			table_destroy(t)
-			return nil, exprs_err
+			return nil, made_err
 		}
-		t.indexes[i].exprs = exprs
 	}
 	return t, ERROR_NONE
 }
@@ -187,12 +181,7 @@ table_destroy :: proc(t: ^Table) {
 	if !t.borrowed do table_drop_values(t)
 	rows_destroy(&t.rows)
 	delete(t.history)
-	for i in 0 ..< len(t.indexes) {
-		index_tree_free(&t.indexes[i])
-		table_index_map_free(t, i)
-		ordered_close(t.indexes[i].pages)
-		index_exprs_destroy(t.indexes[i].exprs)
-	}
+	for i in 0 ..< len(t.indexes) do table_index_free(t, i, false)
 	delete(t.indexes)
 	// A paged table is closed, not deleted: the caller removes the file when the
 	// table is dropped. Dirty frames are dropped with it, which is safe because
@@ -560,11 +549,10 @@ table_memory :: proc(t: ^Table) -> Table_Memory {
 		// The values live in the page file and so do the index keys: what an
 		// index costs here is its buffer pool, not one entry per row.
 		memory.rows = int(t.paged.rows)
-		for index in t.indexes {
-			if index.pages != nil {
-				memory.index_entries += int(ordered_entries(index.pages))
-				memory.index_bytes += page_resident(index.pages.file) * PAGE_SIZE
-			}
+		for &index in t.indexes {
+			entries, bytes := index_paged_memory(&index)
+			memory.index_entries += entries
+			memory.index_bytes += bytes
 		}
 		return memory
 	}
@@ -906,16 +894,7 @@ table_truncate :: proc(t: ^Table) {
 	if t.paged != nil {
 		error_drop(page_rows_truncate(t.paged))
 		t.next_int_key = 0
-		for _, i in t.indexes {
-			if t.indexes[i].pages != nil {
-				error_drop(ordered_clear(t.indexes[i].pages))
-			} else {
-				index_tree_free(&t.indexes[i])
-				index_tree_init(&t.indexes[i])
-			}
-			table_index_map_free(t, i)
-			t.indexes[i].lookup = make(map[string]^Index_Bucket)
-		}
+		for _, i in t.indexes do table_index_clear(t, i)
 		return
 	}
 	// Truncating while a snapshot reads the same values cannot free them: they
@@ -924,12 +903,7 @@ table_truncate :: proc(t: ^Table) {
 	table_drop_values(t)
 	rows_clear(&t.rows)
 	clear(&t.history)
-	for _, i in t.indexes {
-		index_tree_free(&t.indexes[i])
-		index_tree_init(&t.indexes[i])
-		table_index_map_free(t, i)
-		t.indexes[i].lookup = make(map[string]^Index_Bucket)
-	}
+	for _, i in t.indexes do table_index_clear(t, i)
 }
 
 // table_insert_borrowed stores a row whose values belong to another table. The
@@ -994,27 +968,13 @@ table_snapshot :: proc(source: ^Table) -> ^Table {
 	clone.next_int_key = source.next_int_key
 	clone.indexes = make([]Index, len(source.indexes))
 	for &target, index in clone.indexes {
-		from := &source.indexes[index]
-		target = Index {
-			schema    = from.schema,
-			unique    = from.unique,
-			lookup    = make(map[string]^Index_Bucket),
-			int_keyed = from.int_keyed,
+		shared, share_err := index_share(&source.indexes[index])
+		target = shared
+		if share_err.kind != .None {
+			error_free(&share_err)
+			table_destroy(clone)
+			return nil
 		}
-		// A partial or expression index evaluates its own parsed copy.
-		if from.exprs != nil {
-			exprs, exprs_err := index_exprs_make(from.schema)
-			if exprs_err.kind != .None {
-				error_free(&exprs_err)
-				table_destroy(clone)
-				return nil
-			}
-			target.exprs = exprs
-		}
-		// The tree is shared: the clone copies a node when it first writes one.
-		ib_share(&target.tree, &from.tree)
-		index_lookup_clone(from, &target, context.allocator)
-		index_ints_clone(from, &target)
 	}
 	// The rows are shared, block by block: the copy lists the same blocks and
 	// copies one only when it changes it (Row_Blocks).
@@ -1115,53 +1075,6 @@ table_max_int :: proc(t: ^Table, column: int) -> i64 {
 		}
 	}
 	return best
-}
-
-// table_largest_int_indexed answers table_largest_int from an index over the
-// column alone, when the table has one: its keys are in order, numbers under
-// tag 0x02 (write_key_number) and every other kind after them or before, so
-// the largest integer is found walking back from the first key past the
-// numbers. Every INSERT that left an INTEGER PRIMARY KEY out walked all the
-// rows for it: 1 ms over 50 000 rows, the whole cost of such a commit, where
-// SQLite reads the last entry of its tree. `ok` is false without such an
-// index, or when the walk meets more than a few keys it cannot use (reals, or
-// rows the transaction changed), and the caller scans.
-table_largest_int_indexed :: proc(t: ^Table, column: int, skip: proc(id: Row_Id, user: rawptr) -> bool = nil, user: rawptr = nil) -> (largest: i64, found: bool, ok: bool) {
-	if t.paged != nil do return
-	for &index in t.indexes {
-		if index.pages != nil || index.schema.algorithm != .Btree || !index_is_plain(index.schema) do continue
-		if len(index.schema.columns) != 1 || index.schema.columns[0] != column do continue
-		if column < len(t.schema.columns) && len(t.schema.columns[column].collation) > 0 do continue
-		// The first key past the numbers: the first of any kind tagged above 0x02.
-		past_numbers := [1]u8{0x03}
-		c := ib_lower_bound(&index.tree, string(past_numbers[:]))
-		if c.valid {
-			ib_prev(&c)
-		} else {
-			c = ib_last(&index.tree)
-		}
-		for steps := 0; c.valid; steps += 1 {
-			if steps == 64 do return 0, false, false
-			key := ib_key(&c)
-			if len(key) == 0 || key[0] != 0x02 do return 0, false, true
-			slot := ib_slot(&c)
-			best: i64
-			held := false
-			consider :: proc(t: ^Table, column: int, id: Row_Id, skip: proc(id: Row_Id, user: rawptr) -> bool, user: rawptr, best: ^i64, held: ^bool) {
-				if skip != nil && skip(id, user) do return
-				row, exists := table_memory_row(t, id)
-				if !exists || row.deleted_seq != 0 || column >= len(row.values) || row.values[column].kind != .Int do return
-				if !held^ || row.values[column].i > best^ do best^ = row.values[column].i
-				held^ = true
-			}
-			consider(t, column, slot.first, skip, user, &best, &held)
-			for id in slot.more do consider(t, column, id, skip, user, &best, &held)
-			if held do return best, true, true
-			ib_prev(&c)
-		}
-		return 0, false, true
-	}
-	return
 }
 
 // table_largest_int is the largest integer a memory table's live rows hold in
@@ -1336,15 +1249,9 @@ table_add_index :: proc(t: ^Table, index: Index_Schema) -> Error {
 	delete(t.indexes)
 	t.indexes = grown
 	position := len(t.indexes) - 1
-	t.indexes[position] = Index {
-		schema = stored,
-		unique = stored.unique,
-		lookup = make(map[string]^Index_Bucket),
-	}
-	index_tree_init(&t.indexes[position])
-	exprs, exprs_err := index_exprs_make(stored)
-	if exprs_err.kind != .None do return exprs_err
-	t.indexes[position].exprs = exprs
+	made, made_err := index_make(stored)
+	t.indexes[position] = made
+	if made_err.kind != .None do return made_err
 	if attach_err := table_index_attach_pages(t, position); attach_err.kind != .None {
 		return attach_err
 	}
@@ -1393,10 +1300,7 @@ table_drop_index :: proc(t: ^Table, name: string) -> Error {
 		if index.schema.implicit {
 			return errf(.Invalid_Argument, "index %s comes from a constraint and cannot be dropped", name)
 		}
-		index_tree_free(&t.indexes[i])
-		table_index_map_free(t, i)
-		table_index_detach_pages(t, i, true)
-		index_exprs_destroy(t.indexes[i].exprs)
+		table_index_free(t, i, true)
 		shorter := make([]Index, len(t.indexes) - 1)
 		copy(shorter[:i], t.indexes[:i])
 		copy(shorter[i:], t.indexes[i + 1:])
