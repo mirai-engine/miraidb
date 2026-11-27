@@ -341,6 +341,20 @@ ran DDL. Only the query's own statement is kept: a part of it that runs on its
 own, such as a write's body without its CTEs or the statement an attached
 database runs, is resolved at every run.
 
+A call is linked when its statement is resolved (`Call_Link`, A1.8d). The link
+records what the call reaches: a program's function that answers before a
+builtin of its name (its definition is kept in the link), a JSON function, a
+date function, or a builtin, by the name its dispatch switches on, already
+lowered and with SQLite's other spellings mapped. Only the virtual-table
+overload is still checked at run time, since it depends on the first
+argument's table. A linked call skips the name comparisons, the lowering and
+the registry lookup that `eval_call` makes by name, and puts up to eight
+arguments on the stack instead of in a heap array. The function registry is
+part of the catalog: registering or dropping a function moves the generation,
+so a kept statement links its calls again. Calls that `eval_call` takes
+elsewhere before dispatching keep no link: an aggregate, a `min`/`max` of
+several arguments, `grouping`, RAISE, and a call with FILTER or ORDER BY.
+
 A query binds sources: `Source` pairs a table with one of its rows and an
 optional alias. Single-table statements build a one-source context; a join
 builds one source per table. Column resolution searches the bound sources
