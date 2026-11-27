@@ -69,8 +69,11 @@ Res_Source :: struct {
 	qualified_only: bool,
 	// ident is the schema's identity of a table of the database
 	// (Table_Schema.ident), whose columns are `columns` in their order; 0 for
-	// anything else, which a link does not name.
+	// anything else, which a link does not name. schema is that table's, read
+	// while the resolution runs (a comparison's link takes a column's declared
+	// type and collation from it).
 	ident:   u32,
+	schema:  ^Table_Schema,
 }
 
 @(private)
@@ -238,7 +241,7 @@ res_internal :: proc(name: string) -> bool {
 res_table_source :: proc(table: ^Table, alias: string) -> Res_Source {
 	columns := make([]string, len(table.schema.columns), context.temp_allocator)
 	for column, i in table.schema.columns do columns[i] = column.name
-	return Res_Source{name = table.schema.name, alias = alias, columns = columns, known = true, table = true, no_rowid = table.schema.without_rowid, ident = table.schema.ident}
+	return Res_Source{name = table.schema.name, alias = alias, columns = columns, known = true, table = true, no_rowid = table.schema.without_rowid, ident = table.schema.ident, schema = &table.schema}
 }
 
 // res_vtab_source is a program's virtual table: its declared columns, hidden
@@ -662,12 +665,22 @@ res_expr :: proc(walk: ^Res_Walk, expr: ^Expr) {
 	// A chain of binary operators (`a OR b OR c ...`, a long `||`) is built
 	// left-deep without the parser nesting, so it can be thousands deep: the
 	// left side is walked in a loop, not by recursion.
+	// A comparison in the chain is linked once both its sides are resolved,
+	// after the walk reaches the chain's leftmost operand (res_bind_compare).
 	expr := expr
+	compares: [dynamic]^Expr
 	for expr != nil && walk.err.kind == .None {
 		binary, is_binary := expr^.(Binary_Expr)
 		if !is_binary do break
 		res_expr(walk, binary.right)
+		if walk.bindings != nil && binary_compares(binary.op) {
+			if compares == nil do compares = make([dynamic]^Expr, 0, 4, context.temp_allocator)
+			append(&compares, expr)
+		}
 		expr = binary.left
+	}
+	defer if walk.err.kind == .None {
+		for i := len(compares) - 1; i >= 0; i -= 1 do res_bind_compare(walk, compares[i]^.(Binary_Expr))
 	}
 	if expr == nil || walk.err.kind != .None do return
 	switch e in expr^ {
@@ -676,6 +689,7 @@ res_expr :: proc(walk: ^Res_Walk, expr: ^Expr) {
 		if res_where_alias(walk, expr, e) do return
 		res_column(walk, e)
 	case Binary_Expr:
+		// Not reached: the loop above walks every binary operator.
 		res_expr(walk, e.left)
 		res_expr(walk, e.right)
 	case Unary_Expr:
@@ -1084,4 +1098,80 @@ res_bind_call :: proc(walk: ^Res_Walk, e: Call_Expr) {
 		link.dispatch = builtin_dispatch_name(link.lowered)
 	}
 	bindings.calls[local] = link
+}
+
+// res_bind_compare links a comparison to the collation and affinities its
+// operands give it (Compare_Link), decided as eval_expr decides them at every
+// row: a COLLATE on the right, else on the left, else the left column's
+// declared collation, else the right's; each side's affinity from its column's
+// declared type. A side that names a column without a link of its own (an
+// enclosing query's, a view's) leaves the comparison without one.
+@(private)
+res_bind_compare :: proc(walk: ^Res_Walk, e: Binary_Expr) {
+	bindings := walk.bindings
+	if bindings == nil || e.id <= bindings.base || len(walk.scopes) == 0 do return
+	local := e.id - bindings.base
+	if local >= Node_Id(len(bindings.compares)) do return
+	Side :: struct {
+		explicit:  string,
+		collated:  bool,
+		declared:  string,
+		affinity:  Column_Affinity,
+		column:    Node_Id,
+	}
+	side :: proc(walk: ^Res_Walk, expr: ^Expr) -> (out: Side, ok: bool) {
+		if expr == nil do return {}, true
+		operand := expr
+		if collate, is_collate := operand^.(Collate_Expr); is_collate {
+			out.explicit, out.collated = collate.name, true
+			operand = collate.operand
+		}
+		column, is_column := operand^.(Column_Expr)
+		if !is_column do return out, true
+		bindings := walk.bindings
+		if column.id <= bindings.base do return {}, false
+		local := column.id - bindings.base
+		if local >= Node_Id(len(bindings.columns)) do return {}, false
+		binding := bindings.columns[local]
+		if binding.column < 0 do return {}, false
+		scope := &walk.scopes[len(walk.scopes) - 1]
+		if int(binding.from) >= len(scope.sources) do return {}, false
+		schema := scope.sources[binding.from].schema
+		if schema == nil || schema.ident != binding.ident || int(binding.column) >= len(schema.columns) do return {}, false
+		declared := schema.columns[binding.column]
+		out.declared = declared.collation
+		out.affinity = declared_affinity(declared.type)
+		out.column = column.id
+		return out, true
+	}
+	left, left_ok := side(walk, e.left)
+	right, right_ok := side(walk, e.right)
+	if !left_ok || !right_ok do return
+	name := ""
+	if left.collated do name = left.explicit
+	if right.collated do name = right.explicit
+	if !left.collated && !right.collated {
+		name = left.declared
+		if len(name) == 0 do name = right.declared
+	}
+	ref, known := collation_ref(walk.tx.store, name)
+	if !known do return
+	bindings.compares[local] = Compare_Link {
+		linked         = true,
+		collation      = ref,
+		left_affinity  = left.affinity,
+		right_affinity = right.affinity,
+		left_column    = left.column,
+		right_column   = right.column,
+	}
+}
+
+// binary_compares says the operator compares its operands, under a collation
+// and their affinities.
+binary_compares :: #force_inline proc(op: Binary_Op) -> bool {
+	#partial switch op {
+	case .Eq, .Ne, .Lt, .Le, .Gt, .Ge, .Is, .Is_Not:
+		return true
+	}
+	return false
 }

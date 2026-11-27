@@ -687,3 +687,12 @@ value_compare_collated :: proc(
 	}
 	return value_compare(a, b)
 }
+
+// value_compare_decided is value_compare_collated through a collation decided
+// when the statement was resolved, when there is one.
+@(private)
+value_compare_decided :: #force_inline proc(a, b: Value, collation: string, store: ^Store, ref: ^Collation_Ref) -> (order: slice.Ordering, ok: bool) {
+	if ref == nil do return value_compare_collated(a, b, collation, store)
+	if a.kind == .String && b.kind == .String do return string_ordering(collation_ref_compare(ref, a.s, b.s)), true
+	return value_compare(a, b)
+}

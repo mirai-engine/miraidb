@@ -183,36 +183,7 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 	case Collate_Expr:
 		return eval_expr(ctx, e.operand)
 	case Binary_Expr:
-		// A COLLATE on either side decides how the comparison treats text.
-		collation := ""
-		if collate, ok := collate_name(e.left); ok do collation = collate
-		if collate, ok := collate_name(e.right); ok do collation = collate
-		if len(collation) == 0 {
-			if declared, ok := column_collation(ctx, e.left); ok do collation = declared
-			if len(collation) == 0 {
-				if declared, ok := column_collation(ctx, e.right); ok do collation = declared
-			}
-		}
-		left, left_err := eval_expr(ctx, e.left)
-		if left_err.kind != .None do return {}, left_err
-		right, right_err := eval_expr(ctx, e.right)
-		if right_err.kind != .None do return {}, right_err
-		#partial switch e.op {
-		case .Eq, .Ne, .Lt, .Le, .Gt, .Ge, .Is, .Is_Not:
-			left, right = comparison_affinity(ctx, e.left, e.right, left, right)
-		}
-		if ctx.tx == nil do return eval_binary(e.op, left, right, collation, nil)
-		// An operator's answer (the text `||` makes) lives in the statement's
-		// memory, as a function's does (eval_call).
-		outer := context.allocator
-		value: Value
-		err: Error
-		{
-			context.allocator = ctx.tx.alloc
-			value, err = eval_binary(e.op, left, right, collation, ctx.tx.store)
-		}
-		if len(err.message) > 0 do err.message = strings.clone(err.message, outer)
-		return value, err
+		return eval_binary_expr(ctx, &e)
 	case Unary_Expr:
 		operand, operand_err := eval_expr(ctx, e.operand)
 		if operand_err.kind != .None do return {}, operand_err
@@ -359,6 +330,77 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 	return {}, errf(.Internal, "unknown expression")
 }
 
+// eval_binary_expr evaluates an operator over its operands. It is its own
+// frame, out of eval_expr's: eval_expr recurses for every node, and what a
+// comparison keeps (its link, its collation) made every level of it bigger.
+@(private)
+eval_binary_expr :: #force_no_inline proc(ctx: ^Eval_Ctx, e: ^Binary_Expr) -> (Value, Error) {
+	comparison := false
+	#partial switch e.op {
+	case .Eq, .Ne, .Lt, .Le, .Gt, .Ge, .Is, .Is_Not:
+		comparison = true
+	}
+	left, left_err := eval_expr(ctx, e.left)
+	if left_err.kind != .None do return {}, left_err
+	right, right_err := eval_expr(ctx, e.right)
+	if right_err.kind != .None do return {}, right_err
+	// Two integers compare as numbers whatever the collation and the
+	// affinities: neither applies to them (value_compare_collated,
+	// comparison_affinity), so neither is worked out.
+	if comparison && left.kind == .Int && right.kind == .Int {
+		x, y := left.i, right.i
+		#partial switch e.op {
+		case .Eq, .Is:
+			return value_bool(x == y), ERROR_NONE
+		case .Ne, .Is_Not:
+			return value_bool(x != y), ERROR_NONE
+		case .Lt:
+			return value_bool(x < y), ERROR_NONE
+		case .Le:
+			return value_bool(x <= y), ERROR_NONE
+		case .Gt:
+			return value_bool(x > y), ERROR_NONE
+		case .Ge:
+			return value_bool(x >= y), ERROR_NONE
+		}
+	}
+	// A comparison its resolution linked takes its collation and its
+	// operands' affinities from the link (A1.8e).
+	link: ^Compare_Link
+	if comparison do link, _ = compare_bound(ctx, e.id)
+	// A COLLATE on either side decides how the comparison treats text; only
+	// a comparison reads it.
+	collation := ""
+	if comparison && link == nil {
+		if collate, ok := collate_name(e.left); ok do collation = collate
+		if collate, ok := collate_name(e.right); ok do collation = collate
+		if len(collation) == 0 {
+			if declared, ok := column_collation(ctx, e.left); ok do collation = declared
+			if len(collation) == 0 {
+				if declared, ok := column_collation(ctx, e.right); ok do collation = declared
+			}
+		}
+	}
+	if link != nil {
+		left, right = affinity_apply(link.left_affinity, link.right_affinity, left, right)
+	} else if comparison {
+		left, right = comparison_affinity(ctx, e.left, e.right, left, right)
+	}
+	ref := link != nil ? &link.collation : nil
+	if ctx.tx == nil do return eval_binary(e.op, left, right, collation, nil, ref)
+	// An operator's answer (the text `||` makes) lives in the statement's
+	// memory, as a function's does (eval_call).
+	outer := context.allocator
+	value: Value
+	err: Error
+	{
+		context.allocator = ctx.tx.alloc
+		value, err = eval_binary(e.op, left, right, collation, ctx.tx.store, ref)
+	}
+	if len(err.message) > 0 do err.message = strings.clone(err.message, outer)
+	return value, err
+}
+
 // eval_row_in_subquery answers `(a, b) IN (SELECT x, y …)`: true when a row of
 // the subquery equals the tuple, NULL when no row does but one could (a NULL on
 // either side of a column that decides it), false otherwise.
@@ -410,6 +452,9 @@ eval_binary :: proc(
 	right: Value,
 	collation: string = "",
 	store: ^Store = nil,
+	// ref is the collation decided when the statement was resolved
+	// (Compare_Link); `collation` is the name, decided at the row, otherwise.
+	ref: ^Collation_Ref = nil,
 ) -> (Value, Error) {
 	#partial switch op {
 	case .And:
@@ -427,7 +472,7 @@ eval_binary :: proc(
 		if value_is_null(left) || value_is_null(right) {
 			same = value_is_null(left) && value_is_null(right)
 		} else {
-			order, ok := value_compare_collated(left, right, collation, store)
+			order, ok := value_compare_decided(left, right, collation, store, ref)
 			// Values of different classes are never the same value.
 			same = ok && order == .Equal
 		}
@@ -443,7 +488,7 @@ eval_binary :: proc(
 		// `{a,b}`. PostgreSQL parses it against the column's type; here the array
 		// on the other side says what the elements are.
 		compared_left, compared_right := arrays_from_text(left, right)
-		order, ok := value_compare_collated(compared_left, compared_right, collation, store)
+		order, ok := value_compare_decided(compared_left, compared_right, collation, store, ref)
 		if !ok {
 			return {}, errf(
 				.Invalid_Type,
@@ -1482,8 +1527,13 @@ declared_affinity :: proc(declared: Column_Type) -> Column_Affinity {
 @(private)
 comparison_affinity :: proc(ctx: ^Eval_Ctx, left_expr, right_expr: ^Expr, left, right: Value) -> (Value, Value) {
 	if left.kind == right.kind || left.kind == .Null || right.kind == .Null do return left, right
-	left_affinity := column_affinity(ctx, left_expr)
-	right_affinity := column_affinity(ctx, right_expr)
+	return affinity_apply(column_affinity(ctx, left_expr), column_affinity(ctx, right_expr), left, right)
+}
+
+// affinity_apply is comparison_affinity once each side's affinity is known.
+@(private)
+affinity_apply :: proc(left_affinity, right_affinity: Column_Affinity, left, right: Value) -> (Value, Value) {
+	if left.kind == right.kind || left.kind == .Null || right.kind == .Null do return left, right
 	if left_affinity == .None && right_affinity == .None do return left, right
 	convert :: proc(v: Value, affinity: Column_Affinity) -> Value {
 		switch affinity {

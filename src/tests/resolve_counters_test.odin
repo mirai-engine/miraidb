@@ -58,9 +58,9 @@ test_the_names_a_statement_resolves_while_it_runs :: proc(t: ^testing.T) {
 	call := rc_measure(t, store, "SELECT count(*) FROM a WHERE lower(name) = 'n5'")
 	testing.expectf(t, call.function_names < 20, "function: %d lookups", call.function_names)
 
-	// A collation is found by its name at every comparison (A1.5).
+	// A comparison is linked to its collation when its statement is resolved (A1.8e).
 	collated := rc_measure(t, store, "SELECT count(*) FROM a WHERE name = 'n5' COLLATE NOCASE")
-	testing.expectf(t, collated.collation_names >= RC_ROWS, "collation: %d lookups", collated.collation_names)
+	testing.expectf(t, collated.collation_names < 20, "collation: %d lookups", collated.collation_names)
 
 	// A view's text is parsed at every run that reads it (A1.6).
 	view := rc_measure(t, store, "SELECT count(*) FROM small")
