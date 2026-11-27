@@ -813,3 +813,37 @@ on `k`, each figure the median of 5 runs, two runs that agree:
   first: on an integer `DIRECT` index the map is not reached.
 - Kept as it is: it becomes the memory backend's accelerator when the index
   contract lands (A2.3), and is audited again once the engine is more mature.
+
+## A unique insert by stage (A2.6, 2026-11-27)
+
+`tx_insert` cut into stages with a clock read at each boundary, a batch of 256
+inserts over 2048 rows with one unique index (`insert_bulk unique_0`), the mean
+of 100 batches. A clock read costs ~50 ns, which is what a stage with no work
+shows; the third column takes it off.
+
+| Stage | Before, ns/row | Less the clock | After, ns/row |
+|---|---:|---:|---:|
+| resolve the table and its writes | 61 | ~10 | 64 |
+| coerce and copy the values (3 columns) | 227 | ~175 | 216 |
+| CHECK, index validation, foreign keys | 108 | ~10 | 114 |
+| the unique check | 153 | ~105 | 156 |
+| triggers (none) | 108 | ~5 | 111 |
+| stage the row and register its key | 288 | ~240 | 235 |
+
+Registering the key was ~160 ns of the last stage: the staged integer keys were
+an Odin map, which hashed the 24 bytes of a key with a byte hasher and grew from
+64 entries three times in a batch of 256. They are an open-addressed table now
+(`staged_ints.odin`), made at the first key, with the integer mix of
+`int_keys.odin`. The value loop read each 192-byte `Column` by value; it reads
+it in place. Staging the row itself (`srows_set`) is ~75 ns of writing a fresh
+80-byte row: sizing the array for the batch made it ~25 ns cheaper and the
+insert dearer, and was dropped.
+
+`bin/parity.exe mem`, six interleaved rounds against the previous `main`:
+
+| workload | before, µs | after, µs | | reference | after ÷ reference |
+|---|---:|---:|---:|---:|---:|
+| insert_bulk u32_u64_u64 unique_0 | 273.1 | 244.2 | −10.6% | 186 | 1.31× (was 1.47×) |
+| insert_bulk u32_u64_str unique_0 | 312.8 | 309.2 | −1.2% | 231 | 1.34× (was 1.35×) |
+| update_bulk u32_u64_u64 | 278.2 | 260.5 | −6.4% | 352 | 0.74× |
+| the other workloads | | | −2.6 to +1.4% | | |
