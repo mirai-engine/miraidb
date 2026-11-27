@@ -1127,9 +1127,8 @@ res_bind_call :: proc(walk: ^Res_Walk, e: Call_Expr) {
 
 // res_bind_compare links a comparison to the collation and affinities its
 // operands give it (Compare_Link), decided as eval_expr decides them at every
-// row: a COLLATE on the right, else on the left, else the left column's
-// declared collation, else the right's; each side's affinity from its column's
-// declared type. A side that names a column without a link of its own (an
+// row: the collation by SQLite's precedence (collation_precedence), each
+// side's affinity from its column's declared type. A side that names a column without a link of its own (an
 // enclosing query's, a view's) leaves the comparison without one.
 @(private)
 res_bind_compare :: proc(walk: ^Res_Walk, e: Binary_Expr) {
@@ -1174,13 +1173,10 @@ res_bind_compare :: proc(walk: ^Res_Walk, e: Binary_Expr) {
 	left, left_ok := side(walk, e.left)
 	right, right_ok := side(walk, e.right)
 	if !left_ok || !right_ok do return
-	name := ""
-	if left.collated do name = left.explicit
-	if right.collated do name = right.explicit
-	if !left.collated && !right.collated {
-		name = left.declared
-		if len(name) == 0 do name = right.declared
-	}
+	name := collation_precedence(
+		{explicit = left.explicit, collated = left.collated, column = left.column != 0, declared = left.declared},
+		{explicit = right.explicit, collated = right.collated, column = right.column != 0, declared = right.declared},
+	)
 	ref, known := collation_ref(walk.tx.store, name)
 	if !known do return
 	bindings.compares[local] = Compare_Link {

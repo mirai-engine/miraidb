@@ -371,16 +371,7 @@ eval_binary_expr :: #force_no_inline proc(ctx: ^Eval_Ctx, e: ^Binary_Expr) -> (V
 	// A COLLATE on either side decides how the comparison treats text; only
 	// a comparison reads it.
 	collation := ""
-	if comparison && link == nil {
-		if collate, ok := collate_name(e.left); ok do collation = collate
-		if collate, ok := collate_name(e.right); ok do collation = collate
-		if len(collation) == 0 {
-			if declared, ok := column_collation(ctx, e.left); ok do collation = declared
-			if len(collation) == 0 {
-				if declared, ok := column_collation(ctx, e.right); ok do collation = declared
-			}
-		}
-	}
+	if comparison && link == nil do collation = comparison_collation(ctx, e.left, e.right)
 	if link != nil {
 		left, right = affinity_apply(link.left_affinity, link.right_affinity, left, right)
 	} else if comparison {

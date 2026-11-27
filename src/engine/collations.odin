@@ -432,3 +432,40 @@ nocase_compare :: proc(a, b: string) -> int {
 	if j < len(b) do return -1
 	return 0
 }
+
+// Collation_Operand is what one operand of a comparison brings to the choice
+// of its collation (collation_precedence): an explicit COLLATE, and whether it
+// is a column, with the collation the column declares ("" for BINARY).
+Collation_Operand :: struct {
+	explicit: string,
+	collated: bool,
+	column:   bool,
+	declared: string,
+}
+
+// collation_precedence is the collation a comparison uses, by SQLite's rule:
+// an explicit COLLATE, the left operand's first; else the collation of a
+// column operand, the left one's first, which is BINARY for a column that
+// declares none (`plain = nocase_column` compares as BINARY); else BINARY.
+collation_precedence :: proc(left, right: Collation_Operand) -> string {
+	if left.collated do return left.explicit
+	if right.collated do return right.explicit
+	if left.column do return left.declared
+	if right.column do return right.declared
+	return ""
+}
+
+// collation_operand is what `expr` brings to a comparison's collation, its
+// column's declared collation read from the context's sources.
+collation_operand :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (out: Collation_Operand) {
+	if expr == nil do return
+	if name, ok := collate_name(expr); ok {
+		out.explicit, out.collated = name, true
+		return
+	}
+	if _, is_column := expr^.(Column_Expr); is_column {
+		out.column = true
+		out.declared, _ = column_collation(ctx, expr)
+	}
+	return
+}

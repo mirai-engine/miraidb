@@ -658,15 +658,11 @@ in_equal :: proc(a, b: Value, collation: string, store: ^Store) -> bool {
 	return ok && order == .Equal
 }
 
-// comparison_collation is the collation a comparison of two operands uses: an
-// explicit COLLATE on either side, else the left column's, else the right's.
+// comparison_collation is the collation a comparison of two operands uses
+// (collation_precedence).
 @(private)
 comparison_collation :: proc(ctx: ^Eval_Ctx, left, right: ^Expr) -> string {
-	if name, ok := collate_name(left); ok do return name
-	if name, ok := collate_name(right); ok do return name
-	if name, ok := column_collation(ctx, left); ok do return name
-	if name, ok := column_collation(ctx, right); ok do return name
-	return ""
+	return collation_precedence(collation_operand(ctx, left), collation_operand(ctx, right))
 }
 
 // value_compare_collated applies an expression-level collation to two texts. The
