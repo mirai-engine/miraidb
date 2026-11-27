@@ -193,6 +193,34 @@ Table_Writes :: struct {
 	unique_ints: map[[3]u64]Row_Id,
 	next_row_id: u64,
 	next_sequence: i64,
+	// int_key_* is the largest integer the staged inserts hold in an INTEGER
+	// PRIMARY KEY (tx_next_int_key): `int_key_column` is its position plus one,
+	// 0 when not known. A row appended is weighed into it; any other change to
+	// the staged inserts forgets it (writes_int_key_forget), and the next key
+	// walks them again. Walking them at every insert made a load of n rows that
+	// leave the key out cost n²/2 row reads.
+	int_key_column: int,
+	int_key_top:    i64,
+	int_key_found:  bool,
+}
+
+// writes_int_key_forget drops what Table_Writes knows of its inserts' largest
+// integer key: a staged insert was replaced, taken out or reshaped.
+@(private)
+writes_int_key_forget :: #force_inline proc(writes: ^Table_Writes) {
+	writes.int_key_column = 0
+}
+
+// writes_int_key_weigh counts an appended insert's key into the largest known.
+@(private)
+writes_int_key_weigh :: #force_inline proc(writes: ^Table_Writes, values: []Value) {
+	if writes.int_key_column == 0 do return
+	position := writes.int_key_column - 1
+	if position >= len(values) || values[position].kind != .Int do return
+	if !writes.int_key_found || values[position].i > writes.int_key_top {
+		writes.int_key_top = values[position].i
+		writes.int_key_found = true
+	}
 }
 
 // Stage_Undo is one change to a transaction's staged rows, as it was before the
@@ -244,6 +272,7 @@ tx_statement_undo :: proc(tx: ^Tx, mark: int) {
 		w := u.writes
 		switch u.kind {
 		case .Insert:
+			writes_int_key_forget(w)
 			if u.had do srows_set(&w.inserts, u.row)
 			else do srows_erase(&w.inserts, u.id)
 		case .Update:
@@ -1090,6 +1119,7 @@ tx_drop_column :: proc(tx: ^Tx, name, column_name: string) -> Error {
 	replacement.next_sequence = current.next_sequence
 	// Staged rows lose the column as well, so later statements see the new shape.
 	if writes, ok := tx.state.writes[name]; ok {
+		writes_int_key_forget(writes)
 		for row in srows_ptrs(&writes.inserts) {
 			next := make([]Value, len(row.values) - 1, tx.alloc)
 			copy(next, row.values[:index])
@@ -1558,7 +1588,16 @@ tx_next_int_key :: proc(table: ^Table, writes: ^Table_Writes, position: int) -> 
 			if !found^ || values[position].i > largest^ do largest^ = values[position].i
 			found^ = true
 		}
-		for row in srows_ptrs(&writes.inserts) do weigh(row.values, position, &largest, &found)
+		// The staged inserts' largest is kept as they are appended; it is walked
+		// for again only after another change to them.
+		if writes.int_key_column != position + 1 {
+			writes.int_key_column = position + 1
+			writes.int_key_top, writes.int_key_found = 0, false
+			for row in srows_ptrs(&writes.inserts) do weigh(row.values, position, &writes.int_key_top, &writes.int_key_found)
+		}
+		if writes.int_key_found && (!found || writes.int_key_top > largest) {
+			largest, found = writes.int_key_top, true
+		}
 		for _, values in writes.updates do weigh(values, position, &largest, &found)
 	}
 	return found ? largest + 1 : 1
@@ -1699,7 +1738,9 @@ tx_insert_row :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error)
 	}
 	undo_note_insert(tx, writes, id)
 	undo_note_counters(tx, writes)
+	if srows_has(&writes.inserts, id) do writes_int_key_forget(writes)
 	srows_set(&writes.inserts, Row{id = id, values = row_values})
+	writes_int_key_weigh(writes, row_values)
 	// A named rowid below the next one leaves the next one where it was.
 	writes.next_row_id = max(writes.next_row_id, u64(id) + 1)
 	if has_triggers {
@@ -1836,6 +1877,7 @@ tx_update_row :: proc(tx: ^Tx, name: string, id: Row_Id, values: []Value) -> Err
 	}
 	if srows_has(&writes.inserts, id) {
 		undo_note_insert(tx, writes, id)
+		writes_int_key_forget(writes)
 		srows_set(&writes.inserts, Row{id = id, values = row_values})
 	} else {
 		undo_note_update(tx, writes, id)
@@ -1904,6 +1946,7 @@ tx_delete_impl :: proc(tx: ^Tx, name: string, id: Row_Id, fire_triggers: bool) -
 	tx_unregister_unique(tx, name, table, previous.values, id)
 	if srows_has(&writes.inserts, id) {
 		undo_note_insert(tx, writes, id)
+		writes_int_key_forget(writes)
 		srows_erase(&writes.inserts, id)
 	} else {
 		if _, updated := writes.updates[id]; updated {
@@ -1940,6 +1983,7 @@ tx_truncate :: proc(tx: ^Tx, name: string) -> Error {
 		return errf(.Sql_Unsupported, "TRUNCATE cannot run inside another statement")
 	}
 	writes := tx_writes(tx, name, table)
+	writes_int_key_forget(writes)
 	srows_clear(&writes.inserts)
 	clear(&writes.updates)
 	clear(&writes.deletes)
