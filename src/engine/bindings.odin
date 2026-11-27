@@ -86,6 +86,9 @@ Compare_Link :: struct {
 	right_affinity: Column_Affinity,
 	left_column:    Node_Id,
 	right_column:   Node_Id,
+	// named is a collation decided by a name (a COLLATE, a column's), not
+	// BINARY for want of one.
+	named:          bool,
 }
 
 // Statement_Bindings are the links of one parsed query: `columns[id - base]`,
@@ -225,6 +228,16 @@ call_bound :: #force_inline proc(ctx: ^Eval_Ctx, id: Node_Id) -> (^Call_Link, bo
 
 // compare_bound is the link of a comparison, when its resolution made one and
 // the column links it was made from hold for the context's sources.
+// compare_collated is the link of a comparison a named collation decides:
+// BETWEEN and IN compare without one as they did (an IN with no collation
+// compares with value_equal, which a link does not), and only a name cost them
+// a lookup per row.
+compare_collated :: #force_inline proc(ctx: ^Eval_Ctx, id: Node_Id) -> (^Compare_Link, bool) {
+	link, linked := compare_bound(ctx, id)
+	if !linked || !link.named do return nil, false
+	return link, true
+}
+
 compare_bound :: #force_inline proc(ctx: ^Eval_Ctx, id: Node_Id) -> (^Compare_Link, bool) {
 	bindings := ctx.bindings
 	if bindings == nil || id <= bindings.base do return nil, false

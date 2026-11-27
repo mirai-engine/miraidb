@@ -2,6 +2,7 @@ package engine
 
 import "core:fmt"
 import "core:mem"
+import "core:slice"
 import "core:strings"
 import "core:unicode/utf8"
 
@@ -216,10 +217,21 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 		if operand.kind == .Null || low.kind == .Null || high.kind == .Null {
 			return value_null(), ERROR_NONE
 		}
-		// `x BETWEEN a AND b` is `x >= a AND x <= b`, collation included.
+		// `x BETWEEN a AND b` is `x >= a AND x <= b`, collation included: the
+		// one each comparison's link decided, else worked out by name.
 		store := ctx.tx != nil ? ctx.tx.store : nil
-		low_order, low_ok := value_compare_collated(operand, low, comparison_collation(ctx, e.operand, e.low), store)
-		high_order, high_ok := value_compare_collated(operand, high, comparison_collation(ctx, e.operand, e.high), store)
+		low_order, high_order: slice.Ordering
+		low_ok, high_ok: bool
+		if link, linked := compare_collated(ctx, e.low_id); linked {
+			low_order, low_ok = value_compare_decided(operand, low, "", store, &link.collation)
+		} else {
+			low_order, low_ok = value_compare_collated(operand, low, comparison_collation(ctx, e.operand, e.low), store)
+		}
+		if link, linked := compare_collated(ctx, e.high_id); linked {
+			high_order, high_ok = value_compare_decided(operand, high, "", store, &link.collation)
+		} else {
+			high_order, high_ok = value_compare_collated(operand, high, comparison_collation(ctx, e.operand, e.high), store)
+		}
 		if !low_ok || !high_ok {
 			return {}, errf(.Invalid_Type, "BETWEEN mixes incompatible types")
 		}
@@ -244,10 +256,17 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 		operand, operand_err := eval_expr(ctx, e.operand)
 		if operand_err.kind != .None do return {}, operand_err
 		if operand.kind == .Null do return value_null(), ERROR_NONE
-		// The left operand's collation decides, as in SQLite.
+		// The left operand's collation decides, as in SQLite: the one its link
+		// decided, else worked out by name.
 		in_store := ctx.tx != nil ? ctx.tx.store : nil
-		in_collation, _ := collate_name(e.operand)
-		if len(in_collation) == 0 do in_collation, _ = column_collation(ctx, e.operand)
+		in_collation := ""
+		in_ref: ^Collation_Ref
+		if link, linked := compare_collated(ctx, e.id); linked {
+			in_ref = &link.collation
+		} else {
+			in_collation, _ = collate_name(e.operand)
+			if len(in_collation) == 0 do in_collation, _ = column_collation(ctx, e.operand)
+		}
 		if e.subquery != nil {
 			if ctx.tx == nil do return {}, errf(.Sql_Unsupported, "subqueries need a transaction")
 			sub, sub_err := subquery_run(ctx, e.subquery^)
@@ -261,7 +280,7 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 					unknown = true
 					continue
 				}
-				if in_equal(operand, row[0], in_collation, in_store) {
+				if in_equal_decided(operand, row[0], in_collation, in_store, in_ref) {
 					found = true
 					break
 				}
@@ -280,7 +299,7 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 				unknown = true
 				continue
 			}
-			if in_equal(operand, value, in_collation, in_store) {
+			if in_equal_decided(operand, value, in_collation, in_store, in_ref) {
 				found = true
 				break
 			}

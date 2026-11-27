@@ -196,18 +196,25 @@ Is_Null_Expr :: struct {
 	negated: bool,
 }
 
+// Between_Expr is two comparisons of the operand, one with each bound, and
+// each has the number its link is kept by (Compare_Link).
 Between_Expr :: struct {
 	operand: ^Expr,
 	low:     ^Expr,
 	high:    ^Expr,
 	negated: bool,
+	low_id:  Node_Id,
+	high_id: Node_Id,
 }
 
+// In_Expr compares the operand under its own collation, kept by `id`
+// (Compare_Link).
 In_Expr :: struct {
 	operand:  ^Expr,
 	items:    []^Expr,
 	subquery: ^Select_Stmt,
 	negated:  bool,
+	id:       Node_Id,
 }
 
 // Subquery_Expr is a parenthesized SELECT in expression position: a scalar

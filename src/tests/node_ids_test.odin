@@ -6,7 +6,7 @@ import db "../engine"
 
 // A resolved statement links a node by its number (A1.8): every node the
 // parser makes that a resolution links (a column, a call, a binary operator, a
-// select)
+// select, an IN, the two comparisons of a BETWEEN)
 // has a number of its own, from the query's block (node_base + 1 ..
 // node_base + node_count) with none missing, and no two queries share one.
 
@@ -39,6 +39,13 @@ ni_expr :: proc(seen: ^Ni_Seen, expr: ^db.Expr) {
 			id = e.id
 		case db.Binary_Expr:
 			id = e.id
+		case db.In_Expr:
+			id = e.id
+		case db.Between_Expr:
+			// Two comparisons, two numbers.
+			seen.nodes += 1
+			seen.ids[e.low_id] += 1
+			id = e.high_id
 		case db.Subquery_Expr:
 			// The walk stops at a subquery; its SELECT is the same query's.
 			ni_select(seen, e.select)
@@ -57,7 +64,7 @@ ni_expr :: proc(seen: ^Ni_Seen, expr: ^db.Expr) {
 
 @(test)
 test_the_parser_numbers_the_nodes_a_resolution_links :: proc(t: ^testing.T) {
-	sql := "SELECT a.x + 1, lower(b.n), count(*) FROM a JOIN b ON b.id = a.id AND b.k <> 2 WHERE a.x > (SELECT max(v) FROM c WHERE c.k = a.k) OR a.y IN (1, 2)"
+	sql := "SELECT a.x + 1, lower(b.n), count(*) FROM a JOIN b ON b.id = a.id AND b.k <> 2 WHERE a.x > (SELECT max(v) FROM c WHERE c.k = a.k) OR a.y IN (1, 2) OR a.x BETWEEN 3 AND a.y"
 	query, err := db.sql_parse(sql)
 	if !testing.expectf(t, db.error_ok(err), "parse: %s", err.message) do return
 	defer db.query_destroy(&query)

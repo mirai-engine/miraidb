@@ -661,6 +661,15 @@ in_equal :: proc(a, b: Value, collation: string, store: ^Store) -> bool {
 	return ok && order == .Equal
 }
 
+// in_equal_decided is in_equal through the collation a link decided, when
+// there is one (compare_collated).
+@(private)
+in_equal_decided :: #force_inline proc(a, b: Value, collation: string, store: ^Store, ref: ^Collation_Ref) -> bool {
+	if ref == nil do return in_equal(a, b, collation, store)
+	order, ok := value_compare_decided(a, b, collation, store, ref)
+	return ok && order == .Equal
+}
+
 // comparison_collation is the collation a comparison of two operands uses
 // (collation_precedence).
 @(private)

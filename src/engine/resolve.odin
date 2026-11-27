@@ -709,10 +709,14 @@ res_expr :: proc(walk: ^Res_Walk, expr: ^Expr) {
 		res_expr(walk, e.operand)
 		res_expr(walk, e.low)
 		res_expr(walk, e.high)
+		res_link_compare(walk, e.low_id, e.operand, e.low)
+		res_link_compare(walk, e.high_id, e.operand, e.high)
 	case In_Expr:
 		res_expr(walk, e.operand)
 		for item in e.items do res_expr(walk, item)
 		if e.subquery != nil do res_select(walk, e.subquery)
+		// The operand's collation alone decides, as eval_expr reads it.
+		res_link_compare(walk, e.id, e.operand, nil)
 	case Call_Expr:
 		if limit := walk.tx.store.function_arg_limit; limit > 0 && len(e.args) > limit && walk.err.kind == .None {
 			walk.err = errf(.Invalid_Argument, "too many arguments on function %s", e.name)
@@ -1155,9 +1159,17 @@ res_bind_call :: proc(walk: ^Res_Walk, e: Call_Expr) {
 // enclosing query's, a view's) leaves the comparison without one.
 @(private)
 res_bind_compare :: proc(walk: ^Res_Walk, e: Binary_Expr) {
+	res_link_compare(walk, e.id, e.left, e.right)
+}
+
+// res_link_compare links the comparison numbered `id` of `left` with `right`
+// (nil for none: an IN's operand, whose collation alone decides), as
+// res_bind_compare does a comparison operator's.
+@(private)
+res_link_compare :: proc(walk: ^Res_Walk, id: Node_Id, left_expr, right_expr: ^Expr) {
 	bindings := walk.bindings
-	if bindings == nil || e.id <= bindings.base || len(walk.scopes) == 0 do return
-	local := e.id - bindings.base
+	if bindings == nil || id <= bindings.base || len(walk.scopes) == 0 do return
+	local := id - bindings.base
 	if local >= Node_Id(len(bindings.compares)) do return
 	Side :: struct {
 		explicit:  string,
@@ -1193,8 +1205,8 @@ res_bind_compare :: proc(walk: ^Res_Walk, e: Binary_Expr) {
 		out.column = column.id
 		return out, true
 	}
-	left, left_ok := side(walk, e.left)
-	right, right_ok := side(walk, e.right)
+	left, left_ok := side(walk, left_expr)
+	right, right_ok := side(walk, right_expr)
 	if !left_ok || !right_ok do return
 	name := collation_precedence(
 		{explicit = left.explicit, collated = left.collated, column = left.column != 0, declared = left.declared},
@@ -1209,6 +1221,7 @@ res_bind_compare :: proc(walk: ^Res_Walk, e: Binary_Expr) {
 		right_affinity = right.affinity,
 		left_column    = left.column,
 		right_column   = right.column,
+		named          = len(name) > 0,
 	}
 }
 

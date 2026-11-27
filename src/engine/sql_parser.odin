@@ -3138,7 +3138,7 @@ parse_comparison :: proc(p: ^Parser) -> ^Expr {
 			p_expect_keyword(p, "and")
 			high := parse_operand(p)
 			e := new(Expr, p.alloc)
-			e^ = Between_Expr{operand = left, low = low, high = high, negated = negated}
+			e^ = Between_Expr{operand = left, low = low, high = high, negated = negated, low_id = p_node_id(p), high_id = p_node_id(p)}
 			left = e
 			continue
 		}
@@ -3148,7 +3148,7 @@ parse_comparison :: proc(p: ^Parser) -> ^Expr {
 				subquery := parse_scalar_subquery(p)
 				p_expect_punct(p, ")")
 				e := new(Expr, p.alloc)
-				e^ = In_Expr{operand = left, subquery = subquery, negated = negated}
+				e^ = In_Expr{operand = left, subquery = subquery, negated = negated, id = p_node_id(p)}
 				left = e
 				continue
 			}
@@ -3172,7 +3172,7 @@ parse_comparison :: proc(p: ^Parser) -> ^Expr {
 				continue
 			}
 			e := new(Expr, p.alloc)
-			e^ = In_Expr{operand = left, items = items[:], negated = negated}
+			e^ = In_Expr{operand = left, items = items[:], negated = negated, id = p_node_id(p)}
 			left = e
 			continue
 		}
