@@ -138,3 +138,50 @@ test_a_commit_is_reproduced_from_its_list_of_changes :: proc(t: ^testing.T) {
 	testing.expectf(t, len(replica.err) == 0, "applying the list failed: %s", replica.err)
 	same_state(t, source, target)
 }
+
+@(private = "file")
+Recorder :: struct {
+	payloads: [dynamic][]u8,
+}
+
+@(private = "file")
+record :: proc(ctx: rawptr, store: ^db.Store, ops: []db.Store_Op) {
+	recorder := (^Recorder)(ctx)
+	w: db.Byte_Writer
+	db.bw_init(&w)
+	for op in ops do db.store_op_encode(&w, op)
+	append(&recorder.payloads, db.bw_bytes(&w))
+}
+
+// Two stores that run the same transactions publish the same changes in the
+// same order: a commit that creates or drops several tables listed them in
+// the order of a map, which differs from one store to the next.
+@(test)
+test_two_stores_publish_the_same_changes :: proc(t: ^testing.T) {
+	recorders: [2]Recorder
+	defer for &r in recorders {
+		for payload in r.payloads do delete(payload)
+		delete(r.payloads)
+	}
+	for &recorder in recorders {
+		store, err := db.store_open("", {persistent = false})
+		if !testing.expectf(t, db.error_ok(err), "open: %s", err.message) do return
+		store.on_commit = record
+		store.on_commit_ctx = &recorder
+		created := make([dynamic]string, context.temp_allocator)
+		dropped := make([dynamic]string, context.temp_allocator)
+		for i in 0 ..< 16 {
+			append(&created, fmt.tprintf("CREATE TABLE t%d (n INTEGER)", i))
+			append(&created, fmt.tprintf("INSERT INTO t%d VALUES (%d)", i, i))
+			append(&dropped, fmt.tprintf("DROP TABLE t%d", i))
+		}
+		run_in_tx(t, store, created[:])
+		run_in_tx(t, store, dropped[:])
+		store.on_commit = nil
+		db.store_close(store)
+	}
+	if !testing.expect_value(t, len(recorders[0].payloads), len(recorders[1].payloads)) do return
+	for payload, i in recorders[0].payloads {
+		testing.expectf(t, slice.equal(payload, recorders[1].payloads[i]), "commit %d: the two stores listed different changes", i + 1)
+	}
+}

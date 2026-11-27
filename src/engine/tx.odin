@@ -2705,15 +2705,27 @@ tx_build_ops :: proc(tx: ^Tx) -> []Store_Op {
 	}
 	ops := make([dynamic]Store_Op, 0, count)
 	// Drops go first: a table this transaction dropped and created again is
-	// applied in that order, on replay and at commit alike.
-	for name in tx.state.dropped {
-		append(&ops, Store_Op{kind = .Drop_Table, name = name})
+	// applied in that order, on replay and at commit alike. Each kind goes in
+	// name order, as the alters do: in the order of the map, two stores that ran
+	// the same transaction listed the same changes differently, and a follower
+	// replaying another's log could not tell its own changes from them (A3).
+	// A commit that drops or creates nothing sorts nothing.
+	if len(tx.state.dropped) > 0 {
+		dropped_names := map_keys_sorted(tx.state.dropped)
+		for name in dropped_names {
+			append(&ops, Store_Op{kind = .Drop_Table, name = name})
+		}
+		delete(dropped_names)
 	}
-	for name in tx.state.created {
-		append(
-			&ops,
-			Store_Op{kind = .Create_Table, name = name, schema = tx.state.created[name].schema},
-		)
+	if len(tx.state.created) > 0 {
+		created_names := map_keys_sorted(tx.state.created)
+		for name in created_names {
+			append(
+				&ops,
+				Store_Op{kind = .Create_Table, name = name, schema = tx.state.created[name].schema},
+			)
+		}
+		delete(created_names)
 	}
 	altered_names := map_keys_sorted(tx.state.altered)
 	for name in altered_names {
