@@ -3,7 +3,8 @@ package engine
 // Resolve_Counters counts what the engine works out again while statements
 // run: the name of a column, a function or a collation looked up, a text
 // parsed (a statement, a policy, a view, a trigger), the names of a statement
-// checked and a join order planned. The statement path (A1 in the plan) moves
+// checked, a join order planned and a memory table's rows counted by reading
+// them. The statement path (A1 in the plan) moves
 // each of these out of the run, and out of the row first: these numbers are
 // how a test says it did.
 //
@@ -16,6 +17,7 @@ Resolve_Counters :: struct {
 	parses:          u64,
 	resolutions:     u64,
 	plans:           u64,
+	row_counts:      u64,
 }
 
 @(thread_local, private)

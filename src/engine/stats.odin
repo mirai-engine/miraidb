@@ -245,9 +245,9 @@ stats_estimate_rows :: proc(
 	predicate: ^Expr,
 	params: []Value,
 ) -> u64 {
-	total := u64(table_row_count(table))
+	// The statistics have the count; a memory table counts by reading its rows.
 	stats, has_stats := stats_get(store, table.schema.name)
-	if has_stats do total = stats.rows
+	total := has_stats ? stats.rows : u64(table_row_count(table))
 	if predicate == nil || !has_stats || stats.rows == 0 do return total
 	conjuncts := make([dynamic]^Expr)
 	defer delete(conjuncts)

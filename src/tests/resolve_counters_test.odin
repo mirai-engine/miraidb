@@ -69,10 +69,14 @@ test_the_names_a_statement_resolves_while_it_runs :: proc(t: ^testing.T) {
 
 	// A correlated subquery reads the enclosing row's column through its link,
 	// from the frame of the select it names, and plans once per statement
-	// (A1.8g).
+	// (A1.8g). Its access to b, chosen at each of its runs, does not count b's
+	// rows, which a memory table counts by reading them all: the estimate is
+	// read only with statistics, or by EXPLAIN (A1.10). Each run counted b
+	// twice.
 	correlated := rc_measure(t, store, "SELECT count(*) FROM a WHERE x >= (SELECT count(*) FROM b WHERE b.a_id = a.id)")
 	testing.expectf(t, correlated.column_names <= RC_ROWS + 20, "correlated: %d column lookups", correlated.column_names)
 	testing.expectf(t, correlated.plans <= 2, "correlated: %d plans", correlated.plans)
+	testing.expectf(t, correlated.row_counts <= 2, "correlated: %d row counts", correlated.row_counts)
 
 	// An aggregate of the engine's is linked by its lowered name (A1.10): every
 	// group asked the name of each aggregate in it, 300 for these 100 groups.

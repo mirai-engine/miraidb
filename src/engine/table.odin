@@ -1805,6 +1805,7 @@ table_cow_clone :: proc(source: ^Table) -> ^Table {
 
 table_row_count :: proc(t: ^Table) -> int {
 	if t.paged != nil do return int(t.paged.rows)
+	resolve_counted.row_counts += 1
 	live := 0
 	it := rows_iter(&t.rows)
 	for row in rows_next(&it) {

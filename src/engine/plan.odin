@@ -57,19 +57,27 @@ Plan_Access :: struct {
 
 // plan_access picks between scanning a table and probing one of its indexes.
 // `predicate` is what the caller will filter with; the estimate of how many rows
-// survive it is what both sides are priced with.
+// survive it is what both sides are priced with. Without statistics the choice
+// reads no estimate (the first index a conjunct can use answers), and a caller
+// that wants the choice alone (`estimate` false) does not count the table's
+// rows for it: a memory table counts by reading every row, and a correlated
+// subquery planned its access once per row of the query around it.
 plan_access :: proc(
 	store: ^Store,
 	table: ^Table,
 	ref: Table_Ref,
 	predicate: ^Expr,
 	params: []Value,
+	estimate := true,
 ) -> Plan_Access {
-	rows := stats_estimate_rows(store, table, predicate, params)
-	// A scan pays for every row it reads, not for the rows that survive the
-	// filter: the filter runs on all of them.
-	scan_rows := u64(table_row_count(table))
-	if stats, has_stats := stats_get(store, table.schema.name); has_stats do scan_rows = stats.rows
+	stats, has_stats := stats_get(store, table.schema.name)
+	rows, scan_rows: u64
+	if has_stats || estimate {
+		rows = stats_estimate_rows(store, table, predicate, params)
+		// A scan pays for every row it reads, not for the rows that survive
+		// the filter: the filter runs on all of them.
+		scan_rows = has_stats ? stats.rows : u64(table_row_count(table))
+	}
 	best := Plan_Access {
 		kind  = .Scan,
 		index = -1,
@@ -77,7 +85,6 @@ plan_access :: proc(
 		cost  = f64(scan_rows) * PLAN_SCAN_ROW,
 	}
 	if predicate == nil || table == nil do return best
-	_, has_stats := stats_get(store, table.schema.name)
 	conjuncts := make([dynamic]^Expr)
 	defer delete(conjuncts)
 	split_and(predicate, &conjuncts)
