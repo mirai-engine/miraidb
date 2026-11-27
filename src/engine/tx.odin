@@ -643,9 +643,12 @@ tx_begin_read :: proc(store: ^Store) -> ^Tx {
 	tx.read_only = true
 	tx_arena_take(store, &tx.arena)
 	tx.alloc = arena_allocator_guarded(&tx.arena)
-	tx.read_tables = make(map[string]bool)
-	tx.cte_tables = make(map[string]^Table)
-	tx.cursors = make(map[string]^Cursor)
+	// A read's maps live in its arena, as everything it keeps does: they are
+	// made by bumping a pointer and go with the arena, where a statement made
+	// and freed five of them in the heap (A1.9).
+	tx.read_tables = make(map[string]bool, tx.alloc)
+	tx.cte_tables = make(map[string]^Table, tx.alloc)
+	tx.cursors = make(map[string]^Cursor, tx.alloc)
 	tx.use_frozen = true
 	// The lock is held only while the snapshot is taken or borrowed; the
 	// statement then runs without it, so a long read never blocks a commit.
@@ -665,7 +668,8 @@ tx_begin_read :: proc(store: ^Store) -> ^Tx {
 	// two statements of this transaction either: the shared lock is held until
 	// the references are taken, and a commit that later changes one of these
 	// tables copies it first (store_table_writable), so this view never moves.
-	tx.frozen = make(map[string]^Table, len(store.tables))
+	tx.frozen = make(map[string]^Table, len(store.tables), tx.alloc)
+	tx.frozen_list = make([dynamic]^Table, 0, len(store.tables), tx.alloc)
 	for name, table in store.tables {
 		shared := table_share(table)
 		tx.frozen[name] = shared
