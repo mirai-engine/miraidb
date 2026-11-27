@@ -856,13 +856,13 @@ plan_view_relation :: proc(
 	if len(ref.args) > 0 do return {}, false
 	sql, found := view_sql(tx, ref.name)
 	if !found do return {}, false
-	query, parse_err := sql_parse(sql)
+	tree, parse_err := tree_parse(tx, .View, sql)
 	if parse_err.kind != .None {
 		error_free(&parse_err)
 		return {}, false
 	}
-	defer query_destroy(&query)
-	inner, is_select := query.statement.(Select_Stmt)
+	defer tree_give(tx, tree)
+	inner, is_select := tree.query.statement.(Select_Stmt)
 	if !is_select do return {}, false
 	base, base_err := tx_table(tx, inner.from.name)
 	if base_err.kind != .None {

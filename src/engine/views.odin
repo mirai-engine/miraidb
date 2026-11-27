@@ -236,12 +236,14 @@ tx_materialize_view :: proc(tx: ^Tx, name, sql: string, args: []Value) -> (^Tabl
 			return nil, errf(.Sql_Unsupported, "view %s refers to itself", name)
 		}
 	}
-	query, parse_err := sql_parse(sql)
+	// The view's tree is kept for the generation (tree_parse): a run reads it
+	// as written, and the planner priced the same one.
+	tree, parse_err := tree_parse(tx, .View, sql)
 	if parse_err.kind != .None {
 		return nil, error_wrap(parse_err, .Corrupt_Log, "view %s holds invalid SQL: %s", name, parse_err.message)
 	}
-	defer query_destroy(&query)
-	select_stmt, is_select := query.statement.(Select_Stmt)
+	defer tree_give(tx, tree)
+	select_stmt, is_select := tree.query.statement.(Select_Stmt)
 	if !is_select {
 		return nil, errf(.Corrupt_Log, "view %s does not hold a SELECT", name)
 	}

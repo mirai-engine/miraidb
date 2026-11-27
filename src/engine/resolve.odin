@@ -391,13 +391,16 @@ res_ref :: proc(walk: ^Res_Walk, scope: ^Res_Scope, ref: ^Table_Ref) {
 @(private)
 res_view_columns :: proc(walk: ^Res_Walk, sql: string) -> ([]string, bool) {
 	if walk.depth >= VIEW_MAX_DEPTH do return nil, false
-	query, parse_err := sql_parse(sql)
-	defer query_destroy(&query)
+	// The resolver's own tree of the view, kept for the generation: what the
+	// walk rewrites in it lives in its arena.
+	tree, parse_err := tree_parse(walk.tx, .View_Columns, sql)
 	if parse_err.kind != .None {
 		error_free(&parse_err)
 		return nil, false
 	}
-	inner := Res_Walk{tx = walk.tx, depth = walk.depth + 1}
+	defer tree_give(walk.tx, tree)
+	query := tree.query
+	inner := Res_Walk{tx = walk.tx, depth = walk.depth + 1, alloc = arena_allocator_guarded(&query.arena)}
 	inner.scopes = make([dynamic]Res_Scope, 0, 4, context.temp_allocator)
 	inner.ctes = make([dynamic]Res_Cte, 0, 2, context.temp_allocator)
 	names := make([dynamic]string, 0, 4, context.temp_allocator)

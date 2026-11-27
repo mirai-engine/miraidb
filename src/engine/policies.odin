@@ -24,7 +24,11 @@ POLICY_SCHEMA_SQL :: `
 Policy_Set :: struct {
 	using_exprs: [dynamic]^Expr,
 	check_exprs: [dynamic]^Expr,
-	queries:     [dynamic]^Query,
+	// trees are the predicates' parses, kept by the store for the generation
+	// (tree_parse) and given back by policy_set_destroy, through `tx`, the
+	// transaction that took them.
+	trees:       [dynamic]Kept_Tree,
+	tx:          ^Tx,
 }
 
 sql_exec_create_policy :: proc(tx: ^Tx, stmt: Create_Policy_Stmt) -> (Sql_Result, Error) {
@@ -132,12 +136,11 @@ policy_validate :: proc(tx: ^Tx, table, sql: string) -> Error {
 policy_parse :: proc(tx: ^Tx, table, sql: string, set: ^Policy_Set) -> (^Expr, Error) {
 	source := strings.concatenate({"SELECT 1 FROM ", table, " WHERE (", sql, ")"})
 	defer delete(source)
-	query := new(Query)
-	parsed, parse_err := sql_parse(source)
-	query^ = parsed
-	append(&set.queries, query)
+	tree, parse_err := tree_parse(tx, .Policy, source)
 	if parse_err.kind != .None do return nil, parse_err
-	select_stmt, is_select := query.statement.(Select_Stmt)
+	set.tx = tx
+	append(&set.trees, tree)
+	select_stmt, is_select := tree.query.statement.(Select_Stmt)
 	if !is_select || select_stmt.where_clause == nil {
 		return nil, errf(.Sql_Syntax, "policy %s is not a predicate", sql)
 	}
@@ -198,11 +201,8 @@ policy_allows :: proc(set: ^Policy_Set, ctx: ^Eval_Ctx, check: bool) -> (bool, E
 }
 
 policy_set_destroy :: proc(set: ^Policy_Set) {
-	for query in set.queries {
-		query_destroy(query)
-		free(query)
-	}
-	delete(set.queries)
+	for tree in set.trees do tree_give(set.tx, tree)
+	delete(set.trees)
 	delete(set.using_exprs)
 	delete(set.check_exprs)
 }

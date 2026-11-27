@@ -62,9 +62,9 @@ test_the_names_a_statement_resolves_while_it_runs :: proc(t: ^testing.T) {
 	collated := rc_measure(t, store, "SELECT count(*) FROM a WHERE name = 'n5' COLLATE NOCASE")
 	testing.expectf(t, collated.collation_names < 20, "collation: %d lookups", collated.collation_names)
 
-	// A view's text is parsed at every run that reads it (A1.6).
+	// A view's text is parsed once per catalog generation (A1.8f).
 	view := rc_measure(t, store, "SELECT count(*) FROM small")
-	testing.expectf(t, view.parses >= 1, "view: %d parses", view.parses)
+	testing.expect_value(t, view.parses, 0)
 
 	// A correlated subquery looks the enclosing row's column up by name per
 	// inner row, and plans its join order again for every outer row (A1.8).
