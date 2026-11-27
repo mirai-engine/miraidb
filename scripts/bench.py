@@ -65,7 +65,13 @@ TIME_TOLERANCE = 1.10
 # its life on the machine's mood instead of on the code.
 RUN_NOISE = 3.0
 BYTES_TOLERANCE = 1.10
-# The commit a reader forces to copy shared structure, at READER_ROWS rows.
+# The commit a reader forces to copy shared structure, at READER_ROWS rows. The
+# gate holds the median of the commits after the first in one process
+# (`bench-read`): the first also pays for memory and code the process touches
+# for the first time, 0.2-0.9 ms from one run to the next with no code change,
+# and a median of three such firsts failed the gate on noise. The ones after it
+# are about 50 us; a commit that copied the table would pay that copy on every
+# one of them (10-21 ms over 50 000 rows before R7).
 READER_ROWS = 50000
 READER_LIMIT_US = 1000.0
 
@@ -147,7 +153,8 @@ def measure(binary: str, rows: int, iterations: int) -> dict:
 
 
 def reader_commit_us(binary: str, rows: int, runs: int = 3) -> list[float]:
-    """The commit made with a reader open, on a fresh table of `rows`, `runs` times."""
+    """The median commit made with a reader open after the first, on a fresh table
+    of `rows`, in each of `runs` processes."""
     directory = os.path.join(ROOT, "_bench_tmp")
     times = []
     for _ in range(runs):
@@ -158,9 +165,9 @@ def reader_commit_us(binary: str, rows: int, runs: int = 3) -> list[float]:
             out = run(binary, "bench-read", relative, str(rows), "10", "--no-sync")
         finally:
             shutil.rmtree(directory, ignore_errors=True)
-        found = re.search(r"commit with a read open: ([\d.]+) us", out)
+        found = re.search(r"commits with a read open, \d+ after the first: median ([\d.]+) us", out)
         if not found:
-            raise SystemExit(f"cannot read the commit with a reader open from: {out}")
+            raise SystemExit(f"cannot read the commits with a reader open from: {out}")
         times.append(float(found.group(1)))
     return times
 
@@ -169,7 +176,7 @@ def check_reader_commit(binary: str) -> int:
     times = reader_commit_us(binary, READER_ROWS)
     median = sorted(times)[len(times) // 2]
     status = "ok  " if median <= READER_LIMIT_US else "FAIL"
-    print(f"{status} commit w/ reader at {READER_ROWS} rows: median {median:.1f} us of "
+    print(f"{status} commit w/ reader at {READER_ROWS} rows (median after the first): {median:.1f} us of "
           f"{', '.join(f'{t:.1f}' for t in times)} (limit {READER_LIMIT_US:.0f} us)")
     return 0 if median <= READER_LIMIT_US else 1
 

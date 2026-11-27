@@ -4,6 +4,7 @@ package main
 import "core:fmt"
 import "core:math"
 import "core:os"
+import "core:slice"
 import "core:strconv"
 import "core:strings"
 import "core:time"
@@ -385,6 +386,32 @@ main :: proc() {
 		}
 		fmt.printfln("commit with a read open: %.1f us", time.duration_microseconds(time.since(copy_start)))
 		db.tx_end(held)
+		// The first such commit also pays for what the process touches for the
+		// first time (fresh memory, the first run of the path): 0.2-0.9 ms from
+		// one run to the next on the same machine, where the ones after it are
+		// 50 us. The median of the next ones is what a commit with a reader
+		// costs, and what the gate (scripts/bench.py) holds: a commit that copied
+		// the table again would cost it on every one of them.
+		READER_COMMITS :: 21
+		commits: [READER_COMMITS]f64
+		for i in 0 ..< READER_COMMITS {
+			reader := db.tx_begin_read(store)
+			commit_start := time.now()
+			if _, commit_err := db.sql_execute(store, "INSERT INTO reads (v) VALUES (1)"); !db.error_ok(commit_err) {
+				db.tx_end(reader)
+				fail(commit_err)
+			}
+			commits[i] = time.duration_microseconds(time.since(commit_start))
+			db.tx_end(reader)
+		}
+		slice.sort(commits[:])
+		fmt.printfln(
+			"commits with a read open, %d after the first: median %.1f us (min %.1f, max %.1f)",
+			READER_COMMITS,
+			commits[READER_COMMITS / 2],
+			commits[0],
+			commits[READER_COMMITS - 1],
+		)
 
 		start := time.now()
 		for _ in 0 ..< iterations {

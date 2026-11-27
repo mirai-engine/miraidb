@@ -34,7 +34,7 @@ Rules for this file:
 | R3 | closed: a prune visits the rows that hold a version or are a tombstone | — | — |
 | R4 | closed: a stored row is one allocation; a full hand-over measured and not worth it | — | — |
 | R6 | closed: a statement's fixed cost, a rowid read and a scan's per-row lists | — | — |
-| R7 | closed: a reader shares the rows by block, the index trees and the table's arena; a commit with a reader open is 0.19 ms over 50 000 rows, gated at 1 ms by `scripts/bench.py` | — | — |
+| R7 | closed: a reader shares the rows by block, the index trees and the table's arena; a commit with a reader open is 0.19 ms over 50 000 rows, gated at 1 ms by `scripts/bench.py`. The gate holds the median of the commits after the first in one process (about 55 us): the first also pays for memory the process touches for the first time, 0.2-0.9 ms from run to run with no code change, and failed the gate on noise (CI 48). A commit that copies every row again costs 7.9-8.9 ms there | — | — |
 | D2 | overlap on an `rtree` table is a scan | node pages and a descent | M |
 | D3 | closed: a retention per store (`PRAGMA history_retention`), applied after each commit; `AS OF` on every table of a join | — | — |
 | D4 | an index of up to 16 pages is built again per commit; a larger one, or an automatic one, re-encodes the `.sqlite` mirror | insert and remove index entries in place | L |
