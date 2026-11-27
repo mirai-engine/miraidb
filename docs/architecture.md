@@ -370,6 +370,19 @@ affinity applies to them. An operator is evaluated in its own frame
 The resolver walks a chain of operators in a loop and links the chain's
 comparisons once both sides of each are resolved.
 
+The trees a statement reads beside its own are kept too (`tree_cache.odin`,
+A1.8f): a view's query and a policy's predicate, keyed by their use and text
+and kept for a catalog generation. Before, a run parsed a view's text three
+times (the resolver for its columns, the planner to price it, the run that
+materializes it) and parsed every policy of a table on every statement. A kept
+tree has one holder at a time; a use nested inside another, or on another
+thread, parses its own and keeps none. The resolver's trees are kept apart
+from the ones a run reads, since a resolution rewrites names in the tree it
+walks and those rewrites now live in that tree's arena. A transaction that
+sees another catalog (its own DDL, or a read that began before a change)
+parses and keeps nothing. A run's view tree depends on its text alone, so the
+generation guards what the resolver wrote into its own trees.
+
 A query binds sources: `Source` pairs a table with one of its rows and an
 optional alias. Single-table statements build a one-source context; a join
 builds one source per table. Column resolution searches the bound sources
