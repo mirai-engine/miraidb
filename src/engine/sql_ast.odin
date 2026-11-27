@@ -147,9 +147,18 @@ Literal_Expr :: struct {
 	value: Value,
 }
 
+// Node_Id numbers the nodes of one parsed query that a resolution links
+// (Column_Expr, Call_Expr, Binary_Expr): the parser gives each a number from 1,
+// dense, and Query.node_count says how many there are, so what the resolution
+// works out for a node can live in an array beside the tree, read by that
+// number (the resolved statement, A1.8). 0 is a node the parser did not make
+// (a rewrite, an expansion of `*`): it has no link and is resolved by name.
+Node_Id :: u32
+
 Column_Expr :: struct {
 	table: string,
 	name:  string,
+	id:    Node_Id,
 }
 
 Star_Expr :: struct {
@@ -160,6 +169,7 @@ Binary_Expr :: struct {
 	op:    Binary_Op,
 	left:  ^Expr,
 	right: ^Expr,
+	id:    Node_Id,
 }
 
 Unary_Expr :: struct {
@@ -202,6 +212,7 @@ Call_Expr :: struct {
 	// and its `ORDER BY` (inside the parentheses) is the order it reads them in.
 	filter:      ^Expr,
 	order_by:    []Order_Item,
+	id:          Node_Id,
 }
 
 Like_Expr :: struct {
@@ -903,6 +914,9 @@ Query :: struct {
 	// param_names has one entry per parameter: its name as written ("?3", ":id",
 	// "@id", "$id") or "" for a bare `?`. It lives in the query's arena.
 	param_names: []string,
+	// node_count is how many nodes the parser numbered (Node_Id): the ids run
+	// from 1 to node_count.
+	node_count: Node_Id,
 }
 
 query_destroy :: proc(q: ^Query) {

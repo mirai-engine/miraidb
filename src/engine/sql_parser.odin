@@ -12,6 +12,8 @@ Parser :: struct {
 	query:       ^Query,
 	err:         Error,
 	param_count: int,
+	// node_count is the last Node_Id given (p_node_id).
+	node_count:  Node_Id,
 	// param_names names each parameter slot: "?3", ":id", "@id", "$id", or ""
 	// for a bare `?`. It lives in the query's arena.
 	param_names: [dynamic]string,
@@ -89,6 +91,7 @@ sql_parse :: proc(source: string) -> (Query, Error) {
 	}
 	q.statement = statement
 	q.param_count = p.param_count
+	q.node_count = p.node_count
 	for len(p.param_names) < p.param_count do append(&p.param_names, "")
 	q.param_names = p.param_names[:]
 	return q, ERROR_NONE
@@ -1363,13 +1366,14 @@ parse_using_condition :: proc(
 			op    = .Eq,
 			left  = column_expr(p, left_name, column),
 			right = column_expr(p, right_name, column),
+			id    = p_node_id(p),
 		}
 		if condition == nil {
 			condition = equality
 			continue
 		}
 		both := new(Expr, p.alloc)
-		both^ = Binary_Expr{op = .And, left = condition, right = equality}
+		both^ = Binary_Expr{op = .And, left = condition, right = equality, id = p_node_id(p)}
 		condition = both
 	}
 	return condition
@@ -1378,8 +1382,35 @@ parse_using_condition :: proc(
 @(private)
 column_expr :: proc(p: ^Parser, table: string, column: string) -> ^Expr {
 	expr := new(Expr, p.alloc)
-	expr^ = Column_Expr{table = strings.clone(table, p.alloc), name = strings.clone(column, p.alloc)}
+	expr^ = Column_Expr{table = strings.clone(table, p.alloc), name = strings.clone(column, p.alloc), id = p_node_id(p)}
 	return expr
+}
+
+// p_node_id is the next node number of the query being parsed (Node_Id).
+@(private)
+p_node_id :: proc(p: ^Parser) -> Node_Id {
+	p.node_count += 1
+	return p.node_count
+}
+
+// node_call and node_column make the numbered nodes of the parse functions that
+// recurse (parse_primary and the ones it reaches). In their own frame: a node
+// built in place is a temporary the size of an Expr in the frame of the
+// function that builds it, and a function that recurses through parentheses
+// carried a dozen of them per level, which is stack an unoptimized build ran
+// out of right at MAX_EXPRESSION_DEPTH.
+@(private)
+node_call :: #force_no_inline proc(p: ^Parser, name: string, args: []^Expr) -> ^Expr {
+	e := new(Expr, p.alloc)
+	e^ = Call_Expr{name = name, args = args, id = p_node_id(p)}
+	return e
+}
+
+@(private)
+node_column :: #force_no_inline proc(p: ^Parser, table: string, name: string) -> ^Expr {
+	e := new(Expr, p.alloc)
+	e^ = Column_Expr{table = table, name = name, id = p_node_id(p)}
+	return e
 }
 
 parse_table_ref :: proc(p: ^Parser) -> Table_Ref {
@@ -2949,8 +2980,7 @@ p_call2 :: proc(p: ^Parser, name: string, first, second: ^Expr) -> ^Expr {
 	args := make([]^Expr, 2, p.alloc)
 	args[0] = first
 	args[1] = second
-	e := new(Expr, p.alloc)
-	e^ = Call_Expr{name = name, args = args}
+	e := node_call(p, name, args)
 	return e
 }
 
@@ -3269,8 +3299,7 @@ parse_unary :: proc(p: ^Parser) -> ^Expr {
 		args := make([]^Expr, 2, p.alloc)
 		args[0] = expr
 		args[1] = index
-		e := new(Expr, p.alloc)
-		e^ = Call_Expr{name = "array_get", args = args}
+		e := node_call(p, "array_get", args)
 		expr = e
 	}
 	// `x::type` is PostgreSQL's cast. It binds tighter than any operator, so
@@ -3291,8 +3320,7 @@ parse_unary :: proc(p: ^Parser) -> ^Expr {
 		args := make([]^Expr, 2, p.alloc)
 		args[0] = expr
 		args[1] = path
-		e := new(Expr, p.alloc)
-		e^ = Call_Expr{name = name, args = args}
+		e := node_call(p, name, args)
 		expr = e
 	}
 	return expr
@@ -3380,8 +3408,7 @@ parse_primary :: proc(p: ^Parser) -> ^Expr {
 				}
 			}
 			p_expect_punct(p, ")")
-			e := new(Expr, p.alloc)
-			e^ = Call_Expr{name = RAISE_CALL, args = args}
+			e := node_call(p, RAISE_CALL, args)
 			return e
 		}
 		// SQLite's time keywords: the current UTC moment as text, as datetime(),
@@ -3394,8 +3421,7 @@ parse_primary :: proc(p: ^Parser) -> ^Expr {
 			if p_match_punct(p, "(") do p_expect_punct(p, ")")
 			args := make([]^Expr, 1, p.alloc)
 			args[0] = expr_literal(p, value_string("now"))
-			e := new(Expr, p.alloc)
-			e^ = Call_Expr{name = function, args = args}
+			e := node_call(p, function, args)
 			return e
 		}
 		// The SQL-standard session values are written without parentheses:
@@ -3405,8 +3431,7 @@ parse_primary :: proc(p: ^Parser) -> ^Expr {
 			name := strings.to_lower(p.current.text, p.alloc)
 			p_advance(p)
 			if p_match_punct(p, "(") do p_expect_punct(p, ")")
-			e := new(Expr, p.alloc)
-			e^ = Call_Expr{name = name}
+			e := node_call(p, name, nil)
 			return e
 		}
 		// `ARRAY[...]` builds an array from its elements. `array` is also a
@@ -3424,8 +3449,7 @@ parse_primary :: proc(p: ^Parser) -> ^Expr {
 					}
 				}
 				p_expect_punct(p, "]")
-				e := new(Expr, p.alloc)
-				e^ = Call_Expr{name = "array_make", args = items[:]}
+				e := node_call(p, "array_make", items[:])
 				return e
 			}
 			p_reset(p, lexer, saved)
@@ -3473,12 +3497,10 @@ parse_primary :: proc(p: ^Parser) -> ^Expr {
 				table = strings.concatenate({table, ".", column_name}, p.alloc)
 				column_name = p_ident(p)
 			}
-			column := new(Expr, p.alloc)
-			column^ = Column_Expr{table = table, name = column_name}
+			column := node_column(p, table, column_name)
 			return column
 		}
-		column := new(Expr, p.alloc)
-		column^ = Column_Expr{name = name}
+		column := node_column(p, "", name)
 		return column
 	case .Quoted_Ident:
 		name := p_ident(p)
@@ -3494,12 +3516,10 @@ parse_primary :: proc(p: ^Parser) -> ^Expr {
 				table = strings.concatenate({table, ".", column_name}, p.alloc)
 				column_name = p_ident(p)
 			}
-			column := new(Expr, p.alloc)
-			column^ = Column_Expr{table = table, name = column_name}
+			column := node_column(p, table, column_name)
 			return column
 		}
-		column := new(Expr, p.alloc)
-		column^ = Column_Expr{name = name}
+		column := node_column(p, "", name)
 		return column
 	case .Punct:
 		if token.text == "?" {
@@ -3562,8 +3582,7 @@ parse_primary :: proc(p: ^Parser) -> ^Expr {
 				append(&items, inner)
 				for p_match_punct(p, ",") do append(&items, parse_expression(p))
 				p_expect_punct(p, ")")
-				e := new(Expr, p.alloc)
-				e^ = Call_Expr{name = ROW_VALUE_CALL, args = items[:]}
+				e := node_call(p, ROW_VALUE_CALL, items[:])
 				return e
 			}
 			p_expect_punct(p, ")")
@@ -3656,7 +3675,7 @@ expr_binary :: proc(p: ^Parser, op: Binary_Op, left, right: ^Expr) -> ^Expr {
 		return nil
 	}
 	e := new(Expr, p.alloc)
-	e^ = Binary_Expr{op = op, left = left, right = right}
+	e^ = Binary_Expr{op = op, left = left, right = right, id = p_node_id(p)}
 	p.binary_depth[e] = depth
 	return e
 }
@@ -3829,6 +3848,7 @@ parse_call :: #force_no_inline proc(p: ^Parser, name: string) -> ^Expr {
 	call := new(Expr, p.alloc)
 	call_expr: Call_Expr
 	call_expr.name = name
+	call_expr.id = p_node_id(p)
 	if p_match_punct(p, "*") {
 		call_expr.star = true
 	} else if !p_is_punct(p, ")") {
