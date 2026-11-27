@@ -130,6 +130,11 @@ Store :: struct {
 	// (sql_execute), up to STATEMENT_CACHE_SIZE, behind statement_cache_mutex.
 	statement_cache:       map[string]Statement_Entry,
 	statement_cache_mutex: sync.Mutex,
+	// tree_cache keeps the trees a statement reads beside its own (a view's
+	// query, a policy's predicate) by their use and text, up to
+	// TREE_CACHE_SIZE, behind tree_cache_mutex (tree_cache.odin).
+	tree_cache:            map[string]Tree_Entry,
+	tree_cache_mutex:      sync.Mutex,
 	// catalog_generation moves on with every commit that changes what a
 	// statement's names resolve to (store_op_changes_catalog), and with every
 	// ATTACH and DETACH. A tree resolved at one generation is parsed again at
@@ -582,6 +587,7 @@ store_close :: proc(store: ^Store) {
 	}
 	delete(store.variables)
 	statement_cache_clear(store)
+	tree_cache_clear(store)
 	for name, _ in store.functions do delete(name)
 	delete(store.functions)
 	for name, _ in store.aggregates do delete(name)
