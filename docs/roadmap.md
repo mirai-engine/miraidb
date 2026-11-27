@@ -36,7 +36,6 @@ that way.
 | # | Item | What is left | Effort | Depends on |
 |---|---|---|---|---|
 | 15 | **D4 — secondary indexes in the mirror** | An index of up to 16 pages is built again per commit; a larger or automatic one re-encodes the `.sqlite` file. Next: entries inserted and removed in place. | L | — |
-| 16 | **D36 — partial and expression indexes in plans** | The planner skips them; match a predicate to a partial index's WHERE and an expression to its index. | M | 8 |
 | 32 | **D37 — catching up with a shared file** | Five processes on one file run `multiwrite01` in 1.5–1.7× SQLite's time: the stalls are traced and the locks held as SQLite holds them, mptest's own tables are patched. Speed only, left for a later audit: a writer still holds the lock ~9 ms (repacking leaves, schema changes re-encode the file) where SQLite holds it ~3. | M | — |
 | 33 | **S8 — the rest of the C API** | 233 of SQLite's 309 functions are exported; 76 are left. | M | — |
 | 34 | **D39 — PostgreSQL's surface** | A probe gate for the dialect, the catalog drivers and ORMs read, PostgreSQL's spelling of grants and policies. | L | — |
@@ -65,7 +64,7 @@ with peer-to-peer sync; its networked phases build on items 27 and 28.
    starting from a profile of the write path. The parity gate
    (`scripts/parity.py`) records its gain with `--record` so it cannot slip back,
    and holds a workload that reached the reference under 1.10x of it.
-2. **S8**, then **D37**, **D4** and **D36**.
+2. **S8**, then **D37** and **D4**.
 3. **D39**, then **D40**.
 4. The disk workloads and the depth items of track C.
 5. **D15, D14** and the release gates, in that order; **D34** when its image is

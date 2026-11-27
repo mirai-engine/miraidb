@@ -50,7 +50,7 @@ Rules for this file:
 | D23 | closed: a refused allocation fails its statement with `.Out_Of_Memory` (`SQLITE_NOMEM`); `test_allocation_failure_walk` | — | — |
 | D24 | closed: `scripts/mirror_fuzz.py` passes 20 seeds of 400 statements against SQLite, a CI gate | — | — |
 | D34 | the threaded suite is green on Linux and Windows; the sanitizer covers the Windows CLI, not the suite | run the suite sanitized on every platform, in CI | S |
-| D36 | a query never reads a partial or expression index | match a query's predicate to the index | M |
+| D36 | closed: the planner reads a partial index the query implies and an expression index for an equality with its expression; `test_partial_and_expression_indexes_answer_as_sqlite`, `scripts/plan_check.py` | — | — |
 | D37 | `multiwrite01` is 1.5–1.7× SQLite (speed only, traced for a later audit): a writer holds the lock ~9 ms where SQLite holds it ~3 | cheaper leaf repacking, schema changes the mirror patches, time it in CI | M |
 | S8 | the `sqlite3_*` facade exports 233 of the 309 functions SQLite declares | the other 76: statements, URIs, pre-update hooks, memory, WAL and snapshots, mutexes | M |
 | D39 | PostgreSQL's surface is not measured in CI; its catalog is `pg_tables` only | a probe gate, the catalog drivers and ORMs read, PostgreSQL's `GRANT` and `CREATE POLICY` | L |
@@ -638,15 +638,26 @@ sanitizer as a gate (it is the CLI only today).
 
 ## D36 — The planner and partial or expression indexes
 
-**Now.** A partial or expression index is maintained and enforced, but the
-planner skips it: `index_is_plain` keeps it out of every probe, range and
-ordered walk, so a query answers from the rows and pays a scan where SQLite would
-read the index.
+**Closed** (A2.5, `src/engine/plan_index.odin`). The planner reads:
 
-**Done when.** A predicate that implies a partial index's WHERE (the same term,
-or a stronger bound) may read it, and an expression a query compares is matched
-to an index over the same expression text; `scripts/plan_check.py` gains both
-plans and the differential corpus keeps passing with the indexes present.
+- a partial index of one column when the query's terms imply its `WHERE`: each
+  of the index's terms is one of the query's, written the same way, or is
+  `x IS NOT NULL` where the query compares `x` (SQLite's rule);
+- an index over one expression for an equality between that expression, written
+  the same way, and a constant, under the comparison's collation only when it
+  is the index's. A number is probed in every numeric kind it equals, since each
+  kind files its own key. ANALYZE measures columns: the equality is priced at
+  10 rows, as SQLite prices an index without statistics.
+
+`test_partial_and_expression_indexes_answer_as_sqlite` checks 20 counts and
+plans against SQLite 3.45, `scripts/plan_check.py` the two plans and one that must
+scan, and the differential corpus queries both indexes it creates.
+
+A range reads a partial index as an equality does.
+
+**Left, not tracked:** a range through an expression index, an `ORDER BY` or a
+join probe through a partial or expression one, and an index over several parts
+of which one is an expression; each still scans as before.
 
 ## D37 — Catching up with a shared file
 

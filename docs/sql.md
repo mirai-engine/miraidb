@@ -147,6 +147,17 @@ keep it. Measured on 50 000 rows (`benchmarks/parity/RESULTS.md`): the check
 `UNIQUE` index over one column already files integer keys by hash, whatever its
 method. Use `HASH` for a table looked up by key far more often than written.
 
+A partial index (`CREATE INDEX ... WHERE ...`) holds only the rows its `WHERE`
+is true for, and a query reads it when its own terms imply that `WHERE`: each
+term of the index's is one of the query's, written the same way, or is
+`x IS NOT NULL` where the query compares `x`. An index over an expression
+(`CREATE INDEX by_mail ON users (lower(email))`) answers an equality between
+that expression, written the same way, and a constant: `WHERE lower(email) = ?`.
+A comparison under another collation than the index's (`lower(email) = 'a'
+COLLATE NOCASE`) scans, as SQLite does. ANALYZE measures columns, not
+expressions: an equality with an indexed expression is priced at 10 rows, as
+SQLite prices an index it has no statistics for.
+
 ## Correlated subqueries and LATERAL
 
 A subquery may read a column of the statement it is written in. The column it

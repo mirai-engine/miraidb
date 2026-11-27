@@ -30,7 +30,6 @@ The detail of each item is in [backlog.md](backlog.md); the order is in
 | Item | Missing today |
 |---|---|
 | **D4**, **D24** — the `.sqlite` mirror | secondary index b-trees patched in place; a reported skip for an index the engine cannot express |
-| **D36** — the planner and partial or expression indexes | a query never reads one; it answers from the rows |
 
 ## Incompatible on purpose, or substituted
 
