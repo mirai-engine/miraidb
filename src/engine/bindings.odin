@@ -1,5 +1,8 @@
 package engine
 
+import "core:mem"
+import "core:reflect"
+
 // The resolved statement (A1.8): what the resolution works out for a node of
 // the parse lives beside the tree, in an array read by the node's number, so a
 // run reads it with an index and a comparison instead of looking a name up per
@@ -33,14 +36,30 @@ Statement_Bindings :: struct {
 // transaction's for the statement (Tx.bindings; the caller gives the previous
 // ones back). Without a query, what the resolution rewrites lives in the
 // transaction's arena and no link is made.
+//
+// A kept tree is resolved once per catalog generation (A1.8c): what the
+// resolution works out depends on the catalog alone, so a run at the
+// generation its last resolution held for takes the statement as that
+// resolution left it, and its links, instead of walking the tree again. Only
+// the query's own statement is kept so: a part of it run on its own (a write's
+// body without its CTEs, the statement an attached database runs) is resolved
+// as before.
 @(private)
 statement_resolve :: proc(tx: ^Tx, statement: ^Statement, query: ^Query) -> Error {
 	if query == nil {
 		tx.bindings = nil
 		return sql_resolve_names(tx, statement, tx.alloc)
 	}
-	alloc := arena_allocator_guarded(&query.arena)
 	bindings := &query.bindings
+	root := statement_is_root(statement, query)
+	generation, holds := tx_catalog_generation(tx)
+	if root && holds && query.resolved_at == generation + 1 {
+		statement^ = query.resolved
+		tx.bindings = bindings
+		return ERROR_NONE
+	}
+	if root do query.resolved_at = 0
+	alloc := arena_allocator_guarded(&query.arena)
 	count := int(query.node_count) + 1
 	if len(bindings.columns) != count {
 		bindings.base = query.node_base
@@ -48,7 +67,16 @@ statement_resolve :: proc(tx: ^Tx, statement: ^Statement, query: ^Query) -> Erro
 	}
 	for &binding in bindings.columns do binding = Column_Binding{column = -1}
 	tx.bindings = bindings
-	return sql_resolve_names(tx, statement, alloc, bindings)
+	err := sql_resolve_names(tx, statement, alloc, bindings)
+	// The catalog is read again after the walk: one that moved during it (an
+	// attached database's, read live) leaves nothing kept.
+	if root && err.kind == .None && holds {
+		if after, still := tx_catalog_generation(tx); still && after == generation {
+			query.resolved = statement^
+			query.resolved_at = generation + 1
+		}
+	}
+	return err
 }
 
 // column_bound is the source and column a linked reference reads, when the
@@ -72,4 +100,15 @@ column_bound :: #force_inline proc(ctx: ^Eval_Ctx, id: Node_Id) -> (source: ^Sou
 	source = &ctx.sources[at]
 	if source.table == nil || source.table.schema.ident != binding.ident do return nil, -1, false
 	return source, int(binding.column), true
+}
+
+// statement_is_root says `statement` is the query's own statement as parsed,
+// not a part of it: the same variant with the same bytes. Only the variant's
+// own bytes are compared, since a variant made into a Statement again leaves
+// the rest of the union as it finds it.
+@(private)
+statement_is_root :: proc(statement: ^Statement, query: ^Query) -> bool {
+	kind := reflect.union_variant_typeid(statement^)
+	if kind == nil || kind != reflect.union_variant_typeid(query.statement) do return false
+	return mem.compare_ptrs(statement, &query.statement, type_info_of(kind).size) == 0
 }

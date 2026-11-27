@@ -935,6 +935,12 @@ Query :: struct {
 	// bindings are the links its resolution made (statement_resolve), in the
 	// query's arena.
 	bindings:   Statement_Bindings,
+	// resolved is the statement as its resolution left it (the names it
+	// rewrites in the statement itself, not under it), and resolved_at the
+	// catalog generation it holds for, plus one: 0 is none. A run at that
+	// generation takes it instead of resolving again (statement_resolve).
+	resolved:    Statement,
+	resolved_at: u64,
 }
 
 query_destroy :: proc(q: ^Query) {
