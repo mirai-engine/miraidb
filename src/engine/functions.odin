@@ -48,6 +48,7 @@ store_mark_nondeterministic :: proc(store: ^Store, name: string, arity: int) {
 	if def, found := store.functions[key]; found {
 		def.nondeterministic = true
 		store.functions[key] = def
+		store_catalog_changed(store)
 	}
 }
 
@@ -125,6 +126,7 @@ store_set_aggregate_window :: proc(store: ^Store, name: string, arity: int, valu
 		def.value = value
 		def.inverse = inverse
 		store.aggregates[key] = def
+		store_catalog_changed(store)
 	}
 }
 
@@ -159,6 +161,9 @@ function_forget :: proc(store: ^Store, key: string) -> bool {
 		delete(stored)
 		found = true
 	}
+	// A statement resolved before links the calls it makes (Call_Link): a
+	// function gone is a catalog change, as a function registered is.
+	if found do store_catalog_changed(store)
 	return found
 }
 
@@ -191,6 +196,7 @@ store_register_function :: proc(
 		user      = user,
 		overrides = overrides,
 	}
+	store_catalog_changed(store)
 	return ERROR_NONE
 }
 
@@ -216,6 +222,7 @@ store_register_aggregate :: proc(
 		arity = arity,
 		user  = user,
 	}
+	store_catalog_changed(store)
 	return ERROR_NONE
 }
 
