@@ -814,6 +814,54 @@ index_lookup_clone :: proc(source: ^Index, target: ^Index, keys: mem.Allocator) 
 
 // --- An index's life ---------------------------------------------------------
 
+// table_indexes_make makes `t`'s indexes, one for each index of its schema. On
+// an error, what was made stays for table_destroy to free.
+table_indexes_make :: proc(t: ^Table) -> Error {
+	t.indexes = make([]Index, len(t.schema.indexes))
+	for _, i in t.schema.indexes {
+		made, made_err := index_make(t.schema.indexes[i])
+		t.indexes[i] = made
+		if made_err.kind != .None do return made_err
+	}
+	return ERROR_NONE
+}
+
+// table_indexes_share gives `clone` a copy of each index of `source`
+// (index_share). On an error, what was shared stays for table_destroy to free.
+table_indexes_share :: proc(clone, source: ^Table) -> Error {
+	clone.indexes = make([]Index, len(source.indexes))
+	for &target, index in clone.indexes {
+		shared, share_err := index_share(&source.indexes[index])
+		target = shared
+		if share_err.kind != .None do return share_err
+	}
+	return ERROR_NONE
+}
+
+// table_index_append adds a new, empty index for `schema` after `t`'s others,
+// at `position`.
+table_index_append :: proc(t: ^Table, schema: Index_Schema) -> (position: int, err: Error) {
+	grown := make([]Index, len(t.indexes) + 1)
+	copy(grown, t.indexes)
+	delete(t.indexes)
+	t.indexes = grown
+	position = len(t.indexes) - 1
+	made, made_err := index_make(schema)
+	t.indexes[position] = made
+	return position, made_err
+}
+
+// table_index_drop frees the index at `index` of `t`, its file included, and
+// takes it out of `t`'s indexes.
+table_index_drop :: proc(t: ^Table, index: int) {
+	table_index_free(t, index, true)
+	shorter := make([]Index, len(t.indexes) - 1)
+	copy(shorter[:index], t.indexes[:index])
+	copy(shorter[index:], t.indexes[index + 1:])
+	delete(t.indexes)
+	t.indexes = shorter
+}
+
 // index_make is a new, empty index for `schema`. An index that failed to parse
 // its partial or expression parts comes back with what was made, for the
 // caller's table to free with the rest.

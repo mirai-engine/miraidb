@@ -146,14 +146,9 @@ table_create :: proc(schema: ^Table_Schema) -> (^Table, Error) {
 	if t.schema.auto_increment_column != NO_COLUMN {
 		t.next_sequence = t.schema.columns[t.schema.auto_increment_column].sequence.start
 	}
-	t.indexes = make([]Index, len(t.schema.indexes))
-	for _, i in t.schema.indexes {
-		made, made_err := index_make(t.schema.indexes[i])
-		t.indexes[i] = made
-		if made_err.kind != .None {
-			table_destroy(t)
-			return nil, made_err
-		}
+	if made_err := table_indexes_make(t); made_err.kind != .None {
+		table_destroy(t)
+		return nil, made_err
 	}
 	return t, ERROR_NONE
 }
@@ -966,15 +961,10 @@ table_snapshot :: proc(source: ^Table) -> ^Table {
 	clone.next_row_id = source.next_row_id
 	clone.next_sequence = source.next_sequence
 	clone.next_int_key = source.next_int_key
-	clone.indexes = make([]Index, len(source.indexes))
-	for &target, index in clone.indexes {
-		shared, share_err := index_share(&source.indexes[index])
-		target = shared
-		if share_err.kind != .None {
-			error_free(&share_err)
-			table_destroy(clone)
-			return nil
-		}
+	if share_err := table_indexes_share(clone, source); share_err.kind != .None {
+		error_free(&share_err)
+		table_destroy(clone)
+		return nil
 	}
 	// The rows are shared, block by block: the copy lists the same blocks and
 	// copies one only when it changes it (Row_Blocks).
@@ -1244,13 +1234,7 @@ table_add_index :: proc(t: ^Table, index: Index_Schema) -> Error {
 	copy(merged, t.schema.indexes)
 	merged[len(t.schema.indexes)] = stored
 	t.schema.indexes = merged
-	grown := make([]Index, len(t.indexes) + 1)
-	copy(grown, t.indexes)
-	delete(t.indexes)
-	t.indexes = grown
-	position := len(t.indexes) - 1
-	made, made_err := index_make(stored)
-	t.indexes[position] = made
+	position, made_err := table_index_append(t, stored)
 	if made_err.kind != .None do return made_err
 	if attach_err := table_index_attach_pages(t, position); attach_err.kind != .None {
 		return attach_err
@@ -1300,12 +1284,7 @@ table_drop_index :: proc(t: ^Table, name: string) -> Error {
 		if index.schema.implicit {
 			return errf(.Invalid_Argument, "index %s comes from a constraint and cannot be dropped", name)
 		}
-		table_index_free(t, i, true)
-		shorter := make([]Index, len(t.indexes) - 1)
-		copy(shorter[:i], t.indexes[:i])
-		copy(shorter[i:], t.indexes[i + 1:])
-		delete(t.indexes)
-		t.indexes = shorter
+		table_index_drop(t, i)
 		remaining := make([]Index_Schema, len(t.schema.indexes) - 1, t.arena_allocator)
 		write := 0
 		for existing in t.schema.indexes {

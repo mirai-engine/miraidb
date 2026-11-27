@@ -33,7 +33,7 @@ ENGINE = "src/engine"
 # index_page.odin, every other index*.odin, and int_keys.odin. table.odin keeps
 # the rows and reaches the index through index.odin's procedures.
 MODULE = {"int_keys.odin"}
-BASELINE = {"fields": 0, "table indexes": 5}
+BASELINE = {"fields": 0, "table indexes": 0}
 
 FIELDS = r"(?:tree|pages|lookup|ints|int_keyed)"
 # A name bound to an element of `.indexes`: `for index in t.indexes`,

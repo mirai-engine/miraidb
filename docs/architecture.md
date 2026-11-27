@@ -153,9 +153,11 @@ A table is a `Table_Schema` plus:
   table, a B+tree of 4 KiB pages (`index_page.odin`, one file per index with
   its own pool), where leaves are chained in key order and a range scan is a
   cursor over that chain. A `HASH` or `DIRECT` index adds an equality map
-  beside either backend. Nothing outside the index's files reaches into a
-  backend: `scripts/index_boundary.py` counts what does, and CI fails when the
-  count grows.
+  beside either backend. Nothing outside the index's files reaches into an
+  index: the rest of the engine, `table.odin` included, reads its schema with
+  `table_index_schema` and asks it through `index.odin`'s procedures, never
+  through a table's `indexes[...]` or a backend's fields.
+  `scripts/index_boundary.py` counts both, and CI fails when either is not 0.
 - `next_row_id`, the id the next inserted row receives.
 
 The primary key and every `UNIQUE` column get an implicit unique index during
