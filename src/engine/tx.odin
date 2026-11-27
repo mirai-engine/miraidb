@@ -1667,7 +1667,7 @@ tx_insert_row :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error)
 		position := table.schema.primary_key[0]
 		if table.schema.columns[position].type.kind == .Int do pk_position = position
 	}
-	for column, i in table.schema.columns {
+	for &column, i in table.schema.columns {
 		v := values[i]
 		if i == pk_position && !column.auto_increment && (v.kind == .Default || v.kind == .Null) {
 			v = value_int(tx_next_int_key(table, writes, i))
@@ -1830,7 +1830,7 @@ tx_update_row :: proc(tx: ^Tx, name: string, id: Row_Id, values: []Value) -> Err
 		position := table.schema.primary_key[0]
 		if table.schema.columns[position].type.kind == .Int do pk_position = position
 	}
-	for column, i in table.schema.columns {
+	for &column, i in table.schema.columns {
 		v := values[i]
 		if i == pk_position && !column.auto_increment && (v.kind == .Default || v.kind == .Null) {
 			v = value_int(tx_next_int_key(table, writes, i))
