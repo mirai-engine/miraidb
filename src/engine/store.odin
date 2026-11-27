@@ -1551,12 +1551,34 @@ store_flush_pages :: proc(store: ^Store, seq: u64) -> Error {
 
 // store_apply_payload decodes and applies one commit record. It is used both by
 // replay and by the commit path (the latter already holds the write lock).
-store_apply_payload :: proc(store: ^Store, payload: []u8, seq: u64) -> Error {
+// store_apply_payload applies one commit record of the log. With `changes`,
+// it also lists what the record changed as the commit published it: the
+// changes in their order, each update's and delete's old row read from the
+// table it applies to (a follower replaying another store's log sees the
+// commits as their store did, D14). The caller frees it (commit_changes_free).
+store_apply_payload :: proc(store: ^Store, payload: []u8, seq: u64, changes: ^Commit_Changes = nil) -> Error {
 	store.apply_seq = seq
 	r: Byte_Reader
 	br_init(&r, payload)
 	count := int(br_read_u32(&r))
 	if r.bad do return errf(.Corrupt_Log, "commit payload is truncated")
+	listed: [dynamic]Store_Op
+	olds: [dynamic][]Value
+	list_alloc := context.allocator
+	if changes != nil {
+		changes^ = commit_changes_make(nil, nil)
+		changes.seq = seq
+		if changes.copied.arena == nil do return errf(.Out_Of_Memory, "cannot list the changes of commit %d", seq)
+		list_alloc = arena_allocator_guarded(changes.copied.arena)
+		listed = make([dynamic]Store_Op, 0, count, list_alloc)
+		olds = make([dynamic][]Value, 0, count, list_alloc)
+	}
+	defer if changes != nil && changes.copied.arena != nil {
+		changes.ops = listed[:]
+		changes.copied.ops = listed[:]
+		changes.old = olds[:]
+		changes.temp = make([]bool, len(listed), list_alloc)
+	}
 	// An operation is decoded into a scratch arena: applying it copies what the
 	// store keeps (the table's schema, the row's values), so the arena is reset
 	// after each one and a snapshot of the whole state costs one operation.
@@ -1568,7 +1590,12 @@ store_apply_payload :: proc(store: ^Store, payload: []u8, seq: u64) -> Error {
 	for _ in 0 ..< count {
 		op, op_err := store_op_decode(&r, arena_allocator_guarded(&scratch))
 		if op_err.kind != .None do return op_err
-		apply_err := store_apply(store, op)
+		old: []Value
+		apply_err := store_apply(store, op, nil, changes != nil ? &old : nil, list_alloc)
+		if changes != nil {
+			append(&listed, store_op_clone(op, list_alloc))
+			append(&olds, old)
+		}
 		virtual.arena_free_all(&scratch)
 		if apply_err.kind != .None do return apply_err
 	}

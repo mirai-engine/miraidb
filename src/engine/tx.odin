@@ -2701,7 +2701,8 @@ tx_free_ops :: proc(copied: ^Op_Copy) {
 // it outlives the transaction (A3). An old row of a memory table is the
 // table's own version of it, lent until the publish returns (the retention
 // runs after it): a consumer that keeps one copies it. The log keeps the new
-// values only.
+// values only: a replay lists the old ones again from the tables it applies
+// to (store_apply_payload).
 Commit_Changes :: struct {
 	seq:    u64,
 	ops:    []Store_Op,

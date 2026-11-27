@@ -342,3 +342,103 @@ test_a_group_commit_publishes_each_transaction :: proc(t: ^testing.T) {
 	db.error_free(&hooked_err)
 	store.hooks.commit = nil
 }
+
+@(private = "file")
+Log_Copy :: struct {
+	payloads: [dynamic][]u8,
+	seqs:     [dynamic]u64,
+	listed:   [dynamic][]u8,
+}
+
+// encode_changes writes a commit's durable changes and their old rows.
+@(private = "file")
+encode_changes :: proc(changes: ^db.Commit_Changes) -> []u8 {
+	w: db.Byte_Writer
+	db.bw_init(&w)
+	for op, i in changes.ops {
+		if changes.temp[i] do continue
+		db.store_op_encode(&w, op)
+		db.store_op_encode(&w, db.Store_Op{kind = .Insert, name = "old", values = changes.old[i]})
+	}
+	return db.bw_bytes(&w)
+}
+
+@(private = "file")
+copy_log :: proc(ctx: rawptr, store: ^db.Store, changes: ^db.Commit_Changes) {
+	log := (^Log_Copy)(ctx)
+	w: db.Byte_Writer
+	db.bw_init(&w)
+	durable := 0
+	for _, i in changes.ops do if !changes.temp[i] do durable += 1
+	db.bw_write_u32(&w, u32(durable))
+	for op, i in changes.ops do if !changes.temp[i] do db.store_op_encode(&w, op)
+	append(&log.payloads, db.bw_bytes(&w))
+	append(&log.seqs, changes.seq)
+	append(&log.listed, encode_changes(changes))
+}
+
+// A replay lists what each commit changed as the commit published it, old rows
+// included, though the log keeps only the new ones: each record applied to a
+// store at the state before it reads them from its tables.
+@(test)
+test_a_replay_lists_the_changes_its_commits_published :: proc(t: ^testing.T) {
+	conn, err := db.embed_open(":memory:")
+	if !testing.expectf(t, db.error_ok(err), "open: %s", err.message) do return
+	defer db.embed_close(conn)
+	log: Log_Copy
+	defer {
+		for b in log.payloads do delete(b)
+		for b in log.listed do delete(b)
+		delete(log.payloads)
+		delete(log.seqs)
+		delete(log.listed)
+	}
+	conn.store.on_commit = copy_log
+	conn.store.on_commit_ctx = &log
+	for sql in CORPUS do session_exec(t, conn, sql)
+	for statements in TRANSACTIONS {
+		session_exec(t, conn, "BEGIN")
+		for sql in statements do session_exec(t, conn, sql)
+		session_exec(t, conn, "COMMIT")
+	}
+	conn.store.on_commit = nil
+	// A follower in memory, and one whose tables live in page files, where an
+	// update and a delete read the old row from its page.
+	PAGED_PATH :: "_test_replay_paged"
+	db.remove_tree(PAGED_PATH)
+	defer db.remove_tree(PAGED_PATH)
+	for paged in ([]bool{false, true}) {
+		options := db.Store_Options{persistent = false}
+		if paged do options = db.Store_Options{persistent = true, create = true, durable = false, paged_tables = true, page_frames = 8}
+		follower, follower_err := db.store_open(paged ? PAGED_PATH : "", options)
+		if !testing.expectf(t, db.error_ok(follower_err), "open: %s", follower_err.message) do return
+		replay_into(t, follower, &log, paged)
+		db.store_close(follower)
+	}
+}
+
+@(private = "file")
+replay_into :: proc(t: ^testing.T, follower: ^db.Store, log: ^Log_Copy, paged: bool) {
+	replayed := 0
+	defer if paged do testing.expectf(t, replayed >= 8, "the paged follower replayed %d commits", replayed)
+	for payload, i in log.payloads {
+		changes: db.Commit_Changes
+		apply_err := db.store_apply_payload(follower, payload, log.seqs[i], &changes)
+		// A paged table cannot be altered: the paged follower stops at the
+		// corpus's ALTER, past its updates, deletes, REPLACE and upsert.
+		if paged && apply_err.kind != .None && strings.contains(apply_err.message, "page store") {
+			db.error_free(&apply_err)
+			db.commit_changes_free(&changes)
+			return
+		}
+		testing.expectf(t, db.error_ok(apply_err), "commit %d: %s", log.seqs[i], apply_err.message)
+		db.error_free(&apply_err)
+		replayed += 1
+		follower.commit_seq = log.seqs[i]
+		listed := encode_changes(&changes)
+		testing.expectf(t, slice.equal(listed, log.listed[i]), "commit %d (paged %v): the replay listed other changes than the commit published", log.seqs[i], paged)
+		delete(listed)
+		db.commit_changes_free(&changes)
+	}
+}
+

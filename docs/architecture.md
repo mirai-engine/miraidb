@@ -274,7 +274,11 @@ rows ordered by `Row_Id`, which keeps unsorted output deterministic.
    its own made before the apply when someone watches the store (`Op_Copy`: the
    names, values, schemas and indexes in one arena, since the transaction's
    memory is gone by then). The `.sqlite` mirror takes the same list without
-   the TEMP changes (`commit_changes_durable`). The list is the
+   the TEMP changes (`commit_changes_durable`). The log keeps the new values
+   only; a replay lists the old ones again from the tables it applies to
+   (`store_apply_payload` with a `Commit_Changes`), so a follower sees each
+   commit as the store that made it did
+   (`test_a_replay_lists_the_changes_its_commits_published`). The list is the
    commit: applied to a copy of the state before it, it gives the state after
    it (`test_a_commit_is_reproduced_from_its_list_of_changes`).
    `scripts/change_consumers.py` counts the consumers that still recompute
