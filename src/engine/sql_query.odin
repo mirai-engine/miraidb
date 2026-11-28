@@ -207,21 +207,26 @@ rowid_alias_name :: proc(name: string) -> bool {
 @(private)
 rowid_value :: proc(source: Source) -> (Value, bool) {
 	if source.table == nil do return {}, false
-	if source.row.id == NO_ROW_ID do return {}, false
+	return schema_rowid_value(&source.table.schema, source.row)
+}
+
+// schema_rowid_value is rowid_value for a row of a table with `schema`: a
+// trigger's NEW and OLD rows have a schema and no source.
+schema_rowid_value :: proc(schema: ^Table_Schema, row: Row) -> (Value, bool) {
+	if row.id == NO_ROW_ID do return {}, false
 	// A WITHOUT ROWID table has no row id to name.
-	if source.table.schema.without_rowid do return {}, false
-	schema := &source.table.schema
+	if schema.without_rowid do return {}, false
 	if len(schema.primary_key) == 1 {
 		key := schema.primary_key[0]
 		if key >= 0 && key < len(schema.columns) && schema.columns[key].type.kind == .Int {
-			if key < len(source.row.values) {
-				if key_value, ok := value_to_i64(source.row.values[key]); ok {
+			if key < len(row.values) {
+				if key_value, ok := value_to_i64(row.values[key]); ok {
 					return value_int(key_value), true
 				}
 			}
 		}
 	}
-	return value_int(i64(source.row.id)), true
+	return value_int(i64(row.id)), true
 }
 
 

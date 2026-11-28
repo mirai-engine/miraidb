@@ -66,6 +66,17 @@ eval_expr :: proc(ctx: ^Eval_Ctx, expr: ^Expr) -> (Value, Error) {
 				is_new := strings.equal_fold(e.table, "new")
 				if is_new || strings.equal_fold(e.table, "old") {
 					index, found := schema_column_index(&ctx.tx.trigger_schema, e.name)
+					// NEW.rowid, _rowid_ and oid name the row itself, unless the
+					// table declares a column with that name, as for a source.
+					// They used to fail as a column the table has not.
+					if !found && rowid_alias_name(e.name) {
+						present := is_new ? ctx.tx.trigger_new_present : ctx.tx.trigger_old_present
+						if !present do return value_null(), ERROR_NONE
+						row := is_new ? ctx.tx.trigger_new : ctx.tx.trigger_old
+						if rowid, has_rowid := schema_rowid_value(&ctx.tx.trigger_schema, row); has_rowid {
+							return rowid, ERROR_NONE
+						}
+					}
 					if !found {
 						return {}, errf(
 							.Column_Not_Found,
