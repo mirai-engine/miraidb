@@ -663,9 +663,9 @@ sqlite_share_catch_up :: proc(conn: ^Embed_Conn, file: ^Sqlite_File, hashes: map
 	}
 	// The rows are the file's: no hook reports them, no trigger runs again, and
 	// the commit does not write them back.
-	saved_commit, saved_row := store.hooks.commit, store.hooks.row_change
-	store.hooks.commit, store.hooks.row_change = nil, nil
-	defer store.hooks.commit, store.hooks.row_change = saved_commit, saved_row
+	saved_commit, saved_row, saved_event := store.hooks.commit, store.hooks.row_change, store.hooks.row_event
+	store.hooks.commit, store.hooks.row_change, store.hooks.row_event = nil, nil, nil
+	defer store.hooks.commit, store.hooks.row_change, store.hooks.row_event = saved_commit, saved_row, saved_event
 	saved_keys := store.foreign_keys_off
 	store.foreign_keys_off = true
 	defer store.foreign_keys_off = saved_keys

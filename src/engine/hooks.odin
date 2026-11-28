@@ -23,6 +23,30 @@ Row_Change :: enum u8 {
 // REPLACE removes, nor for the engine's catalog tables, as in SQLite.
 Row_Change_Hook :: #type proc(ctx: rawptr, change: Row_Change, table: string, rowid: i64)
 
+// Row_Event is a row a statement is about to change, as SQLite's preupdate
+// hook sees it: the change, the table, the rowid before and after it (as SQLite
+// names it: the INTEGER PRIMARY KEY when the table has one) and the values
+// before and after it (nil on the side that does not exist), and how deep in
+// triggers the change runs (0 for the statement's own rows). `replaced` marks
+// the delete of a row an INSERT or UPDATE OR REPLACE removes. Everything in it
+// is good until the hook returns.
+Row_Event :: struct {
+	change:    Row_Change,
+	table:     string,
+	old_rowid: i64,
+	new_rowid: i64,
+	old:       []Value,
+	new:       []Value,
+	depth:     int,
+	replaced:  bool,
+}
+
+// Row_Event_Hook runs for each row of a user table a statement changes, after
+// its BEFORE triggers and before the row is written and its AFTER triggers run,
+// where SQLite runs the preupdate hook: for the rows a trigger changes and the
+// rows a REPLACE removes too, and not for the engine's catalog tables (A3.5).
+Row_Event_Hook :: #type proc(ctx: rawptr, event: ^Row_Event)
+
 // Commit_Hook runs when a transaction that changed something is about to
 // commit; answering true turns the commit into a rollback.
 Commit_Hook :: #type proc(ctx: rawptr) -> bool
@@ -35,6 +59,8 @@ Rollback_Hook :: #type proc(ctx: rawptr)
 Store_Hooks :: struct {
 	row_change:     Row_Change_Hook,
 	row_change_ctx: rawptr,
+	row_event:      Row_Event_Hook,
+	row_event_ctx:  rawptr,
 	commit:         Commit_Hook,
 	commit_ctx:     rawptr,
 	rollback:       Rollback_Hook,
@@ -83,6 +109,33 @@ hook_row_change :: proc(tx: ^Tx, change: Row_Change, name: string, rowid: i64) {
 	hooks := &tx.store.hooks
 	if hooks.row_change == nil || catalog_table_name(name) do return
 	hooks.row_change(hooks.row_change_ctx, change, name, rowid)
+}
+
+// hook_row_event reports a row about to change to the row event hook: `old`
+// and `new` are the row before and after (an empty Row on the side that does
+// not exist).
+@(private)
+hook_row_event :: proc(tx: ^Tx, change: Row_Change, name: string, table: ^Table, old, new: Row, replaced := false) {
+	hooks := &tx.store.hooks
+	if hooks.row_event == nil || catalog_table_name(name) do return
+	event := Row_Event {
+		change   = change,
+		table    = name,
+		old      = old.values,
+		new      = new.values,
+		depth    = tx.trigger_depth,
+		replaced = replaced,
+	}
+	if change != .Insert do event.old_rowid = hook_row_rowid(table, old)
+	if change != .Delete do event.new_rowid = hook_row_rowid(table, new)
+	hooks.row_event(hooks.row_event_ctx, &event)
+}
+
+@(private)
+hook_row_rowid :: proc(table: ^Table, row: Row) -> i64 {
+	value, ok := rowid_value(Source{table = table, row = row})
+	if !ok do return i64(row.id)
+	return value.i
 }
 
 // store_fire_rollback runs the rollback hook; the embedding layer calls it for

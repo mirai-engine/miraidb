@@ -36,11 +36,14 @@ store_replace_content :: proc(store: ^Store, image: []u8, detach: bool) -> Error
 	defer if has_file do sqlite_file_destroy(&file)
 	saved_commit := store.hooks.commit
 	saved_row := store.hooks.row_change
+	saved_event := store.hooks.row_event
 	store.hooks.commit = nil
 	store.hooks.row_change = nil
+	store.hooks.row_event = nil
 	defer {
 		store.hooks.commit = saved_commit
 		store.hooks.row_change = saved_row
+		store.hooks.row_event = saved_event
 	}
 	if detach && len(store.sqlite_mirror) > 0 {
 		delete(store.sqlite_mirror)

@@ -117,7 +117,7 @@ normative description of the invariants; the code follows it.
 | `sqlite_printf.odin` | SQLite's printf |
 | `authorize.odin` | The authorizer |
 | `functions.odin` | A program's scalar functions and aggregates |
-| `hooks.odin` | The hooks an embedding layer installs |
+| `hooks.odin` | The hooks an embedding layer installs, and the row event: each row a statement is about to write, with its values before and after, where SQLite runs the preupdate hook |
 | `handles.odin` | Live handles behind the C ABI's opaque pointers |
 | `embed.odin` | The embedding API |
 

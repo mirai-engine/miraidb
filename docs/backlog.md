@@ -727,7 +727,13 @@ documentation (`sqlite3_bind_`, `sqlite3_result_xxxxx`, …), so 76 are missing:
 `bind_blob64`, `next_stmt`, `normalized_sql`, `get_table`, the `uri_*` and
 `filename_*` family, the pre-update hook, `stmt_scanstatus`, the memory counters
 and heap limits, the WAL checkpoint calls and snapshots, the mutex calls, and
-the setup calls a default build of SQLite answers trivially.
+the setup calls a default build of SQLite answers trivially. The engine side of
+the pre-update hook is there: `Store_Hooks.row_event` reports each row a
+statement is about to write with its values before and after, its rowids and
+its trigger depth, the rows a `REPLACE` removes included
+(`test_row_events_see_the_rows_a_trigger_sees`); `sqlite3_preupdate_*` is the
+facade over it. One order differs from SQLite: the row a `REPLACE` removes is
+reported before the `BEFORE INSERT` trigger, which SQLite runs first.
 
 **Done when.** The facade exports every function of `sqlite.h.in` but the
 placeholders, the count is measured against that header instead of a written

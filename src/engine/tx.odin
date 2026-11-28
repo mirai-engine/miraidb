@@ -1744,6 +1744,7 @@ tx_insert_row :: proc(tx: ^Tx, name: string, values: []Value) -> (Row_Id, Error)
 	); trigger_err.kind != .None {
 		return 0, trigger_err
 	}
+	if tx.store.hooks.row_event != nil do hook_row_event(tx, .Insert, name, table, Row{}, Row{id = id, values = row_values})
 	undo_note_insert(tx, writes, id)
 	undo_note_counters(tx, writes)
 	if srows_has(&writes.inserts, id) do writes_int_key_forget(writes)
@@ -1883,6 +1884,7 @@ tx_update_row :: proc(tx: ^Tx, name: string, id: Row_Id, values: []Value) -> Err
 	); trigger_err.kind != .None {
 		return trigger_err
 	}
+	if tx.store.hooks.row_event != nil do hook_row_event(tx, .Update, name, table, previous, Row{id = id, values = row_values})
 	if srows_has(&writes.inserts, id) {
 		undo_note_insert(tx, writes, id)
 		writes_int_key_forget(writes)
@@ -1950,6 +1952,9 @@ tx_delete_impl :: proc(tx: ^Tx, name: string, id: Row_Id, fire_triggers: bool) -
 			return trigger_err
 		}
 	}
+	// A REPLACE removes its rows without triggers, and the hook sees them: as
+	// SQLite's preupdate hook does, unlike its update hook.
+	if tx.store.hooks.row_event != nil do hook_row_event(tx, .Delete, name, table, previous, Row{}, !fire_triggers)
 	writes := tx_writes(tx, name, table)
 	tx_unregister_unique(tx, name, table, previous.values, id)
 	if srows_has(&writes.inserts, id) {
