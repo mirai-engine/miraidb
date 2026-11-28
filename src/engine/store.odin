@@ -2227,17 +2227,21 @@ Latency_Stats :: struct {
 	query_bucket:  [LATENCY_BUCKETS]u64,
 }
 
-// store_latency_stats reads the histogram counters under the store lock, so a
-// caller never sees a bucket being incremented.
+// store_latency_stats copies the histogram counters. Each is read whole; two
+// of them may be a commit apart.
 store_latency_stats :: proc(store: ^Store) -> Latency_Stats {
-	sync.rw_mutex_shared_lock(&store.mutex)
-	defer sync.rw_mutex_shared_unlock(&store.mutex)
-	return Latency_Stats {
-		commits = store.commit_count,
-		queries = store.query_count,
-		commit_bucket = store.commit_latency,
-		query_bucket = store.query_latency,
+	// The counters are atomics (store_record_commit_latency), so they are read
+	// as atomics, without the store's lock: a write transaction holds it, and
+	// a PRAGMA stats inside one waited for itself forever.
+	stats := Latency_Stats {
+		commits = sync.atomic_load(&store.commit_count),
+		queries = sync.atomic_load(&store.query_count),
 	}
+	for i in 0 ..< LATENCY_BUCKETS {
+		stats.commit_bucket[i] = sync.atomic_load(&store.commit_latency[i])
+		stats.query_bucket[i] = sync.atomic_load(&store.query_latency[i])
+	}
+	return stats
 }
 
 store_last_commit_us :: proc(store: ^Store) -> i64 {

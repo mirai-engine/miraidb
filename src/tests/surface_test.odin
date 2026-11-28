@@ -229,6 +229,25 @@ test_sum_overflow :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_stats_answer_inside_a_write_transaction :: proc(t: ^testing.T) {
+	// PRAGMA stats inside an open write transaction answers: it took the
+	// store's lock, which the transaction holds, and waited for itself.
+	store := fresh_db(t, "stats_in_tx")
+	if store == nil do return
+	defer cleanup_db(store, "stats_in_tx")
+	run_done(t, store, "CREATE TABLE t (a)")
+	tx := db.tx_begin_write(store)
+	inserted, insert_err := db.sql_execute_in_tx(tx, "INSERT INTO t VALUES (1)")
+	testing.expect(t, db.error_ok(insert_err))
+	db.sql_result_destroy(&inserted)
+	stats, stats_err := db.sql_execute_in_tx(tx, "PRAGMA stats")
+	testing.expect(t, db.error_ok(stats_err))
+	testing.expect(t, len(stats.rows) > 0)
+	db.sql_result_destroy(&stats)
+	testing.expect(t, db.error_ok(db.tx_commit(tx)))
+}
+
+@(test)
 test_sum_reads_a_text_as_its_number :: proc(t: ^testing.T) {
 	// sum(), total() and avg() read a text as its number and a boolean as its
 	// integer under the engine's rules too, as SQLite does: they used to fail
