@@ -1361,8 +1361,13 @@ eval_aggregate_named :: proc(ctx: ^Eval_Ctx, call: Call_Expr, name: string, buil
 			if !value_is_numeric(operand) {
 				return {}, errf(.Invalid_Type, "%s() expects numbers", name)
 			}
-			if operand.kind == .Float {
+			if operand.kind == .Float && !uses_float {
+				// The integers added before the first REAL are part of the sum: SQLite's
+				// sum() of 1 and 2.5 is 3.5. It used to answer 2.5.
 				uses_float = true
+				sum_float = uses_128 ? f64(sum_128) : f64(sum_int)
+			}
+			if uses_float {
 				number, _ := value_to_f64(operand)
 				sum_float += number
 			} else if operand.kind == .Int128 || operand.kind == .Uint128 {
@@ -1371,9 +1376,6 @@ eval_aggregate_named :: proc(ctx: ^Eval_Ctx, call: Call_Expr, name: string, buil
 					sum_128 = i128(sum_int)
 				}
 				sum_128 += value_as_i128(operand)
-			} else if uses_float {
-				number, _ := value_to_f64(operand)
-				sum_float += number
 			} else if uses_128 {
 				number, _ := value_to_i64(operand)
 				sum_128 += i128(number)

@@ -229,6 +229,24 @@ test_sum_overflow :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_sum_keeps_the_integers_before_a_real :: proc(t: ^testing.T) {
+	// The integers a sum added before its first REAL stay in it, as in SQLite,
+	// on the path that streams the scan, the one that groups and a window's.
+	// They used to be dropped: sum() of 1, 2.5 and 3 answered 5.5.
+	store := fresh_db(t, "sum_mixed")
+	if store == nil do return
+	defer cleanup_db(store, "sum_mixed")
+	run_done(t, store, "CREATE TABLE m (id INTEGER PRIMARY KEY, k INTEGER, x)")
+	run_done(t, store, "INSERT INTO m VALUES (1, 1, 1), (2, 1, 2.5), (3, 1, 3)")
+	testing.expect_value(t, scalar(t, store, "SELECT sum(x) FROM m").f, 6.5)
+	testing.expect_value(t, scalar(t, store, "SELECT avg(x) FROM m").f, 6.5 / 3)
+	testing.expect_value(t, scalar(t, store, "SELECT total(x) FROM m").f, 6.5)
+	testing.expect_value(t, scalar(t, store, "SELECT sum(x) FROM m GROUP BY k").f, 6.5)
+	testing.expect_value(t, scalar(t, store, "SELECT sum(x) FROM m WHERE id > 0 GROUP BY k HAVING count(*) > 1").f, 6.5)
+	testing.expect_value(t, scalar(t, store, "SELECT s FROM (SELECT id, sum(x) OVER (ORDER BY id) AS s FROM m) WHERE id = 3").f, 6.5)
+}
+
+@(test)
 test_having_alias :: proc(t: ^testing.T) {
 	// HAVING may name an alias of the select list, as SQLite allows; a column
 	// of a source with the same name wins over the alias.

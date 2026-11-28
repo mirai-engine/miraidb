@@ -117,8 +117,13 @@ agg_stream_add :: proc(row_ctx: ^Eval_Ctx, stream: ^Agg_Stream) -> Error {
 			if !value_is_numeric(operand) {
 				return errf(.Invalid_Type, "%s() expects numbers", acc.name)
 			}
-			if operand.kind == .Float {
+			if operand.kind == .Float && !acc.uses_float {
+				// The integers added before the first REAL are part of the sum: SQLite's
+				// sum() of 1 and 2.5 is 3.5. It used to answer 2.5.
 				acc.uses_float = true
+				acc.sum_float = acc.uses_128 ? f64(acc.sum_128) : f64(acc.sum_int)
+			}
+			if acc.uses_float {
 				number, _ := value_to_f64(operand)
 				acc.sum_float += number
 			} else if operand.kind == .Int128 || operand.kind == .Uint128 {
@@ -127,9 +132,6 @@ agg_stream_add :: proc(row_ctx: ^Eval_Ctx, stream: ^Agg_Stream) -> Error {
 					acc.sum_128 = i128(acc.sum_int)
 				}
 				acc.sum_128 += value_as_i128(operand)
-			} else if acc.uses_float {
-				number, _ := value_to_f64(operand)
-				acc.sum_float += number
 			} else if acc.uses_128 {
 				number, _ := value_to_i64(operand)
 				acc.sum_128 += i128(number)
