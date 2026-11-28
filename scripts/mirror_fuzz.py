@@ -18,6 +18,14 @@ both sides or fail on both. After each chunk:
 
 Exit code 0 means every chunk held. A failure prints the seed and the statement
 number, which replays it.
+
+A chunk that holds may still have been kept by re-encoding the whole file, which
+answers right and costs the file. After each seed the facade's `PRAGMA stats`
+says how many commits did that and why (`mirror_rewrite:<cause>`) and how many
+index trees commits built again (`mirror_index_rebuilds`); the totals are
+printed, and for the run CI makes (seeds 1-20, 400 statements, chunks of 40)
+held at BASELINE: more fails, and so does fewer until the baseline is lowered to
+it (A4.1). A schema change re-encodes the file by design ("schema").
 """
 
 from __future__ import annotations
@@ -35,6 +43,22 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from python_sqlite3 import stage  # noqa: E402
 from sqlite_processes import Side, facade_libversion  # noqa: E402
+
+# The run CI makes, and what its commits cost the file (2026-11-28, A4.1):
+# most re-encodings are a file with a table the patcher cannot address by rowid
+# ("unpatchable table", a WITHOUT ROWID one: every commit to that file pays the
+# file) and commits to such a table ("unsupported table"); "index" is an index
+# past what a commit builds again, which D4 (A4.3) takes off.
+CI_RUN = (1, 20, 400, 40)
+BASELINE: dict[str, int] = {
+    "mirror_index_rebuilds": 511,
+    "mirror_rewrite:index": 70,
+    "mirror_rewrite:layout": 20,
+    "mirror_rewrite:schema": 33,
+    "mirror_rewrite:unknown schema": 10,
+    "mirror_rewrite:unpatchable table": 2459,
+    "mirror_rewrite:unsupported table": 520,
+}
 
 
 class Model:
@@ -171,8 +195,19 @@ def integrity(path: str) -> list:
         return [row[0] for row in cx.execute("PRAGMA integrity_check").fetchall()]
 
 
-def run_seed(args: argparse.Namespace, seed: int) -> list[str] | None:
-    """Runs one seed's stream; None when a side did not load what it should."""
+def mirror_costs(side: Side) -> dict[str, int]:
+    """The facade's mirror counters: re-encodings by cause, index trees built again."""
+    answer = side.run("PRAGMA stats")
+    costs: dict[str, int] = {}
+    for metric, value in answer.get("rows", []):
+        if metric.startswith("mirror_rewrite:") or metric == "mirror_index_rebuilds":
+            costs[metric] = costs.get(metric, 0) + int(value)
+    return costs
+
+
+def run_seed(args: argparse.Namespace, seed: int, costs: dict[str, int]) -> list[str] | None:
+    """Runs one seed's stream; None when a side did not load what it should.
+    Adds what the seed's commits cost the facade's file to `costs`."""
     staged = tempfile.mkdtemp(prefix="mirror_fuzz_")
     reference_dir = tempfile.mkdtemp(prefix="mirror_fuzz_sqlite_")
     failures: list[str] = []
@@ -220,6 +255,8 @@ def run_seed(args: argparse.Namespace, seed: int) -> list[str] | None:
                     failures.append(f"after statement {number}: {table} differs: facade {len(mine[table])} rows, SQLite {len(reference[table])}; first: facade {shown[0]} SQLite {shown[1]}")
             if failures:
                 break
+        for metric, value in mirror_costs(facade).items():
+            costs[metric] = costs.get(metric, 0) + value
         facade.close()
         sqlite.close()
     finally:
@@ -240,14 +277,23 @@ def main() -> int:
         print(f"mirror fuzz: no facade at {args.facade}")
         return 2
     failed = 0
+    costs: dict[str, int] = {}
     for seed in range(args.seed, args.seed + args.seeds):
-        failures = run_seed(args, seed)
+        failures = run_seed(args, seed, costs)
         if failures is None:
             return 2
         for failure in failures:
             print(f"FAIL (seed {seed}) {failure}")
         print(f"mirror fuzz: seed {seed}, {args.statements} statements, {len(failures)} failure(s)", flush=True)
         failed += bool(failures)
+    shown = ", ".join(f"{metric} {value}" for metric, value in sorted(costs.items())) or "none"
+    print(f"mirror fuzz: what the commits cost the file: {shown}")
+    if not failed and (args.seed, args.seeds, args.statements, args.chunk) == CI_RUN:
+        held = {metric: value for metric, value in costs.items() if value}
+        if held != BASELINE:
+            print(f"mirror fuzz: the baseline says {BASELINE or 'none'}; "
+                  "update BASELINE in scripts/mirror_fuzz.py if this is a gain")
+            return 1
     return 1 if failed else 0
 
 

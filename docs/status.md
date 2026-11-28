@@ -47,10 +47,15 @@ the gaps are named rather than left to be discovered.
   A full page splits into as many pages as it needs, a leaf that loses its last
   row is unlinked and its page goes back on the free list, and a commit that the
   patcher cannot express (a table without a single INTEGER primary key, a
-  secondary index, a schema change, a write-ahead log) re-encodes the file
-  instead. `scripts/mirror_cost.py --check` is the gate and it verifies the
-  result with real `sqlite3`; `PRAGMA stats` reports `mirror_pages` and
-  `mirror_rewrites`, and `miraidb sql --mirror-report` prints them.
+  secondary index past sixteen pages, a schema change, a write-ahead log)
+  re-encodes the file instead; a secondary index under that is built again
+  from the table's rows in pages of its own. `scripts/mirror_cost.py --check` is
+  the gate and it verifies the result with real `sqlite3`; `PRAGMA stats`
+  reports `mirror_pages`, `mirror_rewrites`, each re-encoding's cause
+  (`mirror_rewrite:<cause>`) and `mirror_index_rebuilds`, and `miraidb sql
+  --mirror-report` prints them with the time the file took (`mirror-us`).
+  `mirror_cost.py` and `scripts/mirror_fuzz.py` hold those counts at a
+  baseline, so a fallback that answers right still shows.
 - An interrupted mirror commit is rolled back, not guessed at: the pages are
   journalled in SQLite's own rollback-journal format (magic, nonce, per-page
   checksum, sector-padded records), page 1 is written last, and whoever owns the

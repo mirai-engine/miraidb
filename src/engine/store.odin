@@ -267,6 +267,17 @@ Store :: struct {
 	mirror_pages_written: int,
 	mirror_bytes_written: u64,
 	mirror_full_writes:   int,
+	// mirror_rewrite_causes counts those re-encodings by what made the patcher
+	// give up (Sqlite_Mirror.fallback_reason; "unpatchable table" when the file
+	// has a table it cannot patch, a WITHOUT ROWID one, so that every commit
+	// re-encodes it; "layout" when the file could not be read), and mirror_index_rebuilds the index trees a commit built
+	// again from the table's rows (mirror_rebuild_indexes). mirror_flush_ns is
+	// the time keeping the file current took, rewrites included. The gates read
+	// them (scripts/mirror_cost.py, scripts/mirror_fuzz.py): a fallback that
+	// still answers right is not a patch (A4.1).
+	mirror_rewrite_causes: map[string]int,
+	mirror_index_rebuilds: int,
+	mirror_flush_ns:       u64,
 	// mirror_reason says why the last commit re-encoded the mirrored file.
 	mirror_reason:        string,
 	// mirror_touched names what this store's commits to a shared file changed
@@ -583,6 +594,8 @@ store_close :: proc(store: ^Store) {
 	delete(store.mirror_losses)
 	clear(&store.mirror_losses)
 	delete(store.mirror_reason)
+	for cause in store.mirror_rewrite_causes do delete(cause)
+	delete(store.mirror_rewrite_causes)
 	for name in store.mirror_touched do delete(name)
 	delete(store.mirror_touched)
 	delete(store.sqlite_mirror)
@@ -932,6 +945,8 @@ store_sqlite_mirror_flush :: proc(store: ^Store, ops: []Store_Op = nil, guarded:
 	if store == nil || len(store.sqlite_mirror) == 0 do return ERROR_NONE
 	sync.shared_lock(&store.mutex)
 	defer sync.shared_unlock(&store.mutex)
+	started := time.tick_now()
+	defer store.mirror_flush_ns += u64(time.tick_since(started))
 	// The guard (EXCLUSIVE, for a file other processes share) is taken right
 	// before the first write, and `guarded` tells the caller to let it go.
 	exclusive :: proc(store: ^Store, guarded: ^bool) {
@@ -956,9 +971,10 @@ store_sqlite_mirror_flush :: proc(store: ^Store, ops: []Store_Op = nil, guarded:
 		if build_err.kind != .None {
 			delete(store.mirror_reason)
 			store.mirror_reason = strings.clone(build_err.message)
+			build_kind := build_err.kind
 			error_free(&build_err)
 			exclusive(store, guarded)
-			return store_sqlite_mirror_rewrite(store)
+			return store_sqlite_mirror_rewrite(store, build_kind == .Sql_Unsupported ? "unpatchable table" : "layout")
 		}
 		store.mirror = built
 	}
@@ -972,7 +988,7 @@ store_sqlite_mirror_flush :: proc(store: ^Store, ops: []Store_Op = nil, guarded:
 	if needs_full {
 		delete(store.mirror_reason)
 		store.mirror_reason = strings.clone(store.mirror.fallback_reason)
-		return store_sqlite_mirror_rewrite(store)
+		return store_sqlite_mirror_rewrite(store, store.mirror.fallback_reason)
 	}
 	before_pages = store.mirror.pages_written
 	before_bytes = store.mirror.bytes_written
@@ -1017,9 +1033,15 @@ store_mirror_crash_before_header :: proc(store: ^Store) {
 // store_sqlite_mirror_rewrite writes the whole state to the mirrored file and
 // reads the layout back, which is how a commit the page patcher cannot express
 // is handled.
-store_sqlite_mirror_rewrite :: proc(store: ^Store) -> Error {
+store_sqlite_mirror_rewrite :: proc(store: ^Store, cause: string) -> Error {
 	if store == nil || len(store.sqlite_mirror) == 0 do return ERROR_NONE
 	store.mirror_full_writes += 1
+	named := len(cause) > 0 ? cause : "unnamed"
+	if _, counted := store.mirror_rewrite_causes[named]; counted {
+		store.mirror_rewrite_causes[named] += 1
+	} else {
+		store.mirror_rewrite_causes[strings.clone(named)] = 1
+	}
 	mirror_destroy(store.mirror)
 	store.mirror = nil
 	image, _, _, image_err := sqlite_file_image(store)

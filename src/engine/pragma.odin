@@ -842,6 +842,15 @@ pragma_stats :: proc(store: ^Store) -> Sql_Result {
 	// of commits that had to re-encode the whole file.
 	append_counts(&rows, "mirror_pages", u64(store.mirror_pages_written))
 	append_counts(&rows, "mirror_rewrites", u64(store.mirror_full_writes))
+	// Why they re-encoded it, one row per cause, and the index trees commits
+	// built again from a table's rows.
+	append_counts(&rows, "mirror_index_rebuilds", u64(store.mirror_index_rebuilds))
+	causes := make([dynamic]string, 0, len(store.mirror_rewrite_causes), context.temp_allocator)
+	for cause in store.mirror_rewrite_causes do append(&causes, cause)
+	slice.sort(causes[:])
+	for cause in causes {
+		append_counts(&rows, fmt.tprintf("mirror_rewrite:%s", cause), u64(store.mirror_rewrite_causes[cause]))
+	}
 	bound: u64 = 1
 	for bucket in 0 ..< LATENCY_BUCKETS {
 		append_counts(&rows, fmt.tprintf("commit_us_lt_%d", bound), stats.commit_bucket[bucket])

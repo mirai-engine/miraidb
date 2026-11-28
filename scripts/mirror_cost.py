@@ -14,6 +14,13 @@ file. It is the twentieth-first CI gate. A second, smaller table has an index
 of its own: a commit that writes it builds that index again in pages of its own
 (D4), so it may write the index but not the file, and no commit may fall back
 to re-encoding the file (`mirror-rewrites`).
+
+A third table, `notes`, has an index past the sixteen pages a commit builds
+again (MIRROR_INDEX_REBUILD_PAGES): today each commit that writes it re-encodes
+the whole file, cause "index". The counts it reports (rewrites by cause, index
+trees built again) are held at BASELINE: more fails, and so does fewer until the
+baseline is lowered to it, so what D4 gains is kept (A4.1). The time each commit
+spent keeping the file current (`mirror-us`) is printed beside them.
 """
 
 import argparse
@@ -25,6 +32,15 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# What the commits of each table cost today: re-encodings of the file by cause,
+# and index trees built again from the table's rows. D4 (A4.3) lowers them.
+BASELINE = {
+    "items": {"rewrites": {}, "index_rebuilds": 0},
+    "tags": {"rewrites": {}, "index_rebuilds": 6},
+    "notes": {"rewrites": {"index": 4}, "index_rebuilds": 0},
+}
+NOTES = 4000
 WORK = os.path.join(ROOT, "_mirror_cost")
 DB = os.path.join(WORK, "mirror.db")
 
@@ -51,6 +67,15 @@ def build(rows: int, text: int) -> None:
         "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 200) "
         "INSERT INTO tags (id, tag, n) SELECT i, 'tag' || (i * 7 % 200), i % 13 FROM n"
     )
+    # The large index: about seventy pages of keys, past what a commit builds
+    # again, so the patcher gives up on it today.
+    raw.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, note TEXT, n INTEGER)")
+    raw.execute("CREATE INDEX notes_note ON notes (note)")
+    raw.execute(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?) "
+        "INSERT INTO notes (id, note, n) SELECT i, printf('note %06d %s', i * 7919 % ?, hex(randomblob(24))), i % 17 FROM n",
+        (NOTES, NOTES),
+    )
     raw.commit()
     raw.close()
 
@@ -71,6 +96,20 @@ def mirror_counters(output: str) -> tuple[int, int]:
     pages = re.search(r"^mirror-pages: (\d+)$", output, re.MULTILINE)
     rewrites = re.search(r"^mirror-rewrites: (\d+)$", output, re.MULTILINE)
     return (int(pages.group(1)) if pages else -1, int(rewrites.group(1)) if rewrites else -1)
+
+
+def mirror_detail(output: str) -> dict:
+    """The causes of the re-encodings, the index trees built again and the time."""
+    causes = {}
+    for cause, count in re.findall(r"^mirror-rewrite-cause: (.+) (\d+)$", output, re.MULTILINE):
+        causes[cause] = causes.get(cause, 0) + int(count)
+    rebuilds = re.search(r"^mirror-index-rebuilds: (\d+)$", output, re.MULTILINE)
+    micros = re.search(r"^mirror-us: (\d+)$", output, re.MULTILINE)
+    return {
+        "rewrites": causes,
+        "index_rebuilds": int(rebuilds.group(1)) if rebuilds else -1,
+        "us": int(micros.group(1)) if micros else -1,
+    }
 
 
 def main() -> int:
@@ -97,21 +136,37 @@ def main() -> int:
     pages = 0
     rewrites = 0
     late = options.rows * 10 + 1
-    for sql in (
-        f"INSERT INTO items (id, name, score) VALUES ({late}, 'late', 3)",
-        f"UPDATE items SET name = 'renamed' WHERE id = {late}",
-        "DELETE FROM items WHERE id = 5",
-        "INSERT INTO tags (id, tag, n) VALUES (1000, 'aaa first', 99)",
-        "UPDATE tags SET tag = 'zzz last', n = -1 WHERE id = 7",
-        "DELETE FROM tags WHERE id = 8",
+    seen = {table: {"rewrites": {}, "index_rebuilds": 0, "us": []} for table in BASELINE}
+    for table, sql in (
+        ("items", f"INSERT INTO items (id, name, score) VALUES ({late}, 'late', 3)"),
+        ("items", f"UPDATE items SET name = 'renamed' WHERE id = {late}"),
+        ("items", "DELETE FROM items WHERE id = 5"),
+        ("tags", "INSERT INTO tags (id, tag, n) VALUES (1000, 'aaa first', 99)"),
+        ("tags", "UPDATE tags SET tag = 'zzz last', n = -1 WHERE id = 7"),
+        ("tags", "DELETE FROM tags WHERE id = 8"),
+        ("notes", f"INSERT INTO notes (id, note, n) VALUES ({NOTES + 1}, 'aaa note', 1)"),
+        ("notes", "UPDATE notes SET note = 'zzz note' WHERE id = 11"),
+        ("notes", "UPDATE notes SET n = -1 WHERE id = 12"),
+        ("notes", "DELETE FROM notes WHERE id = 13"),
     ):
-        statement_pages, statement_rewrites = mirror_counters(run_statement(binary, sql))
+        output = run_statement(binary, sql)
+        detail = mirror_detail(output)
+        for cause, count in detail["rewrites"].items():
+            seen[table]["rewrites"][cause] = seen[table]["rewrites"].get(cause, 0) + count
+        seen[table]["index_rebuilds"] += max(detail["index_rebuilds"], 0)
+        seen[table]["us"].append(detail["us"])
+        if table == "notes":
+            continue
+        statement_pages, statement_rewrites = mirror_counters(output)
         pages += max(statement_pages, 0)
         rewrites += max(statement_rewrites, 0)
     page_size = 4096
     written = pages * page_size
     print(f"mirror_cost: rows={options.rows} text={options.text} file={file_bytes // 1024} KiB "
           f"pages={pages} written={written // 1024} KiB rewrites={rewrites}")
+    for table, counts in seen.items():
+        print(f"mirror_cost: {table}: rewrites {counts['rewrites'] or 'none'}, "
+              f"index trees built again {counts['index_rebuilds']}, mirror us per commit {counts['us']}")
 
     raw = sqlite3.connect(DB)
     integrity = raw.execute("PRAGMA integrity_check").fetchone()[0]
@@ -121,6 +176,8 @@ def main() -> int:
     # SQLite reads the rows through each index, so a stale entry would answer.
     by_tag = [r[0] for r in raw.execute("SELECT id FROM tags INDEXED BY tags_tag WHERE tag IN ('aaa first', 'zzz last', 'tag56') ORDER BY tag")]
     by_n = raw.execute("SELECT count(*), min(n), max(n) FROM tags INDEXED BY tags_n WHERE n > -5").fetchone()
+    by_note = [r[0] for r in raw.execute("SELECT id FROM notes INDEXED BY notes_note WHERE note IN ('aaa note', 'zzz note') ORDER BY note")]
+    notes = raw.execute("SELECT count(*), sum(n = -1) FROM notes").fetchone()
     raw.close()
     shutil.rmtree(WORK, ignore_errors=True)
     if integrity != "ok":
@@ -131,6 +188,9 @@ def main() -> int:
         return 1
     if by_tag != [1000, 7] or by_n != (200, -1, 99):
         print(f"mirror_cost: SQLite reads the wrong rows through the indexes ({by_tag}, {by_n})", file=sys.stderr)
+        return 1
+    if by_note != [NOTES + 1, 11] or notes != (NOTES, 1):
+        print(f"mirror_cost: SQLite reads the wrong notes ({by_note}, {notes})", file=sys.stderr)
         return 1
     if not options.check:
         return 0
@@ -147,6 +207,17 @@ def main() -> int:
             f"mirror_cost: six commits wrote {written} bytes for a {file_bytes}-byte file",
             file=sys.stderr,
         )
+        return 1
+    # The counts are held where they are: more is a regression, fewer is a gain
+    # the baseline has to take.
+    held = True
+    for table, want in BASELINE.items():
+        got = {"rewrites": seen[table]["rewrites"], "index_rebuilds": seen[table]["index_rebuilds"]}
+        if got != want:
+            held = False
+            print(f"mirror_cost: {table} costs {got}, the baseline says {want}; "
+                  "update BASELINE in scripts/mirror_cost.py if this is a gain", file=sys.stderr)
+    if not held:
         return 1
     print("mirror_cost: a commit patches pages instead of rewriting the file")
     return 0

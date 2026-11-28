@@ -214,6 +214,9 @@ main :: proc() {
 			fmt.printfln("mirror-pages: %d", store.mirror_pages_written)
 			fmt.printfln("mirror-bytes: %d", store.mirror_bytes_written)
 			fmt.printfln("mirror-rewrites: %d", store.mirror_full_writes)
+			fmt.printfln("mirror-index-rebuilds: %d", store.mirror_index_rebuilds)
+			fmt.printfln("mirror-us: %d", store.mirror_flush_ns / 1000)
+			for cause, count in store.mirror_rewrite_causes do fmt.printfln("mirror-rewrite-cause: %s %d", cause, count)
 			if len(store.mirror_reason) > 0 do fmt.printfln("mirror-reason: %s", store.mirror_reason)
 			// An object the rewrite had to rebuild from the engine's model loses
 			// whatever that model cannot express, and the report says which.

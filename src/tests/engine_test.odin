@@ -8360,9 +8360,18 @@ test_mirror_grows_and_reopens :: proc(t: ^testing.T) {
 	mirror_check(t, path)
 	mirror_statement(t, conn.store, "DELETE FROM items WHERE id > 2400")
 	mirror_check(t, path)
-	// A table with a secondary index cannot be patched: it re-encodes the file.
+	// That delete re-encodes the file today: the patcher does not find the path
+	// to a leaf it emptied ("chain"). The count is held here so that the day it
+	// patches shows. This test used to read it as the next statement's rewrite.
+	testing.expect_value(t, conn.store.mirror_full_writes, 1)
+	testing.expect_value(t, conn.store.mirror_rewrite_causes["chain"], 1)
+	// A table with a secondary index is patched: its index is built again from
+	// the table's rows, in pages of its own, and the file is not re-encoded.
+	rebuilds := conn.store.mirror_index_rebuilds
 	mirror_statement(t, conn.store, "INSERT INTO indexed (id, code) VALUES (1, 10)")
-	testing.expect(t, conn.store.mirror_full_writes > 0, "an indexed table must re-encode")
+	testing.expect_value(t, conn.store.mirror_full_writes, 1)
+	testing.expect_value(t, conn.store.mirror_index_rebuilds, rebuilds + 1)
+	mirror_check(t, path)
 	// A schema change re-encodes too, and patching resumes afterwards.
 	mirror_statement(t, conn.store, "CREATE TABLE fresh (id INTEGER PRIMARY KEY, v TEXT)")
 	fulls := conn.store.mirror_full_writes

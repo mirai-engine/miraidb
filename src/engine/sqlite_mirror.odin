@@ -453,7 +453,9 @@ mirror_build :: proc(store: ^Store, path: string, recover := false, alloc := con
 		// Anything this writer cannot patch is best handled by starting from a
 		// file the writer produced.
 		mirror_destroy(m)
-		return nil, errf(.Io, "%s has a table this writer cannot patch", path)
+		// Its own kind, so a commit that re-encodes the file for it says so
+		// (Store.mirror_rewrite_causes) apart from a file it could not read.
+		return nil, errf(.Sql_Unsupported, "%s has a table this writer cannot patch", path)
 	}
 	return m, ERROR_NONE
 }
@@ -697,6 +699,7 @@ mirror_rebuild_indexes :: proc(store: ^Store, m: ^Sqlite_Mirror, entry: ^Mirror_
 		}
 		master.root = root
 		m.master_dirty = true
+		store.mirror_index_rebuilds += 1
 		// The image grew or moved while the tree was built.
 		view.data = m.image
 	}
@@ -1731,7 +1734,10 @@ mirror_apply_commit :: proc(store: ^Store, m: ^Sqlite_Mirror, ops: []Store_Op) -
 				return true, ERROR_NONE
 			}
 			payload := sqlite_encode_record(op.values, column, m.alloc)
-			if payload == nil do return true, ERROR_NONE
+			if payload == nil {
+				m.fallback_reason = "record"
+				return true, ERROR_NONE
+			}
 			append(&tables[at].edits, Mirror_Edit{rowid = rowid, payload = payload})
 		case .Delete:
 			rowid, present := table.rowid_of[op.row_id]
@@ -1747,14 +1753,21 @@ mirror_apply_commit :: proc(store: ^Store, m: ^Sqlite_Mirror, ops: []Store_Op) -
 				return true, ERROR_NONE
 			}
 			new_rowid, keyed := mirror_row_rowid(schema.schema, column, op.row_id, op.values)
-			if !keyed do return true, ERROR_NONE
+			if !keyed {
+				m.fallback_reason = "update without an integer key"
+				return true, ERROR_NONE
+			}
 			if new_rowid != old {
 				append(&tables[at].edits, Mirror_Edit{remove = true, rowid = old})
 			}
 			payload := sqlite_encode_record(op.values, column, m.alloc)
-			if payload == nil do return true, ERROR_NONE
+			if payload == nil {
+				m.fallback_reason = "record"
+				return true, ERROR_NONE
+			}
 			append(&tables[at].edits, Mirror_Edit{rowid = new_rowid, payload = payload})
 		case .Create_Table, .Truncate, .Drop_Table, .Create_Index, .Drop_Index, .Alter_Table:
+			m.fallback_reason = "schema"
 			return true, ERROR_NONE
 		}
 	}
