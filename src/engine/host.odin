@@ -1418,10 +1418,11 @@ host_apply_incremental_aggregate :: proc(
 	subscription: ^Subscription,
 	entry: ^Subscription_Query,
 	index: int,
-	ops: []Store_Op,
+	changes: Table_Changes,
 ) -> bool {
 	stmt, is_select := entry.query.statement.(Select_Stmt)
 	if !is_select || !entry.agg || !host_agg_shaped(entry) do return false
+	ops := changes.ops
 	if !entry.agg_ready do return false
 	tx := tx_begin_read(host.store)
 	defer tx_end(tx)
@@ -2048,48 +2049,111 @@ host_apply_incremental :: proc(
 	return true
 }
 
+// Table_Changes are the changes of one table in a commit, in the commit's
+// order, with the row each update and delete replaced (Commit_Changes.old).
+@(private)
+Table_Changes :: struct {
+	name: string,
+	ops:  []Store_Op,
+	old:  [][]Value,
+}
+
+// host_commit_tables splits a commit's changes by table, once per commit: a
+// query over one table reads its table's changes, not every change of the
+// commit. A commit of one table (the usual one) is its own split.
+@(private)
+host_commit_tables :: proc(changes: ^Commit_Changes) -> []Table_Changes {
+	ops := changes.ops
+	if len(ops) == 0 do return nil
+	single := true
+	for op in ops[1:] {
+		if !strings.equal_fold(op.name, ops[0].name) {
+			single = false
+			break
+		}
+	}
+	if single {
+		out := make([]Table_Changes, 1)
+		out[0] = Table_Changes{name = ops[0].name, ops = ops, old = changes.old}
+		return out
+	}
+	names := make([dynamic]string)
+	defer delete(names)
+	counts := make([dynamic]int)
+	defer delete(counts)
+	at := make([]int, len(ops))
+	defer delete(at)
+	for op, i in ops {
+		found := -1
+		for name, j in names {
+			if strings.equal_fold(name, op.name) {
+				found = j
+				break
+			}
+		}
+		if found < 0 {
+			append(&names, op.name)
+			append(&counts, 0)
+			found = len(names) - 1
+		}
+		at[i] = found
+		counts[found] += 1
+	}
+	out := make([]Table_Changes, len(names))
+	for name, j in names {
+		out[j] = Table_Changes{name = name, ops = make([]Store_Op, counts[j]), old = make([][]Value, counts[j])}
+		counts[j] = 0
+	}
+	for op, i in ops {
+		j := at[i]
+		out[j].ops[counts[j]] = op
+		if changes.old != nil do out[j].old[counts[j]] = changes.old[i]
+		counts[j] += 1
+	}
+	return out
+}
+
+@(private)
+host_commit_tables_free :: proc(tables: []Table_Changes, changes: ^Commit_Changes) {
+	for table in tables {
+		if raw_data(table.ops) == raw_data(changes.ops) do continue
+		delete(table.ops)
+		delete(table.old)
+	}
+	delete(tables)
+}
+
+@(private)
+host_table_changes :: proc(tables: []Table_Changes, name: string) -> (Table_Changes, bool) {
+	for table in tables {
+		if strings.equal_fold(table.name, name) do return table, true
+	}
+	return {}, false
+}
+
 // host_on_commit refreshes every query whose tables changed and publishes one
 // delta per query.
 host_on_commit :: proc(ctx: rawptr, store: ^Store, changes: ^Commit_Changes) {
 	host := (^Host)(ctx)
 	if host == nil do return
 	ops := changes.ops
-	changed_tables := make([dynamic]string)
-	defer delete(changed_tables)
-	for op in ops {
-		known := false
-		for name in changed_tables {
-			if strings.equal_fold(name, op.name) {
-				known = true
-				break
-			}
-		}
-		if !known do append(&changed_tables, op.name)
-	}
+	tables := host_commit_tables(changes)
+	defer host_commit_tables_free(tables, changes)
 	for subscription in host.subscriptions {
 		for &entry, i in subscription.queries {
-			changed := false
-			for name in changed_tables {
-				if strings.equal_fold(name, entry.table) {
-					changed = true
-					break
-				}
-				for joined in entry.join_tables {
-					if strings.equal_fold(name, joined) {
-						changed = true
-						break
-					}
-				}
+			own, changed := host_table_changes(tables, entry.table)
+			for joined in entry.join_tables {
 				if changed do break
+				_, changed = host_table_changes(tables, joined)
 			}
 			if !changed do continue
-			if host_apply_incremental(host, subscription, &entry, i, ops) {
+			if host_apply_incremental(host, subscription, &entry, i, own.ops) {
 				continue
 			}
 			if host_apply_incremental_join(host, subscription, &entry, i, ops) {
 				continue
 			}
-			if host_apply_incremental_aggregate(host, subscription, &entry, i, ops) {
+			if host_apply_incremental_aggregate(host, subscription, &entry, i, own) {
 				continue
 			}
 			rows, ids, eval_err := host_evaluate(host, subscription, i)
