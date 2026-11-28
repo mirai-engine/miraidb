@@ -229,6 +229,25 @@ test_sum_overflow :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_sum_reads_a_text_as_its_number :: proc(t: ^testing.T) {
+	// sum(), total() and avg() read a text as its number and a boolean as its
+	// integer under the engine's rules too, as SQLite does: they used to fail
+	// with "expects numbers" outside the SQLite face.
+	store := fresh_db(t, "sum_text")
+	if store == nil do return
+	defer cleanup_db(store, "sum_text")
+	run_done(t, store, "CREATE TABLE m (id INTEGER PRIMARY KEY, x)")
+	run_done(t, store, "INSERT INTO m VALUES (1, '3'), (2, 'a'), (3, 2)")
+	testing.expect_value(t, scalar(t, store, "SELECT sum(x) FROM m").f, 5.0)
+	testing.expect_value(t, scalar(t, store, "SELECT total(x) FROM m").f, 5.0)
+	testing.expect_value(t, scalar(t, store, "SELECT avg(x) FROM m").f, 5.0 / 3)
+	testing.expect_value(t, scalar(t, store, "SELECT sum(x) FROM m WHERE id <> 2").i, i64(5))
+	testing.expect_value(t, scalar(t, store, "SELECT sum(x) FROM m GROUP BY id > 0").f, 5.0)
+	testing.expect_value(t, scalar(t, store, "SELECT s FROM (SELECT id, sum(x) OVER (ORDER BY id) AS s FROM m) WHERE id = 3").f, 5.0)
+	testing.expect_value(t, scalar(t, store, "SELECT sum(x) FROM (SELECT true AS x UNION ALL SELECT true)").i, i64(2))
+}
+
+@(test)
 test_sum_keeps_the_integers_before_a_real :: proc(t: ^testing.T) {
 	// The integers a sum added before its first REAL stay in it, as in SQLite,
 	// on the path that streams the scan, the one that groups and a window's.

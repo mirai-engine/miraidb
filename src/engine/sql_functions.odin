@@ -1356,8 +1356,9 @@ eval_aggregate_named :: proc(ctx: ^Eval_Ctx, call: Call_Expr, name: string, buil
 				if order == .Greater do accumulator = value
 			}
 		case "sum", "total", "avg":
-			// SQLite adds a boolean as its integer and a text by its number.
-			operand := sqlite_rules_on() ? sqlite_sum_operand(value) : value
+			// A boolean is added as its integer and a text by its number, as SQLite
+			// adds them, under the engine's rules too: a sum is not arithmetic.
+			operand := sqlite_sum_operand(value)
 			if !value_is_numeric(operand) {
 				return {}, errf(.Invalid_Type, "%s() expects numbers", name)
 			}

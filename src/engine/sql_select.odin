@@ -112,8 +112,9 @@ agg_stream_add :: proc(row_ctx: ^Eval_Ctx, stream: ^Agg_Stream) -> Error {
 				}
 			}
 		case "sum", "total", "avg":
-			// SQLite adds a boolean as its integer and a text by its number.
-			operand := sqlite_rules_on() ? sqlite_sum_operand(value) : value
+			// A boolean is added as its integer and a text by its number, as SQLite
+			// adds them, under the engine's rules too: a sum is not arithmetic.
+			operand := sqlite_sum_operand(value)
 			if !value_is_numeric(operand) {
 				return errf(.Invalid_Type, "%s() expects numbers", acc.name)
 			}

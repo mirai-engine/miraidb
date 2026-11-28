@@ -93,6 +93,10 @@ both and fails on any answer that differs).
 The last row was already right on the SQLite face, which reads a declared type
 by its affinity; it is listed because the engine's rule differs.
 
+`sum()`, `total()` and `avg()` are not arithmetic: under both rules they add a
+text as its number (`'a'` as `0.0`) and a boolean as its integer, as SQLite
+does. They used to fail with "expects numbers" under the engine's rules.
+
 ## What changed
 
 - Arithmetic under SQLite's rules: a division or a remainder by zero is

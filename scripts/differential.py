@@ -106,6 +106,8 @@ QUERIES = [
     "SELECT count(DISTINCT dept), sum(DISTINCT dept), avg(DISTINCT dept) FROM emp",
     # The integers a sum adds before its first REAL stay in it.
     "SELECT sum(x), avg(x), total(x) FROM (SELECT 1 AS x UNION ALL SELECT 2.5 UNION ALL SELECT 3)",
+    # An aggregate reads a text as its number, under the engine's rules too.
+    "SELECT sum(x), avg(x), total(x) FROM (SELECT '3' AS x UNION ALL SELECT 'a' UNION ALL SELECT 2)",
     "SELECT dept AS d, count(*) FROM emp GROUP BY d ORDER BY d",
     # A join written with USING: the merged column appears once in `SELECT *`,
     # the left relation supplies it, and a qualified star still lists them all.

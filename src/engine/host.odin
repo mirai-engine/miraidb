@@ -1428,7 +1428,7 @@ host_agg_fold :: proc(
 		case .Count:
 			d.seen += sign
 		case .Sum, .Total, .Avg:
-			operand := sqlite_rules_on() ? sqlite_sum_operand(value) : value
+			operand := sqlite_sum_operand(value)
 			if operand.kind != .Int do return false
 			n, _ := value_to_i64(operand)
 			magnitude := n < 0 ? u64(-(n + 1)) + 1 : u64(n)
