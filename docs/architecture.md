@@ -635,11 +635,27 @@ Two shapes avoid the re-evaluation:
 
 - **Grouped aggregates.** A grouped subscription keeps a group table: for each
   group, the base rows that feed it and the row it last published. A commit
-  looks up the group of the row that changed (through a row-to-group map, so a
-  delete needs no old values), moves the row, and recomputes only the groups it
-  touched, publishing the row as a delete plus an insert when it differs and
-  dropping the group when its last row goes. Without `GROUP BY` the single
-  group is recomputed from a scan.
+  reaches each subscription with its table's changes only (`Table_Changes`,
+  split once per commit). It looks up the group of the row that changed
+  (through a row-to-group map), moves the row by the values of the change, and
+  publishes only the groups it touched, as a delete plus an insert when the row
+  differs, dropping the group when its last row goes. Without `GROUP BY` there
+  is one group, kept when no row is left: its row is the aggregates of no rows
+  (`count` 0), as a fresh evaluation answers; it used to vanish.
+- **Running aggregates.** When every aggregate of the projection is a
+  projection of its own and one of `count`, `sum`, `total`, `avg`, `min` and
+  `max` over at most one argument (no `DISTINCT`, `FILTER` or `ORDER BY`), a
+  group keeps their running values: a commit adds the new row and takes out the
+  old one (`Commit_Changes.old`), and the group's row is evaluated from them as
+  a streaming scan evaluates its final row (`Agg_Stream`). The values stay the
+  ones a fresh evaluation gives, or the group reads its rows once, in id order
+  (`host_agg_recompute`, counted by `host_agg_group_reads`): a sum meets a value
+  that is not a 64-bit integer, or its magnitudes pass 2^53 (past which the
+  order of the additions could overflow or round); the extreme of `min` or
+  `max` leaves, or is tied by a value that is not the same. A plain column of
+  the projection reads the group's row with the lowest id
+  (`test_aggregate_subscriptions_follow_every_commit`,
+  `test_aggregate_groups_are_read_only_when_their_values_cannot_follow`).
 
 `DISTINCT`, `ORDER BY`, `LIMIT` and policies still take the full evaluation and
 diff. Their deltas are correct; making them incremental is a refinement

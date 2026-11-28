@@ -2,6 +2,7 @@ package engine
 
 import "core:mem"
 import "core:mem/virtual"
+import "core:slice"
 import "core:strings"
 import "core:sync"
 import "core:time"
@@ -81,20 +82,73 @@ Subscription_Query :: struct {
 	join_keys:      map[Source_Row]string,
 	// agg marks a grouped query over one table (or one aggregate over all of
 	// it). Its state is one entry per group with the rows that feed it and the
-	// row last published, so a commit recomputes only the groups it touches.
+	// row last published, so a commit recomputes only the groups it touches. A
+	// query without GROUP BY has one group, "", which an empty set keeps: its
+	// row is the aggregates of no rows, as a fresh evaluation answers.
 	agg:         bool,
 	agg_ready:   bool,
-	agg_whole:   bool,
 	agg_groups:  map[string]Agg_Group,
 	agg_by_row:  map[Row_Id]string,
+	// agg_delta marks a query whose groups keep running values of their
+	// aggregates (Agg_Group.delta), so a commit adds and takes out the rows it
+	// changed instead of reading the group (host_agg_delta_shape): each one of
+	// agg_calls is a projection of its own, of kind agg_kinds. agg_plain marks
+	// a projection that also reads a column outside an aggregate, which the
+	// group's first row (by id) answers.
+	agg_delta:   bool,
+	agg_plain:   bool,
+	agg_calls:   []Call_Expr,
+	agg_kinds:   []Agg_Delta_Kind,
 }
 
 // Agg_Group is one group of an aggregate subscription: the base rows that feed
-// it and the row that was last published for it.
+// it and the row that was last published for it. With agg_delta it also keeps
+// the running value of each aggregate (`delta`), which `exact` says still is
+// the one a fresh evaluation gives; `first` is its row with the lowest id,
+// while `first_known`.
 Agg_Group :: struct {
-	rows:      map[Row_Id]struct{},
-	published: []Value,
-	found:     bool,
+	rows:        map[Row_Id]struct{},
+	published:   []Value,
+	found:       bool,
+	delta:       []Agg_Delta,
+	exact:       bool,
+	first:       Row_Id,
+	first_known: bool,
+}
+
+// Agg_Delta_Kind is an aggregate a group keeps as a running value.
+Agg_Delta_Kind :: enum u8 {
+	Count,
+	Sum,
+	Total,
+	Avg,
+	Min,
+	Max,
+}
+
+@(private)
+AGG_DELTA_NAMES := [Agg_Delta_Kind]string {
+	.Count = "count",
+	.Sum   = "sum",
+	.Total = "total",
+	.Avg   = "avg",
+	.Min   = "min",
+	.Max   = "max",
+}
+
+// AGG_DELTA_EXACT bounds the integers a running sum holds: while their
+// magnitudes add up to no more than 2^53, no order of adding them leaves 64
+// bits and every partial sum is exact as a REAL, so the running sum is the one
+// a fresh evaluation adds up (sum_int, or total's sum_float).
+AGG_DELTA_EXACT :: u64(1) << 53
+
+// Agg_Delta is the running value of one aggregate of a group: how many values
+// it counted, their sum and the sum of their magnitudes, or the extreme.
+Agg_Delta :: struct {
+	seen:      int,
+	sum:       i64,
+	magnitude: u64,
+	best:      Value,
 }
 
 // Source_Row names a stored row inside one source of a join query. Row ids are
@@ -180,6 +234,10 @@ Host :: struct {
 	// incremental_updates counts the deltas applied row by row instead of by
 	// re-evaluating the query.
 	incremental_updates:  u64,
+	// agg_group_reads counts the groups of an aggregate subscription read from
+	// their rows (host_agg_recompute), where their running values could not
+	// follow a commit.
+	agg_group_reads:      u64,
 	// join_rows_walked counts the candidate rows the incremental join path
 	// visited. It is diagnostic: a test proves a commit costs the matches.
 	join_rows_walked:     u64,
@@ -610,14 +668,21 @@ free_subscription_queries :: proc(queries: []Subscription_Query) {
 // it kept the keys and the row sets of every group.
 @(private)
 host_agg_state_free :: proc(entry: ^Subscription_Query) {
-	for key, group in entry.agg_groups {
+	for key, &group in entry.agg_groups {
 		free_values(group.published)
 		delete(group.rows)
+		host_agg_delta_free(&group)
 		delete(key)
 	}
 	delete(entry.agg_groups)
 	for _, key in entry.agg_by_row do delete(key)
 	delete(entry.agg_by_row)
+	delete(entry.agg_calls)
+	delete(entry.agg_kinds)
+	entry.agg_calls = nil
+	entry.agg_kinds = nil
+	entry.agg_delta = false
+	entry.agg_plain = false
 }
 
 // entry_key_alloc is the allocator that owns the keys of a query's row cache.
@@ -1272,9 +1337,210 @@ host_agg_publish :: proc(
 	if values != nil do free_values(values)
 }
 
-// host_agg_recompute evaluates one group from the rows it names.
+// agg_delta_kind is the running aggregate a call can be kept as: count, sum,
+// total, avg, min or max of at most one argument, with no DISTINCT, FILTER or
+// ORDER BY.
+@(private)
+agg_delta_kind :: proc(call: Call_Expr) -> (Agg_Delta_Kind, bool) {
+	if call.is_distinct || call.filter != nil || len(call.order_by) > 0 do return {}, false
+	for name, kind in AGG_DELTA_NAMES {
+		if !strings.equal_fold(call.name, name) do continue
+		if kind == .Count do return kind, call.star || len(call.args) <= 1
+		return kind, !call.star && len(call.args) == 1
+	}
+	return {}, false
+}
+
+// host_agg_delta_shape decides whether a query's groups keep running values:
+// every aggregate of the projection is a projection item of its own and a
+// running one (agg_delta_kind). Anything else, an aggregate inside an
+// expression included, reads the group on each change (host_agg_recompute).
+@(private)
+host_agg_delta_shape :: proc(entry: ^Subscription_Query, expanded: []^Expr) {
+	calls := make([dynamic]Call_Expr)
+	kinds := make([dynamic]Agg_Delta_Kind)
+	plain := false
+	for expr in expanded {
+		if !expr_is_aggregate(expr) {
+			plain = true
+			continue
+		}
+		call, direct := expr^.(Call_Expr)
+		kind, running := agg_delta_kind(call)
+		if !direct || !running {
+			delete(calls)
+			delete(kinds)
+			return
+		}
+		append(&calls, call)
+		append(&kinds, kind)
+	}
+	entry.agg_calls = calls[:]
+	entry.agg_kinds = kinds[:]
+	entry.agg_delta = true
+	entry.agg_plain = plain
+}
+
+@(private)
+host_agg_delta_free :: proc(group: ^Agg_Group) {
+	for d in group.delta do value_deep_free(d.best, context.allocator)
+	delete(group.delta)
+	group.delta = nil
+}
+
+// host_agg_fold adds one row to a group's running values (sign 1) or takes it
+// out (sign -1). It answers false when they can no longer be the ones a fresh
+// evaluation gives: a sum meets a value that is not a 64-bit integer or passes
+// AGG_DELTA_EXACT, the extreme of min or max leaves or is tied by a value that
+// is not the same, an argument fails. The group then reads its rows again.
+// `reading` folds the rows of such a read, in id order, where a tie keeps the
+// value it has, as the evaluator does.
+@(private)
+host_agg_fold :: proc(
+	tx: ^Tx,
+	entry: ^Subscription_Query,
+	group: ^Agg_Group,
+	source: Source,
+	sign: int,
+	reading := false,
+) -> bool {
+	heap := context.allocator
+	context.allocator = tx.alloc
+	ctx := eval_context(Eval_Ctx {
+		tx     = tx,
+	})
+	sources := [1]Source{source}
+	ctx.sources = sources[:]
+	for call, c in entry.agg_calls {
+		kind := entry.agg_kinds[c]
+		d := &group.delta[c]
+		if call.star || len(call.args) == 0 {
+			d.seen += sign
+			continue
+		}
+		value, eval_err := eval_expr(&ctx, call.args[0])
+		if eval_err.kind != .None {
+			error_free(&eval_err)
+			return false
+		}
+		if value.kind == .Null do continue
+		switch kind {
+		case .Count:
+			d.seen += sign
+		case .Sum, .Total, .Avg:
+			operand := sqlite_rules_on() ? sqlite_sum_operand(value) : value
+			if operand.kind != .Int do return false
+			n, _ := value_to_i64(operand)
+			magnitude := n < 0 ? u64(-(n + 1)) + 1 : u64(n)
+			if sign > 0 {
+				if magnitude > AGG_DELTA_EXACT - d.magnitude do return false
+				d.magnitude += magnitude
+				d.sum += n
+			} else {
+				if magnitude > d.magnitude do return false
+				d.magnitude -= magnitude
+				d.sum -= n
+			}
+			d.seen += sign
+		case .Min, .Max:
+			if sign < 0 {
+				// Only a value that is not the extreme leaves without a read.
+				if d.best.kind == .Null do return false
+				order, comparable := value_compare(value, d.best)
+				if !comparable || order == .Equal do return false
+				continue
+			}
+			if d.best.kind == .Null {
+				d.best = value_clone(value, heap)
+				continue
+			}
+			order, comparable := value_compare(value, d.best)
+			if !comparable do return false
+			if (kind == .Min && order == .Less) || (kind == .Max && order == .Greater) {
+				value_deep_free(d.best, heap)
+				d.best = value_clone(value, heap)
+			} else if order == .Equal && !reading && (value.kind != d.best.kind || !value_equal(value, d.best)) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// host_agg_delta_values evaluates a group's projection from its running
+// values, the way a streaming scan evaluates its final row (Agg_Stream): an
+// aggregate answers from its accumulator, a plain column from the group's first
+// row.
+@(private)
+host_agg_delta_values :: proc(
+	entry: ^Subscription_Query,
+	tx: ^Tx,
+	stmt: Select_Stmt,
+	expanded: []^Expr,
+	base: ^Table,
+	group: ^Agg_Group,
+) -> (values: []Value, ok: bool) {
+	if entry.agg_plain && len(group.rows) > 0 && !group.first_known {
+		for id, _ in group.rows {
+			if !group.first_known || id < group.first {
+				group.first = id
+				group.first_known = true
+			}
+		}
+	}
+	heap := context.allocator
+	context.allocator = tx.alloc
+	stream := Agg_Stream {
+		accs = make([dynamic]Agg_Acc, 0, len(entry.agg_calls)),
+	}
+	for call, c in entry.agg_calls {
+		d := group.delta[c]
+		kind := entry.agg_kinds[c]
+		acc := Agg_Acc {
+			call    = call,
+			name    = AGG_DELTA_NAMES[kind],
+			seen    = d.seen,
+			sum_int = d.sum,
+			best    = d.best,
+		}
+		if kind == .Total {
+			acc.uses_float = true
+			acc.sum_float = f64(d.sum)
+		}
+		append(&stream.accs, acc)
+	}
+	final := eval_context(Eval_Ctx {
+		tx     = tx,
+		stream = &stream,
+	})
+	if entry.agg_plain && len(group.rows) > 0 {
+		row, exists := table_memory_row(base, group.first)
+		if !exists do return nil, false
+		if _, visible := row_values_at(row, tx.read_seq); !visible do return nil, false
+		sources := make([]Source, 1)
+		sources[0] = Source{table = base, row = row, alias = stmt.from.alias}
+		final.sources = sources
+	}
+	values = make([]Value, len(expanded), heap)
+	for expr, i in expanded {
+		value, eval_err := eval_expr(&final, expr)
+		if eval_err.kind != .None {
+			error_free(&eval_err)
+			for v in values[:i] do value_deep_free(v, heap)
+			delete(values, heap)
+			return nil, false
+		}
+		values[i] = value_clone(value, heap)
+	}
+	return values, true
+}
+
+// host_agg_recompute reads the rows of one group, in id order, and publishes
+// its row. A query whose groups keep running values folds them again from
+// these rows, and publishes from them when they are exact.
 @(private)
 host_agg_recompute :: proc(
+	host: ^Host,
 	entry: ^Subscription_Query,
 	tx: ^Tx,
 	stmt: Select_Stmt,
@@ -1283,11 +1549,35 @@ host_agg_recompute :: proc(
 	group: ^Agg_Group,
 	inserts, deletes: ^[dynamic][]Value,
 ) {
+	host.agg_group_reads += 1
 	ids := make([dynamic]Row_Id, 0, len(group.rows), tx.alloc)
 	defer delete(ids)
 	for id, _ in group.rows do append(&ids, id)
+	slice.sort(ids[:])
 	sources := host_agg_group_sources(tx, stmt, base, ids[:])
-	if len(sources) == 0 {
+	group.first_known = len(sources) > 0
+	if group.first_known do group.first = sources[0][0].row.id
+	if entry.agg_delta {
+		host_agg_delta_free(group)
+		group.delta = make([]Agg_Delta, len(entry.agg_calls))
+		group.exact = true
+		for source in sources {
+			if !host_agg_fold(tx, entry, group, source[0], 1, true) {
+				group.exact = false
+				break
+			}
+		}
+		if group.exact {
+			if values, ok := host_agg_delta_values(entry, tx, stmt, expanded, base, group); ok {
+				for item in sources do delete(item)
+				delete(sources)
+				host_agg_publish(entry, group, values, true, inserts, deletes)
+				return
+			}
+			group.exact = false
+		}
+	}
+	if len(sources) == 0 && len(stmt.group_by) > 0 {
 		delete(sources)
 		host_agg_publish(entry, group, nil, false, inserts, deletes)
 		return
@@ -1295,6 +1585,28 @@ host_agg_recompute :: proc(
 	values, ok := host_agg_values(tx, stmt, expanded, sources)
 	delete(sources)
 	host_agg_publish(entry, group, values, ok, inserts, deletes)
+}
+
+// host_agg_refresh publishes a group a commit touched: from its running values
+// while they are exact, else from its rows.
+@(private)
+host_agg_refresh :: proc(
+	host: ^Host,
+	entry: ^Subscription_Query,
+	tx: ^Tx,
+	stmt: Select_Stmt,
+	expanded: []^Expr,
+	base: ^Table,
+	group: ^Agg_Group,
+	inserts, deletes: ^[dynamic][]Value,
+) {
+	if entry.agg_delta && group.exact {
+		if values, ok := host_agg_delta_values(entry, tx, stmt, expanded, base, group); ok {
+			host_agg_publish(entry, group, values, true, inserts, deletes)
+			return
+		}
+	}
+	host_agg_recompute(host, entry, tx, stmt, expanded, base, group, inserts, deletes)
 }
 
 // host_agg_prepare builds the group table from the current state. Like the join
@@ -1323,6 +1635,7 @@ host_agg_prepare :: proc(host: ^Host, entry: ^Subscription_Query) -> bool {
 		for column in columns do delete(column) // projection names are cloned in the heap
 		delete(columns)
 	}
+	host_agg_delta_shape(entry, expanded)
 	live := make([dynamic]Row)
 	if collect_err := tx_collect(tx, stmt.from.name, &live); collect_err.kind != .None {
 		delete(live)
@@ -1345,8 +1658,16 @@ host_agg_prepare :: proc(host: ^Host, entry: ^Subscription_Query) -> bool {
 		entry.agg_groups[key] = group
 		entry.agg_by_row[row.id] = strings.clone(key)
 	}
+	// Without GROUP BY the one group is there with no row too.
+	if len(stmt.group_by) == 0 {
+		if _, exists := entry.agg_groups[""]; !exists {
+			entry.agg_groups[""] = Agg_Group {
+				rows = make(map[Row_Id]struct{}),
+			}
+		}
+	}
 	for _, &group in entry.agg_groups {
-		host_agg_recompute(entry, tx, stmt, expanded, base, &group, nil, nil)
+		host_agg_recompute(host, entry, tx, stmt, expanded, base, &group, nil, nil)
 	}
 	entry.agg_ready = true
 	return true
@@ -1363,6 +1684,7 @@ host_agg_drop_group :: proc(
 	if !exists do return
 	if group.found && deletes != nil do append(deletes, value_row_clone(group.published))
 	free_values(group.published)
+	host_agg_delta_free(&group)
 	// The map's key and each row's copy of it are the entry's to free.
 	stored, _ := delete_key(&entry.agg_groups, key)
 	delete(stored)
@@ -1376,42 +1698,11 @@ host_agg_drop_group :: proc(
 
 }
 
-// host_agg_recompute_whole evaluates the single group of a query without GROUP
-// BY: every live row that passes the WHERE.
-@(private)
-host_agg_recompute_whole :: proc(
-	tx: ^Tx,
-	stmt: Select_Stmt,
-	expanded: []^Expr,
-	base: ^Table,
-	entry: ^Subscription_Query,
-	inserts, deletes: ^[dynamic][]Value,
-) {
-	live := make([dynamic]Row)
-	if collect_err := tx_collect(tx, stmt.from.name, &live); collect_err.kind != .None {
-		delete(live)
-		return
-	}
-	defer delete(live)
-	group, exists := entry.agg_groups[""]
-	if !exists do group.rows = make(map[Row_Id]struct{})
-	sources := make([dynamic][]Source, 0, len(live))
-	for row in live {
-		source := Source{table = base, row = row, alias = stmt.from.alias}
-		if !host_agg_matches(tx, stmt, source) do continue
-		one := make([]Source, 1)
-		one[0] = source
-		append(&sources, one)
-	}
-	values, ok := host_agg_values(tx, stmt, expanded, sources[:])
-	delete(sources)
-	if !ok do return
-	host_agg_publish(entry, &group, values, true, inserts, deletes)
-	entry.agg_groups[""] = group
-}
-
 // host_apply_incremental_aggregate publishes aggregate deltas from the groups a
-// commit touches, recomputing each group once from the rows it names.
+// commit touches. Each change moves its row between groups by its values (the
+// new ones in the change, the old ones in Commit_Changes.old), and a group with
+// running values adds and takes out the row; a group without them, or whose
+// values cannot follow, is read once (host_agg_refresh).
 @(private)
 host_apply_incremental_aggregate :: proc(
 	host: ^Host,
@@ -1424,6 +1715,14 @@ host_apply_incremental_aggregate :: proc(
 	if !is_select || !entry.agg || !host_agg_shaped(entry) do return false
 	ops := changes.ops
 	if !entry.agg_ready do return false
+	// A change of the table's shape or a truncate rebuilds the groups, from
+	// the full evaluation.
+	for op in ops {
+		#partial switch op.kind {
+		case .Create_Table, .Truncate, .Drop_Table, .Create_Index, .Drop_Index, .Alter_Table:
+			return false
+		}
+	}
 	tx := tx_begin_read(host.store)
 	defer tx_end(tx)
 	base, table_err := tx_table(tx, stmt.from.name)
@@ -1469,68 +1768,77 @@ host_apply_incremental_aggregate :: proc(
 		append(touched, strings.clone(key))
 	}
 	any_op := false
-	for op in ops {
-		if !strings.equal_fold(op.name, stmt.from.name) do continue
-		switch op.kind {
-		case .Insert, .Update, .Delete:
-			any_op = true
-			old_key, had_old := entry.agg_by_row[op.row_id]
-			matched := false
-			new_key := ""
-			if op.kind != .Delete {
-				if row, exists := table_memory_row(base, op.row_id); exists {
-					source := Source{table = base, row = row, alias = stmt.from.alias}
-					if host_agg_matches(tx, stmt, source) {
-						if key, key_ok := host_agg_key(tx, stmt, source); key_ok {
-							matched = true
-							new_key = key
-						} else {
-							return false
-						}
+	for op, i in ops {
+		if op.kind != .Insert && op.kind != .Update && op.kind != .Delete do continue
+		any_op = true
+		old_key, had_old := entry.agg_by_row[op.row_id]
+		matched := false
+		new_key := ""
+		row := Row{id = op.row_id, values = op.values}
+		if op.kind != .Delete {
+			source := Source{table = base, row = row, alias = stmt.from.alias}
+			if host_agg_matches(tx, stmt, source) {
+				key, key_ok := host_agg_key(tx, stmt, source)
+				if !key_ok do return false
+				matched = true
+				new_key = key
+			}
+		}
+		if had_old {
+			touch(&touched, old_key)
+			if group, exists := entry.agg_groups[old_key]; exists {
+				if entry.agg_delta && group.exact {
+					old: []Value = i < len(changes.old) ? changes.old[i] : nil
+					replaced := Row{id = op.row_id, values = old}
+					if old == nil || !host_agg_fold(tx, entry, &group, Source{table = base, row = replaced, alias = stmt.from.alias}, -1) {
+						group.exact = false
 					}
 				}
+				delete_key(&group.rows, op.row_id)
+				if group.first_known && group.first == op.row_id do group.first_known = false
+				entry.agg_groups[old_key] = group
 			}
-			if had_old {
-				touch(&touched, old_key)
-				if group, exists := entry.agg_groups[old_key]; exists {
-					delete_key(&group.rows, op.row_id)
-					entry.agg_groups[old_key] = group
-				}
-				// The row's entry held its own copy of the key.
-				delete_key(&entry.agg_by_row, op.row_id)
-				delete(old_key)
-			}
-			if matched {
-				touch(&touched, new_key)
-				group, exists := entry.agg_groups[new_key]
-				if exists {
-					delete(new_key)
-				} else {
-					group.rows = make(map[Row_Id]struct{})
-				}
-				group.rows[op.row_id] = {}
-				entry.agg_groups[new_key] = group
-				entry.agg_by_row[op.row_id] = strings.clone(new_key)
-			} else {
-				delete(new_key)
-			}
-		case .Create_Table, .Truncate, .Drop_Table, .Create_Index, .Drop_Index, .Alter_Table:
-			return false
+			// The row's entry held its own copy of the key.
+			delete_key(&entry.agg_by_row, op.row_id)
+			delete(old_key)
 		}
+		if !matched {
+			delete(new_key)
+			continue
+		}
+		touch(&touched, new_key)
+		group, exists := entry.agg_groups[new_key]
+		if !exists {
+			group.rows = make(map[Row_Id]struct{})
+			group.exact = true
+			if entry.agg_delta do group.delta = make([]Agg_Delta, len(entry.agg_calls))
+		}
+		if len(group.rows) == 0 {
+			group.first = op.row_id
+			group.first_known = true
+		} else if group.first_known && op.row_id < group.first {
+			group.first = op.row_id
+		}
+		if entry.agg_delta && group.exact {
+			if !host_agg_fold(tx, entry, &group, Source{table = base, row = row, alias = stmt.from.alias}, 1) {
+				group.exact = false
+			}
+		}
+		group.rows[op.row_id] = {}
+		entry.agg_by_row[op.row_id] = strings.clone(new_key)
+		// A group already there keeps the key its map holds.
+		entry.agg_groups[new_key] = group
+		if exists do delete(new_key)
 	}
 	if !any_op do return true
 	for key in touched {
-		if entry.agg_whole {
-			host_agg_recompute_whole(tx, stmt, expanded, base, entry, &inserts, &deletes)
-			continue
-		}
 		group, exists := entry.agg_groups[key]
 		if !exists do continue
-		if len(group.rows) == 0 {
+		if len(group.rows) == 0 && len(stmt.group_by) > 0 {
 			host_agg_drop_group(entry, key, &deletes)
 			continue
 		}
-		host_agg_recompute(entry, tx, stmt, expanded, base, &group, &inserts, &deletes)
+		host_agg_refresh(host, entry, tx, stmt, expanded, base, &group, &inserts, &deletes)
 		entry.agg_groups[key] = group
 	}
 	if len(inserts) == 0 && len(deletes) == 0 do return true
@@ -2886,6 +3194,12 @@ host_client_should_drop :: proc(host: ^Host, owner: u64) -> bool {
 // host_incremental_updates reports how many deltas were applied row by row.
 host_incremental_updates :: proc(host: ^Host) -> u64 {
 	return host.incremental_updates
+}
+
+// host_agg_group_reads reports how many groups of aggregate subscriptions were
+// read from their rows (Host.agg_group_reads).
+host_agg_group_reads :: proc(host: ^Host) -> u64 {
+	return host.agg_group_reads
 }
 
 // host_join_rows_walked reports how many candidate rows the incremental join path

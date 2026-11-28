@@ -32,15 +32,14 @@ SITES = [
     ("host.odin", "host_on_commit", r"\bhost_evaluate\(",
      "a subscription runs its query again and compares the results"),
     ("host.odin", "host_agg_recompute", r"\bhost_agg_group_sources\(",
-     "an aggregate subscription reads every row of a group a commit touched"),
-    ("host.odin", "host_agg_recompute_whole", r"\btx_collect\(",
-     "an aggregate subscription without GROUP BY reads the whole table"),
+     "an aggregate subscription reads the rows of a group whose running values"
+     " cannot follow a commit (a REAL in a sum, the extreme of min or max leaving)"),
     ("sqlite_share.odin", "sqlite_share_catch_up", r"\btx_truncate\(",
      "a file another process wrote is reloaded table by table"),
     ("events.odin", "events_read", r"\btx_collect\(",
      "an event read collects the whole table to find the events past a cursor"),
 ]
-BASELINE = 6
+BASELINE = 5
 
 
 def body(path: str, proc: str) -> str:
