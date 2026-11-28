@@ -451,18 +451,30 @@ a dead leader. Failover stays unclaimed. [versioning-plan.md](versioning-plan.md
 builds its networked phases on this.
 
 **Reusing the engine's networking.** The engine this database accompanies
-(checked out as `mirai-engine`) has a networking library in Odin, so the
-follower needs no new protocol: it can import `net` and carry commit records as
-its messages.
+(checked out as `mirai-engine`, read at `e05720e8`) has a networking package in
+Odin, `net` (package `mirai_net`, about 9 500 lines and 128 tests), that a
+follower could carry commit records over:
 
 | Piece there | What it gives a follower |
 |---|---|
-| `channel` | datagrams delivered whole and in order, or not at all; one reliable channel and one unreliable |
-| `replication` / `protocol` | the message set for peers and the rules for what is sent once and in what order |
-| `baseline` + `collection` | "start from this state, then apply changes": a snapshot plus the records after `seq` |
-| `clock` | ticks numbered alike on both ends, which makes applying a record deterministic |
-| `peer` / `host` / `connection` | connection lifecycle and queues; a full reliable queue refuses instead of dropping |
-| `conditioner` | simulated latency, jitter and loss: the rig for a lagging or flapping follower |
+| `transport` + `udp_*` | datagrams in batches behind an interface with a blocking wait and a wake (`sendmmsg` on Linux, `sendmsg_x` on Darwin, a loop on Windows): the place another transport plugs in |
+| `secure` | Noise handshakes (NKpsk0 for an invitation, IK for a known identity), datagrams sealed with AEGIS-128L, a stateless cookie and a replay filter |
+| `channel` | three kinds: unreliable, sequenced and reliable; a reliable one streams a message of any size in chunks, which is how a record of up to 4 MiB or a snapshot would go in 1 200-byte datagrams |
+| `peer` + `host` | connection lifecycle, acks, roaming, delay-based congestion control and a send rate; the network half runs on one worker thread |
+| `Sim_Network` + `conditioner` | a deterministic simulated network, and latency, loss, jitter and bandwidth over a real one: the rig for a lagging or flapping follower |
+| `invite` + `portmap` | invitation keys, and port opening through PCP, NAT-PMP and UPnP, for peers outside a LAN |
+
+The rest of `net` replicates game objects (`protocol`, `replication`, `back`,
+`scope`, `event`, `clock`, `interpolation`: entities, spatial scope, ticks and
+inputs), and a follower needs none of it. It is not a layer apart: `Host`,
+`Back` and `Peer` hold its state (`Front`, `Repl`, `Peer_Repl`, the object kinds
+of `Command` and `Op`) whether a protocol is set or not, and the identity model
+of `secure` names its peer classes after one product. Taking the connection
+layer means splitting those first, there or in the copy. The package imports
+`mirai:std/base`, `std/serial` (its bit stream; the package pulls
+`std/subprocess`), `std/blake3` and `std/math` (for interpolation only) through
+the `mirai:` collection, and allocates everything up front, where this database
+allocates per message. It has no TLS either, so D15 does not come with it.
 
 This database brings the segmented log with CRC32C per record, the replay path
 and the snapshot with an offset index; D14 is mostly wiring.
