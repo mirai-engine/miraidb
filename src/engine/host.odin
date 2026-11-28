@@ -1257,7 +1257,9 @@ host_agg_values :: proc(
 }
 
 // host_agg_group_sources binds the rows a group names, skipping the ones the
-// read transaction cannot see (a row a commit just deleted).
+// read transaction cannot see (a row a commit just deleted). A table that uses
+// the page store is read through the transaction (host_agg_row): a memory row
+// lookup found none of its rows, and its groups emptied.
 @(private)
 host_agg_group_sources :: proc(
 	tx: ^Tx,
@@ -1267,14 +1269,24 @@ host_agg_group_sources :: proc(
 ) -> [][]Source {
 	group := make([dynamic][]Source, 0, len(ids))
 	for id in ids {
-		row, exists := table_memory_row(base, id)
+		row, exists := host_agg_row(tx, stmt, base, id)
 		if !exists do continue
-		if _, visible := row_values_at(row, tx.read_seq); !visible do continue
 		one := make([]Source, 1)
 		one[0] = Source{table = base, row = row, alias = stmt.from.alias}
 		append(&group, one)
 	}
 	return group[:]
+}
+
+// host_agg_row is row `id` of a group's table as the read sees it: a memory
+// row in place, a paged one decoded through the transaction.
+@(private)
+host_agg_row :: proc(tx: ^Tx, stmt: Select_Stmt, base: ^Table, id: Row_Id) -> (Row, bool) {
+	if base.paged != nil do return tx_get(tx, stmt.from.name, id)
+	row, exists := table_memory_row(base, id)
+	if !exists do return {}, false
+	if _, visible := row_values_at(row, tx.read_seq); !visible do return {}, false
+	return row, true
 }
 
 // host_agg_publish compares a fresh group row with the one the subscriber has
@@ -1514,9 +1526,8 @@ host_agg_delta_values :: proc(
 		stream = &stream,
 	})
 	if entry.agg_plain && len(group.rows) > 0 {
-		row, exists := table_memory_row(base, group.first)
+		row, exists := host_agg_row(tx, stmt, base, group.first)
 		if !exists do return nil, false
-		if _, visible := row_values_at(row, tx.read_seq); !visible do return nil, false
 		sources := make([]Source, 1)
 		sources[0] = Source{table = base, row = row, alias = stmt.from.alias}
 		final.sources = sources

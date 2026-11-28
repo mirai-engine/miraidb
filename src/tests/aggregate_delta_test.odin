@@ -46,9 +46,29 @@ delta_apply :: proc(ctx: rawptr, update: ^db.Subscription_Update) {
 test_aggregate_subscriptions_follow_every_commit :: proc(t: ^testing.T) {
 	store := fresh_db(t, "aggregate_delta")
 	if store == nil do return
+	defer cleanup_db(store, "aggregate_delta")
+	follow_every_commit(t, store, "memory")
+}
+
+// The same corpus over a table that uses the page store, whose rows a group
+// reads through the transaction: it read only memory rows, and lost a paged
+// table's groups when it read them.
+@(test)
+test_aggregate_subscriptions_follow_every_commit_on_pages :: proc(t: ^testing.T) {
+	PATH :: "_test_aggregate_delta_paged"
+	db.remove_tree(PATH)
+	defer db.remove_tree(PATH)
+	store, err := db.store_open(PATH, {persistent = true, create = true, durable = false, paged_tables = true, page_frames = 8})
+	if !testing.expectf(t, db.error_ok(err), "open: %s", err.message) do return
+	defer db.store_close(store)
+	follow_every_commit(t, store, "paged")
+	testing.expect(t, store.tables["t"].paged != nil)
+}
+
+@(private = "file")
+follow_every_commit :: proc(t: ^testing.T, store: ^db.Store, face: string) {
 	host := db.host_init(store)
 	defer db.host_destroy(host)
-	defer cleanup_db(store, "aggregate_delta")
 	run_done(t, store, "CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT, v INTEGER, w REAL)")
 	run_done(t, store, "INSERT INTO t VALUES (1, 'a', 1, 0.5), (2, 'a', 4, NULL), (3, 'b', NULL, 2.0), (4, 'b', 7, 1.25), (5, 'c', 2, NULL)")
 
@@ -118,7 +138,7 @@ test_aggregate_subscriptions_follow_every_commit :: proc(t: ^testing.T) {
 		testing.expectf(t, db.error_ok(commit_err), "step %d: %s", s, commit_err.message)
 		db.error_free(&commit_err)
 		for sql, q in QUERIES {
-			label := fmt.tprintf("step %d (%s), %s", s, statements[0], sql)
+			label := fmt.tprintf("%s, step %d (%s), %s", face, s, statements[0], sql)
 			delta_matches_fresh(t, host, sql, &sets.sets[ids[q]], label)
 		}
 	}
