@@ -269,6 +269,22 @@ rows_iter :: #force_inline proc "contextless" (r: ^Row_Blocks) -> Rows_Iter {
 	return Rows_Iter{r = r}
 }
 
+// rows_iter_from is an iterator that starts at the first row whose id is not
+// below `id`: the block that would hold it, and its place there, found by the
+// same search a lookup does.
+rows_iter_from :: proc "contextless" (r: ^Row_Blocks, id: Row_Id) -> Rows_Iter {
+	it := Rows_Iter{r = r}
+	if r.count == 0 do return it
+	at := rows_block_of(r, id)
+	block := r.blocks[at]
+	slot, _ := rows_slot_of(block, id)
+	it.cur = block
+	it.block = at + 1
+	it.slot = slot
+	it.limit = block.count
+	return it
+}
+
 // rows_next is the next row, to read.
 rows_next :: #force_inline proc "contextless" (it: ^Rows_Iter) -> (^Row, bool) {
 	if it.slot < it.limit {

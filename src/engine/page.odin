@@ -754,6 +754,40 @@ row_dir_key :: proc(row_id: Row_Id) -> [8]u8 {
 	return key
 }
 
+// page_rows_collect_from appends the live rows whose id is not below `from`,
+// in id order, at most `limit` of them (0: all), decoded into `alloc`: the
+// directory is walked from `from` on, so the rows before it are never read.
+page_rows_collect_from :: proc(rows: ^Page_Rows, out: ^[dynamic]Row, from: Row_Id, limit: int, alloc: mem.Allocator) {
+	start := row_dir_key(from)
+	cursor := ordered_seek(rows.dir, string(start[:]))
+	taken := 0
+	buf: [8]u8
+	for cursor.valid {
+		if limit > 0 && taken >= limit do break
+		key, value, ok := ordered_cursor_read(&cursor, buf[:])
+		if !ok || len(key) != 8 do break
+		id: u64
+		for i in 0 ..< 8 do id = id << 8 | u64(key[i])
+		location := Row_Location{page = Page_Id(value >> 16), slot = u16(value & 0xFFFF)}
+		if frame, load_err := page_load(rows.file, location.page); load_err.kind == .None {
+			offset, length := page_slot_get(frame.data, location.slot)
+			if length > 0 {
+				if row, decoded := row_cell_decode(frame.data[offset:offset + length], alloc); decoded {
+					row.id = Row_Id(id)
+					append(out, row)
+					taken += 1
+				}
+			}
+			page_release(rows.file, frame, false)
+		} else {
+			// A page it cannot load is the read's failure (page_note_failure).
+			error_free(&load_err)
+			break
+		}
+		if !ordered_next(&cursor) do break
+	}
+}
+
 @(private)
 row_dir_value :: proc(page: Page_Id, slot: u16) -> u64 {
 	return u64(page) << 16 | u64(slot)

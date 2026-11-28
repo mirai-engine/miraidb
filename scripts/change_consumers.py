@@ -36,10 +36,8 @@ SITES = [
      " cannot follow a commit (a REAL in a sum, the extreme of min or max leaving)"),
     ("sqlite_share.odin", "sqlite_share_catch_up", r"\btx_truncate\(",
      "a file another process wrote is reloaded table by table"),
-    ("events.odin", "events_read", r"\btx_collect\(",
-     "an event read collects the whole table to find the events past a cursor"),
 ]
-BASELINE = 5
+BASELINE = 4
 
 
 def body(path: str, proc: str) -> str:

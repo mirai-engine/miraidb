@@ -21,7 +21,12 @@ event_tables :: proc(store: ^Store, alloc: mem.Allocator) -> []string {
 }
 
 // events_read returns the rows of an event table whose id is greater than or
-// equal to `from_id`, at most `limit` of them (zero means no limit).
+// equal to `from_id`, at most `limit` of them (zero means no limit), in
+// `alloc`. It reads from the cursor on (tx_collect_from): it used to collect
+// the whole table on every read, so a consumer near the end of 50 000 events
+// paid for all of them. The values are copied into `alloc`, strings
+// included: they pointed into the table, or into the read's arena for a paged
+// table, which the read frees.
 events_read :: proc(
 	host: ^Host,
 	table: string,
@@ -31,18 +36,12 @@ events_read :: proc(
 ) -> ([]Row, Error) {
 	tx := tx_begin_read(host.store)
 	defer tx_end(tx)
-	all: [dynamic]Row
-	defer delete(all)
-	if collect_err := tx_collect(tx, table, &all); collect_err.kind != .None {
+	found: [dynamic]Row
+	defer delete(found)
+	if collect_err := tx_collect_from(tx, table, from_id, limit, &found); collect_err.kind != .None {
 		return nil, collect_err
 	}
-	out := make([dynamic]Row, 0, 8, alloc)
-	for row in all {
-		if row.id < from_id do continue
-		if limit > 0 && len(out) >= limit do break
-		values := make([]Value, len(row.values), alloc)
-		copy(values, row.values)
-		append(&out, Row{id = row.id, values = values})
-	}
-	return out[:], ERROR_NONE
+	out := make([]Row, len(found), alloc)
+	for row, i in found do out[i] = Row{id = row.id, values = values_clone_in(row.values, alloc)}
+	return out, ERROR_NONE
 }

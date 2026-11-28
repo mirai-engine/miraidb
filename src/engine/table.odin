@@ -1066,6 +1066,33 @@ table_collect :: proc(
 	}
 }
 
+// table_collect_from appends the rows of `t` visible at `seq` whose id is not
+// below `from`, in id order, at most `limit` of them (0: all). It starts at
+// `from`: a memory table at the block that holds it, a paged one at its place
+// in the row directory, so the rows before it cost nothing (A3.6).
+table_collect_from :: proc(
+	t: ^Table,
+	out: ^[dynamic]Row,
+	from: Row_Id,
+	limit: int,
+	seq: u64 = max(u64),
+	alloc: mem.Allocator = context.allocator,
+) {
+	if t.paged != nil {
+		page_rows_collect_from(t.paged, out, from, limit, alloc)
+		return
+	}
+	taken := 0
+	it := rows_iter_from(&t.rows, from)
+	for row in rows_next(&it) {
+		if limit > 0 && taken >= limit do break
+		values, visible := row_values_at(row^, seq)
+		if !visible do continue
+		append(out, Row{id = row.id, values = values})
+		taken += 1
+	}
+}
+
 // table_max_int returns the largest Int value in one column, or 0 when the
 // column holds none. It answers the INTEGER PRIMARY KEY assignment for both
 // backends: a paged table has no map to walk, so the pages are streamed and no

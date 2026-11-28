@@ -61,7 +61,7 @@ rather than hidden in this table.
 | B5 | Views with parameters | done | positional `?` parameters bound by `FROM v(...)`, plus `OR REPLACE` and materialization | test_view_parameters |
 | B6 | Persisted reducer catalog | done | `_reducer` stores name, kind and parameter types | test_reducer_catalog |
 | B7 | Procedures with their own transaction phase | done | commit between phases, open the next one, sleep | test_procedures |
-| B8 | Event tables and outbox | done | `CREATE EVENT TABLE` is append-only; `events_read` reads from a cursor and `SHOW events` lists them | test_event_tables |
+| B8 | Event tables and outbox | done | `CREATE EVENT TABLE` is append-only; `events_read` reads from a cursor, starting at the cursor's row on a memory or a paged table, and `SHOW events` lists them | test_event_tables, test_an_event_read_starts_at_its_cursor |
 | B9 | Full schedule (instant and interval) | done | one-shot, immediate and interval rows; cancellation by deleting the row | test_scheduler, test_schedule_interval |
 | B10 | Row-level security | done | `USING`/`CHECK` policies in `_policy`, combined with AND | test_policies |
 | B11 | Session and module variables | done | `SET`/`SHOW` for the session, `_var` and `host_set_module_variable` for the module | test_set_and_show, test_module_variables |

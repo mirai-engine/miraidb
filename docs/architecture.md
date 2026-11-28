@@ -94,7 +94,7 @@ normative description of the invariants; the code follows it.
 | `fts.odin` | Full-text search over a shadow inverted index |
 | `vtab.odin` | Virtual tables a program implements |
 | `system_tables.odin` | System tables over the live schema |
-| `events.odin` | Append-only event tables |
+| `events.odin` | Append-only event tables, read from a cursor on: a read starts at the cursor's row (`tx_collect_from`), not at the table's first |
 | `meta.odin` | Module and schema metadata |
 | `variables.odin` | Module variables, committed in `_var` |
 | `migrations.odin` | Schema steps applied in order |

@@ -1352,6 +1352,32 @@ tx_collect :: proc(tx: ^Tx, name: string, out: ^[dynamic]Row) -> Error {
 	return ERROR_NONE
 }
 
+// tx_collect_from fills `out` with the visible rows of one table whose id is
+// not below `from`, ordered by row id, at most `limit` of them (0: all). It
+// reads from `from` on (table_collect_from); a table this transaction wrote is
+// collected whole, since its staged rows have to be merged (tx_collect).
+tx_collect_from :: proc(tx: ^Tx, name: string, from: Row_Id, limit: int, out: ^[dynamic]Row) -> Error {
+	table, table_err := tx_table(tx, name)
+	if table_err.kind != .None do return table_err
+	writes := tx.state.writes[name]
+	staged := tx.state.dropped[name] || (writes != nil && (writes.truncated || srows_len(&writes.inserts) > 0 || len(writes.updates) > 0 || len(writes.deletes) > 0))
+	if !staged {
+		table_collect_from(table, out, from, limit, tx.read_seq, tx.alloc)
+		return ERROR_NONE
+	}
+	all := make([dynamic]Row)
+	defer delete(all)
+	if collect_err := tx_collect(tx, name, &all); collect_err.kind != .None do return collect_err
+	taken := 0
+	for row in all {
+		if row.id < from do continue
+		if limit > 0 && taken >= limit do break
+		append(out, row)
+		taken += 1
+	}
+	return ERROR_NONE
+}
+
 // tx_collect_at reads the rows as they were at one commit sequence. It reads the
 // live table, not the transaction's frozen snapshot: the snapshot is built for
 // the present and drops the versions a past read needs. The read lock the
